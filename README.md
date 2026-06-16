@@ -6,14 +6,14 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **Early placeholder.** The real CLI is under active development. This package reserves the
-`hara-cli` name on npm. Follow along:
+🚧 **Early placeholder.** The real CLI is under active development. This package reserves
+`@nanhara/hara` on npm. Follow along:
 
 - Repo: https://github.com/hara-cli/hara
 - Site: https://hara.run
 
 ```bash
-npm i -g hara-cli
+npm i -g @nanhara/hara
 hara            # prints status
 hara --version
 ```

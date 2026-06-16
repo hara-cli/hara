@@ -1,5 +1,5 @@
 {
-  "name": "hara-cli",
+  "name": "@nanhara/hara",
   "version": "0.0.1",
   "description": "hara — a coding agent CLI that runs like an engineering org. Placeholder; under active development.",
   "bin": {
