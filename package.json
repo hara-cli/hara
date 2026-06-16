@@ -1,0 +1,36 @@
+{
+  "name": "hara-cli",
+  "version": "0.0.1",
+  "description": "hara — a coding agent CLI that runs like an engineering org. Placeholder; under active development.",
+  "bin": {
+    "hara": "bin/hara.mjs"
+  },
+  "type": "module",
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "coding-agent",
+    "llm",
+    "agent-orchestration",
+    "multi-agent"
+  ],
+  "license": "MIT",
+  "author": "Nanhara (无锡南荒科技)",
+  "homepage": "https://hara.run",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hara-cli/hara.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
