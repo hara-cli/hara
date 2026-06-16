@@ -18,4 +18,4 @@ hara            # prints status
 hara --version
 ```
 
-MIT © Nanhara (无锡南荒科技)
+MIT © Nanhara
