@@ -38,7 +38,8 @@
     "build": "tsc",
     "prepare": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "tsc && node --test"
   },
   "publishConfig": {
     "access": "public"

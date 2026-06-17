@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { readFileSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 
 export interface HaraConfig {
   apiKey: string | undefined;
@@ -10,24 +10,32 @@ export interface HaraConfig {
 
 const DEFAULT_MODEL = "claude-opus-4-8";
 
-/** Resolve config from env first, then ~/.hara/config.json. */
-export function loadConfig(): HaraConfig {
-  let apiKey = process.env.ANTHROPIC_API_KEY;
-  let model = process.env.HARA_MODEL ?? DEFAULT_MODEL;
+export function configPath(): string {
+  return join(homedir(), ".hara", "config.json");
+}
 
-  const cfgPath = join(homedir(), ".hara", "config.json");
-  if (existsSync(cfgPath)) {
-    try {
-      const j = JSON.parse(readFileSync(cfgPath, "utf8")) as {
-        apiKey?: string;
-        model?: string;
-      };
-      apiKey ??= j.apiKey;
-      if (j.model && !process.env.HARA_MODEL) model = j.model;
-    } catch {
-      // ignore malformed config
-    }
+export function readRawConfig(): Record<string, string> {
+  const p = configPath();
+  if (!existsSync(p)) return {};
+  try {
+    return JSON.parse(readFileSync(p, "utf8")) as Record<string, string>;
+  } catch {
+    return {};
   }
+}
 
+export function writeConfigValue(key: string, value: string): void {
+  const p = configPath();
+  const cfg = readRawConfig();
+  cfg[key] = value;
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+}
+
+/** Resolve effective config: env vars take precedence over the config file. */
+export function loadConfig(): HaraConfig {
+  const raw = readRawConfig();
+  const apiKey = process.env.ANTHROPIC_API_KEY ?? raw.apiKey;
+  const model = process.env.HARA_MODEL ?? raw.model ?? DEFAULT_MODEL;
   return { apiKey, model, cwd: process.cwd() };
 }
