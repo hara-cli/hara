@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "hara — a coding agent CLI that runs like an engineering org. Placeholder; under active development.",
   "bin": {
     "hara": "bin/hara.mjs"
@@ -9,7 +9,9 @@
   "files": [
     "bin",
     "README.md",
-    "LICENSE"
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "CLA.md"
   ],
   "keywords": [
     "ai",
@@ -20,7 +22,7 @@
     "agent-orchestration",
     "multi-agent"
   ],
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "author": "Nanhara",
   "homepage": "https://hara.run",
   "repository": {

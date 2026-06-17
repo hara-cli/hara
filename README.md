@@ -18,4 +18,11 @@ hara            # prints status
 hara --version
 ```
 
-MIT © Nanhara
+## License
+
+Licensed under either of **MIT** ([LICENSE-MIT](LICENSE-MIT)) or **Apache-2.0**
+([LICENSE-APACHE](LICENSE-APACHE)) at your option.
+
+Contributions are accepted under these terms; see [CLA.md](CLA.md).
+
+© 2026 Nanhara
