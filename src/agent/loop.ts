@@ -1,5 +1,5 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { getTool, toolDefs, type ToolContext } from "../tools/registry.js";
+import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
+import { getTool, toolSpecs, type ToolContext } from "../tools/registry.js";
 import { c, out } from "../ui.js";
 
 const system = (cwd: string) =>
@@ -9,58 +9,32 @@ Be concise and direct. Use the provided tools to read files, write files, and ru
 commands. Prefer small, verifiable steps. After completing a task, give a one-line summary.`;
 
 export interface RunOpts {
-  client: Anthropic;
-  model: string;
+  provider: Provider;
   ctx: ToolContext;
   autoApprove: boolean;
   confirm: (q: string) => Promise<boolean>;
 }
 
-/** Streaming manual agentic loop. Mutates `history` in place. */
-export async function runAgent(history: Anthropic.MessageParam[], opts: RunOpts): Promise<void> {
-  const { client, model, ctx } = opts;
+/** Provider-agnostic agentic loop. Mutates `history` in place. */
+export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<void> {
+  const { provider, ctx } = opts;
 
-  while (true) {
-    const stream = client.messages.stream({
-      model,
-      max_tokens: 64000,
-      thinking: { type: "adaptive" },
-      system: system(ctx.cwd),
-      tools: toolDefs(),
-      messages: history,
-    });
-    stream.on("text", (delta) => out(delta));
-
-    let message: Anthropic.Message;
-    try {
-      message = await stream.finalMessage();
-    } catch (e) {
-      if (e instanceof Anthropic.APIError) {
-        out(c.red(`\n[API error ${e.status ?? ""}] ${e.message}\n`));
-        return;
-      }
-      throw e;
-    }
+  for (;;) {
+    const r = await provider.turn({ system: system(ctx.cwd), history, tools: toolSpecs(), onText: out });
     out("\n");
+    history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 
-    history.push({ role: "assistant", content: message.content });
-
-    if (message.stop_reason === "refusal") {
-      out(c.yellow("[the model declined this request]\n"));
+    if (r.stop === "error") {
+      out(c.red(`[${provider.id} error] ${r.errorMsg ?? "unknown"}\n`));
       return;
     }
-    if (message.stop_reason === "pause_turn") continue; // server tool paused; resend
-    if (message.stop_reason !== "tool_use") return; // end_turn / stop_sequence / max_tokens
+    if (r.stop !== "tool_use") return;
 
-    const toolUses = message.content.filter(
-      (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
-    );
-
-    const results: Anthropic.ToolResultBlockParam[] = [];
-    for (const tu of toolUses) {
+    const results: ToolResult[] = [];
+    for (const tu of r.toolUses) {
       const tool = getTool(tu.name);
       if (!tool) {
-        results.push({ type: "tool_result", tool_use_id: tu.id, content: `Unknown tool: ${tu.name}`, is_error: true });
+        results.push({ id: tu.id, name: tu.name, content: `Unknown tool: ${tu.name}`, isError: true });
         continue;
       }
       if (tool.dangerous && !opts.autoApprove) {
@@ -68,19 +42,18 @@ export async function runAgent(history: Anthropic.MessageParam[], opts: RunOpts)
         const preview = String(input.command ?? input.path ?? "");
         const ok = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
         if (!ok) {
-          results.push({ type: "tool_result", tool_use_id: tu.id, content: "User denied this action.", is_error: true });
+          results.push({ id: tu.id, name: tu.name, content: "User denied this action.", isError: true });
           continue;
         }
       }
       out(c.dim(`  ↳ ${tu.name}\n`));
       try {
-        const result = await tool.run(tu.input, ctx);
-        results.push({ type: "tool_result", tool_use_id: tu.id, content: result });
+        const res = await tool.run(tu.input, ctx);
+        results.push({ id: tu.id, name: tu.name, content: res });
       } catch (e: any) {
-        results.push({ type: "tool_result", tool_use_id: tu.id, content: `Error: ${e.message}`, is_error: true });
+        results.push({ id: tu.id, name: tu.name, content: `Error: ${e.message}`, isError: true });
       }
     }
-
-    history.push({ role: "user", content: results });
+    history.push({ role: "tool", results });
   }
 }

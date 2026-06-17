@@ -1,14 +1,24 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import Anthropic from "@anthropic-ai/sdk";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { loadConfig, configPath, readRawConfig, writeConfigValue } from "./config.js";
+import {
+  loadConfig,
+  configPath,
+  readRawConfig,
+  writeConfigValue,
+  providerEnvKey,
+  CONFIG_KEYS,
+  type HaraConfig,
+} from "./config.js";
 import { runAgent } from "./agent/loop.js";
 import { getTools } from "./tools/registry.js";
+import { createAnthropicProvider } from "./providers/anthropic.js";
+import { createOpenAIProvider } from "./providers/openai.js";
+import type { Provider, NeutralMsg } from "./providers/types.js";
 import { c, out } from "./ui.js";
 import "./tools/builtin.js"; // side-effect: register built-in tools
 
@@ -16,6 +26,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
 
 const maskKey = (v?: string) => (v ? `${v.slice(0, 7)}…${v.slice(-4)}` : "(unset)");
+
+function makeProvider(cfg: HaraConfig): Provider {
+  if (cfg.provider === "anthropic") {
+    return createAnthropicProvider({ apiKey: cfg.apiKey!, model: cfg.model, baseURL: cfg.baseURL });
+  }
+  // qwen / openai → OpenAI-compatible
+  return createOpenAIProvider({ apiKey: cfg.apiKey!, model: cfg.model, baseURL: cfg.baseURL, label: cfg.provider });
+}
 
 function helpText(): string {
   return (
@@ -44,10 +62,10 @@ program
 const config = program.command("config").description("manage ~/.hara/config.json");
 config
   .command("set <key> <value>")
-  .description("set a config value (key: apiKey | model)")
+  .description(`set a config value (keys: ${CONFIG_KEYS.join(" | ")})`)
   .action((key: string, value: string) => {
-    if (key !== "apiKey" && key !== "model") {
-      out(c.red(`Unknown key '${key}'. Valid keys: apiKey, model.\n`));
+    if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
+      out(c.red(`Unknown key '${key}'. Valid keys: ${CONFIG_KEYS.join(", ")}.\n`));
       process.exit(1);
     }
     writeConfigValue(key, value);
@@ -61,7 +79,13 @@ config
     if (key) {
       out((key === "apiKey" ? maskKey(raw.apiKey) : raw[key] ?? "(unset)") + "\n");
     } else {
-      out(`path:   ${configPath()}\nmodel:  ${raw.model ?? "(default claude-opus-4-8)"}\napiKey: ${maskKey(raw.apiKey)}\n`);
+      out(
+        `path:     ${configPath()}\n` +
+          `provider: ${raw.provider ?? "(default anthropic)"}\n` +
+          `model:    ${raw.model ?? "(provider default)"}\n` +
+          `baseURL:  ${raw.baseURL ?? "(provider default)"}\n` +
+          `apiKey:   ${maskKey(raw.apiKey)}\n`,
+      );
     }
   });
 config
@@ -72,40 +96,41 @@ config
 // default action (interactive REPL / one-shot)
 program.action(async (opts) => {
   const cfg = loadConfig();
-  let model = opts.model ?? cfg.model;
+  if (opts.model) cfg.model = opts.model;
 
   if (!cfg.apiKey) {
-    out(c.red("No API key found.\n"));
+    out(c.red(`No API key found for provider '${cfg.provider}'.\n`));
     out(
-      `Set ${c.bold("ANTHROPIC_API_KEY")}, or run ${c.bold("hara config set apiKey sk-ant-...")} ` +
-        `(writes ${c.dim("~/.hara/config.json")}).\n`,
+      `Set ${c.bold(providerEnvKey(cfg.provider))} (or ${c.bold("HARA_API_KEY")}), ` +
+        `or run ${c.bold("hara config set apiKey <key>")}.\n`,
     );
     process.exit(1);
   }
 
-  const client = new Anthropic({ apiKey: cfg.apiKey });
+  const provider = makeProvider(cfg);
   const ctx = { cwd: cfg.cwd };
-  const history: Anthropic.MessageParam[] = [];
+  const history: NeutralMsg[] = [];
 
   if (opts.print) {
     history.push({ role: "user", content: String(opts.print) });
-    await runAgent(history, { client, model, ctx, autoApprove: opts.yes ?? true, confirm: async () => true });
+    await runAgent(history, { provider, ctx, autoApprove: opts.yes ?? true, confirm: async () => true });
     return;
   }
 
-  out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${model}  ·  ${ctx.cwd}\n`));
+  out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${ctx.cwd}\n`));
   out(c.dim("Type a task. /help for commands, /exit to quit.\n\n"));
 
   const rl = createInterface({ input: stdin, output: stdout });
   const confirm = async (q: string) =>
     (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
+  let activeProvider = provider;
 
   for (;;) {
     let line: string;
     try {
       line = (await rl.question(c.cyan("hara> "))).trim();
     } catch {
-      break; // Ctrl-D / closed stream
+      break;
     }
     if (!line) continue;
     if (line === "/exit" || line === "/quit") break;
@@ -122,10 +147,11 @@ program.action(async (opts) => {
     if (line === "/model" || line.startsWith("/model ")) {
       const m = line.slice("/model".length).trim();
       if (m) {
-        model = m;
-        out(c.dim(`(model → ${m})\n`));
+        cfg.model = m;
+        activeProvider = makeProvider(cfg);
+        out(c.dim(`(model → ${cfg.provider}:${m})\n`));
       } else {
-        out(`model: ${model}\n`);
+        out(`${cfg.provider}:${cfg.model}\n`);
       }
       continue;
     }
@@ -136,7 +162,7 @@ program.action(async (opts) => {
     }
     history.push({ role: "user", content: line });
     try {
-      await runAgent(history, { client, model, ctx, autoApprove: opts.yes ?? false, confirm });
+      await runAgent(history, { provider: activeProvider, ctx, autoApprove: opts.yes ?? false, confirm });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

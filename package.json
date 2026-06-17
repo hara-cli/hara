@@ -46,7 +46,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
-    "commander": "^15.0.0"
+    "commander": "^15.0.0",
+    "openai": "^6.44.0"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",

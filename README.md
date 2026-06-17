@@ -25,12 +25,32 @@ npm install -g .   # or: npm link
 
 ## Setup
 
-hara talks to Claude. Provide an API key one of two ways:
+hara is **multi-provider** — pick a provider + key.
 
+**Anthropic (default)**
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-# or: ~/.hara/config.json  →  { "apiKey": "sk-ant-...", "model": "claude-opus-4-8" }
 ```
+
+**Qwen** (Alibaba DashScope, OpenAI-compatible)
+```bash
+hara config set provider qwen
+hara config set apiKey   sk-...      # your DashScope key
+hara config set model    qwen3.7     # or qwen3-coder-plus, qwen-plus, …
+# endpoint defaults to dashscope compatible-mode; the "coding" endpoint also works:
+# hara config set baseURL https://coding.dashscope.aliyuncs.com/v1
+```
+
+**Any OpenAI-compatible endpoint** (GLM, Kimi, OpenAI, local servers)
+```bash
+hara config set provider openai
+hara config set baseURL  https://your-endpoint/v1
+hara config set apiKey   ...
+hara config set model    ...
+```
+
+Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `HARA_MODEL`,
+`HARA_BASE_URL`, `HARA_API_KEY`, or the provider key (`ANTHROPIC_API_KEY` / `DASHSCOPE_API_KEY`).
 
 ## Use
 
@@ -45,14 +65,14 @@ Inside the REPL: `/help`, `/reset`, `/exit`.
 
 ### What it can do (v0.1)
 
-A streaming agent loop with three built-in tools — `read_file`, `write_file`, `bash` — and a
+A streaming agentic loop with three built-in tools — `read_file`, `write_file`, `bash` — and a
 human-in-the-loop confirmation gate on the dangerous ones (`write_file`, `bash`) unless you pass `-y`.
-Default model: `claude-opus-4-8`.
+**Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI).
 
 ### Roadmap
 
-MCP client · permission policies · session persistence (SQLite+FTS5) · multi-provider · and the
-**governed role-agent org** (routing, dispatcher, SSOT, approval gates, cron) — see the design docs.
+MCP client · permission policies · session persistence (SQLite+FTS5) · streaming for OpenAI-compatible
+providers · and the **governed role-agent org** (routing, dispatcher, SSOT, approval gates, cron).
 
 ## License
 

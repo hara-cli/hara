@@ -1,4 +1,4 @@
-import type Anthropic from "@anthropic-ai/sdk";
+import type { ToolSpec } from "../providers/types.js";
 
 export interface ToolContext {
   cwd: string;
@@ -31,11 +31,11 @@ export function getTools(): Tool[] {
   return [...registry.values()];
 }
 
-/** Anthropic tool definitions derived from the registry. */
-export function toolDefs(): Anthropic.Tool[] {
+/** Provider-neutral tool specs derived from the registry. */
+export function toolSpecs(): ToolSpec[] {
   return getTools().map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: t.input_schema,
-  })) as Anthropic.Tool[];
+  }));
 }
