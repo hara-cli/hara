@@ -1,13 +1,13 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.0.2",
-  "description": "hara — a coding agent CLI that runs like an engineering org. Placeholder; under active development.",
+  "version": "0.1.0",
+  "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
-    "hara": "bin/hara.mjs"
+    "hara": "dist/index.js"
   },
   "type": "module",
   "files": [
-    "bin",
+    "dist",
     "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE",
@@ -20,7 +20,9 @@
     "coding-agent",
     "llm",
     "agent-orchestration",
-    "multi-agent"
+    "multi-agent",
+    "anthropic",
+    "claude"
   ],
   "license": "MIT OR Apache-2.0",
   "author": "Nanhara",
@@ -32,7 +34,22 @@
   "engines": {
     "node": ">=20"
   },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.2",
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
   }
 }
