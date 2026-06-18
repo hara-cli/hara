@@ -43,6 +43,10 @@ hara config set provider qwen
 hara config set apiKey   sk-...      # your DashScope model-studio key
 hara config set model    qwen-plus   # or qwen-max, qwen3-coder-plus, …
 # endpoint defaults to dashscope compatible-mode/v1
+#
+# coding-plan keys (sk-sp-…) use the coding endpoint instead:
+#   hara config set baseURL https://coding.dashscope.aliyuncs.com/v1
+#   hara config set model   qwen3-coder-plus   # or qwen3.6-plus
 ```
 
 **Any OpenAI-compatible endpoint** (GLM, Kimi, OpenAI, local servers)
