@@ -18,6 +18,7 @@ import { runAgent } from "./agent/loop.js";
 import { getTools } from "./tools/registry.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
+import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
 import type { Provider, NeutralMsg } from "./providers/types.js";
 import { c, out } from "./ui.js";
 import "./tools/builtin.js"; // side-effect: register built-in tools
@@ -27,12 +28,23 @@ const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) a
 
 const maskKey = (v?: string) => (v ? `${v.slice(0, 7)}…${v.slice(-4)}` : "(unset)");
 
-function makeProvider(cfg: HaraConfig): Provider {
-  if (cfg.provider === "anthropic") {
-    return createAnthropicProvider({ apiKey: cfg.apiKey!, model: cfg.model, baseURL: cfg.baseURL });
+/** Build a provider from config (async: qwen-oauth may refresh its token). null if unauthenticated. */
+async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
+  if (cfg.provider === "qwen-oauth") {
+    const auth = await getValidQwenAuth();
+    if (!auth) return null;
+    return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model: cfg.model, label: "qwen-oauth" });
   }
-  // qwen / openai → OpenAI-compatible
-  return createOpenAIProvider({ apiKey: cfg.apiKey!, model: cfg.model, baseURL: cfg.baseURL, label: cfg.provider });
+  if (!cfg.apiKey) return null;
+  if (cfg.provider === "anthropic") {
+    return createAnthropicProvider({ apiKey: cfg.apiKey, model: cfg.model, baseURL: cfg.baseURL });
+  }
+  return createOpenAIProvider({ apiKey: cfg.apiKey, model: cfg.model, baseURL: cfg.baseURL, label: cfg.provider });
+}
+
+function authHint(cfg: HaraConfig): string {
+  if (cfg.provider === "qwen-oauth") return `Run ${c.bold("hara login qwen")} to authenticate.`;
+  return `Set ${c.bold(providerEnvKey(cfg.provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara config set apiKey <key>")}.`;
 }
 
 function helpText(): string {
@@ -57,6 +69,23 @@ program
   .option("-p, --print <prompt>", "run a single prompt non-interactively, then exit")
   .option("-y, --yes", "auto-approve tool actions (skip confirmations)")
   .option("-m, --model <model>", "model id (overrides config)");
+
+// `hara login qwen` — Qwen Code OAuth device login
+const login = program.command("login").description("authenticate a provider");
+login
+  .command("qwen")
+  .description("Qwen OAuth device login (free 'Qwen Code' tier — same as OpenClaw)")
+  .action(async () => {
+    try {
+      await qwenDeviceLogin((m) => out(m + "\n"));
+      writeConfigValue("provider", "qwen-oauth");
+      writeConfigValue("model", "coder-model");
+      out(c.green("\n✓ Qwen OAuth complete — provider set to qwen-oauth (model coder-model). Run `hara` to use it.\n"));
+    } catch (e: any) {
+      out(c.red(`\nQwen OAuth failed: ${e.message}\n`));
+      process.exit(1);
+    }
+  });
 
 // `hara config …`
 const config = program.command("config").description("manage ~/.hara/config.json");
@@ -98,16 +127,13 @@ program.action(async (opts) => {
   const cfg = loadConfig();
   if (opts.model) cfg.model = opts.model;
 
-  if (!cfg.apiKey) {
-    out(c.red(`No API key found for provider '${cfg.provider}'.\n`));
-    out(
-      `Set ${c.bold(providerEnvKey(cfg.provider))} (or ${c.bold("HARA_API_KEY")}), ` +
-        `or run ${c.bold("hara config set apiKey <key>")}.\n`,
-    );
+  let provider = await buildProvider(cfg);
+  if (!provider) {
+    out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`));
+    out(authHint(cfg) + "\n");
     process.exit(1);
   }
 
-  const provider = makeProvider(cfg);
   const ctx = { cwd: cfg.cwd };
   const history: NeutralMsg[] = [];
 
@@ -123,7 +149,6 @@ program.action(async (opts) => {
   const rl = createInterface({ input: stdin, output: stdout });
   const confirm = async (q: string) =>
     (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
-  let activeProvider = provider;
 
   for (;;) {
     let line: string;
@@ -148,8 +173,13 @@ program.action(async (opts) => {
       const m = line.slice("/model".length).trim();
       if (m) {
         cfg.model = m;
-        activeProvider = makeProvider(cfg);
-        out(c.dim(`(model → ${cfg.provider}:${m})\n`));
+        const p = await buildProvider(cfg);
+        if (p) {
+          provider = p;
+          out(c.dim(`(model → ${cfg.provider}:${m})\n`));
+        } else {
+          out(c.red("(could not rebuild provider)\n"));
+        }
       } else {
         out(`${cfg.provider}:${cfg.model}\n`);
       }
@@ -162,7 +192,7 @@ program.action(async (opts) => {
     }
     history.push({ role: "user", content: line });
     try {
-      await runAgent(history, { provider: activeProvider, ctx, autoApprove: opts.yes ?? false, confirm });
+      await runAgent(history, { provider, ctx, autoApprove: opts.yes ?? false, confirm });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

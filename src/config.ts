@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 
-export type ProviderId = "anthropic" | "qwen" | "openai";
+export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai";
 
 export interface HaraConfig {
   provider: ProviderId;
@@ -19,6 +19,8 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
     baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     envKey: "DASHSCOPE_API_KEY",
   },
+  // free "Qwen Code" OAuth tier — auth comes from ~/.hara/qwen-oauth.json, not an apiKey
+  "qwen-oauth": { model: "coder-model", envKey: "QWEN_OAUTH_TOKEN" },
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
 };
 

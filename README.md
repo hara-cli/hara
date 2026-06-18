@@ -32,13 +32,17 @@ hara is **multi-provider** — pick a provider + key.
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-**Qwen** (Alibaba DashScope, OpenAI-compatible)
+**Qwen — free OAuth** ("Qwen Code" tier, no API key — same flow as OpenClaw)
+```bash
+hara login qwen      # device login: open the printed URL, approve — token auto-refreshes
+```
+
+**Qwen — DashScope API key** (Alibaba Model Studio, OpenAI-compatible)
 ```bash
 hara config set provider qwen
-hara config set apiKey   sk-...      # your DashScope key
-hara config set model    qwen3.7     # or qwen3-coder-plus, qwen-plus, …
-# endpoint defaults to dashscope compatible-mode; the "coding" endpoint also works:
-# hara config set baseURL https://coding.dashscope.aliyuncs.com/v1
+hara config set apiKey   sk-...      # your DashScope model-studio key
+hara config set model    qwen-plus   # or qwen-max, qwen3-coder-plus, …
+# endpoint defaults to dashscope compatible-mode/v1
 ```
 
 **Any OpenAI-compatible endpoint** (GLM, Kimi, OpenAI, local servers)
