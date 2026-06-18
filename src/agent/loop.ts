@@ -2,17 +2,20 @@ import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
 import { getTool, toolSpecs, type ToolContext } from "../tools/registry.js";
 import { c, out } from "../ui.js";
 
-const system = (cwd: string) =>
+const system = (cwd: string, projectContext?: string) =>
   `You are hara, a coding agent running in the user's terminal.
 Working directory: ${cwd}
-Be concise and direct. Use the provided tools to read files, write files, and run shell
-commands. Prefer small, verifiable steps. After completing a task, give a one-line summary.`;
+Be concise and direct. Use the provided tools to read files, edit/write files, and run shell
+commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
+them whole. After completing a task, give a one-line summary.` +
+  (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "");
 
 export interface RunOpts {
   provider: Provider;
   ctx: ToolContext;
   autoApprove: boolean;
   confirm: (q: string) => Promise<boolean>;
+  projectContext?: string;
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
@@ -20,7 +23,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   const { provider, ctx } = opts;
 
   for (;;) {
-    const r = await provider.turn({ system: system(ctx.cwd), history, tools: toolSpecs(), onText: out });
+    const r = await provider.turn({ system: system(ctx.cwd, opts.projectContext), history, tools: toolSpecs(), onText: out });
     out("\n");
     history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 

@@ -68,19 +68,22 @@ Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `H
 ## Use
 
 ```bash
-hara                       # interactive REPL in the current directory
-hara -p "fix the lint errors in src/"   # one-shot, non-interactive
+hara                       # interactive REPL (offers to create AGENTS.md on first run)
+hara init                  # analyze the project & (re)generate AGENTS.md
+hara -p "summarize @README.md and fix the lint errors in src/"   # one-shot; @path attaches a file
 hara -y                    # auto-approve tool actions (no confirmations)
-hara -m claude-sonnet-4-6  # pick a model
+hara -m glm-5              # pick a model
 ```
 
-Inside the REPL: `/help`, `/reset`, `/exit`.
+Inside the REPL: `/help`, `/init`, `/tools`, `/model`, `/reset`, `/exit`. Type `@` + Tab to attach a file.
 
-### What it can do (v0.1)
+### What it can do (v0.2)
 
-A streaming agentic loop with three built-in tools — `read_file`, `write_file`, `bash` — and a
-human-in-the-loop confirmation gate on the dangerous ones (`write_file`, `bash`) unless you pass `-y`.
-**Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI).
+A streaming agentic loop with built-in tools — `read_file`, `write_file`, **`edit_file`** (surgical
+exact-string edits), `bash` — behind a human-in-the-loop confirmation gate on the dangerous ones unless `-y`.
+- **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
+- **`@file` mentions**: attach file contents to a message (`@path`, Tab-completes from `git ls-files`).
+- **Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI).
 
 ### Roadmap
 
