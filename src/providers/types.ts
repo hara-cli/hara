@@ -19,6 +19,7 @@ export interface TurnResult {
   toolUses: ToolUse[];
   stop: "end" | "tool_use" | "error";
   errorMsg?: string;
+  usage?: { input: number; output: number };
 }
 
 export interface TurnArgs {

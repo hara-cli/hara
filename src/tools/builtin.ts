@@ -25,6 +25,7 @@ registerTool({
     },
     required: ["path"],
   },
+  kind: "read",
   async run(input, ctx) {
     return cap(await readFile(abs(input.path, ctx.cwd), "utf8"));
   },
@@ -41,7 +42,7 @@ registerTool({
     },
     required: ["path", "content"],
   },
-  dangerous: true,
+  kind: "edit",
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
     await mkdir(dirname(p), { recursive: true });
@@ -61,7 +62,7 @@ registerTool({
     },
     required: ["command"],
   },
-  dangerous: true,
+  kind: "exec",
   async run(input, ctx) {
     try {
       const { stdout, stderr } = await pexec(input.command, {

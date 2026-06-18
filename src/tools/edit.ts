@@ -18,7 +18,7 @@ registerTool({
     },
     required: ["path", "old_string", "new_string"],
   },
-  dangerous: true,
+  kind: "edit",
   async run(input, ctx) {
     const p = isAbsolute(input.path) ? input.path : resolve(ctx.cwd, input.path);
     const { old_string, new_string, replace_all } = input;

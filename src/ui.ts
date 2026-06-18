@@ -15,3 +15,7 @@ export const c = {
 export function out(s: string): void {
   stdout.write(s);
 }
+
+export function statusLine(model: string, inTok: number, outTok: number): string {
+  return c.dim(`  ${model} · ↑${inTok} ↓${outTok} tok`);
+}

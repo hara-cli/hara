@@ -2,6 +2,17 @@
 
 All notable changes to `@nanhara/hara`.
 
+## 0.3.0 — unreleased (Tier-2 coding-CLI polish)
+
+- **Approval modes** — `suggest` (confirm edits & shell), `auto-edit` (auto file edits, confirm shell),
+  `full-auto` (no prompts). Set via `--approval`, `hara config set approval`, or `/approval`; `-y` = full-auto.
+- **Slash-command registry** — `/help` `/init` `/tools` `/model` `/approval` `/usage` `/reset` `/exit`,
+  data-driven (auto-listed in `/help`).
+- **Config profiles & project config** — named `profiles` in `~/.hara/config.json` (`--profile` /
+  `HARA_PROFILE`), plus a project-level `.hara/config.json` that overrides the global config.
+- **Status line** — model + cumulative token usage (`↑in ↓out`) after each turn and in `-p` output;
+  `/usage` shows it on demand.
+
 ## 0.2.0 — unreleased (coding-CLI features, borrowed from Codex)
 
 - **Project context (`AGENTS.md`)** — auto-loaded each run (walks up to the project root, concatenates,

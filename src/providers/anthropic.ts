@@ -58,7 +58,8 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
         .filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use")
         .map((b) => ({ id: b.id, name: b.name, input: b.input }));
       const stop = msg.stop_reason === "tool_use" ? "tool_use" : "end";
-      return { text, toolUses, stop };
+      const usage = { input: msg.usage?.input_tokens ?? 0, output: msg.usage?.output_tokens ?? 0 };
+      return { text, toolUses, stop, usage };
     },
   };
 }

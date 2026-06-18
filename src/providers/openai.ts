@@ -76,7 +76,8 @@ export function createOpenAIProvider(opts: {
       });
 
       const stop = choice?.finish_reason === "tool_calls" || toolUses.length ? "tool_use" : "end";
-      return { text, toolUses, stop };
+      const usage = { input: resp.usage?.prompt_tokens ?? 0, output: resp.usage?.completion_tokens ?? 0 };
+      return { text, toolUses, stop, usage };
     },
   };
 }

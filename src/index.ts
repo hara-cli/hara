@@ -12,7 +12,9 @@ import {
   writeConfigValue,
   providerEnvKey,
   CONFIG_KEYS,
+  APPROVAL_MODES,
   type HaraConfig,
+  type ApprovalMode,
 } from "./config.js";
 import { runAgent } from "./agent/loop.js";
 import { getTools } from "./tools/registry.js";
@@ -22,9 +24,9 @@ import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
 import { loadAgentsMd, hasAgentsMd, INIT_PROMPT } from "./context/agents-md.js";
 import { expandMentions, fileCandidates } from "./context/mentions.js";
 import type { Provider, NeutralMsg } from "./providers/types.js";
-import { c, out } from "./ui.js";
-import "./tools/builtin.js"; // side-effect: register read_file/write_file/bash
-import "./tools/edit.js"; // side-effect: register edit_file
+import { c, out, statusLine } from "./ui.js";
+import "./tools/builtin.js"; // register read_file/write_file/bash
+import "./tools/edit.js"; // register edit_file
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
@@ -49,33 +51,27 @@ function authHint(cfg: HaraConfig): string {
   return `Set ${c.bold(providerEnvKey(cfg.provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara config set apiKey <key>")}.`;
 }
 
-/** Run hara against itself to analyze the repo and write AGENTS.md. */
 async function runInit(provider: Provider, cwd: string): Promise<void> {
   const history: NeutralMsg[] = [{ role: "user", content: INIT_PROMPT }];
-  await runAgent(history, { provider, ctx: { cwd }, autoApprove: true, confirm: async () => true });
+  await runAgent(history, { provider, ctx: { cwd }, approval: "full-auto", confirm: async () => true });
 }
 
-/** readline completer: complete `@path` tokens from tracked files. */
 function mentionCompleter(line: string, cwd: string): [string[], string] {
   const m = /@([^\s@]*)$/.exec(line);
   if (!m) return [[], line];
-  const hits = fileCandidates(cwd, m[1]).map((f) => "@" + f);
-  return [hits, "@" + m[1]];
+  return [fileCandidates(cwd, m[1]).map((f) => "@" + f), "@" + m[1]];
 }
 
-function helpText(): string {
-  return (
-    [
-      c.bold("Commands:"),
-      "  /help           show this help",
-      "  /init           analyze the project & (re)generate AGENTS.md",
-      "  /tools          list available tools",
-      "  /model [id]     show or switch the model for this session",
-      "  /reset, /clear  clear conversation context",
-      "  /exit, /quit    leave",
-      c.dim("  @path           attach a file's contents to your message (Tab to complete)"),
-    ].join("\n") + "\n"
-  );
+interface Slash {
+  name: string;
+  aliases?: string[];
+  desc: string;
+  run: (args: string) => Promise<"exit" | void> | ("exit" | void);
+}
+
+function helpText(commands: Slash[]): string {
+  const lines = commands.map((cmd) => `  /${cmd.name.padEnd(13)} ${c.dim(cmd.desc)}`);
+  return c.bold("Commands:\n") + lines.join("\n") + "\n" + c.dim("  @path          attach a file's contents (Tab to complete)\n");
 }
 
 const program = new Command();
@@ -84,10 +80,11 @@ program
   .description("A coding agent CLI that runs like an engineering org.")
   .version(pkg.version)
   .option("-p, --print <prompt>", "run a single prompt non-interactively, then exit")
-  .option("-y, --yes", "auto-approve tool actions (skip confirmations)")
-  .option("-m, --model <model>", "model id (overrides config)");
+  .option("-y, --yes", "auto-approve all tool actions (= --approval full-auto)")
+  .option("-m, --model <model>", "model id (overrides config)")
+  .option("--approval <mode>", "approval mode: suggest | auto-edit | full-auto")
+  .option("--profile <name>", "use a named profile from ~/.hara/config.json");
 
-// `hara init` — analyze repo & write AGENTS.md
 program
   .command("init")
   .description("analyze the project and (re)generate AGENTS.md")
@@ -102,7 +99,6 @@ program
     await runInit(provider, cfg.cwd);
   });
 
-// `hara login qwen`
 const login = program.command("login").description("authenticate a provider");
 login
   .command("qwen")
@@ -119,7 +115,6 @@ login
     }
   });
 
-// `hara config …`
 const config = program.command("config").description("manage ~/.hara/config.json");
 config
   .command("set <key> <value>")
@@ -127,6 +122,10 @@ config
   .action((key: string, value: string) => {
     if (!(CONFIG_KEYS as readonly string[]).includes(key)) {
       out(c.red(`Unknown key '${key}'. Valid keys: ${CONFIG_KEYS.join(", ")}.\n`));
+      process.exit(1);
+    }
+    if (key === "approval" && !APPROVAL_MODES.includes(value as ApprovalMode)) {
+      out(c.red(`Invalid approval mode. One of: ${APPROVAL_MODES.join(", ")}.\n`));
       process.exit(1);
     }
     writeConfigValue(key, value);
@@ -145,6 +144,7 @@ config
           `provider: ${raw.provider ?? "(default anthropic)"}\n` +
           `model:    ${raw.model ?? "(provider default)"}\n` +
           `baseURL:  ${raw.baseURL ?? "(provider default)"}\n` +
+          `approval: ${raw.approval ?? "(default suggest)"}\n` +
           `apiKey:   ${maskKey(raw.apiKey)}\n`,
       );
     }
@@ -156,34 +156,32 @@ config
 
 // default action (interactive REPL / one-shot)
 program.action(async (opts) => {
-  const cfg = loadConfig();
+  const cfg = loadConfig({ profile: opts.profile });
   if (opts.model) cfg.model = opts.model;
-  let provider = await buildProvider(cfg);
-  if (!provider) {
+  const provider0 = await buildProvider(cfg);
+  if (!provider0) {
     out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
     process.exit(1);
   }
+  let provider: Provider = provider0;
   const cwd = cfg.cwd;
+  let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
+  const stats = { input: 0, output: 0 };
 
   // one-shot
   if (opts.print) {
     const projectContext = loadAgentsMd(cwd) || undefined;
     const history: NeutralMsg[] = [{ role: "user", content: expandMentions(String(opts.print), cwd) }];
-    await runAgent(history, { provider, ctx: { cwd }, autoApprove: opts.yes ?? true, confirm: async () => true, projectContext });
+    await runAgent(history, { provider, ctx: { cwd }, approval: "full-auto", confirm: async () => true, projectContext, stats });
+    if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
     return;
   }
 
   // interactive REPL
-  out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${cwd}\n`));
-  const rl = createInterface({
-    input: stdin,
-    output: stdout,
-    completer: (line: string) => mentionCompleter(line, cwd),
-  });
-  const confirm = async (q: string) =>
-    (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
+  out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}  ·  ${cwd}\n`));
+  const rl = createInterface({ input: stdin, output: stdout, completer: (line: string) => mentionCompleter(line, cwd) });
+  const confirm = async (q: string) => (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
 
-  // auto-init AGENTS.md on first run in a project
   if (!hasAgentsMd(cwd)) {
     const ans = (await rl.question(`${c.dim("No AGENTS.md here — analyze this project and create one?")} ${c.dim("[Y/n]")} `)).trim().toLowerCase();
     if (ans === "" || ans.startsWith("y")) {
@@ -197,6 +195,67 @@ program.action(async (opts) => {
   }
   let projectContext = loadAgentsMd(cwd) || undefined;
 
+  const commands: Slash[] = [
+    { name: "help", desc: "show this help", run: () => void out(helpText(commands)) },
+    {
+      name: "init",
+      desc: "analyze project & regenerate AGENTS.md",
+      run: async () => {
+        out(c.dim("Analyzing project…\n"));
+        try {
+          await runInit(provider, cwd);
+          projectContext = loadAgentsMd(cwd) || undefined;
+          out(c.green("AGENTS.md updated.\n"));
+        } catch (e: any) {
+          out(c.red(`[init error] ${e.message}\n`));
+        }
+      },
+    },
+    {
+      name: "tools",
+      desc: "list available tools",
+      run: () => {
+        out(c.bold("Tools:\n"));
+        for (const t of getTools()) out(`  ${t.name}${t.kind !== "read" ? c.yellow(" *") : ""}  ${c.dim(t.description)}\n`);
+        out(c.dim("  * may prompt for confirmation (depends on approval mode)\n"));
+      },
+    },
+    {
+      name: "model",
+      desc: "show or switch model: /model [id]",
+      run: async (a) => {
+        if (a) {
+          cfg.model = a;
+          const p = await buildProvider(cfg);
+          if (p) {
+            provider = p;
+            out(c.dim(`(model → ${cfg.provider}:${a})\n`));
+          } else out(c.red("(could not rebuild provider)\n"));
+        } else out(`${cfg.provider}:${cfg.model}\n`);
+      },
+    },
+    {
+      name: "approval",
+      desc: `show/set approval: /approval [${APPROVAL_MODES.join("|")}]`,
+      run: (a) => {
+        if (a) {
+          if (APPROVAL_MODES.includes(a as ApprovalMode)) {
+            approval = a as ApprovalMode;
+            out(c.dim(`(approval → ${approval})\n`));
+          } else out(c.red(`Invalid mode. One of: ${APPROVAL_MODES.join(", ")}\n`));
+        } else out(`approval: ${approval}\n`);
+      },
+    },
+    { name: "usage", desc: "show token usage this session", run: () => void out(statusLine(cfg.model, stats.input, stats.output) + "\n") },
+    { name: "reset", aliases: ["clear"], desc: "clear conversation context", run: () => void ((history.length = 0), out(c.dim("(context cleared)\n"))) },
+    { name: "exit", aliases: ["quit"], desc: "leave", run: () => "exit" },
+  ];
+  const byName = new Map<string, Slash>();
+  for (const cmd of commands) {
+    byName.set(cmd.name, cmd);
+    for (const a of cmd.aliases ?? []) byName.set(a, cmd);
+  }
+
   out(c.dim(`Type a task. /help · @path attaches a file · /exit to quit.${projectContext ? "  (AGENTS.md loaded)" : ""}\n\n`));
   const history: NeutralMsg[] = [];
 
@@ -208,56 +267,24 @@ program.action(async (opts) => {
       break;
     }
     if (!line) continue;
-    if (line === "/exit" || line === "/quit") break;
-    if (line === "/help") {
-      out(helpText());
-      continue;
-    }
-    if (line === "/init") {
-      out(c.dim("Analyzing project…\n"));
-      try {
-        await runInit(provider, cwd);
-        projectContext = loadAgentsMd(cwd) || undefined;
-        out(c.green("AGENTS.md updated.\n"));
-      } catch (e: any) {
-        out(c.red(`[init error] ${e.message}\n`));
+    if (line.startsWith("/")) {
+      const [name, ...rest] = line.slice(1).split(/\s+/);
+      const cmd = byName.get(name);
+      if (!cmd) {
+        out(c.red(`Unknown command /${name} — /help for the list.\n`));
+        continue;
       }
-      continue;
-    }
-    if (line === "/tools") {
-      out(c.bold("Tools:\n"));
-      for (const t of getTools()) out(`  ${t.name}${t.dangerous ? c.yellow(" *") : ""}  ${c.dim(t.description)}\n`);
-      out(c.dim("  * requires confirmation (use -y to auto-approve)\n"));
-      continue;
-    }
-    if (line === "/model" || line.startsWith("/model ")) {
-      const m = line.slice("/model".length).trim();
-      if (m) {
-        cfg.model = m;
-        const p = await buildProvider(cfg);
-        if (p) {
-          provider = p;
-          out(c.dim(`(model → ${cfg.provider}:${m})\n`));
-        } else {
-          out(c.red("(could not rebuild provider)\n"));
-        }
-      } else {
-        out(`${cfg.provider}:${cfg.model}\n`);
-      }
-      continue;
-    }
-    if (line === "/reset" || line === "/clear") {
-      history.length = 0;
-      out(c.dim("(context cleared)\n"));
+      const res = await cmd.run(rest.join(" "));
+      if (res === "exit") break;
       continue;
     }
     history.push({ role: "user", content: expandMentions(line, cwd) });
     try {
-      await runAgent(history, { provider, ctx: { cwd }, autoApprove: opts.yes ?? false, confirm, projectContext });
+      await runAgent(history, { provider, ctx: { cwd }, approval, confirm, projectContext, stats });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }
-    out("\n");
+    out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
   }
   rl.close();
 });

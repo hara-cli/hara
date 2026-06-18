@@ -5,8 +5,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadAgentsMd, hasAgentsMd, findProjectRoot } from "../dist/context/agents-md.js";
 import { expandMentions } from "../dist/context/mentions.js";
+import { needsConfirm } from "../dist/agent/loop.js";
 import "../dist/tools/edit.js";
 import { getTool } from "../dist/tools/registry.js";
+
+test("approval gate: needsConfirm per mode/kind", () => {
+  // read is never gated
+  assert.equal(needsConfirm("read", "suggest"), false);
+  // suggest: confirm edit + exec
+  assert.equal(needsConfirm("edit", "suggest"), true);
+  assert.equal(needsConfirm("exec", "suggest"), true);
+  // auto-edit: auto file edits, still confirm exec
+  assert.equal(needsConfirm("edit", "auto-edit"), false);
+  assert.equal(needsConfirm("exec", "auto-edit"), true);
+  // full-auto: nothing prompts
+  assert.equal(needsConfirm("edit", "full-auto"), false);
+  assert.equal(needsConfirm("exec", "full-auto"), false);
+});
 
 test("agents-md: finds root via .git and loads AGENTS.md from an ancestor", () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-ctx-"));

@@ -1,6 +1,15 @@
 import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
 import { getTool, toolSpecs, type ToolContext } from "../tools/registry.js";
 import { c, out } from "../ui.js";
+import type { ApprovalMode } from "../config.js";
+
+/** Whether a tool call needs user confirmation under the given approval mode. */
+export function needsConfirm(kind: string | undefined, mode: ApprovalMode): boolean {
+  if (kind === "read") return false;
+  if (mode === "full-auto") return false;
+  if (mode === "auto-edit") return kind === "exec";
+  return true; // suggest: confirm edits and exec
+}
 
 const system = (cwd: string, projectContext?: string) =>
   `You are hara, a coding agent running in the user's terminal.
@@ -13,9 +22,10 @@ them whole. After completing a task, give a one-line summary.` +
 export interface RunOpts {
   provider: Provider;
   ctx: ToolContext;
-  autoApprove: boolean;
+  approval: ApprovalMode;
   confirm: (q: string) => Promise<boolean>;
   projectContext?: string;
+  stats?: { input: number; output: number };
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
@@ -25,6 +35,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   for (;;) {
     const r = await provider.turn({ system: system(ctx.cwd, opts.projectContext), history, tools: toolSpecs(), onText: out });
     out("\n");
+    if (r.usage && opts.stats) {
+      opts.stats.input += r.usage.input;
+      opts.stats.output += r.usage.output;
+    }
     history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 
     if (r.stop === "error") {
@@ -40,7 +54,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         results.push({ id: tu.id, name: tu.name, content: `Unknown tool: ${tu.name}`, isError: true });
         continue;
       }
-      if (tool.dangerous && !opts.autoApprove) {
+      if (needsConfirm(tool.kind, opts.approval)) {
         const input = tu.input as Record<string, unknown>;
         const preview = String(input.command ?? input.path ?? "");
         const ok = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);

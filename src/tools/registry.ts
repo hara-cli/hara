@@ -12,8 +12,8 @@ export interface Tool {
     properties: Record<string, unknown>;
     required?: string[];
   };
-  /** dangerous tools require user confirmation unless auto-approve is on */
-  dangerous?: boolean;
+  /** read | edit | exec — drives the approval gate (read never prompts) */
+  kind?: "read" | "edit" | "exec";
   run(input: any, ctx: ToolContext): Promise<string>;
 }
 

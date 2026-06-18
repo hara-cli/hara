@@ -71,11 +71,15 @@ Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `H
 hara                       # interactive REPL (offers to create AGENTS.md on first run)
 hara init                  # analyze the project & (re)generate AGENTS.md
 hara -p "summarize @README.md and fix the lint errors in src/"   # one-shot; @path attaches a file
-hara -y                    # auto-approve tool actions (no confirmations)
+hara --approval auto-edit  # suggest (default) | auto-edit | full-auto   (-y = full-auto)
+hara --profile work        # use a named profile from ~/.hara/config.json
 hara -m glm-5              # pick a model
 ```
 
-Inside the REPL: `/help`, `/init`, `/tools`, `/model`, `/reset`, `/exit`. Type `@` + Tab to attach a file.
+Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/usage` `/reset` `/exit`. Type `@` + Tab to attach a file.
+
+**Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
+**Profiles**: add a `profiles` map to `~/.hara/config.json` (`--profile <name>`), or drop a project-level `.hara/config.json` that overrides the global config.
 
 ### What it can do (v0.2)
 
