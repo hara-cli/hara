@@ -46,8 +46,13 @@ hara config set model    qwen-plus   # or qwen-max, qwen3-coder-plus, …
 #
 # coding-plan keys (sk-sp-…) use the coding endpoint instead:
 #   hara config set baseURL https://coding.dashscope.aliyuncs.com/v1
-#   hara config set model   qwen3-coder-plus   # or qwen3.6-plus
+#   hara config set model   qwen3.7-plus
+#   plan models: qwen3.7-plus, qwen3.6-plus, qwen3-coder-plus, qwen3-coder-next,
+#                qwen3-max-2026-01-23, glm-5, glm-4.7  (switch with -m or /model)
 ```
+
+> Plan keys (Coding Plan / Token Plan) are licensed **only** for use inside AI coding agents /
+> OpenClaw-type tools like hara — not Dify/n8n, API-testing tools, or direct script/backend calls.
 
 **Any OpenAI-compatible endpoint** (GLM, Kimi, OpenAI, local servers)
 ```bash
