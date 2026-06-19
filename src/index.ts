@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { createInterface } from "node:readline/promises";
+import { emitKeypressEvents } from "node:readline";
 import { stdin, stdout } from "node:process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -36,12 +37,17 @@ import {
 } from "./session/store.js";
 import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
+import { decompose, topoOrder, savePlan, atomPrompt, verify, type Atom } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
 import { sandboxSupported, type SandboxMode } from "./sandbox.js";
 import type { Provider, NeutralMsg } from "./providers/types.js";
 import { c, out, statusLine } from "./ui.js";
+import * as bar from "./statusbar.js";
+import { nearest } from "./fuzzy.js";
 import "./tools/builtin.js"; // register read_file/write_file/bash
 import "./tools/edit.js"; // register edit_file
+import "./tools/search.js"; // register grep/glob/ls
+import "./tools/patch.js"; // register apply_patch
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
@@ -136,6 +142,85 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
   });
 }
 
+function lastAssistantText(history: NeutralMsg[]): string {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i] as { role: string; text?: string };
+    if (m.role === "assistant" && typeof m.text === "string") return m.text;
+  }
+  return "";
+}
+
+/** Decompose a task into atoms, sequence them (DAG), and execute each with a verify gate. */
+async function runPlan(task: string, o: OrgOpts): Promise<void> {
+  const roles = loadRoles(o.cwd);
+  out(c.dim("Planning…\n"));
+  const plan = await decompose(o.baseProvider, task, roles);
+  if (!plan.atoms.length) {
+    out(c.red("Planner returned no atoms — try rephrasing the task.\n"));
+    return;
+  }
+  const ord = topoOrder(plan.atoms);
+  if ("error" in ord) {
+    out(c.red(`${ord.error}\n`));
+    return;
+  }
+  const ordered = ord.ok;
+  out(c.bold(`\nPlan (${ordered.length} atoms):\n`));
+  for (const a of ordered) {
+    out(`  ${c.cyan(a.id)} ${a.title}${a.deps.length ? c.dim(" ←" + a.deps.join(",")) : ""}${a.role ? c.dim(" @" + a.role) : ""}\n`);
+  }
+  if (o.approval !== "full-auto") {
+    const ok = await o.confirm(`${c.yellow("▶")} Execute this ${ordered.length}-atom plan?`);
+    if (!ok) return void out(c.dim("(cancelled)\n"));
+  }
+  savePlan(o.cwd, plan);
+  const done: Atom[] = [];
+  for (const atom of ordered) {
+    atom.status = "running";
+    savePlan(o.cwd, plan);
+    out(c.cyan(`\n▶ ${atom.id} ${atom.title}\n`));
+    const role = atom.role ? roles.find((r) => r.id === atom.role) : undefined;
+    const roleProvider =
+      role?.model && role.model !== o.cfg.model ? ((await buildProvider({ ...o.cfg, model: role.model })) ?? o.baseProvider) : o.baseProvider;
+    const toolFilter = role?.allowTools
+      ? (n: string) => role.allowTools!.includes(n)
+      : role?.denyTools
+        ? (n: string) => !role.denyTools!.includes(n)
+        : undefined;
+    const history: NeutralMsg[] = [{ role: "user", content: atomPrompt(atom, plan, done) }];
+    try {
+      await runAgent(history, {
+        provider: roleProvider,
+        ctx: { cwd: o.cwd, sandbox: o.sandbox },
+        approval: o.approval,
+        confirm: o.confirm,
+        projectContext: o.projectContext,
+        stats: o.stats,
+        systemOverride: role?.system,
+        toolFilter,
+      });
+    } catch (e: any) {
+      atom.status = "failed";
+      atom.note = e.message;
+      savePlan(o.cwd, plan);
+      out(c.red(`  ✗ ${atom.id} errored: ${e.message}\n`));
+      break;
+    }
+    const v = await verify(o.baseProvider, atom, lastAssistantText(history));
+    atom.status = v.ok ? "done" : "failed";
+    atom.note = v.reason;
+    savePlan(o.cwd, plan);
+    if (v.ok) {
+      out(c.green(`  ✓ ${atom.id} verified\n`));
+      done.push(atom);
+    } else {
+      out(c.yellow(`  ⚠ ${atom.id}: ${v.reason}\n`) + c.dim("Stopping — inspect .hara/org/plan.json, then refine & re-run.\n"));
+      break;
+    }
+  }
+  out(c.bold(`\nPlan: ${plan.atoms.filter((a) => a.status === "done").length}/${plan.atoms.length} atoms done.\n`));
+}
+
 function mentionCompleter(line: string, cwd: string): [string[], string] {
   const m = /@([^\s@]*)$/.exec(line);
   if (!m) return [[], line];
@@ -207,7 +292,7 @@ program
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
       process.exit(1);
     }
-    const stats = { input: 0, output: 0 };
+    const stats = { input: 0, output: 0, lastInput: 0 };
     await runOrg(taskParts.join(" "), {
       cfg,
       baseProvider: provider,
@@ -218,6 +303,30 @@ program
       projectContext: loadAgentsMd(cfg.cwd) || undefined,
       stats,
       forceRole: opts2.role,
+    });
+    if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
+  });
+
+program
+  .command("plan <task...>")
+  .description("decompose a task into atoms, sequence them (DAG), and execute each with a verify gate")
+  .action(async (taskParts: string[]) => {
+    const cfg = loadConfig();
+    const provider = await buildProvider(cfg);
+    if (!provider) {
+      out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
+      process.exit(1);
+    }
+    const stats = { input: 0, output: 0, lastInput: 0 };
+    await runPlan(taskParts.join(" "), {
+      cfg,
+      baseProvider: provider,
+      cwd: cfg.cwd,
+      sandbox: cfg.sandbox,
+      approval: "full-auto",
+      confirm: async () => true,
+      projectContext: loadAgentsMd(cfg.cwd) || undefined,
+      stats,
     });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
@@ -317,11 +426,12 @@ program.action(async (opts) => {
   let provider: Provider = provider0;
   const cwd = cfg.cwd;
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
+  let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it
   const sandbox: SandboxMode = (opts.sandbox as SandboxMode) || cfg.sandbox;
   if (sandbox !== "off" && !sandboxSupported()) {
     out(c.yellow(`(sandbox '${sandbox}' is macOS-only; shell runs unsandboxed here)\n`));
   }
-  const stats = { input: 0, output: 0 };
+  const stats = { input: 0, output: 0, lastInput: 0 };
 
   if (Object.keys(cfg.mcpServers).length) {
     await connectMcpServers(cfg.mcpServers, (m) => out(c.dim(m + "\n")));
@@ -341,6 +451,23 @@ program.action(async (opts) => {
   out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}${sandbox !== "off" ? `  ·  sandbox:${sandbox}` : ""}  ·  ${cwd}\n`));
   const rl = createInterface({ input: stdin, output: stdout, completer: (line: string) => mentionCompleter(line, cwd) });
   const confirm = async (q: string) => (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
+  // shift+tab cycles the approval mode (TTY only — emitKeypressEvents would eat piped stdin).
+  // Bare /approval is the reliable fallback everywhere.
+  if (stdin.isTTY) {
+    try {
+      emitKeypressEvents(stdin);
+      stdin.on("keypress", (_s: string, key: { name?: string; shift?: boolean } | undefined) => {
+        if (key && key.shift && key.name === "tab") {
+          approval = bar.nextMode(approval);
+          if (bar.isActive()) bar.update({ approval });
+        } else if (key?.name === "escape" && currentTurn) {
+          currentTurn.abort(); // interrupt the running turn
+        }
+      });
+    } catch {
+      /* keypress unavailable; /approval still works */
+    }
+  }
 
   if (!hasAgentsMd(cwd)) {
     const ans = (await rl.question(`${c.dim("No AGENTS.md here — analyze this project and create one?")} ${c.dim("[Y/n]")} `)).trim().toLowerCase();
@@ -410,6 +537,7 @@ program.action(async (opts) => {
           const p = await buildProvider(cfg);
           if (p) {
             provider = p;
+            if (bar.isActive()) bar.update({ model: a });
             out(c.dim(`(model → ${cfg.provider}:${a})\n`));
           } else out(c.red("(could not rebuild provider)\n"));
         } else out(`${cfg.provider}:${cfg.model}\n`);
@@ -417,14 +545,16 @@ program.action(async (opts) => {
     },
     {
       name: "approval",
-      desc: `show/set approval: /approval [${APPROVAL_MODES.join("|")}]`,
+      desc: `cycle/set approval: /approval [${APPROVAL_MODES.join("|")}]`,
       run: (a) => {
         if (a) {
-          if (APPROVAL_MODES.includes(a as ApprovalMode)) {
-            approval = a as ApprovalMode;
-            out(c.dim(`(approval → ${approval})\n`));
-          } else out(c.red(`Invalid mode. One of: ${APPROVAL_MODES.join(", ")}\n`));
-        } else out(`approval: ${approval}\n`);
+          if (APPROVAL_MODES.includes(a as ApprovalMode)) approval = a as ApprovalMode;
+          else return void out(c.red(`Invalid mode. One of: ${APPROVAL_MODES.join(", ")}\n`));
+        } else {
+          approval = bar.nextMode(approval); // bare /approval cycles
+        }
+        if (bar.isActive()) bar.update({ approval });
+        else out(c.dim(`(approval → ${approval})\n`));
       },
     },
     { name: "usage", desc: "show token usage this session", run: () => void out(statusLine(cfg.model, stats.input, stats.output) + "\n") },
@@ -447,6 +577,16 @@ program.action(async (opts) => {
       },
     },
     {
+      name: "plan",
+      desc: "decompose + execute a task as atoms (DAG + verify): /plan <task>",
+      run: async (a) => {
+        if (!a) return void out(c.dim("usage: /plan <task>\n"));
+        await runPlan(a, { cfg, baseProvider: provider, cwd, sandbox, approval, confirm, projectContext, stats });
+        if (bar.isActive()) bar.update({ input: stats.input, output: stats.output, ctxPct: bar.ctxPctFor(cfg.model, stats.lastInput ?? 0) });
+        else out(statusLine(cfg.model, stats.input, stats.output) + "\n");
+      },
+    },
+    {
       name: "sessions",
       desc: "list saved sessions",
       run: () => {
@@ -464,7 +604,16 @@ program.action(async (opts) => {
     for (const a of cmd.aliases ?? []) byName.set(a, cmd);
   }
 
-  out(c.dim(`Type a task. /help · @path attaches a file · /exit to quit.${projectContext ? "  (AGENTS.md loaded)" : ""}\n\n`));
+  out(c.dim(`Type a task. /help · @path attaches a file · shift+tab cycles mode · Esc interrupts · /exit to quit.${projectContext ? "  (AGENTS.md loaded)" : ""}\n\n`));
+
+  bar.install({ sessionName: meta.title || "new session", model: cfg.model, approval, input: stats.input, output: stats.output });
+  process.on("exit", () => {
+    try {
+      bar.uninstall();
+    } catch {
+      /* best-effort terminal reset */
+    }
+  });
 
   for (;;) {
     let line: string;
@@ -478,7 +627,9 @@ program.action(async (opts) => {
       const [name, ...rest] = line.slice(1).split(/\s+/);
       const cmd = byName.get(name);
       if (!cmd) {
-        out(c.red(`Unknown command /${name} — /help for the list.\n`));
+        const near = nearest(name, [...byName.keys()]);
+        const hint = near.length ? c.dim(` Did you mean ${near.map((n) => "/" + n).join(", ")}?`) : "";
+        out(c.red(`Unknown command /${name}.`) + hint + c.dim(" — /help for the list.\n"));
         continue;
       }
       const res = await cmd.run(rest.join(" "));
@@ -486,20 +637,38 @@ program.action(async (opts) => {
       continue;
     }
     history.push({ role: "user", content: expandMentions(line, cwd) });
+    currentTurn = new AbortController();
     try {
-      await runAgent(history, { provider, ctx: { cwd, sandbox }, approval, confirm, projectContext, stats });
+      await runAgent(history, { provider, ctx: { cwd, sandbox }, approval, confirm, projectContext, stats, signal: currentTurn.signal });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
+    } finally {
+      currentTurn = null;
     }
-    out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
     if (!meta.title) meta.title = titleFrom(history);
+    if (bar.isActive()) {
+      bar.update({
+        sessionName: meta.title,
+        input: stats.input,
+        output: stats.output,
+        ctxPct: bar.ctxPctFor(cfg.model, stats.lastInput ?? 0),
+      });
+    } else {
+      out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
+    }
     saveSession(meta, history);
   }
+  bar.uninstall();
   rl.close();
   await closeMcp();
 });
 
 program.parseAsync().catch((e) => {
+  try {
+    bar.uninstall();
+  } catch {
+    /* ignore */
+  }
   out(c.red(`\n[fatal] ${e?.message ?? e}\n`));
   process.exit(1);
 });

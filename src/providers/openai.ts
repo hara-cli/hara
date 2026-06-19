@@ -38,11 +38,11 @@ export function createOpenAIProvider(opts: {
   baseURL?: string;
   label?: string;
 }): Provider {
-  const client = new OpenAI({ apiKey: opts.apiKey, ...(opts.baseURL ? { baseURL: opts.baseURL } : {}) });
+  const client = new OpenAI({ apiKey: opts.apiKey, maxRetries: 4, ...(opts.baseURL ? { baseURL: opts.baseURL } : {}) });
   return {
     id: opts.label ?? "openai",
     model: opts.model,
-    async turn({ system, history, tools, onText }: TurnArgs): Promise<TurnResult> {
+    async turn({ system, history, tools, onText, signal }: TurnArgs): Promise<TurnResult> {
       const oaiTools = tools.map((t) => ({
         type: "function" as const,
         function: { name: t.name, description: t.description, parameters: t.input_schema },
@@ -51,32 +51,55 @@ export function createOpenAIProvider(opts: {
         model: opts.model,
         messages: toOpenAI(system, history),
         max_tokens: 8192,
+        stream: true,
+        stream_options: { include_usage: true },
       };
       if (oaiTools.length) params.tools = oaiTools;
 
-      let resp: any;
+      // Stream: emit text deltas live; accumulate tool-call args by index; grab usage from the tail chunk.
+      let text = "";
+      const acc = new Map<number, { id: string; name: string; args: string }>();
+      let finish: string | undefined;
+      let usage = { input: 0, output: 0 };
       try {
-        resp = await client.chat.completions.create(params);
+        const stream = await client.chat.completions.create(params, { signal });
+        for await (const chunk of stream as any) {
+          const choice = chunk.choices?.[0];
+          const delta = choice?.delta;
+          if (delta?.content) {
+            text += delta.content;
+            onText(delta.content);
+          }
+          if (delta?.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index ?? 0;
+              const cur = acc.get(idx) ?? { id: "", name: "", args: "" };
+              if (tc.id) cur.id = tc.id;
+              if (tc.function?.name) cur.name = tc.function.name;
+              if (tc.function?.arguments) cur.args += tc.function.arguments;
+              acc.set(idx, cur);
+            }
+          }
+          if (choice?.finish_reason) finish = choice.finish_reason;
+          if (chunk.usage) usage = { input: chunk.usage.prompt_tokens ?? 0, output: chunk.usage.completion_tokens ?? 0 };
+        }
       } catch (e: any) {
+        if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
         return { text: "", toolUses: [], stop: "error", errorMsg: `${e?.status ?? ""} ${e?.message ?? e}` };
       }
 
-      const choice = resp.choices?.[0];
-      const text: string = choice?.message?.content ?? "";
-      if (text) onText(text);
-
-      const toolUses: ToolUse[] = (choice?.message?.tool_calls ?? []).map((tc: any) => {
-        let input: any = {};
-        try {
-          input = JSON.parse(tc.function?.arguments || "{}");
-        } catch {
-          input = {};
-        }
-        return { id: tc.id, name: tc.function?.name, input };
-      });
-
-      const stop = choice?.finish_reason === "tool_calls" || toolUses.length ? "tool_use" : "end";
-      const usage = { input: resp.usage?.prompt_tokens ?? 0, output: resp.usage?.completion_tokens ?? 0 };
+      const toolUses: ToolUse[] = [...acc.values()]
+        .filter((t) => t.id && t.name)
+        .map((t) => {
+          let input: any = {};
+          try {
+            input = JSON.parse(t.args || "{}");
+          } catch {
+            input = {};
+          }
+          return { id: t.id, name: t.name, input };
+        });
+      const stop = finish === "tool_calls" || toolUses.length ? "tool_use" : "end";
       return { text, toolUses, stop, usage };
     },
   };

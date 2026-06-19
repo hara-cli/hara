@@ -27,6 +27,8 @@ export interface TurnArgs {
   history: NeutralMsg[];
   tools: ToolSpec[];
   onText: (delta: string) => void;
+  /** abort the in-flight request (user interrupt) */
+  signal?: AbortSignal;
 }
 
 export interface Provider {

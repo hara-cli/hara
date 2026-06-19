@@ -1,6 +1,7 @@
 import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
 import { getTool, toolSpecs, type ToolContext } from "../tools/registry.js";
 import { c, out } from "../ui.js";
+import { activity } from "../activity.js";
 import type { ApprovalMode } from "../config.js";
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
@@ -29,11 +30,13 @@ export interface RunOpts {
   approval: ApprovalMode;
   confirm: (q: string) => Promise<boolean>;
   projectContext?: string;
-  stats?: { input: number; output: number };
+  stats?: { input: number; output: number; lastInput?: number };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
   /** restrict which tools this run may use (by name) */
   toolFilter?: (name: string) => boolean;
+  /** abort the in-flight LLM request (user interrupt) */
+  signal?: AbortSignal;
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
@@ -47,44 +50,79 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       history,
       tools: specs,
       onText: out,
+      signal: opts.signal,
     });
     out("\n");
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;
       opts.stats.output += r.usage.output;
+      opts.stats.lastInput = r.usage.input;
     }
     history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 
     if (r.stop === "error") {
-      out(c.red(`[${provider.id} error] ${r.errorMsg ?? "unknown"}\n`));
+      out(r.errorMsg === "interrupted" ? c.dim("\n(interrupted)\n") : c.red(`[${provider.id} error] ${r.errorMsg ?? "unknown"}\n`));
       return;
     }
     if (r.stop !== "tool_use") return;
 
-    const results: ToolResult[] = [];
+    // Resolve + gate each call first (confirmations must be sequential — can't prompt in parallel).
+    interface Plan {
+      tu: (typeof r.toolUses)[number];
+      tool: ReturnType<typeof getTool>;
+      denied?: string;
+    }
+    const plans: Plan[] = [];
     for (const tu of r.toolUses) {
       const tool = getTool(tu.name);
       if (!tool) {
-        results.push({ id: tu.id, name: tu.name, content: `Unknown tool: ${tu.name}`, isError: true });
+        plans.push({ tu, tool: undefined, denied: `Unknown tool: ${tu.name}` });
         continue;
       }
       if (needsConfirm(tool.kind, opts.approval)) {
         const input = tu.input as Record<string, unknown>;
-        const preview = String(input.command ?? input.path ?? "");
+        const preview = String(input.command ?? input.path ?? input.pattern ?? "");
         const ok = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
         if (!ok) {
-          results.push({ id: tu.id, name: tu.name, content: "User denied this action.", isError: true });
+          plans.push({ tu, tool, denied: "User denied this action." });
           continue;
         }
       }
+      plans.push({ tu, tool });
       out(c.dim(`  ↳ ${tu.name}\n`));
+    }
+
+    // Execute: read-only tools run concurrently; edit/exec run alone, in order.
+    const results: ToolResult[] = new Array(plans.length);
+    const runOne = async (idx: number, p: Plan): Promise<void> => {
+      if (p.denied !== undefined) {
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: p.denied, isError: true };
+        return;
+      }
+      activity.inc();
       try {
-        const res = await tool.run(tu.input, ctx);
-        results.push({ id: tu.id, name: tu.name, content: res });
+        const res = await p.tool!.run(p.tu.input, ctx);
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: res };
       } catch (e: any) {
-        results.push({ id: tu.id, name: tu.name, content: `Error: ${e.message}`, isError: true });
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: `Error: ${e.message}`, isError: true };
+      } finally {
+        activity.dec();
+      }
+    };
+    let batch: Promise<void>[] = [];
+    for (let i = 0; i < plans.length; i++) {
+      const p = plans[i];
+      if (p.denied === undefined && p.tool?.kind === "read") {
+        batch.push(runOne(i, p)); // safe → accumulate to run concurrently
+      } else {
+        if (batch.length) {
+          await Promise.all(batch); // flush pending reads before an edit/exec
+          batch = [];
+        }
+        await runOne(i, p);
       }
     }
+    await Promise.all(batch);
     history.push({ role: "tool", results });
   }
 }

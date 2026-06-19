@@ -6,8 +6,10 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **v0.5** — a multi-provider coding agent **and** a governed role-agent *org*: define role-agents and
-`hara org "<task>"` routes the work to the role that owns it. Track it: https://github.com/hara-cli/hara · https://hara.run
+🚧 **v0.10** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
+routes work to the role that owns it, and **`hara plan "<task>"`** decomposes a task into a verified
+DAG of atoms. **Streaming on every provider**, colored edit diffs, multi-file `apply_patch`,
+**Esc-to-interrupt**, a pinned status bar, `grep`/`glob`/`ls`, fuzzy `@file` completion, and did-you-mean. Track it: https://github.com/hara-cli/hara · https://hara.run
 
 ## Install
 
@@ -72,6 +74,7 @@ hara                       # interactive REPL (offers to create AGENTS.md on fir
 hara init                  # analyze the project & (re)generate AGENTS.md
 hara roles init            # scaffold role-agents (implementer / reviewer / docs)
 hara org "review src/ for bugs"   # dispatch a task to the role that owns it (or --role <id>)
+hara plan "add a /health endpoint with a test"   # decompose → sequence (DAG) → run each step + verify
 hara -p "summarize @README.md and fix the lint errors in src/"   # one-shot; @path attaches a file
 hara --approval auto-edit  # suggest (default) | auto-edit | full-auto   (-y = full-auto)
 hara --sandbox workspace-write   # confine shell writes to the project (macOS Seatbelt)
@@ -80,7 +83,11 @@ hara --profile work        # use a named profile from ~/.hara/config.json
 hara -m glm-5              # pick a model
 ```
 
-Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/usage` `/sessions` `/reset` `/exit`. Type `@` + Tab to attach a file.
+Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/usage` `/sessions` `/reset` `/exit`. Type `@` + Tab to attach a file (fuzzy, walks subdirectories).
+
+A **status bar** is pinned at the bottom showing the session name, the three approval modes (current
+highlighted), live token usage + context %, and a concurrent-operation count. **shift+tab** (or bare
+`/approval`) cycles the approval mode; **Esc** interrupts a running turn. Set `HARA_FOOTER=0` to disable the bar.
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
 **Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).
@@ -96,13 +103,21 @@ Define role-agents in `.hara/roles/*.md` — each is a persona (the file body) p
 agent — e.g. a read-only `reviewer` that reports issues vs an `implementer` that edits code. `hara roles`
 lists them, `hara roles init` scaffolds a starter set, and `--role <id>` forces a specific role.
 
+Beyond routing, **`hara plan "<task>"`** makes the org *plan*: it decomposes the task into atoms,
+sequences them as a DAG, and executes each step (optionally routed to a role) behind a per-step
+**verify gate** — frame → atomize → sequence → execute → verify. Plan state is the SSOT at
+`.hara/org/plan.json` (inspectable; execution stops on the first failed verification).
+
 ### What it can do (v0.2)
 
-A streaming agentic loop with built-in tools — `read_file`, `write_file`, **`edit_file`** (surgical
-exact-string edits), `bash` — behind a human-in-the-loop confirmation gate on the dangerous ones unless `-y`.
+A streaming agentic loop with built-in tools — `read_file`, `write_file`, **`edit_file`** /
+**`apply_patch`** (surgical edits — single file, or **atomic multi-file** changes), `bash`, and
+read-only **`grep`** / **`glob`** / **`ls`** — behind a human-in-the-loop confirmation gate on the
+dangerous ones unless `-y`. Read-only tools run in parallel within a turn, and edits print a
+**colored diff** of what changed. Press **Esc** to interrupt a running turn.
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
-- **`@file` mentions**: attach file contents to a message (`@path`, Tab-completes from `git ls-files`).
-- **Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI).
+- **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. Mistyped tool/file paths get a "did you mean" suggestion.
+- **Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) — **all streamed live**.
 
 ### Roadmap
 

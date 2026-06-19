@@ -2,7 +2,8 @@
 // and provide fuzzy file candidates for REPL tab-completion.
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import { execSync } from "node:child_process";
+import { listProjectFiles, dirPrefixes } from "../fs-walk.js";
+import { fuzzyRank } from "../fuzzy.js";
 
 const MAX_FILE = 50_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
@@ -32,16 +33,36 @@ export function expandMentions(input: string, cwd: string): string {
   return blocks.length ? `${input}\n\n${blocks.join("\n\n")}` : input;
 }
 
-/** Tracked files whose path contains `query` (for @ autocomplete). git ls-files; [] if not a repo. */
-export function fileCandidates(cwd: string, query: string, limit = 20): string[] {
-  let files: string[];
-  try {
-    files = execSync("git ls-files", { cwd, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 })
-      .split("\n")
-      .filter(Boolean);
-  } catch {
-    return [];
+// Short-lived per-cwd cache so Tab completion stays snappy without re-scanning every press.
+const cache = new Map<string, { at: number; entries: string[] }>();
+const CACHE_MS = 5000;
+
+function projectEntries(cwd: string): string[] {
+  const hit = cache.get(cwd);
+  const now = Date.now();
+  if (hit && now - hit.at < CACHE_MS) return hit.entries;
+  const files = listProjectFiles(cwd);
+  // files + their directory prefixes (so `@src/` drills into the subtree)
+  const entries = [...dirPrefixes(files), ...files];
+  cache.set(cwd, { at: now, entries });
+  return entries;
+}
+
+/**
+ * File/dir candidates whose path matches `query`, for @ autocomplete.
+ * Recurses subdirectories (git-tracked + untracked, or a filesystem walk outside git),
+ * ranks path-prefix and basename matches first. Directories carry a trailing `/`.
+ */
+export function fileCandidates(cwd: string, query: string, limit = 25): string[] {
+  const entries = projectEntries(cwd);
+  if (!query) {
+    // bare `@`: top-level entries, directories first
+    const top = entries.filter((e) => !e.replace(/\/$/, "").includes("/"));
+    top.sort((a, b) => (b.endsWith("/") ? 1 : 0) - (a.endsWith("/") ? 1 : 0) || a.localeCompare(b));
+    return top.slice(0, limit);
   }
-  const q = query.toLowerCase();
-  return files.filter((f) => f.toLowerCase().includes(q)).slice(0, limit);
+  // fuzzy subsequence ranking — `@scr` finds `src/`, `@idx` finds `src/index.ts`
+  return fuzzyRank(query, entries, (e) => e)
+    .slice(0, limit)
+    .map((r) => r.item);
 }

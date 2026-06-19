@@ -1,13 +1,18 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { registerTool } from "./registry.js";
+import { nearestPaths } from "../fs-walk.js";
+import { showDiff } from "../diff.js";
+import { applyEdits, type OneEdit } from "./apply-core.js";
 
 registerTool({
   name: "edit_file",
   description:
-    "Edit an existing file by replacing an exact string. `old_string` must match exactly and appear " +
-    "exactly once (include surrounding context to disambiguate) unless `replace_all` is true. " +
-    "For creating a new file, use write_file instead.",
+    "Edit an existing file by replacing exact strings. Provide a single `old_string`/`new_string`, " +
+    "or `edits` (an array of {old_string,new_string,replace_all?}) applied in order. Each `old_string` " +
+    "must match exactly and appear once (include surrounding context) unless `replace_all` is true. " +
+    "Quote variants (straight/curly) are matched leniently. Use write_file to create a new file, or " +
+    "apply_patch to change several files at once.",
   input_schema: {
     type: "object",
     properties: {
@@ -15,33 +20,44 @@ registerTool({
       old_string: { type: "string", description: "exact text to replace (verbatim, incl. whitespace)" },
       new_string: { type: "string", description: "replacement text" },
       replace_all: { type: "boolean", description: "replace every occurrence (default false)" },
+      edits: {
+        type: "array",
+        description: "multiple edits applied in sequence (alternative to a single old/new)",
+        items: {
+          type: "object",
+          properties: {
+            old_string: { type: "string" },
+            new_string: { type: "string" },
+            replace_all: { type: "boolean" },
+          },
+          required: ["old_string", "new_string"],
+        },
+      },
     },
-    required: ["path", "old_string", "new_string"],
+    required: ["path"],
   },
   kind: "edit",
   async run(input, ctx) {
     const p = isAbsolute(input.path) ? input.path : resolve(ctx.cwd, input.path);
-    const { old_string, new_string, replace_all } = input;
-    if (old_string === new_string) return "Error: old_string and new_string are identical.";
+    const edits: OneEdit[] =
+      Array.isArray(input.edits) && input.edits.length
+        ? input.edits
+        : [{ old_string: input.old_string, new_string: input.new_string, replace_all: input.replace_all }];
 
-    let orig: string;
+    let text: string;
     try {
-      orig = await readFile(p, "utf8");
+      text = await readFile(p, "utf8");
     } catch {
-      return `Error: cannot read ${input.path} (use write_file to create a new file).`;
+      const near = nearestPaths(ctx.cwd, input.path);
+      return `Error: cannot read ${input.path} (use write_file to create a new file).` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
     }
 
-    const count = orig.split(old_string).length - 1;
-    if (count === 0) return `Error: old_string not found in ${input.path}.`;
-    if (count > 1 && !replace_all) {
-      return `Error: old_string appears ${count}× in ${input.path}; add surrounding context to make it unique, or set replace_all.`;
-    }
-
-    // split/join + function-replacement avoid $-pattern interpretation in new_string
-    const updated = replace_all
-      ? orig.split(old_string).join(new_string)
-      : orig.replace(old_string, () => new_string);
-    await writeFile(p, updated, "utf8");
-    return `Edited ${input.path} (${replace_all ? `${count} replacements` : "1 replacement"}).`;
+    const res = applyEdits(text, edits);
+    if ("error" in res) return `Error: ${res.error} in ${input.path}. No changes written.`;
+    await writeFile(p, res.text, "utf8");
+    showDiff(input.path, text, res.text);
+    const note = res.fuzzy ? " (quote-normalized)" : "";
+    const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
+    return `Edited ${input.path}: ${plural(edits.length, "edit")}, ${plural(res.total, "replacement")}${note}.`;
   },
 });

@@ -1,0 +1,47 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { parsePlan, topoOrder } from "../dist/org/planner.js";
+
+test("parsePlan: parses fenced JSON + normalizes deps/status", () => {
+  const text = '```json\n{"atoms":[{"id":"a1","title":"do x","deps":[]},{"id":"a2","title":"do y","deps":["a1"],"verify":"x works","role":"impl"}]}\n```';
+  const atoms = parsePlan(text);
+  assert.equal(atoms.length, 2);
+  assert.equal(atoms[1].id, "a2");
+  assert.deepEqual(atoms[1].deps, ["a1"]);
+  assert.equal(atoms[1].role, "impl");
+  assert.equal(atoms[0].status, "pending");
+});
+
+test("parsePlan: bare JSON + prose around it; defaults missing ids", () => {
+  const atoms = parsePlan('Here is the plan:\n{"atoms":[{"title":"only title"}]}\nDone.');
+  assert.equal(atoms.length, 1);
+  assert.equal(atoms[0].id, "a1"); // defaulted
+  assert.deepEqual(atoms[0].deps, []);
+});
+
+test("parsePlan: garbage → empty", () => {
+  assert.deepEqual(parsePlan("no json here"), []);
+  assert.deepEqual(parsePlan("{bad json"), []);
+});
+
+test("topoOrder: sequences by deps", () => {
+  const atoms = parsePlan('{"atoms":[{"id":"a2","title":"y","deps":["a1"]},{"id":"a1","title":"x","deps":[]},{"id":"a3","title":"z","deps":["a1"]}]}');
+  const r = topoOrder(atoms);
+  assert.ok("ok" in r);
+  assert.equal(r.ok[0].id, "a1"); // dependency first regardless of input order
+  assert.ok(r.ok.findIndex((a) => a.id === "a2") > 0);
+});
+
+test("topoOrder: detects a cycle", () => {
+  const atoms = parsePlan('{"atoms":[{"id":"a1","title":"x","deps":["a2"]},{"id":"a2","title":"y","deps":["a1"]}]}');
+  const r = topoOrder(atoms);
+  assert.ok("error" in r);
+  assert.match(r.error, /cycle/);
+});
+
+test("topoOrder: ignores dangling deps", () => {
+  const atoms = parsePlan('{"atoms":[{"id":"a1","title":"x","deps":["nonexistent"]}]}');
+  const r = topoOrder(atoms);
+  assert.ok("ok" in r);
+  assert.equal(r.ok.length, 1);
+});

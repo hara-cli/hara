@@ -2,6 +2,66 @@
 
 All notable changes to `@nanhara/hara`.
 
+## 0.10.0 — unreleased (multi-file patches + interrupt)
+
+- **`apply_patch`** — change several files in one **atomic** step (all-or-nothing). `changes` is an
+  array of `{path, type:'update'|'create'|'delete', edits?|content?}`; everything is validated and
+  computed in memory first, and **nothing is written if any change fails**. Shows a diff per file.
+  Prefer it over multiple `edit_file` calls for multi-file work. (Shared edit core extracted to
+  `src/tools/apply-core.ts`, reused by `edit_file`.)
+- **Esc interrupts a running turn** — press Esc while the agent is working to abort the in-flight
+  request and return to the prompt (the session is kept). Plumbed via `AbortSignal` through both
+  providers; an interrupt renders as a dim `(interrupted)`, not an error.
+
+## 0.9.0 — unreleased (daily-driver polish: streaming + diffs)
+
+- **Streaming for OpenAI-compatible providers** — Qwen/GLM/OpenAI now stream tokens live (the whole
+  response used to appear at once). Tool calls are accumulated from the stream by index, and usage is
+  read from the final chunk (`stream_options.include_usage`). Anthropic already streamed.
+- **Diff display on edits** — after `edit_file`/`write_file`, hara prints a colored unified diff
+  (`◇ path +N -M` with `+`/`-` lines) so you see exactly what changed. Zero-dependency line diff
+  (`src/diff.ts`); shown in an interactive terminal only (pipes/scripts stay clean).
+- **Sturdier retries** — both SDK clients now retry transient errors (429/5xx/network) up to 4×.
+
+## 0.8.0 — unreleased (atomization planner — the org plans, not just routes)
+
+- **`hara plan "<task>"` / `/plan`** — decompose a task into atoms, sequence them as a DAG, then
+  execute each step (optionally routed to a role) behind a **verify gate**. This is the execution
+  methodology made real: frame → atomize → sequence → execute → verify.
+- **Planner** (`src/org/planner.ts`): `decompose` (LLM → atoms + deps), `topoOrder` (Kahn ordering +
+  cycle detection), per-atom `verify` (checks the step's done-criteria), and an SSOT plan state at
+  `.hara/org/plan.json` — inspectable, and execution stops on the first failed verification.
+- Atoms may carry a `role`, so the planner routes steps to the org's role-agents
+  (implementer/reviewer/docs) with their persona, tool subset, and model.
+
+## 0.7.0 — unreleased (fuzzy matching + did-you-mean)
+
+- **Fuzzy `@file` completion** — `@path` now ranks by a built-in subsequence fuzzy matcher (zero new
+  deps): `@idx` finds `src/index.ts`, `@sc` finds `src/`. Handles insertions/skips (not transpositions).
+- **Path did-you-mean** — when `read_file`/`edit_file` get a path that doesn't exist, the error now
+  suggests the nearest real project files ("Did you mean: src/index.ts?") instead of just failing.
+- **Slash-command did-you-mean** — a mistyped command suggests the closest one ("`/modl` → Did you
+  mean /model?").
+- New `src/fuzzy.ts` (`fuzzyScore`/`fuzzyRank`/`nearest`) + `nearestPaths` in `fs-walk.ts`.
+
+## 0.6.0 — unreleased (CLI UX + search tools)
+
+- **Status bar** — a persistent footer pinned below the REPL transcript (terminal scroll region):
+  session name · the three approval modes with the current one highlighted · live token usage + ctx% ·
+  a concurrent-operation count (`⛁ N`). TTY-only; degrades to the plain after-turn status line when
+  piped. Disable with `HARA_FOOTER=0`.
+- **Approval mode switching** — bare `/approval` now cycles suggest → auto-edit → full-auto (still
+  `/approval <mode>` to set); **shift+tab** cycles it from anywhere (TTY).
+- **Search tools** — `grep` (regex across files, `path:line: text`), `glob` (`**`/`*`/`?` path
+  patterns), `ls` (one directory). All read-only, so they never prompt and run in parallel.
+- **Parallel safe-tool execution** — read-only tool calls in a turn now run concurrently (edit/exec
+  still run alone, in order); the footer's `⛁` count reflects live concurrency.
+- **`edit_file` hardened** — accepts multiple `edits` applied in order, and falls back to
+  quote-insensitive matching (straight ↔ curly) when an exact match isn't found.
+- **`@file` completion fixed** — now walks subdirectories (git-tracked + untracked, or a filesystem
+  walk outside git), drills into directories (`@src/…`), and works in non-git projects. Previously it
+  only consulted `git ls-files` and silently returned nothing otherwise.
+
 ## 0.5.0 — unreleased (Phase 2: governed role-agent org — the differentiator)
 
 - **Roles** — markdown role-agents in `.hara/roles/*.md` (frontmatter: `name`, `description`, `owns[]`,

@@ -2,6 +2,8 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve, isAbsolute } from "node:path";
 import { registerTool } from "./registry.js";
 import { runShell } from "../sandbox.js";
+import { nearestPaths } from "../fs-walk.js";
+import { showDiff } from "../diff.js";
 
 const MAX = 100_000;
 
@@ -25,7 +27,12 @@ registerTool({
   },
   kind: "read",
   async run(input, ctx) {
-    return cap(await readFile(abs(input.path, ctx.cwd), "utf8"));
+    try {
+      return cap(await readFile(abs(input.path, ctx.cwd), "utf8"));
+    } catch (e: any) {
+      const near = nearestPaths(ctx.cwd, input.path);
+      return `Error: cannot read ${input.path}: ${e.code ?? e.message}.` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
+    }
   },
 });
 
@@ -43,8 +50,15 @@ registerTool({
   kind: "edit",
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
+    let prev = "";
+    try {
+      prev = await readFile(p, "utf8");
+    } catch {
+      /* new file */
+    }
     await mkdir(dirname(p), { recursive: true });
     await writeFile(p, input.content, "utf8");
+    showDiff(input.path, prev, input.content);
     return `Wrote ${String(input.content).length} chars to ${p}`;
   },
 });
