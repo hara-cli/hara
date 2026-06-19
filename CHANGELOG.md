@@ -2,6 +2,16 @@
 
 All notable changes to `@nanhara/hara`.
 
+## 0.4.0 — unreleased (Tier-3)
+
+- **Sessions & resume** — conversations saved under `~/.hara/sessions`; `-c`/`--continue` resumes the latest
+  in the cwd, `--resume <id>` a specific one, `hara sessions` / `/sessions` list them.
+- **MCP client** — connect stdio MCP servers via an `mcpServers` map in config (global or project);
+  their tools register as `mcp__<server>__<tool>` and become available to the agent.
+- **OS sandboxing** — `--sandbox` / `config set sandbox` (`off` | `workspace-write` | `read-only`): the
+  `bash` tool runs under macOS Seatbelt — workspace-write confines writes to the project (+ temp),
+  read-only blocks writes. Non-macOS runs unsandboxed (the approval gate still applies).
+
 ## 0.3.0 — unreleased (Tier-2 coding-CLI polish)
 
 - **Approval modes** — `suggest` (confirm edits & shell), `auto-edit` (auto file edits, confirm shell),

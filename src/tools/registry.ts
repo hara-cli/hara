@@ -1,7 +1,9 @@
 import type { ToolSpec } from "../providers/types.js";
+import type { SandboxMode } from "../sandbox.js";
 
 export interface ToolContext {
   cwd: string;
+  sandbox?: SandboxMode;
 }
 
 export interface Tool {

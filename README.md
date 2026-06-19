@@ -72,13 +72,18 @@ hara                       # interactive REPL (offers to create AGENTS.md on fir
 hara init                  # analyze the project & (re)generate AGENTS.md
 hara -p "summarize @README.md and fix the lint errors in src/"   # one-shot; @path attaches a file
 hara --approval auto-edit  # suggest (default) | auto-edit | full-auto   (-y = full-auto)
+hara --sandbox workspace-write   # confine shell writes to the project (macOS Seatbelt)
+hara -c                    # resume the most recent session in this directory
 hara --profile work        # use a named profile from ~/.hara/config.json
 hara -m glm-5              # pick a model
 ```
 
-Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/usage` `/reset` `/exit`. Type `@` + Tab to attach a file.
+Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/usage` `/sessions` `/reset` `/exit`. Type `@` + Tab to attach a file.
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
+**Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).
+**Sessions**: conversations are saved automatically — `-c` / `--resume <id>` to continue, `hara sessions` to list.
+**MCP**: add an `mcpServers` map to config (global or project `.hara/config.json`); their tools appear to the agent as `mcp__<server>__<tool>`.
 **Profiles**: add a `profiles` map to `~/.hara/config.json` (`--profile <name>`), or drop a project-level `.hara/config.json` that overrides the global config.
 
 ### What it can do (v0.2)

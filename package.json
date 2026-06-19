@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "dist/index.js"
@@ -40,13 +40,14 @@
     "prepare": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "tsc && node --test"
+    "test": "tsc && node --test test/*.test.mjs"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "commander": "^15.0.0",
     "openai": "^6.44.0"
   },

@@ -1,9 +1,16 @@
 import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import type { SandboxMode } from "./sandbox.js";
 
 export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
+
+export interface McpServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
 
 export interface HaraConfig {
   provider: ProviderId;
@@ -11,6 +18,8 @@ export interface HaraConfig {
   model: string;
   baseURL: string | undefined;
   approval: ApprovalMode;
+  sandbox: SandboxMode;
+  mcpServers: Record<string, McpServerConfig>;
   cwd: string;
 }
 
@@ -25,8 +34,9 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox"] as const;
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
+export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
 
 export function configPath(): string {
@@ -89,8 +99,14 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const baseURL = process.env.HARA_BASE_URL ?? merged.baseURL ?? d.baseURL;
   const apiKey = process.env.HARA_API_KEY ?? process.env[d.envKey] ?? merged.apiKey;
   const approval = (process.env.HARA_APPROVAL ?? merged.approval ?? "suggest") as ApprovalMode;
+  const sandbox = (process.env.HARA_SANDBOX ?? merged.sandbox ?? "off") as SandboxMode;
+  const mcpServers: Record<string, McpServerConfig> = {
+    ...(globalBase.mcpServers ?? {}),
+    ...(project.mcpServers ?? {}),
+    ...(profile.mcpServers ?? {}),
+  };
 
-  return { provider, apiKey, model, baseURL, approval, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

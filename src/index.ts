@@ -13,6 +13,7 @@ import {
   providerEnvKey,
   CONFIG_KEYS,
   APPROVAL_MODES,
+  SANDBOX_MODES,
   type HaraConfig,
   type ApprovalMode,
 } from "./config.js";
@@ -23,6 +24,18 @@ import { createOpenAIProvider } from "./providers/openai.js";
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
 import { loadAgentsMd, hasAgentsMd, INIT_PROMPT } from "./context/agents-md.js";
 import { expandMentions, fileCandidates } from "./context/mentions.js";
+import {
+  newSessionId,
+  saveSession,
+  loadSession,
+  listSessions,
+  latestForCwd,
+  titleFrom,
+  type SessionMeta,
+  type SessionData,
+} from "./session/store.js";
+import { connectMcpServers, closeMcp } from "./mcp/client.js";
+import { sandboxSupported, type SandboxMode } from "./sandbox.js";
 import type { Provider, NeutralMsg } from "./providers/types.js";
 import { c, out, statusLine } from "./ui.js";
 import "./tools/builtin.js"; // register read_file/write_file/bash
@@ -51,9 +64,9 @@ function authHint(cfg: HaraConfig): string {
   return `Set ${c.bold(providerEnvKey(cfg.provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara config set apiKey <key>")}.`;
 }
 
-async function runInit(provider: Provider, cwd: string): Promise<void> {
+async function runInit(provider: Provider, cwd: string, sandbox: SandboxMode = "off"): Promise<void> {
   const history: NeutralMsg[] = [{ role: "user", content: INIT_PROMPT }];
-  await runAgent(history, { provider, ctx: { cwd }, approval: "full-auto", confirm: async () => true });
+  await runAgent(history, { provider, ctx: { cwd, sandbox }, approval: "full-auto", confirm: async () => true });
 }
 
 function mentionCompleter(line: string, cwd: string): [string[], string] {
@@ -83,7 +96,10 @@ program
   .option("-y, --yes", "auto-approve all tool actions (= --approval full-auto)")
   .option("-m, --model <model>", "model id (overrides config)")
   .option("--approval <mode>", "approval mode: suggest | auto-edit | full-auto")
-  .option("--profile <name>", "use a named profile from ~/.hara/config.json");
+  .option("--profile <name>", "use a named profile from ~/.hara/config.json")
+  .option("-c, --continue", "resume the most recent session in this directory")
+  .option("--resume <id>", "resume a specific session by id")
+  .option("--sandbox <mode>", "sandbox the shell: off | workspace-write | read-only");
 
 program
   .command("init")
@@ -96,7 +112,21 @@ program
       process.exit(1);
     }
     out(c.dim("Analyzing project to generate AGENTS.md…\n"));
-    await runInit(provider, cfg.cwd);
+    await runInit(provider, cfg.cwd, cfg.sandbox);
+  });
+
+program
+  .command("sessions")
+  .description("list saved sessions")
+  .action(() => {
+    const metas = listSessions();
+    if (!metas.length) {
+      out(c.dim("No sessions yet.\n"));
+      return;
+    }
+    for (const m of metas) {
+      out(`${c.bold(m.id)}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${m.provider}:${m.model}  ${m.title}\n`);
+    }
   });
 
 const login = program.command("login").description("authenticate a provider");
@@ -128,6 +158,10 @@ config
       out(c.red(`Invalid approval mode. One of: ${APPROVAL_MODES.join(", ")}.\n`));
       process.exit(1);
     }
+    if (key === "sandbox" && !SANDBOX_MODES.includes(value as SandboxMode)) {
+      out(c.red(`Invalid sandbox mode. One of: ${SANDBOX_MODES.join(", ")}.\n`));
+      process.exit(1);
+    }
     writeConfigValue(key, value);
     out(c.green(`Set ${key} → ${configPath()}\n`));
   });
@@ -145,6 +179,7 @@ config
           `model:    ${raw.model ?? "(provider default)"}\n` +
           `baseURL:  ${raw.baseURL ?? "(provider default)"}\n` +
           `approval: ${raw.approval ?? "(default suggest)"}\n` +
+          `sandbox:  ${raw.sandbox ?? "(default off)"}\n` +
           `apiKey:   ${maskKey(raw.apiKey)}\n`,
       );
     }
@@ -166,19 +201,28 @@ program.action(async (opts) => {
   let provider: Provider = provider0;
   const cwd = cfg.cwd;
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
+  const sandbox: SandboxMode = (opts.sandbox as SandboxMode) || cfg.sandbox;
+  if (sandbox !== "off" && !sandboxSupported()) {
+    out(c.yellow(`(sandbox '${sandbox}' is macOS-only; shell runs unsandboxed here)\n`));
+  }
   const stats = { input: 0, output: 0 };
+
+  if (Object.keys(cfg.mcpServers).length) {
+    await connectMcpServers(cfg.mcpServers, (m) => out(c.dim(m + "\n")));
+  }
 
   // one-shot
   if (opts.print) {
     const projectContext = loadAgentsMd(cwd) || undefined;
     const history: NeutralMsg[] = [{ role: "user", content: expandMentions(String(opts.print), cwd) }];
-    await runAgent(history, { provider, ctx: { cwd }, approval: "full-auto", confirm: async () => true, projectContext, stats });
+    await runAgent(history, { provider, ctx: { cwd, sandbox }, approval: "full-auto", confirm: async () => true, projectContext, stats });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
+    await closeMcp();
     return;
   }
 
   // interactive REPL
-  out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}  ·  ${cwd}\n`));
+  out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}${sandbox !== "off" ? `  ·  sandbox:${sandbox}` : ""}  ·  ${cwd}\n`));
   const rl = createInterface({ input: stdin, output: stdout, completer: (line: string) => mentionCompleter(line, cwd) });
   const confirm = async (q: string) => (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
 
@@ -187,13 +231,34 @@ program.action(async (opts) => {
     if (ans === "" || ans.startsWith("y")) {
       out(c.dim("Analyzing project…\n"));
       try {
-        await runInit(provider, cwd);
+        await runInit(provider, cwd, sandbox);
       } catch (e: any) {
         out(c.red(`[init error] ${e.message}\n`));
       }
     }
   }
   let projectContext = loadAgentsMd(cwd) || undefined;
+
+  // session: --resume <id> / --continue (latest in this cwd) / new
+  let resumed: SessionData | null = null;
+  if (opts.resume) {
+    resumed = loadSession(opts.resume);
+    if (!resumed) out(c.yellow(`(no session '${opts.resume}'; starting fresh)\n`));
+  } else if (opts.continue) {
+    resumed = latestForCwd(cwd);
+    if (!resumed) out(c.dim("(no prior session in this directory; starting fresh)\n"));
+  }
+  const meta: SessionMeta = resumed?.meta ?? {
+    id: newSessionId(),
+    cwd,
+    provider: cfg.provider,
+    model: cfg.model,
+    title: "",
+    createdAt: new Date().toISOString(),
+    updatedAt: "",
+  };
+  const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
+  if (resumed) out(c.dim(`(resumed ${meta.id} · ${history.length} msgs)\n`));
 
   const commands: Slash[] = [
     { name: "help", desc: "show this help", run: () => void out(helpText(commands)) },
@@ -203,7 +268,7 @@ program.action(async (opts) => {
       run: async () => {
         out(c.dim("Analyzing project…\n"));
         try {
-          await runInit(provider, cwd);
+          await runInit(provider, cwd, sandbox);
           projectContext = loadAgentsMd(cwd) || undefined;
           out(c.green("AGENTS.md updated.\n"));
         } catch (e: any) {
@@ -247,6 +312,15 @@ program.action(async (opts) => {
       },
     },
     { name: "usage", desc: "show token usage this session", run: () => void out(statusLine(cfg.model, stats.input, stats.output) + "\n") },
+    {
+      name: "sessions",
+      desc: "list saved sessions",
+      run: () => {
+        const ms = listSessions();
+        if (!ms.length) return void out(c.dim("No sessions yet.\n"));
+        for (const m of ms) out(`  ${m.id}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${m.title}\n`);
+      },
+    },
     { name: "reset", aliases: ["clear"], desc: "clear conversation context", run: () => void ((history.length = 0), out(c.dim("(context cleared)\n"))) },
     { name: "exit", aliases: ["quit"], desc: "leave", run: () => "exit" },
   ];
@@ -257,7 +331,6 @@ program.action(async (opts) => {
   }
 
   out(c.dim(`Type a task. /help · @path attaches a file · /exit to quit.${projectContext ? "  (AGENTS.md loaded)" : ""}\n\n`));
-  const history: NeutralMsg[] = [];
 
   for (;;) {
     let line: string;
@@ -280,13 +353,16 @@ program.action(async (opts) => {
     }
     history.push({ role: "user", content: expandMentions(line, cwd) });
     try {
-      await runAgent(history, { provider, ctx: { cwd }, approval, confirm, projectContext, stats });
+      await runAgent(history, { provider, ctx: { cwd, sandbox }, approval, confirm, projectContext, stats });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }
     out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
+    if (!meta.title) meta.title = titleFrom(history);
+    saveSession(meta, history);
   }
   rl.close();
+  await closeMcp();
 });
 
 program.parseAsync().catch((e) => {

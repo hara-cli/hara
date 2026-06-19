@@ -1,10 +1,8 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve, isAbsolute } from "node:path";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
 import { registerTool } from "./registry.js";
+import { runShell } from "../sandbox.js";
 
-const pexec = promisify(exec);
 const MAX = 100_000;
 
 function abs(p: string, cwd: string): string {
@@ -65,8 +63,7 @@ registerTool({
   kind: "exec",
   async run(input, ctx) {
     try {
-      const { stdout, stderr } = await pexec(input.command, {
-        cwd: ctx.cwd,
+      const { stdout, stderr } = await runShell(input.command, ctx.cwd, ctx.sandbox ?? "off", {
         timeout: input.timeout_ms ?? 120_000,
         maxBuffer: 10 * 1024 * 1024,
       });
