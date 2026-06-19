@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { InputBox, type Status, type Approval } from "./InputBox.js";
 import { activity } from "../activity.js";
 import { ctxPctFor } from "../statusbar.js";
+import { accent } from "./theme.js";
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -24,6 +25,8 @@ export interface Sink {
 export interface Helpers {
   sink: Sink;
   confirm: (q: string) => Promise<boolean | "always">;
+  select: (title: string, options: { label: string; value: string }[]) => Promise<string>;
+  setApproval: (m: Approval) => void;
   signal: AbortSignal;
   exit: () => void;
   approval: Approval;
@@ -46,13 +49,6 @@ interface Item {
 let _id = 0;
 const nid = (): number => ++_id;
 const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
-const VIOLET = "#561FBB"; // nanhara brand violet — truecolor (degrades gracefully on 256/16-color terms)
-const CONFIRM_OPTS: { label: string; reply: boolean | "always" }[] = [
-  { label: "Yes", reply: true },
-  { label: "Yes, and don't ask again this session", reply: "always" },
-  { label: "No  (esc)", reply: false },
-];
-
 function Block({ item, open }: { item: Item; open?: boolean }) {
   switch (item.kind) {
     case "user":
@@ -72,7 +68,7 @@ function Block({ item, open }: { item: Item; open?: boolean }) {
       const hint = long ? (open ? " · ctrl-r collapse" : " · ctrl-r expand") : "";
       return (
         <Box flexDirection="column">
-          <Text color={VIOLET} dimColor>{`✻ thinking … ${lines.length} line${lines.length === 1 ? "" : "s"}${hint}`}</Text>
+          <Text color={accent()} dimColor>{`✻ thinking … ${lines.length} line${lines.length === 1 ? "" : "s"}${hint}`}</Text>
           {shown.map((l, i) => (
             <Text key={i} dimColor>{`│ ${l}`}</Text>
           ))}
@@ -103,7 +99,7 @@ function HeaderCard({ version, model, cwd, tip }: { version: string; model: stri
   return (
     <Box flexDirection="column" marginBottom={1}>
       {BANNER.map((row, i) => (
-        <Text key={i} color={VIOLET}>
+        <Text key={i} color={accent()}>
           {row}
         </Text>
       ))}
@@ -135,8 +131,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [current, setCurrent] = useState<Item[]>([]);
   const [working, setWorking] = useState(false);
   const [status, setStatus] = useState<Status>({ ...initialStatus, agents: 0 });
-  const [confirm, setConfirm] = useState<{ q: string; resolve: (r: boolean | "always") => void } | null>(null);
-  const [confirmSel, setConfirmSel] = useState(0);
+  const [prompt, setPrompt] = useState<{ title: string; options: { label: string; value: unknown; key?: string }[]; resolve: (v: unknown) => void } | null>(null);
+  const [promptSel, setPromptSel] = useState(0);
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const ctrlRef = useRef<AbortController | null>(null);
   const currentRef = useRef<Item[]>([]);
@@ -161,7 +157,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const handleSubmit = useCallback(
     async (line: string): Promise<void> => {
       const t = line.trim();
-      if (!t || working || confirm) return;
+      if (!t || working || prompt) return;
       setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]);
       const ctrl = new AbortController();
       ctrlRef.current = ctrl;
@@ -176,13 +172,21 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           setStatus((s) => ({ ...s, input: s.input + input, output: s.output + output, ctxPct: ctxPctFor(model, input) })),
         session: (name) => setStatus((s) => ({ ...s, sessionName: name })),
       };
-      const confirmFn = (q: string): Promise<boolean | "always"> =>
+      const openPrompt = <T,>(title: string, options: { label: string; value: T; key?: string }[]): Promise<T> =>
         new Promise((resolve) => {
-          setConfirmSel(0);
-          setConfirm({ q, resolve });
+          setPromptSel(0);
+          setPrompt({ title, options: options as { label: string; value: unknown; key?: string }[], resolve: resolve as (v: unknown) => void });
         });
+      const confirmFn = (q: string): Promise<boolean | "always"> =>
+        openPrompt<boolean | "always">(q, [
+          { label: "Yes", value: true, key: "y" },
+          { label: "Yes, and don't ask again this session", value: "always", key: "a" },
+          { label: "No  (esc)", value: false, key: "n" },
+        ]);
+      const selectFn = (title: string, options: { label: string; value: string }[]): Promise<string> => openPrompt(title, options);
+      const setApprovalFn = (m: Approval): void => setStatus((s) => ({ ...s, approval: m }));
       try {
-        await onSubmit(t, { sink, confirm: confirmFn, signal: ctrl.signal, exit, approval: statusRef.current.approval });
+        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval });
       } catch (e: unknown) {
         pushCurrent("notice", `error: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -196,25 +200,26 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       setWorking(false);
       ctrlRef.current = null;
     },
-    [working, confirm, onSubmit, pushCurrent, model, exit],
+    [working, prompt, onSubmit, pushCurrent, model, exit],
   );
 
   useInput((input, key) => {
-    if (confirm) {
-      if (key.upArrow) setConfirmSel((s) => (s - 1 + CONFIRM_OPTS.length) % CONFIRM_OPTS.length);
-      else if (key.downArrow) setConfirmSel((s) => (s + 1) % CONFIRM_OPTS.length);
+    if (prompt) {
+      const opts = prompt.options;
+      if (key.upArrow) setPromptSel((s) => (s - 1 + opts.length) % opts.length);
+      else if (key.downArrow) setPromptSel((s) => (s + 1) % opts.length);
       else if (key.return) {
-        confirm.resolve(CONFIRM_OPTS[confirmSel].reply);
-        setConfirm(null);
-      } else if (input === "y" || input === "Y") {
-        confirm.resolve(true);
-        setConfirm(null);
-      } else if (input === "a" || input === "A") {
-        confirm.resolve("always");
-        setConfirm(null);
-      } else if (key.escape || input === "n" || input === "N") {
-        confirm.resolve(false);
-        setConfirm(null);
+        prompt.resolve(opts[Math.min(promptSel, opts.length - 1)].value);
+        setPrompt(null);
+      } else if (key.escape) {
+        prompt.resolve(opts[opts.length - 1].value); // last option = cancel/no
+        setPrompt(null);
+      } else if (input) {
+        const hit = opts.find((o) => o.key && o.key === input.toLowerCase());
+        if (hit) {
+          prompt.resolve(hit.value);
+          setPrompt(null);
+        }
       }
       return;
     }
@@ -231,18 +236,18 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       {current.map((item) => (
         <Block key={item.id} item={item} open={reasoningOpen} />
       ))}
-      {working && !confirm && <Working />}
-      {confirm && (
+      {working && !prompt && <Working />}
+      {prompt && (
         <Box flexDirection="column" marginTop={1}>
-          <Text color="yellow">{`  ${stripAnsi(confirm.q)}`}</Text>
-          {CONFIRM_OPTS.map((o, i) => (
-            <Text key={i} color={i === confirmSel ? "cyan" : undefined} bold={i === confirmSel}>
-              {(i === confirmSel ? " ❯ " : "   ") + o.label}
+          <Text color="yellow">{`  ${stripAnsi(prompt.title)}`}</Text>
+          {prompt.options.map((o, i) => (
+            <Text key={i} color={i === promptSel ? "cyan" : undefined} bold={i === promptSel}>
+              {(i === promptSel ? " ❯ " : "   ") + o.label}
             </Text>
           ))}
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} isActive={!working && !confirm} onSubmit={handleSubmit} />
+      <InputBox status={status} cwd={cwd} isActive={!working && !prompt} onSubmit={handleSubmit} />
     </Box>
   );
 }

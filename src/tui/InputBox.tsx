@@ -6,8 +6,9 @@ import { Box, Text, useInput, useStdout } from "ink";
 import { useMemo, useState } from "react";
 import { fileCandidates } from "../context/mentions.js";
 
-export const MODES = ["suggest", "auto-edit", "full-auto"] as const;
+export const MODES = ["suggest", "auto-edit", "full-auto", "plan"] as const;
 export type Approval = (typeof MODES)[number];
+export const nextMode = (m: Approval): Approval => MODES[(MODES.indexOf(m) + 1) % MODES.length];
 
 export interface Status {
   sessionName: string;
@@ -49,6 +50,7 @@ const MODE_DESC: Record<Approval, string> = {
   suggest: "confirms edits & commands",
   "auto-edit": "auto-applies edits · asks before commands",
   "full-auto": "runs everything — no prompts  ⚠",
+  plan: "investigate read-only, then propose a plan to approve",
 };
 
 // Prominent approval-mode selector below the box: all three listed, the active one highlighted (red
@@ -61,7 +63,7 @@ function ModeBar({ approval }: { approval: Approval }) {
         {MODES.map((m, i) => (
           <Text key={m}>
             {i > 0 ? "   " : "  "}
-            {m === approval ? <Text color={warn ? "red" : "green"} bold>{`◆ ${m}`}</Text> : <Text dimColor>{m}</Text>}
+            {m === approval ? <Text color={warn ? "red" : m === "plan" ? "cyan" : "green"} bold>{`◆ ${m}`}</Text> : <Text dimColor>{m}</Text>}
           </Text>
         ))}
       </Box>

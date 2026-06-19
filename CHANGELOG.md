@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.19.0 — unreleased (plan mode + theme)
+
+- **Plan mode** — a 4th `shift+tab` mode. hara goes **read-only** (`read_file`/`grep`/`glob`/`ls`/`web_fetch`),
+  investigates, and proposes a step-by-step plan; then a **selectable "proceed?"** prompt — *Yes, auto-apply
+  edits · Yes, approve each edit · No, keep planning* — flips the approval mode and executes the plan.
+  Matches codex (`Default`+`Plan`) / Claude Code.
+- **Selectable prompts** — the tool-approval confirm and the plan-proceed share one `↑↓` / Enter / shortcut
+  select component; the input box stays visible underneath.
+- **Theme switch** — `hara config set theme dark|light` (or `HARA_THEME`). Banner/accent is the brand
+  vermilion **#FF6B5C** on dark, **#C0392B** on light. Truecolor; chalk degrades on 256/16-color terminals.
+
 ## 0.18.0 — unreleased (ink TUI)
 
 - **New terminal UI — a real TUI (ink 6 + React 19).** The interactive REPL is now a **bordered input

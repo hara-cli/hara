@@ -6,11 +6,11 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **v0.18** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
+🚧 **v0.19** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
 routes work to the role that owns it, and **`hara plan "<task>"`** decomposes a task into a verified
 DAG of atoms. **Streaming on every provider** with rendered Markdown + visible reasoning, colored
 edit diffs, multi-file `apply_patch`, **Esc-to-interrupt**, **`/undo`**, **`/compact`**, live shell
-output, an **ink TUI** (a bordered input box pinned at the bottom), `grep`/`glob`/`ls`/`web_fetch`, fuzzy `@file` completion, did-you-mean, a personal `recall` code-asset library, and **parallel sub-agents**. Track it: https://github.com/hara-cli/hara · https://hara.run
+output, an **ink TUI** (bordered input box, **plan mode**, light/dark theme), `grep`/`glob`/`ls`/`web_fetch`, fuzzy `@file` completion, did-you-mean, a personal `recall` code-asset library, and **parallel sub-agents**. Track it: https://github.com/hara-cli/hara · https://hara.run
 
 ## Install
 

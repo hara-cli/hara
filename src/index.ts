@@ -3,6 +3,8 @@ import { Command } from "commander";
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
+import { setTheme } from "./tui/theme.js";
+import { nextMode as cycleMode } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -229,6 +231,10 @@ async function runPlan(task: string, o: OrgOpts): Promise<void> {
 }
 
 const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch"]);
+const PLAN_SYSTEM =
+  "You are in PLAN MODE. Investigate read-only (read_file / grep / glob / ls / web_fetch) and think, " +
+  "then propose a concise step-by-step plan for the task. Do NOT edit files or run commands yet — only plan. " +
+  "End your message with the plan as a short numbered list.";
 
 /** Run a (read-only by default) sub-agent to completion, quietly, and return its final text. */
 async function runSubagent(
@@ -780,12 +786,13 @@ program.action(async (opts) => {
 
   if (useTui) {
     rl.close(); // hand stdin over to ink
+    setTheme(cfg.theme);
     await runTui({
       initialStatus: { sessionName: meta.title || "new session", approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
       cwd,
       header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
-      cycleApproval: (m) => bar.nextMode(m),
+      cycleApproval: (m) => cycleMode(m),
       onSubmit: async (line, h) => {
         if (line.startsWith("/")) {
           const [nm, ...rest] = line.slice(1).split(/\s+/);
@@ -832,6 +839,56 @@ program.action(async (opts) => {
           const near = nearest(nm, [...byName.keys()]);
           return void h.sink.notice(`Unknown command /${nm}.${near.length ? " Did you mean " + near.map((n) => "/" + n).join(", ") + "?" : ""}`);
         }
+        const ui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
+        const appr = h.approval;
+        if (appr === "plan") {
+          // PLAN MODE: read-only investigate → propose a plan → selectable proceed → execute.
+          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) });
+          recalledContext = "";
+          const pin = stats.input;
+          const pout = stats.output;
+          await runAgent(history, {
+            provider,
+            ctx: { cwd, sandbox, spawn, ui },
+            approval: "suggest",
+            confirm: h.confirm,
+            toolFilter: (n) => READONLY_TOOLS.has(n),
+            systemOverride: PLAN_SYSTEM,
+            projectContext,
+            stats,
+            signal: h.signal,
+          });
+          if (!meta.title) {
+            meta.title = titleFrom(history);
+            h.sink.session(meta.title);
+          }
+          h.sink.usage(stats.input - pin, stats.output - pout);
+          saveSession(meta, history);
+          const choice = await h.select("hara has a plan — proceed?", [
+            { label: "Yes, and auto-apply edits", value: "auto-edit" },
+            { label: "Yes, approve each edit", value: "suggest" },
+            { label: "No, keep planning  (esc)", value: "no" },
+          ]);
+          if (choice !== "no") {
+            h.setApproval(choice as "auto-edit" | "suggest");
+            history.push({ role: "user", content: "Proceed: execute the plan above." });
+            const xin = stats.input;
+            const xout = stats.output;
+            await runAgent(history, {
+              provider,
+              ctx: { cwd, sandbox, spawn, ui },
+              approval: choice as ApprovalMode,
+              confirm: h.confirm,
+              autoApprove,
+              projectContext,
+              stats,
+              signal: h.signal,
+            });
+            h.sink.usage(stats.input - xin, stats.output - xout);
+            saveSession(meta, history);
+          }
+          return;
+        }
         const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd);
         recalledContext = "";
         history.push({ role: "user", content: userContent });
@@ -839,13 +896,8 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         await runAgent(history, {
           provider,
-          ctx: {
-            cwd,
-            sandbox,
-            spawn,
-            ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice },
-          },
-          approval: h.approval,
+          ctx: { cwd, sandbox, spawn, ui },
+          approval: appr,
           confirm: h.confirm,
           autoApprove,
           projectContext,

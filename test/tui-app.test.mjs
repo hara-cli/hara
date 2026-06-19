@@ -72,3 +72,31 @@ test("App confirm is a selectable list: ↓ then Enter picks 'don't ask again' �
   assert.equal(reply, "always", "↓ + Enter selects the don't-ask-again option");
   unmount();
 });
+
+test("App select (plan-proceed): ↓↓ + Enter picks the third option", async () => {
+  let choice = null;
+  const onSubmit = async (line, h) => {
+    choice = await h.select("hara has a plan — proceed?", [
+      { label: "Yes, and auto-apply edits", value: "auto-edit" },
+      { label: "Yes, approve each edit", value: "suggest" },
+      { label: "No, keep planning  (esc)", value: "no" },
+    ]);
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("❯ Yes, and auto-apply edits"), "first option selected by default");
+  stdin.write("\x1b[B");
+  await tick();
+  stdin.write("\x1b[B");
+  await tick();
+  stdin.write("\r");
+  await tick(80);
+  assert.equal(choice, "no", "↓↓ + Enter selects the third option");
+  unmount();
+});

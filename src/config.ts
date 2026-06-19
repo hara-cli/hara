@@ -19,6 +19,7 @@ export interface HaraConfig {
   baseURL: string | undefined;
   approval: ApprovalMode;
   sandbox: SandboxMode;
+  theme: "dark" | "light";
   mcpServers: Record<string, McpServerConfig>;
   cwd: string;
 }
@@ -34,7 +35,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme"] as const;
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
@@ -100,13 +101,14 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const apiKey = process.env.HARA_API_KEY ?? process.env[d.envKey] ?? merged.apiKey;
   const approval = (process.env.HARA_APPROVAL ?? merged.approval ?? "suggest") as ApprovalMode;
   const sandbox = (process.env.HARA_SANDBOX ?? merged.sandbox ?? "off") as SandboxMode;
+  const theme = (process.env.HARA_THEME ?? merged.theme ?? "dark") as "dark" | "light";
   const mcpServers: Record<string, McpServerConfig> = {
     ...(globalBase.mcpServers ?? {}),
     ...(project.mcpServers ?? {}),
     ...(profile.mcpServers ?? {}),
   };
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {
