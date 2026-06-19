@@ -87,9 +87,9 @@ hara -m glm-5              # pick a model
 
 Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/usage` `/doctor` `/sessions` `/undo` `/compact` `/recall` `/reset` `/exit` (type `/`+Tab to complete). Type `@` + Tab to attach a file (fuzzy, walks subdirectories).
 
-A **status bar** is pinned at the bottom showing the session name, the three approval modes (current
-highlighted), live token usage + context %, and a concurrent-operation count. **shift+tab** (or bare
-`/approval`) cycles the approval mode; **Esc** interrupts a running turn. Set `HARA_FOOTER=0` to disable the bar.
+A **status header** prints above each prompt — session name, the three approval modes (current
+highlighted), token usage + context %, and a concurrent-op count. **shift+tab** (or bare `/approval`)
+cycles the approval mode; **Esc** interrupts a running turn. Set `HARA_FOOTER=0` to hide it.
 
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal

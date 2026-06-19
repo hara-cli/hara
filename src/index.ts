@@ -665,8 +665,8 @@ program.action(async (opts) => {
         } else {
           approval = bar.nextMode(approval); // bare /approval cycles
         }
-        if (bar.isActive()) bar.update({ approval });
-        else out(c.dim(`(approval → ${approval})\n`));
+        bar.update({ approval });
+        out(c.dim(`(approval → ${approval})\n`));
       },
     },
     { name: "usage", desc: "show token usage this session", run: () => void out(statusLine(cfg.model, stats.input, stats.output) + "\n") },
@@ -776,6 +776,7 @@ program.action(async (opts) => {
   });
 
   for (;;) {
+    bar.render(); // status header above the prompt
     let line: string;
     try {
       line = (await rl.question(c.cyan("hara> "))).trim();

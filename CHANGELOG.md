@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.17.1 — unreleased (status bar actually renders)
+
+- **Fix: the status bar now shows.** The pinned-footer (v0.6) used a terminal scroll region that
+  doesn't compose with Node's `readline`, so it silently never rendered. It's now a status **header
+  printed above each prompt** — session · the three approval modes · tokens + ctx% · concurrent ops —
+  visible in any terminal. (True bottom-pinning needs a full TUI; deferred.) `HARA_FOOTER=0` hides it.
+
 ## 0.17.0 — unreleased (doctor + command completion)
 
 - **`hara doctor` / `/doctor`** — a setup health check: Node version, provider + model, whether auth
