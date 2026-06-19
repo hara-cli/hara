@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parsePlan, topoOrder } from "../dist/org/planner.js";
+import { tmpdir } from "node:os";
+import { parsePlan, topoOrder, runCheck } from "../dist/org/planner.js";
 
 test("parsePlan: parses fenced JSON + normalizes deps/status", () => {
   const text = '```json\n{"atoms":[{"id":"a1","title":"do x","deps":[]},{"id":"a2","title":"do y","deps":["a1"],"verify":"x works","role":"impl"}]}\n```';
@@ -44,4 +45,17 @@ test("topoOrder: ignores dangling deps", () => {
   const r = topoOrder(atoms);
   assert.ok("ok" in r);
   assert.equal(r.ok.length, 1);
+});
+
+test("parsePlan: captures a check command", () => {
+  const a = parsePlan('{"atoms":[{"id":"a1","title":"t","deps":[],"check":"npm test"}]}');
+  assert.equal(a[0].check, "npm test");
+});
+
+test("runCheck: exit 0 passes, nonzero fails", async () => {
+  const ok = await runCheck("echo hi", tmpdir(), "off");
+  assert.ok(ok.ok);
+  assert.match(ok.reason, /hi/);
+  const bad = await runCheck("exit 3", tmpdir(), "off");
+  assert.ok(!bad.ok);
 });

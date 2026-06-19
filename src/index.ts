@@ -3,7 +3,8 @@ import { Command } from "commander";
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { stdin, stdout } from "node:process";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
@@ -37,10 +38,11 @@ import {
 } from "./session/store.js";
 import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
-import { decompose, topoOrder, savePlan, atomPrompt, verify, type Atom } from "./org/planner.js";
+import { decompose, topoOrder, savePlan, atomPrompt, verify, runCheck, type Atom } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
 import { sandboxSupported, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
+import { searchAssets, scaffoldAssets, assetsDir } from "./recall.js";
 import type { Provider, NeutralMsg } from "./providers/types.js";
 import { c, out, statusLine } from "./ui.js";
 import * as bar from "./statusbar.js";
@@ -50,6 +52,7 @@ import "./tools/edit.js"; // register edit_file
 import "./tools/search.js"; // register grep/glob/ls
 import "./tools/patch.js"; // register apply_patch
 import "./tools/web.js"; // register web_fetch
+import "./tools/agent.js"; // register agent (subagent spawn)
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
@@ -169,7 +172,7 @@ async function runPlan(task: string, o: OrgOpts): Promise<void> {
   const ordered = ord.ok;
   out(c.bold(`\nPlan (${ordered.length} atoms):\n`));
   for (const a of ordered) {
-    out(`  ${c.cyan(a.id)} ${a.title}${a.deps.length ? c.dim(" ←" + a.deps.join(",")) : ""}${a.role ? c.dim(" @" + a.role) : ""}\n`);
+    out(`  ${c.cyan(a.id)} ${a.title}${a.deps.length ? c.dim(" ←" + a.deps.join(",")) : ""}${a.role ? c.dim(" @" + a.role) : ""}${a.check ? c.dim(" ✓" + a.check) : ""}\n`);
   }
   if (o.approval !== "full-auto") {
     const ok = await o.confirm(`${c.yellow("▶")} Execute this ${ordered.length}-atom plan?`);
@@ -208,7 +211,8 @@ async function runPlan(task: string, o: OrgOpts): Promise<void> {
       out(c.red(`  ✗ ${atom.id} errored: ${e.message}\n`));
       break;
     }
-    const v = await verify(o.baseProvider, atom, lastAssistantText(history));
+    if (atom.check) out(c.dim(`  check: ${atom.check}\n`));
+    const v = atom.check ? await runCheck(atom.check, o.cwd, o.sandbox) : await verify(o.baseProvider, atom, lastAssistantText(history));
     atom.status = v.ok ? "done" : "failed";
     atom.note = v.reason;
     savePlan(o.cwd, plan);
@@ -221,6 +225,70 @@ async function runPlan(task: string, o: OrgOpts): Promise<void> {
     }
   }
   out(c.bold(`\nPlan: ${plan.atoms.filter((a) => a.status === "done").length}/${plan.atoms.length} atoms done.\n`));
+}
+
+const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch"]);
+
+/** Run a (read-only by default) sub-agent to completion, quietly, and return its final text. */
+async function runSubagent(
+  cfg: HaraConfig,
+  baseProvider: Provider,
+  cwd: string,
+  sandbox: SandboxMode,
+  projectContext: string | undefined,
+  stats: { input: number; output: number; lastInput?: number },
+  task: string,
+  roleId?: string,
+): Promise<string> {
+  const roles = loadRoles(cwd);
+  const role = roleId ? roles.find((r) => r.id === roleId) : undefined;
+  const provider =
+    role?.model && role.model !== cfg.model ? ((await buildProvider({ ...cfg, model: role.model })) ?? baseProvider) : baseProvider;
+  const toolFilter = role?.allowTools
+    ? (n: string) => role.allowTools!.includes(n)
+    : role?.denyTools
+      ? (n: string) => !role.denyTools!.includes(n)
+      : (n: string) => READONLY_TOOLS.has(n); // default sub-agent = read-only (safe to parallelize)
+  const subHistory: NeutralMsg[] = [{ role: "user", content: task }];
+  await runAgent(subHistory, {
+    provider,
+    ctx: { cwd, sandbox }, // no `spawn` here → sub-agents can't recurse
+    approval: "full-auto", // read-only tools, so no prompts (can't prompt in parallel)
+    confirm: async () => true,
+    projectContext,
+    stats,
+    systemOverride: role?.system,
+    toolFilter,
+    quiet: true,
+  });
+  for (let i = subHistory.length - 1; i >= 0; i--) {
+    const m = subHistory[i] as { role: string; text?: string };
+    if (m.role === "assistant" && typeof m.text === "string" && m.text.trim()) return m.text.trim();
+  }
+  return "(sub-agent produced no output)";
+}
+
+/** Check the hara setup and print a health summary (provider/auth/model/node/assets/roles). */
+function runDoctor(cfg: HaraConfig): void {
+  const ok = (b: boolean): string => (b ? c.green("✓") : c.red("✗"));
+  const dot = c.dim("·");
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  const hasKey = !!(cfg.apiKey || process.env[providerEnvKey(cfg.provider)] || process.env.HARA_API_KEY);
+  const oauthOk = cfg.provider === "qwen-oauth" && existsSync(join(homedir(), ".hara", "qwen-oauth.json"));
+  const authed = hasKey || oauthOk;
+  const ad = assetsDir();
+  const roles = loadRoles(cfg.cwd);
+  const lines = [
+    c.bold("hara doctor"),
+    `${ok(nodeMajor >= 20)} node ${process.versions.node} ${c.dim("(need ≥20)")}`,
+    `${dot} provider ${c.bold(cfg.provider)} · model ${c.bold(cfg.model)}${cfg.baseURL ? c.dim(" · " + cfg.baseURL) : ""}`,
+    `${ok(authed)} auth ${authed ? c.dim("configured") : c.yellow("missing — " + authHint(cfg))}`,
+    `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
+    `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
+    `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
+    `${dot} mcp servers ${c.dim(String(Object.keys(cfg.mcpServers).length))}`,
+  ];
+  out(lines.join("\n") + "\n");
 }
 
 function mentionCompleter(line: string, cwd: string): [string[], string] {
@@ -333,6 +401,28 @@ program
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
 
+program
+  .command("recall [query...]")
+  .description("search your code-asset library (~/.hara/code-assets) for snippets/playbooks")
+  .option("--init", "scaffold the code-assets directory with an example")
+  .action((parts: string[], opts2: { init?: boolean }) => {
+    if (opts2.init) {
+      const w = scaffoldAssets();
+      out(w.length ? c.green(`Scaffolded ${assetsDir()}: ${w.join(", ")}\n`) : c.dim(`Assets already exist at ${assetsDir()}\n`));
+      return;
+    }
+    const q = (parts ?? []).join(" ");
+    if (!q) return void out(c.dim("usage: hara recall <query>   (or: hara recall --init)\n"));
+    const hits = searchAssets(q);
+    if (!hits.length) return void out(c.dim(`No matches in ${assetsDir()} (add .md files, or run: hara recall --init)\n`));
+    for (const h of hits) out(`${c.cyan(h.path)}  ${c.dim(h.title)}\n`);
+  });
+
+program
+  .command("doctor")
+  .description("check your hara setup (provider / auth / model / node / assets / roles)")
+  .action(() => runDoctor(loadConfig()));
+
 const rolesCmd = program.command("roles").description("manage org roles (.hara/roles)");
 rolesCmd
   .command("init")
@@ -429,6 +519,7 @@ program.action(async (opts) => {
   const cwd = cfg.cwd;
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
   let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it
+  let recalledContext = ""; // snippets queued by /recall, prepended to the next message
   const sandbox: SandboxMode = (opts.sandbox as SandboxMode) || cfg.sandbox;
   if (sandbox !== "off" && !sandboxSupported()) {
     out(c.yellow(`(sandbox '${sandbox}' is macOS-only; shell runs unsandboxed here)\n`));
@@ -443,7 +534,14 @@ program.action(async (opts) => {
   if (opts.print) {
     const projectContext = loadAgentsMd(cwd) || undefined;
     const history: NeutralMsg[] = [{ role: "user", content: expandMentions(String(opts.print), cwd) }];
-    await runAgent(history, { provider, ctx: { cwd, sandbox }, approval: "full-auto", confirm: async () => true, projectContext, stats });
+    await runAgent(history, {
+      provider,
+      ctx: { cwd, sandbox, spawn: (t, role) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role) },
+      approval: "full-auto",
+      confirm: async () => true,
+      projectContext,
+      stats,
+    });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
     await closeMcp();
     return;
@@ -451,7 +549,18 @@ program.action(async (opts) => {
 
   // interactive REPL
   out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}${sandbox !== "off" ? `  ·  sandbox:${sandbox}` : ""}  ·  ${cwd}\n`));
-  const rl = createInterface({ input: stdin, output: stdout, completer: (line: string) => mentionCompleter(line, cwd) });
+  const rl = createInterface({
+    input: stdin,
+    output: stdout,
+    completer: (line: string): [string[], string] => {
+      const sm = /^\/(\w*)$/.exec(line); // `/<partial>` → complete command names
+      if (sm) {
+        const q = sm[1].toLowerCase();
+        return [[...byName.keys()].filter((n) => n.startsWith(q)).sort().map((n) => "/" + n), line];
+      }
+      return mentionCompleter(line, cwd);
+    },
+  });
   const confirm = async (q: string) => (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
   // shift+tab cycles the approval mode (TTY only — emitKeypressEvents would eat piped stdin).
   // Bare /approval is the reliable fallback everywhere.
@@ -483,6 +592,7 @@ program.action(async (opts) => {
     }
   }
   let projectContext = loadAgentsMd(cwd) || undefined;
+  const spawn = (t: string, role?: string) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role);
 
   // session: --resume <id> / --continue (latest in this cwd) / new
   let resumed: SessionData | null = null;
@@ -560,6 +670,7 @@ program.action(async (opts) => {
       },
     },
     { name: "usage", desc: "show token usage this session", run: () => void out(statusLine(cfg.model, stats.input, stats.output) + "\n") },
+    { name: "doctor", desc: "check your hara setup", run: () => void runDoctor(cfg) },
     {
       name: "roles",
       desc: "list org roles",
@@ -632,7 +743,19 @@ program.action(async (opts) => {
         out(c.green(`(compacted — ${summary.length} chars; context replaced with the summary)\n`));
       },
     },
-    { name: "reset", aliases: ["clear"], desc: "clear conversation context", run: () => void ((history.length = 0), out(c.dim("(context cleared)\n"))) },
+    {
+      name: "recall",
+      desc: "pull snippets from your code-asset library into context: /recall <query>",
+      run: (a) => {
+        if (!a) return void out(c.dim("usage: /recall <query>\n"));
+        const hits = searchAssets(a, 3);
+        if (!hits.length) return void out(c.dim(`(no matches in ${assetsDir()})\n`));
+        const block = hits.map((h) => `Recalled \`${h.path}\` (${h.title}):\n${h.snippet}`).join("\n\n");
+        recalledContext += (recalledContext ? "\n\n" : "") + block;
+        out(c.green(`↗ recalled ${hits.length}: ${hits.map((h) => h.path).join(", ")} (added to your next message)\n`));
+      },
+    },
+    { name: "reset", aliases: ["clear"], desc: "clear conversation context", run: () => void ((history.length = 0), (recalledContext = ""), out(c.dim("(context cleared)\n"))) },
     { name: "exit", aliases: ["quit"], desc: "leave", run: () => "exit" },
   ];
   const byName = new Map<string, Slash>();
@@ -673,10 +796,12 @@ program.action(async (opts) => {
       if (res === "exit") break;
       continue;
     }
-    history.push({ role: "user", content: expandMentions(line, cwd) });
+    const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd);
+    recalledContext = "";
+    history.push({ role: "user", content: userContent });
     currentTurn = new AbortController();
     try {
-      await runAgent(history, { provider, ctx: { cwd, sandbox }, approval, confirm, projectContext, stats, signal: currentTurn.signal });
+      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, projectContext, stats, signal: currentTurn.signal });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     } finally {

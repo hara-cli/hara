@@ -2,7 +2,7 @@
 // and provide fuzzy file candidates for REPL tab-completion.
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import { listProjectFiles, dirPrefixes } from "../fs-walk.js";
+import { listProjectFiles, dirPrefixes, walkFiles } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
 
 const MAX_FILE = 50_000;
@@ -21,10 +21,17 @@ export function expandMentions(input: string, cwd: string): string {
     seen.add(ref);
     const abs = isAbsolute(ref) ? ref : resolve(cwd, ref);
     try {
-      if (existsSync(abs) && statSync(abs).isFile()) {
-        let txt = readFileSync(abs, "utf8");
-        if (txt.length > MAX_FILE) txt = txt.slice(0, MAX_FILE) + "\n…[truncated]";
-        blocks.push(`Referenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\``);
+      if (existsSync(abs)) {
+        const st = statSync(abs);
+        if (st.isFile()) {
+          let txt = readFileSync(abs, "utf8");
+          if (txt.length > MAX_FILE) txt = txt.slice(0, MAX_FILE) + "\n…[truncated]";
+          blocks.push(`Referenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\``);
+        } else if (st.isDirectory()) {
+          // `@dir` loads a listing of the directory's files (the agent can then read specific ones)
+          const files = walkFiles(abs, 300);
+          blocks.push(`Referenced directory \`${ref}\` (${files.length} files):\n\`\`\`\n${files.join("\n") || "(empty)"}\n\`\`\``);
+        }
       }
     } catch {
       /* ignore unreadable mention */
@@ -60,6 +67,14 @@ export function fileCandidates(cwd: string, query: string, limit = 25): string[]
     const top = entries.filter((e) => !e.replace(/\/$/, "").includes("/"));
     top.sort((a, b) => (b.endsWith("/") ? 1 : 0) - (a.endsWith("/") ? 1 : 0) || a.localeCompare(b));
     return top.slice(0, limit);
+  }
+  // drilling: `@src/` → the immediate children of src/ (directories first), like a file picker
+  if (query.endsWith("/")) {
+    const kids = entries.filter((e) => e.startsWith(query) && e !== query && !e.slice(query.length).replace(/\/$/, "").includes("/"));
+    if (kids.length) {
+      kids.sort((a, b) => (b.endsWith("/") ? 1 : 0) - (a.endsWith("/") ? 1 : 0) || a.localeCompare(b));
+      return kids.slice(0, limit);
+    }
   }
   // fuzzy subsequence ranking — `@scr` finds `src/`, `@idx` finds `src/index.ts`
   return fuzzyRank(query, entries, (e) => e)

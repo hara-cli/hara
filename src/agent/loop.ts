@@ -39,6 +39,8 @@ export interface RunOpts {
   toolFilter?: (name: string) => boolean;
   /** abort the in-flight LLM request (user interrupt) */
   signal?: AbortSignal;
+  /** suppress streaming/tool output (sub-agents running in parallel) */
+  quiet?: boolean;
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
@@ -47,14 +49,31 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
 
   for (;;) {
     const specs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
-    const tty = stdout.isTTY;
+    const tty = stdout.isTTY && !opts.quiet;
     const md = tty && process.env.HARA_MD !== "0" ? makeRenderer(out) : null;
     let sawReasoning = false;
+    // "working Ns" spinner until the first output arrives (cleared on text/reasoning or turn end)
+    let spin: ReturnType<typeof setInterval> | null = null;
+    const stopSpin = (): void => {
+      if (spin) {
+        clearInterval(spin);
+        spin = null;
+        out("\r\x1b[K");
+      }
+    };
+    if (tty) {
+      const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+      const t0 = Date.now();
+      let fi = 0;
+      spin = setInterval(() => out(`\r${c.dim(`${frames[fi++ % frames.length]} working ${Math.floor((Date.now() - t0) / 1000)}s`)}`), 100);
+    }
     const r = await provider.turn({
       system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride),
       history,
       tools: specs,
       onText: (d) => {
+        if (opts.quiet) return;
+        stopSpin();
         if (sawReasoning) {
           out("\n");
           sawReasoning = false;
@@ -62,14 +81,18 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         if (md) md.push(d);
         else out(d);
       },
-      onReasoning: tty ? (d) => {
-        sawReasoning = true;
-        out(c.dim(d));
-      } : undefined,
+      onReasoning: tty
+        ? (d) => {
+            stopSpin();
+            sawReasoning = true;
+            out(c.dim(d));
+          }
+        : undefined,
       signal: opts.signal,
     });
+    stopSpin();
     md?.end();
-    out("\n");
+    if (!opts.quiet) out("\n");
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;
       opts.stats.output += r.usage.output;
@@ -78,7 +101,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 
     if (r.stop === "error") {
-      out(r.errorMsg === "interrupted" ? c.dim("\n(interrupted)\n") : c.red(`[${provider.id} error] ${r.errorMsg ?? "unknown"}\n`));
+      if (!opts.quiet) out(r.errorMsg === "interrupted" ? c.dim("\n(interrupted)\n") : c.red(`[${provider.id} error] ${r.errorMsg ?? "unknown"}\n`));
       return;
     }
     if (r.stop !== "tool_use") return;
@@ -96,9 +119,11 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         plans.push({ tu, tool: undefined, denied: `Unknown tool: ${tu.name}` });
         continue;
       }
+      const input = tu.input as Record<string, unknown>;
+      const preview = String(input.path ?? input.command ?? input.pattern ?? input.url ?? input.task ?? "")
+        .replace(/\s+/g, " ")
+        .trim();
       if (needsConfirm(tool.kind, opts.approval)) {
-        const input = tu.input as Record<string, unknown>;
-        const preview = String(input.command ?? input.path ?? input.pattern ?? "");
         const ok = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
         if (!ok) {
           plans.push({ tu, tool, denied: "User denied this action." });
@@ -106,7 +131,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         }
       }
       plans.push({ tu, tool });
-      out(c.dim(`  ↳ ${tu.name}\n`));
+      if (!opts.quiet) out(c.dim(`  ↳ ${tu.name}${preview ? " " + preview.slice(0, 80) : ""}\n`));
     }
 
     // Execute: read-only tools run concurrently; edit/exec run alone, in order.

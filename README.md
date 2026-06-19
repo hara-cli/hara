@@ -6,11 +6,11 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **v0.14** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
+🚧 **v0.17** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
 routes work to the role that owns it, and **`hara plan "<task>"`** decomposes a task into a verified
 DAG of atoms. **Streaming on every provider** with rendered Markdown + visible reasoning, colored
 edit diffs, multi-file `apply_patch`, **Esc-to-interrupt**, **`/undo`**, **`/compact`**, live shell
-output, a pinned status bar, `grep`/`glob`/`ls`/`web_fetch`, fuzzy `@file` completion, and did-you-mean. Track it: https://github.com/hara-cli/hara · https://hara.run
+output, a pinned status bar, `grep`/`glob`/`ls`/`web_fetch`, fuzzy `@file` completion, did-you-mean, a personal `recall` code-asset library, and **parallel sub-agents**. Track it: https://github.com/hara-cli/hara · https://hara.run
 
 ## Install
 
@@ -73,6 +73,7 @@ Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `H
 ```bash
 hara                       # interactive REPL (offers to create AGENTS.md on first run)
 hara init                  # analyze the project & (re)generate AGENTS.md
+hara doctor                # check your setup (auth / model / node / assets / roles)
 hara roles init            # scaffold role-agents (implementer / reviewer / docs)
 hara org "review src/ for bugs"   # dispatch a task to the role that owns it (or --role <id>)
 hara plan "add a /health endpoint with a test"   # decompose → sequence (DAG) → run each step + verify
@@ -84,7 +85,7 @@ hara --profile work        # use a named profile from ~/.hara/config.json
 hara -m glm-5              # pick a model
 ```
 
-Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/usage` `/sessions` `/undo` `/compact` `/reset` `/exit`. Type `@` + Tab to attach a file (fuzzy, walks subdirectories).
+Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/usage` `/doctor` `/sessions` `/undo` `/compact` `/recall` `/reset` `/exit` (type `/`+Tab to complete). Type `@` + Tab to attach a file (fuzzy, walks subdirectories).
 
 A **status bar** is pinned at the bottom showing the session name, the three approval modes (current
 highlighted), live token usage + context %, and a concurrent-operation count. **shift+tab** (or bare
@@ -93,6 +94,10 @@ highlighted), live token usage + context %, and a concurrent-operation count. **
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal
 only; `HARA_MD=0` disables Markdown rendering.
+
+**Recall** — `hara recall --init` creates a personal `~/.hara/code-assets` library (snippets/playbooks
+as `*.md`); `hara recall "<query>"` searches it, and `/recall <query>` pulls the best matches into your
+next message. A git-versionable library of code/patterns you want to reuse (`HARA_ASSETS` overrides the path).
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
 **Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).
@@ -106,12 +111,16 @@ Define role-agents in `.hara/roles/*.md` — each is a persona (the file body) p
 (keywords that route a task here), optional `rejects`, `model`, and `allowTools`/`denyTools`. `hara org
 "<task>"` routes the task to the role that **owns** it (keyword match, LLM fallback) and runs that role's
 agent — e.g. a read-only `reviewer` that reports issues vs an `implementer` that edits code. `hara roles`
-lists them, `hara roles init` scaffolds a starter set, and `--role <id>` forces a specific role.
+lists them, `hara roles init` scaffolds a starter set, and `--role <id>` forces a specific role. The
+**`agent`** tool spawns **parallel read-only sub-agents** for fan-out — analyze / review / search
+several things at once (each can take a `role`).
 
 Beyond routing, **`hara plan "<task>"`** makes the org *plan*: it decomposes the task into atoms,
 sequences them as a DAG, and executes each step (optionally routed to a role) behind a per-step
-**verify gate** — frame → atomize → sequence → execute → verify. Plan state is the SSOT at
-`.hara/org/plan.json` (inspectable; execution stops on the first failed verification).
+**verify gate** — frame → atomize → sequence → execute → verify. Each atom may carry a `check` shell
+command, so verification is **objective** (e.g. `npm test`, `tsc --noEmit`) rather than a
+self-assessment. Plan state is the SSOT at `.hara/org/plan.json` (inspectable; execution stops on the
+first failed verification).
 
 ### What it can do
 
@@ -122,12 +131,12 @@ dangerous ones unless `-y`. Read-only tools run in parallel within a turn, and e
 **colored diff** of what changed. Shell output streams live; press **Esc** to interrupt a running
 turn, or **`/undo`** to revert the last edit.
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
-- **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. Mistyped tool/file paths get a "did you mean" suggestion.
+- **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. `@<dir>` loads a directory listing, `@src/`+Tab drills into a folder, and mistyped tool/file paths get a "did you mean" suggestion.
 - **Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) — **all streamed live**.
 
 ### Roadmap
 
-Subagent parallelism · context auto-compaction · cron autonomy for the org · single-binary
+Context auto-compaction · planner atoms in parallel · cron autonomy for the org · single-binary
 distribution · and an enterprise control-plane (fleet + central token management).
 
 ## License

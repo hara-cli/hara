@@ -5,6 +5,46 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.17.0 — unreleased (doctor + command completion)
+
+- **`hara doctor` / `/doctor`** — a setup health check: Node version, provider + model, whether auth
+  is configured (with a fix hint), config path, code-assets, roles, MCP servers. Diagnoses the common
+  "not authenticated / wrong model" pitfalls at a glance.
+- **`/command` Tab-completion** — typing `/` (or `/mo`) + Tab completes slash-command names in the REPL.
+
+## 0.16.1 — unreleased (terminal UX polish)
+
+- **`@<dir>` loads a directory** — mentioning a directory now attaches a listing of its files (the
+  agent can then read specific ones); previously `@dir` did nothing.
+- **`@src/` Tab drills in** — completing a path that ends in `/` lists that folder's immediate
+  children (directories first), like a file picker.
+- **Tool calls show their argument** — `↳ read_file src/x.ts`, `↳ bash npm test`, `↳ grep TODO`
+  instead of a bare tool name.
+- **"working Ns" spinner** while a turn is in flight (cleared the moment output/reasoning streams).
+
+## 0.16.0 — unreleased (parallel sub-agents)
+
+- **`agent` tool** — delegate an independent sub-task to a fresh sub-agent; spawn several in one turn
+  to run them **in parallel** (the footer's `⛁ N agents` count is now real). Sub-agents are read-only
+  by default (analysis/search/review/web), so they're safe to parallelize; pass a `role` id to use
+  that role's persona + tools. The agent loop gained a `quiet` mode so parallel sub-agents don't
+  interleave output — only their results return to the parent. Sub-agents can't recurse (no nested
+  fan-out).
+
+## 0.15.0 — unreleased (code-asset recall)
+
+- **`hara recall "<query>"` / `/recall`** — a personal, git-versionable library of snippets/playbooks
+  at `~/.hara/code-assets` (override with `HARA_ASSETS`). Lexical search ranks `*.md` assets by
+  query-word matches; in the REPL `/recall` pulls the top matches into your **next message's context**.
+  `hara recall --init` scaffolds the directory with an example. Phase-C v0 — lexical-first (embeddings
+  deferred until proven necessary).
+
+## 0.14.1 — unreleased (planner: objective verify gate)
+
+- **`hara plan` verify can run a command** — an atom may carry a `check` shell command; the verify
+  gate passes only if it exits 0 (objective), falling back to the LLM self-check when no `check` is
+  given. Makes plans trustworthy — e.g. `npm test`, `tsc --noEmit`, `test -f path`.
+
 ## 0.14.0 — unreleased (web_fetch)
 
 - **`web_fetch`** — fetch an `http(s)` URL and return its text (HTML reduced to readable text), for

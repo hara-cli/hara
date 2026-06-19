@@ -4,6 +4,8 @@ import type { SandboxMode } from "../sandbox.js";
 export interface ToolContext {
   cwd: string;
   sandbox?: SandboxMode;
+  /** spawn a sub-agent for a sub-task (set by the REPL/-p; absent inside sub-agents) */
+  spawn?: (task: string, role?: string) => Promise<string>;
 }
 
 export interface Tool {

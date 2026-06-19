@@ -6,6 +6,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Provider } from "../providers/types.js";
 import type { Role } from "./roles.js";
+import { runShell, type SandboxMode } from "../sandbox.js";
 
 export type AtomStatus = "pending" | "running" | "done" | "failed";
 export interface Atom {
@@ -13,7 +14,8 @@ export interface Atom {
   title: string;
   detail?: string;
   deps: string[];
-  verify?: string; // observable done-criteria
+  verify?: string; // observable done-criteria (LLM-checked if no `check`)
+  check?: string; // shell command that exits 0 iff this step is done (objective gate)
   role?: string; // optional role id to route this atom to
   status: AtomStatus;
   note?: string; // verify result / failure reason
@@ -29,8 +31,8 @@ const PLAN_SYSTEM = `You are hara's planner. Decompose a coding task using this 
 2) ATOMIZE into the smallest independently-verifiable steps.
 3) SEQUENCE them with dependencies (a step lists the ids it depends on).
 Return ONLY a JSON object, no prose:
-{"atoms":[{"id":"a1","title":"imperative step","detail":"how/where","deps":[],"verify":"observable done-criteria","role":"<roleId or omit>"}]}
-Rules: short ids (a1,a2,…); deps reference earlier ids only; typically 3-8 atoms; each atom small and verifiable.`;
+{"atoms":[{"id":"a1","title":"imperative step","detail":"how/where","deps":[],"verify":"observable done-criteria","check":"shell command exiting 0 iff done (optional)","role":"<roleId or omit>"}]}
+Rules: short ids (a1,a2,…); deps reference earlier ids only; typically 3-8 atoms; each atom small and verifiable. Prefer a concrete 'check' command (e.g. "npm test", "tsc --noEmit", "test -f src/x.ts") so a step is verified objectively; omit 'check' if none fits.`;
 
 /** Ask the model to decompose `task` into an atomized, sequenced plan. */
 export async function decompose(provider: Provider, task: string, roles: Role[]): Promise<Plan> {
@@ -64,6 +66,7 @@ export function parsePlan(text: string): Atom[] {
       detail: typeof a.detail === "string" ? a.detail : undefined,
       deps: Array.isArray(a.deps) ? a.deps.filter((d: any) => typeof d === "string") : [],
       verify: typeof a.verify === "string" ? a.verify : undefined,
+      check: typeof a.check === "string" && a.check ? a.check : undefined,
       role: typeof a.role === "string" && a.role ? a.role : undefined,
       status: "pending",
     });
@@ -138,6 +141,17 @@ export async function verify(provider: Provider, atom: Atom, transcriptTail: str
   const t = r.text.trim();
   if (/^done\b/i.test(t)) return { ok: true, reason: "verified" };
   return { ok: false, reason: t.replace(/^needswork:?\s*/i, "").slice(0, 200) || "did not meet criteria" };
+}
+
+/** Objective gate: run the atom's `check` shell command; exit 0 = pass. */
+export async function runCheck(cmd: string, cwd: string, sandbox: SandboxMode): Promise<{ ok: boolean; reason: string }> {
+  try {
+    const { stdout } = await runShell(cmd, cwd, sandbox, { timeout: 120_000, maxBuffer: 1_000_000 });
+    return { ok: true, reason: (stdout.trim().split("\n").pop() || "ok").slice(0, 200) };
+  } catch (e: any) {
+    const out = (e?.stderr || e?.stdout || e?.message || "").toString().trim();
+    return { ok: false, reason: (out.split("\n").pop() || `exit ${e?.code ?? "?"}`).slice(0, 200) };
+  }
 }
 
 function planDir(cwd: string): string {
