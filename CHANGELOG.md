@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.21.0 — unreleased (self-evolution · M2)
+
+- **`playbook_save`** — the agent grows its own reusable playbooks (`~/.hara/code-assets/playbooks/<slug>.md`,
+  frontmatter + body), found later by `recall` / `memory_search`.
+- **AGENTS.md self-refinement** — the agent may propose AGENTS.md edits via `edit_file`, reviewed through the
+  normal diff/approval gate (no new write path).
+- **Guard** (`src/memory/guard.ts`) — a lexical scan on agent-written memory + playbooks blocks prompt-injection
+  phrases, secret-shaped tokens (`sk-…`/`AKIA…`/PEM/`ghp_…`), and `file://` URLs before they hit disk.
+- **Session-end distill** — with `evolve: proactive` (default), `/exit` runs one reflection turn that persists
+  durable learnings via `memory_write` / `playbook_save`. Set `evolve: light` (no distill) or `off` to disable.
+- 76 offline tests.
+
 ## 0.20.0 — unreleased (memory + self-evolution · M1)
 
 - **Long-term memory** — a lexical, file-backed store (no embeddings): global `~/.hara/memory/` + project

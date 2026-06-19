@@ -21,7 +21,8 @@ Be concise and direct. Use the provided tools to read files, edit/write files, a
 commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
 them whole. You have a persistent memory: use memory_search before answering about prior decisions,
 conventions, or the user's preferences, and memory_write to proactively save durable facts you learn.
-After completing a task, give a one-line summary.`;
+Save reusable how-tos with playbook_save; if you discover a durable project convention, you may propose
+an edit to AGENTS.md via edit_file (the user reviews the diff). After completing a task, give a one-line summary.`;
 
 function composeSystem(cwd: string, projectContext?: string, override?: string, memory?: string): string {
   const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);

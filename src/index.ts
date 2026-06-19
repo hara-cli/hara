@@ -237,6 +237,9 @@ const PLAN_SYSTEM =
   "You are in PLAN MODE. Investigate read-only (read_file / grep / glob / ls / web_fetch) and think, " +
   "then propose a concise step-by-step plan for the task. Do NOT edit files or run commands yet — only plan. " +
   "End your message with the plan as a short numbered list.";
+const DISTILL_SYSTEM =
+  "The session is ending. Reflect and persist only durable, reusable learnings: memory_write for facts / " +
+  "conventions / the user's preferences, playbook_save for reusable how-tos. Be selective — skip the trivial. Then reply DONE.";
 
 /** Run a (read-only by default) sub-agent to completion, quietly, and return its final text. */
 async function runSubagent(
@@ -809,7 +812,28 @@ program.action(async (opts) => {
         if (line.startsWith("/")) {
           const [nm, ...rest] = line.slice(1).split(/\s+/);
           const arg = rest.join(" ").trim();
-          if (nm === "exit" || nm === "quit") return void h.exit();
+          if (nm === "exit" || nm === "quit") {
+            if (cfg.evolve === "proactive" && history.length >= 4) {
+              h.sink.notice("✻ distilling session learnings…");
+              try {
+                await runAgent(history, {
+                  provider,
+                  ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice } },
+                  approval: "full-auto",
+                  confirm: h.confirm,
+                  toolFilter: (n) => n === "memory_write" || n === "playbook_save" || READONLY_TOOLS.has(n),
+                  systemOverride: DISTILL_SYSTEM,
+                  memory: buildMemory(),
+                  stats,
+                  signal: h.signal,
+                });
+                saveSession(meta, history);
+              } catch {
+                /* exit anyway */
+              }
+            }
+            return void h.exit();
+          }
           if (nm === "help") return void h.sink.notice(commands.map((x) => `/${x.name} — ${x.desc}`).join("\n"));
           if (nm === "tools")
             return void h.sink.notice(getTools().map((t) => `${t.name}${t.kind !== "read" ? " *" : ""} — ${t.description}`).join("\n"));
