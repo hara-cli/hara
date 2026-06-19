@@ -2,6 +2,39 @@
 
 All notable changes to `@nanhara/hara`.
 
+> Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
+> **patch** (last) number bumps for **optimizations/fixes of existing features**.
+
+## 0.14.0 — unreleased (web_fetch)
+
+- **`web_fetch`** — fetch an `http(s)` URL and return its text (HTML reduced to readable text), for
+  pulling docs / references / pages into context. Read-only, follows redirects, 30s timeout,
+  size-capped. Not sandboxed (network egress is in-process, not via `bash`).
+
+## 0.13.0 — unreleased (context management)
+
+- **`/compact`** — summarize the conversation so far into a brief and replace the history with it, to
+  free up context in long sessions (preserves goal, decisions, files changed, next steps).
+- **Context budget warning** — after a turn, if the context reaches ≥80% of the model's window, hara
+  warns and suggests `/compact` / `/reset`. (The status bar already shows live `ctx %`.)
+
+## 0.12.0 — unreleased (rendered output + visible reasoning)
+
+- **Markdown rendering** — assistant output renders in the terminal: headers, **bold**, `inline
+  code`, and bullets are styled; code fences pass through verbatim (copy-paste accurate). Line-buffered
+  streaming (`src/md.ts`); interactive terminal only — pipes/`-p` stay raw, disable with `HARA_MD=0`.
+- **Reasoning/thinking display** — when a model streams reasoning (GLM-5 / DeepSeek `reasoning_content`,
+  or Anthropic thinking), hara shows it dimmed before the answer. Interactive terminal only.
+
+## 0.11.0 — unreleased (undo + live shell output)
+
+- **`/undo`** — revert the last file change(s) made this session. Every edit tool
+  (`write_file`/`edit_file`/`apply_patch`) records the prior file state; `/undo` restores it (and
+  deletes files that were freshly created). In-session, up to 50 steps. (`src/undo.ts`)
+- **Live bash output** — the `bash` tool now streams stdout/stderr **as the command runs**
+  (interactive terminal only) instead of waiting for completion. `runShell` rewritten on `spawn` with
+  an `onData` hook; the full output is still captured for the model.
+
 ## 0.10.0 — unreleased (multi-file patches + interrupt)
 
 - **`apply_patch`** — change several files in one **atomic** step (all-or-nothing). `changes` is an

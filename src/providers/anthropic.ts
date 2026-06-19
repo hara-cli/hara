@@ -31,7 +31,7 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
   return {
     id: "anthropic",
     model: opts.model,
-    async turn({ system, history, tools, onText, signal }: TurnArgs): Promise<TurnResult> {
+    async turn({ system, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
       const stream = client.messages.stream(
         {
           model: opts.model,
@@ -44,6 +44,7 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
         { signal },
       );
       stream.on("text", onText);
+      if (onReasoning) (stream as any).on("thinking", onReasoning); // thinking deltas (if emitted)
 
       let msg: Anthropic.Message;
       try {

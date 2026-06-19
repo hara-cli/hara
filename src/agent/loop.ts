@@ -1,7 +1,9 @@
 import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
 import { getTool, toolSpecs, type ToolContext } from "../tools/registry.js";
+import { stdout } from "node:process";
 import { c, out } from "../ui.js";
 import { activity } from "../activity.js";
+import { makeRenderer } from "../md.js";
 import type { ApprovalMode } from "../config.js";
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
@@ -45,13 +47,28 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
 
   for (;;) {
     const specs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
+    const tty = stdout.isTTY;
+    const md = tty && process.env.HARA_MD !== "0" ? makeRenderer(out) : null;
+    let sawReasoning = false;
     const r = await provider.turn({
       system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride),
       history,
       tools: specs,
-      onText: out,
+      onText: (d) => {
+        if (sawReasoning) {
+          out("\n");
+          sawReasoning = false;
+        }
+        if (md) md.push(d);
+        else out(d);
+      },
+      onReasoning: tty ? (d) => {
+        sawReasoning = true;
+        out(c.dim(d));
+      } : undefined,
       signal: opts.signal,
     });
+    md?.end();
     out("\n");
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;

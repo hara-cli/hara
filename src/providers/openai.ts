@@ -42,7 +42,7 @@ export function createOpenAIProvider(opts: {
   return {
     id: opts.label ?? "openai",
     model: opts.model,
-    async turn({ system, history, tools, onText, signal }: TurnArgs): Promise<TurnResult> {
+    async turn({ system, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
       const oaiTools = tools.map((t) => ({
         type: "function" as const,
         function: { name: t.name, description: t.description, parameters: t.input_schema },
@@ -70,6 +70,8 @@ export function createOpenAIProvider(opts: {
             text += delta.content;
             onText(delta.content);
           }
+          const rc = (delta as any)?.reasoning_content ?? (delta as any)?.reasoning; // GLM-5 / DeepSeek
+          if (rc) onReasoning?.(rc);
           if (delta?.tool_calls) {
             for (const tc of delta.tool_calls) {
               const idx = tc.index ?? 0;

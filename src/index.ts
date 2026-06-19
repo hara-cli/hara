@@ -40,6 +40,7 @@ import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.
 import { decompose, topoOrder, savePlan, atomPrompt, verify, type Atom } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
 import { sandboxSupported, type SandboxMode } from "./sandbox.js";
+import { undoLast } from "./undo.js";
 import type { Provider, NeutralMsg } from "./providers/types.js";
 import { c, out, statusLine } from "./ui.js";
 import * as bar from "./statusbar.js";
@@ -48,6 +49,7 @@ import "./tools/builtin.js"; // register read_file/write_file/bash
 import "./tools/edit.js"; // register edit_file
 import "./tools/search.js"; // register grep/glob/ls
 import "./tools/patch.js"; // register apply_patch
+import "./tools/web.js"; // register web_fetch
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
@@ -595,6 +597,41 @@ program.action(async (opts) => {
         for (const m of ms) out(`  ${m.id}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${m.title}\n`);
       },
     },
+    {
+      name: "undo",
+      desc: "revert the last file change(s) made this session",
+      run: async () => {
+        const r = await undoLast();
+        if ("error" in r) return void out(c.dim(`(${r.error})\n`));
+        out(c.green(`↩ reverted: ${r.files.join(", ")}\n`));
+      },
+    },
+    {
+      name: "compact",
+      desc: "summarize the conversation so far to free up context",
+      run: async () => {
+        if (history.length < 2) return void out(c.dim("(nothing to compact)\n"));
+        out(c.dim("Compacting…\n"));
+        const r = await provider.turn({
+          system:
+            "Summarize the conversation so far into a concise but complete brief so the assistant can " +
+            "continue seamlessly: the user's goal, key decisions, files changed, current state, and open next steps. " +
+            "Be specific. Output only the summary.",
+          history: [...history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
+          tools: [],
+          onText: () => {},
+        });
+        if (r.stop === "error") return void out(c.red(`(compact failed: ${r.errorMsg})\n`));
+        const summary = r.text.trim();
+        if (!summary) return void out(c.dim("(compact produced nothing)\n"));
+        history.length = 0;
+        history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
+        stats.input += r.usage?.input ?? 0;
+        stats.output += r.usage?.output ?? 0;
+        saveSession(meta, history);
+        out(c.green(`(compacted — ${summary.length} chars; context replaced with the summary)\n`));
+      },
+    },
     { name: "reset", aliases: ["clear"], desc: "clear conversation context", run: () => void ((history.length = 0), out(c.dim("(context cleared)\n"))) },
     { name: "exit", aliases: ["quit"], desc: "leave", run: () => "exit" },
   ];
@@ -657,6 +694,8 @@ program.action(async (opts) => {
       out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
     }
     saveSession(meta, history);
+    const ctxPct = bar.ctxPctFor(cfg.model, stats.lastInput ?? 0);
+    if (ctxPct >= 80) out(c.yellow(`  ⚠ context ${ctxPct}% full — /compact to summarize, or /reset to clear\n`));
   }
   bar.uninstall();
   rl.close();

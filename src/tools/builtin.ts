@@ -1,9 +1,11 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname, resolve, isAbsolute } from "node:path";
+import { stdout as procOut } from "node:process";
 import { registerTool } from "./registry.js";
 import { runShell } from "../sandbox.js";
 import { nearestPaths } from "../fs-walk.js";
 import { showDiff } from "../diff.js";
+import { recordEdit } from "../undo.js";
 
 const MAX = 100_000;
 
@@ -50,7 +52,7 @@ registerTool({
   kind: "edit",
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
-    let prev = "";
+    let prev: string | null = null;
     try {
       prev = await readFile(p, "utf8");
     } catch {
@@ -58,7 +60,8 @@ registerTool({
     }
     await mkdir(dirname(p), { recursive: true });
     await writeFile(p, input.content, "utf8");
-    showDiff(input.path, prev, input.content);
+    showDiff(input.path, prev ?? "", input.content);
+    recordEdit([{ path: input.path, absPath: p, before: prev }]);
     return `Wrote ${String(input.content).length} chars to ${p}`;
   },
 });
@@ -76,10 +79,12 @@ registerTool({
   },
   kind: "exec",
   async run(input, ctx) {
+    const live = procOut.isTTY ? (s: string) => procOut.write(s) : undefined; // stream output in a terminal
     try {
       const { stdout, stderr } = await runShell(input.command, ctx.cwd, ctx.sandbox ?? "off", {
         timeout: input.timeout_ms ?? 120_000,
         maxBuffer: 10 * 1024 * 1024,
+        onData: live,
       });
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
       return cap(combined.trim() || "(no output)");

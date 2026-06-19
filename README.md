@@ -6,10 +6,11 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **v0.10** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
+🚧 **v0.14** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
 routes work to the role that owns it, and **`hara plan "<task>"`** decomposes a task into a verified
-DAG of atoms. **Streaming on every provider**, colored edit diffs, multi-file `apply_patch`,
-**Esc-to-interrupt**, a pinned status bar, `grep`/`glob`/`ls`, fuzzy `@file` completion, and did-you-mean. Track it: https://github.com/hara-cli/hara · https://hara.run
+DAG of atoms. **Streaming on every provider** with rendered Markdown + visible reasoning, colored
+edit diffs, multi-file `apply_patch`, **Esc-to-interrupt**, **`/undo`**, **`/compact`**, live shell
+output, a pinned status bar, `grep`/`glob`/`ls`/`web_fetch`, fuzzy `@file` completion, and did-you-mean. Track it: https://github.com/hara-cli/hara · https://hara.run
 
 ## Install
 
@@ -83,11 +84,15 @@ hara --profile work        # use a named profile from ~/.hara/config.json
 hara -m glm-5              # pick a model
 ```
 
-Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/usage` `/sessions` `/reset` `/exit`. Type `@` + Tab to attach a file (fuzzy, walks subdirectories).
+Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/usage` `/sessions` `/undo` `/compact` `/reset` `/exit`. Type `@` + Tab to attach a file (fuzzy, walks subdirectories).
 
 A **status bar** is pinned at the bottom showing the session name, the three approval modes (current
 highlighted), live token usage + context %, and a concurrent-operation count. **shift+tab** (or bare
 `/approval`) cycles the approval mode; **Esc** interrupts a running turn. Set `HARA_FOOTER=0` to disable the bar.
+
+Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
+and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal
+only; `HARA_MD=0` disables Markdown rendering.
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
 **Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).
@@ -108,21 +113,22 @@ sequences them as a DAG, and executes each step (optionally routed to a role) be
 **verify gate** — frame → atomize → sequence → execute → verify. Plan state is the SSOT at
 `.hara/org/plan.json` (inspectable; execution stops on the first failed verification).
 
-### What it can do (v0.2)
+### What it can do
 
 A streaming agentic loop with built-in tools — `read_file`, `write_file`, **`edit_file`** /
 **`apply_patch`** (surgical edits — single file, or **atomic multi-file** changes), `bash`, and
-read-only **`grep`** / **`glob`** / **`ls`** — behind a human-in-the-loop confirmation gate on the
+read-only **`grep`** / **`glob`** / **`ls`** / **`web_fetch`** — behind a human-in-the-loop confirmation gate on the
 dangerous ones unless `-y`. Read-only tools run in parallel within a turn, and edits print a
-**colored diff** of what changed. Press **Esc** to interrupt a running turn.
+**colored diff** of what changed. Shell output streams live; press **Esc** to interrupt a running
+turn, or **`/undo`** to revert the last edit.
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
 - **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. Mistyped tool/file paths get a "did you mean" suggestion.
 - **Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) — **all streamed live**.
 
 ### Roadmap
 
-MCP client · permission policies · session persistence (SQLite+FTS5) · streaming for OpenAI-compatible
-providers · and the **governed role-agent org** (routing, dispatcher, SSOT, approval gates, cron).
+Subagent parallelism · context auto-compaction · cron autonomy for the org · single-binary
+distribution · and an enterprise control-plane (fleet + central token management).
 
 ## License
 

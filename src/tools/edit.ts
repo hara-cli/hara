@@ -4,6 +4,7 @@ import { registerTool } from "./registry.js";
 import { nearestPaths } from "../fs-walk.js";
 import { showDiff } from "../diff.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
+import { recordEdit } from "../undo.js";
 
 registerTool({
   name: "edit_file",
@@ -56,6 +57,7 @@ registerTool({
     if ("error" in res) return `Error: ${res.error} in ${input.path}. No changes written.`;
     await writeFile(p, res.text, "utf8");
     showDiff(input.path, text, res.text);
+    recordEdit([{ path: input.path, absPath: p, before: text }]);
     const note = res.fuzzy ? " (quote-normalized)" : "";
     const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
     return `Edited ${input.path}: ${plural(edits.length, "edit")}, ${plural(res.total, "replacement")}${note}.`;

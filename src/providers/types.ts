@@ -27,6 +27,8 @@ export interface TurnArgs {
   history: NeutralMsg[];
   tools: ToolSpec[];
   onText: (delta: string) => void;
+  /** stream reasoning/thinking deltas (shown dimmed); optional, provider-dependent */
+  onReasoning?: (delta: string) => void;
   /** abort the in-flight request (user interrupt) */
   signal?: AbortSignal;
 }

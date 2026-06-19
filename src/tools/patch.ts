@@ -5,6 +5,7 @@ import { isAbsolute, resolve, dirname } from "node:path";
 import { registerTool } from "./registry.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
 import { showDiff } from "../diff.js";
+import { recordEdit } from "../undo.js";
 
 interface Change {
   path: string;
@@ -19,6 +20,7 @@ interface Plan {
   type: "update" | "create" | "delete";
   before: string;
   after: string | null; // null = delete
+  existed: boolean; // did the file exist before (for undo: false → undo deletes)
 }
 
 registerTool({
@@ -81,16 +83,18 @@ registerTool({
         } catch {
           return `Error: ${tag} delete ${ch.path}: file not found. Nothing written.`;
         }
-        plans.push({ path: ch.path, abs: p, type, before, after: null });
+        plans.push({ path: ch.path, abs: p, type, before, after: null, existed: true });
       } else if (type === "create") {
         if (typeof ch.content !== "string") return `Error: ${tag} create ${ch.path} needs \`content\`. Nothing written.`;
         let before = "";
+        let existed = false;
         try {
           before = await readFile(p, "utf8");
+          existed = true;
         } catch {
           /* new file */
         }
-        plans.push({ path: ch.path, abs: p, type, before, after: ch.content });
+        plans.push({ path: ch.path, abs: p, type, before, after: ch.content, existed });
       } else {
         // update
         let before: string;
@@ -100,11 +104,11 @@ registerTool({
           return `Error: ${tag} update ${ch.path}: cannot read (use type:create for a new file). Nothing written.`;
         }
         if (typeof ch.content === "string" && !ch.edits) {
-          plans.push({ path: ch.path, abs: p, type, before, after: ch.content });
+          plans.push({ path: ch.path, abs: p, type, before, after: ch.content, existed: true });
         } else {
           const res = applyEdits(before, ch.edits ?? []);
           if ("error" in res) return `Error: ${tag} ${ch.path} — ${res.error}. Nothing written.`;
-          plans.push({ path: ch.path, abs: p, type, before, after: res.text });
+          plans.push({ path: ch.path, abs: p, type, before, after: res.text, existed: true });
         }
       }
     }
@@ -123,6 +127,7 @@ registerTool({
         summary.push(`${pl.type === "create" ? "created" : "updated"} ${pl.path}`);
       }
     }
+    recordEdit(plans.map((pl) => ({ path: pl.path, absPath: pl.abs, before: pl.existed ? pl.before : null })));
     return `apply_patch: ${plans.length} file(s) — ${summary.join("; ")}.`;
   },
 });
