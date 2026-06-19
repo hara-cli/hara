@@ -6,8 +6,8 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **Early / v0.1** — a minimal but working single coding agent (the foundation). The governed
-multi-agent "org" layer is next on the roadmap. Track it: https://github.com/hara-cli/hara · https://hara.run
+🚧 **v0.5** — a multi-provider coding agent **and** a governed role-agent *org*: define role-agents and
+`hara org "<task>"` routes the work to the role that owns it. Track it: https://github.com/hara-cli/hara · https://hara.run
 
 ## Install
 
@@ -70,6 +70,8 @@ Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `H
 ```bash
 hara                       # interactive REPL (offers to create AGENTS.md on first run)
 hara init                  # analyze the project & (re)generate AGENTS.md
+hara roles init            # scaffold role-agents (implementer / reviewer / docs)
+hara org "review src/ for bugs"   # dispatch a task to the role that owns it (or --role <id>)
 hara -p "summarize @README.md and fix the lint errors in src/"   # one-shot; @path attaches a file
 hara --approval auto-edit  # suggest (default) | auto-edit | full-auto   (-y = full-auto)
 hara --sandbox workspace-write   # confine shell writes to the project (macOS Seatbelt)
@@ -85,6 +87,14 @@ Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/usage` `/sessio
 **Sessions**: conversations are saved automatically — `-c` / `--resume <id>` to continue, `hara sessions` to list.
 **MCP**: add an `mcpServers` map to config (global or project `.hara/config.json`); their tools appear to the agent as `mcp__<server>__<tool>`.
 **Profiles**: add a `profiles` map to `~/.hara/config.json` (`--profile <name>`), or drop a project-level `.hara/config.json` that overrides the global config.
+
+### The org — what makes hara different
+
+Define role-agents in `.hara/roles/*.md` — each is a persona (the file body) plus frontmatter: `owns`
+(keywords that route a task here), optional `rejects`, `model`, and `allowTools`/`denyTools`. `hara org
+"<task>"` routes the task to the role that **owns** it (keyword match, LLM fallback) and runs that role's
+agent — e.g. a read-only `reviewer` that reports issues vs an `implementer` that edits code. `hara roles`
+lists them, `hara roles init` scaffolds a starter set, and `--role <id>` forces a specific role.
 
 ### What it can do (v0.2)
 

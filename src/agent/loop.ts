@@ -11,13 +11,17 @@ export function needsConfirm(kind: string | undefined, mode: ApprovalMode): bool
   return true; // suggest: confirm edits and exec
 }
 
-const system = (cwd: string, projectContext?: string) =>
+const HARA_SYSTEM = (cwd: string) =>
   `You are hara, a coding agent running in the user's terminal.
 Working directory: ${cwd}
 Be concise and direct. Use the provided tools to read files, edit/write files, and run shell
 commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
-them whole. After completing a task, give a one-line summary.` +
-  (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "");
+them whole. After completing a task, give a one-line summary.`;
+
+function composeSystem(cwd: string, projectContext?: string, override?: string): string {
+  const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
+  return head + (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "");
+}
 
 export interface RunOpts {
   provider: Provider;
@@ -26,6 +30,10 @@ export interface RunOpts {
   confirm: (q: string) => Promise<boolean>;
   projectContext?: string;
   stats?: { input: number; output: number };
+  /** role persona used instead of the default hara system prompt */
+  systemOverride?: string;
+  /** restrict which tools this run may use (by name) */
+  toolFilter?: (name: string) => boolean;
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
@@ -33,7 +41,13 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   const { provider, ctx } = opts;
 
   for (;;) {
-    const r = await provider.turn({ system: system(ctx.cwd, opts.projectContext), history, tools: toolSpecs(), onText: out });
+    const specs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
+    const r = await provider.turn({
+      system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride),
+      history,
+      tools: specs,
+      onText: out,
+    });
     out("\n");
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;

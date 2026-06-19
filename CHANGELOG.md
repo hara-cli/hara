@@ -2,6 +2,16 @@
 
 All notable changes to `@nanhara/hara`.
 
+## 0.5.0 — unreleased (Phase 2: governed role-agent org — the differentiator)
+
+- **Roles** — markdown role-agents in `.hara/roles/*.md` (frontmatter: `name`, `description`, `owns[]`,
+  `rejects[]`, `model?`, `allowTools[]`/`denyTools[]`; body = persona). `hara roles` lists, `hara roles init` scaffolds.
+- **Dispatcher** — `hara org "<task>"` routes a task to the role that **owns** it (keyword match → LLM
+  fallback), or `--role <id>` to force one; runs that role's agent with its persona, tool subset, and model.
+  `/org` and `/roles` in the REPL.
+- hara now runs like an engineering org, not a single agent — a read-only `reviewer` vs an editing
+  `implementer`, each owning its slice of the work.
+
 ## 0.4.0 — unreleased (Tier-3)
 
 - **Sessions & resume** — conversations saved under `~/.hara/sessions`; `-c`/`--continue` resumes the latest

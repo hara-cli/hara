@@ -34,6 +34,8 @@ import {
   type SessionMeta,
   type SessionData,
 } from "./session/store.js";
+import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
+import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
 import { sandboxSupported, type SandboxMode } from "./sandbox.js";
 import type { Provider, NeutralMsg } from "./providers/types.js";
@@ -67,6 +69,71 @@ function authHint(cfg: HaraConfig): string {
 async function runInit(provider: Provider, cwd: string, sandbox: SandboxMode = "off"): Promise<void> {
   const history: NeutralMsg[] = [{ role: "user", content: INIT_PROMPT }];
   await runAgent(history, { provider, ctx: { cwd, sandbox }, approval: "full-auto", confirm: async () => true });
+}
+
+interface OrgOpts {
+  cfg: HaraConfig;
+  baseProvider: Provider;
+  cwd: string;
+  sandbox: SandboxMode;
+  approval: ApprovalMode;
+  confirm: (q: string) => Promise<boolean>;
+  projectContext?: string;
+  stats: { input: number; output: number };
+  forceRole?: string;
+}
+
+/** Dispatch a task to the owning role and run that role's agent (its persona + tool subset + model). */
+async function runOrg(task: string, o: OrgOpts): Promise<void> {
+  const roles = loadRoles(o.cwd);
+  if (!roles.length) {
+    out(c.yellow("No roles defined — run ") + c.bold("hara roles init") + c.yellow(" to scaffold some.\n"));
+    return;
+  }
+  let role: Role | undefined;
+  if (o.forceRole) {
+    role = roles.find((r) => r.id === o.forceRole);
+    if (!role) {
+      out(c.red(`No role '${o.forceRole}'. Available: ${roles.map((r) => r.id).join(", ")}\n`));
+      return;
+    }
+  } else {
+    const kw = routeByKeywords(task, roles);
+    if (kw) {
+      role = kw.role;
+    } else {
+      const r = await o.baseProvider.turn({
+        system: "You are a task dispatcher. Reply with only a role id.",
+        history: [{ role: "user", content: buildDispatchPrompt(task, roles) }],
+        tools: [],
+        onText: () => {},
+      });
+      role = parseRoleId(r.text, roles) ?? roles[0];
+    }
+  }
+  out(c.dim(`→ ${role.id} owns this task\n`));
+
+  const roleProvider =
+    role.model && role.model !== o.cfg.model
+      ? ((await buildProvider({ ...o.cfg, model: role.model })) ?? o.baseProvider)
+      : o.baseProvider;
+  const toolFilter = role.allowTools
+    ? (n: string) => role!.allowTools!.includes(n)
+    : role.denyTools
+      ? (n: string) => !role!.denyTools!.includes(n)
+      : undefined;
+
+  const history: NeutralMsg[] = [{ role: "user", content: expandMentions(task, o.cwd) }];
+  await runAgent(history, {
+    provider: roleProvider,
+    ctx: { cwd: o.cwd, sandbox: o.sandbox },
+    approval: o.approval,
+    confirm: o.confirm,
+    projectContext: o.projectContext,
+    stats: o.stats,
+    systemOverride: role.system,
+    toolFilter,
+  });
 }
 
 function mentionCompleter(line: string, cwd: string): [string[], string] {
@@ -128,6 +195,55 @@ program
       out(`${c.bold(m.id)}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${m.provider}:${m.model}  ${m.title}\n`);
     }
   });
+
+program
+  .command("org <task...>")
+  .description("dispatch a task to the owning role and run it")
+  .option("--role <id>", "force a specific role")
+  .action(async (taskParts: string[], opts2: { role?: string }) => {
+    const cfg = loadConfig();
+    const provider = await buildProvider(cfg);
+    if (!provider) {
+      out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
+      process.exit(1);
+    }
+    const stats = { input: 0, output: 0 };
+    await runOrg(taskParts.join(" "), {
+      cfg,
+      baseProvider: provider,
+      cwd: cfg.cwd,
+      sandbox: cfg.sandbox,
+      approval: "full-auto",
+      confirm: async () => true,
+      projectContext: loadAgentsMd(cfg.cwd) || undefined,
+      stats,
+      forceRole: opts2.role,
+    });
+    if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
+  });
+
+const rolesCmd = program.command("roles").description("manage org roles (.hara/roles)");
+rolesCmd
+  .command("init")
+  .description("scaffold example roles")
+  .action(() => {
+    const written = scaffoldRoles(process.cwd());
+    out(
+      written.length
+        ? c.green(`Created ${written.length} file(s) in .hara/roles/: ${written.join(", ")}\n`)
+        : c.dim("Roles already exist in .hara/roles/.\n"),
+    );
+  });
+rolesCmd.action(() => {
+  const roles = loadRoles(process.cwd());
+  if (!roles.length) {
+    out(c.dim("No roles. Run `hara roles init`.\n"));
+    return;
+  }
+  for (const r of roles) {
+    out(`${c.bold(r.id)}${r.model ? c.dim(` (${r.model})`) : ""}  ${c.dim("owns: " + r.owns.join(", "))}\n  ${r.description}\n`);
+  }
+});
 
 const login = program.command("login").description("authenticate a provider");
 login
@@ -312,6 +428,24 @@ program.action(async (opts) => {
       },
     },
     { name: "usage", desc: "show token usage this session", run: () => void out(statusLine(cfg.model, stats.input, stats.output) + "\n") },
+    {
+      name: "roles",
+      desc: "list org roles",
+      run: () => {
+        const rs = loadRoles(cwd);
+        if (!rs.length) return void out(c.dim("No roles. Run `hara roles init`.\n"));
+        for (const r of rs) out(`  ${r.id}  ${c.dim("owns: " + r.owns.join(", "))}\n`);
+      },
+    },
+    {
+      name: "org",
+      desc: "dispatch a task to the owning role: /org <task>",
+      run: async (a) => {
+        if (!a) return void out(c.dim("usage: /org <task>\n"));
+        await runOrg(a, { cfg, baseProvider: provider, cwd, sandbox, approval, confirm, projectContext, stats });
+        out(statusLine(cfg.model, stats.input, stats.output) + "\n");
+      },
+    },
     {
       name: "sessions",
       desc: "list saved sessions",
