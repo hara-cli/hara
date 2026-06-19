@@ -1,10 +1,6 @@
-// REPL status line — session name · the 3 approval modes (current highlighted) · token usage + ctx%
-// · concurrent-op count. Rendered as a header just above each prompt (call `render()` per loop turn).
-//
-// NOTE: an earlier version tried to PIN this to the terminal bottom via a scroll region (DECSTBM),
-// but Node's `readline` doesn't know about reserved rows, so it didn't render reliably. True bottom
-// pinning needs a full TUI (ink/ratatui) — a separate effort. A per-prompt header is robust and works
-// everywhere. The `footerLines` composer is pure, for tests.
+// REPL input frame — a border line above and below the prompt, session name in the top-right,
+// mode/tokens/concurrency in the bottom border. Drawn around the readline prompt (plain printed
+// lines — no scroll region, works everywhere). `borderTop`/`borderBottom` are pure, for tests.
 import { stdout } from "node:process";
 import { c } from "./ui.js";
 import { activity } from "./activity.js";
@@ -28,13 +24,8 @@ const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
 const vlen = (s: string): number => stripAnsi(s).length;
 const fmtTok = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
 const truncate = (s: string, max: number): string => (s.length <= max ? s : s.slice(0, Math.max(0, max - 1)) + "…");
+const rule = (n: number): string => c.dim("─".repeat(Math.max(0, n)));
 
-function padBetween(left: string, right: string, cols: number): string {
-  const gap = Math.max(1, cols - vlen(left) - vlen(right));
-  return left + " ".repeat(gap) + right;
-}
-
-/** Rough context-window estimate for the ctx% gauge (UI hint only; not authoritative). */
 export function contextWindow(model: string): number {
   const m = model.toLowerCase();
   if (/haiku/.test(m)) return 200_000;
@@ -44,44 +35,48 @@ export function contextWindow(model: string): number {
 export const ctxPctFor = (model: string, lastInput: number): number =>
   lastInput > 0 ? Math.min(99, Math.round((lastInput / contextWindow(model)) * 100)) : 0;
 
-/** Pure status composer — two lines fit to `cols`, with `agents` concurrent ops. */
-export function footerLines(s: BarState, cols: number, agents: number): string[] {
-  const sel = MODES.map((m) => (m === s.approval ? c.green(c.bold(`◆${m}`)) : c.dim(m))).join("  ");
-  const name = truncate(s.sessionName || "new session", Math.max(8, cols - vlen(stripAnsi(sel)) - 8));
-  const line1 = ` ${c.cyan("⏺")} ${c.bold(name)}   ${sel}`;
+/** Top border with the session name in the right corner: `────────── ⏺ session ─` */
+export function borderTop(s: BarState, cols: number): string {
+  const name = truncate(s.sessionName || "new session", Math.max(8, cols - 14));
+  const label = `${c.cyan("⏺")} ${c.bold(name)}`;
+  return rule(cols - vlen(label) - 3) + " " + label + " " + rule(1);
+}
+
+/** Bottom border carrying mode · tokens · concurrency: `── ◆suggest auto-edit full-auto · ↑0 ↓0 · ⛁ ──` */
+export function borderBottom(s: BarState, cols: number, agents: number): string {
+  const sel = MODES.map((m) => (m === s.approval ? c.green(`◆${m}`) : c.dim(m))).join(" ");
   const ctx = s.ctxPct > 0 ? ` · ctx ${s.ctxPct}%` : "";
-  const usage = c.dim(`↑${fmtTok(s.input)} ↓${fmtTok(s.output)}${ctx}`);
-  const ag = agents > 0 ? c.yellow(`⛁ ${agents} agents`) : c.dim("⛁ idle");
-  const line2 = padBetween(` ${usage}`, `${ag} `, cols);
-  return [line1, line2];
+  const ag = agents > 0 ? c.yellow(`⛁${agents}`) : c.dim("⛁");
+  const info = `${sel} ${c.dim("·")} ${c.dim(`↑${fmtTok(s.input)} ↓${fmtTok(s.output)}${ctx}`)} ${c.dim("·")} ${ag}`;
+  return rule(2) + " " + info + " " + rule(cols - vlen(info) - 4);
 }
 
 export function install(initial: Partial<BarState>): void {
   state = { ...state, ...initial };
   active = process.env.HARA_FOOTER !== "0" && !!stdout.isTTY;
 }
-
 export function update(partial: Partial<BarState>): void {
   state = { ...state, ...partial };
 }
-
-/** Print the status header above the next prompt (call once per REPL loop iteration). */
-export function render(): void {
-  if (!active) return;
-  const lines = footerLines(state, stdout.columns ?? 80, activity.running);
+const w = (s: string): void => {
   try {
-    stdout.write(c.dim("─".repeat(Math.min(stdout.columns ?? 80, 60))) + "\n" + lines.join("\n") + "\n");
+    stdout.write(s);
   } catch {
-    /* ignore write errors */
+    /* ignore */
   }
+};
+/** Top border — call right before the prompt. */
+export function renderTop(): void {
+  if (active) w(borderTop(state, stdout.columns ?? 80) + "\n");
 }
-
+/** Bottom border — call right after the prompt is submitted. */
+export function renderBottom(): void {
+  if (active) w(borderBottom(state, stdout.columns ?? 80, activity.running) + "\n");
+}
 export const isActive = (): boolean => active;
 export function uninstall(): void {
-  /* no-op (header model — nothing pinned to tear down) */
+  /* no-op (border model — nothing pinned) */
 }
-
-/** Next approval mode in the cycle (for shift+tab / bare /approval). */
 export function nextMode(m: ApprovalMode): ApprovalMode {
   return MODES[(MODES.indexOf(m) + 1) % MODES.length];
 }

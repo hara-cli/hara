@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { walkFiles, dirPrefixes, listProjectFiles } from "../dist/fs-walk.js";
 import { fileCandidates } from "../dist/context/mentions.js";
 import { activity } from "../dist/activity.js";
-import { footerLines, ctxPctFor, nextMode } from "../dist/statusbar.js";
+import { borderTop, borderBottom, ctxPctFor, nextMode } from "../dist/statusbar.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/search.js";
 import "../dist/tools/edit.js";
@@ -129,18 +129,16 @@ test("activity: inc/dec tracks running + peak", () => {
   assert.equal(activity.running, base);
 });
 
-test("statusbar: footerLines composes 2 lines with name/mode/tokens/agents", () => {
-  const lines = footerLines(
-    { sessionName: "refactor auth", model: "claude-opus-4-8", approval: "suggest", input: 12400, output: 3100, ctxPct: 8 },
-    80,
-    3,
-  );
-  assert.equal(lines.length, 2);
-  assert.match(lines[0], /refactor auth/);
-  assert.match(lines[0], /suggest/);
-  assert.match(lines[1], /12\.4k/);
-  assert.match(lines[1], /ctx 8%/);
-  assert.match(lines[1], /3 agents/);
+test("statusbar: borderTop/borderBottom frame name/mode/tokens/agents", () => {
+  const s = { sessionName: "refactor auth", model: "claude-opus-4-8", approval: "suggest", input: 12400, output: 3100, ctxPct: 8 };
+  const top = borderTop(s, 80);
+  const bottom = borderBottom(s, 80, 3);
+  assert.match(top, /⏺/);
+  assert.match(top, /refactor auth/);
+  assert.match(bottom, /suggest/);
+  assert.match(bottom, /12\.4k/);
+  assert.match(bottom, /ctx 8%/);
+  assert.match(bottom, /⛁3/);
 });
 
 test("statusbar: ctxPctFor + nextMode cycle", () => {

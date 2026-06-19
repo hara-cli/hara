@@ -6,11 +6,11 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **v0.17** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
+🚧 **v0.18** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
 routes work to the role that owns it, and **`hara plan "<task>"`** decomposes a task into a verified
 DAG of atoms. **Streaming on every provider** with rendered Markdown + visible reasoning, colored
 edit diffs, multi-file `apply_patch`, **Esc-to-interrupt**, **`/undo`**, **`/compact`**, live shell
-output, a pinned status bar, `grep`/`glob`/`ls`/`web_fetch`, fuzzy `@file` completion, did-you-mean, a personal `recall` code-asset library, and **parallel sub-agents**. Track it: https://github.com/hara-cli/hara · https://hara.run
+output, an **ink TUI** (a bordered input box pinned at the bottom), `grep`/`glob`/`ls`/`web_fetch`, fuzzy `@file` completion, did-you-mean, a personal `recall` code-asset library, and **parallel sub-agents**. Track it: https://github.com/hara-cli/hara · https://hara.run
 
 ## Install
 
@@ -87,9 +87,11 @@ hara -m glm-5              # pick a model
 
 Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/usage` `/doctor` `/sessions` `/undo` `/compact` `/recall` `/reset` `/exit` (type `/`+Tab to complete). Type `@` + Tab to attach a file (fuzzy, walks subdirectories).
 
-A **status header** prints above each prompt — session name, the three approval modes (current
-highlighted), token usage + context %, and a concurrent-op count. **shift+tab** (or bare `/approval`)
-cycles the approval mode; **Esc** interrupts a running turn. Set `HARA_FOOTER=0` to hide it.
+The interactive REPL is an **ink TUI**: a bordered **input box pinned at the bottom** — session name in
+the top-right corner, approval modes + token usage + concurrency in the bottom border — with the
+conversation scrolling above it. Streaming text, reasoning, tool calls, and colored diffs render as live
+blocks; a spinner runs during a turn. **shift+tab** cycles the approval mode, **Esc** interrupts a running
+turn, and tool approvals appear inline (y/N). Set `HARA_TUI=0` for the classic readline REPL.
 
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal

@@ -1,11 +1,23 @@
 import type { ToolSpec } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
 
+/** Where agent-side output goes. In the TUI it drives ink state; in plain mode it's absent and
+ *  the loop/tools fall back to writing the terminal directly. */
+export interface UiSink {
+  text(delta: string): void;
+  reasoning(delta: string): void;
+  tool(name: string, preview: string): void;
+  diff(text: string): void;
+  notice(text: string): void;
+}
+
 export interface ToolContext {
   cwd: string;
   sandbox?: SandboxMode;
   /** spawn a sub-agent for a sub-task (set by the REPL/-p; absent inside sub-agents) */
   spawn?: (task: string, role?: string) => Promise<string>;
+  /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */
+  ui?: UiSink;
 }
 
 export interface Tool {

@@ -4,7 +4,7 @@ import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { isAbsolute, resolve, dirname } from "node:path";
 import { registerTool } from "./registry.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
-import { showDiff } from "../diff.js";
+import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
 
 interface Change {
@@ -118,12 +118,12 @@ registerTool({
     for (const pl of plans) {
       if (pl.type === "delete") {
         await unlink(pl.abs);
-        showDiff(pl.path, pl.before, "");
+        emitDiff(pl.path, pl.before, "", ctx.ui);
         summary.push(`deleted ${pl.path}`);
       } else {
         await mkdir(dirname(pl.abs), { recursive: true });
         await writeFile(pl.abs, pl.after as string, "utf8");
-        showDiff(pl.path, pl.before, pl.after as string);
+        emitDiff(pl.path, pl.before, pl.after as string, ctx.ui);
         summary.push(`${pl.type === "create" ? "created" : "updated"} ${pl.path}`);
       }
     }

@@ -30,7 +30,9 @@ export interface RunOpts {
   provider: Provider;
   ctx: ToolContext;
   approval: ApprovalMode;
-  confirm: (q: string) => Promise<boolean>;
+  confirm: (q: string) => Promise<boolean | "always">;
+  /** tool names auto-approved for the rest of the session (chosen via "don't ask again") */
+  autoApprove?: Set<string>;
   projectContext?: string;
   stats?: { input: number; output: number; lastInput?: number };
   /** role persona used instead of the default hara system prompt */
@@ -49,7 +51,8 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
 
   for (;;) {
     const specs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
-    const tty = stdout.isTTY && !opts.quiet;
+    const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
+    const tty = stdout.isTTY && !opts.quiet && !sink;
     const md = tty && process.env.HARA_MD !== "0" ? makeRenderer(out) : null;
     let sawReasoning = false;
     // "working Ns" spinner until the first output arrives (cleared on text/reasoning or turn end)
@@ -73,6 +76,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       tools: specs,
       onText: (d) => {
         if (opts.quiet) return;
+        if (sink) {
+          sink.text(d);
+          return;
+        }
         stopSpin();
         if (sawReasoning) {
           out("\n");
@@ -81,18 +88,24 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         if (md) md.push(d);
         else out(d);
       },
-      onReasoning: tty
-        ? (d) => {
-            stopSpin();
-            sawReasoning = true;
-            out(c.dim(d));
-          }
-        : undefined,
+      onReasoning:
+        sink || tty
+          ? (d) => {
+              if (opts.quiet) return;
+              if (sink) {
+                sink.reasoning(d);
+                return;
+              }
+              stopSpin();
+              sawReasoning = true;
+              out(c.dim(d));
+            }
+          : undefined,
       signal: opts.signal,
     });
     stopSpin();
     md?.end();
-    if (!opts.quiet) out("\n");
+    if (!opts.quiet && !sink) out("\n");
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;
       opts.stats.output += r.usage.output;
@@ -101,7 +114,11 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 
     if (r.stop === "error") {
-      if (!opts.quiet) out(r.errorMsg === "interrupted" ? c.dim("\n(interrupted)\n") : c.red(`[${provider.id} error] ${r.errorMsg ?? "unknown"}\n`));
+      const msg = r.errorMsg === "interrupted" ? "(interrupted)" : `[${provider.id} error] ${r.errorMsg ?? "unknown"}`;
+      if (!opts.quiet) {
+        if (sink) sink.notice(msg);
+        else out(r.errorMsg === "interrupted" ? c.dim(`\n${msg}\n`) : c.red(`${msg}\n`));
+      }
       return;
     }
     if (r.stop !== "tool_use") return;
@@ -123,15 +140,20 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       const preview = String(input.path ?? input.command ?? input.pattern ?? input.url ?? input.task ?? "")
         .replace(/\s+/g, " ")
         .trim();
-      if (needsConfirm(tool.kind, opts.approval)) {
-        const ok = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
-        if (!ok) {
+      if (needsConfirm(tool.kind, opts.approval) && !opts.autoApprove?.has(tu.name)) {
+        const reply = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
+        if (reply === false) {
           plans.push({ tu, tool, denied: "User denied this action." });
           continue;
         }
+        if (reply === "always") opts.autoApprove?.add(tu.name);
       }
       plans.push({ tu, tool });
-      if (!opts.quiet) out(c.dim(`  ↳ ${tu.name}${preview ? " " + preview.slice(0, 80) : ""}\n`));
+      if (!opts.quiet) {
+        const pv = preview ? preview.slice(0, 80) : "";
+        if (sink) sink.tool(tu.name, pv);
+        else out(c.dim(`  ↳ ${tu.name}${pv ? " " + pv : ""}\n`));
+      }
     }
 
     // Execute: read-only tools run concurrently; edit/exec run alone, in order.

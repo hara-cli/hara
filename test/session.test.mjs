@@ -34,7 +34,7 @@ test("session: save → load round-trip, title, latestForCwd, list", () => {
     const loaded = loadSession(id);
     assert.ok(loaded);
     assert.equal(loaded.meta.id, id);
-    assert.equal(loaded.meta.title, "hello world task");
+    assert.equal(loaded.meta.title, "hello-world-task"); // clean ASCII slug
     assert.equal(loaded.history.length, 2);
     assert.equal(latestForCwd(cwd)?.meta.id, id);
     assert.ok(listSessions(cwd).some((m) => m.id === id));

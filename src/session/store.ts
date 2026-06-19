@@ -28,10 +28,29 @@ const sessionFile = (id: string) => join(sessionsDir(), `${id}.json`);
 
 export const newSessionId = (): string => randomUUID().slice(0, 8);
 
+const STOP = new Set(
+  "the a an to of for and or with in on at my our your this that it is please can could you help me we add fix make do run create update change implement".split(" "),
+);
+const WORDS = "amber basalt cedar delta ember flint grove harbor indigo jade kelp larch maple onyx quartz river slate terra umber vale willow zephyr".split(" ");
+
+/** A short, ASCII, few-word session name from the first message — no CJK or garbled chars. For
+ *  all-CJK / empty input, a stable word derived from the text. Keeps the status bar tidy. */
+export function cleanSessionName(raw: string): string {
+  const words = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]+/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 1 && !STOP.has(w));
+  const slug = words.slice(0, 3).join("-").slice(0, 24).replace(/^-+|-+$/g, "");
+  if (slug) return slug;
+  let h = 0;
+  for (const ch of raw) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return WORDS[h % WORDS.length] ?? "session";
+}
+
 export function titleFrom(history: NeutralMsg[]): string {
   const firstUser = history.find((h) => h.role === "user");
-  const t = firstUser && firstUser.role === "user" ? firstUser.content : "session";
-  return t.replace(/\s+/g, " ").trim().slice(0, 60) || "session";
+  return cleanSessionName(firstUser && firstUser.role === "user" ? firstUser.content : "");
 }
 
 export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {

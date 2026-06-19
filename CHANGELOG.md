@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.18.0 — unreleased (ink TUI)
+
+- **New terminal UI — a real TUI (ink 6 + React 19).** The interactive REPL is now a **bordered input
+  box pinned at the bottom**: the session name sits in the top-right corner, and the approval modes +
+  token usage + concurrent-agent count live in the bottom border, with the conversation scrolling above.
+  Streaming assistant text, dim reasoning, tool calls, and colored diffs render as live blocks; a spinner
+  shows while a turn runs (**Esc** interrupts); tool-approval prompts appear inline (y/N); **shift+tab**
+  cycles the approval mode. Same approach Claude Code itself uses (ink). `HARA_TUI=0` falls back to the
+  classic readline REPL.
+- The agent loop + tools now emit through a `UiSink` so output is rendered by ink (not raw stdout),
+  keeping the TUI uncorrupted; the plain path is unchanged when no sink is present (`-p`, pipes, sub-agents).
+- TUI slash commands: `/help` `/tools` `/model` `/undo` `/recall` `/reset` `/exit` (others → `HARA_TUI=0`).
+
 ## 0.17.1 — unreleased (status bar actually renders)
 
 - **Fix: the status bar now shows.** The pinned-footer (v0.6) used a terminal scroll region that

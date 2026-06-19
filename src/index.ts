@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
+import { runTui } from "./tui/run.js";
 import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -519,6 +520,7 @@ program.action(async (opts) => {
   const cwd = cfg.cwd;
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
   let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it
+  const autoApprove = new Set<string>(); // tools the user chose "don't ask again" for, this session
   let recalledContext = ""; // snippets queued by /recall, prepended to the next message
   const sandbox: SandboxMode = (opts.sandbox as SandboxMode) || cfg.sandbox;
   if (sandbox !== "off" && !sandboxSupported()) {
@@ -547,7 +549,8 @@ program.action(async (opts) => {
     return;
   }
 
-  // interactive REPL
+  // interactive REPL — ink TUI by default on a real terminal; HARA_TUI=0 forces the classic readline path
+  const useTui = stdin.isTTY && stdout.isTTY && process.env.HARA_TUI !== "0";
   out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}${sandbox !== "off" ? `  ·  sandbox:${sandbox}` : ""}  ·  ${cwd}\n`));
   const rl = createInterface({
     input: stdin,
@@ -562,9 +565,9 @@ program.action(async (opts) => {
     },
   });
   const confirm = async (q: string) => (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
-  // shift+tab cycles the approval mode (TTY only — emitKeypressEvents would eat piped stdin).
+  // shift+tab cycles the approval mode (classic REPL only; the TUI handles its own keys).
   // Bare /approval is the reliable fallback everywhere.
-  if (stdin.isTTY) {
+  if (stdin.isTTY && !useTui) {
     try {
       emitKeypressEvents(stdin);
       stdin.on("keypress", (_s: string, key: { name?: string; shift?: boolean } | undefined) => {
@@ -755,6 +758,17 @@ program.action(async (opts) => {
         out(c.green(`↗ recalled ${hits.length}: ${hits.map((h) => h.path).join(", ")} (added to your next message)\n`));
       },
     },
+    {
+      name: "name",
+      desc: "rename this session: /name <name>",
+      run: (a) => {
+        if (!a) return void out(c.dim(`session: ${meta.title || "(unnamed)"}\n`));
+        meta.title = a.slice(0, 32);
+        if (bar.isActive()) bar.update({ sessionName: meta.title });
+        saveSession(meta, history);
+        out(c.green(`(renamed → ${meta.title})\n`));
+      },
+    },
     { name: "reset", aliases: ["clear"], desc: "clear conversation context", run: () => void ((history.length = 0), (recalledContext = ""), out(c.dim("(context cleared)\n"))) },
     { name: "exit", aliases: ["quit"], desc: "leave", run: () => "exit" },
   ];
@@ -762,6 +776,92 @@ program.action(async (opts) => {
   for (const cmd of commands) {
     byName.set(cmd.name, cmd);
     for (const a of cmd.aliases ?? []) byName.set(a, cmd);
+  }
+
+  if (useTui) {
+    rl.close(); // hand stdin over to ink
+    await runTui({
+      initialStatus: { sessionName: meta.title || "new session", approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
+      model: cfg.model,
+      cwd,
+      header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
+      cycleApproval: (m) => bar.nextMode(m),
+      onSubmit: async (line, h) => {
+        if (line.startsWith("/")) {
+          const [nm, ...rest] = line.slice(1).split(/\s+/);
+          const arg = rest.join(" ").trim();
+          if (nm === "exit" || nm === "quit") return void h.exit();
+          if (nm === "help") return void h.sink.notice(commands.map((x) => `/${x.name} — ${x.desc}`).join("\n"));
+          if (nm === "tools")
+            return void h.sink.notice(getTools().map((t) => `${t.name}${t.kind !== "read" ? " *" : ""} — ${t.description}`).join("\n"));
+          if (nm === "reset" || nm === "clear") {
+            history.length = 0;
+            recalledContext = "";
+            return void h.sink.notice("(context cleared)");
+          }
+          if (nm === "undo") {
+            const r = await undoLast();
+            return void h.sink.notice("error" in r ? `(${r.error})` : `↩ reverted: ${r.files.join(", ")}`);
+          }
+          if (nm === "model") {
+            if (!arg) return void h.sink.notice(`model: ${cfg.provider}:${cfg.model}`);
+            cfg.model = arg;
+            const p = await buildProvider(cfg);
+            if (p) {
+              provider = p;
+              return void h.sink.notice(`(model → ${cfg.provider}:${arg})`);
+            }
+            return void h.sink.notice("(could not rebuild provider)");
+          }
+          if (nm === "recall") {
+            if (!arg) return void h.sink.notice("usage: /recall <query>");
+            const hits = searchAssets(arg, 3);
+            if (!hits.length) return void h.sink.notice(`(no matches in ${assetsDir()})`);
+            recalledContext += (recalledContext ? "\n\n" : "") + hits.map((x) => `Recalled \`${x.path}\` (${x.title}):\n${x.snippet}`).join("\n\n");
+            return void h.sink.notice(`↗ recalled ${hits.length}: ${hits.map((x) => x.path).join(", ")} (added to your next message)`);
+          }
+          if (nm === "name") {
+            if (!arg) return void h.sink.notice(`session: ${meta.title || "(unnamed)"}`);
+            meta.title = arg.slice(0, 32);
+            h.sink.session(meta.title);
+            saveSession(meta, history);
+            return void h.sink.notice(`(renamed → ${meta.title})`);
+          }
+          if (byName.has(nm))
+            return void h.sink.notice(`/${nm} isn't wired into the TUI yet — run with HARA_TUI=0 for the classic REPL.`);
+          const near = nearest(nm, [...byName.keys()]);
+          return void h.sink.notice(`Unknown command /${nm}.${near.length ? " Did you mean " + near.map((n) => "/" + n).join(", ") + "?" : ""}`);
+        }
+        const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd);
+        recalledContext = "";
+        history.push({ role: "user", content: userContent });
+        const beforeIn = stats.input;
+        const beforeOut = stats.output;
+        await runAgent(history, {
+          provider,
+          ctx: {
+            cwd,
+            sandbox,
+            spawn,
+            ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice },
+          },
+          approval: h.approval,
+          confirm: h.confirm,
+          autoApprove,
+          projectContext,
+          stats,
+          signal: h.signal,
+        });
+        if (!meta.title) {
+          meta.title = titleFrom(history);
+          h.sink.session(meta.title);
+        }
+        h.sink.usage(stats.input - beforeIn, stats.output - beforeOut);
+        saveSession(meta, history);
+      },
+    });
+    await closeMcp();
+    process.exit(0); // TUI done — exit cleanly (ink can leave stdin referenced)
   }
 
   out(c.dim(`Type a task. /help · @path attaches a file · shift+tab cycles mode · Esc interrupts · /exit to quit.${projectContext ? "  (AGENTS.md loaded)" : ""}\n\n`));
@@ -776,13 +876,14 @@ program.action(async (opts) => {
   });
 
   for (;;) {
-    bar.render(); // status header above the prompt
+    bar.renderTop(); // top border + session name
     let line: string;
     try {
-      line = (await rl.question(c.cyan("hara> "))).trim();
+      line = (await rl.question(c.cyan("› "))).trim();
     } catch {
       break;
     }
+    bar.renderBottom(); // bottom border + modes/usage
     if (!line) continue;
     if (line.startsWith("/")) {
       const [name, ...rest] = line.slice(1).split(/\s+/);
@@ -802,7 +903,7 @@ program.action(async (opts) => {
     history.push({ role: "user", content: userContent });
     currentTurn = new AbortController();
     try {
-      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, projectContext, stats, signal: currentTurn.signal });
+      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, stats, signal: currentTurn.signal });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     } finally {

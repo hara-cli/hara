@@ -4,7 +4,7 @@ import { stdout as procOut } from "node:process";
 import { registerTool } from "./registry.js";
 import { runShell } from "../sandbox.js";
 import { nearestPaths } from "../fs-walk.js";
-import { showDiff } from "../diff.js";
+import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
 
 const MAX = 100_000;
@@ -60,7 +60,7 @@ registerTool({
     }
     await mkdir(dirname(p), { recursive: true });
     await writeFile(p, input.content, "utf8");
-    showDiff(input.path, prev ?? "", input.content);
+    emitDiff(input.path, prev ?? "", input.content, ctx.ui);
     recordEdit([{ path: input.path, absPath: p, before: prev }]);
     return `Wrote ${String(input.content).length} chars to ${p}`;
   },
@@ -79,13 +79,26 @@ registerTool({
   },
   kind: "exec",
   async run(input, ctx) {
-    const live = procOut.isTTY ? (s: string) => procOut.write(s) : undefined; // stream output in a terminal
+    let buf = ""; // TUI: line-buffer live output into the sink (one notice per line)
+    const live = ctx.ui
+      ? (s: string) => {
+          buf += s;
+          let i: number;
+          while ((i = buf.indexOf("\n")) >= 0) {
+            ctx.ui!.notice(buf.slice(0, i));
+            buf = buf.slice(i + 1);
+          }
+        }
+      : procOut.isTTY
+        ? (s: string) => procOut.write(s) // stream output in a plain terminal
+        : undefined;
     try {
       const { stdout, stderr } = await runShell(input.command, ctx.cwd, ctx.sandbox ?? "off", {
         timeout: input.timeout_ms ?? 120_000,
         maxBuffer: 10 * 1024 * 1024,
         onData: live,
       });
+      if (ctx.ui && buf) ctx.ui.notice(buf); // flush trailing partial line
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
       return cap(combined.trim() || "(no output)");
     } catch (e: any) {

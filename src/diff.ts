@@ -92,3 +92,9 @@ export function showDiff(path: string, oldText: string, newText: string): void {
   const d = renderDiff(path, oldText, newText);
   if (d) stdout.write(d);
 }
+
+/** Route a diff to the UI sink (TUI) when present, else print it to the terminal. */
+export function emitDiff(path: string, oldText: string, newText: string, sink?: { diff(t: string): void }): void {
+  if (sink) sink.diff(renderDiff(path, oldText, newText));
+  else showDiff(path, oldText, newText);
+}

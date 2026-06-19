@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.17.1",
+  "version": "0.18.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "dist/index.js"
@@ -49,10 +49,14 @@
     "@anthropic-ai/sdk": "^0.104.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "commander": "^15.0.0",
-    "openai": "^6.44.0"
+    "ink": "^6.8.0",
+    "openai": "^6.44.0",
+    "react": "^19.2.7"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",
+    "@types/react": "^19.2.17",
+    "ink-testing-library": "^4.0.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }
