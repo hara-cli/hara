@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.20.0 — unreleased (memory + self-evolution · M1)
+
+- **Long-term memory** — a lexical, file-backed store (no embeddings): global `~/.hara/memory/` + project
+  `<root>/.hara/memory/` (`MEMORY.md` / `USER.md` / daily logs). Tools: `memory_search`, `memory_get`,
+  `memory_write`, `memory_forget`. The agent recalls before answering about prior decisions and is nudged to
+  **proactively save** durable facts (conventions, your preferences, tricky solutions).
+- **Injection** — a capped MEMORY/USER digest is added to the system prompt (frozen snapshot at session
+  start), reusing the `recall` lexical engine over the memory roots.
+- **Short-term working memory** — `SessionMeta.workingSet` survives `/compact` (which used to wipe it) and
+  resume; `/compact` distills its summary into it.
+- **Global roles** — `~/.hara/roles/*.md` (reusable personas) alongside project `.hara/roles/`; project wins
+  on name clash — the same global/project scoping as memory + config.
+- 74 offline tests; zero new runtime deps. (M2 = playbooks + AGENTS.md self-refine + a guard + session-end distill.)
+
 ## 0.19.0 — unreleased (plan mode + theme)
 
 - **Plan mode** — a 4th `shift+tab` mode. hara goes **read-only** (`read_file`/`grep`/`glob`/`ls`/`web_fetch`),

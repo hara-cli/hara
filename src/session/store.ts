@@ -13,6 +13,8 @@ export interface SessionMeta {
   title: string;
   createdAt: string;
   updatedAt: string;
+  /** short-term working memory — a few durable one-liners that survive /compact + resume */
+  workingSet?: string[];
 }
 export interface SessionData {
   meta: SessionMeta;

@@ -4,6 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
 import { setTheme } from "./tui/theme.js";
+import { memoryDigest } from "./memory/store.js";
 import { nextMode as cycleMode } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync } from "node:fs";
@@ -56,6 +57,7 @@ import "./tools/search.js"; // register grep/glob/ls
 import "./tools/patch.js"; // register apply_patch
 import "./tools/web.js"; // register web_fetch
 import "./tools/agent.js"; // register agent (subagent spawn)
+import "./tools/memory.js"; // register memory_search/get/write/forget
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
@@ -622,6 +624,9 @@ program.action(async (opts) => {
     updatedAt: "",
   };
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
+  const memorySnap = memoryDigest(cwd); // durable memory, read once (frozen snapshot)
+  const buildMemory = (): string =>
+    (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
   if (resumed) out(c.dim(`(resumed ${meta.id} · ${history.length} msgs)\n`));
 
   const commands: Slash[] = [
@@ -744,6 +749,13 @@ program.action(async (opts) => {
         if (r.stop === "error") return void out(c.red(`(compact failed: ${r.errorMsg})\n`));
         const summary = r.text.trim();
         if (!summary) return void out(c.dim("(compact produced nothing)\n"));
+        // keep the summary's essence in working memory so it survives the history wipe + injects next turns
+        meta.workingSet = summary
+          .split("\n")
+          .map((l) => l.replace(/^[-*\d.\s]+/, "").trim())
+          .filter((l) => l.length > 3)
+          .slice(0, 12)
+          .map((l) => l.slice(0, 140));
         history.length = 0;
         history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
         stats.input += r.usage?.input ?? 0;
@@ -854,6 +866,7 @@ program.action(async (opts) => {
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n),
             systemOverride: PLAN_SYSTEM,
+            memory: buildMemory(),
             projectContext,
             stats,
             signal: h.signal,
@@ -878,6 +891,7 @@ program.action(async (opts) => {
               provider,
               ctx: { cwd, sandbox, spawn, ui },
               approval: choice as ApprovalMode,
+              memory: buildMemory(),
               confirm: h.confirm,
               autoApprove,
               projectContext,
@@ -898,6 +912,7 @@ program.action(async (opts) => {
           provider,
           ctx: { cwd, sandbox, spawn, ui },
           approval: appr,
+          memory: buildMemory(),
           confirm: h.confirm,
           autoApprove,
           projectContext,
@@ -955,7 +970,7 @@ program.action(async (opts) => {
     history.push({ role: "user", content: userContent });
     currentTurn = new AbortController();
     try {
-      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, stats, signal: currentTurn.signal });
+      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     } finally {

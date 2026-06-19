@@ -19,11 +19,17 @@ const HARA_SYSTEM = (cwd: string) =>
 Working directory: ${cwd}
 Be concise and direct. Use the provided tools to read files, edit/write files, and run shell
 commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
-them whole. After completing a task, give a one-line summary.`;
+them whole. You have a persistent memory: use memory_search before answering about prior decisions,
+conventions, or the user's preferences, and memory_write to proactively save durable facts you learn.
+After completing a task, give a one-line summary.`;
 
-function composeSystem(cwd: string, projectContext?: string, override?: string): string {
+function composeSystem(cwd: string, projectContext?: string, override?: string, memory?: string): string {
   const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
-  return head + (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "");
+  return (
+    head +
+    (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "") +
+    (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "")
+  );
 }
 
 export interface RunOpts {
@@ -34,6 +40,8 @@ export interface RunOpts {
   /** tool names auto-approved for the rest of the session (chosen via "don't ask again") */
   autoApprove?: Set<string>;
   projectContext?: string;
+  /** durable memory digest injected into the system prompt (frozen snapshot) */
+  memory?: string;
   stats?: { input: number; output: number; lastInput?: number };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
@@ -71,7 +79,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       spin = setInterval(() => out(`\r${c.dim(`${frames[fi++ % frames.length]} working ${Math.floor((Date.now() - t0) / 1000)}s`)}`), 100);
     }
     const r = await provider.turn({
-      system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride),
+      system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
       history,
       tools: specs,
       onText: (d) => {

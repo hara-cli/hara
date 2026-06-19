@@ -2,6 +2,7 @@
 // Frontmatter: name, description, owns[], rejects[], model?, allowTools[], denyTools[]. Body = persona/system.
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { findProjectRoot } from "../context/agents-md.js";
 
 export interface Role {
@@ -17,6 +18,10 @@ export interface Role {
 
 export function rolesDir(cwd: string): string {
   return join(findProjectRoot(cwd), ".hara", "roles");
+}
+/** Global roles — reusable personas across all projects. */
+export function globalRolesDir(): string {
+  return join(homedir(), ".hara", "roles");
 }
 
 function parseFrontmatter(text: string): { fm: Record<string, any>; body: string } {
@@ -43,28 +48,31 @@ function parseFrontmatter(text: string): { fm: Record<string, any>; body: string
 }
 
 export function loadRoles(cwd: string): Role[] {
-  const dir = rolesDir(cwd);
-  if (!existsSync(dir)) return [];
-  const roles: Role[] = [];
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith(".md") || f === "README.md") continue;
-    try {
-      const { fm, body } = parseFrontmatter(readFileSync(join(dir, f), "utf8"));
-      roles.push({
-        id: (fm.name as string) || f.replace(/\.md$/, ""),
-        description: (fm.description as string) || "",
-        owns: Array.isArray(fm.owns) ? fm.owns : [],
-        rejects: Array.isArray(fm.rejects) ? fm.rejects : [],
-        model: fm.model || undefined,
-        allowTools: Array.isArray(fm.allowTools) ? fm.allowTools : undefined,
-        denyTools: Array.isArray(fm.denyTools) ? fm.denyTools : undefined,
-        system: body,
-      });
-    } catch {
-      /* skip bad role file */
+  const byId = new Map<string, Role>();
+  // global roles first, then project roles override on id clash (project wins) — same scope model as memory/config
+  for (const dir of [globalRolesDir(), rolesDir(cwd)]) {
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".md") || f === "README.md") continue;
+      try {
+        const { fm, body } = parseFrontmatter(readFileSync(join(dir, f), "utf8"));
+        const id = (fm.name as string) || f.replace(/\.md$/, "");
+        byId.set(id, {
+          id,
+          description: (fm.description as string) || "",
+          owns: Array.isArray(fm.owns) ? fm.owns : [],
+          rejects: Array.isArray(fm.rejects) ? fm.rejects : [],
+          model: fm.model || undefined,
+          allowTools: Array.isArray(fm.allowTools) ? fm.allowTools : undefined,
+          denyTools: Array.isArray(fm.denyTools) ? fm.denyTools : undefined,
+          system: body,
+        });
+      } catch {
+        /* skip bad role file */
+      }
     }
   }
-  return roles;
+  return [...byId.values()];
 }
 
 export function hasRoles(cwd: string): boolean {

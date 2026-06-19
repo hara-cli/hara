@@ -27,24 +27,31 @@ function titleOf(text: string, path: string): string {
   return h ? h[1].trim() : (path.split("/").pop() ?? path);
 }
 
-/** Lexical search: rank .md assets by how many query words appear in path+content. */
-export function searchAssets(query: string, limit = 5): Recalled[] {
-  const dir = assetsDir();
-  if (!existsSync(dir)) return [];
+/**
+ * Lexical search: rank .md files by how many query words appear in path+content.
+ * Default searches the code-asset library (relative paths). Pass `roots` to search other dirs
+ * (e.g. the memory store) — then paths come back absolute so callers can read them directly.
+ */
+export function searchAssets(query: string, limit = 5, roots?: string[]): Recalled[] {
+  const dirs = roots ?? [assetsDir()];
+  const abs = roots !== undefined;
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return [];
   const hits: Recalled[] = [];
-  for (const rel of walkFiles(dir).filter((f) => f.endsWith(".md"))) {
-    let text: string;
-    try {
-      text = readFileSync(join(dir, rel), "utf8");
-    } catch {
-      continue;
+  for (const dir of dirs) {
+    if (!existsSync(dir)) continue;
+    for (const rel of walkFiles(dir).filter((f) => f.endsWith(".md"))) {
+      let text: string;
+      try {
+        text = readFileSync(join(dir, rel), "utf8");
+      } catch {
+        continue;
+      }
+      const hay = (rel + "\n" + text).toLowerCase();
+      const score = words.filter((w) => hay.includes(w)).length;
+      if (!score) continue;
+      hits.push({ path: abs ? join(dir, rel) : rel, title: titleOf(text, rel), snippet: text.slice(0, 800), score });
     }
-    const hay = (rel + "\n" + text).toLowerCase();
-    const score = words.filter((w) => hay.includes(w)).length;
-    if (!score) continue;
-    hits.push({ path: rel, title: titleOf(text, rel), snippet: text.slice(0, 800), score });
   }
   hits.sort((a, b) => b.score - a.score || a.path.length - b.path.length);
   return hits.slice(0, limit);
