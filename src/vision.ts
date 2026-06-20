@@ -84,6 +84,41 @@ export const SCREENSHOT_SYSTEM = [
   "Positions guide clicks, so always estimate them. Be concise and factual; never invent elements.",
 ].join("\n");
 
+// Grounding — ask a vision model WHERE a UI element is (for accurate RPA clicking), as resolution-independent
+// fractions so it works regardless of Retina/DPI scaling.
+export const LOCATE_SYSTEM = [
+  "You are given a screenshot. The user names ONE UI element (button, field, icon, menu item, link).",
+  "Return ONLY its CENTER as JSON: {\"x\": <0-1000>, \"y\": <0-1000>}, where x is the position as per-mille of",
+  "the image WIDTH (0=left, 1000=right) and y as per-mille of the HEIGHT (0=top, 1000=bottom).",
+  "If the element is not visible, return {\"x\": -1, \"y\": -1}. Output ONLY the JSON, nothing else.",
+].join("\n");
+
+/** Parse a grounding reply → {x,y} as 0..1 fractions (accepts per-mille / percent / fraction), or null. */
+export function parseLocate(text: string): { x: number; y: number } | null {
+  const m = text.match(/"x"\s*:\s*(-?\d+(?:\.\d+)?)[\s,}]+.*?"y"\s*:\s*(-?\d+(?:\.\d+)?)/s) || text.match(/(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  let x = Number(m[1]);
+  let y = Number(m[2]);
+  if (x < 0 || y < 0 || Number.isNaN(x) || Number.isNaN(y)) return null; // not found / unparseable
+  const norm = (v: number): number => (v > 100 ? v / 1000 : v > 1.5 ? v / 100 : v); // per-mille | percent | fraction → 0..1
+  x = Math.min(1, Math.max(0, norm(x)));
+  y = Math.min(1, Math.max(0, norm(y)));
+  return { x, y };
+}
+
+/** Send a screenshot to a (grounding-capable) vision model and get the target's center as 0..1 fractions. */
+export async function locateImage(provider: Provider, image: ImageAttachment, target: string, opts: { signal?: AbortSignal } = {}): Promise<{ x: number; y: number } | null> {
+  const r = await provider.turn({
+    system: LOCATE_SYSTEM,
+    history: [{ role: "user", content: `Locate this element: ${target}`, images: [image] }],
+    tools: [],
+    onText: () => {},
+    signal: opts.signal,
+  });
+  if (r.stop === "error") return null;
+  return parseLocate(r.text);
+}
+
 const PROMPT = "Describe the attached image(s) per your instructions.";
 
 /** Send images to the vision provider and return its textual description. Throws on a provider error.

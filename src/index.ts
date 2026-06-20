@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
 import { readClipboardImage } from "./images.js";
-import { describeImages, classifyVision, SCREENSHOT_SYSTEM } from "./vision.js";
+import { describeImages, locateImage, classifyVision, SCREENSHOT_SYSTEM } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
@@ -1208,6 +1208,18 @@ program.action(async (opts) => {
         return "";
       }
     };
+    // grounding for accurate RPA: ask the vision model WHERE an element is (0..1 fractions) so the computer
+    // tool can click it precisely instead of guessing pixels from a text description.
+    const locateScreenshot = async (path: string, target: string): Promise<{ x: number; y: number } | null> => {
+      const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+      const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
+      if (!vp) return null;
+      try {
+        return await locateImage(vp, { path, mediaType: "image/png" }, target);
+      } catch {
+        return null;
+      }
+    };
     const remindVision = (sink: { notice: (s: string) => void }): void => {
       if (remindedVision) return void sink.notice(`⚠ image skipped — ${cfg.model} is text-only. Add a vision model: /vision <model>`);
       remindedVision = true;
@@ -1423,7 +1435,7 @@ program.action(async (opts) => {
           const pout = stats.output;
           await runAgent(history, {
             provider,
-            ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot },
+            ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot, locate: locateScreenshot },
             approval: "suggest",
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n),
@@ -1451,7 +1463,7 @@ program.action(async (opts) => {
             const xout = stats.output;
             await runAgent(history, {
               provider,
-              ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot },
+              ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot, locate: locateScreenshot },
               approval: choice as ApprovalMode,
               memory: buildMemory(),
               confirm: h.confirm,
@@ -1474,7 +1486,7 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         await runAgent(history, {
           provider,
-          ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot },
+          ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot, locate: locateScreenshot },
           approval: appr,
           memory: buildMemory(),
           confirm: h.confirm,

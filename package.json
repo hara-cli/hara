@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.42.0",
+  "version": "0.43.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "dist/index.js"

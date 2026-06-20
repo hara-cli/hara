@@ -13,7 +13,7 @@ import { loadConfig } from "../config.js";
 
 type Tier = "off" | "read" | "click" | "full";
 const RANK: Record<Tier, number> = { off: 0, read: 1, click: 2, full: 3 };
-const ACTION_MIN: Record<string, Tier> = { screenshot: "read", move: "click", click: "click", type: "full", key: "full" };
+const ACTION_MIN: Record<string, Tier> = { screenshot: "read", find: "read", move: "click", click: "click", type: "full", key: "full" };
 // dangerous combos refused even at full tier (quit / close / delete / task-switch-kill)
 const KEY_BLOCK = /(?:\b(cmd|command|ctrl|control|alt|option|win|super|meta)\b.*\+.*\b(q|w|delete|del|f4|escape|esc)\b)|ctrl\+alt\+(?:delete|del|backspace)/i;
 
@@ -66,6 +66,27 @@ function screenshot(): { path?: string; error?: string } {
     return { error: "screenshot produced no file" };
   }
   return { path: out };
+}
+
+/** Logical screen size in the coordinate space the click backends use (points on mac, pixels on win/linux).
+ *  Grounding returns 0..1 fractions, so click = fraction × this. null if undetectable. */
+function screenSize(): { w: number; h: number } | null {
+  try {
+    if (process.platform === "darwin") {
+      const r = run("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
+      const n = r.out.match(/-?\d+/g);
+      if (n && n.length >= 4) return { w: Number(n[2]), h: Number(n[3]) };
+    } else if (process.platform === "linux") {
+      const [w, h] = run("xdotool", ["getdisplaygeometry"]).out.trim().split(/\s+/).map(Number);
+      if (w && h) return { w, h };
+    } else if (process.platform === "win32") {
+      const [w, h] = ps('Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "$($b.Width) $($b.Height)"').out.trim().split(/\s+/).map(Number);
+      if (w && h) return { w, h };
+    }
+  } catch {
+    /* fall through */
+  }
+  return null;
 }
 
 /** Name of the frontmost application/window (for the allowlist check). "" if undetectable. */
@@ -169,19 +190,20 @@ export function computerBackends(): string {
 registerTool({
   name: "computer",
   description:
-    "Control the screen to operate desktop software (not just the browser): take a screenshot, then " +
-    "click/move/type/press keys at coordinates. Workflow: screenshot → read what's on screen → act. " +
-    "A screenshot returns the interactive elements and their positions so you can click them; pass `focus` " +
-    "to target what you're looking for. Opt-in and permission-gated (tier + per-app allowlist).",
+    "Control the screen to operate desktop software (not just the browser): screenshot, then click/move/type/" +
+    "press keys. Prefer grounding over guessing pixels — pass `target` (e.g. 'the Send button') to click/move " +
+    "and it's located by a vision model; or `find` to just get coordinates. Workflow: screenshot → read → " +
+    "click a target → re-screenshot to verify. Opt-in and permission-gated (tier + per-app allowlist).",
   input_schema: {
     type: "object",
     properties: {
-      action: { type: "string", enum: ["screenshot", "click", "move", "type", "key"] },
-      x: { type: "number", description: "x pixel (click/move)" },
-      y: { type: "number", description: "y pixel (click/move)" },
+      action: { type: "string", enum: ["screenshot", "find", "click", "move", "type", "key"] },
+      target: { type: "string", description: "describe a UI element to locate (find) or click/move to — e.g. 'the Send button'. Preferred over x,y." },
+      x: { type: "number", description: "x pixel (click/move; or use `target`)" },
+      y: { type: "number", description: "y pixel (click/move; or use `target`)" },
       text: { type: "string", description: "text to type (type)" },
       keys: { type: "string", description: "key or combo, e.g. 'return', 'cmd+c' (key)" },
-      focus: { type: "string", description: "screenshot only: what to look for, e.g. 'the Login button' — focuses the read" },
+      focus: { type: "string", description: "screenshot only: what to look for — focuses the read" },
     },
     required: ["action"],
   },
@@ -193,7 +215,7 @@ registerTool({
     const action = String(input.action ?? "");
     if (!actionAllowed(tier, action)) return `'${action}' needs a higher tier (current computerUse=${tier}). Raise it with \`hara config set computerUse …\`.`;
 
-    if (action !== "screenshot") {
+    if (action !== "screenshot" && action !== "find") {
       // per-app allowlist: only act when an allowlisted app is frontmost (the key guard against wrong-window clicks)
       if (!cfg.computerApps.length) return "No apps allowlisted — set `hara config set computerApps \"App Name, …\"` before clicking/typing.";
       const app = frontmostApp();
@@ -214,7 +236,28 @@ registerTool({
       }
       return `Screenshot saved to ${s.path}. Configure a vision model so I can read it: \`hara config set visionModel <model>\`.`;
     }
+
+    // Grounding: locate a described element and turn it into screen coordinates (more reliable than guessing
+    // pixels from a text description). Used for `find`, and for click/move when given a `target` and no x,y.
+    const needsLocate = action === "find" || ((action === "click" || action === "move") && input.target != null && (input.x == null || input.y == null));
+    if (needsLocate) {
+      const target = String(input.target ?? "");
+      if (!target) return action === "find" ? "find needs a `target` (what to locate)." : "click/move needs `x,y` or a `target`.";
+      if (!ctx.locate) return "Grounding needs a vision model that can see images — set one: `hara config set visionModel <model>`.";
+      const s = screenshot();
+      if (s.error) return `Screenshot failed: ${s.error}`;
+      const loc = await ctx.locate(s.path!, target);
+      if (!loc) return `Couldn't locate "${target}" on screen — try a screenshot to see what's there, or rephrase the target.`;
+      const size = screenSize();
+      if (!size) return `Located "${target}" but couldn't read the screen size to convert coordinates.`;
+      const gx = Math.round(loc.x * size.w);
+      const gy = Math.round(loc.y * size.h);
+      if (action === "find") return `"${target}" is at ~${gx},${gy} (${Math.round(loc.x * 100)}% across, ${Math.round(loc.y * 100)}% down).`;
+      input.x = gx;
+      input.y = gy;
+    }
+
     const r = pointerOrKeyboard(action, input);
-    return r.ok ? `✓ ${r.msg}` : `Failed: ${r.msg}`;
+    return r.ok ? `✓ ${r.msg}${needsLocate ? ` (located "${input.target}")` : ""}` : `Failed: ${r.msg}`;
   },
 });

@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describeImages, DESCRIBE_SYSTEM, SCREENSHOT_SYSTEM, classifyVision } from "../dist/vision.js";
+import { describeImages, DESCRIBE_SYSTEM, SCREENSHOT_SYSTEM, classifyVision, parseLocate } from "../dist/vision.js";
+
+test("parseLocate: grounding coords (per-mille / percent / fraction) → 0..1 fractions", () => {
+  assert.deepEqual(parseLocate('{"x": 500, "y": 250}'), { x: 0.5, y: 0.25 }); // per-mille
+  assert.deepEqual(parseLocate('{"x": 50, "y": 25}'), { x: 0.5, y: 0.25 }); // percent
+  assert.deepEqual(parseLocate('here: {"x":1000,"y":0}'), { x: 1, y: 0 }); // edges, prose around it
+  assert.equal(parseLocate('{"x": -1, "y": -1}'), null, "not-found sentinel → null");
+  assert.equal(parseLocate("no coordinates here"), null);
+});
 
 test("classifyVision: vision-capable families → 'vision'", () => {
   const V = (p, m) => assert.equal(classifyVision(p, m), "vision", `${p}/${m}`);

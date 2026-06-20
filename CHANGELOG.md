@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.43.0 — unreleased (grounding for screen control — accurate clicks)
+
+- The `computer` tool now **locates UI elements by description** instead of guessing pixels from a text read.
+  Pass `target` to `click`/`move` (e.g. "the Send button") — hara screenshots, asks a vision model for the
+  element's position (resolution-independent fractions, Retina-safe), and clicks there. New **`find`** action
+  returns coordinates without clicking.
+- This is codex's "native computer-use" lesson applied **locally**: codex's `computer_use` is a remote browser
+  sandbox; hara grounds against your own screen + apps. Needs a grounding-capable vision model (e.g. a qwen-VL).
+- `screenSize()` per OS converts fractions → click coords; `parseLocate` accepts per-mille/percent/fraction
+  replies (tested). cliclick installed → `hara doctor` shows screencapture ✓ + cliclick ✓.
+- **Still requires you to grant macOS Screen Recording + Accessibility** to actually drive the screen — those
+  toggles can only be set by you in System Settings.
+
 ## 0.42.0 — unreleased (type-ahead: keep typing while the agent works)
 
 - You can now **type while the agent is working** — the message enters a **FIFO queue** and is sent

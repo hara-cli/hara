@@ -21,6 +21,8 @@ export interface ToolContext {
   /** describe an image file via the vision sidecar (lets the computer tool return a screenshot as text);
    *  `hint` focuses the description on a goal (e.g. "the Login button") for actionable RPA output */
   describeImage?: (path: string, hint?: string) => Promise<string>;
+  /** locate a UI element in a screenshot via a grounding vision model → center as 0..1 fractions (for RPA clicks) */
+  locate?: (path: string, target: string) => Promise<{ x: number; y: number } | null>;
 }
 
 export interface Tool {
