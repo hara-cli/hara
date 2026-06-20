@@ -18,6 +18,8 @@ export interface ToolContext {
   spawn?: (task: string, role?: string) => Promise<string>;
   /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */
   ui?: UiSink;
+  /** describe an image file via the vision sidecar (lets the computer tool return a screenshot as text) */
+  describeImage?: (path: string) => Promise<string>;
 }
 
 export interface Tool {
@@ -28,8 +30,9 @@ export interface Tool {
     properties: Record<string, unknown>;
     required?: string[];
   };
-  /** read | edit | exec — drives the approval gate (read never prompts) */
-  kind?: "read" | "edit" | "exec";
+  /** read | edit | exec | computer — drives the approval gate (read never prompts; computer always asks
+   *  once per session for a grant, even in full-auto) */
+  kind?: "read" | "edit" | "exec" | "computer";
   run(input: any, ctx: ToolContext): Promise<string>;
 }
 

@@ -10,6 +10,7 @@ import type { ApprovalMode } from "../config.js";
 /** Whether a tool call needs user confirmation under the given approval mode. */
 export function needsConfirm(kind: string | undefined, mode: ApprovalMode): boolean {
   if (kind === "read") return false;
+  if (kind === "computer") return true; // screen control always needs a session grant (even full-auto)
   if (mode === "full-auto") return false;
   if (mode === "auto-edit") return kind === "exec";
   return true; // suggest: confirm edits and exec

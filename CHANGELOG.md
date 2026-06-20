@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.31.0 — unreleased (native screen control)
+
+- **`computer` tool — operate desktop software, not just the browser.** Screenshot → read → click / move /
+  type / press keys at coordinates. Native shell-out per OS (no heavy deps): macOS `screencapture` + `cliclick`,
+  Windows PowerShell (.NET / user32, built-in), Linux `scrot` + `xdotool`.
+- **Strict, opt-in safety**: `computerUse: off|read|click|full` (default **off**) gates capability tiers;
+  `computerApps` is a frontmost-window **allowlist** checked before any click/type (the key guard against
+  wrong-window actions); a **dangerous-key blocklist** (cmd+q, ctrl+alt+del…); and a **once-per-session grant**
+  (the `computer` tool kind always confirms once, even in full-auto).
+- Screenshots are **read via the vision sidecar** (a screenshot is described to text) so a text-only main
+  model can still act on what's on screen. `hara doctor` shows the tier, per-OS backend availability, and the
+  app allowlist.
+
 ## 0.30.1 — unreleased
 
 - Capture honors `assetCapture`: in **ask** (default) the end-of-session distill now **prompts before saving**

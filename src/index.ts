@@ -67,6 +67,7 @@ import "./tools/agent.js"; // register agent (subagent spawn)
 import "./tools/memory.js"; // register memory_search/get/write/forget/skill_create
 import "./tools/skill.js"; // register the skill loader tool
 import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
+import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
@@ -326,6 +327,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} skills ${(() => { const n = loadSkillIndex(cfg.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(cfg.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
     `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)} ${c.dim("· capture")} ${c.bold(cfg.assetCapture)}`,
     `${dot} vision · ${c.bold(cfg.model)} ${vdesc}${cfg.visionModel ? c.dim(" · describer ") + c.bold(cfg.visionModel) : vcap === "text" ? c.yellow(" · set /vision <model>") : ""}`,
+    `${dot} screen ${cfg.computerUse === "off" ? c.dim("off (hara config set computerUse read|click|full)") : c.bold(cfg.computerUse) + c.dim(` · ${computerBackends()}${cfg.computerApps.length ? " · apps: " + cfg.computerApps.join(", ") : " · no app allowlist"}`)}`,
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
     `${dot} mcp servers ${c.dim(String(Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length))}`,
   ];
@@ -956,6 +958,17 @@ program.action(async (opts) => {
       visionProvider = await buildProvider({ ...cfg, model: cfg.visionModel!, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey });
       return visionProvider;
     };
+    // lets the computer tool return a screenshot as text (describe via the vision sidecar / a vision main model)
+    const describeScreenshot = async (path: string): Promise<string> => {
+      const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+      const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
+      if (!vp) return "";
+      try {
+        return await describeImages(vp, [{ path, mediaType: "image/png" }]);
+      } catch {
+        return "";
+      }
+    };
     const remindVision = (sink: { notice: (s: string) => void }): void => {
       if (remindedVision) return void sink.notice(`⚠ image skipped — ${cfg.model} is text-only. Add a vision model: /vision <model>`);
       remindedVision = true;
@@ -1171,7 +1184,7 @@ program.action(async (opts) => {
           const pout = stats.output;
           await runAgent(history, {
             provider,
-            ctx: { cwd, sandbox, spawn, ui },
+            ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot },
             approval: "suggest",
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n),
@@ -1199,7 +1212,7 @@ program.action(async (opts) => {
             const xout = stats.output;
             await runAgent(history, {
               provider,
-              ctx: { cwd, sandbox, spawn, ui },
+              ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot },
               approval: choice as ApprovalMode,
               memory: buildMemory(),
               confirm: h.confirm,
@@ -1222,7 +1235,7 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         await runAgent(history, {
           provider,
-          ctx: { cwd, sandbox, spawn, ui },
+          ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot },
           approval: appr,
           memory: buildMemory(),
           confirm: h.confirm,

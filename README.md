@@ -159,6 +159,10 @@ matches into your next message. A git-versionable library of code/patterns you w
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
 **Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).
+**Screen control** (opt-in): the `computer` tool drives desktop software (screenshot → click/type), native per OS
+(mac `screencapture`+`cliclick` · Windows PowerShell · Linux `scrot`+`xdotool`). Off by default — enable a tier with
+`hara config set computerUse read|click|full` and allowlist apps with `hara config set computerApps "App, …"`. Guarded
+by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and a once-per-session grant; screenshots are read via your vision model.
 **Sessions**: conversations are saved automatically — `-c` / `--resume <id>` to continue, `hara sessions` to list.
 **MCP**: add an `mcpServers` map to config (global or project `.hara/config.json`); their tools appear to the agent as `mcp__<server>__<tool>`.
 **Profiles**: add a `profiles` map to `~/.hara/config.json` (`--profile <name>`), or drop a project-level `.hara/config.json` that overrides the global config.
