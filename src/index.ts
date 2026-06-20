@@ -9,8 +9,8 @@ import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
-import { readFileSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
@@ -311,6 +311,11 @@ const REVIEW_SYSTEM =
   "issues, missing error handling, unclear naming, and missing/weak tests. You may read files (read-only) " +
   "for context. Be concise and specific — cite file:line and the concrete fix. Group findings by severity: " +
   "**Blocker**, **Should-fix**, **Nit**. If nothing material is wrong, say the diff looks good. Never edit files.";
+const COMMIT_SYSTEM =
+  "Write a git commit message for the staged diff. A concise imperative subject (≤72 chars; an optional " +
+  "conventional-commits prefix like feat:/fix:/refactor:/docs:/test:/chore: is welcome). If the change is " +
+  "non-trivial, add a blank line then a short body (a few bullets or sentences) on what changed and why. " +
+  "Output ONLY the commit message — no code fences, no preamble, no surrounding quotes.";
 const PLAN_SYSTEM =
   "You are in PLAN MODE. Investigate read-only (read_file / grep / glob / ls / web_fetch) and think, " +
   "then propose a concise step-by-step plan for the task. Do NOT edit files or run commands yet — only plan. " +
@@ -612,6 +617,65 @@ program
       stats,
     });
     if (stats.input || stats.output) out("\n" + statusLine(cfg.model, stats.input, stats.output) + "\n");
+  });
+
+program
+  .command("commit")
+  .description("generate a commit message from staged changes and commit (-y to skip the confirm)")
+  .option("-a, --all", "stage all tracked changes first (git add -u)")
+  .action(async (opts: { all?: boolean }) => {
+    const skipConfirm = !!program.opts().yes; // reuse the global -y/--yes (auto-approve)
+    const cfg = loadConfig();
+    const provider = await buildProvider(cfg);
+    if (!provider) {
+      out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
+      process.exit(1);
+    }
+    if (opts.all) {
+      try {
+        await runShell("git add -u", cfg.cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
+      } catch {
+        /* report below if nothing is staged */
+      }
+    }
+    let diff = "";
+    try {
+      diff = (await runShell("git diff --staged", cfg.cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout;
+    } catch (e) {
+      return void out(c.red(`git diff failed: ${e instanceof Error ? e.message : String(e)}\n`) + c.dim("(is this a git repo?)\n"));
+    }
+    if (!diff.trim()) return void out(c.dim("Nothing staged. Stage changes with `git add`, or use `hara commit -a`.\n"));
+    out(c.dim("Writing a commit message…\n"));
+    const r = await provider.turn({
+      system: COMMIT_SYSTEM,
+      history: [{ role: "user", content: `Write a commit message for these staged changes:\n\n\`\`\`diff\n${diff.slice(0, 120_000)}\n\`\`\`` }],
+      tools: [],
+      onText: () => {},
+    });
+    if (r.stop === "error") return void out(c.red(`message generation failed: ${r.errorMsg ?? "provider error"}\n`));
+    const msg = r.text.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
+    if (!msg) return void out(c.red("No commit message produced — commit manually or retry.\n"));
+    out("\n" + c.bold("Proposed commit message:\n") + c.dim("─".repeat(48) + "\n") + msg + "\n" + c.dim("─".repeat(48)) + "\n\n");
+    if (!skipConfirm) {
+      const rl = createInterface({ input: stdin, output: stdout });
+      const ans = (await rl.question(`Commit with this message? ${c.dim("[Y/n]")} `)).trim().toLowerCase();
+      rl.close();
+      if (ans === "n" || ans === "no") return void out(c.dim("(cancelled — nothing committed)\n"));
+    }
+    const tmp = join(tmpdir(), `hara-commit-${process.pid}.txt`);
+    writeFileSync(tmp, msg + "\n", "utf8");
+    try {
+      const res = await runShell(`git commit -F ${JSON.stringify(tmp)}`, cfg.cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
+      out(c.green("✓ committed ") + c.dim(((res.stdout || "").trim().split("\n")[0] || "").slice(0, 100)) + "\n");
+    } catch (e) {
+      out(c.red(`git commit failed: ${e instanceof Error ? e.message : String(e)}\n`));
+    } finally {
+      try {
+        rmSync(tmp);
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
   });
 
 const rolesCmd = program.command("roles").description("manage org roles (.hara/roles)");

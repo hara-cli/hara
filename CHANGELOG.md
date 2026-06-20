@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.39.0 — unreleased (hara commit — AI commit messages)
+
+- **`hara commit`** generates a conventional-commits message from your staged diff, shows it, and commits after
+  a `Y/n` confirm. `-a` stages tracked changes first; the global `-y` skips the confirm. Pairs with `hara
+  review` (review → commit). Verified live (glm-5): generated `feat(util): add mul function` and committed it.
+- Note: the skip-confirm reuses the global `-y/--yes` (a subcommand `-y` would collide with it — same lesson as
+  `hara plan resume`).
+
 ## 0.38.0 — unreleased (hara review — review your changes)
 
 - **`hara review`** reviews your uncommitted changes (`git diff HEAD`) for correctness bugs, security issues,

@@ -114,6 +114,7 @@ hara org "review src/ for bugs"   # dispatch a task to the role that owns it (or
 hara plan "add a /health endpoint with a test"   # decompose → sequence (DAG) → run each step + verify
 hara plan --parallel "..."  # run independent atoms concurrently  ·  hara plan resume  # continue a stopped plan
 hara review                 # review uncommitted changes for bugs/security/missing tests (--staged · --base main)
+hara commit                 # AI commit message from staged changes, then commit (-a to stage all · -y to skip confirm)
 hara index                 # build the semantic search index (after: hara config set embedProvider ollama|qwen)
 hara -p "summarize @README.md and fix the lint errors in src/"   # one-shot; @path attaches a file
 hara --approval auto-edit  # suggest (default) | auto-edit | full-auto   (-y = full-auto)
