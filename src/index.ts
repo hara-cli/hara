@@ -5,7 +5,7 @@ import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest } from "./memory/store.js";
-import { nextMode as cycleMode } from "./tui/InputBox.js";
+import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -240,6 +240,17 @@ const PLAN_SYSTEM =
 const DISTILL_SYSTEM =
   "The session is ending. Reflect and persist only durable, reusable learnings: memory_write for facts / " +
   "conventions / the user's preferences, playbook_save for reusable how-tos. Be selective — skip the trivial. Then reply DONE.";
+const COMPACT_SYSTEM =
+  "Summarize the conversation so far into a concise but complete brief so the assistant can " +
+  "continue seamlessly: the user's goal, key decisions, files changed, current state, and open next steps. " +
+  "Be specific. Output only the summary.";
+const workingSetFromSummary = (s: string): string[] =>
+  s
+    .split("\n")
+    .map((l) => l.replace(/^[-*\d.\s]+/, "").trim())
+    .filter((l) => l.length > 3)
+    .slice(0, 12)
+    .map((l) => l.slice(0, 140));
 
 /** Run a (read-only by default) sub-agent to completion, quietly, and return its final text. */
 async function runSubagent(
@@ -281,7 +292,7 @@ async function runSubagent(
 }
 
 /** Check the hara setup and print a health summary (provider/auth/model/node/assets/roles). */
-function runDoctor(cfg: HaraConfig): void {
+function runDoctor(cfg: HaraConfig): string {
   const ok = (b: boolean): string => (b ? c.green("✓") : c.red("✗"));
   const dot = c.dim("·");
   const nodeMajor = Number(process.versions.node.split(".")[0]);
@@ -300,7 +311,7 @@ function runDoctor(cfg: HaraConfig): void {
     `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
     `${dot} mcp servers ${c.dim(String(Object.keys(cfg.mcpServers).length))}`,
   ];
-  out(lines.join("\n") + "\n");
+  return lines.join("\n");
 }
 
 function mentionCompleter(line: string, cwd: string): [string[], string] {
@@ -433,7 +444,7 @@ program
 program
   .command("doctor")
   .description("check your hara setup (provider / auth / model / node / assets / roles)")
-  .action(() => runDoctor(loadConfig()));
+  .action(() => out(runDoctor(loadConfig()) + "\n"));
 
 const rolesCmd = program.command("roles").description("manage org roles (.hara/roles)");
 rolesCmd
@@ -687,7 +698,7 @@ program.action(async (opts) => {
       },
     },
     { name: "usage", desc: "show token usage this session", run: () => void out(statusLine(cfg.model, stats.input, stats.output) + "\n") },
-    { name: "doctor", desc: "check your hara setup", run: () => void runDoctor(cfg) },
+    { name: "doctor", desc: "check your hara setup", run: () => void out(runDoctor(cfg) + "\n") },
     {
       name: "roles",
       desc: "list org roles",
@@ -741,10 +752,7 @@ program.action(async (opts) => {
         if (history.length < 2) return void out(c.dim("(nothing to compact)\n"));
         out(c.dim("Compacting…\n"));
         const r = await provider.turn({
-          system:
-            "Summarize the conversation so far into a concise but complete brief so the assistant can " +
-            "continue seamlessly: the user's goal, key decisions, files changed, current state, and open next steps. " +
-            "Be specific. Output only the summary.",
+          system: COMPACT_SYSTEM,
           history: [...history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
           tools: [],
           onText: () => {},
@@ -752,13 +760,7 @@ program.action(async (opts) => {
         if (r.stop === "error") return void out(c.red(`(compact failed: ${r.errorMsg})\n`));
         const summary = r.text.trim();
         if (!summary) return void out(c.dim("(compact produced nothing)\n"));
-        // keep the summary's essence in working memory so it survives the history wipe + injects next turns
-        meta.workingSet = summary
-          .split("\n")
-          .map((l) => l.replace(/^[-*\d.\s]+/, "").trim())
-          .filter((l) => l.length > 3)
-          .slice(0, 12)
-          .map((l) => l.slice(0, 140));
+        meta.workingSet = workingSetFromSummary(summary); // survives the history wipe + injects next turns
         history.length = 0;
         history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
         stats.input += r.usage?.input ?? 0;
@@ -870,8 +872,66 @@ program.action(async (opts) => {
             saveSession(meta, history);
             return void h.sink.notice(`(renamed → ${meta.title})`);
           }
+          if (nm === "compact") {
+            if (history.length < 2) return void h.sink.notice("(nothing to compact)");
+            h.sink.notice("✻ compacting…");
+            const cui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
+            if (cfg.evolve !== "off") {
+              try {
+                await runAgent(history, {
+                  provider,
+                  ctx: { cwd, sandbox, spawn, ui: cui },
+                  approval: "full-auto",
+                  confirm: h.confirm,
+                  toolFilter: (n) => n === "memory_write" || n === "playbook_save" || READONLY_TOOLS.has(n),
+                  systemOverride: DISTILL_SYSTEM,
+                  memory: buildMemory(),
+                  stats,
+                  signal: h.signal,
+                });
+              } catch {
+                /* flush is best-effort */
+              }
+            }
+            const cr = await provider.turn({
+              system: COMPACT_SYSTEM,
+              history: [...history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
+              tools: [],
+              onText: () => {},
+            });
+            if (cr.stop === "error") return void h.sink.notice(`(compact failed: ${cr.errorMsg})`);
+            const summary = cr.text.trim();
+            if (!summary) return void h.sink.notice("(compact produced nothing)");
+            meta.workingSet = workingSetFromSummary(summary);
+            history.length = 0;
+            history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
+            stats.input += cr.usage?.input ?? 0;
+            stats.output += cr.usage?.output ?? 0;
+            h.sink.usage(cr.usage?.input ?? 0, cr.usage?.output ?? 0);
+            saveSession(meta, history);
+            return void h.sink.notice(`(compacted — kept ${meta.workingSet.length} working-memory notes)`);
+          }
+          if (nm === "sessions") {
+            const ms = listSessions();
+            return void h.sink.notice(
+              ms.length ? ms.slice(0, 12).map((m) => `  ${m.id}  ${m.updatedAt.slice(0, 16).replace("T", " ")}  ${m.title}`).join("\n") : "No sessions yet.",
+            );
+          }
+          if (nm === "usage") return void h.sink.notice(`tokens — ↑${stats.input} ↓${stats.output}`);
+          if (nm === "doctor") return void h.sink.notice(runDoctor(cfg).replace(/\[[0-9;]*m/g, ""));
+          if (nm === "roles") {
+            const rs = loadRoles(cwd);
+            return void h.sink.notice(rs.length ? rs.map((r) => `  ${r.id} — owns: ${r.owns.join(", ")}`).join("\n") : "No roles. Run `hara roles init`.");
+          }
+          if (nm === "approval") {
+            const all = ["suggest", "auto-edit", "full-auto", "plan"];
+            if (arg && !all.includes(arg)) return void h.sink.notice(`Invalid mode. One of: ${all.join(", ")}`);
+            const m = (arg || cycleMode(h.approval)) as Approval;
+            h.setApproval(m);
+            return void h.sink.notice(`(approval → ${m})`);
+          }
           if (byName.has(nm))
-            return void h.sink.notice(`/${nm} isn't wired into the TUI yet — run with HARA_TUI=0 for the classic REPL.`);
+            return void h.sink.notice(`/${nm} isn't wired into the TUI yet — use \`hara ${nm} …\` as a subcommand, or HARA_TUI=0.`);
           const near = nearest(nm, [...byName.keys()]);
           return void h.sink.notice(`Unknown command /${nm}.${near.length ? " Did you mean " + near.map((n) => "/" + n).join(", ") + "?" : ""}`);
         }

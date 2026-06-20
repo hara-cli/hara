@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.21.1 — unreleased (TUI command parity)
+
+- Wire the missing slash commands into the default ink TUI: **`/compact`** (with the proactive pre-compact
+  flush + working-set distill), **`/sessions`**, **`/usage`**, **`/doctor`**, **`/roles`**, **`/approval [mode]`**.
+  (`runDoctor` now returns a string so both the classic REPL and the TUI can render it.) `/org` and `/plan`
+  remain `hara org`/`hara plan` subcommands.
+
 ## 0.21.0 — unreleased (self-evolution · M2)
 
 - **`playbook_save`** — the agent grows its own reusable playbooks (`~/.hara/code-assets/playbooks/<slug>.md`,
