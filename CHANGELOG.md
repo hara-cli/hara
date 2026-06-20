@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.24.0 — unreleased (auto-detect vision capability)
+
+- **Automatic** image routing — hara classifies the main model and decides each turn:
+  - vision-capable (Claude, gpt-4o, qwen-vl, glm-4v…) → image sent **inline**, describer suspended;
+  - text-only (DeepSeek, qwen-coder, glm-4-flash…) → image **auto-described** by `visionModel` into text,
+    or — if none set — a **reminder** to add one (`/vision <model>`);
+  - **unknown** model → hara **asks once** ("Can <model> see images? Yes / No / Skip") and remembers the
+    answer per-model.
+- Built-in, extensible **capability map** (`classifyVision`) for the major families — Claude / GPT / Qwen /
+  GLM / DeepSeek / Gemini / Mistral / Llama / Kimi / Grok / Pixtral·Llava·InternVL.
+- **`/vision <model>`** sets the describer in-place; **`/vision main yes|no|auto`** overrides/clears the
+  current model's detected capability (stored per-model in `modelVision`). `hara doctor` shows it.
+
 ## 0.23.0 — unreleased (vision sidecar for text-only models)
 
 - **Use pasted images with text-only models** (DeepSeek, coding models, …) via a configurable vision

@@ -1,6 +1,57 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describeImages, DESCRIBE_SYSTEM } from "../dist/vision.js";
+import { describeImages, DESCRIBE_SYSTEM, classifyVision } from "../dist/vision.js";
+
+test("classifyVision: vision-capable families → 'vision'", () => {
+  const V = (p, m) => assert.equal(classifyVision(p, m), "vision", `${p}/${m}`);
+  V("anthropic", "claude-opus-4-8");
+  V("anthropic", "claude-haiku-4-5");
+  V("openai", "gpt-4o");
+  V("openai", "gpt-4o-mini");
+  V("openai", "gpt-4-turbo");
+  V("qwen", "qwen-vl-max");
+  V("qwen", "qwen2.5-vl-7b-instruct");
+  V("qwen", "qwen3-vl-plus");
+  V("qwen", "qvq-72b-preview");
+  V("openai", "glm-4v");
+  V("openai", "glm-4.5v");
+  V("openai", "deepseek-vl2");
+  V("openai", "gemini-2.5-pro");
+  V("openai", "pixtral-12b");
+  V("openai", "llava-1.6");
+  V("openai", "internvl2-8b");
+  V("openai", "llama-3.2-90b-vision");
+  V("openai", "grok-vision-beta");
+});
+
+test("classifyVision: text-only families → 'text'", () => {
+  const T = (p, m) => assert.equal(classifyVision(p, m), "text", `${p}/${m}`);
+  T("qwen", "qwen3-coder-plus");
+  T("qwen", "qwen-plus");
+  T("qwen", "qwen-max");
+  T("openai", "deepseek-chat");
+  T("openai", "deepseek-v3");
+  T("openai", "deepseek-r1");
+  T("openai", "gpt-3.5-turbo");
+  T("openai", "gpt-4");
+  T("openai", "gemma-2-9b");
+  T("openai", "mistral-large-latest");
+  T("openai", "kimi-k2");
+  T("openai", "llama-3.1-70b");
+  T("openai", "glm-4-flash");
+  T("openai", "glm-4.6");
+});
+
+test("classifyVision: genuinely unknown models → 'unknown' (ask the user)", () => {
+  assert.equal(classifyVision("openai", "glm-5"), "unknown");
+  assert.equal(classifyVision("openai", "some-mystery-llm-9000"), "unknown");
+});
+
+test("classifyVision: per-model overrides win and don't leak across models", () => {
+  assert.equal(classifyVision("openai", "glm-5", { "glm-5": "yes" }), "vision");
+  assert.equal(classifyVision("openai", "glm-5", { "glm-5": "no" }), "text");
+  assert.equal(classifyVision("openai", "deepseek-chat", { "glm-5": "yes" }), "text");
+});
 
 function fakeProvider(result) {
   const calls = [];

@@ -88,15 +88,17 @@ hara config set apiKey   ...
 hara config set model    ...
 ```
 
-**Vision for text-only models** (optional) — let a text-only main model (DeepSeek, coding models) act on
-images you paste:
+**Vision** — hara **auto-detects** whether your main model can see images. A vision model (Claude, gpt-4o,
+qwen-vl, glm-4v…) gets pasted images **inline**. For a **text-only** model (DeepSeek, coding models), set a
+describer — the "eyes" — and hara OCRs/describes each pasted image into text first:
 ```bash
-hara config set visionModel qwen-vl-max   # a vision model on the same plan/key — the "eyes"
-# pasted images (Ctrl+V) are OCR'd/described into text by it, then your main model continues.
-# unset = images go inline (needs a vision-capable main model). Point vision elsewhere if needed:
+hara config set visionModel qwen-vl-max   # a vision model on the same plan/key
+# point it elsewhere if your endpoint doesn't serve vision:
 #   hara config set visionBaseURL https://dashscope.aliyuncs.com/compatible-mode/v1
 #   hara config set visionApiKey  sk-...
 ```
+If a model's capability is unknown, hara **asks once and remembers**. In the TUI, `/vision <model>` sets the
+describer and `/vision main yes|no|auto` corrects a model's detected capability.
 
 Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `HARA_MODEL`,
 `HARA_BASE_URL`, `HARA_API_KEY`, or the provider key (`ANTHROPIC_API_KEY` / `DASHSCOPE_API_KEY`).
@@ -126,8 +128,8 @@ conversation scrolling above it. Streaming text, reasoning, tool calls, and colo
 blocks; a spinner runs during a turn. **shift+tab** cycles the approval mode, **Esc** interrupts a running
 turn, and tool approvals appear inline (y/N). **Ctrl+V** pastes an image from your clipboard (a screenshot,
 or a copied image) — or drag an image file into the terminal — and it shows as an `[Image #N]` chip. A
-vision-capable main model sees it directly; for a **text-only** model, set `visionModel` (see Setup) to OCR
-it into text first. Set `HARA_TUI=0` for the classic readline REPL.
+hara auto-detects the model's capability — a vision model sees it directly; a text-only model routes it through
+a `visionModel` describer (see Setup), and hara reminds you if one isn't set. Set `HARA_TUI=0` for the classic readline REPL.
 
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal

@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
 import { readClipboardImage } from "./images.js";
-import { describeImages } from "./vision.js";
+import { describeImages, classifyVision } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
@@ -18,6 +18,7 @@ import {
   configPath,
   readRawConfig,
   writeConfigValue,
+  setModelVisionOverride,
   providerEnvKey,
   CONFIG_KEYS,
   APPROVAL_MODES,
@@ -306,6 +307,8 @@ function runDoctor(cfg: HaraConfig): string {
   const authed = hasKey || oauthOk;
   const ad = assetsDir();
   const roles = loadRoles(cfg.cwd);
+  const vcap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+  const vdesc = vcap === "vision" ? c.dim("sees images (inline)") : vcap === "text" ? c.dim("text-only") : c.yellow("capability unknown — asks on first image");
   const lines = [
     c.bold("hara doctor"),
     `${ok(nodeMajor >= 20)} node ${process.versions.node} ${c.dim("(need ≥20)")}`,
@@ -315,7 +318,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
     `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
     `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)}`,
-    `${dot} vision ${cfg.visionModel ? c.dim("describe pasted images via ") + c.bold(cfg.visionModel) : c.dim("inline (set visionModel to OCR images for text-only models)")}`,
+    `${dot} vision · ${c.bold(cfg.model)} ${vdesc}${cfg.visionModel ? c.dim(" · describer ") + c.bold(cfg.visionModel) : vcap === "text" ? c.yellow(" · set /vision <model>") : ""}`,
     `${dot} mcp servers ${c.dim(String(Object.keys(cfg.mcpServers).length))}`,
   ];
   return lines.join("\n");
@@ -692,6 +695,35 @@ program.action(async (opts) => {
       },
     },
     {
+      name: "vision",
+      desc: "vision describer: /vision <model> · /vision main yes|no|auto",
+      run: (a) => {
+        const parts = (a || "").trim().split(/\s+/).filter(Boolean);
+        if (!parts.length) {
+          const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+          out(`main ${cfg.model}: ${cap} · describer: ${cfg.visionModel || "(none)"}\n`);
+          return;
+        }
+        if (parts[0] === "main") {
+          const v = parts[1];
+          if (!["yes", "no", "auto"].includes(v)) return void out("usage: /vision main yes|no|auto\n");
+          if (v === "auto") {
+            const m = { ...cfg.modelVision };
+            delete m[cfg.model];
+            cfg.modelVision = m;
+            setModelVisionOverride(cfg.model, null);
+          } else {
+            cfg.modelVision = { ...cfg.modelVision, [cfg.model]: v as "yes" | "no" };
+            setModelVisionOverride(cfg.model, v as "yes" | "no");
+          }
+          return void out(`(${cfg.model} vision = ${v})\n`);
+        }
+        cfg.visionModel = parts.join(" ");
+        writeConfigValue("visionModel", cfg.visionModel);
+        out(`(visionModel → ${cfg.visionModel})\n`);
+      },
+    },
+    {
       name: "approval",
       desc: `cycle/set approval: /approval [${APPROVAL_MODES.join("|")}]`,
       run: (a) => {
@@ -812,33 +844,87 @@ program.action(async (opts) => {
   if (useTui) {
     rl.close(); // hand stdin over to ink
     setTheme(cfg.theme);
-    // Vision sidecar: lazily build a describer provider (same plan/key, different model) and turn
-    // pasted images into text when `visionModel` is set; otherwise attach inline for a vision main model.
+    // Vision: a text-only main model routes pasted images through a describer (`visionModel`); a
+    // vision-capable main model gets them inline (describer auto-suspended). Unknown models are asked
+    // once and remembered per-model in cfg.modelVision. See classifyVision for the capability map.
     let visionProvider: Provider | null | undefined;
     const getVisionProvider = async (): Promise<Provider | null> => {
       if (visionProvider !== undefined) return visionProvider;
       visionProvider = await buildProvider({ ...cfg, model: cfg.visionModel!, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey });
       return visionProvider;
     };
+    let remindedVision = false;
+    const remindVision = (sink: { notice: (s: string) => void }): void => {
+      if (remindedVision) return void sink.notice(`⚠ image skipped — ${cfg.model} is text-only. Add a vision model: /vision <model>`);
+      remindedVision = true;
+      sink.notice(
+        `⚠ ${cfg.model} is text-only and can't see images, so your image was skipped.\n` +
+          `  Add a vision model to read images for it:\n` +
+          `      /vision qwen-vl-max     ← sets it now (uses your current plan/key) and remembers it\n` +
+          `  It OCRs/describes each pasted image into text the model can act on.`,
+      );
+    };
+    /** `/vision <model>` sets the describer; `/vision main yes|no|auto` sets the current model's capability. */
+    const applyVision = (arg: string): string => {
+      const parts = arg.trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) {
+        const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+        return `vision — main ${cfg.model}: ${cap}${cap === "unknown" ? " (asks on first image)" : ""} · describer: ${cfg.visionModel || "(none — /vision <model>)"}`;
+      }
+      if (parts[0] === "main") {
+        const v = parts[1];
+        if (!v || !["yes", "no", "auto"].includes(v)) return "usage: /vision main yes|no|auto";
+        if (v === "auto") {
+          const m = { ...cfg.modelVision };
+          delete m[cfg.model];
+          cfg.modelVision = m;
+          setModelVisionOverride(cfg.model, null);
+        } else {
+          cfg.modelVision = { ...cfg.modelVision, [cfg.model]: v as "yes" | "no" };
+          setModelVisionOverride(cfg.model, v as "yes" | "no");
+        }
+        return `(${cfg.model} vision = ${v})`;
+      }
+      cfg.visionModel = parts.join(" ");
+      visionProvider = undefined; // rebuild the describer with the new model
+      writeConfigValue("visionModel", cfg.visionModel);
+      return `(visionModel → ${cfg.visionModel}; text-only models describe pasted images with it)`;
+    };
     const resolveImages = async (
       imgs: ImageAttachment[] | undefined,
-      sink: { notice: (s: string) => void },
-      signal?: AbortSignal,
-    ): Promise<{ extraText: string; attach?: ImageAttachment[] }> => {
-      if (!imgs?.length) return { extraText: "" };
-      if (!cfg.visionModel) return { extraText: "", attach: imgs }; // no sidecar → inline for a vision main model
+      h: { sink: { notice: (s: string) => void }; select: (t: string, o: { label: string; value: string }[]) => Promise<string>; signal?: AbortSignal },
+    ): Promise<{ extraText?: string; attach?: ImageAttachment[]; skip?: boolean }> => {
+      if (!imgs?.length) return {};
+      let cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+      if (cap === "unknown") {
+        const ans = await h.select(`Can your model "${cfg.model}" understand images (vision)?`, [
+          { label: "Yes — send images to it directly", value: "yes" },
+          { label: "No — describe them with a vision model first", value: "no" },
+          { label: "Skip the image this time", value: "skip" },
+        ]);
+        if (ans === "skip") return { skip: true };
+        cap = ans === "yes" ? "vision" : "text";
+        cfg.modelVision = { ...cfg.modelVision, [cfg.model]: ans as "yes" | "no" };
+        setModelVisionOverride(cfg.model, ans as "yes" | "no");
+        h.sink.notice(`(remembered: ${cfg.model} ${ans === "yes" ? "supports images" : "is text-only"})`);
+      }
+      if (cap === "vision") return { attach: imgs }; // native vision — describer suspended
+      if (!cfg.visionModel) {
+        remindVision(h.sink);
+        return { skip: true };
+      }
       const vp = await getVisionProvider();
       if (!vp) {
-        sink.notice(`(visionModel ${cfg.visionModel} unavailable — attaching image inline)`);
-        return { extraText: "", attach: imgs };
+        h.sink.notice(`(visionModel ${cfg.visionModel} unavailable — check visionApiKey/visionBaseURL)`);
+        return { skip: true };
       }
-      sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with ${cfg.visionModel}…`);
+      h.sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with ${cfg.visionModel}…`);
       try {
-        const desc = await describeImages(vp, imgs, { signal });
+        const desc = await describeImages(vp, imgs, { signal: h.signal });
         return { extraText: `\n\n[Image description — via ${cfg.visionModel}]\n${desc}` };
       } catch (e) {
-        sink.notice(`(image describe failed: ${e instanceof Error ? e.message : String(e)} — attaching inline)`);
-        return { extraText: "", attach: imgs };
+        h.sink.notice(`(image describe failed: ${e instanceof Error ? e.message : String(e)})`);
+        return { skip: true };
       }
     };
     await runTui({
@@ -957,6 +1043,7 @@ program.action(async (opts) => {
           }
           if (nm === "usage") return void h.sink.notice(`tokens — ↑${stats.input} ↓${stats.output}`);
           if (nm === "doctor") return void h.sink.notice(runDoctor(cfg).replace(/\[[0-9;]*m/g, ""));
+          if (nm === "vision") return void h.sink.notice(applyVision(arg));
           if (nm === "roles") {
             const rs = loadRoles(cwd);
             return void h.sink.notice(rs.length ? rs.map((r) => `  ${r.id} — owns: ${r.owns.join(", ")}`).join("\n") : "No roles. Run `hara roles init`.");
@@ -977,8 +1064,9 @@ program.action(async (opts) => {
         const appr = h.approval;
         if (appr === "plan") {
           // PLAN MODE: read-only investigate → propose a plan → selectable proceed → execute.
-          const planImg = await resolveImages(images, h.sink, h.signal);
-          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + planImg.extraText, ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
+          const planImg = await resolveImages(images, h);
+          if (planImg.skip) return;
+          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + (planImg.extraText ?? ""), ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
           recalledContext = "";
           const pin = stats.input;
           const pout = stats.output;
@@ -1026,10 +1114,11 @@ program.action(async (opts) => {
           }
           return;
         }
-        const { extraText, attach } = await resolveImages(images, h.sink, h.signal);
-        const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + extraText;
+        const ri = await resolveImages(images, h);
+        if (ri.skip) return;
+        const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + (ri.extraText ?? "");
         recalledContext = "";
-        history.push({ role: "user", content: userContent, ...(attach?.length ? { images: attach } : {}) });
+        history.push({ role: "user", content: userContent, ...(ri.attach?.length ? { images: ri.attach } : {}) });
         const beforeIn = stats.input;
         const beforeOut = stats.output;
         await runAgent(history, {

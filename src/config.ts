@@ -27,6 +27,10 @@ export interface HaraConfig {
   visionModel: string | undefined;
   visionBaseURL: string | undefined;
   visionApiKey: string | undefined;
+  /** Per-model vision-capability overrides the user has confirmed (model id → "yes"|"no"). Built-in
+   *  detection (classifyVision) handles known families; this records answers for unknown ones so we
+   *  ask at most once per model and stay correct when the main model is switched. */
+  modelVision: Record<string, "yes" | "no">;
   mcpServers: Record<string, McpServerConfig>;
   cwd: string;
 }
@@ -89,6 +93,18 @@ export function writeConfigValue(key: string, value: string): void {
   writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }
 
+/** Record (or clear, with cap=null) a confirmed per-model vision capability in `modelVision`. */
+export function setModelVisionOverride(model: string, cap: "yes" | "no" | null): void {
+  const p = configPath();
+  const cfg = readRawConfig();
+  const map: Record<string, string> = cfg.modelVision && typeof cfg.modelVision === "object" ? cfg.modelVision : {};
+  if (cap === null) delete map[model];
+  else map[model] = cap;
+  cfg.modelVision = map;
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+}
+
 /**
  * Effective config. Precedence (high→low): env vars > selected profile >
  * project `.hara/config.json` > global `~/.hara/config.json` > provider defaults.
@@ -113,13 +129,14 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const visionModel = process.env.HARA_VISION_MODEL ?? merged.visionModel;
   const visionBaseURL = process.env.HARA_VISION_BASE_URL ?? merged.visionBaseURL;
   const visionApiKey = process.env.HARA_VISION_API_KEY ?? merged.visionApiKey;
+  const modelVision = merged.modelVision && typeof merged.modelVision === "object" ? (merged.modelVision as Record<string, "yes" | "no">) : {};
   const mcpServers: Record<string, McpServerConfig> = {
     ...(globalBase.mcpServers ?? {}),
     ...(project.mcpServers ?? {}),
     ...(profile.mcpServers ?? {}),
   };
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, visionModel, visionBaseURL, visionApiKey, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, visionModel, visionBaseURL, visionApiKey, modelVision, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {
