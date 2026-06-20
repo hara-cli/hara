@@ -5,7 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.33.0 — unreleased (semantic recall + memory)
+## 0.34.0 — unreleased (incremental indexing)
+
+- **`hara index` is now incremental.** Re-running it re-embeds only the files whose mtime changed since the
+  last build; unchanged files keep their existing vectors, and deleted files drop out. A changed embedding
+  model still forces a full rebuild. Output reports `(N embedded, M reused)`.
+- Turns indexing from a run-once-and-go-stale command into something you can re-run after every edit. Measured
+  on hara's own repo with local `bge-m3`: full build **~68s** → unchanged rebuild **~0.4s** (~150×); editing one
+  file re-embeds just that file's chunks.
+- Internal: each chunk records its source file's mtime; `buildIndex` returns `{total, embedded, reused}`.
+
+## 0.33.0 — 2026-06-20 · first public release (semantic recall + memory)
 
 - **`recall` and `memory_search` go hybrid too.** The semantic layer added in 0.32 now also powers your
   code-asset library and durable memory — `hara index --assets` embeds `~/.hara/code-assets`, global skills,

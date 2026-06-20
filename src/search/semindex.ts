@@ -2,7 +2,7 @@
 // code-asset / repo / knowledge-base scale (hundreds–low-thousands of chunks); the optional zvec adapter is
 // the scale-up path later. Markdown/code stays the SSOT; this index is a derived, rebuildable, gitignored
 // artifact. The embedder is injected (see embed.ts) so the store + chunking are testable without a model.
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { findProjectRoot } from "../context/agents-md.js";
@@ -17,6 +17,7 @@ export interface Chunk {
   text: string;
   file: string;
   source: string; // repo | code-assets | skills | memory
+  mtime?: number; // source file's mtimeMs — lets `hara index` reuse unchanged files (incremental)
 }
 interface Item extends Chunk {
   vec: number[];
@@ -38,13 +39,21 @@ export function indexPath(name: string, cwd: string): string {
   return join(homedir(), ".hara", "index", `${name}.json`);
 }
 
+function statMtime(p: string): number {
+  try {
+    return statSync(p).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 /** Split a file into chunks: Markdown by `#` headings, code by ~40-line windows. Heuristic, zero-dep —
- *  also the substrate embeddings reuse. */
-export function chunkText(text: string, file: string, source: string): Chunk[] {
+ *  also the substrate embeddings reuse. `mtime` (when given) is stamped on every chunk for incremental reuse. */
+export function chunkText(text: string, file: string, source: string, mtime?: number): Chunk[] {
   const out: Chunk[] = [];
   const push = (body: string, n: number): void => {
     const t = body.trim();
-    if (t.length >= 12) out.push({ id: `${file}#${n}`, text: t.slice(0, 2000), file, source });
+    if (t.length >= 12) out.push({ id: `${file}#${n}`, text: t.slice(0, 2000), file, source, mtime });
   };
   if (/\.(md|mdx)$/i.test(file)) {
     const parts = text.split(/^(?=#{1,6}\s)/m);
@@ -71,22 +80,64 @@ function cosine(a: number[], b: number[]): number {
   return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
 }
 
-/** Embed all chunks and write the index file. Returns the count written. */
-export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder, cwd: string, model = "embed"): Promise<number> {
+/** Build/refresh the index. **Incremental**: files whose mtime is unchanged since the last build keep their
+ *  existing vectors (no re-embed); only new/changed files are embedded, and deleted files drop out. A changed
+ *  embedding model forces a full rebuild (old vectors aren't comparable). Returns counts. */
+export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder, cwd: string, model = "embed"): Promise<{ total: number; embedded: number; reused: number }> {
+  const p = indexPath(name, cwd);
+
+  // Load the previous index → reuse vectors for unchanged files.
+  const prevByFile = new Map<string, Item[]>();
+  let prevModel = "";
+  if (existsSync(p)) {
+    try {
+      const old = JSON.parse(readFileSync(p, "utf8")) as IndexFile;
+      prevModel = old.model;
+      for (const it of old.items ?? []) {
+        const arr = prevByFile.get(it.file);
+        if (arr) arr.push(it);
+        else prevByFile.set(it.file, [it]);
+      }
+    } catch {
+      /* corrupt index → full rebuild */
+    }
+  }
+  const sameModel = prevModel === model;
+
+  const byFile = new Map<string, Chunk[]>();
+  for (const c of chunks) {
+    const arr = byFile.get(c.file);
+    if (arr) arr.push(c);
+    else byFile.set(c.file, [c]);
+  }
+
   const items: Item[] = [];
+  const toEmbed: Chunk[] = [];
+  let reused = 0;
+  for (const [file, fchunks] of byFile) {
+    const mtime = fchunks[0].mtime ?? 0;
+    const prev = prevByFile.get(file);
+    if (sameModel && prev?.length && mtime > 0 && prev.every((it) => it.mtime === mtime)) {
+      items.push(...prev); // file unchanged → keep its vectors
+      reused += prev.length;
+    } else {
+      toEmbed.push(...fchunks);
+    }
+  }
+
   const B = 64;
-  for (let i = 0; i < chunks.length; i += B) {
-    const batch = chunks.slice(i, i + B);
+  for (let i = 0; i < toEmbed.length; i += B) {
+    const batch = toEmbed.slice(i, i + B);
     const vecs = await embed(batch.map((c) => c.text));
     batch.forEach((c, j) => vecs[j] && items.push({ ...c, vec: vecs[j] }));
   }
-  const p = indexPath(name, cwd);
+
   const dir = dirname(p);
   mkdirSync(dir, { recursive: true });
   // The index is derived + rebuildable (and may embed file contents) — never let it be committed.
   if (!existsSync(join(dir, ".gitignore"))) writeFileSync(join(dir, ".gitignore"), "*\n", "utf8");
   writeFileSync(p, JSON.stringify({ model, items } satisfies IndexFile), "utf8");
-  return items.length;
+  return { total: items.length, embedded: toEmbed.length, reused };
 }
 
 export function indexExists(name: string, cwd: string): boolean {
@@ -109,7 +160,7 @@ export function collectDirChunks(dir: string, source: string): Chunk[] {
       continue;
     }
     if (isProbablyBinary(buf)) continue;
-    chunks.push(...chunkText(buf.toString("utf8"), abs, source));
+    chunks.push(...chunkText(buf.toString("utf8"), abs, source, statMtime(abs)));
   }
   return chunks;
 }
@@ -128,7 +179,7 @@ export function collectRepoChunks(root: string): Chunk[] {
       continue;
     }
     if (isProbablyBinary(buf)) continue;
-    chunks.push(...chunkText(buf.toString("utf8"), rel, "repo"));
+    chunks.push(...chunkText(buf.toString("utf8"), rel, "repo", statMtime(abs)));
   }
   return chunks;
 }

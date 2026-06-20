@@ -33,7 +33,7 @@ import { createOpenAIProvider } from "./providers/openai.js";
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
 import { loadAgentsMd, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import { getEmbedder } from "./search/embed.js";
-import { collectRepoChunks, collectDirChunks, buildIndex, indexPath, indexExists } from "./search/semindex.js";
+import { collectRepoChunks, collectDirChunks, buildIndex, indexPath, indexExists, type Chunk } from "./search/semindex.js";
 import { searchHybrid } from "./search/hybrid.js";
 import { expandMentions, fileCandidates } from "./context/mentions.js";
 import {
@@ -485,12 +485,13 @@ program
     const model = `${cfg.embedProvider}:${cfg.embedModel ?? "default"}`;
     const doRepo = opts.all || opts.repo || (!opts.assets && !opts.all);
     const doAssets = opts.all || opts.assets;
-    const build = async (name: string, chunks: { id: string; text: string; file: string; source: string }[], blurb: string): Promise<void> => {
+    const build = async (name: string, chunks: Chunk[], blurb: string): Promise<void> => {
       if (!chunks.length) return void out(c.dim(`Nothing to index for ${name}.\n`));
-      out(c.dim(`Embedding ${chunks.length} ${name} chunks with ${cfg.embedProvider}…\n`));
+      out(c.dim(`Indexing ${chunks.length} ${name} chunks with ${cfg.embedProvider}…\n`));
       try {
-        const n = await buildIndex(name, chunks, embed, cwd, model);
-        out(c.green(`Indexed ${n} chunks → ${indexPath(name, cwd)}`) + c.dim(` (${blurb})`) + "\n");
+        const r = await buildIndex(name, chunks, embed, cwd, model);
+        const detail = r.reused ? `${r.embedded} embedded, ${r.reused} reused` : `${r.embedded} embedded`;
+        out(c.green(`Indexed ${r.total} chunks`) + c.dim(` (${detail}) → ${indexPath(name, cwd)} · ${blurb}`) + "\n");
       } catch (e) {
         out(c.red(`Indexing ${name} failed: ${(e as Error).message}\n`));
         out(c.dim("Check the embedding endpoint/key; search still works lexically.\n"));

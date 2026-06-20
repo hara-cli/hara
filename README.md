@@ -163,7 +163,8 @@ not just keywords. By default they're lexical (zero setup). Configure an embeddi
 then `hara index` (repo, for `codebase_search`) / `hara index --assets` (code-assets, skills & memory) / `hara
 index --all`. A query like "read an image pasted from the clipboard" then surfaces `src/images.ts` even with no
 shared words. Indexes are rebuildable `.hara/index/` artifacts (self-`.gitignore`d, never committed); no native
-vector DB needed, and lexical still works when there's no index.
+vector DB needed, and lexical still works when there's no index. Re-running `hara index` is **incremental** —
+only changed files re-embed (a full repo rebuild that takes ~a minute re-runs in well under a second).
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
 **Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).

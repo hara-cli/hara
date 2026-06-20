@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chunkText, buildIndex, queryIndex, indexExists, collectRepoChunks, collectDirChunks } from "../dist/search/semindex.js";
@@ -34,8 +34,8 @@ test("buildIndex + queryIndex round-trips and ranks by cosine", async () => {
       { id: "3", text: "function connectDatabase() { retry on error }", file: "db.ts", source: "repo" },
     ];
     assert.equal(indexExists("repo", dir), false);
-    const n = await buildIndex("repo", chunks, mockEmbed, dir);
-    assert.equal(n, 3);
+    const r = await buildIndex("repo", chunks, mockEmbed, dir);
+    assert.equal(r.total, 3);
     assert.equal(indexExists("repo", dir), true);
 
     const hits = await queryIndex("repo", "auth login token", mockEmbed, dir, 3);
@@ -68,6 +68,41 @@ test("collectRepoChunks walks code + markdown in a project root", () => {
     assert.ok(chunks.some((ch) => ch.file === "main.ts"), "indexes code");
     assert.ok(chunks.some((ch) => ch.file === "notes.md"), "indexes markdown");
     assert.ok(chunks.every((ch) => ch.source === "repo"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("buildIndex is incremental — unchanged files keep their vectors", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-inc-"));
+  try {
+    writeFileSync(join(dir, "package.json"), "{}"); // anchor findProjectRoot to this dir → index stays here
+    writeFileSync(join(dir, "a.md"), "# Alpha\nfirst doc about authentication flows\n");
+    writeFileSync(join(dir, "b.md"), "# Beta\nsecond doc about rendering buttons\n");
+    let calls = 0;
+    const counting = async (texts) => {
+      calls += texts.length;
+      return texts.map(() => [1, 0, 0]);
+    };
+
+    // first build: everything embedded (name="repo" keeps the index inside the temp dir)
+    const r1 = await buildIndex("repo", collectDirChunks(dir, "assets"), counting, dir);
+    assert.ok(r1.embedded >= 2 && r1.reused === 0, "first build embeds all");
+    const afterFirst = calls;
+
+    // rebuild, nothing changed → 0 embedded, all reused, embedder untouched
+    const r2 = await buildIndex("repo", collectDirChunks(dir, "assets"), counting, dir);
+    assert.equal(r2.embedded, 0, "unchanged rebuild embeds nothing");
+    assert.equal(r2.reused, r1.total, "everything reused");
+    assert.equal(calls, afterFirst, "embedder not called on an unchanged rebuild");
+
+    // change one file (force a newer mtime) → only that file re-embedded, the other reused
+    writeFileSync(join(dir, "a.md"), "# Alpha\nrewritten — now about caching tokens\n");
+    const later = new Date(Date.now() + 5000);
+    utimesSync(join(dir, "a.md"), later, later);
+    const r3 = await buildIndex("repo", collectDirChunks(dir, "assets"), counting, dir);
+    assert.ok(r3.embedded >= 1, "changed file re-embedded");
+    assert.ok(r3.reused >= 1, "unchanged file reused");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
