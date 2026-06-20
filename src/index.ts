@@ -654,6 +654,38 @@ program.action(async (opts) => {
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
   if (resumed) out(c.dim(`(resumed ${meta.id} · ${history.length} msgs)\n`));
 
+  // Vision describer state — shared by the `/vision` command (both REPLs) and the TUI image pipeline.
+  let visionProvider: Provider | null | undefined;
+  let remindedVision = false;
+  /** `/vision <model>` sets the describer; `/vision main yes|no|auto` sets the current model's capability. */
+  const applyVision = (arg: string): string => {
+    const parts = arg.trim().split(/\s+/).filter(Boolean);
+    if (parts.length === 0) {
+      const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+      return `vision — main ${cfg.model}: ${cap}${cap === "unknown" ? " (asks on first image)" : ""} · describer: ${cfg.visionModel || "(none — /vision <model>)"}`;
+    }
+    if (parts[0] === "main") {
+      const v = parts[1];
+      if (!v || !["yes", "no", "auto"].includes(v)) return "usage: /vision main yes|no|auto";
+      if (v === "auto") {
+        const m = { ...cfg.modelVision };
+        delete m[cfg.model];
+        cfg.modelVision = m;
+        setModelVisionOverride(cfg.model, null);
+      } else {
+        cfg.modelVision = { ...cfg.modelVision, [cfg.model]: v as "yes" | "no" };
+        setModelVisionOverride(cfg.model, v as "yes" | "no");
+      }
+      return `(${cfg.model} vision = ${v})`;
+    }
+    const model = parts.join(" ");
+    cfg.visionModel = model;
+    visionProvider = undefined; // rebuild the describer with the new model
+    writeConfigValue("visionModel", model);
+    const warn = classifyVision(cfg.provider, model, cfg.modelVision) !== "vision" ? `  ⚠ ${model} isn't a known vision model — if it can't read images, pick a *-vl / vision model.` : "";
+    return `(visionModel → ${model}; text-only main models describe pasted images with it)${warn}`;
+  };
+
   const commands: Slash[] = [
     { name: "help", desc: "show this help", run: () => void out(helpText(commands)) },
     {
@@ -685,6 +717,8 @@ program.action(async (opts) => {
       run: async (a) => {
         if (a) {
           cfg.model = a;
+          visionProvider = undefined;
+          remindedVision = false;
           const p = await buildProvider(cfg);
           if (p) {
             provider = p;
@@ -697,31 +731,7 @@ program.action(async (opts) => {
     {
       name: "vision",
       desc: "vision describer: /vision <model> · /vision main yes|no|auto",
-      run: (a) => {
-        const parts = (a || "").trim().split(/\s+/).filter(Boolean);
-        if (!parts.length) {
-          const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-          out(`main ${cfg.model}: ${cap} · describer: ${cfg.visionModel || "(none)"}\n`);
-          return;
-        }
-        if (parts[0] === "main") {
-          const v = parts[1];
-          if (!["yes", "no", "auto"].includes(v)) return void out("usage: /vision main yes|no|auto\n");
-          if (v === "auto") {
-            const m = { ...cfg.modelVision };
-            delete m[cfg.model];
-            cfg.modelVision = m;
-            setModelVisionOverride(cfg.model, null);
-          } else {
-            cfg.modelVision = { ...cfg.modelVision, [cfg.model]: v as "yes" | "no" };
-            setModelVisionOverride(cfg.model, v as "yes" | "no");
-          }
-          return void out(`(${cfg.model} vision = ${v})\n`);
-        }
-        cfg.visionModel = parts.join(" ");
-        writeConfigValue("visionModel", cfg.visionModel);
-        out(`(visionModel → ${cfg.visionModel})\n`);
-      },
+      run: (a) => void out(applyVision(a || "") + "\n"),
     },
     {
       name: "approval",
@@ -847,13 +857,11 @@ program.action(async (opts) => {
     // Vision: a text-only main model routes pasted images through a describer (`visionModel`); a
     // vision-capable main model gets them inline (describer auto-suspended). Unknown models are asked
     // once and remembered per-model in cfg.modelVision. See classifyVision for the capability map.
-    let visionProvider: Provider | null | undefined;
     const getVisionProvider = async (): Promise<Provider | null> => {
       if (visionProvider !== undefined) return visionProvider;
       visionProvider = await buildProvider({ ...cfg, model: cfg.visionModel!, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey });
       return visionProvider;
     };
-    let remindedVision = false;
     const remindVision = (sink: { notice: (s: string) => void }): void => {
       if (remindedVision) return void sink.notice(`⚠ image skipped — ${cfg.model} is text-only. Add a vision model: /vision <model>`);
       remindedVision = true;
@@ -863,32 +871,6 @@ program.action(async (opts) => {
           `      /vision qwen-vl-max     ← sets it now (uses your current plan/key) and remembers it\n` +
           `  It OCRs/describes each pasted image into text the model can act on.`,
       );
-    };
-    /** `/vision <model>` sets the describer; `/vision main yes|no|auto` sets the current model's capability. */
-    const applyVision = (arg: string): string => {
-      const parts = arg.trim().split(/\s+/).filter(Boolean);
-      if (parts.length === 0) {
-        const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-        return `vision — main ${cfg.model}: ${cap}${cap === "unknown" ? " (asks on first image)" : ""} · describer: ${cfg.visionModel || "(none — /vision <model>)"}`;
-      }
-      if (parts[0] === "main") {
-        const v = parts[1];
-        if (!v || !["yes", "no", "auto"].includes(v)) return "usage: /vision main yes|no|auto";
-        if (v === "auto") {
-          const m = { ...cfg.modelVision };
-          delete m[cfg.model];
-          cfg.modelVision = m;
-          setModelVisionOverride(cfg.model, null);
-        } else {
-          cfg.modelVision = { ...cfg.modelVision, [cfg.model]: v as "yes" | "no" };
-          setModelVisionOverride(cfg.model, v as "yes" | "no");
-        }
-        return `(${cfg.model} vision = ${v})`;
-      }
-      cfg.visionModel = parts.join(" ");
-      visionProvider = undefined; // rebuild the describer with the new model
-      writeConfigValue("visionModel", cfg.visionModel);
-      return `(visionModel → ${cfg.visionModel}; text-only models describe pasted images with it)`;
     };
     const resolveImages = async (
       imgs: ImageAttachment[] | undefined,
@@ -923,15 +905,25 @@ program.action(async (opts) => {
         const desc = await describeImages(vp, imgs, { signal: h.signal });
         return { extraText: `\n\n[Image description — via ${cfg.visionModel}]\n${desc}` };
       } catch (e) {
-        h.sink.notice(`(image describe failed: ${e instanceof Error ? e.message : String(e)})`);
+        const msg = h.signal?.aborted ? "image describe cancelled" : `image describe failed: ${e instanceof Error ? e.message : String(e)}`;
+        h.sink.notice(`(${msg})`);
         return { skip: true };
       }
     };
+    const mainCap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+    const visionLine =
+      mainCap === "vision"
+        ? `${cfg.model} reads images directly`
+        : cfg.visionModel
+          ? `${cfg.model} is text-only → images read by ${cfg.visionModel}`
+          : mainCap === "text"
+            ? `${cfg.model} is text-only — /vision <model> to read pasted images`
+            : `${cfg.model} image support unknown — asked on first paste`;
     await runTui({
       initialStatus: { sessionName: meta.title || "new session", approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
       cwd,
-      header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
+      header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
       cycleApproval: (m) => cycleMode(m),
       onClipboardImage: readClipboardImage,
       onSubmit: async (line, h, images) => {
@@ -975,6 +967,8 @@ program.action(async (opts) => {
           if (nm === "model") {
             if (!arg) return void h.sink.notice(`model: ${cfg.provider}:${cfg.model}`);
             cfg.model = arg;
+            visionProvider = undefined; // new model may resolve a different describer / capability
+            remindedVision = false;
             const p = await buildProvider(cfg);
             if (p) {
               provider = p;

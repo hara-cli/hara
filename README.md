@@ -127,9 +127,10 @@ the top-right corner, approval modes + token usage + concurrency in the bottom b
 conversation scrolling above it. Streaming text, reasoning, tool calls, and colored diffs render as live
 blocks; a spinner runs during a turn. **shift+tab** cycles the approval mode, **Esc** interrupts a running
 turn, and tool approvals appear inline (y/N). **Ctrl+V** pastes an image from your clipboard (a screenshot,
-or a copied image) — or drag an image file into the terminal — and it shows as an `[Image #N]` chip. A
-hara auto-detects the model's capability — a vision model sees it directly; a text-only model routes it through
-a `visionModel` describer (see Setup), and hara reminds you if one isn't set. Set `HARA_TUI=0` for the classic readline REPL.
+or a copied image) — or drag an image file into the terminal — and it shows as a 🖼 **chip** below the prompt
+(⌫ on an empty line removes the last one). hara auto-detects the model's capability — a vision model sees the
+image directly; a text-only model routes it through a `visionModel` describer (see Setup), shown in the header
+at startup. Set `HARA_TUI=0` for the classic readline REPL.
 
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal

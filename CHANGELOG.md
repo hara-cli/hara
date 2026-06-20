@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.25.0 — unreleased (vision UX polish + ground-truth capability map)
+
+- **Header shows image routing at startup** — the banner now states whether the main model reads images
+  directly, routes them through a describer (`👁 glm-5 is text-only → images read by qwen3.7-plus`), or will
+  ask on first paste.
+- **Cleaner paste** — a pasted/dragged image is a 🖼 **chip** below the prompt (no more `[Image #N]` token in
+  your text); the input stays clean, you can submit an image with no text, and **backspace on empty input
+  removes the last attachment** (cc-haha style).
+- **Capability map corrected to the Alibaba Coding Plan** (ground truth): `qwen3.5/3.6/3.7-plus` + `kimi-k2.5`
+  → vision; `qwen3-max`, `qwen3-coder-*`, `glm-5`, `glm-4.7`, `MiniMax-M2.5` → text-only. So `glm-5` no longer
+  hits the "unknown" prompt — it routes straight to the describer.
+- **Hardening** (expert review): `/vision` is now one implementation shared by both REPLs; setting a
+  non-vision describer warns; `/model` resets the describer cache + reminder; Esc during describe reads as
+  "cancelled" not "failed".
+
 ## 0.24.1 — unreleased
 
 - Capability map: recognize the Alibaba coding-plan **Qwen3 flagships** (`qwen3.x-plus` / `qwen3-max`) as

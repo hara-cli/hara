@@ -122,7 +122,7 @@ export function InputBox({
   const [cursor, setCursor] = useState(0);
   const [sel, setSel] = useState(0);
   const [dismissed, setDismissed] = useState(false);
-  const [images, setImages] = useState<(ImageAttachment & { placeholder: string })[]>([]);
+  const [images, setImages] = useState<ImageAttachment[]>([]);
 
   const set = (v: string, c: number): void => {
     setValue(v);
@@ -131,20 +131,15 @@ export function InputBox({
     setDismissed(false);
   };
 
-  // Attach an image: drop an `[Image #N]` token into the text at the cursor and track the file.
+  // Attach an image as a chip below the box — the typed text stays clean (no inline token).
   const addImage = (img: ImageAttachment): void => {
-    const tag = `[Image #${images.length + 1}]`;
-    const before = value.slice(0, cursor);
-    const ins = (before && !before.endsWith(" ") ? " " : "") + tag + " ";
-    setValue(before + ins + value.slice(cursor));
-    setCursor((before + ins).length);
-    setImages((xs) => [...xs, { ...img, placeholder: tag }]);
-    setSel(0);
+    setImages((xs) => [...xs, img]);
     setDismissed(false);
   };
 
   const submit = (text: string): void => {
-    onSubmit?.(text, images.length ? images.map((i) => ({ path: i.path, mediaType: i.mediaType })) : undefined);
+    if (!text.trim() && images.length === 0) return; // nothing to send
+    onSubmit?.(text, images.length ? images : undefined);
     set("", 0);
     setImages([]);
   };
@@ -200,6 +195,7 @@ export function InputBox({
       }
       if (key.backspace || key.delete) {
         if (cursor > 0) set(value.slice(0, cursor - 1) + value.slice(cursor), cursor - 1);
+        else if (images.length) setImages((xs) => xs.slice(0, -1)); // empty input → remove the last attachment
         return;
       }
       if (input && !key.ctrl && !key.meta) {
@@ -246,8 +242,12 @@ export function InputBox({
         <Box>
           <Text>{"  "}</Text>
           {images.map((im, i) => (
-            <Text key={i} color="magenta">{`${i > 0 ? "   " : ""}🖼 ${im.placeholder}`}</Text>
+            <Text key={i}>
+              <Text backgroundColor="magenta" color="white">{` 🖼 image ${i + 1} `}</Text>
+              <Text> </Text>
+            </Text>
           ))}
+          <Text dimColor>{`${images.length} attached · ⌫ removes last`}</Text>
         </Box>
       ) : null}
       {popupOpen ? <MentionPopup items={candidates} selected={selIdx} query={mention!.query} /> : null}

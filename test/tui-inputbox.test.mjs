@@ -69,7 +69,7 @@ test("InputBox shows an @path popup with file matches", async () => {
   unmount();
 });
 
-test("InputBox: Ctrl+V attaches a clipboard image (placeholder + chip), passed to onSubmit", async () => {
+test("InputBox: Ctrl+V attaches a clipboard image as a chip (clean input), image-only submit", async () => {
   let submitted = null;
   const fakeImg = { path: "/tmp/shot.png", mediaType: "image/png" };
   const { lastFrame, stdin, unmount } = render(
@@ -83,17 +83,17 @@ test("InputBox: Ctrl+V attaches a clipboard image (placeholder + chip), passed t
   stdin.write("\x16"); // Ctrl+V
   await tick();
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("[Image #1]"), "placeholder inserted into the input text");
-  assert.ok(frame.includes("🖼"), "image chip shown below the box");
-  stdin.write("\r");
+  assert.ok(frame.includes("🖼 image 1"), "image chip shown below the box");
+  assert.ok(!frame.includes("[Image #1]"), "no inline placeholder token pollutes the input");
+  stdin.write("\r"); // submit with no text — just the image
   await tick();
-  assert.ok(submitted, "submitted on Enter");
-  assert.equal(submitted.v.trim(), "[Image #1]", "text carries the placeholder");
-  assert.deepEqual(submitted.images, [fakeImg], "attachment (path + mediaType) passed to onSubmit");
+  assert.ok(submitted, "submitted on Enter even with empty text");
+  assert.equal(submitted.v.trim(), "", "input text stays clean");
+  assert.deepEqual(submitted.images, [fakeImg], "attachment passed to onSubmit");
   unmount();
 });
 
-test("InputBox: pasting/dragging an image file path attaches it instead of typing the path", async () => {
+test("InputBox: pasting/dragging an image file path attaches it as a chip, not literal text", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-ib-"));
   const png = join(dir, "pic.png");
   writeFileSync(png, Buffer.from([1, 2, 3]));
@@ -104,10 +104,24 @@ test("InputBox: pasting/dragging an image file path attaches it instead of typin
   stdin.write(png); // a dragged-in terminal emits the bare path
   await tick();
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("[Image #1]"), "path became an attachment placeholder");
+  assert.ok(frame.includes("🖼 image 1"), "path became an attachment chip");
   assert.ok(!frame.includes(png), "raw path not inserted as literal text");
   stdin.write("\r");
   await tick();
   assert.deepEqual(submitted.images, [{ path: png, mediaType: "image/png" }], "attachment passed on submit");
+  unmount();
+});
+
+test("InputBox: backspace on empty input removes the last image chip", async () => {
+  const fakeImg = { path: "/tmp/a.png", mediaType: "image/png" };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(InputBox, { status: S, cwd, onClipboardImage: () => fakeImg }),
+  );
+  stdin.write("\x16"); // attach one
+  await tick();
+  assert.ok(strip(lastFrame()).includes("🖼 image 1"), "chip present");
+  stdin.write("\x7f"); // backspace (DEL) on empty input
+  await tick();
+  assert.ok(!strip(lastFrame()).includes("🖼 image 1"), "chip removed");
   unmount();
 });

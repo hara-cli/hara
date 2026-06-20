@@ -13,8 +13,10 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("qwen", "qwen2.5-vl-7b-instruct");
   V("qwen", "qwen3-vl-plus");
   V("qwen", "qvq-72b-preview");
-  V("qwen", "qwen3.7-plus"); // Alibaba coding-plan flagship — verified multimodal
-  V("qwen", "qwen3-max-2026-01-23");
+  V("qwen", "qwen3.7-plus"); // Coding Plan: 视觉理解 (verified live)
+  V("qwen", "qwen3.6-plus");
+  V("qwen", "qwen3.5-plus");
+  V("openai", "kimi-k2.5"); // Coding Plan: 视觉理解
   V("openai", "glm-4v");
   V("openai", "glm-4.5v");
   V("openai", "deepseek-vl2");
@@ -42,11 +44,17 @@ test("classifyVision: text-only families → 'text'", () => {
   T("openai", "llama-3.1-70b");
   T("openai", "glm-4-flash");
   T("openai", "glm-4.6");
+  T("qwen", "qwen3-max-2026-01-23"); // Coding Plan: text only (no 视觉理解)
+  T("qwen", "qwen3-coder-next");
+  T("openai", "glm-5"); // Coding Plan: text only
+  T("openai", "glm-4.7");
+  T("openai", "minimax-m2.5");
+  T("openai", "kimi-k2"); // older Kimi (k2.5 is the vision one)
 });
 
 test("classifyVision: genuinely unknown models → 'unknown' (ask the user)", () => {
-  assert.equal(classifyVision("openai", "glm-5"), "unknown");
   assert.equal(classifyVision("openai", "some-mystery-llm-9000"), "unknown");
+  assert.equal(classifyVision("openai", "frobnicator-x1"), "unknown");
 });
 
 test("classifyVision: per-model overrides win and don't leak across models", () => {

@@ -30,6 +30,18 @@ test("App runs a turn: user line in, streamed assistant reply out, status bar pi
   unmount();
 });
 
+test("App header shows the vision routing line at init (describer display)", async () => {
+  const header = { version: "9.9.9", model: "qwen:glm-5", cwd: "/x", vision: "glm-5 is text-only → images read by qwen3.7-plus" };
+  const { lastFrame, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), header, onSubmit: async () => {} }),
+  );
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("👁"), "vision indicator shown in the header");
+  assert.ok(frame.includes("images read by qwen3.7-plus"), "describer routing shown at init");
+  unmount();
+});
+
 test("App shows a tool-approval confirm and resolves on 'y'", async () => {
   let granted = null;
   const onSubmit = async (line, h) => {
