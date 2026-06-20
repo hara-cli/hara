@@ -12,6 +12,11 @@ import { registerTool } from "./registry.js";
 import { loadConfig } from "../config.js";
 
 // ── RPA gotchas (hard-won; read before changing this file) ───────────────────────────────────────────
+// 0. TWO macOS PERMISSIONS, separately: Screen Recording (for `screencapture`) AND Accessibility (for
+//    `cliclick` click/move/type/key). They're granted independently in System Settings → Privacy & Security.
+//    Screenshots can work while clicks/keys SILENTLY DO NOTHING — if cliclick has no Accessibility grant it
+//    no-ops with exit 0, so the screen just never changes (the #1 cause of "it does nothing"). `open -a` is
+//    used to foreground apps (below) precisely because it needs no Accessibility grant.
 // 1. FOREGROUND TRAP: hara runs inside a terminal, which is the frontmost window — so screenshots capture
 //    and clicks land on the TERMINAL, not the app you mean. Always `activate` the target app FIRST
 //    (activateApp → osascript/AppActivate/wmctrl), then screenshot/find/click. The per-app allowlist also
@@ -101,7 +106,8 @@ function screenshot(): { path?: string; error?: string } {
 /** Bring an app to the foreground so screenshots/clicks land on IT, not the terminal hara runs in. */
 function activateApp(app: string): { ok: boolean; msg: string } {
   if (process.platform === "darwin") {
-    const r = run("osascript", ["-e", `tell application ${JSON.stringify(app)} to activate`]);
+    // `open -a` reliably launches+foregrounds; `osascript … activate` often leaves another window on top.
+    const r = run("open", ["-a", app]);
     return { ok: r.ok, msg: r.ok ? `activated ${app}` : r.out || `couldn't activate ${app}` };
   }
   if (process.platform === "win32") {
