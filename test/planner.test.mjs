@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { parsePlan, topoOrder, runCheck } from "../dist/org/planner.js";
+import { parsePlan, topoOrder, topoWaves, runCheck } from "../dist/org/planner.js";
 
 test("parsePlan: parses fenced JSON + normalizes deps/status", () => {
   const text = '```json\n{"atoms":[{"id":"a1","title":"do x","deps":[]},{"id":"a2","title":"do y","deps":["a1"],"verify":"x works","role":"impl"}]}\n```';
@@ -45,6 +45,35 @@ test("topoOrder: ignores dangling deps", () => {
   const r = topoOrder(atoms);
   assert.ok("ok" in r);
   assert.equal(r.ok.length, 1);
+});
+
+test("topoWaves: groups independent atoms into concurrent waves (diamond DAG)", () => {
+  // a1 → (a2, a3) → a4   ⇒ waves [a1], [a2,a3], [a4]
+  const atoms = parsePlan(
+    '{"atoms":[{"id":"a4","title":"merge","deps":["a2","a3"]},{"id":"a1","title":"setup","deps":[]},{"id":"a2","title":"left","deps":["a1"]},{"id":"a3","title":"right","deps":["a1"]}]}',
+  );
+  const r = topoWaves(atoms);
+  assert.ok("ok" in r);
+  assert.equal(r.ok.length, 3);
+  assert.deepEqual(r.ok[0].map((a) => a.id), ["a1"]);
+  assert.deepEqual(r.ok[1].map((a) => a.id).sort(), ["a2", "a3"]); // independent → same wave
+  assert.deepEqual(r.ok[2].map((a) => a.id), ["a4"]);
+  assert.equal(r.ok.flat().length, atoms.length); // every atom scheduled once
+});
+
+test("topoWaves: all-independent atoms collapse to one wave", () => {
+  const atoms = parsePlan('{"atoms":[{"id":"a1","title":"x","deps":[]},{"id":"a2","title":"y","deps":[]},{"id":"a3","title":"z","deps":[]}]}');
+  const r = topoWaves(atoms);
+  assert.ok("ok" in r);
+  assert.equal(r.ok.length, 1);
+  assert.equal(r.ok[0].length, 3);
+});
+
+test("topoWaves: detects a cycle", () => {
+  const atoms = parsePlan('{"atoms":[{"id":"a1","title":"x","deps":["a2"]},{"id":"a2","title":"y","deps":["a1"]}]}');
+  const r = topoWaves(atoms);
+  assert.ok("error" in r);
+  assert.match(r.error, /cycle/);
 });
 
 test("parsePlan: captures a check command", () => {

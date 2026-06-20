@@ -9,7 +9,7 @@
 🚧 **v0.33** · TypeScript · local-first · Apache-2.0
 
 **Highlights**
-- **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**).
+- **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**), and `hara plan --parallel` runs independent atoms concurrently.
 - **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only → propose a plan → approve → execute), selectable approvals with "don't ask again", windowed reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
 - **Persistent memory + self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting, **proactively saves** durable facts, and grows its own playbooks (a lexical guard screens what it writes).
 - **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
@@ -191,7 +191,8 @@ sequences them as a DAG, and executes each step (optionally routed to a role) be
 **verify gate** — frame → atomize → sequence → execute → verify. Each atom may carry a `check` shell
 command, so verification is **objective** (e.g. `npm test`, `tsc --noEmit`) rather than a
 self-assessment. Plan state is the SSOT at `.hara/org/plan.json` (inspectable; execution stops on the
-first failed verification).
+first failed verification). With **`hara plan --parallel`**, independent atoms (the same dependency wave)
+run **concurrently** — the org works the independent parts at once, not one step at a time.
 
 ### What it can do
 

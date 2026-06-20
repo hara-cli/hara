@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.35.0 — unreleased (parallel plan execution — the org works in parallel)
+
+- **`hara plan --parallel`** runs independent atoms concurrently. The planner already builds a dependency DAG;
+  now `topoWaves` groups atoms into dependency *waves* (every atom in a wave depends only on earlier waves), and
+  each wave's atoms execute at the same time. A diamond plan `a1 → (a2,a3) → a4` runs a2 and a3 together.
+- This is the org differentiator made literal: not one agent stepping through a list, but a team working the
+  independent parts at once. Verified live (glm-5): two independent atoms ran in one wave and completed
+  out-of-order; both check-gates passed.
+- Sequential remains the default (and is what interactive approval uses, since concurrent atoms can't share a
+  prompt). `hara plan` is full-auto, so `--parallel` is safe there. A wave stops the run if any of its atoms fail.
+- Internal: `executeAtom` extracted (shared by both paths); `topoWaves(atoms)` added alongside `topoOrder`.
+
 ## 0.34.0 — unreleased (incremental indexing)
 
 - **`hara index` is now incremental.** Re-running it re-embeds only the files whose mtime changed since the

@@ -109,6 +109,23 @@ export function topoOrder(atoms: Atom[]): { ok: Atom[] } | { error: string } {
   return { ok: order };
 }
 
+/** Group atoms into dependency "waves": every atom in a wave depends only on atoms in EARLIER waves, so a
+ *  wave's atoms are mutually independent and may run concurrently. Preserves atom order; errors on a cycle. */
+export function topoWaves(atoms: Atom[]): { ok: Atom[][] } | { error: string } {
+  const byId = new Map(atoms.map((a) => [a.id, a]));
+  const remaining = new Map(atoms.map((a) => [a.id, a]));
+  const done = new Set<string>();
+  const waves: Atom[][] = [];
+  while (remaining.size) {
+    const wave = [...remaining.values()].filter((a) => a.deps.every((d) => !byId.has(d) || done.has(d)));
+    if (!wave.length) return { error: "plan has a dependency cycle — cannot sequence" };
+    for (const a of wave) remaining.delete(a.id);
+    for (const a of wave) done.add(a.id);
+    waves.push(wave);
+  }
+  return { ok: waves };
+}
+
 /** Prompt to execute a single atom in the context of the overall plan. */
 export function atomPrompt(atom: Atom, plan: Plan, done: Atom[]): string {
   const priors = done.length ? `Already completed: ${done.map((a) => a.title).join("; ")}.\n` : "";

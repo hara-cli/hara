@@ -52,7 +52,7 @@ import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
-import { decompose, topoOrder, savePlan, atomPrompt, verify, runCheck, type Atom } from "./org/planner.js";
+import { decompose, topoOrder, topoWaves, savePlan, atomPrompt, verify, runCheck, type Atom, type Plan } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
 import { sandboxSupported, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
@@ -110,6 +110,7 @@ interface OrgOpts {
   projectContext?: string;
   stats: { input: number; output: number };
   forceRole?: string;
+  parallel?: boolean; // execute independent atoms (same dependency wave) concurrently
 }
 
 /** Dispatch a task to the owning role and run that role's agent (its persona + tool subset + model). */
@@ -174,7 +175,49 @@ function lastAssistantText(history: NeutralMsg[]): string {
   return "";
 }
 
-/** Decompose a task into atoms, sequence them (DAG), and execute each with a verify gate. */
+/** Run one atom (routed to its role if any), then gate it (its `check` command, else an LLM verify). */
+async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], o: OrgOpts): Promise<boolean> {
+  atom.status = "running";
+  savePlan(o.cwd, plan);
+  const role = atom.role ? roles.find((r) => r.id === atom.role) : undefined;
+  const roleProvider =
+    role?.model && role.model !== o.cfg.model ? ((await buildProvider({ ...o.cfg, model: role.model })) ?? o.baseProvider) : o.baseProvider;
+  const toolFilter = role?.allowTools
+    ? (n: string) => role.allowTools!.includes(n)
+    : role?.denyTools
+      ? (n: string) => !role.denyTools!.includes(n)
+      : undefined;
+  const history: NeutralMsg[] = [{ role: "user", content: atomPrompt(atom, plan, done) }];
+  try {
+    await runAgent(history, {
+      provider: roleProvider,
+      ctx: { cwd: o.cwd, sandbox: o.sandbox },
+      approval: o.approval,
+      confirm: o.confirm,
+      projectContext: o.projectContext,
+      memory: memoryDigest(o.cwd),
+      stats: o.stats,
+      systemOverride: role?.system,
+      toolFilter,
+      quiet: o.parallel, // concurrent atoms would otherwise interleave their streamed output
+    });
+  } catch (e: any) {
+    atom.status = "failed";
+    atom.note = e.message;
+    savePlan(o.cwd, plan);
+    out(c.red(`  ✗ ${atom.id} errored: ${e.message}\n`));
+    return false;
+  }
+  const v = atom.check ? await runCheck(atom.check, o.cwd, o.sandbox) : await verify(o.baseProvider, atom, lastAssistantText(history));
+  atom.status = v.ok ? "done" : "failed";
+  atom.note = v.reason;
+  savePlan(o.cwd, plan);
+  out(v.ok ? c.green(`  ✓ ${atom.id} verified\n`) : c.yellow(`  ⚠ ${atom.id}: ${v.reason}\n`));
+  return v.ok;
+}
+
+/** Decompose a task into atoms, sequence them (DAG), and execute each with a verify gate.
+ *  With `parallel`, independent atoms (the same dependency wave) run concurrently. */
 async function runPlan(task: string, o: OrgOpts): Promise<void> {
   const roles = loadRoles(o.cwd);
   out(c.dim("Planning…\n"));
@@ -199,49 +242,28 @@ async function runPlan(task: string, o: OrgOpts): Promise<void> {
   }
   savePlan(o.cwd, plan);
   const done: Atom[] = [];
-  for (const atom of ordered) {
-    atom.status = "running";
-    savePlan(o.cwd, plan);
-    out(c.cyan(`\n▶ ${atom.id} ${atom.title}\n`));
-    const role = atom.role ? roles.find((r) => r.id === atom.role) : undefined;
-    const roleProvider =
-      role?.model && role.model !== o.cfg.model ? ((await buildProvider({ ...o.cfg, model: role.model })) ?? o.baseProvider) : o.baseProvider;
-    const toolFilter = role?.allowTools
-      ? (n: string) => role.allowTools!.includes(n)
-      : role?.denyTools
-        ? (n: string) => !role.denyTools!.includes(n)
-        : undefined;
-    const history: NeutralMsg[] = [{ role: "user", content: atomPrompt(atom, plan, done) }];
-    try {
-      await runAgent(history, {
-        provider: roleProvider,
-        ctx: { cwd: o.cwd, sandbox: o.sandbox },
-        approval: o.approval,
-        confirm: o.confirm,
-        projectContext: o.projectContext,
-        memory: memoryDigest(o.cwd),
-        stats: o.stats,
-        systemOverride: role?.system,
-        toolFilter,
-      });
-    } catch (e: any) {
-      atom.status = "failed";
-      atom.note = e.message;
-      savePlan(o.cwd, plan);
-      out(c.red(`  ✗ ${atom.id} errored: ${e.message}\n`));
-      break;
+
+  if (o.parallel) {
+    const waved = topoWaves(plan.atoms);
+    if ("error" in waved) return void out(c.red(`${waved.error}\n`));
+    out(c.dim(`Parallel mode — ${waved.ok.length} wave(s).\n`));
+    for (const wave of waved.ok) {
+      out(c.cyan(`\n▶ wave [${wave.map((a) => a.id).join(", ")}] — ${wave.length} in parallel\n`));
+      const results = await Promise.all(wave.map((atom) => executeAtom(atom, plan, done, roles, o)));
+      wave.forEach((atom, i) => results[i] && done.push(atom));
+      if (results.some((r) => !r)) {
+        out(c.dim("Stopping — a wave atom failed. Inspect .hara/org/plan.json, then refine & re-run.\n"));
+        break;
+      }
     }
-    if (atom.check) out(c.dim(`  check: ${atom.check}\n`));
-    const v = atom.check ? await runCheck(atom.check, o.cwd, o.sandbox) : await verify(o.baseProvider, atom, lastAssistantText(history));
-    atom.status = v.ok ? "done" : "failed";
-    atom.note = v.reason;
-    savePlan(o.cwd, plan);
-    if (v.ok) {
-      out(c.green(`  ✓ ${atom.id} verified\n`));
-      done.push(atom);
-    } else {
-      out(c.yellow(`  ⚠ ${atom.id}: ${v.reason}\n`) + c.dim("Stopping — inspect .hara/org/plan.json, then refine & re-run.\n"));
-      break;
+  } else {
+    for (const atom of ordered) {
+      out(c.cyan(`\n▶ ${atom.id} ${atom.title}\n`));
+      if (await executeAtom(atom, plan, done, roles, o)) done.push(atom);
+      else {
+        out(c.dim("Stopping — inspect .hara/org/plan.json, then refine & re-run.\n"));
+        break;
+      }
     }
   }
   out(c.bold(`\nPlan: ${plan.atoms.filter((a) => a.status === "done").length}/${plan.atoms.length} atoms done.\n`));
@@ -427,7 +449,8 @@ program
 program
   .command("plan <task...>")
   .description("decompose a task into atoms, sequence them (DAG), and execute each with a verify gate")
-  .action(async (taskParts: string[]) => {
+  .option("--parallel", "run independent atoms (same dependency wave) concurrently")
+  .action(async (taskParts: string[], opts: { parallel?: boolean }) => {
     const cfg = loadConfig();
     const provider = await buildProvider(cfg);
     if (!provider) {
@@ -444,6 +467,7 @@ program
       confirm: async () => true,
       projectContext: loadAgentsMd(cfg.cwd) || undefined,
       stats,
+      parallel: opts.parallel,
     });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
