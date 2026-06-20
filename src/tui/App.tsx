@@ -294,10 +294,9 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         </Box>
       )}
       {pool.length > 0 && !prompt && (
-        <Box flexDirection="column" marginTop={1}>
-          <Text dimColor>{`  📥 pool (${pool.length}) — sent together when this turn finishes:`}</Text>
+        <Box flexDirection="column">
           {pool.map((l, i) => (
-            <Text key={i} dimColor>{`   ${i + 1}. ${l.length > 64 ? l.slice(0, 64) + "…" : l}`}</Text>
+            <Text key={i} color={accent()}>{`  › ${l.length > 72 ? l.slice(0, 72) + "…" : l}`}</Text>
           ))}
         </Box>
       )}

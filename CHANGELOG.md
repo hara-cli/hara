@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.45.0 — unreleased (screen control: activate, IME-safe typing)
+
+- **`activate` action** — bring the target app to the foreground before screenshot/click. Fixes clicks landing
+  on the terminal hara runs in (the "Ghostty" problem): the agent must `activate WeChat` *first*.
+- **IME-safe typing** — `type` now sets the clipboard and pastes (Cmd/Ctrl+V) instead of injecting keystrokes,
+  which a Chinese input method garbles. Reliable for **CJK + emoji** (verified pbcopy round-trip: `你好 hello 😀`);
+  falls back to keystrokes for ASCII if the clipboard set fails.
+- The hard-won **RPA gotchas** (foreground trap, IME, Retina coords, grounding fragility, placeholder text like
+  "AAAA") are documented at the top of `computer.ts`.
+- TUI: the type-ahead pool shows each queued line **highlighted** (accent color) above the input — no verbose
+  header (per feedback).
+
 ## 0.44.0 — unreleased (type-ahead pool: visible + coalesced)
 
 - The type-ahead queue is now a **visible pool**: messages typed while the agent works are listed above the

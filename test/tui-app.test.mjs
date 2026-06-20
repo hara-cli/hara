@@ -177,7 +177,7 @@ test("App type-ahead: typing while working queues, then sends after the turn", a
   await tick();
   stdin.write("\r");
   await tick();
-  assert.ok(strip(lastFrame()).includes("pool"), "shows the visible pool");
+  assert.ok(strip(lastFrame()).includes("second"), "pooled message shown (highlighted) above the input");
   assert.equal(seen.length, 1, "queued message NOT sent while working");
   releaseFirst(); // finish turn 1 → pool drains
   await tick(150);

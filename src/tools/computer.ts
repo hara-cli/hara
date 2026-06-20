@@ -11,9 +11,26 @@ import { join } from "node:path";
 import { registerTool } from "./registry.js";
 import { loadConfig } from "../config.js";
 
+// ── RPA gotchas (hard-won; read before changing this file) ───────────────────────────────────────────
+// 1. FOREGROUND TRAP: hara runs inside a terminal, which is the frontmost window — so screenshots capture
+//    and clicks land on the TERMINAL, not the app you mean. Always `activate` the target app FIRST
+//    (activateApp → osascript/AppActivate/wmctrl), then screenshot/find/click. The per-app allowlist also
+//    refuses clicks unless an allowlisted app is frontmost.
+// 2. IME TRAP: keystroke injection (`cliclick t:`) is intercepted/converted by a CJK input method, so it
+//    cannot reliably enter Chinese/emoji (you get pinyin candidates or garble). `type` therefore PASTES via
+//    the clipboard (setClipboard + Cmd/Ctrl+V) — IME-immune and Unicode-safe — and only falls back to
+//    keystrokes if the clipboard set fails.
+// 3. RETINA/COORDS: screencapture is pixel-resolution (2× on Retina) but cliclick uses LOGICAL points.
+//    Grounding returns 0..1 fractions; multiply by screenSize() (logical) so clicks are scale-independent.
+// 4. GROUNDING IS FRAGILE: the vision model can mislocate an element. Prefer `find` to sanity-check coords,
+//    and ALWAYS re-screenshot after a click to verify before the next step.
+// 5. PLACEHOLDER TEXT: a model unsure what to type may emit placeholders (the observed "AAAA"). This tool
+//    faithfully types `input.text`; the caller/prompt must supply the REAL text, never a placeholder.
+// For *reliable* app automation prefer a real UI-automation backend (e.g. the pywechat MCP on Windows) over
+// this screenshot→ground→click loop, which is best-effort.
 type Tier = "off" | "read" | "click" | "full";
 const RANK: Record<Tier, number> = { off: 0, read: 1, click: 2, full: 3 };
-const ACTION_MIN: Record<string, Tier> = { screenshot: "read", find: "read", move: "click", click: "click", type: "full", key: "full" };
+const ACTION_MIN: Record<string, Tier> = { screenshot: "read", find: "read", activate: "click", move: "click", click: "click", type: "full", key: "full" };
 // dangerous combos refused even at full tier (quit / close / delete / task-switch-kill)
 const KEY_BLOCK = /(?:\b(cmd|command|ctrl|control|alt|option|win|super|meta)\b.*\+.*\b(q|w|delete|del|f4|escape|esc)\b)|ctrl\+alt\+(?:delete|del|backspace)/i;
 
@@ -38,6 +55,19 @@ function has(cmd: string): boolean {
   return (process.platform === "win32" ? run("where", [cmd]) : run("which", [cmd])).ok;
 }
 const ps = (script: string) => run("powershell", ["-NoProfile", "-Command", script]);
+
+/** Put text on the OS clipboard (so `type` can paste it — IME-safe + Unicode-safe, unlike keystroke injection). */
+function setClipboard(text: string): boolean {
+  try {
+    if (process.platform === "darwin") return spawnSync("pbcopy", [], { input: text, timeout: 5000 }).status === 0;
+    if (process.platform === "win32") return spawnSync("clip", [], { input: text, timeout: 5000 }).status === 0;
+    if (has("wl-copy")) return spawnSync("wl-copy", [], { input: text, timeout: 5000 }).status === 0;
+    if (has("xclip")) return spawnSync("xclip", ["-selection", "clipboard"], { input: text, timeout: 5000 }).status === 0;
+  } catch {
+    /* fall through */
+  }
+  return false;
+}
 
 let seq = 0;
 function tmpShot(): string {
@@ -66,6 +96,23 @@ function screenshot(): { path?: string; error?: string } {
     return { error: "screenshot produced no file" };
   }
   return { path: out };
+}
+
+/** Bring an app to the foreground so screenshots/clicks land on IT, not the terminal hara runs in. */
+function activateApp(app: string): { ok: boolean; msg: string } {
+  if (process.platform === "darwin") {
+    const r = run("osascript", ["-e", `tell application ${JSON.stringify(app)} to activate`]);
+    return { ok: r.ok, msg: r.ok ? `activated ${app}` : r.out || `couldn't activate ${app}` };
+  }
+  if (process.platform === "win32") {
+    const r = ps(`(New-Object -ComObject WScript.Shell).AppActivate(${JSON.stringify(app)})`);
+    return { ok: r.ok, msg: r.ok ? `activated ${app}` : r.out || `couldn't activate ${app}` };
+  }
+  if (process.platform === "linux") {
+    const r = has("wmctrl") ? run("wmctrl", ["-a", app]) : run("xdotool", ["search", "--name", app, "windowactivate"]);
+    return { ok: r.ok, msg: r.ok ? `activated ${app}` : r.out || `couldn't activate ${app} (need wmctrl/xdotool)` };
+  }
+  return { ok: false, msg: `activate unsupported on ${process.platform}` };
 }
 
 /** Logical screen size in the coordinate space the click backends use (points on mac, pixels on win/linux).
@@ -142,19 +189,34 @@ using System;using System.Runtime.InteropServices;public class Ms{[DllImport("us
   if (action === "type") {
     const text = String(input.text ?? "");
     if (!text) return { ok: false, msg: "type needs text" };
+    // IME-safe path: set the clipboard and paste. Keystroke injection (below) is intercepted/garbled by a
+    // CJK input method and can't enter Chinese/emoji reliably; pasting is immune and Unicode-safe.
+    if (setClipboard(text)) {
+      if (mac && has("cliclick")) {
+        const r = run("cliclick", ["kd:cmd", "t:v", "ku:cmd"]); // Cmd+V
+        if (r.ok) return { ok: true, msg: `pasted ${text.length} chars` };
+      } else if (lin && has("xdotool")) {
+        const r = run("xdotool", ["key", "ctrl+v"]);
+        if (r.ok) return { ok: true, msg: `pasted ${text.length} chars` };
+      } else if (win) {
+        const r = ps("Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('^v')");
+        if (r.ok) return { ok: true, msg: `pasted ${text.length} chars` };
+      }
+    }
+    // Fallback: keystroke injection (fine for ASCII when no IME is active).
     if (mac) {
       if (!has("cliclick")) return { ok: false, msg: "cliclick not found — install with `brew install cliclick`" };
       const r = run("cliclick", [`t:${text}`]);
-      return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars` : r.out };
+      return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars (keystroke)` : r.out };
     }
     if (lin) {
       if (!has("xdotool")) return { ok: false, msg: "xdotool not found" };
       const r = run("xdotool", ["type", "--clearmodifiers", text]);
-      return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars` : r.out };
+      return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars (keystroke)` : r.out };
     }
     if (win) {
       const r = ps(`Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait(${JSON.stringify(text)})`);
-      return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars` : r.out };
+      return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars (keystroke)` : r.out };
     }
   }
   if (action === "key") {
@@ -190,14 +252,17 @@ export function computerBackends(): string {
 registerTool({
   name: "computer",
   description:
-    "Control the screen to operate desktop software (not just the browser): screenshot, then click/move/type/" +
-    "press keys. Prefer grounding over guessing pixels — pass `target` (e.g. 'the Send button') to click/move " +
-    "and it's located by a vision model; or `find` to just get coordinates. Workflow: screenshot → read → " +
-    "click a target → re-screenshot to verify. Opt-in and permission-gated (tier + per-app allowlist).",
+    "Control the screen to operate desktop software (not just the browser). ALWAYS `activate` the target app " +
+    "FIRST (e.g. activate WeChat) — otherwise screenshots/clicks hit the terminal hara runs in, not the app. " +
+    "Then prefer grounding over guessing pixels: pass `target` (e.g. 'the Send button') to click/move and it's " +
+    "located by a vision model; or `find` to just get coordinates. Workflow: activate → screenshot → click a " +
+    "target → re-screenshot to verify. When typing, type the ACTUAL text — never placeholders. Opt-in and " +
+    "permission-gated (tier + per-app allowlist).",
   input_schema: {
     type: "object",
     properties: {
-      action: { type: "string", enum: ["screenshot", "find", "click", "move", "type", "key"] },
+      action: { type: "string", enum: ["screenshot", "activate", "find", "click", "move", "type", "key"] },
+      app: { type: "string", description: "app to bring to the foreground (activate) — e.g. 'WeChat'. Do this BEFORE screenshot/click so they hit the app, not the terminal." },
       target: { type: "string", description: "describe a UI element to locate (find) or click/move to — e.g. 'the Send button'. Preferred over x,y." },
       x: { type: "number", description: "x pixel (click/move; or use `target`)" },
       y: { type: "number", description: "y pixel (click/move; or use `target`)" },
@@ -214,6 +279,16 @@ registerTool({
     if (tier === "off") return "Screen control is off. Enable it: `hara config set computerUse read|click|full` (and `hara config set computerApps \"App Name, …\"` for the click/type allowlist).";
     const action = String(input.action ?? "");
     if (!actionAllowed(tier, action)) return `'${action}' needs a higher tier (current computerUse=${tier}). Raise it with \`hara config set computerUse …\`.`;
+
+    // Bring the target app to the foreground first — without this, clicks land on the terminal hara runs in.
+    if (action === "activate") {
+      const app = String(input.app ?? input.target ?? "");
+      if (!app) return "activate needs an `app` name (e.g. 'WeChat').";
+      if (!cfg.computerApps.some((a) => app.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(app.toLowerCase())))
+        return `Refused: "${app}" isn't in your allowlist (${cfg.computerApps.join(", ") || "empty"}). Add it: \`hara config set computerApps "${app}"\`.`;
+      const r = activateApp(app);
+      return r.ok ? `✓ ${r.msg} — now screenshot/find/click to act on it` : `Failed: ${r.msg}`;
+    }
 
     if (action !== "screenshot" && action !== "find") {
       // per-app allowlist: only act when an allowlisted app is frontmost (the key guard against wrong-window clicks)
