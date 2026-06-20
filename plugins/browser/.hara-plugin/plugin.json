@@ -1,0 +1,9 @@
+{
+  "name": "browser",
+  "version": "0.1.0",
+  "description": "Reliable web automation for hara via the Playwright MCP — acts on the DOM/accessibility tree (selectors, auto-wait), not pixels. navigate / click / type / fill / snapshot.",
+  "skills": ["skills"],
+  "mcpServers": {
+    "browser": { "command": "npx", "args": ["-y", "@playwright/mcp@latest"] }
+  }
+}

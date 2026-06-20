@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.47.0 — unreleased (browser plugin: reliable web automation via Playwright MCP)
+
+- New first-party **`browser` plugin** wires the **Playwright MCP** (`@playwright/mcp`) into hara → the agent gets
+  reliable web automation: `mcp__browser__navigate / snapshot / click / type / fill_form …` acting on the page's
+  **DOM/accessibility tree** (selectors, auto-waiting), NOT screenshots or pixel coordinates. This is the
+  reliable counterpart to the fragile desktop `computer` tool — no permission walls, no coordinate-guessing.
+- Ships a `web-automation` skill (snapshot-driven workflow; notes the `chrome-devtools-mcp` alternative for
+  driving your real logged-in Chrome, à la openclaw/cc-haha).
+- Install: `hara plugin add file:<repo>/plugins/browser`; `npx playwright install chromium` once. Verified
+  `@playwright/mcp@0.0.76` resolves + the plugin loads (`hara doctor` → plugins: browser).
+
 ## 0.46.0 — unreleased (screen control: bounded-failure circuit breaker)
 
 - The `computer` tool now **stops after 3 consecutive failures** instead of letting the agent loop forever on a
