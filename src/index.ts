@@ -4,6 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
 import { readClipboardImage } from "./images.js";
+import { describeImages } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
@@ -314,6 +315,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
     `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
     `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)}`,
+    `${dot} vision ${cfg.visionModel ? c.dim("describe pasted images via ") + c.bold(cfg.visionModel) : c.dim("inline (set visionModel to OCR images for text-only models)")}`,
     `${dot} mcp servers ${c.dim(String(Object.keys(cfg.mcpServers).length))}`,
   ];
   return lines.join("\n");
@@ -810,6 +812,35 @@ program.action(async (opts) => {
   if (useTui) {
     rl.close(); // hand stdin over to ink
     setTheme(cfg.theme);
+    // Vision sidecar: lazily build a describer provider (same plan/key, different model) and turn
+    // pasted images into text when `visionModel` is set; otherwise attach inline for a vision main model.
+    let visionProvider: Provider | null | undefined;
+    const getVisionProvider = async (): Promise<Provider | null> => {
+      if (visionProvider !== undefined) return visionProvider;
+      visionProvider = await buildProvider({ ...cfg, model: cfg.visionModel!, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey });
+      return visionProvider;
+    };
+    const resolveImages = async (
+      imgs: ImageAttachment[] | undefined,
+      sink: { notice: (s: string) => void },
+      signal?: AbortSignal,
+    ): Promise<{ extraText: string; attach?: ImageAttachment[] }> => {
+      if (!imgs?.length) return { extraText: "" };
+      if (!cfg.visionModel) return { extraText: "", attach: imgs }; // no sidecar → inline for a vision main model
+      const vp = await getVisionProvider();
+      if (!vp) {
+        sink.notice(`(visionModel ${cfg.visionModel} unavailable — attaching image inline)`);
+        return { extraText: "", attach: imgs };
+      }
+      sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with ${cfg.visionModel}…`);
+      try {
+        const desc = await describeImages(vp, imgs, { signal });
+        return { extraText: `\n\n[Image description — via ${cfg.visionModel}]\n${desc}` };
+      } catch (e) {
+        sink.notice(`(image describe failed: ${e instanceof Error ? e.message : String(e)} — attaching inline)`);
+        return { extraText: "", attach: imgs };
+      }
+    };
     await runTui({
       initialStatus: { sessionName: meta.title || "new session", approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
@@ -946,7 +977,8 @@ program.action(async (opts) => {
         const appr = h.approval;
         if (appr === "plan") {
           // PLAN MODE: read-only investigate → propose a plan → selectable proceed → execute.
-          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd), ...(images?.length ? { images } : {}) });
+          const planImg = await resolveImages(images, h.sink, h.signal);
+          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + planImg.extraText, ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
           recalledContext = "";
           const pin = stats.input;
           const pout = stats.output;
@@ -994,9 +1026,10 @@ program.action(async (opts) => {
           }
           return;
         }
-        const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd);
+        const { extraText, attach } = await resolveImages(images, h.sink, h.signal);
+        const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + extraText;
         recalledContext = "";
-        history.push({ role: "user", content: userContent, ...(images?.length ? { images } : {}) });
+        history.push({ role: "user", content: userContent, ...(attach?.length ? { images: attach } : {}) });
         const beforeIn = stats.input;
         const beforeOut = stats.output;
         await runAgent(history, {

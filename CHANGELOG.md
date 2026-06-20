@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.23.0 — unreleased (vision sidecar for text-only models)
+
+- **Use pasted images with text-only models** (DeepSeek, coding models, …) via a configurable vision
+  **sidecar**: `hara config set visionModel <model>` (e.g. a `qwen-vl-*` on the same Alibaba plan) — hara
+  OCRs/describes each pasted image into text with that model, then your main model continues. Reuses the
+  main provider's endpoint + key; override with `visionBaseURL` / `visionApiKey` if vision lives elsewhere.
+  Unset = images go inline (needs a vision main model).
+- The describe prompt is coding-tuned: verbatim transcription of text/code in fenced blocks, plus UI /
+  diagram / error description. `hara doctor` shows the vision status.
+
 ## 0.22.0 — unreleased (image paste / vision)
 
 - **Paste images into the prompt** (ink TUI) — **Ctrl+V** pastes an image from the OS clipboard (a

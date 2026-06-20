@@ -88,6 +88,16 @@ hara config set apiKey   ...
 hara config set model    ...
 ```
 
+**Vision for text-only models** (optional) — let a text-only main model (DeepSeek, coding models) act on
+images you paste:
+```bash
+hara config set visionModel qwen-vl-max   # a vision model on the same plan/key — the "eyes"
+# pasted images (Ctrl+V) are OCR'd/described into text by it, then your main model continues.
+# unset = images go inline (needs a vision-capable main model). Point vision elsewhere if needed:
+#   hara config set visionBaseURL https://dashscope.aliyuncs.com/compatible-mode/v1
+#   hara config set visionApiKey  sk-...
+```
+
 Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `HARA_MODEL`,
 `HARA_BASE_URL`, `HARA_API_KEY`, or the provider key (`ANTHROPIC_API_KEY` / `DASHSCOPE_API_KEY`).
 
@@ -115,8 +125,9 @@ the top-right corner, approval modes + token usage + concurrency in the bottom b
 conversation scrolling above it. Streaming text, reasoning, tool calls, and colored diffs render as live
 blocks; a spinner runs during a turn. **shift+tab** cycles the approval mode, **Esc** interrupts a running
 turn, and tool approvals appear inline (y/N). **Ctrl+V** pastes an image from your clipboard (a screenshot,
-or a copied image) — or drag an image file into the terminal — to attach it for vision-capable models; it
-shows as an `[Image #N]` chip. Set `HARA_TUI=0` for the classic readline REPL.
+or a copied image) — or drag an image file into the terminal — and it shows as an `[Image #N]` chip. A
+vision-capable main model sees it directly; for a **text-only** model, set `visionModel` (see Setup) to OCR
+it into text first. Set `HARA_TUI=0` for the classic readline REPL.
 
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal
