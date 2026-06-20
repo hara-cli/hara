@@ -66,6 +66,7 @@ import "./tools/web.js"; // register web_fetch
 import "./tools/agent.js"; // register agent (subagent spawn)
 import "./tools/memory.js"; // register memory_search/get/write/forget/skill_create
 import "./tools/skill.js"; // register the skill loader tool
+import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };

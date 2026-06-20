@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.30.0 — unreleased (codebase search — the repo as a knowledge base)
+
+- **`codebase_search`** — the current project is now a searchable knowledge base. Relevance-ranked **lexical**
+  search over the repo's code/text (respects `.gitignore` via `listProjectFiles`), returning the top files +
+  their densest snippet (`file:line`). Distinct from `grep` (exact pattern): the agent finds *related* code
+  from a natural-language query ("where's auth handled?") while working. Zero new deps; it's the interface a
+  semantic (zvec) index slots into later.
+
 ## 0.29.0 — unreleased (asset capture & curation — phase 1)
 
 - **Unified asset search** (the fix that enables the rest): `recall` / `searchAssets` now cover **skills +
