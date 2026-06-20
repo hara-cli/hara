@@ -53,7 +53,7 @@ import { decompose, topoOrder, savePlan, atomPrompt, verify, runCheck, type Atom
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
 import { sandboxSupported, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
-import { searchAssets, scaffoldAssets, assetsDir } from "./recall.js";
+import { searchAssets, scaffoldAssets, assetsDir, assetSearchRoots } from "./recall.js";
 import type { Provider, NeutralMsg, ImageAttachment } from "./providers/types.js";
 import { c, out, statusLine } from "./ui.js";
 import * as bar from "./statusbar.js";
@@ -917,7 +917,7 @@ program.action(async (opts) => {
       desc: "pull snippets from your code-asset library into context: /recall <query>",
       run: (a) => {
         if (!a) return void out(c.dim("usage: /recall <query>\n"));
-        const hits = searchAssets(a, 3);
+        const hits = searchAssets(a, 3, assetSearchRoots(cwd));
         if (!hits.length) return void out(c.dim(`(no matches in ${assetsDir()})\n`));
         const block = hits.map((h) => `Recalled \`${h.path}\` (${h.title}):\n${h.snippet}`).join("\n\n");
         recalledContext += (recalledContext ? "\n\n" : "") + block;
@@ -1032,7 +1032,7 @@ program.action(async (opts) => {
                   ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice } },
                   approval: "full-auto",
                   confirm: h.confirm,
-                  toolFilter: (n) => n === "memory_write" || n === "skill_create" || READONLY_TOOLS.has(n),
+                  toolFilter: (n) => n === "memory_write" || (cfg.assetCapture !== "off" && n === "skill_create") || READONLY_TOOLS.has(n),
                   systemOverride: DISTILL_SYSTEM,
                   memory: buildMemory(),
                   stats,
@@ -1071,7 +1071,7 @@ program.action(async (opts) => {
           }
           if (nm === "recall") {
             if (!arg) return void h.sink.notice("usage: /recall <query>");
-            const hits = searchAssets(arg, 3);
+            const hits = searchAssets(arg, 3, assetSearchRoots(cwd));
             if (!hits.length) return void h.sink.notice(`(no matches in ${assetsDir()})`);
             recalledContext += (recalledContext ? "\n\n" : "") + hits.map((x) => `Recalled \`${x.path}\` (${x.title}):\n${x.snippet}`).join("\n\n");
             return void h.sink.notice(`↗ recalled ${hits.length}: ${hits.map((x) => x.path).join(", ")} (added to your next message)`);
@@ -1094,7 +1094,7 @@ program.action(async (opts) => {
                   ctx: { cwd, sandbox, spawn, ui: cui },
                   approval: "full-auto",
                   confirm: h.confirm,
-                  toolFilter: (n) => n === "memory_write" || n === "skill_create" || READONLY_TOOLS.has(n),
+                  toolFilter: (n) => n === "memory_write" || (cfg.assetCapture !== "off" && n === "skill_create") || READONLY_TOOLS.has(n),
                   systemOverride: DISTILL_SYSTEM,
                   memory: buildMemory(),
                   stats,

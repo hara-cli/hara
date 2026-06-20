@@ -144,11 +144,18 @@ Code / codex / openclaw). Drop a `~/.hara/skills/<name>/SKILL.md` (or project `.
 `description` frontmatter and Markdown instructions; the agent sees the list and calls the `skill` tool to load
 a skill's full body only when it's relevant (progressive disclosure). `hara skills init` scaffolds one, `hara
 skills` lists them, `/skill <id>` loads one into your next message, and the agent saves its own with
-`skill_create`. Optional frontmatter: `when_to_use`, `allowed-tools`, `context: fork` (run as a sub-agent), `paths`.
+`skill_create` (`scope: project|personal`). Optional frontmatter: `when_to_use`, `allowed-tools`, `context: fork` (run as a sub-agent), `paths`.
+When the agent saves a skill, secrets are **redacted** and local paths/emails **generalized** (`<project>` / `~` / `<email>`),
+and a near-duplicate is flagged so it updates instead of piling up. `assetCapture: off|ask|auto` controls proactive end-of-session capture.
 
-**Recall** — `hara recall --init` creates a personal `~/.hara/code-assets` library (snippets/playbooks
-as `*.md`); `hara recall "<query>"` searches it, and `/recall <query>` pulls the best matches into your
-next message. A git-versionable library of code/patterns you want to reuse (`HARA_ASSETS` overrides the path).
+**Plugins** — bundle skills + roles + MCP servers in one installable unit (Claude-Code-compatible
+`plugin.json` / `.claude-plugin/`). `hara plugin add file:<path> | github:<owner/repo> | git:<url>` installs it;
+`hara plugin` lists; `enable`/`disable`/`remove`. A plugin's skills/roles/MCP auto-contribute (your project &
+global override them). `.claude/agents/*.md` subagents load as roles too.
+
+**Recall** — `hara recall --init` creates a personal `~/.hara/code-assets` library (snippets as `*.md`);
+`hara recall "<query>"` searches it **plus your skills** (one corpus), and `/recall <query>` pulls the best
+matches into your next message. A git-versionable library of code/patterns you want to reuse (`HARA_ASSETS` overrides the path).
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
 **Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).

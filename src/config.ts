@@ -21,6 +21,8 @@ export interface HaraConfig {
   sandbox: SandboxMode;
   theme: "dark" | "light";
   evolve: "off" | "light" | "proactive";
+  /** proactive code-asset capture at session end: off | ask (propose) | auto (save personal/project only). */
+  assetCapture: "off" | "ask" | "auto";
   /** Optional vision "sidecar": when set, pasted images are OCR'd/described by this model into text
    *  so a text-only main model (DeepSeek, coding models…) can use them. Endpoint/key default to the
    *  main provider's; override only if vision lives elsewhere. */
@@ -46,7 +48,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "visionModel", "visionBaseURL", "visionApiKey"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "visionModel", "visionBaseURL", "visionApiKey"] as const;
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
@@ -126,6 +128,7 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const sandbox = (process.env.HARA_SANDBOX ?? merged.sandbox ?? "off") as SandboxMode;
   const theme = (process.env.HARA_THEME ?? merged.theme ?? "dark") as "dark" | "light";
   const evolve = (process.env.HARA_EVOLVE ?? merged.evolve ?? "proactive") as "off" | "light" | "proactive";
+  const assetCapture = (process.env.HARA_ASSET_CAPTURE ?? merged.assetCapture ?? "ask") as "off" | "ask" | "auto";
   const visionModel = process.env.HARA_VISION_MODEL ?? merged.visionModel;
   const visionBaseURL = process.env.HARA_VISION_BASE_URL ?? merged.visionBaseURL;
   const visionApiKey = process.env.HARA_VISION_API_KEY ?? merged.visionApiKey;
@@ -136,7 +139,7 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
     ...(profile.mcpServers ?? {}),
   };
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, visionModel, visionBaseURL, visionApiKey, modelVision, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, visionModel, visionBaseURL, visionApiKey, modelVision, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

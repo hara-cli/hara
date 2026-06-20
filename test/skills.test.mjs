@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadSkillIndex, loadSkillBody, skillsDigest, invalidateSkillsCache } from "../dist/skills/skills.js";
+import { searchAssets, assetSearchRoots } from "../dist/recall.js";
 
 function tmpProject() {
   const dir = join(tmpdir(), "hara-skills-" + Math.random().toString(36).slice(2));
@@ -51,6 +52,19 @@ test("skillsDigest: one line per model-invocable skill, drops disable-model-invo
     const digest = skillsDigest(proj);
     assert.match(digest, /alpha: Do alpha things/);
     assert.doesNotMatch(digest, /secret|hidden helper/); // disable-model-invocation hides it from the index
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("assetSearchRoots unifies skills + code-assets so recall finds skills (Phase 0)", () => {
+  const proj = tmpProject();
+  try {
+    writeSkill(proj, "zod-forms", "name: zod-forms\ndescription: use the zod resolver for react-hook-form", "Use zodResolver(schema) with useForm.");
+    const roots = assetSearchRoots(proj);
+    const hits = searchAssets("zod resolver", 5, roots);
+    assert.ok(hits.some((h) => h.path.includes("zod-forms")), "recall finds the skill via the unified corpus");
   } finally {
     rmSync(proj, { recursive: true, force: true });
     invalidateSkillsCache();

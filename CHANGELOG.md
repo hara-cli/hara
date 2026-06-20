@@ -5,6 +5,32 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.29.0 — unreleased (asset capture & curation — phase 1)
+
+- **Unified asset search** (the fix that enables the rest): `recall` / `searchAssets` now cover **skills +
+  code-assets** as one corpus — they were disconnected, so agent-saved skills were invisible to recall (and
+  dedup was impossible).
+- **`skill_create` is now curated capture:**
+  - **`scope`** — `project` (this repo's `.hara/skills`) or `personal` (`~/.hara/skills`, default). Sharing to
+    company / public stays a separate, human-confirmed step.
+  - **Sanitize on save** — secrets are **redacted** to typed placeholders (`<REDACTED:sk-key>`…) rather than
+    blocking the whole save; local identifiers are generalized (`<project>` / `~` / `<email>`); injection
+    phrases are still hard-blocked.
+  - **Dedup signal** — searches the unified corpus before saving and flags a near-duplicate so you update
+    instead of piling up.
+- **`assetCapture: off | ask | auto`** gates proactive end-of-session capture (the distill turn).
+- `guard.ts` gains `redactSecrets()` / `scrubLocal()` — redact on the way in; `scanMemory` still blocks on load.
+
+## 0.28.0 — unreleased (plugins)
+
+- **Plugins** — a distribution unit bundling skills + roles + MCP servers; it owns nothing at runtime, the
+  existing loaders pick its contents up. Manifest is **Claude-Code-compatible** (`.claude-plugin/plugin.json`,
+  `.hara-plugin/plugin.json`, or bare `plugin.json`) so hara can consume community plugins.
+- `hara plugin add file:<path> | github:<owner/repo> | git:<url>` installs into `~/.hara/plugins/<name>`;
+  `hara plugin` lists; `hara plugin enable/disable/remove`. Enabled plugins' skills/roles/MCP auto-contribute
+  (lowest precedence — project & global override). `hara doctor` shows them.
+- **Claude-Code subagent interop**: `.claude/agents/*.md` load as roles (`tools:` → allowTools).
+
 ## 0.27.0 — unreleased (skills)
 
 - **Skills** — agentskills.io-standard reusable capabilities at `~/.hara/skills/<name>/SKILL.md` (+ project

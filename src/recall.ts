@@ -5,9 +5,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { walkFiles } from "./fs-walk.js";
+import { skillsDirs } from "./skills/skills.js";
 
 export function assetsDir(): string {
   return process.env.HARA_ASSETS || join(homedir(), ".hara", "code-assets");
+}
+
+/** Every lexical-search root for "assets": the skills (project + global + plugin) and the code-asset
+ *  library — one corpus so `recall` and dedup-before-save see the same things. */
+export function assetSearchRoots(cwd: string): string[] {
+  return [...skillsDirs(cwd), assetsDir()];
 }
 
 export interface Recalled {

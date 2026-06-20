@@ -3,10 +3,10 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { isAbsolute, resolve, join } from "node:path";
 import { registerTool } from "./registry.js";
-import { searchAssets } from "../recall.js";
+import { searchAssets, assetSearchRoots } from "../recall.js";
 import { memoryRoots, appendMemory, replaceMemory, forgetMemory, type Scope, type Target } from "../memory/store.js";
-import { scanMemory } from "../memory/guard.js";
-import { globalSkillsDir, invalidateSkillsCache } from "../skills/skills.js";
+import { scanMemory, redactSecrets, scrubLocal } from "../memory/guard.js";
+import { globalSkillsDir, skillsDir, invalidateSkillsCache } from "../skills/skills.js";
 
 const asTarget = (v: unknown): Target => (["memory", "user", "log"].includes(v as string) ? (v as Target) : "memory");
 const asScope = (v: unknown): Scope => (v === "global" ? "global" : "project");
@@ -86,28 +86,43 @@ registerTool({
       name: { type: "string", description: "short kebab-case skill id" },
       description: { type: "string", description: "one line: what it does + when to use it" },
       body: { type: "string", description: "the instructions in Markdown (steps, code, gotchas)" },
+      scope: { type: "string", enum: ["project", "personal"], description: "project = this repo's .hara/skills; personal = ~/.hara/skills (default). Sharing to company/public is a separate, human-confirmed step." },
     },
     required: ["name", "description", "body"],
   },
   kind: "edit",
-  async run(input) {
+  async run(input, ctx) {
     const slug = String(input.name ?? "")
       .toLowerCase()
       .replace(/[^a-z0-9-]+/g, "-")
       .replace(/^-+|-+$/g, "")
       .slice(0, 48);
     if (!slug) return "Error: invalid name.";
-    const description = String(input.description ?? "").replace(/\s+/g, " ").trim();
-    const body = String(input.body ?? "");
+    let description = String(input.description ?? "").replace(/\s+/g, " ").trim();
     if (!description) return "Error: a description is required (it's how the skill gets surfaced).";
+    // sanitize on capture: generalize local paths/emails, then redact secrets; block only on residue.
+    description = scrubLocal(description, ctx.cwd);
+    let body = scrubLocal(String(input.body ?? ""), ctx.cwd);
+    const rd = redactSecrets(description);
+    const rb = redactSecrets(body);
+    description = rd.text;
+    body = rb.text;
+    const redactions = [...rd.redactions, ...rb.redactions];
     const scan = scanMemory(`${description}\n${body}`);
-    if (!scan.ok) return `Blocked: content looks unsafe (${scan.hits.join(", ")}). Remove secrets/injection text.`;
-    const dir = join(globalSkillsDir(), slug);
-    mkdirSync(dir, { recursive: true });
+    if (!scan.ok) return `Blocked: content still looks unsafe (${scan.hits.join(", ")}). Remove injection/exfil text.`;
+    const scope = input.scope === "project" ? "project" : "personal";
+    const dir = join(scope === "project" ? skillsDir(ctx.cwd) : globalSkillsDir(), slug);
     const f = join(dir, "SKILL.md");
+    // dedup: surface a near-duplicate so the agent updates instead of piling up (lexical signal, not a block)
+    const dups = searchAssets(`${slug} ${description}`, 3, assetSearchRoots(ctx.cwd)).filter((h) => h.path !== f && h.score >= 2);
+    mkdirSync(dir, { recursive: true });
     writeFileSync(f, `---\nname: ${slug}\ndescription: ${description}\n---\n\n${body.trim()}\n`, "utf8");
     invalidateSkillsCache();
-    return `Saved skill to ${f}`;
+    const notes = [
+      redactions.length ? `redacted ${redactions.length} secret(s)` : "",
+      dups.length ? `⚠ similar already exists: ${dups.map((d) => d.path).join(", ")} — consider updating instead` : "",
+    ].filter(Boolean);
+    return `Saved ${scope} skill to ${f}${notes.length ? ` (${notes.join("; ")})` : ""}`;
   },
 });
 
