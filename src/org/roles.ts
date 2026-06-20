@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { findProjectRoot } from "../context/agents-md.js";
+import { pluginRoleDirs } from "../plugins/plugins.js";
 
 export interface Role {
   id: string;
@@ -22,6 +23,16 @@ export function rolesDir(cwd: string): string {
 /** Global roles — reusable personas across all projects. */
 export function globalRolesDir(): string {
   return join(homedir(), ".hara", "roles");
+}
+/** Claude-Code subagents (`.claude/agents/*.md`) — consumed for ecosystem interop (project scope). */
+export function claudeAgentsDir(cwd: string): string {
+  return join(findProjectRoot(cwd), ".claude", "agents");
+}
+/** Accept Claude-Code `tools:` (comma string or list) as an alias for hara's allowTools. */
+function claudeTools(v: unknown): string[] | undefined {
+  if (Array.isArray(v)) return v as string[];
+  if (typeof v === "string" && v.trim()) return v.split(",").map((s) => s.trim()).filter(Boolean);
+  return undefined;
 }
 
 function parseFrontmatter(text: string): { fm: Record<string, any>; body: string } {
@@ -49,8 +60,8 @@ function parseFrontmatter(text: string): { fm: Record<string, any>; body: string
 
 export function loadRoles(cwd: string): Role[] {
   const byId = new Map<string, Role>();
-  // global roles first, then project roles override on id clash (project wins) — same scope model as memory/config
-  for (const dir of [globalRolesDir(), rolesDir(cwd)]) {
+  // lowest→highest precedence: plugins < global < .claude/agents < .hara/roles (project wins, same as memory/config)
+  for (const dir of [...pluginRoleDirs(), globalRolesDir(), claudeAgentsDir(cwd), rolesDir(cwd)]) {
     if (!existsSync(dir)) continue;
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".md") || f === "README.md") continue;
@@ -63,7 +74,7 @@ export function loadRoles(cwd: string): Role[] {
           owns: Array.isArray(fm.owns) ? fm.owns : [],
           rejects: Array.isArray(fm.rejects) ? fm.rejects : [],
           model: fm.model || undefined,
-          allowTools: Array.isArray(fm.allowTools) ? fm.allowTools : undefined,
+          allowTools: Array.isArray(fm.allowTools) ? fm.allowTools : claudeTools(fm.tools),
           denyTools: Array.isArray(fm.denyTools) ? fm.denyTools : undefined,
           system: body,
         });

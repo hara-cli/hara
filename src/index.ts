@@ -47,6 +47,7 @@ import {
 } from "./session/store.js";
 import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills } from "./skills/skills.js";
+import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
 import { decompose, topoOrder, savePlan, atomPrompt, verify, runCheck, type Atom } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
@@ -324,7 +325,8 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} skills ${(() => { const n = loadSkillIndex(cfg.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(cfg.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
     `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)}`,
     `${dot} vision · ${c.bold(cfg.model)} ${vdesc}${cfg.visionModel ? c.dim(" · describer ") + c.bold(cfg.visionModel) : vcap === "text" ? c.yellow(" · set /vision <model>") : ""}`,
-    `${dot} mcp servers ${c.dim(String(Object.keys(cfg.mcpServers).length))}`,
+    `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
+    `${dot} mcp servers ${c.dim(String(Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length))}`,
   ];
   return lines.join("\n");
 }
@@ -507,6 +509,47 @@ skillsCmd.action(() => {
   }
 });
 
+const pluginCmd = program.command("plugin").description("manage plugins (bundle skills/roles/MCP servers)");
+pluginCmd
+  .command("add <source>")
+  .description("install a plugin from file:<path> | github:<owner/repo> | git:<url>")
+  .action((source: string) => {
+    try {
+      const p = installPlugin(source);
+      setPluginEnabled(p.name, true);
+      const m = p.manifest;
+      const parts = [
+        m.skills?.length ? `${m.skills.length} skill dir(s)` : "",
+        m.agents?.length ? `${m.agents.length} role dir(s)` : "",
+        m.mcpServers ? `${Object.keys(m.mcpServers).length} mcp server(s)` : "",
+      ].filter(Boolean);
+      out(c.green(`Installed ${p.name}@${p.version}${parts.length ? c.dim(" — " + parts.join(", ")) : ""}\n`));
+    } catch (e: any) {
+      out(c.red(`Install failed: ${e.message}\n`));
+    }
+  });
+pluginCmd
+  .command("remove <name>")
+  .alias("uninstall")
+  .description("uninstall a plugin")
+  .action((name: string) => out(uninstallPlugin(name) ? c.green(`Removed ${name}\n`) : c.dim(`(no plugin '${name}')\n`)));
+pluginCmd
+  .command("enable <name>")
+  .description("enable an installed plugin")
+  .action((name: string) => (setPluginEnabled(name, true), out(c.green(`Enabled ${name}\n`))));
+pluginCmd
+  .command("disable <name>")
+  .description("disable an installed plugin (keeps it installed)")
+  .action((name: string) => (setPluginEnabled(name, false), out(c.green(`Disabled ${name}\n`))));
+pluginCmd.action(() => {
+  const installed = listInstalled();
+  if (!installed.length) return void out(c.dim("No plugins. Install with `hara plugin add <source>`.\n"));
+  const on = new Set(enabledPlugins().map((p) => p.name));
+  for (const p of installed) {
+    out(`${on.has(p.name) ? c.green("●") : c.dim("○")} ${c.bold(p.name)}@${p.version}${p.manifest.description ? c.dim("  " + p.manifest.description) : ""}\n`);
+  }
+});
+
 const login = program.command("login").description("authenticate a provider");
 login
   .command("qwen")
@@ -588,8 +631,9 @@ program.action(async (opts) => {
   }
   const stats = { input: 0, output: 0, lastInput: 0 };
 
-  if (Object.keys(cfg.mcpServers).length) {
-    await connectMcpServers(cfg.mcpServers, (m) => out(c.dim(m + "\n")));
+  const mcpAll = { ...pluginMcpServers(), ...cfg.mcpServers }; // user config wins over plugin-contributed servers
+  if (Object.keys(mcpAll).length) {
+    await connectMcpServers(mcpAll, (m) => out(c.dim(m + "\n")));
   }
 
   // one-shot

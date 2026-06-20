@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { findProjectRoot } from "../context/agents-md.js";
 import { scanMemory } from "../memory/guard.js";
+import { pluginSkillDirs } from "../plugins/plugins.js";
 
 export interface Skill {
   id: string;
@@ -28,9 +29,9 @@ export function skillsDir(cwd: string): string {
 export function globalSkillsDir(): string {
   return join(homedir(), ".hara", "skills");
 }
-/** Search roots, lowest→highest precedence (later wins on id clash). Plugins prepend in S2. */
+/** Search roots, lowest→highest precedence (later wins on id clash): plugins < global < project. */
 export function skillsDirs(cwd: string): string[] {
-  return [globalSkillsDir(), skillsDir(cwd)];
+  return [...pluginSkillDirs(), globalSkillsDir(), skillsDir(cwd)];
 }
 
 function listVal(v: unknown): string[] | undefined {
@@ -63,6 +64,7 @@ function parseFrontmatter(text: string): { fm: Record<string, any>; body: string
 export function loadSkillIndex(cwd: string): Skill[] {
   const byId = new Map<string, Skill>();
   const gdir = globalSkillsDir();
+  const pdir = skillsDir(cwd);
   for (const dir of skillsDirs(cwd)) {
     if (!existsSync(dir)) continue;
     for (const entry of readdirSync(dir)) {
@@ -82,7 +84,7 @@ export function loadSkillIndex(cwd: string): Skill[] {
           userInvocable: !isFalse(fm["user-invocable"]),
           modelInvocable: !isTrue(fm["disable-model-invocation"]),
           file,
-          source: dir === gdir ? "global" : "project",
+          source: dir === gdir ? "global" : dir === pdir ? "project" : "plugin",
         });
       } catch {
         /* skip bad skill */
