@@ -46,6 +46,7 @@ import {
   type SessionData,
 } from "./session/store.js";
 import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
+import { loadSkillIndex, loadSkillBody, scaffoldSkills } from "./skills/skills.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
 import { decompose, topoOrder, savePlan, atomPrompt, verify, runCheck, type Atom } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
@@ -62,7 +63,8 @@ import "./tools/search.js"; // register grep/glob/ls
 import "./tools/patch.js"; // register apply_patch
 import "./tools/web.js"; // register web_fetch
 import "./tools/agent.js"; // register agent (subagent spawn)
-import "./tools/memory.js"; // register memory_search/get/write/forget
+import "./tools/memory.js"; // register memory_search/get/write/forget/skill_create
+import "./tools/skill.js"; // register the skill loader tool
 
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
@@ -246,7 +248,7 @@ const PLAN_SYSTEM =
   "End your message with the plan as a short numbered list.";
 const DISTILL_SYSTEM =
   "The session is ending. Reflect and persist only durable, reusable learnings: memory_write for facts / " +
-  "conventions / the user's preferences, playbook_save for reusable how-tos. Be selective — skip the trivial. Then reply DONE.";
+  "conventions / the user's preferences, skill_create for reusable how-tos. Be selective — skip the trivial. Then reply DONE.";
 const COMPACT_SYSTEM =
   "Summarize the conversation so far into a concise but complete brief so the assistant can " +
   "continue seamlessly: the user's goal, key decisions, files changed, current state, and open next steps. " +
@@ -319,6 +321,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
     `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
+    `${dot} skills ${(() => { const n = loadSkillIndex(cfg.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(cfg.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
     `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)}`,
     `${dot} vision · ${c.bold(cfg.model)} ${vdesc}${cfg.visionModel ? c.dim(" · describer ") + c.bold(cfg.visionModel) : vcap === "text" ? c.yellow(" · set /vision <model>") : ""}`,
     `${dot} mcp servers ${c.dim(String(Object.keys(cfg.mcpServers).length))}`,
@@ -478,6 +481,29 @@ rolesCmd.action(() => {
   }
   for (const r of roles) {
     out(`${c.bold(r.id)}${r.model ? c.dim(` (${r.model})`) : ""}  ${c.dim("owns: " + r.owns.join(", "))}\n  ${r.description}\n`);
+  }
+});
+
+const skillsCmd = program.command("skills").description("manage skills (.hara/skills/<name>/SKILL.md)");
+skillsCmd
+  .command("init")
+  .description("scaffold an example skill")
+  .action(() => {
+    const written = scaffoldSkills(process.cwd());
+    out(
+      written.length
+        ? c.green(`Created an example skill: ${written.join(", ")}\n`)
+        : c.dim("Skills already exist in .hara/skills/.\n"),
+    );
+  });
+skillsCmd.action(() => {
+  const skills = loadSkillIndex(process.cwd());
+  if (!skills.length) {
+    out(c.dim("No skills. Run `hara skills init`, or the agent saves them with skill_create.\n"));
+    return;
+  }
+  for (const s of skills) {
+    out(`${c.bold(s.id)}${s.context === "fork" ? c.dim(" (fork)") : ""}  ${c.dim(s.source)}\n  ${s.description}\n`);
   }
 });
 
@@ -762,6 +788,26 @@ program.action(async (opts) => {
       },
     },
     {
+      name: "skills",
+      desc: "list available skills",
+      run: () => {
+        const ss = loadSkillIndex(cwd);
+        if (!ss.length) return void out(c.dim("No skills. Run `hara skills init`.\n"));
+        for (const s of ss) out(`  ${s.id}  ${c.dim(s.description)}\n`);
+      },
+    },
+    {
+      name: "skill",
+      desc: "load a skill's instructions into your next message: /skill <id>",
+      run: (a) => {
+        if (!a) return void out(c.dim("usage: /skill <id>\n"));
+        const sk = loadSkillIndex(cwd).find((s) => s.id === a.trim());
+        if (!sk) return void out(c.dim(`(no skill '${a.trim()}')\n`));
+        recalledContext += (recalledContext ? "\n\n" : "") + `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}`;
+        out(c.green(`↗ loaded skill ${sk.id} (added to your next message)\n`));
+      },
+    },
+    {
       name: "org",
       desc: "dispatch a task to the owning role: /org <task>",
       run: async (a) => {
@@ -942,7 +988,7 @@ program.action(async (opts) => {
                   ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice } },
                   approval: "full-auto",
                   confirm: h.confirm,
-                  toolFilter: (n) => n === "memory_write" || n === "playbook_save" || READONLY_TOOLS.has(n),
+                  toolFilter: (n) => n === "memory_write" || n === "skill_create" || READONLY_TOOLS.has(n),
                   systemOverride: DISTILL_SYSTEM,
                   memory: buildMemory(),
                   stats,
@@ -1004,7 +1050,7 @@ program.action(async (opts) => {
                   ctx: { cwd, sandbox, spawn, ui: cui },
                   approval: "full-auto",
                   confirm: h.confirm,
-                  toolFilter: (n) => n === "memory_write" || n === "playbook_save" || READONLY_TOOLS.has(n),
+                  toolFilter: (n) => n === "memory_write" || n === "skill_create" || READONLY_TOOLS.has(n),
                   systemOverride: DISTILL_SYSTEM,
                   memory: buildMemory(),
                   stats,
@@ -1044,6 +1090,17 @@ program.action(async (opts) => {
           if (nm === "roles") {
             const rs = loadRoles(cwd);
             return void h.sink.notice(rs.length ? rs.map((r) => `  ${r.id} — owns: ${r.owns.join(", ")}`).join("\n") : "No roles. Run `hara roles init`.");
+          }
+          if (nm === "skills") {
+            const ss = loadSkillIndex(cwd);
+            return void h.sink.notice(ss.length ? ss.map((s) => `  ${s.id} — ${s.description}`).join("\n") : "No skills. Run `hara skills init`.");
+          }
+          if (nm === "skill") {
+            if (!arg) return void h.sink.notice("usage: /skill <id>");
+            const sk = loadSkillIndex(cwd).find((s) => s.id === arg.trim());
+            if (!sk) return void h.sink.notice(`(no skill '${arg.trim()}')`);
+            recalledContext += (recalledContext ? "\n\n" : "") + `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}`;
+            return void h.sink.notice(`↗ loaded skill ${sk.id} (added to your next message)`);
           }
           if (nm === "approval") {
             const all = ["suggest", "auto-edit", "full-auto", "plan"];

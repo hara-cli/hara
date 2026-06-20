@@ -4,6 +4,7 @@ import { stdout } from "node:process";
 import { c, out } from "../ui.js";
 import { activity } from "../activity.js";
 import { makeRenderer } from "../md.js";
+import { skillsDigest } from "../skills/skills.js";
 import type { ApprovalMode } from "../config.js";
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
@@ -21,15 +22,19 @@ Be concise and direct. Use the provided tools to read files, edit/write files, a
 commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
 them whole. You have a persistent memory: use memory_search before answering about prior decisions,
 conventions, or the user's preferences, and memory_write to proactively save durable facts you learn.
-Save reusable how-tos with playbook_save; if you discover a durable project convention, you may propose
-an edit to AGENTS.md via edit_file (the user reviews the diff). After completing a task, give a one-line summary.`;
+When a task matches one of the Skills listed below, call the \`skill\` tool to load its full instructions
+before acting; save a reusable how-to as a new skill with skill_create. If you discover a durable project
+convention, you may propose an edit to AGENTS.md via edit_file (the user reviews the diff). After completing
+a task, give a one-line summary.`;
 
 function composeSystem(cwd: string, projectContext?: string, override?: string, memory?: string): string {
   const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
+  const skills = skillsDigest(cwd);
   return (
     head +
     (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "") +
-    (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "")
+    (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "") +
+    (skills ? `\n\n# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
   );
 }
 

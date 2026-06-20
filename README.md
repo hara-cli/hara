@@ -139,6 +139,13 @@ Assistant output is **rendered as Markdown** (headers, bold, inline code, lists;
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal
 only; `HARA_MD=0` disables Markdown rendering.
 
+**Skills** — reusable capabilities on the **agentskills.io standard** (`SKILL.md`, interoperable with Claude
+Code / codex / openclaw). Drop a `~/.hara/skills/<name>/SKILL.md` (or project `.hara/skills/`) with `name` +
+`description` frontmatter and Markdown instructions; the agent sees the list and calls the `skill` tool to load
+a skill's full body only when it's relevant (progressive disclosure). `hara skills init` scaffolds one, `hara
+skills` lists them, `/skill <id>` loads one into your next message, and the agent saves its own with
+`skill_create`. Optional frontmatter: `when_to_use`, `allowed-tools`, `context: fork` (run as a sub-agent), `paths`.
+
 **Recall** — `hara recall --init` creates a personal `~/.hara/code-assets` library (snippets/playbooks
 as `*.md`); `hara recall "<query>"` searches it, and `/recall <query>` pulls the best matches into your
 next message. A git-versionable library of code/patterns you want to reuse (`HARA_ASSETS` overrides the path).

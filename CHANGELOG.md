@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.27.0 — unreleased (skills)
+
+- **Skills** — agentskills.io-standard reusable capabilities at `~/.hara/skills/<name>/SKILL.md` (+ project
+  `.hara/skills`). The system prompt lists each skill (id + description); the agent calls the new **`skill`**
+  tool to load a skill's full instructions on demand — progressive disclosure (the body returns as a tool
+  result, keeping the prompt cache stable). `context: fork` runs the skill as a sub-agent; `allowed-tools` /
+  `when_to_use` / `paths` / `user-invocable` frontmatter supported (Claude-Code-compatible).
+- **`skill_create`** replaces `playbook_save` — the agent saves a reusable how-to as a real SKILL.md (lexical
+  guard scans it). Playbooks are now just the agent-authored corner of the one skills system.
+- **`hara skills` / `hara skills init`**, plus `/skills` (list) and `/skill <id>` (load into your next
+  message). `hara doctor` lists your skills. Reuses the existing recall lexical engine — no new deps.
+
 ## 0.26.0 — unreleased (inline image tokens + session UUID & auto-name)
 
 - **Pasted images are inline `[Image #N]` tokens** (Claude Code / codex style) — highlighted in the input

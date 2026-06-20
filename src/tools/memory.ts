@@ -3,9 +3,10 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { isAbsolute, resolve, join } from "node:path";
 import { registerTool } from "./registry.js";
-import { searchAssets, assetsDir } from "../recall.js";
+import { searchAssets } from "../recall.js";
 import { memoryRoots, appendMemory, replaceMemory, forgetMemory, type Scope, type Target } from "../memory/store.js";
 import { scanMemory } from "../memory/guard.js";
+import { globalSkillsDir, invalidateSkillsCache } from "../skills/skills.js";
 
 const asTarget = (v: unknown): Target => (["memory", "user", "log"].includes(v as string) ? (v as Target) : "memory");
 const asScope = (v: unknown): Scope => (v === "global" ? "global" : "project");
@@ -74,37 +75,39 @@ registerTool({
 });
 
 registerTool({
-  name: "playbook_save",
+  name: "skill_create",
   description:
-    "Save a reusable playbook (a how-to / pattern you can recall later) to your code-asset library. " +
-    "Use after solving something worth reusing — `hara recall` and memory_search find it later.",
+    "Save a reusable skill (a how-to / capability) as a SKILL.md so you and future sessions can load it " +
+    "later via the `skill` tool. Use after solving something worth reusing. The `description` is how you'll " +
+    "recognize when to load it, so make it specific (what it does + when to use it).",
   input_schema: {
     type: "object",
     properties: {
-      slug: { type: "string", description: "short kebab-case file name" },
-      title: { type: "string" },
-      tags: { type: "array", items: { type: "string" } },
-      body: { type: "string", description: "the playbook in Markdown (steps, code, gotchas)" },
+      name: { type: "string", description: "short kebab-case skill id" },
+      description: { type: "string", description: "one line: what it does + when to use it" },
+      body: { type: "string", description: "the instructions in Markdown (steps, code, gotchas)" },
     },
-    required: ["slug", "title", "body"],
+    required: ["name", "description", "body"],
   },
   kind: "edit",
   async run(input) {
-    const slug = String(input.slug ?? "")
+    const slug = String(input.name ?? "")
       .toLowerCase()
       .replace(/[^a-z0-9-]+/g, "-")
       .replace(/^-+|-+$/g, "")
       .slice(0, 48);
-    if (!slug) return "Error: invalid slug.";
+    if (!slug) return "Error: invalid name.";
+    const description = String(input.description ?? "").replace(/\s+/g, " ").trim();
     const body = String(input.body ?? "");
-    const scan = scanMemory(`${input.title}\n${body}`);
+    if (!description) return "Error: a description is required (it's how the skill gets surfaced).";
+    const scan = scanMemory(`${description}\n${body}`);
     if (!scan.ok) return `Blocked: content looks unsafe (${scan.hits.join(", ")}). Remove secrets/injection text.`;
-    const tags = Array.isArray(input.tags) ? input.tags : [];
-    const dir = join(assetsDir(), "playbooks");
+    const dir = join(globalSkillsDir(), slug);
     mkdirSync(dir, { recursive: true });
-    const f = join(dir, `${slug}.md`);
-    writeFileSync(f, `---\ntitle: ${input.title}\ntags: [${tags.join(", ")}]\n---\n\n${body.trim()}\n`, "utf8");
-    return `Saved playbook to ${f}`;
+    const f = join(dir, "SKILL.md");
+    writeFileSync(f, `---\nname: ${slug}\ndescription: ${description}\n---\n\n${body.trim()}\n`, "utf8");
+    invalidateSkillsCache();
+    return `Saved skill to ${f}`;
   },
 });
 
