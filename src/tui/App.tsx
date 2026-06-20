@@ -147,7 +147,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const ctrlRef = useRef<AbortController | null>(null);
   const queueRef = useRef<{ line: string; images?: ImageAttachment[] }[]>([]); // type-ahead: FIFO of messages entered while working
-  const [queued, setQueued] = useState(0); // queue depth, for the UI hint
+  const [pool, setPool] = useState<string[]>([]); // type-ahead pool: queued message lines, shown above the input
   const drainingRef = useRef(false); // idempotency guard so the drain effect can't double-send one item
   const currentRef = useRef<Item[]>([]);
   currentRef.current = current;
@@ -173,10 +173,9 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       const t = line.trim();
       if ((!t && !images?.length) || prompt) return; // nothing to send, or a choice is pending
       if (working) {
-        // type-ahead: hold the message in a FIFO queue; it's sent when the current turn finishes
+        // type-ahead: hold the message in the pool; all pooled messages are sent together when the turn ends
         queueRef.current.push({ line, images });
-        setQueued(queueRef.current.length);
-        pushCurrent("notice", "⌨ queued — sends when the current turn finishes");
+        setPool(queueRef.current.map((q) => q.line.trim() || "🖼 (image)"));
         return;
       }
       setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]); // t already carries any [Image #N] tokens
@@ -224,14 +223,17 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     [working, prompt, onSubmit, pushCurrent, model, exit],
   );
 
-  // Drain the type-ahead queue: when a turn finishes (working → false) and nothing is awaiting a choice,
-  // send the next queued message. Runs one at a time (each send sets working again), preserving FIFO order.
+  // Drain the type-ahead pool: when the turn finishes (working → false) and nothing awaits a choice, COALESCE
+  // every pooled message into ONE turn and send it — additions/clarifications go to the agent together, in order.
   useEffect(() => {
     if (working || prompt || drainingRef.current || !queueRef.current.length) return;
     drainingRef.current = true;
-    const next = queueRef.current.shift()!;
-    setQueued(queueRef.current.length);
-    void Promise.resolve(handleSubmit(next.line, next.images)).finally(() => {
+    const batch = queueRef.current;
+    queueRef.current = [];
+    setPool([]);
+    const line = batch.map((b) => b.line).join("\n\n");
+    const images = batch.flatMap((b) => b.images ?? []);
+    void Promise.resolve(handleSubmit(line, images.length ? images : undefined)).finally(() => {
       drainingRef.current = false;
     });
   }, [working, prompt, handleSubmit]);
@@ -264,7 +266,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       // Esc = stop everything: abort the turn AND drop any type-ahead (a stopped turn shouldn't fire queued msgs)
       if (queueRef.current.length) {
         queueRef.current = [];
-        setQueued(0);
+        setPool([]);
       }
       ctrlRef.current?.abort();
     }
@@ -291,7 +293,15 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           <Text dimColor>{`   ↑↓ or 1–${prompt.options.length} to choose · Enter · Esc cancels`}</Text>
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} isActive={!prompt} working={working} queued={queued} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
+      {pool.length > 0 && !prompt && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text dimColor>{`  📥 pool (${pool.length}) — sent together when this turn finishes:`}</Text>
+          {pool.map((l, i) => (
+            <Text key={i} dimColor>{`   ${i + 1}. ${l.length > 64 ? l.slice(0, 64) + "…" : l}`}</Text>
+          ))}
+        </Box>
+      )}
+      <InputBox status={status} cwd={cwd} isActive={!prompt} working={working} queued={pool.length} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );
 }

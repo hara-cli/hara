@@ -177,11 +177,42 @@ test("App type-ahead: typing while working queues, then sends after the turn", a
   await tick();
   stdin.write("\r");
   await tick();
-  assert.ok(strip(lastFrame()).includes("queued"), "shows a queued hint");
+  assert.ok(strip(lastFrame()).includes("pool"), "shows the visible pool");
   assert.equal(seen.length, 1, "queued message NOT sent while working");
-  releaseFirst(); // finish turn 1 → queue drains
+  releaseFirst(); // finish turn 1 → pool drains
   await tick(150);
   assert.ok(seen.includes("second"), "queued message sent after the turn finished");
+  unmount();
+});
+
+test("App type-ahead: multiple pooled messages coalesce into one turn", async () => {
+  const seen = [];
+  let release;
+  const onSubmit = async (line) => {
+    seen.push(line);
+    if (line === "go") await new Promise((r) => (release = r));
+  };
+  const { stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("also do A"); // pool two messages while working
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("and B");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.equal(seen.length, 1, "nothing sent while working");
+  release();
+  await tick(150);
+  assert.equal(seen.length, 2, "exactly one coalesced turn after the first");
+  assert.ok(seen[1].includes("also do A") && seen[1].includes("and B"), "both pooled messages combined into one turn");
   unmount();
 });
 

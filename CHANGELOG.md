@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.44.0 — unreleased (type-ahead pool: visible + coalesced)
+
+- The type-ahead queue is now a **visible pool**: messages typed while the agent works are listed above the
+  input (`📥 pool (N) — sent together when this turn finishes`), so Enter visibly *enters the pool* instead of
+  appearing to vanish (the reported "回车消失了/没显示在对话池").
+- On turn-end the pool is **coalesced into one turn** — your "also do X" / "and Y" additions reach the agent
+  together, in order, rather than as separate sequential turns.
+- Esc still clears the pool (stop means stop). 130 tests (+1 coalesce; existing type-ahead tests updated).
+
 ## 0.43.0 — unreleased (grounding for screen control — accurate clicks)
 
 - The `computer` tool now **locates UI elements by description** instead of guessing pixels from a text read.
