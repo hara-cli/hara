@@ -54,7 +54,7 @@ import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPlugi
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
 import { decompose, topoOrder, topoWaves, savePlan, loadPlan, atomPrompt, verify, runCheck, type Atom, type Plan } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
-import { sandboxSupported, type SandboxMode } from "./sandbox.js";
+import { sandboxSupported, runShell, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
 import { searchAssets, scaffoldAssets, assetsDir, assetSearchRoots } from "./recall.js";
 import type { Provider, NeutralMsg, ImageAttachment } from "./providers/types.js";
@@ -305,7 +305,12 @@ async function runResume(o: OrgOpts): Promise<void> {
   await executePlan(plan, roles, o);
 }
 
-const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch"]);
+const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "codebase_search"]);
+const REVIEW_SYSTEM =
+  "You are a senior code reviewer. Review the git diff the user provides for: correctness bugs, security " +
+  "issues, missing error handling, unclear naming, and missing/weak tests. You may read files (read-only) " +
+  "for context. Be concise and specific — cite file:line and the concrete fix. Group findings by severity: " +
+  "**Blocker**, **Should-fix**, **Nit**. If nothing material is wrong, say the diff looks good. Never edit files.";
 const PLAN_SYSTEM =
   "You are in PLAN MODE. Investigate read-only (read_file / grep / glob / ls / web_fetch) and think, " +
   "then propose a concise step-by-step plan for the task. Do NOT edit files or run commands yet — only plan. " +
@@ -572,6 +577,42 @@ program
   .command("doctor")
   .description("check your hara setup (provider / auth / model / node / assets / roles)")
   .action(() => out(runDoctor(loadConfig()) + "\n"));
+
+program
+  .command("review")
+  .description("review your uncommitted changes (git diff) for bugs, security, and missing tests")
+  .option("--staged", "review only staged changes")
+  .option("--base <ref>", "review against a base ref (e.g. main) instead of just the working tree")
+  .action(async (opts: { staged?: boolean; base?: string }) => {
+    const cfg = loadConfig();
+    const provider = await buildProvider(cfg);
+    if (!provider) {
+      out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
+      process.exit(1);
+    }
+    const cmd = opts.base ? `git diff ${opts.base}` : opts.staged ? "git diff --staged" : "git diff HEAD";
+    let diff = "";
+    try {
+      diff = (await runShell(cmd, cfg.cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout;
+    } catch (e) {
+      return void out(c.red(`\`${cmd}\` failed: ${e instanceof Error ? e.message : String(e)}\n`) + c.dim("(is this a git repo?)\n"));
+    }
+    if (!diff.trim()) return void out(c.dim(`No changes to review (${cmd}).\n`));
+    out(c.dim(`Reviewing \`${cmd}\` (${diff.split("\n").length} diff lines)…\n\n`));
+    const stats = { input: 0, output: 0, lastInput: 0 };
+    await runAgent([{ role: "user", content: `Review this diff:\n\n\`\`\`diff\n${diff.slice(0, 120_000)}\n\`\`\`` }], {
+      provider,
+      ctx: { cwd: cfg.cwd, sandbox: cfg.sandbox },
+      approval: "full-auto",
+      confirm: async () => true,
+      systemOverride: REVIEW_SYSTEM,
+      toolFilter: (n) => READONLY_TOOLS.has(n), // read-only: the reviewer can inspect, never edit
+      projectContext: loadAgentsMd(cfg.cwd) || undefined,
+      memory: memoryDigest(cfg.cwd),
+      stats,
+    });
+    if (stats.input || stats.output) out("\n" + statusLine(cfg.model, stats.input, stats.output) + "\n");
+  });
 
 const rolesCmd = program.command("roles").description("manage org roles (.hara/roles)");
 rolesCmd

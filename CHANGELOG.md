@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.38.0 — unreleased (hara review — review your changes)
+
+- **`hara review`** reviews your uncommitted changes (`git diff HEAD`) for correctness bugs, security issues,
+  missing error handling, naming, and missing tests — grouped by severity (**Blocker / Should-fix / Nit**) with
+  file:line and concrete fixes. **Read-only**: it can read files for context but never edits. `--staged`
+  reviews staged changes; `--base <ref>` reviews against a ref (e.g. `main`).
+- Verified live (glm-5): on a planted diff it flagged a hardcoded secret (Blocker), an unguarded divide, and
+  dead code, then gave a clear "do not merge" verdict.
+- `codebase_search` added to the read-only tool set (so reviewers / sub-agents can search the repo).
+
 ## 0.37.0 — unreleased (task-aware screenshots for screen control)
 
 - Screenshots from the `computer` tool are now read with a **screenshot-tuned prompt** aimed at *acting*, not
