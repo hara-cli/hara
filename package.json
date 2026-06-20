@@ -10,8 +10,7 @@
     "dist",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE-MIT",
-    "LICENSE-APACHE",
+    "LICENSE",
     "CLA.md"
   ],
   "keywords": [
@@ -25,7 +24,7 @@
     "anthropic",
     "claude"
   ],
-  "license": "MIT OR Apache-2.0",
+  "license": "Apache-2.0",
   "author": "Nanhara",
   "homepage": "https://hara.run",
   "repository": {

@@ -18,6 +18,9 @@ All notable changes to `@nanhara/hara`.
   Capture/dedup (`skill_create`) stays purely lexical by design (saving shouldn't depend on an embedding model).
 - Verified end-to-end with local `bge-m3`: "retrying a request that failed" → a backoff snippet; "how do I ship
   a release" → the deploy note — both matched by meaning, not keywords.
+- **License simplified to Apache-2.0** (from `MIT OR Apache-2.0`). Apache-2.0 adds an explicit patent grant +
+  trademark protection — the right fit for a company-backed tool with a commercial future, and matches the peer
+  norm (Codex, Goose). `LICENSE-MIT` removed; `LICENSE-APACHE` → `LICENSE`.
 
 ## 0.32.0 — unreleased (semantic search for `codebase_search`)
 

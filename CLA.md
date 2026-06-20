@@ -26,7 +26,7 @@ agree that:
 
 3. **Right to relicense.** You agree the Maintainer may license Your
    contributions to third parties under the Project's then-current open-source
-   license(s) (**MIT OR Apache-2.0**) **and** under separate terms, including
+   license (**Apache-2.0**) **and** under separate terms, including
    commercial/proprietary licenses. This lets the Project sustain itself via an
    open-core model without re-contacting every contributor.
 

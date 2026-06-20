@@ -6,7 +6,7 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **v0.21** · TypeScript · local-first · MIT/Apache-2.0
+🚧 **v0.33** · TypeScript · local-first · Apache-2.0
 
 **Highlights**
 - **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**).
@@ -211,7 +211,7 @@ turn, or **`/undo`** to revert the last edit.
 
 ## License
 
-Licensed under either **MIT** ([LICENSE-MIT](LICENSE-MIT)) or **Apache-2.0**
-([LICENSE-APACHE](LICENSE-APACHE)) at your option. Contributions per [CLA.md](CLA.md).
+Licensed under the **Apache License 2.0** ([LICENSE](LICENSE)) — a permissive license with an
+explicit patent grant. Contributions per [CLA.md](CLA.md).
 
 © 2026 Nanhara
