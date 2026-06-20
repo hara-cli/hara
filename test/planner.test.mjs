@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { parsePlan, topoOrder, topoWaves, runCheck } from "../dist/org/planner.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { parsePlan, topoOrder, topoWaves, runCheck, savePlan, loadPlan } from "../dist/org/planner.js";
 
 test("parsePlan: parses fenced JSON + normalizes deps/status", () => {
   const text = '```json\n{"atoms":[{"id":"a1","title":"do x","deps":[]},{"id":"a2","title":"do y","deps":["a1"],"verify":"x works","role":"impl"}]}\n```';
@@ -79,6 +81,22 @@ test("topoWaves: detects a cycle", () => {
 test("parsePlan: captures a check command", () => {
   const a = parsePlan('{"atoms":[{"id":"a1","title":"t","deps":[],"check":"npm test"}]}');
   assert.equal(a[0].check, "npm test");
+});
+
+test("savePlan/loadPlan round-trips the SSOT (resume relies on it)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-plan-"));
+  try {
+    const plan = { task: "t", createdAt: "now", atoms: parsePlan('{"atoms":[{"id":"a1","title":"x","deps":[]},{"id":"a2","title":"y","deps":["a1"]}]}') };
+    plan.atoms[0].status = "done";
+    savePlan(dir, plan);
+    const back = loadPlan(dir);
+    assert.ok(back);
+    assert.equal(back.task, "t");
+    assert.equal(back.atoms[0].status, "done"); // resume reads this to skip a1
+    assert.equal(back.atoms.filter((a) => a.status !== "done").length, 1); // only a2 remains
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("runCheck: exit 0 passes, nonzero fails", async () => {

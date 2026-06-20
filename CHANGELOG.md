@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.36.0 — unreleased (resumable plans)
+
+- **`hara plan resume`** continues the saved plan (`.hara/org/plan.json`): atoms already marked done are
+  skipped, pending/failed ones run. When a verify gate stops a plan midway, fix the issue and resume instead
+  of starting from scratch. Interrupted atoms (running/failed) reset to pending; works with `--parallel` too.
+- Internal: execution extracted into a shared `executePlan` (skips completed atoms) used by both fresh runs and
+  resume; `loadPlan` wired into the CLI. Verified: a half-done plan resumed, skipped the done atom, ran only
+  the pending one.
+
 ## 0.35.0 — unreleased (parallel plan execution — the org works in parallel)
 
 - **`hara plan --parallel`** runs independent atoms concurrently. The planner already builds a dependency DAG;

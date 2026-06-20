@@ -191,8 +191,9 @@ sequences them as a DAG, and executes each step (optionally routed to a role) be
 **verify gate** — frame → atomize → sequence → execute → verify. Each atom may carry a `check` shell
 command, so verification is **objective** (e.g. `npm test`, `tsc --noEmit`) rather than a
 self-assessment. Plan state is the SSOT at `.hara/org/plan.json` (inspectable; execution stops on the
-first failed verification). With **`hara plan --parallel`**, independent atoms (the same dependency wave)
-run **concurrently** — the org works the independent parts at once, not one step at a time.
+first failed verification — fix it and **`hara plan resume`** continues, skipping the atoms already done).
+With **`hara plan --parallel`**, independent atoms (the same dependency wave) run **concurrently** — the org
+works the independent parts at once, not one step at a time.
 
 ### What it can do
 

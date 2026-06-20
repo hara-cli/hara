@@ -52,7 +52,7 @@ import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
-import { decompose, topoOrder, topoWaves, savePlan, atomPrompt, verify, runCheck, type Atom, type Plan } from "./org/planner.js";
+import { decompose, topoOrder, topoWaves, savePlan, loadPlan, atomPrompt, verify, runCheck, type Atom, type Plan } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
 import { sandboxSupported, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
@@ -216,6 +216,50 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
   return v.ok;
 }
 
+/** Execute a plan's atoms (sequential, or parallel waves with --parallel). Atoms already marked `done`
+ *  are skipped — so this doubles as the resume engine. Stops on the first failure. */
+async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<void> {
+  const done: Atom[] = plan.atoms.filter((a) => a.status === "done");
+  const doneIds = new Set(done.map((a) => a.id));
+
+  if (o.parallel) {
+    const waved = topoWaves(plan.atoms);
+    if ("error" in waved) return void out(c.red(`${waved.error}\n`));
+    out(c.dim(`Parallel mode — ${waved.ok.length} wave(s).\n`));
+    for (const wave of waved.ok) {
+      const todo = wave.filter((a) => !doneIds.has(a.id));
+      if (!todo.length) continue; // whole wave already complete (resume)
+      out(c.cyan(`\n▶ wave [${todo.map((a) => a.id).join(", ")}] — ${todo.length} in parallel\n`));
+      const results = await Promise.all(todo.map((atom) => executeAtom(atom, plan, done, roles, o)));
+      todo.forEach((atom, i) => {
+        if (results[i]) {
+          done.push(atom);
+          doneIds.add(atom.id);
+        }
+      });
+      if (results.some((r) => !r)) {
+        out(c.dim("Stopping — a wave atom failed. Inspect .hara/org/plan.json, then fix & `hara plan resume`.\n"));
+        break;
+      }
+    }
+  } else {
+    const ord = topoOrder(plan.atoms);
+    if ("error" in ord) return void out(c.red(`${ord.error}\n`));
+    for (const atom of ord.ok) {
+      if (doneIds.has(atom.id)) continue; // resume: skip completed atoms
+      out(c.cyan(`\n▶ ${atom.id} ${atom.title}\n`));
+      if (await executeAtom(atom, plan, done, roles, o)) {
+        done.push(atom);
+        doneIds.add(atom.id);
+      } else {
+        out(c.dim("Stopping — inspect .hara/org/plan.json, then fix & `hara plan resume`.\n"));
+        break;
+      }
+    }
+  }
+  out(c.bold(`\nPlan: ${plan.atoms.filter((a) => a.status === "done").length}/${plan.atoms.length} atoms done.\n`));
+}
+
 /** Decompose a task into atoms, sequence them (DAG), and execute each with a verify gate.
  *  With `parallel`, independent atoms (the same dependency wave) run concurrently. */
 async function runPlan(task: string, o: OrgOpts): Promise<void> {
@@ -231,42 +275,34 @@ async function runPlan(task: string, o: OrgOpts): Promise<void> {
     out(c.red(`${ord.error}\n`));
     return;
   }
-  const ordered = ord.ok;
-  out(c.bold(`\nPlan (${ordered.length} atoms):\n`));
-  for (const a of ordered) {
+  out(c.bold(`\nPlan (${ord.ok.length} atoms):\n`));
+  for (const a of ord.ok) {
     out(`  ${c.cyan(a.id)} ${a.title}${a.deps.length ? c.dim(" ←" + a.deps.join(",")) : ""}${a.role ? c.dim(" @" + a.role) : ""}${a.check ? c.dim(" ✓" + a.check) : ""}\n`);
   }
   if (o.approval !== "full-auto") {
-    const ok = await o.confirm(`${c.yellow("▶")} Execute this ${ordered.length}-atom plan?`);
+    const ok = await o.confirm(`${c.yellow("▶")} Execute this ${ord.ok.length}-atom plan?`);
     if (!ok) return void out(c.dim("(cancelled)\n"));
   }
   savePlan(o.cwd, plan);
-  const done: Atom[] = [];
+  await executePlan(plan, roles, o);
+}
 
-  if (o.parallel) {
-    const waved = topoWaves(plan.atoms);
-    if ("error" in waved) return void out(c.red(`${waved.error}\n`));
-    out(c.dim(`Parallel mode — ${waved.ok.length} wave(s).\n`));
-    for (const wave of waved.ok) {
-      out(c.cyan(`\n▶ wave [${wave.map((a) => a.id).join(", ")}] — ${wave.length} in parallel\n`));
-      const results = await Promise.all(wave.map((atom) => executeAtom(atom, plan, done, roles, o)));
-      wave.forEach((atom, i) => results[i] && done.push(atom));
-      if (results.some((r) => !r)) {
-        out(c.dim("Stopping — a wave atom failed. Inspect .hara/org/plan.json, then refine & re-run.\n"));
-        break;
-      }
-    }
-  } else {
-    for (const atom of ordered) {
-      out(c.cyan(`\n▶ ${atom.id} ${atom.title}\n`));
-      if (await executeAtom(atom, plan, done, roles, o)) done.push(atom);
-      else {
-        out(c.dim("Stopping — inspect .hara/org/plan.json, then refine & re-run.\n"));
-        break;
-      }
-    }
+/** Resume the saved plan (.hara/org/plan.json): re-run atoms that aren't done; completed atoms are skipped. */
+async function runResume(o: OrgOpts): Promise<void> {
+  const roles = loadRoles(o.cwd);
+  const plan = loadPlan(o.cwd);
+  if (!plan) return void out(c.red('No saved plan at .hara/org/plan.json — run `hara plan "<task>"` first.\n'));
+  const remaining = plan.atoms.filter((a) => a.status !== "done");
+  if (!remaining.length) return void out(c.green(`Plan already complete — ${plan.atoms.length}/${plan.atoms.length} done.\n`));
+  out(c.bold(`Resuming: ${plan.task}\n`) + c.dim(`${plan.atoms.length - remaining.length}/${plan.atoms.length} done · ${remaining.length} to go\n`));
+  for (const a of remaining) out(`  ${c.cyan(a.id)} ${a.title} ${c.dim("(" + a.status + ")")}\n`);
+  if (o.approval !== "full-auto") {
+    const ok = await o.confirm(`${c.yellow("▶")} Resume the ${remaining.length} remaining atom(s)?`);
+    if (!ok) return void out(c.dim("(cancelled)\n"));
   }
-  out(c.bold(`\nPlan: ${plan.atoms.filter((a) => a.status === "done").length}/${plan.atoms.length} atoms done.\n`));
+  for (const a of plan.atoms) if (a.status === "failed" || a.status === "running") a.status = "pending"; // retry interrupted
+  savePlan(o.cwd, plan);
+  await executePlan(plan, roles, o);
 }
 
 const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch"]);
@@ -447,7 +483,7 @@ program
   });
 
 program
-  .command("plan <task...>")
+  .command("plan [task...]")
   .description("decompose a task into atoms, sequence them (DAG), and execute each with a verify gate")
   .option("--parallel", "run independent atoms (same dependency wave) concurrently")
   .action(async (taskParts: string[], opts: { parallel?: boolean }) => {
@@ -458,7 +494,7 @@ program
       process.exit(1);
     }
     const stats = { input: 0, output: 0, lastInput: 0 };
-    await runPlan(taskParts.join(" "), {
+    const o: OrgOpts = {
       cfg,
       baseProvider: provider,
       cwd: cfg.cwd,
@@ -468,7 +504,11 @@ program
       projectContext: loadAgentsMd(cfg.cwd) || undefined,
       stats,
       parallel: opts.parallel,
-    });
+    };
+    const task = (taskParts ?? []).join(" ").trim();
+    if (task === "resume") await runResume(o);
+    else if (!task) out(c.dim('usage: hara plan "<task>"   (or: hara plan resume)\n'));
+    else await runPlan(task, o);
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
 
