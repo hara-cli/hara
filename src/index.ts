@@ -146,6 +146,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
     approval: o.approval,
     confirm: o.confirm,
     projectContext: o.projectContext,
+    memory: memoryDigest(o.cwd),
     stats: o.stats,
     systemOverride: role.system,
     toolFilter,
@@ -205,6 +206,7 @@ async function runPlan(task: string, o: OrgOpts): Promise<void> {
         approval: o.approval,
         confirm: o.confirm,
         projectContext: o.projectContext,
+        memory: memoryDigest(o.cwd),
         stats: o.stats,
         systemOverride: role?.system,
         toolFilter,
@@ -279,6 +281,7 @@ async function runSubagent(
     approval: "full-auto", // read-only tools, so no prompts (can't prompt in parallel)
     confirm: async () => true,
     projectContext,
+    memory: memoryDigest(cwd),
     stats,
     systemOverride: role?.system,
     toolFilter,
@@ -309,6 +312,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
     `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
+    `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)}`,
     `${dot} mcp servers ${c.dim(String(Object.keys(cfg.mcpServers).length))}`,
   ];
   return lines.join("\n");
@@ -564,6 +568,7 @@ program.action(async (opts) => {
       approval: "full-auto",
       confirm: async () => true,
       projectContext,
+      memory: memoryDigest(cwd),
       stats,
     });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");

@@ -5,6 +5,12 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.21.2 — unreleased (memory everywhere)
+
+- Memory now injects into **every execution mode** — `hara -p` one-shot, `hara org`, `hara plan` atoms,
+  and sub-agents — not only the interactive REPL (M1 had wired just the interactive turns).
+- `hara doctor` / `/doctor` shows memory status + the `evolve` level.
+
 ## 0.21.1 — unreleased (TUI command parity)
 
 - Wire the missing slash commands into the default ink TUI: **`/compact`** (with the proactive pre-compact
