@@ -5,6 +5,12 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.24.1 — unreleased
+
+- Capability map: recognize the Alibaba coding-plan **Qwen3 flagships** (`qwen3.x-plus` / `qwen3-max`) as
+  **vision-capable** — verified `qwen3.7-plus` accepts image input and describes/OCRs accurately. (As a
+  `visionModel` describer it already worked; this corrects its classification when used as the *main* model.)
+
 ## 0.24.0 — unreleased (auto-detect vision capability)
 
 - **Automatic** image routing — hara classifies the main model and decides each turn:

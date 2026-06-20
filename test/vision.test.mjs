@@ -13,6 +13,8 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("qwen", "qwen2.5-vl-7b-instruct");
   V("qwen", "qwen3-vl-plus");
   V("qwen", "qvq-72b-preview");
+  V("qwen", "qwen3.7-plus"); // Alibaba coding-plan flagship — verified multimodal
+  V("qwen", "qwen3-max-2026-01-23");
   V("openai", "glm-4v");
   V("openai", "glm-4.5v");
   V("openai", "deepseek-vl2");

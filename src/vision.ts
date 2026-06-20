@@ -15,6 +15,7 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   { rx: /gpt-4(\b|-0|-1)|gpt-3\.5|davinci|babbage|text-(?:embedding|davinci)/i, cap: "text" },
   // Qwen
   { rx: /qwen.*vl|qwen.*omni|qvq/i, cap: "vision" },
+  { rx: /qwen-?3[.\d]*-(?:plus|max)/i, cap: "vision" }, // Qwen3 flagships (Alibaba coding plan) accept images — verified qwen3.7-plus
   { rx: /qwen.*(?:coder|plus|max|turbo|long|math)|qwq|qwen[\d.]*-?\d+b\b|qwen-?\d/i, cap: "text" },
   // GLM / Zhipu
   { rx: /glm-?4(?:\.\d+)?v|cogvlm|glm.*-v\b/i, cap: "vision" },
