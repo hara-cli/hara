@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.46.0 — unreleased (screen control: bounded-failure circuit breaker)
+
+- The `computer` tool now **stops after 3 consecutive failures** instead of letting the agent loop forever on a
+  broken setup (learned from codex, which bounds Computer Use attempts then gives up). After 3 in a row it
+  returns a clear stop + the likely cause (missing Accessibility/Screen Recording permission, or the app isn't
+  reachable) + how to fix; resets on any success. Each failure shows the running `[n/3]` count.
+
+## 0.45.1 — unreleased (activate via `open -a`; Accessibility gotcha)
+
+- `activateApp` uses `open -a <app>` on macOS — `osascript … to activate` often left another window on top.
+- Documented (gotcha #0 in `computer.ts`) that **cliclick needs the Accessibility permission, separate from
+  Screen Recording** — without it, clicks/keys silently no-op (the #1 cause of "it does nothing").
+
 ## 0.45.0 — unreleased (screen control: activate, IME-safe typing)
 
 - **`activate` action** — bring the target app to the foreground before screenshot/click. Fixes clicks landing

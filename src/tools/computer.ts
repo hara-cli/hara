@@ -48,6 +48,26 @@ export function keyIsBlocked(keys: string): boolean {
   return KEY_BLOCK.test(keys);
 }
 
+// Circuit breaker (learned from codex): bound consecutive screen-control failures so the agent can't loop
+// forever on a broken setup. Reset on any success; after FAIL_LIMIT in a row, return a clear stop + how to fix.
+const FAIL_LIMIT = 3;
+let consecFails = 0;
+export function resetComputerFails(): void {
+  consecFails = 0;
+}
+function ok(msg: string): string {
+  consecFails = 0;
+  return msg;
+}
+function fail(msg: string): string {
+  consecFails += 1;
+  if (consecFails >= FAIL_LIMIT) {
+    consecFails = 0;
+    return `⛔ Stopping screen control — ${FAIL_LIMIT} actions failed in a row (last: ${msg}). Most likely a missing macOS permission (Accessibility for click/type, Screen Recording for screenshots) or the target app isn't reachable. Fix that, then ask me to try again — I won't keep retrying blindly.`;
+  }
+  return `Failed: ${msg}  [${consecFails}/${FAIL_LIMIT} before I stop]`;
+}
+
 function run(cmd: string, args: string[]): { ok: boolean; out: string } {
   try {
     const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 15000 });
@@ -293,7 +313,7 @@ registerTool({
       if (!cfg.computerApps.some((a) => app.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(app.toLowerCase())))
         return `Refused: "${app}" isn't in your allowlist (${cfg.computerApps.join(", ") || "empty"}). Add it: \`hara config set computerApps "${app}"\`.`;
       const r = activateApp(app);
-      return r.ok ? `✓ ${r.msg} — now screenshot/find/click to act on it` : `Failed: ${r.msg}`;
+      return r.ok ? ok(`✓ ${r.msg} — now screenshot/find/click to act on it`) : fail(r.msg);
     }
 
     if (action !== "screenshot" && action !== "find") {
@@ -306,16 +326,16 @@ registerTool({
 
     if (action === "screenshot") {
       const s = screenshot();
-      if (s.error) return `Screenshot failed: ${s.error}`;
+      if (s.error) return fail(`screenshot — ${s.error}`);
       if (ctx.describeImage) {
         try {
           const desc = await ctx.describeImage(s.path!, input.focus ? String(input.focus) : undefined);
-          if (desc) return `Screenshot (read via vision):\n${desc}`;
+          if (desc) return ok(`Screenshot (read via vision):\n${desc}`);
         } catch {
           /* fall through to path */
         }
       }
-      return `Screenshot saved to ${s.path}. Configure a vision model so I can read it: \`hara config set visionModel <model>\`.`;
+      return ok(`Screenshot saved to ${s.path}. Configure a vision model so I can read it: \`hara config set visionModel <model>\`.`);
     }
 
     // Grounding: locate a described element and turn it into screen coordinates (more reliable than guessing
@@ -326,19 +346,19 @@ registerTool({
       if (!target) return action === "find" ? "find needs a `target` (what to locate)." : "click/move needs `x,y` or a `target`.";
       if (!ctx.locate) return "Grounding needs a vision model that can see images — set one: `hara config set visionModel <model>`.";
       const s = screenshot();
-      if (s.error) return `Screenshot failed: ${s.error}`;
+      if (s.error) return fail(`screenshot — ${s.error}`);
       const loc = await ctx.locate(s.path!, target);
-      if (!loc) return `Couldn't locate "${target}" on screen — try a screenshot to see what's there, or rephrase the target.`;
+      if (!loc) return fail(`couldn't locate "${target}" on screen — try a screenshot first, or rephrase the target`);
       const size = screenSize();
-      if (!size) return `Located "${target}" but couldn't read the screen size to convert coordinates.`;
+      if (!size) return fail(`located "${target}" but couldn't read the screen size to convert coordinates`);
       const gx = Math.round(loc.x * size.w);
       const gy = Math.round(loc.y * size.h);
-      if (action === "find") return `"${target}" is at ~${gx},${gy} (${Math.round(loc.x * 100)}% across, ${Math.round(loc.y * 100)}% down).`;
+      if (action === "find") return ok(`"${target}" is at ~${gx},${gy} (${Math.round(loc.x * 100)}% across, ${Math.round(loc.y * 100)}% down).`);
       input.x = gx;
       input.y = gy;
     }
 
     const r = pointerOrKeyboard(action, input);
-    return r.ok ? `✓ ${r.msg}${needsLocate ? ` (located "${input.target}")` : ""}` : `Failed: ${r.msg}`;
+    return r.ok ? ok(`✓ ${r.msg}${needsLocate ? ` (located "${input.target}")` : ""}`) : fail(r.msg);
   },
 });
