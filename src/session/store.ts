@@ -28,7 +28,17 @@ function sessionsDir(): string {
 }
 const sessionFile = (id: string) => join(sessionsDir(), `${id}.json`);
 
-export const newSessionId = (): string => randomUUID().slice(0, 8);
+/** A full UUID per session (the stable identity). */
+export const newSessionId = (): string => randomUUID();
+/** First segment of the UUID — a compact label for the status bar / `/sessions`. */
+export const shortId = (id: string): string => id.slice(0, 8);
+
+/** Resolve a full id OR a unique prefix (e.g. the short id) to a session id, for `--resume`. */
+export function resolveSessionId(idOrPrefix: string): string | null {
+  if (existsSync(sessionFile(idOrPrefix))) return idOrPrefix;
+  const hit = listSessions().find((m) => m.id.startsWith(idOrPrefix));
+  return hit ? hit.id : null;
+}
 
 const STOP = new Set(
   "the a an to of for and or with in on at my our your this that it is please can could you help me we add fix make do run create update change implement".split(" "),
@@ -50,9 +60,23 @@ export function cleanSessionName(raw: string): string {
   return WORDS[h % WORDS.length] ?? "session";
 }
 
+/** A concise, human session name auto-summarized from the first message. Language-agnostic — keeps CJK
+ *  (unlike the ASCII-slug `cleanSessionName`), trims code/whitespace, caps length. Empty for blank input
+ *  (callers fall back to the short id, never "new session"). */
+export function deriveTitle(text: string): string {
+  const t = text
+    .replace(/^\/\S+\s*/, "") // drop a leading slash-command
+    .replace(/```[\s\S]*?```/g, " ") // drop fenced code blocks
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!t) return "";
+  const max = 40;
+  return t.length <= max ? t : t.slice(0, max).replace(/\s+\S*$/, "").trim() + "…";
+}
+
 export function titleFrom(history: NeutralMsg[]): string {
   const firstUser = history.find((h) => h.role === "user");
-  return cleanSessionName(firstUser && firstUser.role === "user" ? firstUser.content : "");
+  return deriveTitle(firstUser && firstUser.role === "user" ? firstUser.content : "");
 }
 
 export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {

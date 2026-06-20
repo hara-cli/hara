@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.26.0 — unreleased (inline image tokens + session UUID & auto-name)
+
+- **Pasted images are inline `[Image #N]` tokens** (Claude Code / codex style) — highlighted in the input
+  where you paste, carried inline in the message; **backspace over a token removes it + its attachment**
+  (and renumbers the rest). Replaces the chip experiment (a desktop-GUI pattern) with the terminal-native
+  one both reference tools use.
+- **Sessions now have a full UUID** (was an 8-char stub) + an **auto-summarized name** from the first
+  message that's **language-aware (keeps CJK)** — a Chinese first line names the session meaningfully
+  instead of a random word; it never shows "new session" (falls back to the short id).
+- Startup header shows `session <uuid>`; the top border shows the name (or short id); `/sessions` + `/name`
+  show the short id / full UUID; **`--resume` accepts a short-id prefix**, not just the full UUID.
+
 ## 0.25.0 — unreleased (vision UX polish + ground-truth capability map)
 
 - **Header shows image routing at startup** — the banner now states whether the main model reads images

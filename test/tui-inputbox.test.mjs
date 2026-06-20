@@ -69,7 +69,7 @@ test("InputBox shows an @path popup with file matches", async () => {
   unmount();
 });
 
-test("InputBox: Ctrl+V attaches a clipboard image as a chip (clean input), image-only submit", async () => {
+test("InputBox: Ctrl+V inserts a highlighted [Image #N] token inline + tracks the file", async () => {
   let submitted = null;
   const fakeImg = { path: "/tmp/shot.png", mediaType: "image/png" };
   const { lastFrame, stdin, unmount } = render(
@@ -80,20 +80,20 @@ test("InputBox: Ctrl+V attaches a clipboard image as a chip (clean input), image
       onSubmit: (v, images) => (submitted = { v, images }),
     }),
   );
+  stdin.write("look "); // type, then paste
+  await tick();
   stdin.write("\x16"); // Ctrl+V
   await tick();
-  const frame = strip(lastFrame());
-  assert.ok(frame.includes("🖼 image 1"), "image chip shown below the box");
-  assert.ok(!frame.includes("[Image #1]"), "no inline placeholder token pollutes the input");
-  stdin.write("\r"); // submit with no text — just the image
+  assert.ok(strip(lastFrame()).includes("[Image #1]"), "inline token shown in the input");
+  stdin.write("\r");
   await tick();
-  assert.ok(submitted, "submitted on Enter even with empty text");
-  assert.equal(submitted.v.trim(), "", "input text stays clean");
+  assert.ok(submitted, "submitted");
+  assert.ok(submitted.v.includes("[Image #1]"), "token carried inline in the text");
   assert.deepEqual(submitted.images, [fakeImg], "attachment passed to onSubmit");
   unmount();
 });
 
-test("InputBox: pasting/dragging an image file path attaches it as a chip, not literal text", async () => {
+test("InputBox: pasting an image file path inserts an inline token, not the raw path", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-ib-"));
   const png = join(dir, "pic.png");
   writeFileSync(png, Buffer.from([1, 2, 3]));
@@ -104,7 +104,7 @@ test("InputBox: pasting/dragging an image file path attaches it as a chip, not l
   stdin.write(png); // a dragged-in terminal emits the bare path
   await tick();
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("🖼 image 1"), "path became an attachment chip");
+  assert.ok(frame.includes("[Image #1]"), "path became an inline token");
   assert.ok(!frame.includes(png), "raw path not inserted as literal text");
   stdin.write("\r");
   await tick();
@@ -112,16 +112,22 @@ test("InputBox: pasting/dragging an image file path attaches it as a chip, not l
   unmount();
 });
 
-test("InputBox: backspace on empty input removes the last image chip", async () => {
+test("InputBox: backspace over an [Image #N] token removes the token and its attachment", async () => {
   const fakeImg = { path: "/tmp/a.png", mediaType: "image/png" };
+  let submitted = null;
   const { lastFrame, stdin, unmount } = render(
-    React.createElement(InputBox, { status: S, cwd, onClipboardImage: () => fakeImg }),
+    React.createElement(InputBox, { status: S, cwd, onClipboardImage: () => fakeImg, onSubmit: (v, images) => (submitted = { v, images }) }),
   );
-  stdin.write("\x16"); // attach one
+  stdin.write("\x16"); // attach → value is "[Image #1] "
   await tick();
-  assert.ok(strip(lastFrame()).includes("🖼 image 1"), "chip present");
-  stdin.write("\x7f"); // backspace (DEL) on empty input
+  assert.ok(strip(lastFrame()).includes("[Image #1]"), "token present");
+  stdin.write("\x7f"); // backspace over the token (+ its trailing space) removes it whole
   await tick();
-  assert.ok(!strip(lastFrame()).includes("🖼 image 1"), "chip removed");
+  assert.ok(!strip(lastFrame()).includes("[Image #1]"), "token removed");
+  stdin.write("hi");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.equal(submitted.images, undefined, "attachment removed with the token");
   unmount();
 });

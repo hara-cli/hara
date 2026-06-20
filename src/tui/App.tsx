@@ -36,7 +36,7 @@ export interface AppProps {
   initialStatus: Status;
   model: string;
   cwd: string;
-  header?: { version: string; model: string; cwd: string; tip?: string; vision?: string };
+  header?: { version: string; model: string; cwd: string; tip?: string; vision?: string; session?: string };
   onSubmit: (line: string, h: Helpers, images?: ImageAttachment[]) => Promise<void>;
   cycleApproval?: (cur: Approval) => Approval;
   /** Read an image off the OS clipboard for Ctrl+V (injected; omitted in tests). */
@@ -98,7 +98,7 @@ const BANNER = [
   "██║  ██║██║  ██║██║  ██║██║  ██║",
   "╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝",
 ];
-function HeaderCard({ version, model, cwd, tip, vision }: { version: string; model: string; cwd: string; tip?: string; vision?: string }) {
+function HeaderCard({ version, model, cwd, tip, vision, session }: { version: string; model: string; cwd: string; tip?: string; vision?: string; session?: string }) {
   return (
     <Box flexDirection="column" marginBottom={1}>
       {BANNER.map((row, i) => (
@@ -108,6 +108,7 @@ function HeaderCard({ version, model, cwd, tip, vision }: { version: string; mod
       ))}
       <Text dimColor>{` the coding agent that runs like an org   ·   v${version}`}</Text>
       <Text dimColor>{` ${model}  ·  ${cwd}`}</Text>
+      {session ? <Text dimColor>{` session ${session}`}</Text> : null}
       {vision ? (
         <Text>
           <Text color={accent()}>{" 👁 "}</Text>
@@ -167,8 +168,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     async (line: string, images?: ImageAttachment[]): Promise<void> => {
       const t = line.trim();
       if ((!t && !images?.length) || working || prompt) return; // allow image-only turns
-      const tag = images?.length ? `  (${images.length} image${images.length === 1 ? "" : "s"})` : "";
-      setHistory((h) => [...h, { id: nid(), kind: "user", text: (t + tag).trim() }]);
+      setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]); // t already carries any [Image #N] tokens
       const ctrl = new AbortController();
       ctrlRef.current = ctrl;
       setWorking(true);

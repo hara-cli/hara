@@ -3,7 +3,7 @@
 // concurrency. Composed from <Text> rows (no ink border fork needed) so the title sits exactly
 // where we want it. Pure-ish: pass `width` to make rendering deterministic in tests.
 import { Box, Text, useInput, useStdout } from "ink";
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { fileCandidates } from "../context/mentions.js";
 import { imagePathFromPaste } from "../images.js";
 import type { ImageAttachment } from "../providers/types.js";
@@ -97,6 +97,58 @@ function MentionPopup({ items, selected, query }: { items: string[]; selected: n
   );
 }
 
+const TOKEN_RE = /\[Image #\d+\]/g;
+
+/** Render the prompt line: plain text + the cursor, with any `[Image #N]` attachment tokens highlighted
+ *  (codex / Claude-Code style — the image lives inline in the text, visibly distinct from what you typed). */
+function InputLine({ value, cursor }: { value: string; cursor: number }) {
+  const parts: { text: string; token: boolean }[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  TOKEN_RE.lastIndex = 0;
+  while ((m = TOKEN_RE.exec(value))) {
+    if (m.index > last) parts.push({ text: value.slice(last, m.index), token: false });
+    parts.push({ text: m[0], token: true });
+    last = m.index + m[0].length;
+  }
+  if (last < value.length) parts.push({ text: value.slice(last), token: false });
+  const seg = (token: boolean, text: string, k: string) =>
+    token ? (
+      <Text key={k} backgroundColor="magenta" color="white">
+        {text}
+      </Text>
+    ) : (
+      <Text key={k}>{text}</Text>
+    );
+  const nodes: ReactNode[] = [];
+  let pos = 0;
+  let ki = 0;
+  for (const p of parts) {
+    const start = pos;
+    const end = pos + p.text.length;
+    if (cursor >= start && cursor < end) {
+      const rel = cursor - start;
+      if (rel > 0) nodes.push(seg(p.token, p.text.slice(0, rel), `s${ki++}`));
+      nodes.push(
+        <Text key={`c${ki++}`} inverse>
+          {p.text[rel]}
+        </Text>,
+      );
+      if (rel + 1 < p.text.length) nodes.push(seg(p.token, p.text.slice(rel + 1), `e${ki++}`));
+    } else {
+      nodes.push(seg(p.token, p.text, `p${ki++}`));
+    }
+    pos = end;
+  }
+  if (cursor >= value.length)
+    nodes.push(
+      <Text key="end" inverse>
+        {" "}
+      </Text>,
+    );
+  return <Text>{nodes}</Text>;
+}
+
 /** Top border (session) + prompt line + bottom border (usage) + ModeBar, with an @path popup. */
 export function InputBox({
   status,
@@ -131,9 +183,16 @@ export function InputBox({
     setDismissed(false);
   };
 
-  // Attach an image as a chip below the box — the typed text stays clean (no inline token).
+  // Attach an image: drop a highlighted `[Image #N]` token inline at the cursor and track the file
+  // (codex / Claude-Code style). Backspace over the token removes both.
   const addImage = (img: ImageAttachment): void => {
+    const tok = `[Image #${images.length + 1}]`;
+    const before = value.slice(0, cursor);
+    const ins = (before && !/\s$/.test(before) ? " " : "") + tok + " ";
+    setValue(before + ins + value.slice(cursor));
+    setCursor((before + ins).length);
     setImages((xs) => [...xs, img]);
+    setSel(0);
     setDismissed(false);
   };
 
@@ -194,8 +253,22 @@ export function InputBox({
         return;
       }
       if (key.backspace || key.delete) {
-        if (cursor > 0) set(value.slice(0, cursor - 1) + value.slice(cursor), cursor - 1);
-        else if (images.length) setImages((xs) => xs.slice(0, -1)); // empty input → remove the last attachment
+        if (cursor > 0) {
+          const head = value.slice(0, cursor);
+          const tm = /\[Image #(\d+)\]\s?$/.exec(head); // backspacing over an attachment token removes it whole
+          if (tm) {
+            const n = Number(tm[1]);
+            const kept = head.slice(0, tm.index) + value.slice(cursor);
+            const renumbered = kept.replace(/\[Image #(\d+)\]/g, (m2, d) => (Number(d) > n ? `[Image #${Number(d) - 1}]` : m2));
+            setImages((xs) => xs.filter((_, i) => i !== n - 1));
+            setValue(renumbered);
+            setCursor(tm.index);
+            setSel(0);
+            setDismissed(false);
+            return;
+          }
+          set(value.slice(0, cursor - 1) + value.slice(cursor), cursor - 1);
+        }
         return;
       }
       if (input && !key.ctrl && !key.meta) {
@@ -218,10 +291,9 @@ export function InputBox({
     { isActive },
   );
 
-  const at = value[cursor] ?? " ";
   return (
     <Box flexDirection="column">
-      <TopBorder name={status.sessionName || "new session"} width={w} />
+      <TopBorder name={status.sessionName || "session"} width={w} />
       <Box>
         <Text color="cyan">{"› "}</Text>
         {value.length === 0 ? (
@@ -230,26 +302,10 @@ export function InputBox({
             <Text dimColor>{placeholder}</Text>
           </Text>
         ) : (
-          <Text>
-            {value.slice(0, cursor)}
-            <Text inverse>{at}</Text>
-            {value.slice(cursor + 1)}
-          </Text>
+          <InputLine value={value} cursor={cursor} />
         )}
       </Box>
       <BottomBorder s={status} width={w} />
-      {images.length > 0 ? (
-        <Box>
-          <Text>{"  "}</Text>
-          {images.map((im, i) => (
-            <Text key={i}>
-              <Text backgroundColor="magenta" color="white">{` 🖼 image ${i + 1} `}</Text>
-              <Text> </Text>
-            </Text>
-          ))}
-          <Text dimColor>{`${images.length} attached · ⌫ removes last`}</Text>
-        </Box>
-      ) : null}
       {popupOpen ? <MentionPopup items={candidates} selected={selIdx} query={mention!.query} /> : null}
       <ModeBar approval={status.approval} />
     </Box>

@@ -35,6 +35,8 @@ import { loadAgentsMd, hasAgentsMd, INIT_PROMPT } from "./context/agents-md.js";
 import { expandMentions, fileCandidates } from "./context/mentions.js";
 import {
   newSessionId,
+  shortId,
+  resolveSessionId,
   saveSession,
   loadSession,
   listSessions,
@@ -633,7 +635,8 @@ program.action(async (opts) => {
   // session: --resume <id> / --continue (latest in this cwd) / new
   let resumed: SessionData | null = null;
   if (opts.resume) {
-    resumed = loadSession(opts.resume);
+    const rid = resolveSessionId(opts.resume); // accept a full UUID or a unique prefix (short id)
+    resumed = rid ? loadSession(rid) : null;
     if (!resumed) out(c.yellow(`(no session '${opts.resume}'; starting fresh)\n`));
   } else if (opts.continue) {
     resumed = latestForCwd(cwd);
@@ -652,7 +655,7 @@ program.action(async (opts) => {
   const memorySnap = memoryDigest(cwd); // durable memory, read once (frozen snapshot)
   const buildMemory = (): string =>
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
-  if (resumed) out(c.dim(`(resumed ${meta.id} · ${history.length} msgs)\n`));
+  if (resumed) out(c.dim(`(resumed ${shortId(meta.id)} · ${history.length} msgs)\n`));
 
   // Vision describer state — shared by the `/vision` command (both REPLs) and the TUI image pipeline.
   let visionProvider: Provider | null | undefined;
@@ -783,7 +786,7 @@ program.action(async (opts) => {
       run: () => {
         const ms = listSessions();
         if (!ms.length) return void out(c.dim("No sessions yet.\n"));
-        for (const m of ms) out(`  ${m.id}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${m.title}\n`);
+        for (const m of ms) out(`  ${shortId(m.id)}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${m.title || "(untitled)"}\n`);
       },
     },
     {
@@ -835,7 +838,7 @@ program.action(async (opts) => {
       name: "name",
       desc: "rename this session: /name <name>",
       run: (a) => {
-        if (!a) return void out(c.dim(`session: ${meta.title || "(unnamed)"}\n`));
+        if (!a) return void out(c.dim(`session: ${meta.title || "(untitled)"} · ${meta.id}\n`));
         meta.title = a.slice(0, 32);
         if (bar.isActive()) bar.update({ sessionName: meta.title });
         saveSession(meta, history);
@@ -920,10 +923,10 @@ program.action(async (opts) => {
             ? `${cfg.model} is text-only — /vision <model> to read pasted images`
             : `${cfg.model} image support unknown — asked on first paste`;
     await runTui({
-      initialStatus: { sessionName: meta.title || "new session", approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
+      initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
       cwd,
-      header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
+      header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
       cycleApproval: (m) => cycleMode(m),
       onClipboardImage: readClipboardImage,
       onSubmit: async (line, h, images) => {
@@ -984,7 +987,7 @@ program.action(async (opts) => {
             return void h.sink.notice(`↗ recalled ${hits.length}: ${hits.map((x) => x.path).join(", ")} (added to your next message)`);
           }
           if (nm === "name") {
-            if (!arg) return void h.sink.notice(`session: ${meta.title || "(unnamed)"}`);
+            if (!arg) return void h.sink.notice(`session: ${meta.title || "(untitled)"} · ${meta.id}`);
             meta.title = arg.slice(0, 32);
             h.sink.session(meta.title);
             saveSession(meta, history);
@@ -1032,7 +1035,7 @@ program.action(async (opts) => {
           if (nm === "sessions") {
             const ms = listSessions();
             return void h.sink.notice(
-              ms.length ? ms.slice(0, 12).map((m) => `  ${m.id}  ${m.updatedAt.slice(0, 16).replace("T", " ")}  ${m.title}`).join("\n") : "No sessions yet.",
+              ms.length ? ms.slice(0, 12).map((m) => `  ${shortId(m.id)}  ${m.updatedAt.slice(0, 16).replace("T", " ")}  ${m.title || "(untitled)"}`).join("\n") : "No sessions yet.",
             );
           }
           if (nm === "usage") return void h.sink.notice(`tokens — ↑${stats.input} ↓${stats.output}`);
@@ -1140,7 +1143,7 @@ program.action(async (opts) => {
 
   out(c.dim(`Type a task. /help · @path attaches a file · shift+tab cycles mode · Esc interrupts · /exit to quit.${projectContext ? "  (AGENTS.md loaded)" : ""}\n\n`));
 
-  bar.install({ sessionName: meta.title || "new session", model: cfg.model, approval, input: stats.input, output: stats.output });
+  bar.install({ sessionName: meta.title || shortId(meta.id), model: cfg.model, approval, input: stats.input, output: stats.output });
   process.on("exit", () => {
     try {
       bar.uninstall();
