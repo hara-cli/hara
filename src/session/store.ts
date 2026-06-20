@@ -79,6 +79,21 @@ export function titleFrom(history: NeutralMsg[]): string {
   return deriveTitle(firstUser && firstUser.role === "user" ? firstUser.content : "");
 }
 
+/** Normalize a phrase to an ASCII kebab-case slug (lowercase, a–z0–9 + single hyphens, capped). Non-ASCII
+ *  is dropped — used to clean a model-generated English session name. Returns "" if nothing ASCII remains. */
+export function slugify(text: string, max = 40): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+/, "")
+    .slice(0, max)
+    .replace(/-+$/, "");
+}
+
 export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {
   meta.updatedAt = new Date().toISOString();
   const data: SessionData = { meta, history };

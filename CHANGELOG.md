@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.41.0 — unreleased (English session names, auto-summarized)
+
+- After the first turn a session gets a short **English kebab-case name** summarizing what it's about
+  (e.g. `add-semantic-search`) via one tiny model call — replacing the literal first-message title. A non-English
+  conversation is translated to an English gist (pinyin only if untranslatable). Names stay short + ASCII.
+- The stable session **id is still the UUID** (unchanged — this only improves the human-friendly name); falls
+  back to the lexical title if the naming call fails. New `slugify()` helper (tested).
+
 ## 0.40.0 — unreleased (TUI polish: markdown rendering + numbered choices)
 
 - The ink TUI now **renders assistant Markdown** (headers, bold, inline code, bullets; code fences kept

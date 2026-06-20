@@ -45,6 +45,7 @@ import {
   listSessions,
   latestForCwd,
   titleFrom,
+  slugify,
   type SessionMeta,
   type SessionData,
 } from "./session/store.js";
@@ -316,6 +317,30 @@ const COMMIT_SYSTEM =
   "conventional-commits prefix like feat:/fix:/refactor:/docs:/test:/chore: is welcome). If the change is " +
   "non-trivial, add a blank line then a short body (a few bullets or sentences) on what changed and why. " +
   "Output ONLY the commit message — no code fences, no preamble, no surrounding quotes.";
+const SESSION_NAME_SYSTEM =
+  "Name this coding session as a SHORT slug: 2–4 English words, lowercase, hyphen-separated, ASCII only " +
+  "(e.g. add-semantic-search, fix-login-redirect). If the conversation is in another language, translate the " +
+  "gist to English (use pinyin only if a term is untranslatable). Output ONLY the slug.";
+
+/** One short model call → a 2–4 word English kebab-case session name summarizing the work.
+ *  Always ASCII (translates non-English gist). Falls back to the lexical title on any failure. */
+async function nameSession(provider: Provider, history: NeutralMsg[]): Promise<string> {
+  const text = (m: NeutralMsg | undefined): string => {
+    if (!m) return "";
+    if (m.role === "assistant") return typeof m.text === "string" ? m.text : "";
+    if (m.role === "user") return typeof m.content === "string" ? m.content : "";
+    return "";
+  };
+  const basis =
+    `User: ${text(history.find((m) => m.role === "user")).slice(0, 800)}\n` +
+    `Assistant: ${text(history.find((m) => m.role === "assistant")).slice(0, 800)}`;
+  try {
+    const r = await provider.turn({ system: SESSION_NAME_SYSTEM, history: [{ role: "user", content: basis }], tools: [], onText: () => {} });
+    return slugify(r.text) || titleFrom(history);
+  } catch {
+    return titleFrom(history);
+  }
+}
 const PLAN_SYSTEM =
   "You are in PLAN MODE. Investigate read-only (read_file / grep / glob / ls / web_fetch) and think, " +
   "then propose a concise step-by-step plan for the task. Do NOT edit files or run commands yet — only plan. " +
@@ -1409,7 +1434,7 @@ program.action(async (opts) => {
             signal: h.signal,
           });
           if (!meta.title) {
-            meta.title = titleFrom(history);
+            meta.title = await nameSession(provider, history);
             h.sink.session(meta.title);
           }
           h.sink.usage(stats.input - pin, stats.output - pout);
@@ -1459,7 +1484,7 @@ program.action(async (opts) => {
           signal: h.signal,
         });
         if (!meta.title) {
-          meta.title = titleFrom(history);
+          meta.title = await nameSession(provider, history);
           h.sink.session(meta.title);
         }
         h.sink.usage(stats.input - beforeIn, stats.output - beforeOut);
@@ -1515,7 +1540,7 @@ program.action(async (opts) => {
     } finally {
       currentTurn = null;
     }
-    if (!meta.title) meta.title = titleFrom(history);
+    if (!meta.title) meta.title = await nameSession(provider, history);
     if (bar.isActive()) {
       bar.update({
         sessionName: meta.title,
