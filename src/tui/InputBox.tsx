@@ -157,6 +157,8 @@ export function InputBox({
   onSubmit,
   onClipboardImage,
   isActive = true,
+  working = false,
+  queued = 0,
   placeholder = "Type a task · /help · @file · Ctrl+V paste image · shift+tab mode · Esc interrupts",
 }: {
   status: Status;
@@ -166,6 +168,10 @@ export function InputBox({
   /** Read an image off the OS clipboard (Ctrl+V). Injected so the view stays side-effect-free in tests. */
   onClipboardImage?: () => ImageAttachment | null;
   isActive?: boolean;
+  /** the agent is mid-turn — typing here is type-ahead (queued, sent when the turn finishes) */
+  working?: boolean;
+  /** how many messages are already queued (for the hint) */
+  queued?: number;
   placeholder?: string;
 }) {
   const { stdout } = useStdout();
@@ -306,6 +312,7 @@ export function InputBox({
         )}
       </Box>
       <BottomBorder s={status} width={w} />
+      {working ? <Text dimColor>{`  ⌨ working — Enter queues your message${queued ? ` · ${queued} queued` : ""} · Esc interrupts`}</Text> : null}
       {popupOpen ? <MentionPopup items={candidates} selected={selIdx} query={mention!.query} /> : null}
       <ModeBar approval={status.approval} />
     </Box>

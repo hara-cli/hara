@@ -156,3 +156,59 @@ test("App renders assistant markdown (bold/inline-code styled, not raw)", async 
   // (color is TTY-only via the `c` helper; in a real terminal ink passes the ANSI through — verified by dogfooding)
   unmount();
 });
+
+test("App type-ahead: typing while working queues, then sends after the turn", async () => {
+  const seen = [];
+  let releaseFirst;
+  const onSubmit = async (line) => {
+    seen.push(line);
+    if (line === "first") await new Promise((r) => (releaseFirst = r)); // hold turn 1 open
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("first");
+  await tick();
+  stdin.write("\r"); // start turn 1 (stays working)
+  await tick();
+  assert.ok(seen.includes("first"), "turn 1 started");
+  stdin.write("second"); // type-ahead while working
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("queued"), "shows a queued hint");
+  assert.equal(seen.length, 1, "queued message NOT sent while working");
+  releaseFirst(); // finish turn 1 → queue drains
+  await tick(150);
+  assert.ok(seen.includes("second"), "queued message sent after the turn finished");
+  unmount();
+});
+
+test("App type-ahead: Esc while working clears the queue (stop means stop)", async () => {
+  const seen = [];
+  let release;
+  const onSubmit = async (line) => {
+    seen.push(line);
+    if (line === "first") await new Promise((r) => (release = r));
+  };
+  const { stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("first");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("queued one"); // type-ahead
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.equal(seen.length, 1, "queued, not yet sent");
+  stdin.write("\x1b"); // Esc → abort + clear the queue
+  await tick();
+  release(); // turn 1 ends
+  await tick(150);
+  assert.ok(!seen.includes("queued one"), "queued message dropped after Esc — stop means stop");
+  unmount();
+});

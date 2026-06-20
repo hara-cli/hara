@@ -146,6 +146,9 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [promptSel, setPromptSel] = useState(0);
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const ctrlRef = useRef<AbortController | null>(null);
+  const queueRef = useRef<{ line: string; images?: ImageAttachment[] }[]>([]); // type-ahead: FIFO of messages entered while working
+  const [queued, setQueued] = useState(0); // queue depth, for the UI hint
+  const drainingRef = useRef(false); // idempotency guard so the drain effect can't double-send one item
   const currentRef = useRef<Item[]>([]);
   currentRef.current = current;
   const statusRef = useRef(status);
@@ -168,7 +171,14 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const handleSubmit = useCallback(
     async (line: string, images?: ImageAttachment[]): Promise<void> => {
       const t = line.trim();
-      if ((!t && !images?.length) || working || prompt) return; // allow image-only turns
+      if ((!t && !images?.length) || prompt) return; // nothing to send, or a choice is pending
+      if (working) {
+        // type-ahead: hold the message in a FIFO queue; it's sent when the current turn finishes
+        queueRef.current.push({ line, images });
+        setQueued(queueRef.current.length);
+        pushCurrent("notice", "⌨ queued — sends when the current turn finishes");
+        return;
+      }
       setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]); // t already carries any [Image #N] tokens
       const ctrl = new AbortController();
       ctrlRef.current = ctrl;
@@ -214,6 +224,18 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     [working, prompt, onSubmit, pushCurrent, model, exit],
   );
 
+  // Drain the type-ahead queue: when a turn finishes (working → false) and nothing is awaiting a choice,
+  // send the next queued message. Runs one at a time (each send sets working again), preserving FIFO order.
+  useEffect(() => {
+    if (working || prompt || drainingRef.current || !queueRef.current.length) return;
+    drainingRef.current = true;
+    const next = queueRef.current.shift()!;
+    setQueued(queueRef.current.length);
+    void Promise.resolve(handleSubmit(next.line, next.images)).finally(() => {
+      drainingRef.current = false;
+    });
+  }, [working, prompt, handleSubmit]);
+
   useInput((input, key) => {
     if (prompt) {
       const opts = prompt.options;
@@ -238,7 +260,14 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       return;
     }
     if (key.ctrl && input === "r") return setReasoningOpen((x) => !x);
-    if (key.escape && working) ctrlRef.current?.abort();
+    if (key.escape && working) {
+      // Esc = stop everything: abort the turn AND drop any type-ahead (a stopped turn shouldn't fire queued msgs)
+      if (queueRef.current.length) {
+        queueRef.current = [];
+        setQueued(0);
+      }
+      ctrlRef.current?.abort();
+    }
     else if (key.tab && key.shift && cycleApproval) setStatus((s) => ({ ...s, approval: cycleApproval(s.approval) }));
   });
 
@@ -262,7 +291,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           <Text dimColor>{`   ↑↓ or 1–${prompt.options.length} to choose · Enter · Esc cancels`}</Text>
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} isActive={!working && !prompt} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
+      <InputBox status={status} cwd={cwd} isActive={!prompt} working={working} queued={queued} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );
 }

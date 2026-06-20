@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.42.0 — unreleased (type-ahead: keep typing while the agent works)
+
+- You can now **type while the agent is working** — the message enters a **FIFO queue** and is sent
+  automatically when the current turn finishes (the input box stays active mid-turn; a "⌨ working — Enter
+  queues" hint shows the depth). Fixes the "input does nothing while working" dogfooding feedback.
+- **Esc stops everything** — interrupts the turn AND clears the queue, so a stopped turn never fires queued
+  messages. The queue drain is idempotent (guarded against double-send under React StrictMode).
+- Expert-reviewed for queue correctness (FIFO, exactly-once), the Esc/abort UX, and input-handler conflicts.
+
 ## 0.41.0 — unreleased (English session names, auto-summarized)
 
 - After the first turn a session gets a short **English kebab-case name** summarizing what it's about
