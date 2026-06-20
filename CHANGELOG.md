@@ -5,6 +5,12 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.30.1 — unreleased
+
+- Capture honors `assetCapture`: in **ask** (default) the end-of-session distill now **prompts before saving**
+  each skill/memory — the "remind me to confirm" flow — instead of writing silently; **auto** stays silent;
+  **off** disables proactive capture. `hara doctor` shows the capture mode.
+
 ## 0.30.0 — unreleased (codebase search — the repo as a knowledge base)
 
 - **`codebase_search`** — the current project is now a searchable knowledge base. Relevance-ranked **lexical**

@@ -324,7 +324,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
     `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
     `${dot} skills ${(() => { const n = loadSkillIndex(cfg.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(cfg.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
-    `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)}`,
+    `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)} ${c.dim("· capture")} ${c.bold(cfg.assetCapture)}`,
     `${dot} vision · ${c.bold(cfg.model)} ${vdesc}${cfg.visionModel ? c.dim(" · describer ") + c.bold(cfg.visionModel) : vcap === "text" ? c.yellow(" · set /vision <model>") : ""}`,
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
     `${dot} mcp servers ${c.dim(String(Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length))}`,
@@ -1031,7 +1031,7 @@ program.action(async (opts) => {
                 await runAgent(history, {
                   provider,
                   ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice } },
-                  approval: "full-auto",
+                  approval: cfg.assetCapture === "auto" ? "full-auto" : "suggest", // ask → prompt before each save; auto → silent
                   confirm: h.confirm,
                   toolFilter: (n) => n === "memory_write" || (cfg.assetCapture !== "off" && n === "skill_create") || READONLY_TOOLS.has(n),
                   systemOverride: DISTILL_SYSTEM,
@@ -1093,7 +1093,7 @@ program.action(async (opts) => {
                 await runAgent(history, {
                   provider,
                   ctx: { cwd, sandbox, spawn, ui: cui },
-                  approval: "full-auto",
+                  approval: cfg.assetCapture === "auto" ? "full-auto" : "suggest", // ask → prompt before each save; auto → silent
                   confirm: h.confirm,
                   toolFilter: (n) => n === "memory_write" || (cfg.assetCapture !== "off" && n === "skill_create") || READONLY_TOOLS.has(n),
                   systemOverride: DISTILL_SYSTEM,
