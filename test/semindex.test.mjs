@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chunkText, buildIndex, queryIndex, indexExists, collectRepoChunks } from "../dist/search/semindex.js";
+import { chunkText, buildIndex, queryIndex, indexExists, collectRepoChunks, collectDirChunks } from "../dist/search/semindex.js";
 import { getEmbedder } from "../dist/search/embed.js";
+import { searchHybrid } from "../dist/search/hybrid.js";
 
 // Deterministic mock embedder: bag-of-words over a tiny vocab → vector. Stands in for a real embedding
 // model so the index → cosine → rank pipeline is testable without a network/model.
@@ -68,6 +69,36 @@ test("collectRepoChunks walks code + markdown in a project root", () => {
     assert.ok(chunks.some((ch) => ch.file === "notes.md"), "indexes markdown");
     assert.ok(chunks.every((ch) => ch.source === "repo"));
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("collectDirChunks walks a knowledge dir with absolute file paths", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-kb-"));
+  try {
+    writeFileSync(join(dir, "note.md"), "# Note\nsomething reusable worth remembering\n");
+    const chunks = collectDirChunks(dir, "memory");
+    assert.ok(chunks.length >= 1);
+    assert.ok(chunks.every((ch) => ch.source === "memory"));
+    assert.ok(chunks[0].file.startsWith(dir), "file path is absolute (under the dir)");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("searchHybrid falls back to lexical when embeddings are off", async () => {
+  const prev = process.env.HARA_EMBED_PROVIDER;
+  process.env.HARA_EMBED_PROVIDER = "off"; // force lexical regardless of the user's real config
+  const dir = mkdtempSync(join(tmpdir(), "hara-assets-"));
+  try {
+    writeFileSync(join(dir, "retry.md"), "# Retry helper\nexponential backoff retry logic for fetch\n");
+    writeFileSync(join(dir, "auth.md"), "# Auth\nlogin and token handling\n");
+    const hits = await searchHybrid("retry backoff", dir, { indexName: "assets", roots: [dir], limit: 5 });
+    assert.ok(hits.length >= 1, "lexical hits returned with embeddings off");
+    assert.ok(hits[0].path.endsWith("retry.md"), "ranks the retry doc first");
+  } finally {
+    if (prev === undefined) delete process.env.HARA_EMBED_PROVIDER;
+    else process.env.HARA_EMBED_PROVIDER = prev;
     rmSync(dir, { recursive: true, force: true });
   }
 });

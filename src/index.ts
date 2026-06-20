@@ -6,7 +6,7 @@ import { runTui } from "./tui/run.js";
 import { readClipboardImage } from "./images.js";
 import { describeImages, classifyVision } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
-import { memoryDigest } from "./memory/store.js";
+import { memoryDigest, memoryDir } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync } from "node:fs";
@@ -33,7 +33,8 @@ import { createOpenAIProvider } from "./providers/openai.js";
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
 import { loadAgentsMd, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import { getEmbedder } from "./search/embed.js";
-import { collectRepoChunks, buildIndex, indexPath, indexExists } from "./search/semindex.js";
+import { collectRepoChunks, collectDirChunks, buildIndex, indexPath, indexExists } from "./search/semindex.js";
+import { searchHybrid } from "./search/hybrid.js";
 import { expandMentions, fileCandidates } from "./context/mentions.js";
 import {
   newSessionId,
@@ -48,7 +49,7 @@ import {
   type SessionData,
 } from "./session/store.js";
 import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
-import { loadSkillIndex, loadSkillBody, scaffoldSkills } from "./skills/skills.js";
+import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
 import { decompose, topoOrder, savePlan, atomPrompt, verify, runCheck, type Atom } from "./org/planner.js";
@@ -328,7 +329,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
     `${dot} skills ${(() => { const n = loadSkillIndex(cfg.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(cfg.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
     `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)} ${c.dim("· capture")} ${c.bold(cfg.assetCapture)}`,
-    `${dot} search ${c.dim("lexical (always on)")}${cfg.embedProvider === "off" ? c.dim(" · semantic off (hara config set embedProvider ollama|qwen)") : c.dim(" · semantic ") + c.bold(cfg.embedProvider) + (indexExists("repo", cfg.cwd) ? c.green(" · repo indexed") : c.yellow(" · run: hara index"))}`,
+    `${dot} search ${c.dim("lexical (always on)")}${cfg.embedProvider === "off" ? c.dim(" · semantic off (hara config set embedProvider ollama|qwen)") : c.dim(" · semantic ") + c.bold(cfg.embedProvider) + (() => { const idx = ["repo", "assets", "memory"].filter((n) => indexExists(n, cfg.cwd)); return c.dim(" · indexed: ") + (idx.length ? c.green(idx.join(", ")) : c.yellow("none — run: hara index --all")); })()}`,
     `${dot} vision · ${c.bold(cfg.model)} ${vdesc}${cfg.visionModel ? c.dim(" · describer ") + c.bold(cfg.visionModel) : vcap === "text" ? c.yellow(" · set /vision <model>") : ""}`,
     `${dot} screen ${cfg.computerUse === "off" ? c.dim("off (hara config set computerUse read|click|full)") : c.bold(cfg.computerUse) + c.dim(` · ${computerBackends()}${cfg.computerApps.length ? " · apps: " + cfg.computerApps.join(", ") : " · no app allowlist"}`)}`,
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
@@ -451,7 +452,7 @@ program
   .command("recall [query...]")
   .description("search your code-asset library (~/.hara/code-assets) for snippets/playbooks")
   .option("--init", "scaffold the code-assets directory with an example")
-  .action((parts: string[], opts2: { init?: boolean }) => {
+  .action(async (parts: string[], opts2: { init?: boolean }) => {
     if (opts2.init) {
       const w = scaffoldAssets();
       out(w.length ? c.green(`Scaffolded ${assetsDir()}: ${w.join(", ")}\n`) : c.dim(`Assets already exist at ${assetsDir()}\n`));
@@ -459,35 +460,46 @@ program
     }
     const q = (parts ?? []).join(" ");
     if (!q) return void out(c.dim("usage: hara recall <query>   (or: hara recall --init)\n"));
-    const hits = searchAssets(q);
+    const hits = await searchHybrid(q, process.cwd(), { indexName: "assets", roots: assetSearchRoots(process.cwd()) });
     if (!hits.length) return void out(c.dim(`No matches in ${assetsDir()} (add .md files, or run: hara recall --init)\n`));
     for (const h of hits) out(`${c.cyan(h.path)}  ${c.dim(h.title)}\n`);
   });
 
 program
   .command("index")
-  .description("build the semantic index for codebase_search (opt-in; needs an embedding provider)")
-  .action(async () => {
+  .description("build the semantic index (opt-in; needs an embedding provider)")
+  .option("--repo", "index the current project — for codebase_search (default)")
+  .option("--assets", "index your global code-assets, skills & memory — for recall / memory_search")
+  .option("--all", "index everything")
+  .action(async (opts: { repo?: boolean; assets?: boolean; all?: boolean }) => {
     const cfg = loadConfig();
     const embed = getEmbedder(cfg);
     if (!embed) {
-      out(c.yellow("Semantic search is off — codebase_search stays lexical (which still works).\n"));
+      out(c.yellow("Semantic search is off — search stays lexical (which still works).\n"));
       out(c.dim("Turn it on with an embedding provider, then re-run `hara index`:\n"));
       out(c.dim("  hara config set embedProvider ollama   # local & offline (needs Ollama + an embed model)\n"));
       out(c.dim("  hara config set embedProvider qwen     # DashScope text-embedding-v3 (uses your key)\n"));
       return;
     }
-    const root = findProjectRoot(process.cwd());
-    const chunks = collectRepoChunks(root);
-    if (!chunks.length) return void out(c.dim("Nothing to index in this project.\n"));
-    out(c.dim(`Embedding ${chunks.length} chunks with ${cfg.embedProvider}…\n`));
-    try {
-      const n = await buildIndex("repo", chunks, embed, process.cwd(), `${cfg.embedProvider}:${cfg.embedModel ?? "default"}`);
-      out(c.green(`Indexed ${n} chunks → ${indexPath("repo", process.cwd())}\n`));
-      out(c.dim("codebase_search now blends semantic + lexical results.\n"));
-    } catch (e) {
-      out(c.red(`Indexing failed: ${(e as Error).message}\n`));
-      out(c.dim("Check the embedding endpoint/key; codebase_search still works lexically.\n"));
+    const cwd = process.cwd();
+    const model = `${cfg.embedProvider}:${cfg.embedModel ?? "default"}`;
+    const doRepo = opts.all || opts.repo || (!opts.assets && !opts.all);
+    const doAssets = opts.all || opts.assets;
+    const build = async (name: string, chunks: { id: string; text: string; file: string; source: string }[], blurb: string): Promise<void> => {
+      if (!chunks.length) return void out(c.dim(`Nothing to index for ${name}.\n`));
+      out(c.dim(`Embedding ${chunks.length} ${name} chunks with ${cfg.embedProvider}…\n`));
+      try {
+        const n = await buildIndex(name, chunks, embed, cwd, model);
+        out(c.green(`Indexed ${n} chunks → ${indexPath(name, cwd)}`) + c.dim(` (${blurb})`) + "\n");
+      } catch (e) {
+        out(c.red(`Indexing ${name} failed: ${(e as Error).message}\n`));
+        out(c.dim("Check the embedding endpoint/key; search still works lexically.\n"));
+      }
+    };
+    if (doRepo) await build("repo", collectRepoChunks(findProjectRoot(cwd)), "codebase_search");
+    if (doAssets) {
+      await build("assets", [...collectDirChunks(assetsDir(), "code-assets"), ...collectDirChunks(globalSkillsDir(), "skills")], "recall");
+      await build("memory", collectDirChunks(memoryDir("global", cwd), "memory"), "memory_search");
     }
   });
 
@@ -948,9 +960,9 @@ program.action(async (opts) => {
     {
       name: "recall",
       desc: "pull snippets from your code-asset library into context: /recall <query>",
-      run: (a) => {
+      run: async (a) => {
         if (!a) return void out(c.dim("usage: /recall <query>\n"));
-        const hits = searchAssets(a, 3, assetSearchRoots(cwd));
+        const hits = await searchHybrid(a, cwd, { indexName: "assets", roots: assetSearchRoots(cwd), limit: 3 });
         if (!hits.length) return void out(c.dim(`(no matches in ${assetsDir()})\n`));
         const block = hits.map((h) => `Recalled \`${h.path}\` (${h.title}):\n${h.snippet}`).join("\n\n");
         recalledContext += (recalledContext ? "\n\n" : "") + block;
@@ -1115,7 +1127,7 @@ program.action(async (opts) => {
           }
           if (nm === "recall") {
             if (!arg) return void h.sink.notice("usage: /recall <query>");
-            const hits = searchAssets(arg, 3, assetSearchRoots(cwd));
+            const hits = await searchHybrid(arg, cwd, { indexName: "assets", roots: assetSearchRoots(cwd), limit: 3 });
             if (!hits.length) return void h.sink.notice(`(no matches in ${assetsDir()})`);
             recalledContext += (recalledContext ? "\n\n" : "") + hits.map((x) => `Recalled \`${x.path}\` (${x.title}):\n${x.snippet}`).join("\n\n");
             return void h.sink.notice(`↗ recalled ${hits.length}: ${hits.map((x) => x.path).join(", ")} (added to your next message)`);

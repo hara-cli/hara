@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { findProjectRoot } from "../context/agents-md.js";
-import { listProjectFiles, isProbablyBinary, fileSize } from "../fs-walk.js";
+import { listProjectFiles, walkFiles, isProbablyBinary, fileSize } from "../fs-walk.js";
 
 // Same code/text extensions codebase_search ranks lexically — keep the two walks in sync.
 const CODE_RE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|c|h|cc|cpp|hpp|cs|swift|scala|sh|bash|sql|md|mdx|json|ya?ml|toml|html|css|scss|less|vue|svelte|astro|tf|proto|graphql|gql|gradle|txt)$/i;
@@ -91,6 +91,27 @@ export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder,
 
 export function indexExists(name: string, cwd: string): boolean {
   return existsSync(indexPath(name, cwd));
+}
+
+/** Walk one knowledge directory (code-assets / skills / memory) and chunk its files. Files come back as
+ *  absolute paths so recall/memory_search can read or open them directly. */
+export function collectDirChunks(dir: string, source: string): Chunk[] {
+  if (!existsSync(dir)) return [];
+  const chunks: Chunk[] = [];
+  for (const rel of walkFiles(dir)) {
+    if (!CODE_RE.test(rel)) continue;
+    const abs = join(dir, rel);
+    if (fileSize(abs) > 200_000) continue;
+    let buf: Buffer;
+    try {
+      buf = readFileSync(abs);
+    } catch {
+      continue;
+    }
+    if (isProbablyBinary(buf)) continue;
+    chunks.push(...chunkText(buf.toString("utf8"), abs, source));
+  }
+  return chunks;
 }
 
 /** Walk the repo (respecting .gitignore) and chunk every code/text file — the corpus `hara index` embeds. */

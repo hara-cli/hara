@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { isAbsolute, resolve, join } from "node:path";
 import { registerTool } from "./registry.js";
 import { searchAssets, assetSearchRoots } from "../recall.js";
+import { searchHybrid } from "../search/hybrid.js";
 import { memoryRoots, appendMemory, replaceMemory, forgetMemory, type Scope, type Target } from "../memory/store.js";
 import { scanMemory, redactSecrets, scrubLocal } from "../memory/guard.js";
 import { globalSkillsDir, skillsDir, invalidateSkillsCache } from "../skills/skills.js";
@@ -23,7 +24,7 @@ registerTool({
   },
   kind: "read",
   async run(input, ctx) {
-    const hits = searchAssets(String(input.query ?? ""), Math.min(Number(input.limit) || 5, 10), memoryRoots(ctx.cwd));
+    const hits = await searchHybrid(String(input.query ?? ""), ctx.cwd, { indexName: "memory", roots: memoryRoots(ctx.cwd), limit: Math.min(Number(input.limit) || 5, 10) });
     if (!hits.length) return "(no memory matches)";
     return hits.map((h) => `${h.path} — ${h.title}\n${h.snippet}`).join("\n\n");
   },

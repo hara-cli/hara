@@ -24,7 +24,7 @@ export interface Recalled {
   score: number;
 }
 
-function titleOf(text: string, path: string): string {
+export function titleOf(text: string, path: string): string {
   const fm = /^---\n([\s\S]*?)\n---/.exec(text);
   if (fm) {
     const t = /(?:^|\n)title:\s*(.+)/i.exec(fm[1]);

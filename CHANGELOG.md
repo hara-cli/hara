@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.33.0 — unreleased (semantic recall + memory)
+
+- **`recall` and `memory_search` go hybrid too.** The semantic layer added in 0.32 now also powers your
+  code-asset library and durable memory — `hara index --assets` embeds `~/.hara/code-assets`, global skills,
+  and `~/.hara/memory` into `assets` + `memory` indexes. `hara recall`, `/recall`, and the `memory_search` tool
+  then blend meaning-based hits with lexical (semantic leads, lexical fills, deduped by path).
+- **`hara index [--repo|--assets|--all]`** — `--repo` (default) for `codebase_search`, `--assets` for recall +
+  memory, `--all` for everything. Each index is still a self-`.gitignore`d derived artifact; `hara doctor` lists
+  which of `repo / assets / memory` are built.
+- **Lexical stays the default everywhere** — with no index/embedder, recall and memory behave exactly as before.
+  Capture/dedup (`skill_create`) stays purely lexical by design (saving shouldn't depend on an embedding model).
+- Verified end-to-end with local `bge-m3`: "retrying a request that failed" → a backoff snippet; "how do I ship
+  a release" → the deploy note — both matched by meaning, not keywords.
+
 ## 0.32.0 — unreleased (semantic search for `codebase_search`)
 
 - **Opt-in semantic index — `hara index`.** `codebase_search` (the "this repo is a knowledge base" tool) can

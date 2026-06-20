@@ -157,12 +157,13 @@ global override them). `.claude/agents/*.md` subagents load as roles too.
 `hara recall "<query>"` searches it **plus your skills** (one corpus), and `/recall <query>` pulls the best
 matches into your next message. A git-versionable library of code/patterns you want to reuse (`HARA_ASSETS` overrides the path).
 
-**Semantic search** (opt-in) — the `codebase_search` tool finds repo code by *meaning*, not just keywords. By
-default it's lexical (zero setup). Configure an embedding provider and run `hara index` once to add a semantic
-layer: `hara config set embedProvider ollama` (local & offline, e.g. `bge-m3`/`nomic-embed-text`) or `qwen`
-(DashScope) — then a query like "read an image pasted from the clipboard" surfaces `src/images.ts` even with no
-shared words. The index is a rebuildable `.hara/index/` artifact (self-`.gitignore`d, never committed); no native
-vector DB needed.
+**Semantic search** (opt-in) — `codebase_search`, `recall`, and `memory_search` can find things by *meaning*,
+not just keywords. By default they're lexical (zero setup). Configure an embedding provider, then build an index:
+`hara config set embedProvider ollama` (local & offline, e.g. `bge-m3`/`nomic-embed-text`) or `qwen` (DashScope),
+then `hara index` (repo, for `codebase_search`) / `hara index --assets` (code-assets, skills & memory) / `hara
+index --all`. A query like "read an image pasted from the clipboard" then surfaces `src/images.ts` even with no
+shared words. Indexes are rebuildable `.hara/index/` artifacts (self-`.gitignore`d, never committed); no native
+vector DB needed, and lexical still works when there's no index.
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
 **Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).
