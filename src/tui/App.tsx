@@ -13,6 +13,7 @@ import type { ImageAttachment } from "../providers/types.js";
 import { activity } from "../activity.js";
 import { ctxPctFor } from "../statusbar.js";
 import { accent } from "./theme.js";
+import { renderMarkdown } from "../md.js";
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -62,7 +63,7 @@ function Block({ item, open }: { item: Item; open?: boolean }) {
         </Box>
       );
     case "assistant":
-      return <Text>{item.text}</Text>;
+      return <Text>{renderMarkdown(item.text)}</Text>; // headers/bold/inline-code/bullets + verbatim fences
     case "reasoning": {
       // fixed-height window: show the last 5 lines while thinking; ctrl-r toggles the full text.
       const lines = item.text.replace(/\n+$/, "").split("\n");
@@ -224,6 +225,9 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       } else if (key.escape) {
         prompt.resolve(opts[opts.length - 1].value); // last option = cancel/no
         setPrompt(null);
+      } else if (/^[1-9]$/.test(input) && Number(input) <= opts.length) {
+        prompt.resolve(opts[Number(input) - 1].value); // type a number to pick directly
+        setPrompt(null);
       } else if (input) {
         const hit = opts.find((o) => o.key && o.key === input.toLowerCase());
         if (hit) {
@@ -252,9 +256,10 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           <Text color="yellow">{`  ${stripAnsi(prompt.title)}`}</Text>
           {prompt.options.map((o, i) => (
             <Text key={i} color={i === promptSel ? "cyan" : undefined} bold={i === promptSel}>
-              {(i === promptSel ? " ❯ " : "   ") + o.label}
+              {(i === promptSel ? " ❯ " : "   ") + `${i + 1}. ` + o.label}
             </Text>
           ))}
+          <Text dimColor>{`   ↑↓ or 1–${prompt.options.length} to choose · Enter · Esc cancels`}</Text>
         </Box>
       )}
       <InputBox status={status} cwd={cwd} isActive={!working && !prompt} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />

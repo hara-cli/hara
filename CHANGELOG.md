@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.40.0 — unreleased (TUI polish: markdown rendering + numbered choices)
+
+- The ink TUI now **renders assistant Markdown** (headers, bold, inline code, bullets; code fences kept
+  verbatim) instead of showing raw `**`/`##`/backticks. The renderer (`md.ts`) had only been wired into the
+  classic REPL; the default TUI showed markdown literally.
+- **Selection prompts are numbered**: each choice shows `1.`, `2.`, … and you can **press the number to pick it
+  directly** (in addition to ↑↓ + Enter). The hint reads "↑↓ or 1–N to choose".
+
 ## 0.39.0 — unreleased (hara commit — AI commit messages)
 
 - **`hara commit`** generates a conventional-commits message from your staged diff, shows it, and commits after

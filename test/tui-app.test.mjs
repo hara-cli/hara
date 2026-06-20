@@ -76,7 +76,7 @@ test("App confirm is a selectable list: ↓ then Enter picks 'don't ask again' �
   await tick();
   stdin.write("\r");
   await tick();
-  assert.ok(strip(lastFrame()).includes("❯ Yes"), "Yes is selected by default");
+  assert.ok(strip(lastFrame()).includes("❯ 1. Yes"), "Yes is selected by default (numbered)");
   stdin.write("\x1b[B"); // ↓
   await tick();
   stdin.write("\r"); // Enter
@@ -102,7 +102,7 @@ test("App select (plan-proceed): ↓↓ + Enter picks the third option", async (
   await tick();
   stdin.write("\r");
   await tick();
-  assert.ok(strip(lastFrame()).includes("❯ Yes, and auto-apply edits"), "first option selected by default");
+  assert.ok(strip(lastFrame()).includes("❯ 1. Yes, and auto-apply edits"), "first option selected by default (numbered)");
   stdin.write("\x1b[B");
   await tick();
   stdin.write("\x1b[B");
@@ -110,5 +110,49 @@ test("App select (plan-proceed): ↓↓ + Enter picks the third option", async (
   stdin.write("\r");
   await tick(80);
   assert.equal(choice, "no", "↓↓ + Enter selects the third option");
+  unmount();
+});
+
+test("App select: numbered options — typing a number picks it directly", async () => {
+  let choice = null;
+  const onSubmit = async (line, h) => {
+    choice = await h.select("pick one", [
+      { label: "alpha", value: "a" },
+      { label: "beta", value: "b" },
+      { label: "gamma", value: "c" },
+    ]);
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("2. beta"), "options are numbered");
+  stdin.write("3"); // type the number → picks the third directly, no Enter
+  await tick(80);
+  assert.equal(choice, "c", "typing 3 selected the third option");
+  unmount();
+});
+
+test("App renders assistant markdown (bold/inline-code styled, not raw)", async () => {
+  const onSubmit = async (line, h) => {
+    h.sink.assistantDelta("Use **bold** and `code` now.");
+    await tick(200);
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("hi");
+  await tick();
+  stdin.write("\r");
+  await tick(80);
+  const f = strip(lastFrame());
+  assert.ok(f.includes("bold") && f.includes("code"), "text content present");
+  assert.ok(!f.includes("**bold**"), "raw ** markers gone — markdown rendered, not literal");
+  // (color is TTY-only via the `c` helper; in a real terminal ink passes the ANSI through — verified by dogfooding)
   unmount();
 });
