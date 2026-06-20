@@ -1,11 +1,22 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Provider, NeutralMsg, TurnArgs, TurnResult } from "./types.js";
+import { imageToBase64 } from "../images.js";
 
-function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
+export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
   const msgs: Anthropic.MessageParam[] = [];
   for (const m of history) {
     if (m.role === "user") {
-      msgs.push({ role: "user", content: m.content });
+      if (m.images?.length) {
+        const blocks: Anthropic.ContentBlockParam[] = [];
+        if (m.content) blocks.push({ type: "text", text: m.content });
+        for (const img of m.images) {
+          const data = imageToBase64(img.path);
+          if (data) blocks.push({ type: "image", source: { type: "base64", media_type: img.mediaType as Anthropic.Base64ImageSource["media_type"], data } });
+        }
+        msgs.push({ role: "user", content: blocks.length ? blocks : m.content });
+      } else {
+        msgs.push({ role: "user", content: m.content });
+      }
     } else if (m.role === "assistant") {
       const content: Anthropic.ContentBlockParam[] = [];
       if (m.text) content.push({ type: "text", text: m.text });

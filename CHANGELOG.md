@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.22.0 — unreleased (image paste / vision)
+
+- **Paste images into the prompt** (ink TUI) — **Ctrl+V** pastes an image from the OS clipboard (a
+  screenshot, or an image copied from a browser); **dragging an image file** into the terminal (or
+  pasting its path) attaches it too. Each shows as an `[Image #N]` token in the input with a 🖼 chip
+  below the box. Zero new deps — shells out to `osascript`/`sips` (macOS), `wl-paste`/`xclip` (Linux),
+  or PowerShell (Windows), the same posture as the sandbox.
+- **Vision on every provider** — attachments are sent as image blocks: base64 `image` blocks for
+  Anthropic (Claude), `image_url` data-URLs for OpenAI-compatible endpoints (Qwen-VL / GLM-4V /
+  OpenAI). Use a vision-capable model. Oversized images are auto-downsized (macOS `sips`, ≤1568 px)
+  and capped at ~5 MB.
+- Only image **paths** ride in the conversation/session JSON (sessions stay small); bytes are read +
+  base64-encoded at request time. `@image.png` mentions no longer inline binary — they hint to paste.
+- 85 offline tests (clipboard capture, path detection, provider image blocks, TUI paste).
+
 ## 0.21.2 — unreleased (memory everywhere)
 
 - Memory now injects into **every execution mode** — `hara -p` one-shot, `hara org`, `hara plan` atoms,

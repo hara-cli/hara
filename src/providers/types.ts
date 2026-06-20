@@ -2,9 +2,12 @@
 
 export type ToolUse = { id: string; name: string; input: any };
 export type ToolResult = { id: string; name: string; content: string; isError?: boolean };
+/** An image the user attached to a turn. Only the path rides in history (sessions stay small); the
+ *  bytes are read + base64-encoded by each provider at request time. */
+export type ImageAttachment = { path: string; mediaType: string };
 
 export type NeutralMsg =
-  | { role: "user"; content: string }
+  | { role: "user"; content: string; images?: ImageAttachment[] }
   | { role: "assistant"; text: string; toolUses: ToolUse[] }
   | { role: "tool"; results: ToolResult[] };
 

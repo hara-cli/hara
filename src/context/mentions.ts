@@ -4,6 +4,7 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { listProjectFiles, dirPrefixes, walkFiles } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
+import { mediaTypeFor } from "../images.js";
 
 const MAX_FILE = 50_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
@@ -24,9 +25,14 @@ export function expandMentions(input: string, cwd: string): string {
       if (existsSync(abs)) {
         const st = statSync(abs);
         if (st.isFile()) {
-          let txt = readFileSync(abs, "utf8");
-          if (txt.length > MAX_FILE) txt = txt.slice(0, MAX_FILE) + "\n…[truncated]";
-          blocks.push(`Referenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\``);
+          if (mediaTypeFor(abs)) {
+            // don't inline binary image bytes as text — paste it with Ctrl+V (or drag the file in) to attach visually
+            blocks.push(`Referenced \`${ref}\` is an image — paste it with Ctrl+V to attach it visually.`);
+          } else {
+            let txt = readFileSync(abs, "utf8");
+            if (txt.length > MAX_FILE) txt = txt.slice(0, MAX_FILE) + "\n…[truncated]";
+            blocks.push(`Referenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\``);
+          }
         } else if (st.isDirectory()) {
           // `@dir` loads a listing of the directory's files (the agent can then read specific ones)
           const files = walkFiles(abs, 300);

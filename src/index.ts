@@ -3,6 +3,7 @@ import { Command } from "commander";
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
+import { readClipboardImage } from "./images.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
@@ -47,7 +48,7 @@ import { connectMcpServers, closeMcp } from "./mcp/client.js";
 import { sandboxSupported, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
 import { searchAssets, scaffoldAssets, assetsDir } from "./recall.js";
-import type { Provider, NeutralMsg } from "./providers/types.js";
+import type { Provider, NeutralMsg, ImageAttachment } from "./providers/types.js";
 import { c, out, statusLine } from "./ui.js";
 import * as bar from "./statusbar.js";
 import { nearest } from "./fuzzy.js";
@@ -815,7 +816,8 @@ program.action(async (opts) => {
       cwd,
       header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
       cycleApproval: (m) => cycleMode(m),
-      onSubmit: async (line, h) => {
+      onClipboardImage: readClipboardImage,
+      onSubmit: async (line, h, images) => {
         if (line.startsWith("/")) {
           const [nm, ...rest] = line.slice(1).split(/\s+/);
           const arg = rest.join(" ").trim();
@@ -944,7 +946,7 @@ program.action(async (opts) => {
         const appr = h.approval;
         if (appr === "plan") {
           // PLAN MODE: read-only investigate → propose a plan → selectable proceed → execute.
-          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) });
+          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd), ...(images?.length ? { images } : {}) });
           recalledContext = "";
           const pin = stats.input;
           const pout = stats.output;
@@ -994,7 +996,7 @@ program.action(async (opts) => {
         }
         const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd);
         recalledContext = "";
-        history.push({ role: "user", content: userContent });
+        history.push({ role: "user", content: userContent, ...(images?.length ? { images } : {}) });
         const beforeIn = stats.input;
         const beforeOut = stats.output;
         await runAgent(history, {

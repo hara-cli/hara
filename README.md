@@ -10,7 +10,7 @@
 
 **Highlights**
 - **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**).
-- **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only → propose a plan → approve → execute), selectable approvals with "don't ask again", windowed reasoning, light/dark theme.
+- **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only → propose a plan → approve → execute), selectable approvals with "don't ask again", windowed reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
 - **Persistent memory + self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting, **proactively saves** durable facts, and grows its own playbooks (a lexical guard screens what it writes).
 - **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
 - **Solid coding core** — `edit_file` / `apply_patch` (atomic multi-file) with colored diffs · `grep`/`glob`/`ls`/`web_fetch` · fuzzy `@file` · `/undo` · `/compact` · **Esc-to-interrupt** · parallel sub-agents · MCP client · macOS sandbox.
@@ -114,7 +114,9 @@ The interactive REPL is an **ink TUI**: a bordered **input box pinned at the bot
 the top-right corner, approval modes + token usage + concurrency in the bottom border — with the
 conversation scrolling above it. Streaming text, reasoning, tool calls, and colored diffs render as live
 blocks; a spinner runs during a turn. **shift+tab** cycles the approval mode, **Esc** interrupts a running
-turn, and tool approvals appear inline (y/N). Set `HARA_TUI=0` for the classic readline REPL.
+turn, and tool approvals appear inline (y/N). **Ctrl+V** pastes an image from your clipboard (a screenshot,
+or a copied image) — or drag an image file into the terminal — to attach it for vision-capable models; it
+shows as an `[Image #N]` chip. Set `HARA_TUI=0` for the classic readline REPL.
 
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal

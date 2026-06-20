@@ -9,6 +9,7 @@
 import { Box, Static, Text, useApp, useInput } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { InputBox, type Status, type Approval } from "./InputBox.js";
+import type { ImageAttachment } from "../providers/types.js";
 import { activity } from "../activity.js";
 import { ctxPctFor } from "../statusbar.js";
 import { accent } from "./theme.js";
@@ -36,8 +37,10 @@ export interface AppProps {
   model: string;
   cwd: string;
   header?: { version: string; model: string; cwd: string; tip?: string };
-  onSubmit: (line: string, h: Helpers) => Promise<void>;
+  onSubmit: (line: string, h: Helpers, images?: ImageAttachment[]) => Promise<void>;
   cycleApproval?: (cur: Approval) => Approval;
+  /** Read an image off the OS clipboard for Ctrl+V (injected; omitted in tests). */
+  onClipboardImage?: () => ImageAttachment | null;
 }
 
 type Kind = "user" | "assistant" | "reasoning" | "tool" | "diff" | "notice";
@@ -125,7 +128,7 @@ function Working() {
   );
 }
 
-export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval }: AppProps) {
+export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval, onClipboardImage }: AppProps) {
   const { exit } = useApp();
   const [history, setHistory] = useState<Item[]>([]);
   const [current, setCurrent] = useState<Item[]>([]);
@@ -155,10 +158,11 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   }, []);
 
   const handleSubmit = useCallback(
-    async (line: string): Promise<void> => {
+    async (line: string, images?: ImageAttachment[]): Promise<void> => {
       const t = line.trim();
       if (!t || working || prompt) return;
-      setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]);
+      const tag = images?.length ? `  (${images.length} image${images.length === 1 ? "" : "s"})` : "";
+      setHistory((h) => [...h, { id: nid(), kind: "user", text: t + tag }]);
       const ctrl = new AbortController();
       ctrlRef.current = ctrl;
       setWorking(true);
@@ -186,7 +190,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       const selectFn = (title: string, options: { label: string; value: string }[]): Promise<string> => openPrompt(title, options);
       const setApprovalFn = (m: Approval): void => setStatus((s) => ({ ...s, approval: m }));
       try {
-        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval });
+        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval }, images);
       } catch (e: unknown) {
         pushCurrent("notice", `error: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -247,7 +251,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           ))}
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} isActive={!working && !prompt} onSubmit={handleSubmit} />
+      <InputBox status={status} cwd={cwd} isActive={!working && !prompt} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );
 }

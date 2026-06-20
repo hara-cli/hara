@@ -5,6 +5,8 @@
 import { Box, Text, useInput, useStdout } from "ink";
 import { useMemo, useState } from "react";
 import { fileCandidates } from "../context/mentions.js";
+import { imagePathFromPaste } from "../images.js";
+import type { ImageAttachment } from "../providers/types.js";
 
 export const MODES = ["suggest", "auto-edit", "full-auto", "plan"] as const;
 export type Approval = (typeof MODES)[number];
@@ -101,13 +103,16 @@ export function InputBox({
   cwd,
   width,
   onSubmit,
+  onClipboardImage,
   isActive = true,
-  placeholder = "Type a task · /help · @file · shift+tab cycles mode · Esc interrupts",
+  placeholder = "Type a task · /help · @file · Ctrl+V paste image · shift+tab mode · Esc interrupts",
 }: {
   status: Status;
   cwd: string;
   width?: number;
-  onSubmit?: (v: string) => void;
+  onSubmit?: (v: string, images?: ImageAttachment[]) => void;
+  /** Read an image off the OS clipboard (Ctrl+V). Injected so the view stays side-effect-free in tests. */
+  onClipboardImage?: () => ImageAttachment | null;
   isActive?: boolean;
   placeholder?: string;
 }) {
@@ -117,12 +122,31 @@ export function InputBox({
   const [cursor, setCursor] = useState(0);
   const [sel, setSel] = useState(0);
   const [dismissed, setDismissed] = useState(false);
+  const [images, setImages] = useState<(ImageAttachment & { placeholder: string })[]>([]);
 
   const set = (v: string, c: number): void => {
     setValue(v);
     setCursor(c);
     setSel(0);
     setDismissed(false);
+  };
+
+  // Attach an image: drop an `[Image #N]` token into the text at the cursor and track the file.
+  const addImage = (img: ImageAttachment): void => {
+    const tag = `[Image #${images.length + 1}]`;
+    const before = value.slice(0, cursor);
+    const ins = (before && !before.endsWith(" ") ? " " : "") + tag + " ";
+    setValue(before + ins + value.slice(cursor));
+    setCursor((before + ins).length);
+    setImages((xs) => [...xs, { ...img, placeholder: tag }]);
+    setSel(0);
+    setDismissed(false);
+  };
+
+  const submit = (text: string): void => {
+    onSubmit?.(text, images.length ? images.map((i) => ({ path: i.path, mediaType: i.mediaType })) : undefined);
+    set("", 0);
+    setImages([]);
   };
 
   const mention = activeMention(value, cursor);
@@ -160,8 +184,7 @@ export function InputBox({
         return;
       }
       if (key.return) {
-        onSubmit?.(value);
-        set("", 0);
+        submit(value);
         return;
       }
       if (key.leftArrow) return setCursor((c) => Math.max(0, c - 1));
@@ -169,6 +192,12 @@ export function InputBox({
       if (key.ctrl && input === "a") return setCursor(0);
       if (key.ctrl && input === "e") return setCursor(value.length);
       if (key.ctrl && input === "u") return set(value.slice(cursor), 0);
+      if (key.ctrl && input === "v") {
+        // paste a screenshot / image from the OS clipboard
+        const img = onClipboardImage?.();
+        if (img) addImage(img);
+        return;
+      }
       if (key.backspace || key.delete) {
         if (cursor > 0) set(value.slice(0, cursor - 1) + value.slice(cursor), cursor - 1);
         return;
@@ -176,9 +205,16 @@ export function InputBox({
       if (input && !key.ctrl && !key.meta) {
         const nl = input.search(/[\r\n]/); // a chunk carrying a newline (paste / fed input) submits
         if (nl >= 0) {
-          onSubmit?.(value.slice(0, cursor) + input.slice(0, nl) + value.slice(cursor));
-          set("", 0);
+          submit(value.slice(0, cursor) + input.slice(0, nl) + value.slice(cursor));
           return;
+        }
+        // a dragged-in / pasted image file path attaches instead of inserting literal text
+        if (input.length > 3) {
+          const img = imagePathFromPaste(input, cwd);
+          if (img) {
+            addImage(img);
+            return;
+          }
         }
         set(value.slice(0, cursor) + input + value.slice(cursor), cursor + input.length);
       }
@@ -206,6 +242,14 @@ export function InputBox({
         )}
       </Box>
       <BottomBorder s={status} width={w} />
+      {images.length > 0 ? (
+        <Box>
+          <Text>{"  "}</Text>
+          {images.map((im, i) => (
+            <Text key={i} color="magenta">{`${i > 0 ? "   " : ""}🖼 ${im.placeholder}`}</Text>
+          ))}
+        </Box>
+      ) : null}
       {popupOpen ? <MentionPopup items={candidates} selected={selIdx} query={mention!.query} /> : null}
       <ModeBar approval={status.approval} />
     </Box>

@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
 import { InputBox } from "../dist/tui/InputBox.js";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
@@ -63,5 +66,48 @@ test("InputBox shows an @path popup with file matches", async () => {
   const frame = strip(lastFrame());
   assert.ok(/src/.test(frame), "shows src path candidates");
   assert.ok(frame.includes("insert") || frame.includes("select"), "popup hint shown");
+  unmount();
+});
+
+test("InputBox: Ctrl+V attaches a clipboard image (placeholder + chip), passed to onSubmit", async () => {
+  let submitted = null;
+  const fakeImg = { path: "/tmp/shot.png", mediaType: "image/png" };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(InputBox, {
+      status: S,
+      cwd,
+      onClipboardImage: () => fakeImg,
+      onSubmit: (v, images) => (submitted = { v, images }),
+    }),
+  );
+  stdin.write("\x16"); // Ctrl+V
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("[Image #1]"), "placeholder inserted into the input text");
+  assert.ok(frame.includes("🖼"), "image chip shown below the box");
+  stdin.write("\r");
+  await tick();
+  assert.ok(submitted, "submitted on Enter");
+  assert.equal(submitted.v.trim(), "[Image #1]", "text carries the placeholder");
+  assert.deepEqual(submitted.images, [fakeImg], "attachment (path + mediaType) passed to onSubmit");
+  unmount();
+});
+
+test("InputBox: pasting/dragging an image file path attaches it instead of typing the path", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-ib-"));
+  const png = join(dir, "pic.png");
+  writeFileSync(png, Buffer.from([1, 2, 3]));
+  let submitted = null;
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(InputBox, { status: S, cwd, onSubmit: (v, images) => (submitted = { v, images }) }),
+  );
+  stdin.write(png); // a dragged-in terminal emits the bare path
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("[Image #1]"), "path became an attachment placeholder");
+  assert.ok(!frame.includes(png), "raw path not inserted as literal text");
+  stdin.write("\r");
+  await tick();
+  assert.deepEqual(submitted.images, [{ path: png, mediaType: "image/png" }], "attachment passed on submit");
   unmount();
 });

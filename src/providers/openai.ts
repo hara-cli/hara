@@ -1,12 +1,24 @@
 import OpenAI from "openai";
 import type { Provider, NeutralMsg, ToolUse, TurnArgs, TurnResult } from "./types.js";
+import { imageToBase64 } from "../images.js";
 
 /** Build OpenAI chat-completions messages from neutral history. */
-function toOpenAI(system: string, history: NeutralMsg[]): any[] {
+export function toOpenAI(system: string, history: NeutralMsg[]): any[] {
   const msgs: any[] = [{ role: "system", content: system }];
   for (const m of history) {
     if (m.role === "user") {
-      msgs.push({ role: "user", content: m.content });
+      if (m.images?.length) {
+        // multimodal content parts: text + image_url data URLs (Qwen-VL / GLM-4V / OpenAI vision)
+        const parts: any[] = [];
+        if (m.content) parts.push({ type: "text", text: m.content });
+        for (const img of m.images) {
+          const data = imageToBase64(img.path);
+          if (data) parts.push({ type: "image_url", image_url: { url: `data:${img.mediaType};base64,${data}` } });
+        }
+        msgs.push({ role: "user", content: parts.length ? parts : m.content });
+      } else {
+        msgs.push({ role: "user", content: m.content });
+      }
     } else if (m.role === "assistant") {
       const tool_calls = m.toolUses.map((tu) => ({
         id: tu.id,
