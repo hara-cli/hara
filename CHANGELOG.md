@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.37.0 — unreleased (task-aware screenshots for screen control)
+
+- Screenshots from the `computer` tool are now read with a **screenshot-tuned prompt** aimed at *acting*, not
+  transcribing: interactive elements (buttons/fields/menus) with labels and approximate positions, the active
+  element, and any errors. A text-only main model driving the desktop gets something it can actually click.
+- New optional **`focus`** on the screenshot action ("the Login button") narrows the read to the current goal.
+- Internal: `describeImages` gains `system`/`hint` options, `SCREENSHOT_SYSTEM` added, `ctx.describeImage`
+  takes a hint. (For contrast: codex's `computer_use` is a remote/hosted *browser* MCP plugin with no local
+  syscalls — hara stays **native + local** so it can operate your own desktop software.)
+
 ## 0.36.0 — unreleased (resumable plans)
 
 - **`hara plan resume`** continues the saved plan (`.hara/org/plan.json`): atoms already marked done are

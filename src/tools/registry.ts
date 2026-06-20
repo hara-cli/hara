@@ -18,8 +18,9 @@ export interface ToolContext {
   spawn?: (task: string, role?: string) => Promise<string>;
   /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */
   ui?: UiSink;
-  /** describe an image file via the vision sidecar (lets the computer tool return a screenshot as text) */
-  describeImage?: (path: string) => Promise<string>;
+  /** describe an image file via the vision sidecar (lets the computer tool return a screenshot as text);
+   *  `hint` focuses the description on a goal (e.g. "the Login button") for actionable RPA output */
+  describeImage?: (path: string, hint?: string) => Promise<string>;
 }
 
 export interface Tool {

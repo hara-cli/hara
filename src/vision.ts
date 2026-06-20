@@ -71,17 +71,32 @@ export const DESCRIBE_SYSTEM = [
   "5. Be thorough and factual; do not speculate beyond what is visible.",
 ].join("\n");
 
+// Screenshot variant — tuned for driving the desktop (RPA) rather than transcription. A text-only main
+// model can't see, so it needs *actionable* output: where things are, so it can issue clicks.
+export const SCREENSHOT_SYSTEM = [
+  "You are the eyes of an assistant operating this computer; it cannot see the screen and acts only on your",
+  "words. Describe the screenshot so it can ACT. Prioritise, in order:",
+  "1. INTERACTIVE elements — buttons, links, text fields, checkboxes, menus, tabs, icons — each with its",
+  "   visible label and an approximate location: a region (e.g. top-right) AND a rough pixel x,y if you can.",
+  "2. The currently focused/active element or selection, and any open dialog/modal/popup.",
+  "3. Errors, warnings, and key visible text/headings — quote them exactly.",
+  "4. One line on what app/screen this appears to be.",
+  "Positions guide clicks, so always estimate them. Be concise and factual; never invent elements.",
+].join("\n");
+
 const PROMPT = "Describe the attached image(s) per your instructions.";
 
-/** Send images to the vision provider and return its textual description. Throws on a provider error. */
+/** Send images to the vision provider and return its textual description. Throws on a provider error.
+ *  `system` overrides the default prompt (e.g. SCREENSHOT_SYSTEM); `hint` focuses it on a specific goal. */
 export async function describeImages(
   provider: Provider,
   images: ImageAttachment[],
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; system?: string; hint?: string } = {},
 ): Promise<string> {
+  const content = opts.hint ? `${PROMPT}\nFocus especially on: ${opts.hint}` : PROMPT;
   const r = await provider.turn({
-    system: DESCRIBE_SYSTEM,
-    history: [{ role: "user", content: PROMPT, images }],
+    system: opts.system ?? DESCRIBE_SYSTEM,
+    history: [{ role: "user", content, images }],
     tools: [],
     onText: () => {},
     signal: opts.signal,

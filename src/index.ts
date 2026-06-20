@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
 import { readClipboardImage } from "./images.js";
-import { describeImages, classifyVision } from "./vision.js";
+import { describeImages, classifyVision, SCREENSHOT_SYSTEM } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
@@ -1065,13 +1065,15 @@ program.action(async (opts) => {
       visionProvider = await buildProvider({ ...cfg, model: cfg.visionModel!, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey });
       return visionProvider;
     };
-    // lets the computer tool return a screenshot as text (describe via the vision sidecar / a vision main model)
-    const describeScreenshot = async (path: string): Promise<string> => {
+    // lets the computer tool return a screenshot as text (describe via the vision sidecar / a vision main model).
+    // Uses the screenshot-tuned prompt (actionable UI elements + positions) + an optional focus hint, so a
+    // text-only main model gets something it can click on rather than a generic transcription.
+    const describeScreenshot = async (path: string, hint?: string): Promise<string> => {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
       const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
       if (!vp) return "";
       try {
-        return await describeImages(vp, [{ path, mediaType: "image/png" }]);
+        return await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint });
       } catch {
         return "";
       }

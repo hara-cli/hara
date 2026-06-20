@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describeImages, DESCRIBE_SYSTEM, classifyVision } from "../dist/vision.js";
+import { describeImages, DESCRIBE_SYSTEM, SCREENSHOT_SYSTEM, classifyVision } from "../dist/vision.js";
 
 test("classifyVision: vision-capable families → 'vision'", () => {
   const V = (p, m) => assert.equal(classifyVision(p, m), "vision", `${p}/${m}`);
@@ -90,4 +90,20 @@ test("describeImages throws on a provider error", async () => {
 
 test("DESCRIBE_SYSTEM instructs verbatim transcription (OCR for text-only models)", () => {
   assert.match(DESCRIBE_SYSTEM, /VERBATIM/);
+});
+
+test("describeImages: system override + focus hint (task-aware screenshots)", async () => {
+  const { provider, calls } = fakeProvider({ text: "Login button at top-right ~(900,40)", toolUses: [], stop: "end" });
+  const out = await describeImages(provider, [{ path: "/tmp/s.png", mediaType: "image/png" }], {
+    system: SCREENSHOT_SYSTEM,
+    hint: "the Login button",
+  });
+  assert.match(out, /Login button/);
+  assert.equal(calls[0].system, SCREENSHOT_SYSTEM, "uses the screenshot-tuned prompt, not the generic one");
+  assert.match(calls[0].history[0].content, /Focus especially on: the Login button/);
+});
+
+test("SCREENSHOT_SYSTEM is action-oriented (interactive elements + positions)", () => {
+  assert.match(SCREENSHOT_SYSTEM, /INTERACTIVE/);
+  assert.match(SCREENSHOT_SYSTEM, /pixel|location|position/i);
 });

@@ -171,7 +171,8 @@ registerTool({
   description:
     "Control the screen to operate desktop software (not just the browser): take a screenshot, then " +
     "click/move/type/press keys at coordinates. Workflow: screenshot → read what's on screen → act. " +
-    "Opt-in and permission-gated (tier + per-app allowlist).",
+    "A screenshot returns the interactive elements and their positions so you can click them; pass `focus` " +
+    "to target what you're looking for. Opt-in and permission-gated (tier + per-app allowlist).",
   input_schema: {
     type: "object",
     properties: {
@@ -180,6 +181,7 @@ registerTool({
       y: { type: "number", description: "y pixel (click/move)" },
       text: { type: "string", description: "text to type (type)" },
       keys: { type: "string", description: "key or combo, e.g. 'return', 'cmd+c' (key)" },
+      focus: { type: "string", description: "screenshot only: what to look for, e.g. 'the Login button' — focuses the read" },
     },
     required: ["action"],
   },
@@ -204,7 +206,7 @@ registerTool({
       if (s.error) return `Screenshot failed: ${s.error}`;
       if (ctx.describeImage) {
         try {
-          const desc = await ctx.describeImage(s.path!);
+          const desc = await ctx.describeImage(s.path!, input.focus ? String(input.focus) : undefined);
           if (desc) return `Screenshot (read via vision):\n${desc}`;
         } catch {
           /* fall through to path */
