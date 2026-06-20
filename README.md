@@ -6,11 +6,16 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **v0.21** — a multi-provider coding agent **and** a governed role-agent *org*: `hara org "<task>"`
-routes work to the role that owns it, and **`hara plan "<task>"`** decomposes a task into a verified
-DAG of atoms. **Streaming on every provider** with rendered Markdown + visible reasoning, colored
-edit diffs, multi-file `apply_patch`, **Esc-to-interrupt**, **`/undo`**, **`/compact`**, live shell
-output, an **ink TUI** (bordered input box, **plan mode**, light/dark theme), `grep`/`glob`/`ls`/`web_fetch`, fuzzy `@file` completion, did-you-mean, a personal `recall` code-asset library, **persistent memory** (`memory_*` tools + global/project `MEMORY.md`), **self-evolving playbooks**, and **parallel sub-agents**. Track it: https://github.com/hara-cli/hara · https://hara.run
+🚧 **v0.21** · TypeScript · local-first · MIT/Apache-2.0
+
+**Highlights**
+- **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**).
+- **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only → propose a plan → approve → execute), selectable approvals with "don't ask again", windowed reasoning, light/dark theme.
+- **Persistent memory + self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting, **proactively saves** durable facts, and grows its own playbooks (a lexical guard screens what it writes).
+- **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
+- **Solid coding core** — `edit_file` / `apply_patch` (atomic multi-file) with colored diffs · `grep`/`glob`/`ls`/`web_fetch` · fuzzy `@file` · `/undo` · `/compact` · **Esc-to-interrupt** · parallel sub-agents · MCP client · macOS sandbox.
+
+Track it: https://github.com/hara-cli/hara · https://hara.run
 
 ## Install
 
@@ -24,6 +29,24 @@ Or from source:
 git clone https://github.com/hara-cli/hara && cd hara
 npm install        # builds via the prepare script
 npm install -g .   # or: npm link
+```
+
+## Quickstart
+
+```bash
+npm i -g @nanhara/hara
+hara login qwen          # free Qwen OAuth  (or: export ANTHROPIC_API_KEY=…)
+cd your-project
+hara                     # offers to write AGENTS.md, then drops you into the TUI
+```
+
+Then just type a task — e.g. `fix the null check in @src/login.ts and run the tests`.
+**shift+tab** cycles approvals (incl. **plan mode**) · **Esc** interrupts · `@`+Tab attaches a file · `/exit` quits.
+
+One-shot, no REPL:
+
+```bash
+hara -p "summarize @README.md and list any TODOs"
 ```
 
 ## Setup
@@ -138,8 +161,8 @@ turn, or **`/undo`** to revert the last edit.
 
 ### Roadmap
 
-Context auto-compaction · planner atoms in parallel · cron autonomy for the org · single-binary
-distribution · and an enterprise control-plane (fleet + central token management).
+**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel sub-agents · `/compact` context management.
+**Next:** parallel plan atoms · multi-role review chains · cron autonomy for the org · single-binary distribution · an enterprise control-plane (fleet + central token management).
 
 ## License
 
