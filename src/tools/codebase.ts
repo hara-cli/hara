@@ -7,6 +7,9 @@ import { join } from "node:path";
 import { registerTool } from "./registry.js";
 import { listProjectFiles, isProbablyBinary, fileSize } from "../fs-walk.js";
 import { findProjectRoot } from "../context/agents-md.js";
+import { loadConfig } from "../config.js";
+import { getEmbedder } from "../search/embed.js";
+import { queryIndex, indexExists } from "../search/semindex.js";
 
 const MAX_FILE = 200_000; // skip very large files
 const CODE_RE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|c|h|cc|cpp|hpp|cs|swift|scala|sh|bash|sql|md|mdx|json|ya?ml|toml|html|css|scss|less|vue|svelte|astro|tf|proto|graphql|gql|gradle|txt)$/i;
@@ -61,7 +64,32 @@ registerTool({
       hits.push({ file: rel, score: present.length * 100 + bestHits, line: bestLine + 1, snippet });
     }
     hits.sort((a, b) => b.score - a.score || a.file.length - b.file.length);
-    if (!hits.length) return "(no relevant code found)";
-    return hits.slice(0, limit).map((h) => `${h.file}:${h.line}\n${h.snippet}`).join("\n\n---\n\n");
+
+    // Semantic layer (opt-in): if a repo index + embedder are configured, prepend the most relevant
+    // chunks (more precise than word overlap), then fill remaining slots with lexical hits. Falls back
+    // to pure lexical when no index/embedder — zero behaviour change for the default install.
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const cfg = loadConfig();
+    const embed = getEmbedder(cfg);
+    if (embed && indexExists("repo", ctx.cwd)) {
+      try {
+        for (const s of await queryIndex("repo", String(input.query), embed, ctx.cwd, limit)) {
+          if (s.score < 0.2 || seen.has(s.file)) continue;
+          seen.add(s.file);
+          out.push(`${s.file} (semantic ${s.score.toFixed(2)})\n${s.text.split("\n").slice(0, 6).join("\n")}`);
+        }
+      } catch {
+        /* embedding endpoint down → degrade to lexical */
+      }
+    }
+    for (const h of hits) {
+      if (out.length >= limit) break;
+      if (seen.has(h.file)) continue;
+      seen.add(h.file);
+      out.push(`${h.file}:${h.line}\n${h.snippet}`);
+    }
+    if (!out.length) return "(no relevant code found)";
+    return out.join("\n\n---\n\n");
   },
 });

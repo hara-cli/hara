@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.32.0 — unreleased (semantic search for `codebase_search`)
+
+- **Opt-in semantic index — `hara index`.** `codebase_search` (the "this repo is a knowledge base" tool) can
+  now blend **meaning-based** results with its lexical ranking. Build the index once with `hara index`; queries
+  then find the right file even when they share no keywords with the code (e.g. "read an image pasted from the
+  clipboard" → `src/images.ts`).
+- **Zero new dependency, lexical stays the default.** The store is a built-in JSON cosine index (fine for repo /
+  code-asset scale); when no index or embedding provider is configured, `codebase_search` is exactly as before.
+  No native vector DB is required (zvec remains the documented scale-up path).
+- **Bring your own embeddings**: `hara config set embedProvider ollama` (local & offline — e.g. `bge-m3`,
+  `nomic-embed-text`), `qwen` (DashScope `text-embedding-v3`), or any OpenAI-compatible `/embeddings` endpoint
+  (`embedModel` / `embedBaseURL` / `embedApiKey`). Embeddings never run unless you opt in.
+- The index is a **derived, rebuildable artifact** — written under `.hara/index/` with a self-`.gitignore` so it
+  can never be committed (it may embed file contents). `hara doctor` shows the search/semantic/index state.
+
 ## 0.31.0 — unreleased (native screen control)
 
 - **`computer` tool — operate desktop software, not just the browser.** Screenshot → read → click / move /

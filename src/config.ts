@@ -37,6 +37,12 @@ export interface HaraConfig {
    *  detection (classifyVision) handles known families; this records answers for unknown ones so we
    *  ask at most once per model and stay correct when the main model is switched. */
   modelVision: Record<string, "yes" | "no">;
+  /** Semantic index (opt-in): embedding provider for `hara index` + semantic codebase_search/recall.
+   *  off = lexical only (default, zero new deps). ollama = local/offline; qwen = DashScope; openai = compatible. */
+  embedProvider: "off" | "ollama" | "qwen" | "openai";
+  embedModel: string | undefined;
+  embedBaseURL: string | undefined;
+  embedApiKey: string | undefined;
   mcpServers: Record<string, McpServerConfig>;
   cwd: string;
 }
@@ -52,7 +58,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey"] as const;
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
@@ -139,13 +145,17 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const visionBaseURL = process.env.HARA_VISION_BASE_URL ?? merged.visionBaseURL;
   const visionApiKey = process.env.HARA_VISION_API_KEY ?? merged.visionApiKey;
   const modelVision = merged.modelVision && typeof merged.modelVision === "object" ? (merged.modelVision as Record<string, "yes" | "no">) : {};
+  const embedProvider = (process.env.HARA_EMBED_PROVIDER ?? merged.embedProvider ?? "off") as "off" | "ollama" | "qwen" | "openai";
+  const embedModel = process.env.HARA_EMBED_MODEL ?? merged.embedModel;
+  const embedBaseURL = process.env.HARA_EMBED_BASE_URL ?? merged.embedBaseURL;
+  const embedApiKey = process.env.HARA_EMBED_API_KEY ?? merged.embedApiKey;
   const mcpServers: Record<string, McpServerConfig> = {
     ...(globalBase.mcpServers ?? {}),
     ...(project.mcpServers ?? {}),
     ...(profile.mcpServers ?? {}),
   };
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

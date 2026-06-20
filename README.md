@@ -13,7 +13,7 @@
 - **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only → propose a plan → approve → execute), selectable approvals with "don't ask again", windowed reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
 - **Persistent memory + self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting, **proactively saves** durable facts, and grows its own playbooks (a lexical guard screens what it writes).
 - **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
-- **Solid coding core** — `edit_file` / `apply_patch` (atomic multi-file) with colored diffs · `grep`/`glob`/`ls`/`codebase_search` (relevance search over the repo) /`web_fetch` · fuzzy `@file` · `/undo` · `/compact` · **Esc-to-interrupt** · parallel sub-agents · MCP client · macOS sandbox.
+- **Solid coding core** — `edit_file` / `apply_patch` (atomic multi-file) with colored diffs · `grep`/`glob`/`ls`/`codebase_search` (lexical + optional semantic search over the repo) /`web_fetch` · fuzzy `@file` · `/undo` · `/compact` · **Esc-to-interrupt** · parallel sub-agents · MCP client · macOS sandbox.
 
 Track it: https://github.com/hara-cli/hara · https://hara.run
 
@@ -156,6 +156,13 @@ global override them). `.claude/agents/*.md` subagents load as roles too.
 **Recall** — `hara recall --init` creates a personal `~/.hara/code-assets` library (snippets as `*.md`);
 `hara recall "<query>"` searches it **plus your skills** (one corpus), and `/recall <query>` pulls the best
 matches into your next message. A git-versionable library of code/patterns you want to reuse (`HARA_ASSETS` overrides the path).
+
+**Semantic search** (opt-in) — the `codebase_search` tool finds repo code by *meaning*, not just keywords. By
+default it's lexical (zero setup). Configure an embedding provider and run `hara index` once to add a semantic
+layer: `hara config set embedProvider ollama` (local & offline, e.g. `bge-m3`/`nomic-embed-text`) or `qwen`
+(DashScope) — then a query like "read an image pasted from the clipboard" surfaces `src/images.ts` even with no
+shared words. The index is a rebuildable `.hara/index/` artifact (self-`.gitignore`d, never committed); no native
+vector DB needed.
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
 **Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).
