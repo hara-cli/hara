@@ -23,6 +23,12 @@ Track it: https://github.com/hara-cli/hara · https://hara.run
 npm i -g @nanhara/hara
 ```
 
+Or a **standalone binary** (no Node required):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hara-cli/hara/main/install.sh | sh
+```
+
 Or from source:
 
 ```bash
@@ -223,8 +229,8 @@ turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review
 
 ### Roadmap
 
-**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · `/compact` context management.
-**Next:** SSOT data authority · single-binary distribution · an enterprise control-plane (fleet + central token management).
+**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · **single-binary distribution** · `/compact` context management.
+**Next:** SSOT data authority · an enterprise control-plane (fleet + central token management).
 
 ## License
 

@@ -32,7 +32,7 @@ import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
 import { addJob, removeJob, setEnabled, findJob, loadJobs, recordRun, logPath } from "./cron/store.js";
-import { runTick, runJobOnce } from "./cron/runner.js";
+import { runTick, runJobOnce, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools } from "./tools/registry.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
@@ -82,7 +82,19 @@ import "./tools/todo.js"; // register todo_write (inline task checklist)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 
 const here = dirname(fileURLToPath(import.meta.url));
-const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string };
+// Version: from a build-time define in the compiled single-binary (no package.json on its virtual FS),
+// else read package.json (npm install / `node dist`). The read is wrapped so the binary never hits it.
+const pkg = {
+  version:
+    process.env.HARA_BUILD_VERSION ??
+    (((): string => {
+      try {
+        return (JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string }).version;
+      } catch {
+        return "0.0.0";
+      }
+    })()),
+};
 
 const maskKey = (v?: string) => (v ? `${v.slice(0, 7)}…${v.slice(-4)}` : "(unset)");
 
@@ -895,7 +907,7 @@ cronCmd
   .command("install")
   .description("register the per-minute tick with your OS scheduler (launchd on macOS, crontab on Linux)")
   .action(() => {
-    const r = installScheduler(process.execPath, process.argv[1]);
+    const r = installScheduler(selfArgv());
     out((r.ok ? c.green("✓ ") : c.red("✗ ")) + r.msg + "\n");
   });
 cronCmd.command("uninstall").description("remove the OS scheduler entry").action(() => {

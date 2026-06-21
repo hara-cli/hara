@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.60.0 — unreleased (single-binary distribution)
+
+- **Standalone binaries** — hara can now be a single self-contained executable (no Node required):
+  `curl -fsSL .../install.sh | sh`. Built with `bun build --compile` (`npm run build:binary`, or
+  `build:binaries` to cross-compile darwin-arm64/x64 + linux-x64/arm64 from one machine). A tagged
+  release (`.github/workflows/release.yml`) builds + attaches them; `install.sh` grabs the right one.
+- Build fixes for the bundled binary: a Bun plugin **stubs ink's dev-only `react-devtools-core`** (lazy-
+  imported under `DEV`, never in production) so it bundles clean; the version is **baked in via a build
+  define** (a compiled binary has no `package.json` to read at runtime); and cron's self-reinvoke now
+  detects script-vs-binary mode (`selfArgv`) so `hara cron` works from the binary too. The 60 MB binaries
+  are kept out of the npm tarball (`!dist/bin`), which stays ~140 kB.
+
 ## 0.59.0 — unreleased (vim keybindings in the input box)
 
 - **Vim mode** (opt-in: `hara config set vimMode true`, or `HARA_VIM=1`). The TUI prompt becomes modal —

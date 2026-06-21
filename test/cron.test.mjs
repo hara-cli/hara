@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { durationToMs, parseSchedule, parseCron, cronMatches, isDue, nextRun } from "../dist/cron/schedule.js";
-import { dueJobs } from "../dist/cron/runner.js";
+import { dueJobs, selfArgv } from "../dist/cron/runner.js";
 
 test("durationToMs", () => {
   assert.equal(durationToMs("45s"), 45_000);
@@ -67,6 +67,20 @@ test("nextRun: cron scans forward; interval/once compute directly", () => {
   assert.ok(cronNext > from, "in the future");
   assert.equal(nextRun({ schedule: { kind: "every", everyMs: 1000, display: "x" }, createdAt: 0, lastRunAt: 5000 }, from), 6000);
   assert.equal(nextRun({ schedule: { kind: "once", runAt: 9000, display: "x" }, createdAt: 0, lastRunAt: 9000 }, from), null, "already ran");
+});
+
+test("selfArgv: node-script mode includes the script; compiled-binary mode is just the binary", () => {
+  const saved = process.argv[1];
+  try {
+    process.argv[1] = "/x/dist/index.js";
+    assert.deepEqual(selfArgv(), [process.execPath, "/x/dist/index.js"], "node: re-invoke with the script");
+    process.argv[1] = "cron"; // binary: argv[1] is a user arg, not a script
+    assert.deepEqual(selfArgv(), [process.execPath], "binary: re-invoke the binary directly");
+    process.argv[1] = undefined;
+    assert.deepEqual(selfArgv(), [process.execPath]);
+  } finally {
+    process.argv[1] = saved;
+  }
 });
 
 test("dueJobs: only enabled + due", () => {

@@ -1,0 +1,26 @@
+# Build standalone single-file binaries on a version tag and attach them to the GitHub release, so hara
+# can be installed without Node (see install.sh). Bun cross-compiles every target from one runner.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run build:binaries
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/bin/hara-darwin-arm64
+            dist/bin/hara-darwin-x64
+            dist/bin/hara-linux-x64
+            dist/bin/hara-linux-arm64

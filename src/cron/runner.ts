@@ -12,6 +12,13 @@ export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
   return jobs.filter((j) => j.enabled && isDue(j, nowMs));
 }
 
+/** How to invoke hara again — handles both `node dist/index.js` (argv[1] is a script) and the compiled
+ *  single-binary (argv[1] is a user arg, so re-invoke the binary directly). Used by the tick + by install. */
+export function selfArgv(): string[] {
+  const a1 = process.argv[1];
+  return a1 && /\.[cm]?js$|\.ts$/.test(a1) ? [process.execPath, a1] : [process.execPath];
+}
+
 const lockPath = (): string => join(cronDir(), ".tick.lock");
 const LOCK_STALE_MS = 30 * 60_000;
 
@@ -27,7 +34,8 @@ export function runJobOnce(job: CronJob): Promise<{ ok: boolean; error?: string 
     } catch {
       /* logging is best-effort */
     }
-    const child = spawn(process.execPath, [process.argv[1], ...args], { cwd: job.cwd, env: process.env });
+    const self = selfArgv();
+    const child = spawn(self[0], [...self.slice(1), ...args], { cwd: job.cwd, env: process.env });
     const append = (d: Buffer): void => {
       try {
         appendFileSync(log, d);

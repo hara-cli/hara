@@ -24,16 +24,18 @@ export function isInstalled(): boolean {
   return false;
 }
 
-/** Install the per-minute tick. `node` = the node binary, `script` = hara's entry (process.argv[1]). */
-export function installScheduler(node: string, script: string): { ok: boolean; msg: string } {
+/** Install the per-minute tick. `cmd` = how to invoke hara (e.g. `["node","/x/index.js"]` or the single
+ *  binary `["/usr/local/bin/hara"]`); `cron tick` is appended. */
+export function installScheduler(cmd: string[]): { ok: boolean; msg: string } {
   const os = platform();
+  const argv = [...cmd, "cron", "tick"];
   if (os === "darwin") {
     const p = plistFile();
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array><string>${node}</string><string>${script}</string><string>cron</string><string>tick</string></array>
+  <key>ProgramArguments</key><array>${argv.map((a) => `<string>${a}</string>`).join("")}</array>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><false/>
 </dict></plist>
@@ -58,7 +60,7 @@ export function installScheduler(node: string, script: string): { ok: boolean; m
       .filter((l) => !l.includes(CRON_TAG))
       .join("\n")
       .replace(/\n+$/, "");
-    const line = `* * * * * ${node} ${script} cron tick >/dev/null 2>&1  ${CRON_TAG}`;
+    const line = `* * * * * ${argv.join(" ")} >/dev/null 2>&1  ${CRON_TAG}`;
     const next = (kept ? kept + "\n" : "") + line + "\n";
     try {
       execFileSync("crontab", ["-"], { input: next });

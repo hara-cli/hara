@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.59.0",
+  "version": "0.60.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "dist/index.js"
@@ -8,6 +8,7 @@
   "type": "module",
   "files": [
     "dist",
+    "!dist/bin",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -40,7 +41,9 @@
     "prepare": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "test": "tsc && node --test test/*.test.mjs"
+    "test": "tsc && node --test test/*.test.mjs",
+    "build:binary": "tsc && bun scripts/build-binary.ts dist/bin/hara",
+    "build:binaries": "tsc && bun scripts/build-binary.ts dist/bin/hara-darwin-arm64 bun-darwin-arm64 && bun scripts/build-binary.ts dist/bin/hara-darwin-x64 bun-darwin-x64 && bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64 && bun scripts/build-binary.ts dist/bin/hara-linux-arm64 bun-linux-arm64"
   },
   "publishConfig": {
     "access": "public"
