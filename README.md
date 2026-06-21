@@ -59,7 +59,9 @@ hara -p "summarize @README.md and list any TODOs"
 
 ## Setup
 
-hara is **multi-provider** — pick a provider + key.
+The fastest path is **`hara setup`** — an interactive wizard for provider + key + model (it also runs
+automatically the first time you start `hara` unconfigured). Or configure it yourself — hara is
+**multi-provider**:
 
 **Anthropic (default)**
 ```bash

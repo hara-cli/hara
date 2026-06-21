@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.63.0 — unreleased (first-run setup wizard)
+
+- **`hara setup`** — an interactive wizard (provider → optional base URL → API key → model) that writes
+  `~/.hara/config.json` (0600), so a new user doesn't have to know the individual `hara config set` keys.
+  It's also **auto-offered** when you start `hara` unconfigured ("Not authenticated — run setup now?")
+  instead of just erroring. TTY-only (scripts get a clear pointer to `hara config set`).
+
 ## 0.62.0 — unreleased (shell completions)
 
 - **`hara completions bash|zsh|fish`** prints a completion script (eval it in your shell rc) that

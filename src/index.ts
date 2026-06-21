@@ -25,6 +25,7 @@ import {
   SANDBOX_MODES,
   type HaraConfig,
   type ApprovalMode,
+  type ProviderId,
 } from "./config.js";
 import { runAgent } from "./agent/loop.js";
 import { notifyDone } from "./notify.js";
@@ -114,7 +115,36 @@ async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
 
 function authHint(cfg: HaraConfig): string {
   if (cfg.provider === "qwen-oauth") return `Run ${c.bold("hara login qwen")} to authenticate.`;
-  return `Set ${c.bold(providerEnvKey(cfg.provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara config set apiKey <key>")}.`;
+  return `Set ${c.bold(providerEnvKey(cfg.provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara setup")}.`;
+}
+
+const SETUP_DEFAULT_MODEL: Record<string, string> = { anthropic: "claude-opus-4-8", qwen: "qwen-plus", openai: "gpt-4o-mini", "qwen-oauth": "coder-model" };
+
+/** Interactive first-run setup: pick a provider, (optional) base URL, API key, and model → ~/.hara/config.json. */
+async function runSetup(): Promise<void> {
+  if (!stdin.isTTY) {
+    out(c.yellow("`hara setup` is interactive — run it in a terminal, or use `hara config set <key> <value>` in scripts.\n"));
+    return;
+  }
+  const rl = createInterface({ input: stdin, output: stdout });
+  try {
+    out(c.bold("hara setup") + c.dim(" — configure a provider, key, and model (Ctrl-C to cancel)\n\n"));
+    const provider = ((await rl.question(`Provider ${c.dim("anthropic / qwen / openai")} [anthropic]: `)).trim() || "anthropic").toLowerCase();
+    let baseURL = "";
+    if (provider === "qwen" || provider === "openai") {
+      baseURL = (await rl.question(`Base URL ${c.dim("(blank = default; set for an OpenAI-compatible endpoint, e.g. GLM/Kimi/DashScope)")}: `)).trim();
+    }
+    const envKey = providerEnvKey(provider as ProviderId);
+    const apiKey = (await rl.question(`API key ${c.dim(`(blank = use the ${envKey} env var)`)}: `)).trim();
+    const model = (await rl.question(`Model [${SETUP_DEFAULT_MODEL[provider] ?? "?"}]: `)).trim() || SETUP_DEFAULT_MODEL[provider] || "";
+    writeConfigValue("provider", provider);
+    if (baseURL) writeConfigValue("baseURL", baseURL);
+    if (apiKey) writeConfigValue("apiKey", apiKey);
+    if (model) writeConfigValue("model", model);
+    out(c.green(`\n✓ saved to ${configPath()}\n`) + c.dim(`Check it with ${c.bold("hara doctor")}, then just run ${c.bold("hara")}.\n`));
+  } finally {
+    rl.close();
+  }
 }
 
 async function runInit(provider: Provider, cwd: string, sandbox: SandboxMode = "off"): Promise<void> {
@@ -751,6 +781,11 @@ program
   .action(() => out(runDoctor(loadConfig()) + "\n"));
 
 program
+  .command("setup")
+  .description("interactive first-run setup — pick a provider, API key, and model")
+  .action(runSetup);
+
+program
   .command("completions <shell>")
   .description("print a shell completion script: bash | zsh | fish (eval it in your shell rc)")
   .action((shell: string) => {
@@ -1175,6 +1210,17 @@ program.action(async (opts) => {
   if (opts.model) cfg.model = opts.model;
   const provider0 = await buildProvider(cfg);
   if (!provider0) {
+    // First-run friendliness: offer the setup wizard instead of just erroring (interactive TTY only).
+    if (stdin.isTTY && !opts.print) {
+      const rl = createInterface({ input: stdin, output: stdout });
+      const ans = (await rl.question(c.yellow(`Not authenticated for '${cfg.provider}'. Run setup now? `) + c.dim("[Y/n] "))).trim().toLowerCase();
+      rl.close();
+      if (ans === "" || ans === "y" || ans === "yes") {
+        await runSetup();
+        out(c.dim(`\nThen run ${c.bold("hara")} to start.\n`));
+        process.exit(0);
+      }
+    }
     out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
     process.exit(1);
   }
