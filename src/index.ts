@@ -56,7 +56,7 @@ import {
   type SessionMeta,
   type SessionData,
 } from "./session/store.js";
-import { loadRoles, scaffoldRoles, type Role } from "./org/roles.js";
+import { loadRoles, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
@@ -507,11 +507,10 @@ async function runSubagent(
   const role = roleId ? roles.find((r) => r.id === roleId) : undefined;
   const provider =
     role?.model && role.model !== cfg.model ? ((await buildProvider({ ...cfg, model: role.model })) ?? baseProvider) : baseProvider;
-  const toolFilter = role?.allowTools
-    ? (n: string) => role.allowTools!.includes(n)
-    : role?.denyTools
-      ? (n: string) => !role.denyTools!.includes(n)
-      : (n: string) => READONLY_TOOLS.has(n); // default sub-agent = read-only (safe to parallelize)
+  // A sub-agent runs full-auto + UNCONFIRMED + parallel, so it is ALWAYS read-only — a role may narrow
+  // further but can never GRANT write/exec to a fan-out sub-agent (that would bypass the approval gate).
+  // Write-capable roles run in the main loop via `hara org`, behind the user's gate.
+  const toolFilter = subagentToolFilter(role, (n: string) => READONLY_TOOLS.has(n));
   const subHistory: NeutralMsg[] = [{ role: "user", content: task }];
   await runAgent(subHistory, {
     provider,
@@ -1056,6 +1055,18 @@ pluginCmd
         m.mcpServers ? `${Object.keys(m.mcpServers).length} mcp server(s)` : "",
       ].filter(Boolean);
       out(c.green(`Installed ${p.name}@${p.version}${parts.length ? c.dim(" — " + parts.join(", ")) : ""}\n`));
+      // Surface the code-execution surface: a plugin's MCP servers + hooks run shell commands on every
+      // hara launch with no prompt. Installing a plugin = trusting its author to run code; show what.
+      const execs: string[] = [];
+      for (const [name, s] of Object.entries(m.mcpServers ?? {})) execs.push(`mcp ${name}: ${[s.command, ...(s.args ?? [])].join(" ")}`);
+      for (const h of [...(m.hooks?.PreToolUse ?? []), ...(m.hooks?.PostToolUse ?? [])]) execs.push(`hook: ${h.command}`);
+      if (execs.length) {
+        out(
+          c.yellow(`⚠ ${p.name} will run these commands on every hara launch (a plugin is code you run — review them):\n`) +
+            execs.map((e) => c.dim(`    ${e}`)).join("\n") +
+            c.dim(`\n    disable: hara plugin disable ${p.name}\n`),
+        );
+      }
     } catch (e: any) {
       out(c.red(`Install failed: ${e.message}\n`));
     }

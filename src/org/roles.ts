@@ -58,6 +58,18 @@ function parseFrontmatter(text: string): { fm: Record<string, any>; body: string
   return { fm, body: m[2].trim() };
 }
 
+/** Tool filter for a fan-out sub-agent: ALWAYS read-only (sub-agents run full-auto + unconfirmed +
+ *  parallel), with a role allowed to narrow further but never to grant write/exec. `isReadonly` is the
+ *  read-kind predicate. This is the guard that keeps the `agent` tool from bypassing the approval gate. */
+export function subagentToolFilter(role: Role | undefined, isReadonly: (n: string) => boolean): (n: string) => boolean {
+  const roleFilter = role?.allowTools
+    ? (n: string) => role.allowTools!.includes(n)
+    : role?.denyTools
+      ? (n: string) => !role.denyTools!.includes(n)
+      : null;
+  return (n) => isReadonly(n) && (roleFilter ? roleFilter(n) : true);
+}
+
 export function loadRoles(cwd: string): Role[] {
   const byId = new Map<string, Role>();
   // lowest→highest precedence: plugins < global < .claude/agents < .hara/roles (project wins, same as memory/config)

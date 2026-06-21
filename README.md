@@ -177,7 +177,7 @@ vector DB needed, and lexical still works when there's no index. Re-running `har
 only changed files re-embed (a full repo rebuild that takes ~a minute re-runs in well under a second).
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
-**Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt (writes confined to the project / blocked).
+**Sandbox** (macOS): `--sandbox workspace-write|read-only` runs the `bash` tool under Seatbelt — **file-write confinement** (writes confined to the project / blocked). It does not restrict reads, network, or process exec; on non-macOS the shell runs unsandboxed (with a warning).
 **Screen control** (opt-in): the `computer` tool drives desktop software (screenshot → click/type), native per OS
 (mac `screencapture`+`cliclick` · Windows PowerShell · Linux `scrot`+`xdotool`). Off by default — enable a tier with
 `hara config set computerUse read|click|full` and allowlist apps with `hara config set computerApps "App, …"`. Guarded

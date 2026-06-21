@@ -5,6 +5,28 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.61.1 — unreleased (security + correctness hardening — core audit)
+
+A security/correctness audit of the core (sandbox, confirmation gate, file tools, MCP client) found real
+issues; fixed:
+- **Confirmation-gate bypass via sub-agents (critical).** The read-kind `agent` tool never prompts, yet
+  spawned sub-agents ran **full-auto, unconfirmed** — so a role granting `edit_file`/`bash` let a fan-out
+  sub-agent mutate files / run shell with no approval, even in `suggest` mode. Sub-agents are now **always
+  read-only** (a role may narrow further but can never grant write/exec — `subagentToolFilter`). Write-capable
+  roles run in the main loop via `hara org`, behind the gate.
+- **`apply_patch` wasn't actually atomic (critical / data-loss).** It claimed all-or-nothing but Phase 2 wrote
+  files sequentially — a mid-way failure left a half-patched tree with no undo. Now it **rolls back** every
+  applied write on any failure (restores updated/deleted, removes created), so it's truly all-or-nothing.
+- **Sandbox honesty.** It's **file-write confinement only** (not reads/network/exec; `/private/tmp` stays
+  writable) — clarified in the header, `--sandbox` docs, and label so it no longer oversells containment.
+- The non-macOS "runs unsandboxed" warning now fires from `runShell` (every entry point: `-p`, org, cron),
+  not just the REPL; a runaway `bash` whose output exceeds `maxBuffer` is now **killed** (not streamed to
+  the timeout); and `hara plugin add` now **shows the commands a plugin will run** on every launch (its MCP
+  servers + hooks are arbitrary code — surface the trust surface).
+
+196 tests (2 new: the sub-agent read-only guard + the apply_patch rollback). The edit tools, hooks matcher,
+and sandbox profile-injection safety were audited and confirmed solid.
+
 ## 0.61.0 — unreleased (`hara memory` — inspect + distill durable memory)
 
 - New **`hara memory`** command group, giving memory a CLI surface it lacked:

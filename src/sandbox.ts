@@ -1,6 +1,10 @@
-// OS sandboxing for the bash tool. macOS = Seatbelt (sandbox-exec); other platforms run unsandboxed
-// (the approval gate + cwd-scoped file tools still apply). Only the `bash` shell is sandboxed —
-// hara's own file tools (write_file/edit_file) are in-process, explicit, and gated.
+// OS sandboxing for the bash tool — WRITE CONFINEMENT, not a security jail. macOS = Seatbelt
+// (sandbox-exec) restricting `file-write*` to the workspace (workspace-write) or to nothing outside
+// temp (read-only). Reads, network, and process exec are NOT restricted, and /private/tmp +
+// /private/var/folders stay writable in every mode — so this stops a stray `rm`/overwrite escaping the
+// project, NOT a determined exfiltration. Other platforms run UNSANDBOXED (a one-time warning is
+// emitted from runShell so every entry point — REPL, -p, org, cron — surfaces it). Only the `bash`
+// shell is sandboxed; hara's own file tools are in-process, explicit, and gated by the approval flow.
 import { spawn } from "node:child_process";
 import { writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir, platform } from "node:os";
@@ -28,6 +32,8 @@ export function sandboxSupported(): boolean {
   return platform() === "darwin";
 }
 
+let warnedUnsandboxed = false; // emit the "macOS-only" notice at most once per process
+
 export interface ShellOpts {
   timeout: number;
   maxBuffer: number;
@@ -50,6 +56,10 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
     cmd = "sandbox-exec";
     args = ["-f", profileFile, "/bin/bash", "-lc", command];
   } else {
+    if (mode !== "off" && !warnedUnsandboxed) {
+      warnedUnsandboxed = true;
+      process.stderr.write(`hara: --sandbox ${mode} is macOS-only — the shell runs UNSANDBOXED on ${platform()}.\n`);
+    }
     cmd = "/bin/sh";
     args = ["-c", command];
   }
@@ -59,21 +69,32 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let killedForSize = false;
     const grow = (cur: string, add: string) => (cur.length < opts.maxBuffer ? cur + add : cur);
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, opts.timeout);
+    // Kill a runaway command once its total output passes maxBuffer — don't let it stream GBs to the UI
+    // until the timeout just because we stopped retaining the bytes.
+    const checkOverflow = (): void => {
+      if (!killedForSize && stdout.length + stderr.length >= opts.maxBuffer) {
+        killedForSize = true;
+        child.kill("SIGKILL");
+      }
+    };
 
     child.stdout.on("data", (d: Buffer) => {
       const s = d.toString();
       stdout = grow(stdout, s);
       opts.onData?.(s);
+      checkOverflow();
     });
     child.stderr.on("data", (d: Buffer) => {
       const s = d.toString();
       stderr = grow(stderr, s);
       opts.onData?.(s);
+      checkOverflow();
     });
     child.on("error", (e) => {
       clearTimeout(timer);
@@ -81,6 +102,7 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (killedForSize) return resolve({ stdout, stderr: stderr + `\n[output truncated — exceeded ${opts.maxBuffer} bytes; process killed]` });
       if (timedOut) return reject(Object.assign(new Error(`timed out after ${opts.timeout}ms`), { stdout, stderr }));
       if (code !== 0) return reject(Object.assign(new Error(`exit code ${code}`), { stdout, stderr, code }));
       resolve({ stdout, stderr });

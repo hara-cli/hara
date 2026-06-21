@@ -113,20 +113,35 @@ registerTool({
       }
     }
 
-    // PHASE 2 — commit all changes + show each diff.
-    const summary: string[] = [];
-    for (const pl of plans) {
-      if (pl.type === "delete") {
-        await unlink(pl.abs);
-        emitDiff(pl.path, pl.before, "", ctx.ui);
-        summary.push(`deleted ${pl.path}`);
-      } else {
-        await mkdir(dirname(pl.abs), { recursive: true });
-        await writeFile(pl.abs, pl.after as string, "utf8");
-        emitDiff(pl.path, pl.before, pl.after as string, ctx.ui);
-        summary.push(`${pl.type === "create" ? "created" : "updated"} ${pl.path}`);
+    // PHASE 2 — commit all changes. Truly all-or-nothing: if any write fails mid-way, roll back the ones
+    // already applied (restore updated/deleted files, remove created ones) so the tree is never half-patched.
+    const applied: typeof plans = [];
+    try {
+      for (const pl of plans) {
+        if (pl.type === "delete") {
+          await unlink(pl.abs);
+        } else {
+          await mkdir(dirname(pl.abs), { recursive: true });
+          await writeFile(pl.abs, pl.after as string, "utf8");
+        }
+        applied.push(pl);
       }
+    } catch (e) {
+      for (const pl of applied.reverse()) {
+        try {
+          if (pl.type === "create" && !pl.existed) await unlink(pl.abs); // remove a file we created
+          else await writeFile(pl.abs, pl.before, "utf8"); // restore an updated/deleted file's prior content
+        } catch {
+          /* best-effort rollback */
+        }
+      }
+      return `Error: apply_patch failed writing a file (${e instanceof Error ? e.message : String(e)}) — rolled back, nothing left changed.`;
     }
+    // All writes succeeded → now show diffs + record the undo snapshot.
+    const summary = plans.map((pl) => {
+      emitDiff(pl.path, pl.before, pl.type === "delete" ? "" : (pl.after as string), ctx.ui);
+      return pl.type === "delete" ? `deleted ${pl.path}` : `${pl.type === "create" ? "created" : "updated"} ${pl.path}`;
+    });
     recordEdit(plans.map((pl) => ({ path: pl.path, absPath: pl.abs, before: pl.existed ? pl.before : null })));
     return `apply_patch: ${plans.length} file(s) — ${summary.join("; ")}.`;
   },

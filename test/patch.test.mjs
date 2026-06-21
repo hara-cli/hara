@@ -7,6 +7,30 @@ import { applyEdits } from "../dist/tools/apply-core.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/patch.js";
 
+test("apply_patch: a mid-write failure rolls back — never leaves a half-patched tree", async () => {
+  const d = mkdtempSync(join(tmpdir(), "hara-patch-rb-"));
+  try {
+    const a = join(d, "a.txt");
+    writeFileSync(a, "original A\n");
+    // change A (succeeds) then create a file UNDER a.txt — a.txt is a file, so mkdir fails in Phase 2,
+    // AFTER A was written. True atomicity requires A to be rolled back.
+    const res = await getTool("apply_patch").run(
+      {
+        changes: [
+          { type: "update", path: "a.txt", content: "CHANGED A\n" },
+          { type: "create", path: "a.txt/b.txt", content: "B\n" },
+        ],
+      },
+      { cwd: d },
+    );
+    assert.match(res, /rolled back|failed/i, "reports the failure + rollback");
+    assert.equal(readFileSync(a, "utf8"), "original A\n", "A is restored — not left half-patched");
+    assert.ok(!existsSync(join(d, "a.txt", "b.txt")), "B was not created");
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test("applyEdits: sequential edits + replace_all", () => {
   const r = applyEdits("a b a", [{ old_string: "a", new_string: "X", replace_all: true }]);
   assert.ok(!("error" in r));

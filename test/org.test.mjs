@@ -3,8 +3,24 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadRoles, scaffoldRoles } from "../dist/org/roles.js";
+import { loadRoles, scaffoldRoles, subagentToolFilter } from "../dist/org/roles.js";
 import { routeByKeywords, parseRoleId, buildDispatchPrompt } from "../dist/org/router.js";
+
+test("subagentToolFilter: a write-granting role can NOT give a fan-out sub-agent edit/exec (no gate bypass)", () => {
+  const ro = (n) => n === "read_file" || n === "grep" || n === "ls"; // the read-kind predicate
+  const writeRole = subagentToolFilter({ allowTools: ["edit_file", "bash", "read_file"] }, ro);
+  assert.equal(writeRole("edit_file"), false, "role can't grant edit to a sub-agent");
+  assert.equal(writeRole("bash"), false, "role can't grant bash to a sub-agent");
+  assert.equal(writeRole("read_file"), true, "a read tool the role allows is fine");
+  assert.equal(writeRole("grep"), false, "a read tool the role didn't allow is narrowed out");
+  const noRole = subagentToolFilter(undefined, ro);
+  assert.equal(noRole("read_file"), true);
+  assert.equal(noRole("edit_file"), false, "default sub-agent is read-only");
+  const denyRole = subagentToolFilter({ denyTools: ["grep"] }, ro);
+  assert.equal(denyRole("read_file"), true);
+  assert.equal(denyRole("grep"), false, "denied even though read");
+  assert.equal(denyRole("edit_file"), false, "still never write/exec");
+});
 
 function freshRepo() {
   const dir = mkdtempSync(join(tmpdir(), "hara-org-"));
