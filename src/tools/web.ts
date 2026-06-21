@@ -1,8 +1,63 @@
 // web_fetch — fetch an http(s) URL and return readable text (HTML reduced to text). Read-only.
-// Uses Node's global fetch (Node >=20). NOT sandboxed (network egress is in-process, not via bash).
+// Uses Node's global fetch (Node >=20). NOT sandboxed (network egress is in-process, not via bash) —
+// so it carries an SSRF guard: private/loopback/link-local targets are refused, re-checked on every
+// redirect hop, and the body is read under a hard byte ceiling.
 import { registerTool } from "./registry.js";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 
 const MAX = 60_000;
+
+/** True for loopback / private / link-local / ULA / CGNAT addresses we must not let web_fetch reach. */
+export function isPrivateIp(ip: string): boolean {
+  const host = ip.replace(/^\[|\]$/g, "");
+  if (isIP(host) === 4) {
+    const p = host.split(".").map(Number);
+    return p[0] === 0 || p[0] === 10 || p[0] === 127 || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 192 && p[1] === 168) || (p[0] === 169 && p[1] === 254) || (p[0] === 100 && p[1] >= 64 && p[1] <= 127);
+  }
+  const l = host.toLowerCase();
+  if (l === "::1" || l === "::") return true;
+  if (l.startsWith("fe80") || l.startsWith("fc") || l.startsWith("fd")) return true; // link-local + unique-local
+  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(l); // IPv4-mapped IPv6
+  return m ? isPrivateIp(m[1]) : false;
+}
+
+/** Refuse to fetch a host that is (or resolves to) a private/internal address — defeats metadata-endpoint
+ *  / localhost SSRF. Throws (caught by the caller) on a blocked or unresolvable host. */
+async function assertPublicHost(hostname: string): Promise<void> {
+  const host = hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host)) {
+    if (isPrivateIp(host)) throw new Error(`refusing to fetch ${host} (private/loopback address)`);
+    return;
+  }
+  const addrs = await lookup(host, { all: true });
+  for (const a of addrs) if (isPrivateIp(a.address)) throw new Error(`refusing to fetch ${host} — resolves to a private/internal address (${a.address})`);
+}
+
+/** Read a fetch Response body up to `maxBytes`, then stop (avoids materializing a huge / bomb body). */
+async function readCapped(res: Response, maxBytes: number): Promise<string> {
+  if (!res.body) return res.text();
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      total += value.length;
+    }
+    if (total >= maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* already closing */
+      }
+      break;
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 /** Strip HTML to a readable-ish plain-text approximation (no dependency). */
 export function htmlToText(html: string): string {
@@ -146,16 +201,27 @@ registerTool({
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 30_000);
     try {
-      const res = await fetch(url, {
-        signal: ctrl.signal,
-        redirect: "follow",
-        headers: { "user-agent": "hara-cli", accept: "text/html,text/plain,application/json,*/*" },
-      });
+      // Follow redirects manually so the SSRF guard runs on EVERY hop (a public URL can 30x to 169.254…).
+      let current = url;
+      let res: Response;
+      for (let hop = 0; ; hop++) {
+        await assertPublicHost(current.hostname);
+        res = await fetch(current, {
+          signal: ctrl.signal,
+          redirect: "manual",
+          headers: { "user-agent": "hara-cli", accept: "text/html,text/plain,application/json,*/*" },
+        });
+        const loc = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+        if (!loc || hop >= 5) break;
+        const next = new URL(loc, current);
+        if (next.protocol !== "http:" && next.protocol !== "https:") return "Error: redirect to a non-http(s) URL was blocked.";
+        current = next;
+      }
       const ct = res.headers.get("content-type") ?? "";
-      const raw = await res.text();
+      const raw = await readCapped(res, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
       let text = /html/i.test(ct) ? htmlToText(raw) : raw;
       if (text.length > cap) text = text.slice(0, cap) + `\n…[truncated ${text.length - cap} chars]`;
-      return `# ${url.href} (HTTP ${res.status})\n\n${text || "(empty body)"}`;
+      return `# ${current.href} (HTTP ${res.status})\n\n${text || "(empty body)"}`;
     } catch (e: any) {
       return `Error fetching ${url.href}: ${e?.name === "AbortError" ? "timed out (30s)" : (e?.message ?? e)}`;
     } finally {

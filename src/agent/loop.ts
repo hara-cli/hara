@@ -167,13 +167,15 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       const preview = String(input.path ?? input.command ?? input.pattern ?? input.url ?? input.task ?? "")
         .replace(/\s+/g, " ")
         .trim();
-      if (needsConfirm(tool.kind, opts.approval) && !opts.autoApprove?.has(tu.name)) {
+      // Screen control is gated on EVERY action — a prior "don't ask again" must never satisfy it.
+      const alwaysGate = tool.kind === "computer";
+      if (needsConfirm(tool.kind, opts.approval) && (alwaysGate || !opts.autoApprove?.has(tu.name))) {
         const reply = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
         if (reply === false) {
           plans.push({ tu, tool, denied: "User denied this action." });
           continue;
         }
-        if (reply === "always") opts.autoApprove?.add(tu.name);
+        if (reply === "always" && !alwaysGate) opts.autoApprove?.add(tu.name); // computer: treat "always" as one-time yes
       }
       plans.push({ tu, tool });
       if (!opts.quiet) {

@@ -19,6 +19,12 @@ test("keyIsBlocked: dangerous combos refused, safe ones allowed", () => {
   for (const k of ["cmd+c", "return", "ctrl+s", "tab", "cmd+v", "enter"]) assert.equal(keyIsBlocked(k), false, k);
 });
 
+test("keyIsBlocked: catches Windows SendKeys + Linux keysym forms the combo regex missed", () => {
+  for (const k of ["%{F4}", "^{F4}", "^w", "XF86LogOff", "XF86PowerOff", "xf86reboot"]) assert.equal(keyIsBlocked(k), true, `should block ${k}`);
+  // bare editing/navigation keys stay allowed (Delete/Backspace are needed to edit text)
+  for (const k of ["Delete", "BackSpace", "{DEL}", "%{TAB}", "Home", "End"]) assert.equal(keyIsBlocked(k), false, `should allow ${k}`);
+});
+
 test("computer tool: gates on tier + app allowlist (deterministic refusal paths)", async () => {
   const t = getTool("computer");
   assert.ok(t && t.kind === "computer");

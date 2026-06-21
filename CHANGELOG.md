@@ -5,6 +5,30 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.61.2 — unreleased (security hardening — second audit: SSRF, RPA, secrets)
+
+A second audit (RPA / network / auth / search) found more real issues; fixed:
+- **`web_fetch` SSRF (critical).** It would fetch any host — incl. `169.254.169.254` (cloud metadata),
+  `localhost`/`127.0.0.1` internal services, and private ranges — and followed redirects blindly. Now it
+  **refuses private/loopback/link-local/CGNAT targets** (resolving the hostname first), **re-checks on every
+  redirect hop** (manual redirects), and reads the body under a **byte ceiling** (no multi-GB / bomb body).
+- **`computer` "don't ask again" defeated the per-action grant (high).** Screen control is supposed to
+  confirm every action; the shared "always" approval silently auto-approved all future clicks/types. Now
+  `computer` is **never** satisfied by a prior "always" — it always prompts.
+- **Key blocklist bypassable (high).** It only caught spelled-out combos, so Windows SendKeys `%{F4}`/`^w`
+  and Linux `XF86LogOff`/`XF86PowerOff` slipped through. Now caught on all three platforms (bare editing
+  keys like Delete stay allowed).
+- **Secrets could be embedded into the semantic index (medium).** The asset/skill/memory dirs aren't
+  `.gitignore`-filtered, so a stray `credentials.json`/`secrets.yaml` there could be POSTed to the embedding
+  provider + persisted. Now secret-named files are skipped in both index collectors.
+- **Token/config files were world-readable (medium).** `~/.hara/qwen-oauth.json` (access+refresh tokens)
+  and `~/.hara/config.json` (`apiKey`) are now written **0600** (and tightened on save).
+- **RPA app allowlist was substring-matched (low).** `"Notes"` matched `"Notes - Evil"`; now an exact
+  (case-insensitive) frontmost-app match.
+
+The RPA + clipboard shell-outs were confirmed injection-safe (argv arrays, JSON-quoted scripts). 198 tests
+(2 new: the SSRF private-IP guard + the widened key blocklist).
+
 ## 0.61.1 — unreleased (security + correctness hardening — core audit)
 
 A security/correctness audit of the core (sandbox, confirmation gate, file tools, MCP client) found real

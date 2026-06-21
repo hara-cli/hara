@@ -3,7 +3,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
 
 const BASE = "https://chat.qwen.ai";
 const DEVICE_CODE_URL = `${BASE}/api/v1/oauth2/device/code`;
@@ -37,7 +37,13 @@ export function loadQwenToken(): QwenToken | null {
 function saveQwenToken(t: QwenToken): void {
   const p = tokenPath();
   mkdirSync(join(homedir(), ".hara"), { recursive: true });
-  writeFileSync(p, JSON.stringify(t, null, 2) + "\n", "utf8");
+  // 0600 — the file holds long-lived access + refresh tokens; don't leave it world-readable on shared boxes.
+  writeFileSync(p, JSON.stringify(t, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(p, 0o600); // tighten an existing file that predated the mode
+  } catch {
+    /* best-effort */
+  }
 }
 
 const b64url = (b: Buffer) =>

@@ -36,8 +36,13 @@ import { loadConfig } from "../config.js";
 type Tier = "off" | "read" | "click" | "full";
 const RANK: Record<Tier, number> = { off: 0, read: 1, click: 2, full: 3 };
 const ACTION_MIN: Record<string, Tier> = { screenshot: "read", find: "read", activate: "click", move: "click", click: "click", type: "full", key: "full" };
-// dangerous combos refused even at full tier (quit / close / delete / task-switch-kill)
+// dangerous combos refused even at full tier (quit / close / delete / task-switch-kill).
 const KEY_BLOCK = /(?:\b(cmd|command|ctrl|control|alt|option|win|super|meta)\b.*\+.*\b(q|w|delete|del|f4|escape|esc)\b)|ctrl\+alt\+(?:delete|del|backspace)/i;
+// Windows SendKeys spells modifiers as % (Alt) / ^ (Ctrl) with no modifier WORD, so the combo regex
+// above misses them: block Alt+F4 / Ctrl+F4 (close window) and Ctrl+W (close tab) in that syntax.
+const KEY_BLOCK_SENDKEYS = /[%^]\s*\{\s*f4\s*\}|\^\s*w\b/i;
+// Linux/X keysyms for logout / power-off (xdotool key XF86LogOff …) — not modifier combos.
+const KEY_BLOCK_KEYSYM = /\bxf86(logoff|poweroff|reboot|sleep)\b/i;
 
 /** Whether the configured tier permits the action. Exported for tests. */
 export function actionAllowed(tier: Tier, action: string): boolean {
@@ -45,7 +50,7 @@ export function actionAllowed(tier: Tier, action: string): boolean {
 }
 /** Whether a key combo is on the dangerous blocklist. Exported for tests. */
 export function keyIsBlocked(keys: string): boolean {
-  return KEY_BLOCK.test(keys);
+  return KEY_BLOCK.test(keys) || KEY_BLOCK_SENDKEYS.test(keys) || KEY_BLOCK_KEYSYM.test(keys);
 }
 
 // Circuit breaker (learned from codex): bound consecutive screen-control failures so the agent can't loop
@@ -310,7 +315,7 @@ registerTool({
     if (action === "activate") {
       const app = String(input.app ?? input.target ?? "");
       if (!app) return "activate needs an `app` name (e.g. 'WeChat').";
-      if (!cfg.computerApps.some((a) => app.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(app.toLowerCase())))
+      if (!cfg.computerApps.some((a) => a.toLowerCase() === app.toLowerCase()))
         return `Refused: "${app}" isn't in your allowlist (${cfg.computerApps.join(", ") || "empty"}). Add it: \`hara config set computerApps "${app}"\`.`;
       const r = activateApp(app);
       return r.ok ? ok(`✓ ${r.msg} — now screenshot/find/click to act on it`) : fail(r.msg);
@@ -320,7 +325,7 @@ registerTool({
       // per-app allowlist: only act when an allowlisted app is frontmost (the key guard against wrong-window clicks)
       if (!cfg.computerApps.length) return "No apps allowlisted — set `hara config set computerApps \"App Name, …\"` before clicking/typing.";
       const app = frontmostApp();
-      const allowed = cfg.computerApps.some((a) => app.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(app.toLowerCase()));
+      const allowed = cfg.computerApps.some((a) => a.toLowerCase() === app.toLowerCase());
       if (!allowed) return `Refused: frontmost app "${app || "unknown"}" isn't in your allowlist (${cfg.computerApps.join(", ")}). Switch to an allowed app or update computerApps.`;
     }
 

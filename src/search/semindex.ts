@@ -144,13 +144,21 @@ export function indexExists(name: string, cwd: string): boolean {
   return existsSync(indexPath(name, cwd));
 }
 
+// Never embed (and POST to an embedding provider, then persist in the index) a secret-bearing file —
+// the asset/skill/memory dirs aren't .gitignore-filtered, so a stray credentials.json/secrets.yaml/.env
+// there would otherwise leak. Defense-in-depth (the repo walk already respects .gitignore).
+const SECRET_FILE = /(^\.?env(\.|$)|secret|credential|password|apikey|api[_-]?key|\btoken|\.(pem|key|p12|pfx|keystore|crt)$|^\.netrc$|^\.npmrc$|id_(rsa|ed25519|ecdsa))/i;
+function looksSecret(rel: string): boolean {
+  return SECRET_FILE.test(rel.split("/").pop() ?? rel);
+}
+
 /** Walk one knowledge directory (code-assets / skills / memory) and chunk its files. Files come back as
  *  absolute paths so recall/memory_search can read or open them directly. */
 export function collectDirChunks(dir: string, source: string): Chunk[] {
   if (!existsSync(dir)) return [];
   const chunks: Chunk[] = [];
   for (const rel of walkFiles(dir)) {
-    if (!CODE_RE.test(rel)) continue;
+    if (!CODE_RE.test(rel) || looksSecret(rel)) continue;
     const abs = join(dir, rel);
     if (fileSize(abs) > 200_000) continue;
     let buf: Buffer;
@@ -169,7 +177,7 @@ export function collectDirChunks(dir: string, source: string): Chunk[] {
 export function collectRepoChunks(root: string): Chunk[] {
   const chunks: Chunk[] = [];
   for (const rel of listProjectFiles(root)) {
-    if (!CODE_RE.test(rel)) continue;
+    if (!CODE_RE.test(rel) || looksSecret(rel)) continue;
     const abs = join(root, rel);
     if (fileSize(abs) > 200_000) continue;
     let buf: Buffer;

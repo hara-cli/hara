@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
 import type { SandboxMode } from "./sandbox.js";
 import type { HooksConfig } from "./hooks.js";
 import type { NotifyMode } from "./notify.js";
@@ -105,12 +105,22 @@ function readProjectConfig(cwd: string): Record<string, any> {
   return {};
 }
 
+/** Write the config 0600 (it can hold `apiKey`) + tighten an existing file. */
+function persistConfig(p: string, cfg: Record<string, unknown>): void {
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* best-effort */
+  }
+}
+
 export function writeConfigValue(key: string, value: string): void {
   const p = configPath();
   const cfg = readRawConfig();
   cfg[key] = value;
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  persistConfig(p, cfg);
 }
 
 /** Record (or clear, with cap=null) a confirmed per-model vision capability in `modelVision`. */
@@ -121,8 +131,7 @@ export function setModelVisionOverride(model: string, cap: "yes" | "no" | null):
   if (cap === null) delete map[model];
   else map[model] = cap;
   cfg.modelVision = map;
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  persistConfig(p, cfg);
 }
 
 /**
