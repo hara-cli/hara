@@ -31,7 +31,7 @@ import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
-import { addJob, removeJob, setEnabled, findJob, loadJobs, recordRun, logPath } from "./cron/store.js";
+import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
 import { runTick, runJobOnce, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools } from "./tools/registry.js";
@@ -876,20 +876,42 @@ cronCmd
     out(c.green(`✓ scheduled ${job.id}`) + c.dim(` · ${describeSchedule(sched)} · ${job.mode} · cwd ${job.cwd}\n`));
     if (!isInstalled()) out(c.yellow("⚠ scheduler not installed yet — run `hara cron install` so jobs actually fire.\n"));
   });
+// Resolve an id/prefix to one job, printing a clear error for none / ambiguous (never act on a guess).
+const cronResolve = (id: string): CronJob | null => {
+  const r = resolveJob(id);
+  if (r === "ambiguous") return void out(c.red(`ambiguous id "${id}" — matches multiple jobs; type more characters\n`)), null;
+  if (!r) return void out(c.red(`no such job: ${id}\n`)), null;
+  return r;
+};
 cronCmd.command("list").alias("ls").description("list scheduled jobs").action(() => out(renderCronJobs()));
 cronCmd
   .command("remove <id>")
   .alias("rm")
   .description("delete a job (by id or unique prefix)")
-  .action((id: string) => out(removeJob(id) ? c.green(`✓ removed ${id}\n`) : c.red(`no such job: ${id}\n`)));
-cronCmd.command("enable <id>").description("enable a job").action((id: string) => out(setEnabled(id, true) ? c.green(`✓ enabled ${id}\n`) : c.red(`no such job: ${id}\n`)));
-cronCmd.command("disable <id>").description("disable a job (keeps it, stops firing)").action((id: string) => out(setEnabled(id, false) ? c.green(`✓ disabled ${id}\n`) : c.red(`no such job: ${id}\n`)));
+  .action((id: string) => {
+    const j = cronResolve(id);
+    if (j) out(removeJob(j.id) ? c.green(`✓ removed ${j.id}\n`) : c.red("no such job\n"));
+  });
+cronCmd.command("enable <id>").description("enable a job").action((id: string) => {
+  const j = cronResolve(id);
+  if (j) {
+    setEnabled(j.id, true);
+    out(c.green(`✓ enabled ${j.id}\n`));
+  }
+});
+cronCmd.command("disable <id>").description("disable a job (keeps it, stops firing)").action((id: string) => {
+  const j = cronResolve(id);
+  if (j) {
+    setEnabled(j.id, false);
+    out(c.green(`✓ disabled ${j.id}\n`));
+  }
+});
 cronCmd
   .command("run <id>")
   .description("run a job right now, ignoring its schedule")
   .action(async (id: string) => {
-    const job = findJob(id);
-    if (!job) return void out(c.red(`no such job: ${id}\n`));
+    const job = cronResolve(id);
+    if (!job) return;
     out(c.dim(`running ${job.id} (${job.name})…\n`));
     const r = await runJobOnce(job);
     recordRun(job.id, Date.now(), r.ok ? "ok" : "error", r.error);
@@ -918,8 +940,8 @@ cronCmd
   .command("logs <id>")
   .description("show a job's recent run output")
   .action((id: string) => {
-    const job = findJob(id);
-    if (!job) return void out(c.red(`no such job: ${id}\n`));
+    const job = cronResolve(id);
+    if (!job) return;
     const p = logPath(job.id);
     out(existsSync(p) ? readFileSync(p, "utf8").slice(-4000) + "\n" : c.dim("(no runs yet)\n"));
   });

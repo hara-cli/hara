@@ -1,7 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { durationToMs, parseSchedule, parseCron, cronMatches, isDue, nextRun } from "../dist/cron/schedule.js";
 import { dueJobs, selfArgv } from "../dist/cron/runner.js";
+import { resolveJob } from "../dist/cron/store.js";
 
 test("durationToMs", () => {
   assert.equal(durationToMs("45s"), 45_000);
@@ -65,8 +69,50 @@ test("nextRun: cron scans forward; interval/once compute directly", () => {
   const cronNext = nextRun({ schedule: { kind: "cron", expr: "0 9 * * *" }, createdAt: 0 }, from);
   assert.ok(cronNext && new Date(cronNext).getHours() === 9 && new Date(cronNext).getMinutes() === 0);
   assert.ok(cronNext > from, "in the future");
-  assert.equal(nextRun({ schedule: { kind: "every", everyMs: 1000, display: "x" }, createdAt: 0, lastRunAt: 5000 }, from), 6000);
+  const everyNext = nextRun({ schedule: { kind: "every", everyMs: 1000, display: "x" }, createdAt: 0, lastRunAt: 5000 }, from);
+  assert.ok(everyNext > from && everyNext % 1000 === 0 && everyNext - from <= 1000, "next grid boundary after `from` (never in the past)");
   assert.equal(nextRun({ schedule: { kind: "once", runAt: 9000, display: "x" }, createdAt: 0, lastRunAt: 9000 }, from), null, "already ran");
+});
+
+test("hardening: malformed cron is rejected, not silently mis-scheduled", () => {
+  assert.equal(parseCron("0 9 * * 1,"), null, "trailing comma");
+  assert.equal(parseCron("/5 * * * *"), null, "step with no range");
+  assert.equal(parseCron("5/ * * * *"), null, "empty step");
+  assert.equal(parseCron("x 9 * * *"), null, "non-numeric value");
+  assert.equal(parseCron("0 9 * * 1/x"), null, "non-numeric step");
+  assert.ok(parseCron("*/5 0-6 1,15 * 1-5"), "a valid expr still parses");
+  assert.ok(parseSchedule("0 9 * * 1,", 0).error !== undefined, "a bad cron surfaces an error (not a quietly-wrong job)");
+});
+
+test("hardening: Vixie `N/step` extends to max (minute 5/15 = 5,20,35,50)", () => {
+  assert.equal(cronMatches("5/15 * * * *", new Date(2026, 0, 5, 9, 5)), true);
+  assert.equal(cronMatches("5/15 * * * *", new Date(2026, 0, 5, 9, 20)), true);
+  assert.equal(cronMatches("5/15 * * * *", new Date(2026, 0, 5, 9, 6)), false);
+});
+
+test("hardening: interval grid-anchor — an early-landing tick still counts its slot (no halving)", () => {
+  const e = { schedule: { kind: "every", everyMs: 60_000, display: "every 1m" }, createdAt: 0 };
+  assert.equal(isDue({ ...e, lastRunAt: 600_000 }, 659_500), false, "still the same minute-slot → not yet");
+  assert.equal(isDue({ ...e, lastRunAt: 600_000 }, 660_000), true, "next slot → due (even though it's <60s past a slightly-late lastRun)");
+});
+
+test("hardening: resolveJob — exact wins, unique prefix resolves, ambiguous never guesses", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-cron-store-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    mkdirSync(join(home, ".hara", "cron"), { recursive: true });
+    const j = (id) => ({ id, name: id, task: "x", mode: "print", cwd: ".", enabled: true, createdAt: 0, schedule: { kind: "every", everyMs: 1000, display: "x" } });
+    writeFileSync(join(home, ".hara", "cron", "jobs.json"), JSON.stringify([j("abc12345"), j("abc99999"), j("def00000")]));
+    assert.equal(resolveJob("def")?.id, "def00000", "unique prefix resolves");
+    assert.equal(resolveJob("abc12345")?.id, "abc12345", "exact id wins");
+    assert.equal(resolveJob("abc"), "ambiguous", "ambiguous prefix is flagged, not guessed");
+    assert.equal(resolveJob("zzz"), undefined, "no match");
+  } finally {
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("selfArgv: node-script mode includes the script; compiled-binary mode is just the binary", () => {

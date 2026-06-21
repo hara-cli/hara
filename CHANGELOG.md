@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.60.1 — unreleased (cron hardening — from a code-review pass)
+
+A review of the fast-built `hara cron` module surfaced real bugs; fixed:
+- **Malformed cron expressions were silently accepted** (`Number("")===0` etc.) — `"0 9 * * 1,"`, `"/5 * * * *"`, `"5/"` parsed as valid jobs that fire at the wrong time. Now strictly validated and rejected; `N/step` correctly extends to max (Vixie semantics).
+- **`hara cron install` could emit a broken plist/crontab** when a path contained `&`/`<`/`>` (launchd XML) or a space/metacharacter (crontab shell line). Now XML-escaped / shell-quoted, and an install is refused if a path contains a newline.
+- **Per-job logs grew unbounded** — capped to the last ~256KB once over ~1MB.
+- **The tick lock could poison the scheduler for 30 min after a crash, or double-fire a long job** — now keyed on PID liveness (a dead owner is taken over within one tick; a live owner is respected for long runs).
+- **An ambiguous id-prefix silently deleted/toggled the *first* match** — `cron remove/enable/disable/run/logs` now error on an ambiguous prefix instead of guessing.
+
+The vim reducer, type-ahead steering, Anthropic message coalescing, the MCP allowlist, and the binary build were reviewed and confirmed clean. 192 tests (4 new hardening cases).
+
 ## 0.60.0 — unreleased (single-binary distribution)
 
 - **Standalone binaries** — hara can now be a single self-contained executable (no Node required):

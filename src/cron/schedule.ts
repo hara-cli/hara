@@ -29,25 +29,33 @@ interface CronFields {
 
 // Parse one cron field — supports `*`, a step `/n`, a single value `a`, a range `a-b`, a list `a,b`,
 // and a stepped range `a-b/n` — into the explicit set of matching values.
+const isUint = (s: string): boolean => /^\d+$/.test(s); // strict — `Number("")`/`Number(" ")` are 0, so reject non-digits
 function parseField(f: string, min: number, max: number): Set<number> | null {
   const out = new Set<number>();
   for (const part of f.split(",")) {
-    const [rangeRaw, stepRaw] = part.split("/");
+    if (part === "") return null; // empty list element (e.g. a trailing/leading comma)
+    const slash = part.split("/");
+    if (slash.length > 2) return null; // more than one step
+    const [rangeRaw, stepRaw] = slash;
+    if (stepRaw !== undefined && !isUint(stepRaw)) return null; // "5/", "5/x"
     const step = stepRaw === undefined ? 1 : Number(stepRaw);
-    if (!Number.isInteger(step) || step < 1) return null;
+    if (step < 1) return null;
     let lo: number;
     let hi: number;
     if (rangeRaw === "*") {
       lo = min;
       hi = max;
     } else if (rangeRaw.includes("-")) {
-      const [a, b] = rangeRaw.split("-").map(Number);
-      lo = a;
-      hi = b;
+      const ab = rangeRaw.split("-");
+      if (ab.length !== 2 || !isUint(ab[0]) || !isUint(ab[1])) return null;
+      lo = Number(ab[0]);
+      hi = Number(ab[1]);
     } else {
-      lo = hi = Number(rangeRaw);
+      if (!isUint(rangeRaw)) return null;
+      lo = Number(rangeRaw);
+      hi = stepRaw !== undefined ? max : lo; // Vixie: "N/step" means N..max step (not just {N})
     }
-    if (!Number.isInteger(lo) || !Number.isInteger(hi) || lo < min || hi > max || lo > hi) return null;
+    if (lo < min || hi > max || lo > hi) return null;
     for (let v = lo; v <= hi; v += step) out.add(v);
   }
   return out.size ? out : null;
@@ -120,7 +128,9 @@ export function isDue(job: JobTiming, nowMs: number): boolean {
     if (!cronMatches(s.expr, new Date(nowMs))) return false;
     return job.lastRunAt === undefined || Math.floor(job.lastRunAt / 60_000) < Math.floor(nowMs / 60_000);
   }
-  if (s.kind === "every") return nowMs >= (job.lastRunAt ?? job.createdAt) + s.everyMs;
+  // interval: fire once per grid slot of width everyMs — a tick landing slightly early still counts the
+  // slot (a plain `now >= last+everyMs` deadline loses ~half the fires of `every 1m` at 60s tick granularity).
+  if (s.kind === "every") return Math.floor(nowMs / s.everyMs) > Math.floor((job.lastRunAt ?? job.createdAt) / s.everyMs);
   return job.lastRunAt === undefined && nowMs >= s.runAt; // once
 }
 
@@ -128,7 +138,7 @@ export function isDue(job: JobTiming, nowMs: number): boolean {
  *  (e.g. a one-shot already past). */
 export function nextRun(job: JobTiming, fromMs: number): number | null {
   const s = job.schedule;
-  if (s.kind === "every") return (job.lastRunAt ?? job.createdAt) + s.everyMs;
+  if (s.kind === "every") return (Math.floor(fromMs / s.everyMs) + 1) * s.everyMs; // next grid boundary (always > fromMs)
   if (s.kind === "once") return job.lastRunAt === undefined ? s.runAt : null;
   const p = parseCron(s.expr);
   if (!p) return null;

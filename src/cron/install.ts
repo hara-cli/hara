@@ -7,6 +7,8 @@ import { execFileSync } from "node:child_process";
 
 const LABEL = "net.nanhara.hara.cron";
 const CRON_TAG = "# hara-cron";
+const xmlEscape = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`; // safe single-quote for /bin/sh
 const plistFile = (): string => join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 
 function currentCrontab(): string {
@@ -29,13 +31,14 @@ export function isInstalled(): boolean {
 export function installScheduler(cmd: string[]): { ok: boolean; msg: string } {
   const os = platform();
   const argv = [...cmd, "cron", "tick"];
+  if (argv.some((a) => a.includes("\n"))) return { ok: false, msg: "refusing to install — a path contains a newline" };
   if (os === "darwin") {
     const p = plistFile();
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array>${argv.map((a) => `<string>${a}</string>`).join("")}</array>
+  <key>ProgramArguments</key><array>${argv.map((a) => `<string>${xmlEscape(a)}</string>`).join("")}</array>
   <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><false/>
 </dict></plist>
@@ -60,7 +63,7 @@ export function installScheduler(cmd: string[]): { ok: boolean; msg: string } {
       .filter((l) => !l.includes(CRON_TAG))
       .join("\n")
       .replace(/\n+$/, "");
-    const line = `* * * * * ${argv.join(" ")} >/dev/null 2>&1  ${CRON_TAG}`;
+    const line = `* * * * * ${argv.map(shQuote).join(" ")} >/dev/null 2>&1  ${CRON_TAG}`;
     const next = (kept ? kept + "\n" : "") + line + "\n";
     try {
       execFileSync("crontab", ["-"], { input: next });

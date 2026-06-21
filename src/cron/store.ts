@@ -58,23 +58,35 @@ export function addJob(j: Omit<CronJob, "id" | "createdAt" | "enabled"> & { enab
   return job;
 }
 
-/** Find a job by id or unique id-prefix (so users can type the short form). */
-export function findJob(idOrPrefix: string): CronJob | undefined {
+/** Resolve an id or unique id-prefix to a single job. Exact id wins; otherwise the prefix must match
+ *  EXACTLY one job — an ambiguous prefix returns "ambiguous" (never silently picks one, since callers
+ *  delete/toggle). `undefined` = no match. */
+export function resolveJob(idOrPrefix: string): CronJob | "ambiguous" | undefined {
   const jobs = loadJobs();
-  return jobs.find((x) => x.id === idOrPrefix) ?? jobs.filter((x) => x.id.startsWith(idOrPrefix)).at(0);
+  const exact = jobs.find((x) => x.id === idOrPrefix);
+  if (exact) return exact;
+  const pre = jobs.filter((x) => x.id.startsWith(idOrPrefix));
+  return pre.length === 1 ? pre[0] : pre.length > 1 ? "ambiguous" : undefined;
 }
 
-export function removeJob(idOrPrefix: string): boolean {
+/** Find a job by id/unique-prefix (back-compat; ambiguous → undefined). */
+export function findJob(idOrPrefix: string): CronJob | undefined {
+  const r = resolveJob(idOrPrefix);
+  return r === "ambiguous" ? undefined : r;
+}
+
+/** Delete a job by EXACT id (callers resolve the prefix first via resolveJob). */
+export function removeJob(id: string): boolean {
   const jobs = loadJobs();
-  const job = jobs.find((x) => x.id === idOrPrefix) ?? jobs.find((x) => x.id.startsWith(idOrPrefix));
-  if (!job) return false;
-  saveJobs(jobs.filter((x) => x.id !== job.id));
+  if (!jobs.some((x) => x.id === id)) return false;
+  saveJobs(jobs.filter((x) => x.id !== id));
   return true;
 }
 
-export function setEnabled(idOrPrefix: string, on: boolean): boolean {
+/** Enable/disable a job by EXACT id. */
+export function setEnabled(id: string, on: boolean): boolean {
   const jobs = loadJobs();
-  const job = jobs.find((x) => x.id === idOrPrefix) ?? jobs.find((x) => x.id.startsWith(idOrPrefix));
+  const job = jobs.find((x) => x.id === id);
   if (!job) return false;
   job.enabled = on;
   saveJobs(jobs);
