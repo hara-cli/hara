@@ -27,6 +27,29 @@ test("memory: write → search → digest → forget round-trip", () => {
   }
 });
 
+test("memory: a huge global MEMORY can't starve USER prefs out of the digest (per-source budgets)", () => {
+  const d = mkdtempSync(join(tmpdir(), "hara-mem3-"));
+  process.env.HARA_MEMORY = d;
+  const cwd = mkdtempSync(join(tmpdir(), "hara-proj3-"));
+  try {
+    // 5000 chars of memory entries (each its own line) — far over the per-source cap
+    const big = Array.from({ length: 200 }, (_, i) => `- fact line number ${i} about the codebase`).join("\n");
+    appendMemory("global", "memory", big, cwd);
+    appendMemory("global", "user", "ALWAYS answer in terse bullet points", cwd);
+    const dig = memoryDigest(cwd);
+    assert.ok(dig.includes("ALWAYS answer in terse bullet points"), "USER prefs survive even behind a huge MEMORY");
+    assert.ok(/…\[truncated/.test(dig), "the oversized MEMORY is truncated, not dropped");
+    assert.ok(!/fact line number 199 /.test(dig.split("USER preferences")[0]), "MEMORY is actually cut (last lines absent)");
+    // truncation lands on a line boundary — no half-line fragments before the marker
+    const beforeMarker = dig.slice(0, dig.indexOf("…[truncated"));
+    assert.ok(beforeMarker.endsWith("\n") || beforeMarker.endsWith("codebase"), "cut at a line boundary, not mid-entry");
+  } finally {
+    delete process.env.HARA_MEMORY;
+    rmSync(d, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("memory: replace overwrites; scaffold seeds files", () => {
   const d = mkdtempSync(join(tmpdir(), "hara-mem2-"));
   process.env.HARA_MEMORY = d;

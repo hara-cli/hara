@@ -9,7 +9,19 @@ import { findProjectRoot } from "../context/agents-md.js";
 export type Scope = "global" | "project";
 export type Target = "memory" | "user" | "log";
 
-const DIGEST_CAP = 4000; // chars of MEMORY/USER injected at session start (logs reached via search)
+// Per-source budgets for the frozen-snapshot digest (chars). Each source gets its own cap so a large
+// project MEMORY can't crowd out the (smaller but high-value) USER prefs — and each is cut at a line
+// boundary, never mid-entry. Anything beyond these is still reachable via memory_search. (hermes-style
+// per-file budgets; both PAI and hermes confirm lexical injection + capped snapshot beats a vector store.)
+const SOURCE_CAP: Record<Target, number> = { memory: 2000, user: 1200, log: 0 };
+
+/** Truncate at a line boundary at/under `cap` (never mid-entry), with a pointer to search for the rest. */
+function capAtLine(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  const cut = text.slice(0, cap);
+  const nl = cut.lastIndexOf("\n");
+  return (nl > cap * 0.5 ? cut.slice(0, nl) : cut).trimEnd() + "\n…[truncated — memory_search for the rest]";
+}
 
 export function memoryDir(scope: Scope, cwd: string): string {
   if (scope === "global") return process.env.HARA_MEMORY || join(homedir(), ".hara", "memory");
@@ -53,7 +65,9 @@ export function forgetMemory(scope: Scope, target: Target, match: string, cwd: s
   return lines.length - kept.length;
 }
 
-/** Capped MEMORY + USER digest (project + global) for frozen-snapshot injection at session start. */
+/** MEMORY + USER digest (project + global) for frozen-snapshot injection at session start. Each source is
+ *  capped independently (SOURCE_CAP) at a line boundary, so every source is represented (project memory
+ *  never starves USER prefs) and no entry is cut mid-line. Daily logs are reached via memory_search. */
 export function memoryDigest(cwd: string): string {
   const sources: [Scope, Target, string][] = [
     ["project", "memory", "project MEMORY"],
@@ -66,13 +80,12 @@ export function memoryDigest(cwd: string): string {
     if (!existsSync(f)) continue;
     try {
       const t = readFileSync(f, "utf8").trim();
-      if (t) parts.push(`## ${label}\n${t}`);
+      if (t) parts.push(`## ${label}\n${capAtLine(t, SOURCE_CAP[target])}`);
     } catch {
       /* skip unreadable */
     }
   }
-  const out = parts.join("\n\n");
-  return out.length > DIGEST_CAP ? out.slice(0, DIGEST_CAP) + "\n…[memory truncated — use memory_search]" : out;
+  return parts.join("\n\n");
 }
 
 /** Create memory dirs + seed files (global + project). Returns files written. */

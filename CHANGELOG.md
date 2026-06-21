@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.60.2 — unreleased (memory digest: per-source budgets)
+
+- After studying the PAI and hermes memory systems (both lexical-first; both treat vectors as an *optional*
+  optimization, not a requirement — which validates hara's design), tightened the frozen-snapshot digest:
+  the old `slice(0, 4000)` on the **concatenated** sources could cut an entry mid-line and let a large
+  project `MEMORY.md` **crowd `USER.md` out entirely**. Each source (project MEMORY / global MEMORY / USER)
+  now gets its **own** budget and is truncated at a **line boundary**, so high-value user prefs are always
+  injected and no entry is split. The rest stays reachable via `memory_search` (which is already hybrid
+  lexical + opt-in semantic). No behavior change when memory is small.
+
 ## 0.60.1 — unreleased (cron hardening — from a code-review pass)
 
 A review of the fast-built `hara cron` module surfaced real bugs; fixed:
