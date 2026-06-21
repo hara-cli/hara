@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
-import { appendMemory, replaceMemory, forgetMemory, memoryDigest, memoryRoots, scaffoldMemory } from "../dist/memory/store.js";
+import { appendMemory, replaceMemory, forgetMemory, memoryDigest, memoryRoots, scaffoldMemory, readRecentLogs } from "../dist/memory/store.js";
 import { searchAssets } from "../dist/recall.js";
 import { saveSession, loadSession, newSessionId } from "../dist/session/store.js";
 
@@ -43,6 +43,25 @@ test("memory: a huge global MEMORY can't starve USER prefs out of the digest (pe
     // truncation lands on a line boundary — no half-line fragments before the marker
     const beforeMarker = dig.slice(0, dig.indexOf("…[truncated"));
     assert.ok(beforeMarker.endsWith("\n") || beforeMarker.endsWith("codebase"), "cut at a line boundary, not mid-entry");
+  } finally {
+    delete process.env.HARA_MEMORY;
+    rmSync(d, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("memory: readRecentLogs includes recent daily logs, excludes ones outside the window", () => {
+  const d = mkdtempSync(join(tmpdir(), "hara-mem-logs-"));
+  process.env.HARA_MEMORY = d;
+  const cwd = mkdtempSync(join(tmpdir(), "hara-proj-logs-"));
+  try {
+    appendMemory("global", "log", "today: shipped the cron hardening", cwd); // → log/<today>.md
+    mkdirSync(join(d, "log"), { recursive: true });
+    writeFileSync(join(d, "log", "2020-01-01.md"), "ancient note\n"); // far outside any window
+    const recent = readRecentLogs("global", cwd, 14);
+    assert.ok(recent.includes("shipped the cron hardening"), "today's log is in the 14-day window");
+    assert.ok(!recent.includes("ancient note"), "a 2020 log is excluded");
+    assert.equal(readRecentLogs("global", cwd, 14).includes("ancient note"), false);
   } finally {
     delete process.env.HARA_MEMORY;
     rmSync(d, { recursive: true, force: true });

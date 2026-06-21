@@ -7,3 +7,6 @@ npm-debug.log*
 dist/
 *.tgz
 .npmrc
+
+# hara runtime state (memory / roles / org plans / index) when dogfooding in this repo
+.hara/

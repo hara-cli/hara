@@ -6,7 +6,7 @@ import { runTui } from "./tui/run.js";
 import { readClipboardImage } from "./images.js";
 import { describeImages, locateImage, classifyVision, SCREENSHOT_SYSTEM } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
-import { memoryDigest, memoryDir } from "./memory/store.js";
+import { memoryDigest, memoryDir, readRecentLogs, scaffoldMemory, type Scope } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
@@ -474,6 +474,12 @@ const PLAN_SYSTEM =
 const DISTILL_SYSTEM =
   "The session is ending. Reflect and persist only durable, reusable learnings: memory_write for facts / " +
   "conventions / the user's preferences, skill_create for reusable how-tos. Be selective — skip the trivial. Then reply DONE.";
+const MEMORY_DISTILL_SYSTEM =
+  "You consolidate an agent's short-term daily memory logs into its durable long-term memory. You're given " +
+  "the current durable memory and recent daily logs. Extract ONLY durable, reusable facts / decisions / " +
+  "conventions / user preferences from the logs that are NOT already captured, and persist each with " +
+  "memory_write (target=memory, or target=user for preferences; pick the right scope=project|global). " +
+  "Skip the ephemeral, the one-off, and anything already known. Be terse and de-duplicated. Then reply DONE.";
 const COMPACT_SYSTEM =
   "Summarize the conversation so far into a concise but complete brief so the assistant can " +
   "continue seamlessly: the user's goal, key decisions, files changed, current state, and open next steps. " +
@@ -944,6 +950,49 @@ cronCmd
     if (!job) return;
     const p = logPath(job.id);
     out(existsSync(p) ? readFileSync(p, "utf8").slice(-4000) + "\n" : c.dim("(no runs yet)\n"));
+  });
+
+const memoryCmd = program.command("memory").description("inspect + consolidate hara's durable memory (~/.hara/memory + project .hara/memory)");
+memoryCmd.command("show").description("print the memory digest injected at session start").action(() => {
+  const d = memoryDigest(process.cwd());
+  out(d ? d + "\n" : c.dim("(memory is empty — `hara memory init`, or let the agent write via memory_write)\n"));
+});
+memoryCmd.command("init").description("scaffold the memory dirs + seed files (global + project)").action(() => {
+  const w = scaffoldMemory(process.cwd());
+  out(w.length ? c.green(`Scaffolded: ${w.join(", ")}\n`) : c.dim("Memory already scaffolded.\n"));
+});
+memoryCmd
+  .command("distill")
+  .description("consolidate recent daily logs into durable MEMORY (promote short-term → long-term)")
+  .option("--days <n>", "days of logs to consider (default 14)", (v) => parseInt(v, 10))
+  .option("--scope <s>", "global | project | all (default all)")
+  .action(async (opts: { days?: number; scope?: string }) => {
+    const cfg = loadConfig();
+    const provider = await buildProvider(cfg);
+    if (!provider) {
+      out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
+      process.exit(1);
+    }
+    const days = opts.days && opts.days > 0 ? opts.days : 14;
+    const scopes: Scope[] = opts.scope === "global" ? ["global"] : opts.scope === "project" ? ["project"] : ["project", "global"];
+    const logs = scopes
+      .map((s) => readRecentLogs(s, cfg.cwd, days))
+      .filter(Boolean)
+      .join("\n\n");
+    if (!logs.trim()) return void out(c.dim(`No daily logs in the last ${days} day(s) to distill. (The agent jots them via memory_write target=log.)\n`));
+    out(c.dim(`Distilling ${days}-day logs → durable memory…\n`));
+    const stats = { input: 0, output: 0, lastInput: 0 };
+    const history: NeutralMsg[] = [{ role: "user", content: `Current durable memory:\n\n${memoryDigest(cfg.cwd) || "(empty)"}\n\n---\n\nRecent daily logs (last ${days} days):\n\n${logs.slice(0, 80_000)}` }];
+    await runAgent(history, {
+      provider,
+      ctx: { cwd: cfg.cwd, sandbox: cfg.sandbox },
+      approval: "full-auto",
+      confirm: async () => true,
+      toolFilter: (n) => n === "memory_write" || READONLY_TOOLS.has(n),
+      systemOverride: MEMORY_DISTILL_SYSTEM,
+      stats,
+    });
+    if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
 
 const rolesCmd = program.command("roles").description("manage org roles (.hara/roles)");

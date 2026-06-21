@@ -3,7 +3,7 @@
 // project <root>/.hara/memory. Lexical search reuses recall.ts; no embeddings (local-first).
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { findProjectRoot } from "../context/agents-md.js";
 
 export type Scope = "global" | "project";
@@ -86,6 +86,27 @@ export function memoryDigest(cwd: string): string {
     }
   }
   return parts.join("\n\n");
+}
+
+/** Concatenate the daily logs (`log/YYYY-MM-DD.md`) from the last `days` for one scope — the short-term
+ *  tier `hara memory distill` consolidates into evergreen MEMORY. Empty if there's no log dir. */
+export function readRecentLogs(scope: Scope, cwd: string, days: number): string {
+  const dir = join(memoryDir(scope, cwd), "log");
+  if (!existsSync(dir)) return "";
+  const cutoff = Date.now() - days * 86_400_000;
+  const out: string[] = [];
+  for (const f of readdirSync(dir).sort()) {
+    if (!f.endsWith(".md")) continue;
+    const m = /^(\d{4})-(\d{2})-(\d{2})\.md$/.exec(f);
+    if (m && new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() < cutoff) continue;
+    try {
+      const t = readFileSync(join(dir, f), "utf8").trim();
+      if (t) out.push(`### ${f}\n${t}`);
+    } catch {
+      /* skip unreadable */
+    }
+  }
+  return out.join("\n\n");
 }
 
 /** Create memory dirs + seed files (global + project). Returns files written. */

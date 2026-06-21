@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.61.0 — unreleased (`hara memory` — inspect + distill durable memory)
+
+- New **`hara memory`** command group, giving memory a CLI surface it lacked:
+  - **`hara memory show`** — print the digest injected at session start (what the agent actually sees).
+  - **`hara memory init`** — scaffold the global + project memory dirs/seed files.
+  - **`hara memory distill [--days N] [--scope global|project|all]`** — **promote short-term → long-term**:
+    consolidate recent daily logs (`log/YYYY-MM-DD.md`) into durable `MEMORY.md`/`USER.md`, deduped against
+    what's already there, skipping the ephemeral. This closes the one tiering gap the PAI/hermes study
+    surfaced (the daily-log tier was previously write-only). The agent routes each fact to the right
+    target/scope (user pref → `USER.md`, project fact → project memory). Verified live with glm-5.
+- `.hara/` is now gitignored in this repo so dogfooding doesn't leave runtime state (memory/roles/plans).
+
 ## 0.60.2 — unreleased (memory digest: per-source budgets)
 
 - After studying the PAI and hermes memory systems (both lexical-first; both treat vectors as an *optional*
