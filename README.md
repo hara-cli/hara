@@ -207,7 +207,7 @@ the diff and either approves or sends it back with fixes — looping implement �
 (or `--rounds N`). Add **`--commit`** and it commits the approved result with an AI-written message (guarded
 to a clean start tree; a review that doesn't pass leaves the work uncommitted). The
 **`agent`** tool spawns **parallel read-only sub-agents** for fan-out — analyze / review / search
-several things at once (each can take a `role`).
+several things at once (each can take a `role`), bounded to 8 concurrent (`HARA_MAX_CONCURRENCY`).
 
 Beyond routing, **`hara plan "<task>"`** makes the org *plan*: it decomposes the task into atoms,
 sequences them as a DAG, and executes each step (optionally routed to a role) behind a per-step

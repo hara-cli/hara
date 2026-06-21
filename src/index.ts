@@ -33,6 +33,7 @@ import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { completionScript } from "./completions.js";
 import { renderSessionMarkdown } from "./export.js";
 import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL } from "./org-fleet/enroll.js";
+import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
 import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
@@ -395,7 +396,7 @@ async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<void>
       const todo = wave.filter((a) => !doneIds.has(a.id));
       if (!todo.length) continue; // whole wave already complete (resume)
       out(c.cyan(`\n▶ wave [${todo.map((a) => a.id).join(", ")}] — ${todo.length} in parallel\n`));
-      const results = await Promise.all(todo.map((atom) => executeAtom(atom, plan, done, roles, o)));
+      const results = await mapLimit(todo, maxParallel(), (atom) => executeAtom(atom, plan, done, roles, o)); // bounded
       todo.forEach((atom, i) => {
         if (results[i]) {
           done.push(atom);

@@ -6,6 +6,7 @@ import { activity } from "../activity.js";
 import { makeRenderer } from "../md.js";
 import { skillsDigest } from "../skills/skills.js";
 import { runHooks } from "../hooks.js";
+import { mapLimit, maxParallel } from "../concurrency.js";
 import type { ApprovalMode } from "../config.js";
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
@@ -208,20 +209,23 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         activity.dec();
       }
     };
-    let batch: Promise<void>[] = [];
+    let batch: number[] = []; // indices of pending read-kind tools (run concurrently, capped)
+    const flush = async (): Promise<void> => {
+      if (!batch.length) return;
+      const idx = batch;
+      batch = [];
+      await mapLimit(idx, maxParallel(), (i) => runOne(i, plans[i])); // bounded fan-out (e.g. 20 parallel agents → 8 at a time)
+    };
     for (let i = 0; i < plans.length; i++) {
       const p = plans[i];
       if (p.denied === undefined && p.tool?.kind === "read") {
-        batch.push(runOne(i, p)); // safe → accumulate to run concurrently
+        batch.push(i); // safe → accumulate to run concurrently
       } else {
-        if (batch.length) {
-          await Promise.all(batch); // flush pending reads before an edit/exec
-          batch = [];
-        }
+        await flush(); // flush pending reads before an edit/exec
         await runOne(i, p);
       }
     }
-    await Promise.all(batch);
+    await flush();
     history.push({ role: "tool", results });
   }
 }

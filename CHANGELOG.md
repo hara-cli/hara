@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.67.0 — unreleased (bounded parallel concurrency)
+
+- hara already runs work in parallel — fan-out **`agent`** sub-agents, concurrent read-kind tools in a turn,
+  and `hara plan --parallel` waves — but with **no cap**: the model spawning 20 `agent` calls in one turn
+  started 20 LLM loops at once (provider rate-limits / resource thrash). Now a **bounded pool** (`mapLimit`)
+  caps in-flight parallelism to **8** by default (tunable via `HARA_MAX_CONCURRENCY`), matching cc-haha's
+  safeguard (it caps at 10). Excess work queues and runs as slots free; ordering + behavior otherwise
+  unchanged. Applied to the loop's read/agent batch and the parallel-plan wave.
+
 ## 0.66.0 — unreleased (B-end: device enrollment + `hara-gateway` provider)
 
 - First slice of the **B-end** (fleets / control plane): `hara enroll <gateway-url> --code <code>` trades a
