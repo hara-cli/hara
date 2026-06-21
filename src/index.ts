@@ -32,6 +32,7 @@ import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { completionScript } from "./completions.js";
 import { renderSessionMarkdown } from "./export.js";
+import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL } from "./org-fleet/enroll.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
 import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
@@ -106,6 +107,11 @@ async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
     const auth = await getValidQwenAuth();
     if (!auth) return null;
     return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model: cfg.model, label: "qwen-oauth" });
+  }
+  if (cfg.provider === "hara-gateway") {
+    const e = loadEnrollment();
+    if (!e) return null; // not enrolled → `hara enroll`
+    return createOpenAIProvider({ apiKey: e.deviceToken, baseURL: gatewayBaseURL(e), model: cfg.model || e.model, label: "hara-gateway" });
   }
   if (!cfg.apiKey) return null;
   if (cfg.provider === "anthropic") {
@@ -787,6 +793,30 @@ program
   .action(runSetup);
 
 program
+  .command("enroll [gateway-url]")
+  .description("B-end: join a fleet — trade a one-time code for a device token (routes hara through your org's gateway; no provider key on this device)")
+  .option("--code <code>", "enrollment code from your hara-control admin")
+  .option("--status", "show the current enrollment")
+  .option("--clear", "remove the enrollment (revert to your own provider config)")
+  .action(async (gatewayUrl: string | undefined, opts: { code?: string; status?: boolean; clear?: boolean }) => {
+    if (opts.status) {
+      const e = loadEnrollment();
+      return void out(e ? c.green("enrolled") + c.dim(` · ${e.gatewayUrl} · device ${e.deviceId || "?"} · model ${e.model || "(gateway default)"} · since ${e.enrolledAt}\n`) : c.dim("Not enrolled — `hara enroll <gateway-url> --code <code>`.\n"));
+    }
+    if (opts.clear) return void out(clearEnrollment() ? c.green("✓ enrollment cleared — set your own provider with `hara setup`.\n") : c.dim("(not enrolled)\n"));
+    if (!gatewayUrl) return void out(c.red("usage: hara enroll <gateway-url> --code <code>   (or --status / --clear)\n"));
+    if (!opts.code) return void out(c.red("Need --code <code> — ask your hara-control admin to issue an enrollment code.\n"));
+    try {
+      const e = await enrollDevice(gatewayUrl, opts.code);
+      writeConfigValue("provider", "hara-gateway");
+      if (e.model) writeConfigValue("model", e.model);
+      out(c.green(`✓ enrolled with ${e.gatewayUrl}`) + c.dim(` · device ${e.deviceId || "?"} · model ${e.model || "(gateway default)"}\n`) + c.dim("hara routes through the gateway now — the real provider key stays server-side.\n"));
+    } catch (err) {
+      out(c.red(`Enroll failed: ${err instanceof Error ? err.message : String(err)}\n`));
+    }
+  });
+
+program
   .command("export [session]")
   .description("export a session to a Markdown transcript (default: the latest in this directory)")
   .option("--out <file>", "write to a file instead of stdout")
@@ -1242,6 +1272,7 @@ program.action(async (opts) => {
     process.exit(1);
   }
   let provider: Provider = provider0;
+  if (cfg.provider === "hara-gateway") void heartbeat(); // fleet visibility — fire-and-forget, never blocks startup
   const cwd = cfg.cwd;
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
   let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it

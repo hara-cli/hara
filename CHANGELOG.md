@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.66.0 — unreleased (B-end: device enrollment + `hara-gateway` provider)
+
+- First slice of the **B-end** (fleets / control plane): `hara enroll <gateway-url> --code <code>` trades a
+  one-time code for a scoped, revocable **device token** (stored `0600` in `~/.hara/org.json`) and switches
+  hara to the new **`hara-gateway`** provider — an OpenAI-compatible client pointed at your org's gateway.
+  **The real provider key never touches the device** (it stays at the gateway). A heartbeat fires on start
+  for fleet visibility; `--status` / `--clear` manage it. The device↔gateway protocol (enroll / heartbeat /
+  OpenAI-compatible proxy) is documented in `docs/b-end.md` and **verified end-to-end against a stub control
+  plane**. The control-plane server (`hara-control`) + the LiteLLM data-plane are the next, separate increment.
+
 ## 0.65.0 — unreleased (frontmatter-aware asset recall)
 
 - Asset/skill recall (`searchAssets`, behind `hara recall` / `/recall` / skill dedup) now **ranks by the

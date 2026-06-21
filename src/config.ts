@@ -5,7 +5,7 @@ import type { SandboxMode } from "./sandbox.js";
 import type { HooksConfig } from "./hooks.js";
 import type { NotifyMode } from "./notify.js";
 
-export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai";
+export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai" | "hara-gateway";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
 
 export interface McpServerConfig {
@@ -64,6 +64,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   },
   "qwen-oauth": { model: "coder-model", envKey: "QWEN_OAUTH_TOKEN" },
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
+  "hara-gateway": { model: "", envKey: "HARA_GATEWAY_TOKEN" }, // B-end: enrolled device → token in ~/.hara/org.json, routed by the gateway
 };
 
 export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "notify", "vimMode"] as const;
