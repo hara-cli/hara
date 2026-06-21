@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.62.0 — unreleased (shell completions)
+
+- **`hara completions bash|zsh|fish`** prints a completion script (eval it in your shell rc) that
+  tab-completes the top-level subcommands and the subcommands of each group (`cron`, `memory`, `plugin`,
+  `roles`, `skills`, `config`), falling back to file completion. Generated from the live command tree so it
+  never drifts; hand-rolled (no new dependency).
+
 ## 0.61.3 — unreleased (audit follow-through: session robustness + SECURITY.md)
 
 - **Corrupt/hand-edited session files no longer crash** `--resume` or `/sessions` (audit M4): `loadSession`

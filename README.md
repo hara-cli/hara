@@ -29,6 +29,8 @@ Or a **standalone binary** (no Node required):
 curl -fsSL https://raw.githubusercontent.com/hara-cli/hara/main/install.sh | sh
 ```
 
+Tab completion (optional): `eval "$(hara completions zsh)"` in your `~/.zshrc` (or `bash`/`fish`).
+
 Or from source:
 
 ```bash

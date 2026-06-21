@@ -29,6 +29,7 @@ import {
 import { runAgent } from "./agent/loop.js";
 import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
+import { completionScript } from "./completions.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
 import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
@@ -748,6 +749,21 @@ program
   .command("doctor")
   .description("check your hara setup (provider / auth / model / node / assets / roles)")
   .action(() => out(runDoctor(loadConfig()) + "\n"));
+
+program
+  .command("completions <shell>")
+  .description("print a shell completion script: bash | zsh | fish (eval it in your shell rc)")
+  .action((shell: string) => {
+    const top = program.commands.map((cmd) => cmd.name()).filter((n) => n && n !== "completions").sort();
+    const subs: Record<string, string[]> = {};
+    for (const cmd of program.commands) {
+      const sub = cmd.commands.map((s) => s.name()).filter(Boolean);
+      if (sub.length) subs[cmd.name()] = sub;
+    }
+    const script = completionScript(shell, { top, subs });
+    if (!script) return void out(c.red(`Unsupported shell '${shell}'. Use: bash | zsh | fish\n`));
+    out(script);
+  });
 
 program
   .command("mcp")
