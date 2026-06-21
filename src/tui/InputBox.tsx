@@ -6,6 +6,7 @@ import { Box, Text, useInput, useStdout } from "ink";
 import { useMemo, useState, type ReactNode } from "react";
 import { fileCandidates } from "../context/mentions.js";
 import { imagePathFromPaste } from "../images.js";
+import { vimNormal, type VimMode } from "./vim.js";
 import type { ImageAttachment } from "../providers/types.js";
 
 export const MODES = ["suggest", "auto-edit", "full-auto", "plan"] as const;
@@ -159,6 +160,7 @@ export function InputBox({
   isActive = true,
   working = false,
   queued = 0,
+  vim = false,
   placeholder = "Type a task · /help · @file · Ctrl+V paste image · shift+tab mode · Esc interrupts",
 }: {
   status: Status;
@@ -172,6 +174,8 @@ export function InputBox({
   working?: boolean;
   /** how many messages are already queued (for the hint) */
   queued?: number;
+  /** modal (vim) keybindings: Esc → normal mode (commands), i/a → insert */
+  vim?: boolean;
   placeholder?: string;
 }) {
   const { stdout } = useStdout();
@@ -181,6 +185,9 @@ export function InputBox({
   const [sel, setSel] = useState(0);
   const [dismissed, setDismissed] = useState(false);
   const [images, setImages] = useState<ImageAttachment[]>([]);
+  const [mode, setMode] = useState<VimMode>("insert"); // vim only
+  const [pending, setPending] = useState(""); // vim operator-pending (d/c/g)
+  const [register, setRegister] = useState(""); // vim yank/delete register
 
   const set = (v: string, c: number): void => {
     setValue(v);
@@ -207,6 +214,8 @@ export function InputBox({
     onSubmit?.(text, images.length ? images : undefined);
     set("", 0);
     setImages([]);
+    setMode("insert"); // a fresh prompt starts in insert
+    setPending("");
   };
 
   const mention = activeMention(value, cursor);
@@ -240,7 +249,32 @@ export function InputBox({
         return;
       }
       if (key.escape) {
-        if (popupOpen) setDismissed(true);
+        if (popupOpen) {
+          setDismissed(true);
+          return;
+        }
+        if (vim && mode === "insert") {
+          setMode("normal");
+          setPending("");
+        }
+        return;
+      }
+      // vim NORMAL mode: printable keys are commands, not text (Enter/arrows/backspace still navigate/submit)
+      if (vim && mode === "normal") {
+        if (key.return) return submit(value);
+        if (key.leftArrow) return setCursor((c) => Math.max(0, c - 1));
+        if (key.rightArrow) return setCursor((c) => Math.min(value.length, c + 1));
+        if (key.backspace || key.delete) return setCursor((c) => Math.max(0, c - 1));
+        if (input && !key.ctrl && !key.meta) {
+          const st = vimNormal({ value, cursor, mode, pending, register }, input);
+          setValue(st.value);
+          setCursor(st.cursor);
+          setMode(st.mode);
+          setPending(st.pending);
+          setRegister(st.register);
+          setSel(0);
+          setDismissed(false);
+        }
         return;
       }
       if (key.return) {
@@ -301,7 +335,7 @@ export function InputBox({
     <Box flexDirection="column">
       <TopBorder name={status.sessionName || "session"} width={w} />
       <Box>
-        <Text color="cyan">{"› "}</Text>
+        <Text color={vim ? (mode === "normal" ? "yellow" : "green") : "cyan"}>{vim && mode === "normal" ? "◆ " : "› "}</Text>
         {value.length === 0 ? (
           <Text>
             <Text inverse> </Text>
@@ -311,6 +345,7 @@ export function InputBox({
           <InputLine value={value} cursor={cursor} />
         )}
       </Box>
+      {vim ? <Text dimColor>{mode === "normal" ? "  -- NORMAL --  i/a insert · h l 0 $ w b e move · x dd D cw p edit" : "  -- INSERT --  Esc → normal"}</Text> : null}
       <BottomBorder s={status} width={w} />
       {working ? <Text dimColor>{`  ⌨ working — Enter queues your message${queued ? ` · ${queued} queued` : ""} · Esc interrupts`}</Text> : null}
       {popupOpen ? <MentionPopup items={candidates} selected={selIdx} query={mention!.query} /> : null}

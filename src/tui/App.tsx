@@ -45,6 +45,8 @@ export interface AppProps {
   cycleApproval?: (cur: Approval) => Approval;
   /** Read an image off the OS clipboard for Ctrl+V (injected; omitted in tests). */
   onClipboardImage?: () => ImageAttachment | null;
+  /** modal (vim) keybindings in the input box */
+  vim?: boolean;
 }
 
 type Kind = "user" | "assistant" | "reasoning" | "tool" | "diff" | "notice";
@@ -139,7 +141,7 @@ function Working() {
   );
 }
 
-export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval, onClipboardImage }: AppProps) {
+export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval, onClipboardImage, vim }: AppProps) {
   const { exit } = useApp();
   const [history, setHistory] = useState<Item[]>([]);
   const [current, setCurrent] = useState<Item[]>([]);
@@ -315,7 +317,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           ))}
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} isActive={!prompt} working={working} queued={pool.length} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
+      <InputBox status={status} cwd={cwd} isActive={!prompt} working={working} queued={pool.length} vim={vim} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );
 }

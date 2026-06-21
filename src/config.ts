@@ -49,6 +49,8 @@ export interface HaraConfig {
   hooks: HooksConfig;
   /** ping when a (non-trivial) turn finishes: off | bell (terminal BEL) | system (OS notification + bell) */
   notify: NotifyMode;
+  /** modal (vim) keybindings in the TUI input box (opt-in) */
+  vimMode: boolean;
   mcpServers: Record<string, McpServerConfig>;
   cwd: string;
 }
@@ -64,7 +66,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "notify"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "notify", "vimMode"] as const;
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
@@ -162,8 +164,9 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   };
   const hooks = (merged.hooks && typeof merged.hooks === "object" ? merged.hooks : {}) as HooksConfig;
   const notify = (process.env.HARA_NOTIFY ?? merged.notify ?? "off") as NotifyMode;
+  const vimMode = process.env.HARA_VIM === "1" || merged.vimMode === true || merged.vimMode === "true";
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, hooks, notify, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, hooks, notify, vimMode, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

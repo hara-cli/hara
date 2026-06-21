@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.59.0 — unreleased (vim keybindings in the input box)
+
+- **Vim mode** (opt-in: `hara config set vimMode true`, or `HARA_VIM=1`). The TUI prompt becomes modal —
+  **Esc** → normal, **i/a/I/A/o** → insert. Normal-mode motions `h l 0 $ w b e` (+ `gg`/`G`), edits
+  `x D C dd cc dw cw`, and paste `p`/`P` with a delete/yank register. A distinct prompt marker (`◆` yellow)
+  + a `-- NORMAL -- / -- INSERT --` hint show the mode. Off by default (normal typing is unchanged). The
+  editing logic is a pure reducer (`src/tui/vim.ts`), fully unit-tested; `hara doctor` shows the input mode.
+
 ## 0.58.0 — unreleased (`hara cron` — scheduled tasks)
 
 - **Scheduled tasks.** `hara cron add "<schedule>" "<task>"` runs a task on a schedule — the fired job is a

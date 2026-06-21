@@ -544,6 +544,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (cfg.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (cfg.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
     `${dot} notify ${cfg.notify === "off" ? c.dim("off — hara config set notify bell|system") : c.bold(cfg.notify)}`,
     `${dot} cron ${(() => { const n = loadJobs().length; return n ? `${n} job(s) · ${isInstalled() ? c.green("scheduler installed") : c.yellow("scheduler off — hara cron install")}` : c.dim("no jobs — hara cron add"); })()}`,
+    `${dot} input ${cfg.vimMode ? c.bold("vim") + c.dim(" (modal)") : c.dim("default — hara config set vimMode true for vim keys")}`,
   ];
   return lines.join("\n");
 }
@@ -1492,6 +1493,7 @@ program.action(async (opts) => {
       header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
       cycleApproval: (m) => cycleMode(m),
       onClipboardImage: readClipboardImage,
+      vim: cfg.vimMode,
       onSubmit: async (line, h, images) => {
         if (line.startsWith("/")) {
           const [nm, ...rest] = line.slice(1).split(/\s+/);
