@@ -1486,6 +1486,19 @@ program.action(async (opts) => {
         history.push({ role: "user", content: userContent, ...(ri.attach?.length ? { images: ri.attach } : {}) });
         const beforeIn = stats.input;
         const beforeOut = stats.output;
+        // Type-ahead steering: fold messages typed mid-turn into the next model call instead of waiting
+        // for the turn to end (codex-style) — so a clarification/addition course-corrects the live task.
+        const pendingInput = async (): Promise<NeutralMsg[]> => {
+          const out: NeutralMsg[] = [];
+          for (const it of h.drainQueue()) {
+            const r2 = await resolveImages(it.images, h);
+            const body = expandMentions(it.line, cwd) + (r2.skip ? "" : (r2.extraText ?? ""));
+            const attach = !r2.skip && r2.attach?.length ? r2.attach : undefined;
+            if (!body.trim() && !attach) continue; // image-only message whose image was skipped → nothing to add
+            out.push({ role: "user", content: `[I sent this while you were working on the above]\n\n${body}`, ...(attach ? { images: attach } : {}) });
+          }
+          return out;
+        };
         await runAgent(history, {
           provider,
           ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot, locate: locateScreenshot },
@@ -1496,6 +1509,7 @@ program.action(async (opts) => {
           projectContext,
           stats,
           signal: h.signal,
+          pendingInput,
         });
         if (!meta.title) {
           meta.title = await nameSession(provider, history);

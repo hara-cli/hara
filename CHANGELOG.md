@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.52.0 — unreleased (type-ahead steering — mid-turn messages course-correct the live task)
+
+- **Type-ahead now *steers* the running turn** instead of waiting for it to finish. Previously a message
+  typed while hara worked was held and replayed as a brand-new turn once the turn ended — so a
+  supplement ("also handle the error case", "use TS not JS") arrived *after* the task had already
+  finished on the old understanding, becoming rework. Now, studying how **codex** does it (its
+  `pending_input` drains at the next model-call boundary *inside* the same turn) vs **cc-haha/Claude
+  Code** (waits for full completion), hara adopts the codex model: queued messages are **folded into the
+  next model call** (drained after each tool round), so the model course-corrects mid-task. Each shows
+  inline in the transcript at the point it's folded in. Messages typed during the *final* step (no more
+  tool rounds) still start a fresh turn; **Esc** drops the queue and stops.
+- New `RunOpts.pendingInput` (the loop drains it before each model call; unused outside the TUI = zero
+  change for `-p`/sub-agents/plain REPL). The TUI hands the queue through `Helpers.drainQueue`.
+- **`toAnthropic` now coalesces consecutive `user` messages** — required since a steered message lands
+  right after tool-results (which map to a `user` message) and Anthropic rejects two `user` turns in a
+  row. Dormant in normal alternating histories. Unit-tested.
+
 ## 0.51.0 — unreleased (lifecycle hooks — PreToolUse / PostToolUse)
 
 - **Hooks dispatch** — run your own shell commands around every tool call (codex / Claude-Code parity, which

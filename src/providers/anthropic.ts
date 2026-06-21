@@ -4,6 +4,19 @@ import { imageToBase64 } from "../images.js";
 
 export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
   const msgs: Anthropic.MessageParam[] = [];
+  // Append a user message, merging into the previous one if it's also `user` — Anthropic requires
+  // alternating roles, and tool-results map to a user message, so a mid-turn-injected user message
+  // (type-ahead steering) lands right after one. Merging keeps the request valid; dormant otherwise.
+  const pushUser = (content: string | Anthropic.ContentBlockParam[]): void => {
+    const last = msgs[msgs.length - 1];
+    if (last && last.role === "user") {
+      const toBlocks = (c: typeof last.content): Anthropic.ContentBlockParam[] =>
+        typeof c === "string" ? [{ type: "text", text: c }] : c;
+      last.content = [...toBlocks(last.content), ...toBlocks(content)];
+    } else {
+      msgs.push({ role: "user", content });
+    }
+  };
   for (const m of history) {
     if (m.role === "user") {
       if (m.images?.length) {
@@ -13,9 +26,9 @@ export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
           const data = imageToBase64(img.path);
           if (data) blocks.push({ type: "image", source: { type: "base64", media_type: img.mediaType as Anthropic.Base64ImageSource["media_type"], data } });
         }
-        msgs.push({ role: "user", content: blocks.length ? blocks : m.content });
+        pushUser(blocks.length ? blocks : m.content);
       } else {
-        msgs.push({ role: "user", content: m.content });
+        pushUser(m.content);
       }
     } else if (m.role === "assistant") {
       const content: Anthropic.ContentBlockParam[] = [];
@@ -23,15 +36,14 @@ export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
       for (const tu of m.toolUses) content.push({ type: "tool_use", id: tu.id, name: tu.name, input: tu.input });
       msgs.push({ role: "assistant", content: content.length ? content : [{ type: "text", text: "(no output)" }] });
     } else {
-      msgs.push({
-        role: "user",
-        content: m.results.map((r) => ({
+      pushUser(
+        m.results.map((r) => ({
           type: "tool_result" as const,
           tool_use_id: r.id,
           content: r.content,
           is_error: r.isError,
         })),
-      });
+      );
     }
   }
   return msgs;

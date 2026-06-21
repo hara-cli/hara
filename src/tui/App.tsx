@@ -32,6 +32,9 @@ export interface Helpers {
   signal: AbortSignal;
   exit: () => void;
   approval: Approval;
+  /** Type-ahead steering: drain messages queued while the turn ran (shows each inline), for the
+   *  runner to inject before the next model call. Returns [] when nothing is queued. */
+  drainQueue: () => { line: string; images?: ImageAttachment[] }[];
 }
 export interface AppProps {
   initialStatus: Status;
@@ -168,6 +171,18 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     });
   }, []);
 
+  // Type-ahead steering: hand the runner everything queued while the turn ran, showing each message
+  // inline (as a user block) at the point it gets folded into the conversation. Drained mid-turn so an
+  // addition reaches the model on its next call; whatever's still queued at turn end is the effect below.
+  const drainQueue = useCallback((): { line: string; images?: ImageAttachment[] }[] => {
+    if (!queueRef.current.length) return [];
+    const batch = queueRef.current;
+    queueRef.current = [];
+    setPool([]);
+    for (const b of batch) pushCurrent("user", b.line.trim() || "🖼 (image)");
+    return batch;
+  }, [pushCurrent]);
+
   const handleSubmit = useCallback(
     async (line: string, images?: ImageAttachment[]): Promise<void> => {
       const t = line.trim();
@@ -206,7 +221,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       const selectFn = (title: string, options: { label: string; value: string }[]): Promise<string> => openPrompt(title, options);
       const setApprovalFn = (m: Approval): void => setStatus((s) => ({ ...s, approval: m }));
       try {
-        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval }, images);
+        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval, drainQueue }, images);
       } catch (e: unknown) {
         pushCurrent("notice", `error: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -220,7 +235,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       setWorking(false);
       ctrlRef.current = null;
     },
-    [working, prompt, onSubmit, pushCurrent, model, exit],
+    [working, prompt, onSubmit, pushCurrent, model, exit, drainQueue],
   );
 
   // Drain the type-ahead pool: when the turn finishes (working → false) and nothing awaits a choice, COALESCE

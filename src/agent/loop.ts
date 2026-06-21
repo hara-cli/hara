@@ -61,6 +61,10 @@ export interface RunOpts {
   signal?: AbortSignal;
   /** suppress streaming/tool output (sub-agents running in parallel) */
   quiet?: boolean;
+  /** Type-ahead steering (TUI): pull messages the user submitted *while this turn was running* and
+   *  inject them before the next model call — so an addition/clarification reaches the model mid-task
+   *  (codex-style) instead of waiting for the turn to end. Returns image-resolved user messages, or []. */
+  pendingInput?: () => Promise<NeutralMsg[]>;
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
@@ -68,6 +72,11 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   const { provider, ctx } = opts;
 
   for (;;) {
+    // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
+    // reaches the model on this next call (drained after the last tool round; empty on the 1st pass).
+    if (opts.pendingInput) {
+      for (const m of await opts.pendingInput()) history.push(m);
+    }
     const specs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
     const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
     const tty = stdout.isTTY && !opts.quiet && !sink;
