@@ -28,6 +28,7 @@ import {
 } from "./config.js";
 import { runAgent } from "./agent/loop.js";
 import { notifyDone } from "./notify.js";
+import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { getTools } from "./tools/registry.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
@@ -428,7 +429,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} vision · ${c.bold(cfg.model)} ${vdesc}${cfg.visionModel ? c.dim(" · describer ") + c.bold(cfg.visionModel) : vcap === "text" ? c.yellow(" · set /vision <model>") : ""}`,
     `${dot} screen ${cfg.computerUse === "off" ? c.dim("off (hara config set computerUse read|click|full)") : c.bold(cfg.computerUse) + c.dim(` · ${computerBackends()}${cfg.computerApps.length ? " · apps: " + cfg.computerApps.join(", ") : " · no app allowlist"}`)}`,
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
-    `${dot} mcp servers ${c.dim(String(Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length))}`,
+    `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
     `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (cfg.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (cfg.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
     `${dot} notify ${cfg.notify === "off" ? c.dim("off — hara config set notify bell|system") : c.bold(cfg.notify)}`,
   ];
@@ -611,6 +612,16 @@ program
   .command("doctor")
   .description("check your hara setup (provider / auth / model / node / assets / roles)")
   .action(() => out(runDoctor(loadConfig()) + "\n"));
+
+program
+  .command("mcp")
+  .description("run hara as an MCP server (stdio) — expose its read/search tools (incl. codebase_search) to other MCP clients")
+  .action(async () => {
+    const cfg = loadConfig();
+    // stdout is the JSON-RPC transport — diagnostics MUST go to stderr only.
+    process.stderr.write(c.dim(`hara mcp · serving over stdio · cwd ${cfg.cwd}\n  tools: ${mcpServeToolNames().join(", ") || "(none)"}\n  (read-only by default; set HARA_MCP_TOOLS to override)\n`));
+    await startMcpServer(pkg.version, { cwd: cfg.cwd, sandbox: "read-only" });
+  });
 
 program
   .command("review")

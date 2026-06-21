@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.54.0 — unreleased (`hara mcp` — run hara as an MCP server)
+
+- **MCP server mode** — `hara mcp` runs hara as an MCP server over stdio, so other MCP clients (Claude
+  Desktop, Cursor, another hara…) can call its tools. hara was already an MCP *client*; this completes
+  the loop. The high-value one is **`codebase_search`** — point any MCP client at a repo and it gets
+  hara's semantic/lexical code search, plus `read_file`/`grep`/`glob`/`ls`/`web_fetch`/`web_search`.
+  **Read-only by default** — no `edit_file`/`bash`/`computer`, so an external client can't mutate your
+  machine through hara; override the exposed set with `HARA_MCP_TOOLS=a,b,c` at your own risk. Reuses
+  hara's tool registry (`src/mcp/server.ts`, built on `@modelcontextprotocol/sdk` — already a dep).
+  Verified end-to-end (a real MCP client lists the tools + calls `ls`/`codebase_search`). `hara doctor`
+  now shows both the client (servers connected) and serve (tools exposed) sides.
+
+  ```jsonc
+  // e.g. in a client's mcpServers config:
+  "hara": { "command": "hara", "args": ["mcp"] }   // run from the repo you want searchable
+  ```
+
 ## 0.53.0 — unreleased (task-done notifications + steering in plan mode)
 
 - **Notifications** — get pinged when a turn finishes so you can walk away during a long run
