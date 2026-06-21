@@ -5,6 +5,7 @@ import { c, out } from "../ui.js";
 import { activity } from "../activity.js";
 import { makeRenderer } from "../md.js";
 import { skillsDigest } from "../skills/skills.js";
+import { runHooks } from "../hooks.js";
 import type { ApprovalMode } from "../config.js";
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
@@ -182,8 +183,14 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       }
       activity.inc();
       try {
+        const pre = runHooks("PreToolUse", p.tu.name, p.tu.input, ctx.cwd); // a hook may veto the call
+        if (pre.block) {
+          results[idx] = { id: p.tu.id, name: p.tu.name, content: pre.message, isError: true };
+          return;
+        }
         const res = await p.tool!.run(p.tu.input, ctx);
         results[idx] = { id: p.tu.id, name: p.tu.name, content: res };
+        runHooks("PostToolUse", p.tu.name, { input: p.tu.input, result: res }, ctx.cwd); // observe-only
       } catch (e: any) {
         results[idx] = { id: p.tu.id, name: p.tu.name, content: `Error: ${e.message}`, isError: true };
       } finally {

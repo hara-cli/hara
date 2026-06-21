@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { readRawConfig } from "../config.js";
 import type { McpServerConfig } from "../config.js";
+import type { HooksConfig } from "../hooks.js";
 
 export interface PluginManifest {
   name: string;
@@ -16,7 +17,7 @@ export interface PluginManifest {
   skills?: string[]; // dirs (each holds <name>/SKILL.md), relative to the plugin root
   agents?: string[]; // dirs of role/subagent *.md, relative to the plugin root
   mcpServers?: Record<string, McpServerConfig>;
-  hooks?: unknown; // S4
+  hooks?: HooksConfig; // PreToolUse/PostToolUse shell commands
 }
 export interface Plugin {
   name: string;
@@ -82,6 +83,17 @@ export function pluginRoleDirs(): string[] {
 export function pluginMcpServers(): Record<string, McpServerConfig> {
   const out: Record<string, McpServerConfig> = {};
   for (const p of enabledPlugins()) Object.assign(out, p.manifest.mcpServers ?? {});
+  return out;
+}
+/** Lifecycle hooks contributed by enabled plugins (appended after user-config hooks). */
+export function pluginHooks(): HooksConfig {
+  const out: HooksConfig = { PreToolUse: [], PostToolUse: [] };
+  for (const p of enabledPlugins()) {
+    const h = p.manifest.hooks;
+    if (!h || typeof h !== "object") continue;
+    if (Array.isArray(h.PreToolUse)) out.PreToolUse!.push(...h.PreToolUse);
+    if (Array.isArray(h.PostToolUse)) out.PostToolUse!.push(...h.PostToolUse);
+  }
   return out;
 }
 

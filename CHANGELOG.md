@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.51.0 — unreleased (lifecycle hooks — PreToolUse / PostToolUse)
+
+- **Hooks dispatch** — run your own shell commands around every tool call (codex / Claude-Code parity, which
+  hara lacked). A **`PreToolUse`** hook runs *before* a tool and can **veto** it (non-zero exit blocks the
+  call; its stdout/stderr becomes the denial the model sees) — e.g. forbid `bash rm -rf`, gate edits to a
+  path, require a clean tree. A **`PostToolUse`** hook runs *after* (observe-only) — e.g. `prettier` a file
+  the agent just wrote, log/notify. The command gets `{tool, payload}` as JSON on stdin + `HARA_TOOL_NAME`
+  in its env; each is matched by a `matcher` (regex/literal on the tool name, `*`/omitted = all) with a 30s
+  timeout. Configure in `config.json` `"hooks"`; **plugins can contribute hooks** too. `hara doctor` shows
+  the active count. No hooks configured = zero overhead (fast no-op).
+
+  ```jsonc
+  // ~/.hara/config.json
+  "hooks": {
+    "PreToolUse":  [{ "matcher": "bash", "command": "grep -q 'rm -rf' && { echo 'no rm -rf'; exit 1; } || exit 0" }],
+    "PostToolUse": [{ "matcher": "edit_file|write_file", "command": "prettier --write \"$(jq -r .payload.input.path)\" 2>/dev/null; exit 0" }]
+  }
+  ```
+
 ## 0.50.0 — unreleased (web_search — find pages, not just fetch)
 
 - New **`web_search`** tool — search the web (title/URL/snippet), then `web_fetch` a result to read it. Closes

@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import type { SandboxMode } from "./sandbox.js";
+import type { HooksConfig } from "./hooks.js";
 
 export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
@@ -43,6 +44,8 @@ export interface HaraConfig {
   embedModel: string | undefined;
   embedBaseURL: string | undefined;
   embedApiKey: string | undefined;
+  /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
+  hooks: HooksConfig;
   mcpServers: Record<string, McpServerConfig>;
   cwd: string;
 }
@@ -154,8 +157,9 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
     ...(project.mcpServers ?? {}),
     ...(profile.mcpServers ?? {}),
   };
+  const hooks = (merged.hooks && typeof merged.hooks === "object" ? merged.hooks : {}) as HooksConfig;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, hooks, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {
