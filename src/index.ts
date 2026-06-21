@@ -27,6 +27,7 @@ import {
   type ApprovalMode,
 } from "./config.js";
 import { runAgent } from "./agent/loop.js";
+import { notifyDone } from "./notify.js";
 import { getTools } from "./tools/registry.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
@@ -429,6 +430,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
     `${dot} mcp servers ${c.dim(String(Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length))}`,
     `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (cfg.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (cfg.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
+    `${dot} notify ${cfg.notify === "off" ? c.dim("off — hara config set notify bell|system") : c.bold(cfg.notify)}`,
   ];
   return lines.join("\n");
 }
@@ -1427,6 +1429,21 @@ program.action(async (opts) => {
         }
         const ui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
         const appr = h.approval;
+        // Type-ahead steering: fold messages typed mid-turn into the next model call (codex-style) so a
+        // clarification/addition course-corrects the live task, rather than waiting for a fresh turn.
+        // Shared by every turn below (plan investigate, plan execute, and the regular turn).
+        const pendingInput = async (): Promise<NeutralMsg[]> => {
+          const out: NeutralMsg[] = [];
+          for (const it of h.drainQueue()) {
+            const r2 = await resolveImages(it.images, h);
+            const body = expandMentions(it.line, cwd) + (r2.skip ? "" : (r2.extraText ?? ""));
+            const attach = !r2.skip && r2.attach?.length ? r2.attach : undefined;
+            if (!body.trim() && !attach) continue; // image-only message whose image was skipped → nothing to add
+            out.push({ role: "user", content: `[I sent this while you were working on the above]\n\n${body}`, ...(attach ? { images: attach } : {}) });
+          }
+          return out;
+        };
+        const turnStart = Date.now(); // for the task-done notification (gated on elapsed)
         if (appr === "plan") {
           // PLAN MODE: read-only investigate → propose a plan → selectable proceed → execute.
           const planImg = await resolveImages(images, h);
@@ -1446,6 +1463,7 @@ program.action(async (opts) => {
             projectContext,
             stats,
             signal: h.signal,
+            pendingInput,
           });
           if (!meta.title) {
             meta.title = await nameSession(provider, history);
@@ -1473,10 +1491,12 @@ program.action(async (opts) => {
               projectContext,
               stats,
               signal: h.signal,
+              pendingInput,
             });
             h.sink.usage(stats.input - xin, stats.output - xout);
             saveSession(meta, history);
           }
+          notifyDone(cfg.notify, { message: meta.title || "plan turn complete", elapsedMs: Date.now() - turnStart });
           return;
         }
         const ri = await resolveImages(images, h);
@@ -1486,19 +1506,6 @@ program.action(async (opts) => {
         history.push({ role: "user", content: userContent, ...(ri.attach?.length ? { images: ri.attach } : {}) });
         const beforeIn = stats.input;
         const beforeOut = stats.output;
-        // Type-ahead steering: fold messages typed mid-turn into the next model call instead of waiting
-        // for the turn to end (codex-style) — so a clarification/addition course-corrects the live task.
-        const pendingInput = async (): Promise<NeutralMsg[]> => {
-          const out: NeutralMsg[] = [];
-          for (const it of h.drainQueue()) {
-            const r2 = await resolveImages(it.images, h);
-            const body = expandMentions(it.line, cwd) + (r2.skip ? "" : (r2.extraText ?? ""));
-            const attach = !r2.skip && r2.attach?.length ? r2.attach : undefined;
-            if (!body.trim() && !attach) continue; // image-only message whose image was skipped → nothing to add
-            out.push({ role: "user", content: `[I sent this while you were working on the above]\n\n${body}`, ...(attach ? { images: attach } : {}) });
-          }
-          return out;
-        };
         await runAgent(history, {
           provider,
           ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot, locate: locateScreenshot },
@@ -1516,6 +1523,7 @@ program.action(async (opts) => {
           h.sink.session(meta.title);
         }
         h.sink.usage(stats.input - beforeIn, stats.output - beforeOut);
+        notifyDone(cfg.notify, { message: meta.title || "turn complete", elapsedMs: Date.now() - turnStart });
         saveSession(meta, history);
       },
     });
@@ -1561,6 +1569,7 @@ program.action(async (opts) => {
     recalledContext = "";
     history.push({ role: "user", content: userContent });
     currentTurn = new AbortController();
+    const t0 = Date.now();
     try {
       await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal });
     } catch (e: any) {
@@ -1568,6 +1577,7 @@ program.action(async (opts) => {
     } finally {
       currentTurn = null;
     }
+    notifyDone(cfg.notify, { message: meta.title || "turn complete", elapsedMs: Date.now() - t0 });
     if (!meta.title) meta.title = await nameSession(provider, history);
     if (bar.isActive()) {
       bar.update({

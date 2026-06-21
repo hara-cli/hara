@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.53.0 — unreleased (task-done notifications + steering in plan mode)
+
+- **Notifications** — get pinged when a turn finishes so you can walk away during a long run
+  (codex/Claude-Code parity). `hara config set notify bell` rings the terminal BEL; `notify system` fires
+  an OS notification (macOS `osascript` / Linux `notify-send`) plus the bell; default `off`. Gated on
+  elapsed time (≥8s) so quick turns you were watching stay silent. Wired into the TUI turn, plan-mode
+  execute, and the plain REPL; `hara doctor` shows the setting. New `src/notify.ts` (`notifyDone`).
+- **Type-ahead steering now covers plan mode too.** v0.52 wired steering into the regular turn only;
+  the `pendingInput` builder is now hoisted so plan-mode *investigation* and *execution* also fold in
+  messages you type mid-turn (previously they fell back to the old wait-for-turn-end behavior — an
+  inconsistency). All three turn paths now steer.
+
 ## 0.52.0 — unreleased (type-ahead steering — mid-turn messages course-correct the live task)
 
 - **Type-ahead now *steers* the running turn** instead of waiting for it to finish. Previously a message
