@@ -64,6 +64,7 @@ export function cleanSessionName(raw: string): string {
  *  (unlike the ASCII-slug `cleanSessionName`), trims code/whitespace, caps length. Empty for blank input
  *  (callers fall back to the short id, never "new session"). */
 export function deriveTitle(text: string): string {
+  if (typeof text !== "string") return ""; // a malformed/hand-edited session may have a non-string content
   const t = text
     .replace(/^\/\S+\s*/, "") // drop a leading slash-command
     .replace(/```[\s\S]*?```/g, " ") // drop fenced code blocks
@@ -100,11 +101,18 @@ export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {
   writeFileSync(sessionFile(meta.id), JSON.stringify(data, null, 2), "utf8");
 }
 
+/** True if a parsed object has the SessionData shape we can safely use (meta object + history array). */
+function isSessionData(d: unknown): d is SessionData {
+  const o = d as { meta?: unknown; history?: unknown } | null;
+  return !!o && typeof o === "object" && !!o.meta && typeof o.meta === "object" && Array.isArray(o.history);
+}
+
 export function loadSession(id: string): SessionData | null {
   const p = sessionFile(id);
   if (!existsSync(p)) return null;
   try {
-    return JSON.parse(readFileSync(p, "utf8")) as SessionData;
+    const d = JSON.parse(readFileSync(p, "utf8"));
+    return isSessionData(d) ? d : null; // a corrupt / hand-edited file resumes as "no session" instead of crashing
   } catch {
     return null;
   }
@@ -116,7 +124,8 @@ export function listSessions(cwd?: string): SessionMeta[] {
   for (const f of readdirSync(sessionsDir())) {
     if (!f.endsWith(".json")) continue;
     try {
-      metas.push((JSON.parse(readFileSync(join(sessionsDir(), f), "utf8")) as SessionData).meta);
+      const d = JSON.parse(readFileSync(join(sessionsDir(), f), "utf8")) as { meta?: SessionMeta };
+      if (d?.meta && typeof d.meta === "object" && d.meta.id && d.meta.updatedAt) metas.push(d.meta); // skip metaless/corrupt
     } catch {
       /* skip corrupt */
     }

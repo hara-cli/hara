@@ -232,6 +232,10 @@ turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review
 **Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · **single-binary distribution** · `/compact` context management.
 **Next:** SSOT data authority · an enterprise control-plane (fleet + central token management).
 
+## Security
+
+Human-in-the-loop by default, with a layered model (approval gate · read-only sub-agents · write-confinement sandbox · `web_fetch` SSRF guard · `0600` secrets · reviewed plugin trust). Threat model, controls, and how to report a vulnerability: **[SECURITY.md](SECURITY.md)**.
+
 ## License
 
 Licensed under the **Apache License 2.0** ([LICENSE](LICENSE)) — a permissive license with an

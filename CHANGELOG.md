@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.61.3 — unreleased (audit follow-through: session robustness + SECURITY.md)
+
+- **Corrupt/hand-edited session files no longer crash** `--resume` or `/sessions` (audit M4): `loadSession`
+  validates the shape (meta object + history array), `deriveTitle` tolerates a non-string, and `listSessions`
+  skips metaless files instead of throwing.
+- New **`SECURITY.md`** — the threat model, the controls (approval gate, read-only sub-agents, write-confinement
+  sandbox, `web_fetch` SSRF guard, 0600 secrets, plugin trust), what is deliberately *not* a security boundary,
+  and how to report a vulnerability. Captures the posture from the two audit passes.
+
 ## 0.61.2 — unreleased (security hardening — second audit: SSRF, RPA, secrets)
 
 A second audit (RPA / network / auth / search) found more real issues; fixed:
