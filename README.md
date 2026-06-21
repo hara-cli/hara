@@ -189,7 +189,10 @@ Define role-agents in `.hara/roles/*.md` — each is a persona (the file body) p
 (keywords that route a task here), optional `rejects`, `model`, and `allowTools`/`denyTools`. `hara org
 "<task>"` routes the task to the role that **owns** it (keyword match, LLM fallback) and runs that role's
 agent — e.g. a read-only `reviewer` that reports issues vs an `implementer` that edits code. `hara roles`
-lists them, `hara roles init` scaffolds a starter set, and `--role <id>` forces a specific role. The
+lists them, `hara roles init` scaffolds a starter set, and `--role <id>` forces a specific role. Add
+**`--review`** and the org works like a team: the owning role implements, then a **reviewer** role inspects
+the diff and either approves or sends it back with fixes — looping implement → review → fix until approved
+(or `--rounds N`). The
 **`agent`** tool spawns **parallel read-only sub-agents** for fan-out — analyze / review / search
 several things at once (each can take a `role`).
 
@@ -217,8 +220,8 @@ turn, or **`/undo`** to revert the last edit.
 
 ### Roadmap
 
-**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel sub-agents · `/compact` context management.
-**Next:** parallel plan atoms · multi-role review chains · cron autonomy for the org · single-binary distribution · an enterprise control-plane (fleet + central token management).
+**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · `/compact` context management.
+**Next:** cron autonomy for the org · SSOT data authority · single-binary distribution · an enterprise control-plane (fleet + central token management).
 
 ## License
 

@@ -29,6 +29,7 @@ import {
 import { runAgent } from "./agent/loop.js";
 import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
+import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM } from "./org/review-chain.js";
 import { getTools } from "./tools/registry.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
@@ -115,6 +116,8 @@ interface OrgOpts {
   stats: { input: number; output: number };
   forceRole?: string;
   parallel?: boolean; // execute independent atoms (same dependency wave) concurrently
+  review?: boolean; // after implementing, loop a reviewer role until it approves (implement → review → fix)
+  rounds?: number; // max review rounds (default 3)
 }
 
 /** Dispatch a task to the owning role and run that role's agent (its persona + tool subset + model). */
@@ -158,17 +161,61 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
       : undefined;
 
   const history: NeutralMsg[] = [{ role: "user", content: expandMentions(task, o.cwd) }];
-  await runAgent(history, {
-    provider: roleProvider,
-    ctx: { cwd: o.cwd, sandbox: o.sandbox },
-    approval: o.approval,
-    confirm: o.confirm,
-    projectContext: o.projectContext,
-    memory: memoryDigest(o.cwd),
-    stats: o.stats,
-    systemOverride: role.system,
-    toolFilter,
-  });
+  const runImplementer = (): Promise<void> =>
+    runAgent(history, {
+      provider: roleProvider,
+      ctx: { cwd: o.cwd, sandbox: o.sandbox },
+      approval: o.approval,
+      confirm: o.confirm,
+      projectContext: o.projectContext,
+      memory: memoryDigest(o.cwd),
+      stats: o.stats,
+      systemOverride: role.system,
+      toolFilter,
+    });
+  await runImplementer();
+
+  if (!o.review) return;
+
+  // Review chain: a reviewer role inspects the diff and APPROVES or sends it back, looping until clean.
+  const reviewer = roles.find((r) => r.id === "reviewer");
+  const revProvider =
+    reviewer?.model && reviewer.model !== o.cfg.model ? ((await buildProvider({ ...o.cfg, model: reviewer.model })) ?? o.baseProvider) : o.baseProvider;
+  const revSystem = reviewer?.system ?? REVIEWER_SYSTEM;
+  const revTools = reviewer?.allowTools ? (n: string) => reviewer.allowTools!.includes(n) : (n: string) => READONLY_TOOLS.has(n);
+  const maxRounds = Math.max(1, o.rounds ?? 3);
+  for (let round = 1; round <= maxRounds; round++) {
+    const changes = captureChanges(o.cwd);
+    if (!changes.diff && !changes.newFiles.length) {
+      out(c.dim("(no changes to review)\n"));
+      return;
+    }
+    out(c.dim(`🔍 reviewer · round ${round}/${maxRounds}\n`));
+    const rHist: NeutralMsg[] = [{ role: "user", content: reviewPrompt(task, changes) }];
+    await runAgent(rHist, {
+      provider: revProvider,
+      ctx: { cwd: o.cwd, sandbox: o.sandbox },
+      approval: "full-auto", // reviewer is read-only via revTools, so nothing to confirm
+      confirm: o.confirm,
+      projectContext: o.projectContext,
+      memory: memoryDigest(o.cwd),
+      stats: o.stats,
+      systemOverride: revSystem,
+      toolFilter: revTools,
+    });
+    const verdict = parseVerdict(lastAssistantText(rHist));
+    if (verdict.approved) {
+      out(c.green(`✓ reviewer approved after ${round} round(s)\n`));
+      return;
+    }
+    if (round === maxRounds) {
+      out(c.yellow(`⚠ stopped after ${maxRounds} round(s) — reviewer still wants changes.\n`));
+      return;
+    }
+    out(c.yellow(`✗ changes requested — back to ${role.id} (round ${round})\n`));
+    history.push({ role: "user", content: fixPrompt(verdict.issues) });
+    await runImplementer();
+  }
 }
 
 function lastAssistantText(history: NeutralMsg[]): string {
@@ -498,9 +545,11 @@ program
 
 program
   .command("org <task...>")
-  .description("dispatch a task to the owning role and run it")
+  .description("dispatch a task to the owning role and run it (--review loops a reviewer until it approves)")
   .option("--role <id>", "force a specific role")
-  .action(async (taskParts: string[], opts2: { role?: string }) => {
+  .option("--review", "after implementing, loop a reviewer role until it approves (implement → review → fix)")
+  .option("--rounds <n>", "max review rounds with --review (default 3)", (v) => parseInt(v, 10))
+  .action(async (taskParts: string[], opts2: { role?: string; review?: boolean; rounds?: number }) => {
     const cfg = loadConfig();
     const provider = await buildProvider(cfg);
     if (!provider) {
@@ -518,6 +567,8 @@ program
       projectContext: loadAgentsMd(cfg.cwd) || undefined,
       stats,
       forceRole: opts2.role,
+      review: opts2.review,
+      rounds: opts2.rounds,
     });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });

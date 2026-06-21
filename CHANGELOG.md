@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.55.0 — unreleased (multi-role review chain — `hara org --review`)
+
+- **Review chains** — `hara org --review "<task>"` runs the org like an actual engineering team: the owning
+  role implements, then a **reviewer** role inspects the diff and either **approves** or sends it back with
+  concrete fixes, looping implement → review → fix until approved or a round cap (`--rounds`, default 3).
+  This is hara's differentiation — not "one agent + temp sub-agents" but roles that hold each other to a
+  bar. The reviewer is read-only (uses your `reviewer` role if defined, else a built-in persona) and ends
+  with a machine-parseable `VERDICT: APPROVED | CHANGES_REQUESTED`; on changes-requested the issues feed
+  back into the implementer's own conversation so it keeps context. New `src/org/review-chain.ts` (verdict
+  parsing, non-destructive `git diff HEAD` capture, prompts) — all unit-tested. **Verified live end-to-end**
+  (implementer edits a file → reviewer approves → loop exits).
+
 ## 0.54.0 — unreleased (`hara mcp` — run hara as an MCP server)
 
 - **MCP server mode** — `hara mcp` runs hara as an MCP server over stdio, so other MCP clients (Claude
