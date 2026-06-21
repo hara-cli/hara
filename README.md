@@ -213,7 +213,7 @@ A streaming agentic loop with built-in tools — `read_file`, `write_file`, **`e
 read-only **`grep`** / **`glob`** / **`ls`** / **`web_fetch`** — behind a human-in-the-loop confirmation gate on the
 dangerous ones unless `-y`. Read-only tools run in parallel within a turn, and edits print a
 **colored diff** of what changed. Shell output streams live; press **Esc** to interrupt a running
-turn, or **`/undo`** to revert the last edit.
+turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review`**, and **`/commit`** close the change → review → commit loop without leaving the prompt.
 - **Type-ahead steering**: keep typing while hara works — your message is held, then **folded into the next model call** (not deferred to a new turn), so a clarification or "also do X" course-corrects the task already in flight (codex-style). Messages typed after the final step start a fresh turn; **Esc** drops the queue and stops.
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
 - **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. `@<dir>` loads a directory listing, `@src/`+Tab drills into a folder, and mistyped tool/file paths get a "did you mean" suggestion.

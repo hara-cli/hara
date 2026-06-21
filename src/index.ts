@@ -1546,6 +1546,45 @@ program.action(async (opts) => {
             h.setApproval(m);
             return void h.sink.notice(`(approval → ${m})`);
           }
+          if (nm === "diff") {
+            try {
+              const d = (await runShell(arg === "staged" ? "git diff --staged" : "git diff HEAD", cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout.trim();
+              if (!d) return void h.sink.notice(arg === "staged" ? "(nothing staged)" : "(no changes vs HEAD — /diff staged for the index)");
+              return void h.sink.diff(d.length > 12_000 ? d.slice(0, 12_000) + "\n…[truncated]" : d);
+            } catch {
+              return void h.sink.notice("(git diff failed — is this a git repo?)");
+            }
+          }
+          if (nm === "commit") {
+            h.sink.notice("✻ writing a commit message…");
+            const r = await autoCommit(provider, cwd); // stages all + commits with an AI message
+            return void h.sink.notice(r.startsWith("error:") ? `✗ ${r}` : r === "nothing to commit" ? "(nothing to commit — make or stage changes first)" : `✓ committed · ${r.slice(0, 100)}`);
+          }
+          if (nm === "review") {
+            let diff = "";
+            try {
+              diff = (await runShell("git diff HEAD", cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout;
+            } catch {
+              /* not a git repo → empty */
+            }
+            if (!diff.trim()) return void h.sink.notice("(nothing to review — no changes vs HEAD)");
+            const rui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
+            const xin = stats.input;
+            const xout = stats.output;
+            await runAgent([{ role: "user", content: `Review this diff:\n\n\`\`\`diff\n${diff.slice(0, 120_000)}\n\`\`\`` }], {
+              provider,
+              ctx: { cwd, sandbox, ui: rui },
+              approval: "full-auto", // read-only via the tool filter, so nothing prompts
+              confirm: h.confirm,
+              toolFilter: (n) => READONLY_TOOLS.has(n),
+              systemOverride: REVIEW_SYSTEM,
+              memory: buildMemory(),
+              stats,
+              signal: h.signal,
+            });
+            h.sink.usage(stats.input - xin, stats.output - xout);
+            return;
+          }
           if (byName.has(nm))
             return void h.sink.notice(`/${nm} isn't wired into the TUI yet — use \`hara ${nm} …\` as a subcommand, or HARA_TUI=0.`);
           const near = nearest(nm, [...byName.keys()]);

@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.57.0 — unreleased (in-session `/diff`, `/review`, `/commit` in the TUI)
+
+- The default TUI now wires three more slash commands so the **change → review → commit** loop happens
+  in-session instead of dropping to a subcommand (they used to print "isn't wired into the TUI yet"):
+  - **`/diff`** — show the working-tree diff vs HEAD (`/diff staged` for the index), rendered as a colored diff block. No model call.
+  - **`/review`** — a senior-reviewer pass over `git diff HEAD` (read-only), streamed inline.
+  - **`/commit`** — stage everything and commit with an AI-written message (reuses the review→commit machinery).
+  Reuses existing, already-verified pieces (`autoCommit`, `REVIEW_SYSTEM`, `runShell`). Other subcommands
+  (`init`/`index`/`plan`/`org`/…) still point you to `hara <cmd>` or `HARA_TUI=0`.
+
 ## 0.56.0 — unreleased (review → commit capstone + robust verdict parsing)
 
 - **`hara org --review --commit`** closes the loop: once the reviewer approves, hara stages the work and
