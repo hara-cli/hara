@@ -192,7 +192,8 @@ agent — e.g. a read-only `reviewer` that reports issues vs an `implementer` th
 lists them, `hara roles init` scaffolds a starter set, and `--role <id>` forces a specific role. Add
 **`--review`** and the org works like a team: the owning role implements, then a **reviewer** role inspects
 the diff and either approves or sends it back with fixes — looping implement → review → fix until approved
-(or `--rounds N`). The
+(or `--rounds N`). Add **`--commit`** and it commits the approved result with an AI-written message (guarded
+to a clean start tree; a review that doesn't pass leaves the work uncommitted). The
 **`agent`** tool spawns **parallel read-only sub-agents** for fan-out — analyze / review / search
 several things at once (each can take a `role`).
 

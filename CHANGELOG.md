@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.56.0 — unreleased (review → commit capstone + robust verdict parsing)
+
+- **`hara org --review --commit`** closes the loop: once the reviewer approves, hara stages the work and
+  commits it with an AI-written message (reusing `hara commit`'s generation). **Guarded** — it only
+  auto-commits when the working tree was **clean before the run** (so it captures this run's work, never
+  pre-existing WIP), and with `--review` only **after approval** (a review that doesn't pass leaves the
+  changes in your tree, uncommitted). `--commit` works without `--review` too (commit the implementer's
+  result). Verified live end-to-end: implement → review → approve → `✓ committed`.
+- **Robust verdict parsing** (hardening v0.55, found via live smokes). Real models don't emit the literal
+  `VERDICT: APPROVED` token — across runs glm-5 wrote `**VERDICT**: No issues found`, `**VERDICT**: PASS`,
+  and `VERDICT: LGTM`. The parser now anchors on a markdown-tolerant `VERDICT` marker and **classifies the
+  phrase after it** (approve vs changes synonyms), with a changes-signal veto and an ambiguous-→-not-approved
+  safe default (worst case is one extra review round, never a bad auto-commit). `not approved` correctly
+  vetoes despite containing "approv". Unit tests now cover the exact shapes seen in live runs.
+
 ## 0.55.0 — unreleased (multi-role review chain — `hara org --review`)
 
 - **Review chains** — `hara org --review "<task>"` runs the org like an actual engineering team: the owning

@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM } from "../dist/org/review-chain.js";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "../dist/org/review-chain.js";
 
 test("parseVerdict: APPROVED", () => {
   assert.equal(parseVerdict("Looks correct and safe.\nVERDICT: APPROVED").approved, true);
@@ -21,9 +25,25 @@ test("parseVerdict: no verdict line → NOT approved (never assume approval we c
   assert.equal(parseVerdict("seems fine to me?").approved, false);
 });
 
-test("parseVerdict: tolerates markdown / quote prefixes on the verdict line", () => {
+test("parseVerdict: tolerates markdown around the marker AND the token (real model drift)", () => {
   assert.equal(parseVerdict("> **VERDICT: APPROVED**").approved, true);
   assert.equal(parseVerdict("- VERDICT: CHANGES_REQUESTED").approved, false);
+  assert.equal(parseVerdict("**VERDICT**: APPROVED").approved, true);
+  assert.equal(parseVerdict("**VERDICT**: CHANGES_REQUESTED").approved, false);
+  assert.equal(parseVerdict("VERDICT** : CHANGES REQUESTED").approved, false);
+});
+
+test("parseVerdict: recognizes natural-language verdicts (the exact shapes glm-5 emitted in live smokes)", () => {
+  assert.equal(parseVerdict("**VERDICT**: PASS").approved, true);
+  assert.equal(parseVerdict("**VERDICT**: No issues found. Looks great!").approved, true);
+  assert.equal(parseVerdict("VERDICT: LGTM").approved, true);
+  assert.equal(parseVerdict("VERDICT: FAIL — see notes above").approved, false);
+  assert.equal(parseVerdict("VERDICT: Rejected, needs rework").approved, false);
+  assert.equal(parseVerdict("VERDICT: not approved — fix the leak").approved, false, "'not approved' must veto despite containing 'approv'");
+});
+
+test("parseVerdict: a VERDICT with an ambiguous phrase stays NOT approved (never a blind auto-approve)", () => {
+  assert.equal(parseVerdict("VERDICT: done").approved, false);
 });
 
 test("reviewPrompt: task + diff fence + new files + asks for a verdict", () => {
@@ -53,4 +73,29 @@ test("captureChanges: non-git dir → empty, never throws", () => {
 test("REVIEWER_SYSTEM demands both verdict forms", () => {
   assert.match(REVIEWER_SYSTEM, /VERDICT: APPROVED/);
   assert.match(REVIEWER_SYSTEM, /VERDICT: CHANGES_REQUESTED/);
+});
+
+test("stripCommitFence removes a wrapping markdown fence (any/no language)", () => {
+  assert.equal(stripCommitFence("```\nfix: thing\n```"), "fix: thing");
+  assert.equal(stripCommitFence("```text\nfeat: x\n```"), "feat: x");
+  assert.equal(stripCommitFence("plain subject\n\nbody"), "plain subject\n\nbody");
+});
+
+test("isTreeClean: false for a non-git dir; tracks clean→dirty in a real repo", () => {
+  assert.equal(isTreeClean("/"), false, "non-git → never 'clean' (so we never auto-commit blindly)");
+  const dir = mkdtempSync(join(tmpdir(), "hara-clean-"));
+  const git = (...a) => execFileSync("git", a, { cwd: dir, stdio: "ignore" });
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@t.co");
+    git("config", "user.name", "t");
+    writeFileSync(join(dir, "a.txt"), "1");
+    git("add", "-A");
+    git("commit", "-qm", "init");
+    assert.equal(isTreeClean(dir), true, "clean right after a commit");
+    writeFileSync(join(dir, "a.txt"), "2");
+    assert.equal(isTreeClean(dir), false, "dirty after an edit");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -29,7 +29,7 @@ import {
 import { runAgent } from "./agent/loop.js";
 import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
-import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM } from "./org/review-chain.js";
+import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { getTools } from "./tools/registry.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
@@ -118,6 +118,54 @@ interface OrgOpts {
   parallel?: boolean; // execute independent atoms (same dependency wave) concurrently
   review?: boolean; // after implementing, loop a reviewer role until it approves (implement → review → fix)
   rounds?: number; // max review rounds (default 3)
+  commit?: boolean; // commit the result (with --review: only after approval) — guarded to a clean start tree
+}
+
+/** Stage everything and commit with an AI-written message. Returns a one-line summary or "error: …".
+ *  Used by `hara org --commit`; the caller guards on a clean start tree so this only captures the run's work. */
+async function autoCommit(provider: Provider, cwd: string): Promise<string> {
+  try {
+    await runShell("git add -A", cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
+  } catch {
+    /* fall through — empty diff is reported below */
+  }
+  let diff = "";
+  try {
+    diff = (await runShell("git diff --staged", cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout;
+  } catch (e) {
+    return `error: git diff failed (${e instanceof Error ? e.message : String(e)})`;
+  }
+  if (!diff.trim()) return "nothing to commit";
+  const r = await provider.turn({
+    system: COMMIT_SYSTEM,
+    history: [{ role: "user", content: `Write a commit message for these staged changes:\n\n\`\`\`diff\n${diff.slice(0, 120_000)}\n\`\`\`` }],
+    tools: [],
+    onText: () => {},
+  });
+  const msg = stripCommitFence(r.text);
+  if (!msg) return "error: no commit message produced";
+  const tmp = join(tmpdir(), `hara-org-commit-${process.pid}.txt`);
+  writeFileSync(tmp, msg + "\n", "utf8");
+  try {
+    const res = await runShell(`git commit -F ${JSON.stringify(tmp)}`, cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
+    return (res.stdout || "").trim().split("\n")[0] || "committed";
+  } catch (e) {
+    return `error: git commit failed (${e instanceof Error ? e.message : String(e)})`;
+  } finally {
+    try {
+      rmSync(tmp);
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+}
+
+/** Format an autoCommit result + emit it. */
+async function commitStep(provider: Provider, cwd: string): Promise<void> {
+  const r = await autoCommit(provider, cwd);
+  if (r.startsWith("error:")) out(c.red(`✗ ${r}\n`));
+  else if (r === "nothing to commit") out(c.dim("(nothing to commit)\n"));
+  else out(c.green(`✓ committed · ${r.slice(0, 100)}\n`));
 }
 
 /** Dispatch a task to the owning role and run that role's agent (its persona + tool subset + model). */
@@ -173,9 +221,19 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
       systemOverride: role.system,
       toolFilter,
     });
+  const wasClean = o.commit ? isTreeClean(o.cwd) : false; // capture BEFORE the implementer edits anything
+  const doCommit = async (ok: boolean): Promise<void> => {
+    if (!o.commit) return;
+    if (!ok) return void out(c.yellow("(not committing — review didn't approve; changes left in your working tree)\n"));
+    if (!wasClean) return void out(c.yellow("(not auto-committing — the tree wasn't clean before this run; commit manually)\n"));
+    await commitStep(o.baseProvider, o.cwd);
+  };
   await runImplementer();
 
-  if (!o.review) return;
+  if (!o.review) {
+    await doCommit(true);
+    return;
+  }
 
   // Review chain: a reviewer role inspects the diff and APPROVES or sends it back, looping until clean.
   const reviewer = roles.find((r) => r.id === "reviewer");
@@ -206,10 +264,12 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
     const verdict = parseVerdict(lastAssistantText(rHist));
     if (verdict.approved) {
       out(c.green(`✓ reviewer approved after ${round} round(s)\n`));
+      await doCommit(true);
       return;
     }
     if (round === maxRounds) {
       out(c.yellow(`⚠ stopped after ${maxRounds} round(s) — reviewer still wants changes.\n`));
+      await doCommit(false);
       return;
     }
     out(c.yellow(`✗ changes requested — back to ${role.id} (round ${round})\n`));
@@ -549,7 +609,8 @@ program
   .option("--role <id>", "force a specific role")
   .option("--review", "after implementing, loop a reviewer role until it approves (implement → review → fix)")
   .option("--rounds <n>", "max review rounds with --review (default 3)", (v) => parseInt(v, 10))
-  .action(async (taskParts: string[], opts2: { role?: string; review?: boolean; rounds?: number }) => {
+  .option("--commit", "commit the result with an AI message (with --review: only after approval; needs a clean start tree)")
+  .action(async (taskParts: string[], opts2: { role?: string; review?: boolean; rounds?: number; commit?: boolean }) => {
     const cfg = loadConfig();
     const provider = await buildProvider(cfg);
     if (!provider) {
@@ -569,6 +630,7 @@ program
       forceRole: opts2.role,
       review: opts2.review,
       rounds: opts2.rounds,
+      commit: opts2.commit,
     });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });

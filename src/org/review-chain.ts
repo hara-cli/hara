@@ -11,21 +11,33 @@ Inspect them for: correctness and bugs, security, missing edge cases, and whethe
 the task. Use read_file / grep / glob / ls to inspect context and any new files. Be concrete and specific —
 cite files. Block only on real problems (bugs, breakage, security), not style preferences.
 
-End your review with EXACTLY ONE verdict line, on its own line, as the LAST line:
-VERDICT: APPROVED            — the changes correctly and safely accomplish the task
-VERDICT: CHANGES_REQUESTED   — something must be fixed first
+A script parses your final line, so it MUST be EXACTLY one of these two, verbatim, as the LAST line —
+the literal word APPROVED or CHANGES_REQUESTED. Do NOT paraphrase it (not "No issues found", not "LGTM"),
+do NOT bold it, do NOT add words after the token:
+VERDICT: APPROVED
+VERDICT: CHANGES_REQUESTED
 
-If CHANGES_REQUESTED, list the required fixes as a short numbered list ABOVE the verdict line — each one
+Use APPROVED only if the changes correctly and safely accomplish the task. If anything must be fixed, use
+CHANGES_REQUESTED and list the required fixes as a short numbered list ABOVE the verdict line — each one
 naming the file and exactly what to change.`;
 
-/** Parse a reviewer's reply into a verdict. Takes the LAST verdict line (the reviewer's final call);
- *  defaults to NOT approved when no verdict line is present (never claim approval we can't see). */
+// Real models won't reliably emit the literal token — across live runs glm-5 wrote `VERDICT: APPROVED`,
+// `**VERDICT**: No issues found`, and `**VERDICT**: PASS`. So we anchor on the (markdown-tolerant) VERDICT
+// marker, then CLASSIFY the phrase after it: a "changes" signal vetoes (safer), an "approve" signal passes,
+// and anything ambiguous stays NOT approved — worst case is one extra review round, never a bad auto-commit.
+const CHANGES_RE = /\b(changes?[ _-]?request\w*|request\w*[ _-]?changes?|fail(ed|ure)?|reject\w*|block\w*|rework|needs?[ _-]?(work|fix\w*|change\w*)|must[ _-]?(fix|change)|not[ _-]?approv\w*)\b/i;
+const APPROVE_RE = /\b(approv\w*|passe?d?|lgtm|accept\w*|ship[ _-]?it|no[ _-]?(issues?|problems?|changes?|concerns?)|looks?[ _-]?good)\b/i;
+
+/** Parse a reviewer's reply into a verdict — see the note above for why it's lenient. Takes the LAST
+ *  VERDICT marker (the final call) and classifies the phrase after it; `issues` is the body before it. */
 export function parseVerdict(text: string): { approved: boolean; issues: string } {
-  const matches = [...text.matchAll(/^[ \t>*-]*VERDICT:\s*(APPROVED|CHANGES_REQUESTED)/gim)];
-  const m = matches[matches.length - 1];
-  if (!m) return { approved: false, issues: text.trim() };
-  const approved = m[1].toUpperCase() === "APPROVED";
-  return { approved, issues: text.slice(0, m.index).trim() }; // body before the verdict = the requested changes
+  const markers = [...text.matchAll(/VERDICT\b[*_:\s]*/gi)];
+  const last = markers[markers.length - 1];
+  if (!last) return { approved: false, issues: text.trim() };
+  const idx = last.index ?? 0;
+  const after = text.slice(idx + last[0].length, idx + last[0].length + 80); // the verdict phrase itself
+  const approved = !CHANGES_RE.test(after) && APPROVE_RE.test(after); // changes-signal vetoes; ambiguous = not approved
+  return { approved, issues: text.slice(0, idx).trim() };
 }
 
 /** Capture the working-tree changes vs HEAD (what to review). Non-destructive; empty for a non-git dir
@@ -46,6 +58,22 @@ export function captureChanges(cwd: string, cap = 100_000): { diff: string; newF
     .filter(Boolean)
     .slice(0, 50);
   return { diff, newFiles };
+}
+
+/** True only if the working tree is fully clean — no uncommitted changes. The `--commit` capstone uses
+ *  this as a guard: `git add -A` + commit is only safe to run when the tree was clean before the org ran,
+ *  so it captures THIS run's work and never sweeps up pre-existing WIP. False for a non-git dir. */
+export function isTreeClean(cwd: string): boolean {
+  try {
+    return execFileSync("git", ["status", "--porcelain"], { cwd, encoding: "utf8", maxBuffer: 50_000_000 }).trim() === "";
+  } catch {
+    return false; // not a git repo / git error → treat as "not clean" so we never auto-commit blindly
+  }
+}
+
+/** Strip a leading/trailing markdown code fence a model sometimes wraps a commit message in. */
+export function stripCommitFence(text: string): string {
+  return text.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
 }
 
 /** The reviewer's input: the task + the changes to review. */
