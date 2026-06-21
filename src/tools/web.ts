@@ -27,6 +27,99 @@ export function htmlToText(html: string): string {
     .trim();
 }
 
+/** Parse DuckDuckGo HTML results → [{title, url, snippet}]. Best-effort HTML scrape (no key, no dependency). */
+export function parseSearchResults(html: string, limit: number): { title: string; url: string; snippet: string }[] {
+  const strip = (s: string): string =>
+    s
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#x27;|&#39;/g, "'")
+      .replace(/\s+/g, " ")
+      .trim();
+  const snippets: string[] = [];
+  const snipRe = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  let m: RegExpExecArray | null;
+  while ((m = snipRe.exec(html))) snippets.push(strip(m[1]));
+  const out: { title: string; url: string; snippet: string }[] = [];
+  const linkRe = /class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  let i = 0;
+  while ((m = linkRe.exec(html)) && out.length < limit) {
+    let href = m[1].replace(/&amp;/g, "&");
+    const uddg = /[?&]uddg=([^&]+)/.exec(href); // DuckDuckGo wraps results in a /l/?uddg=<real-url> redirect
+    if (uddg) href = decodeURIComponent(uddg[1]);
+    else if (href.startsWith("//")) href = "https:" + href;
+    out.push({ title: strip(m[2]), url: href, snippet: snippets[i++] ?? "" });
+  }
+  return out;
+}
+
+registerTool({
+  name: "web_search",
+  description:
+    "Search the web and return the top results (title, URL, snippet). Use it to FIND information or pages you " +
+    "don't already have a URL for, then `web_fetch` a result to read it. Read-only. Reliable with a Tavily key " +
+    "(env HARA_SEARCH_API_KEY); otherwise a best-effort keyless fallback that may be rate-limited.",
+  input_schema: {
+    type: "object",
+    properties: {
+      query: { type: "string" },
+      limit: { type: "number", description: "max results (default 6, max 10)" },
+    },
+    required: ["query"],
+  },
+  kind: "read",
+  async run(input) {
+    const q = String(input.query ?? "").trim();
+    if (!q) return "(empty query)";
+    const limit = Math.min(Math.max(1, Number(input.limit) || 6), 10);
+    const fmt = (rs: { title: string; url: string; snippet: string }[]): string =>
+      rs.map((r, n) => `${n + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ""}`).join("\n\n");
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20_000);
+    try {
+      // Reliable path: Tavily (designed for agents, free tier) when a key is configured.
+      const key = process.env.HARA_SEARCH_API_KEY || process.env.TAVILY_API_KEY;
+      if (key) {
+        const res = await fetch("https://api.tavily.com/search", {
+          method: "POST",
+          signal: ctrl.signal,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: key, query: q, max_results: limit }),
+        });
+        if (res.ok) {
+          const j = (await res.json()) as { results?: { title?: string; url?: string; content?: string }[] };
+          const rs = (j.results ?? []).map((x) => ({ title: String(x.title ?? x.url ?? ""), url: String(x.url ?? ""), snippet: String(x.content ?? "").slice(0, 200) }));
+          if (rs.length) return fmt(rs);
+        }
+        // Tavily failed → fall through to the keyless best-effort path.
+      }
+      // Keyless fallback: DuckDuckGo HTML (POST — GET returns a 202 challenge). May be rate-limited.
+      const res = await fetch("https://html.duckduckgo.com/html/", {
+        method: "POST",
+        signal: ctrl.signal,
+        redirect: "follow",
+        headers: {
+          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          "content-type": "application/x-www-form-urlencoded",
+          accept: "text/html",
+        },
+        body: `q=${encodeURIComponent(q)}`,
+      });
+      if (!res.ok) return `Search failed: HTTP ${res.status}. Keyless search is rate-limited — set HARA_SEARCH_API_KEY (Tavily) for reliable search, or web_fetch a known URL.`;
+      const results = parseSearchResults(await res.text(), limit);
+      if (!results.length) return "(no results — the keyless endpoint is rate-limited or changed. Set HARA_SEARCH_API_KEY (Tavily) for reliable search, or web_fetch a known URL.)";
+      return fmt(results);
+    } catch (e: any) {
+      return `Search failed: ${e?.name === "AbortError" ? "timed out (20s)" : (e?.message ?? e)}`;
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+});
+
 registerTool({
   name: "web_fetch",
   description:

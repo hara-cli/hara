@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.50.0 — unreleased (web_search — find pages, not just fetch)
+
+- New **`web_search`** tool — search the web (title/URL/snippet), then `web_fetch` a result to read it. Closes
+  the other codex/cc-haha gap (hara could previously only fetch a *known* URL). **Reliable with a Tavily key**
+  (`HARA_SEARCH_API_KEY` / `TAVILY_API_KEY`, free tier); a **keyless DuckDuckGo** fallback works best-effort
+  (POST endpoint; may rate-limit). Read-kind, available to sub-agents. Verified live (keyless: "anthropic
+  claude" → real results); parser unit-tested (incl. the DDG `uddg` redirect decode).
+
 ## 0.49.0 — unreleased (inline todo tool — `todo_write`)
 
 - New **`todo_write`** tool — the agent maintains a live task checklist during multi-step work (codex's

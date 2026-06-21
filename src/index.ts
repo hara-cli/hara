@@ -307,7 +307,7 @@ async function runResume(o: OrgOpts): Promise<void> {
   await executePlan(plan, roles, o);
 }
 
-const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "codebase_search", "todo_write"]);
+const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write"]);
 const REVIEW_SYSTEM =
   "You are a senior code reviewer. Review the git diff the user provides for: correctness bugs, security " +
   "issues, missing error handling, unclear naming, and missing/weak tests. You may read files (read-only) " +
