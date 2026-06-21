@@ -34,6 +34,21 @@ export function titleOf(text: string, path: string): string {
   return h ? h[1].trim() : (path.split("/").pop() ?? path);
 }
 
+/** A ranking boost from the asset's declared dimensions: a query word in the title or the frontmatter
+ *  tags/lang matters more than one buried in the body. Used to order results, NOT the base relevance
+ *  score (which the dedup threshold relies on). */
+export function metaBoost(text: string, title: string, words: string[]): number {
+  const titleL = title.toLowerCase();
+  let b = words.filter((w) => titleL.includes(w)).length * 3;
+  const fm = /^---\n([\s\S]*?)\n---/.exec(text);
+  if (fm) {
+    const tags = (/(?:^|\n)tags:\s*(.+)/i.exec(fm[1])?.[1] ?? "").toLowerCase();
+    const lang = (/(?:^|\n)lang:\s*(.+)/i.exec(fm[1])?.[1] ?? "").toLowerCase();
+    b += words.filter((w) => `${tags} ${lang}`.includes(w)).length * 2;
+  }
+  return b;
+}
+
 /**
  * Lexical search: rank .md files by how many query words appear in path+content.
  * Default searches the code-asset library (relative paths). Pass `roots` to search other dirs
@@ -44,7 +59,7 @@ export function searchAssets(query: string, limit = 5, roots?: string[]): Recall
   const abs = roots !== undefined;
   const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return [];
-  const hits: Recalled[] = [];
+  const hits: (Recalled & { boost: number })[] = [];
   for (const dir of dirs) {
     if (!existsSync(dir)) continue;
     for (const rel of walkFiles(dir).filter((f) => f.endsWith(".md"))) {
@@ -55,13 +70,15 @@ export function searchAssets(query: string, limit = 5, roots?: string[]): Recall
         continue;
       }
       const hay = (rel + "\n" + text).toLowerCase();
-      const score = words.filter((w) => hay.includes(w)).length;
+      const score = words.filter((w) => hay.includes(w)).length; // distinct query words present (dedup threshold uses this)
       if (!score) continue;
-      hits.push({ path: abs ? join(dir, rel) : rel, title: titleOf(text, rel), snippet: text.slice(0, 800), score });
+      const title = titleOf(text, rel);
+      hits.push({ path: abs ? join(dir, rel) : rel, title, snippet: text.slice(0, 800), score, boost: metaBoost(text, title, words) });
     }
   }
-  hits.sort((a, b) => b.score - a.score || a.path.length - b.path.length);
-  return hits.slice(0, limit);
+  // rank by relevance, then by the declared-dimension boost (title/tags/lang), then prefer the shorter path
+  hits.sort((a, b) => b.score - a.score || b.boost - a.boost || a.path.length - b.path.length);
+  return hits.slice(0, limit).map(({ boost, ...r }) => r);
 }
 
 /** Create the assets dir with an example snippet + README. Returns files written. */

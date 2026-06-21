@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.65.0 — unreleased (frontmatter-aware asset recall)
+
+- Asset/skill recall (`searchAssets`, behind `hara recall` / `/recall` / skill dedup) now **ranks by the
+  asset's declared dimensions** — a query word in the `title` or the frontmatter `tags`/`lang` counts more
+  than one buried in the body. The asset format already declared these (the scaffold seeds `tags`/`lang`);
+  retrieval now actually uses them. The base relevance score (distinct query words present) is unchanged,
+  so the dedup-before-save threshold is unaffected — this only improves *ordering*. (Studied codex + cc-haha:
+  both stay lexical + manual-file curation with no semantic search or auto-capture; hara's hybrid lexical+
+  opt-in-semantic recall over a unified skills/code-assets/memory corpus is already ahead.)
+
 ## 0.64.0 — unreleased (session export)
 
 - **`hara export [session] [--out file]`** renders a saved session to a Markdown transcript — the header
