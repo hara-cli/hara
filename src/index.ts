@@ -30,6 +30,10 @@ import { runAgent } from "./agent/loop.js";
 import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
+import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
+import { addJob, removeJob, setEnabled, findJob, loadJobs, recordRun, logPath } from "./cron/store.js";
+import { runTick, runJobOnce } from "./cron/runner.js";
+import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools } from "./tools/registry.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
@@ -539,6 +543,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
     `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (cfg.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (cfg.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
     `${dot} notify ${cfg.notify === "off" ? c.dim("off — hara config set notify bell|system") : c.bold(cfg.notify)}`,
+    `${dot} cron ${(() => { const n = loadJobs().length; return n ? `${n} job(s) · ${isInstalled() ? c.green("scheduler installed") : c.yellow("scheduler off — hara cron install")}` : c.dim("no jobs — hara cron add"); })()}`,
   ];
   return lines.join("\n");
 }
@@ -829,6 +834,81 @@ program
         /* best-effort cleanup */
       }
     }
+  });
+
+function renderCronJobs(): string {
+  const jobs = loadJobs();
+  const head = isInstalled() ? c.green("scheduler: installed") : c.yellow("scheduler: NOT installed — run `hara cron install`");
+  if (!jobs.length) return head + "\n" + c.dim('No jobs. Add one:  hara cron add "every 1h" "<task>"\n');
+  const now = Date.now();
+  const lines = jobs.map((j) => {
+    const nxt = nextRun(j, now);
+    const status = j.lastStatus ? (j.lastStatus === "ok" ? c.green("ok") : c.red("err")) : c.dim("—");
+    return `${c.bold(j.id)} ${describeSchedule(j.schedule)} ${c.dim(`· ${j.mode} · next ${nxt ? new Date(nxt).toLocaleString() : "—"} · last ${status}`)}${j.enabled ? "" : c.dim(" [disabled]")}\n   ${c.dim(j.name)}`;
+  });
+  return head + "\n" + lines.join("\n") + "\n";
+}
+
+const cronCmd = program.command("cron").description("scheduled tasks — run a prompt/org task on a schedule (fired by your OS via `hara cron install`)");
+cronCmd
+  .command("add <schedule> <task...>")
+  .description('schedule a task — schedule = cron expr ("0 9 * * *"), "every 30m", "in 2h", or an ISO timestamp')
+  .option("--name <name>", "a label for the job")
+  .option("--org", "run via `hara org` (role routing + review) instead of a plain `hara -p` prompt")
+  .action((schedule: string, taskParts: string[], opts: { name?: string; org?: boolean }) => {
+    const task = taskParts.join(" ");
+    const sched = parseSchedule(schedule, Date.now());
+    if ("error" in sched) return void out(c.red(sched.error + "\n"));
+    const job = addJob({ name: opts.name || task.slice(0, 48), schedule: sched, task, mode: opts.org ? "org" : "print", cwd: process.cwd(), createdAt: Date.now() });
+    out(c.green(`✓ scheduled ${job.id}`) + c.dim(` · ${describeSchedule(sched)} · ${job.mode} · cwd ${job.cwd}\n`));
+    if (!isInstalled()) out(c.yellow("⚠ scheduler not installed yet — run `hara cron install` so jobs actually fire.\n"));
+  });
+cronCmd.command("list").alias("ls").description("list scheduled jobs").action(() => out(renderCronJobs()));
+cronCmd
+  .command("remove <id>")
+  .alias("rm")
+  .description("delete a job (by id or unique prefix)")
+  .action((id: string) => out(removeJob(id) ? c.green(`✓ removed ${id}\n`) : c.red(`no such job: ${id}\n`)));
+cronCmd.command("enable <id>").description("enable a job").action((id: string) => out(setEnabled(id, true) ? c.green(`✓ enabled ${id}\n`) : c.red(`no such job: ${id}\n`)));
+cronCmd.command("disable <id>").description("disable a job (keeps it, stops firing)").action((id: string) => out(setEnabled(id, false) ? c.green(`✓ disabled ${id}\n`) : c.red(`no such job: ${id}\n`)));
+cronCmd
+  .command("run <id>")
+  .description("run a job right now, ignoring its schedule")
+  .action(async (id: string) => {
+    const job = findJob(id);
+    if (!job) return void out(c.red(`no such job: ${id}\n`));
+    out(c.dim(`running ${job.id} (${job.name})…\n`));
+    const r = await runJobOnce(job);
+    recordRun(job.id, Date.now(), r.ok ? "ok" : "error", r.error);
+    out((r.ok ? c.green("✓ done") : c.red(`✗ ${r.error}`)) + c.dim(` · log: ${logPath(job.id)}\n`));
+  });
+cronCmd
+  .command("tick")
+  .description("run all due jobs now (your OS scheduler calls this every minute)")
+  .action(async () => {
+    const r = await runTick(Date.now());
+    if (r.skipped) return void out(c.dim(`(skipped — ${r.skipped})\n`));
+    out(c.dim(r.ran.length ? `ran ${r.ran.length} job(s): ${r.ran.join(", ")}\n` : "(no jobs due)\n"));
+  });
+cronCmd
+  .command("install")
+  .description("register the per-minute tick with your OS scheduler (launchd on macOS, crontab on Linux)")
+  .action(() => {
+    const r = installScheduler(process.execPath, process.argv[1]);
+    out((r.ok ? c.green("✓ ") : c.red("✗ ")) + r.msg + "\n");
+  });
+cronCmd.command("uninstall").description("remove the OS scheduler entry").action(() => {
+  const r = uninstallScheduler();
+  out((r.ok ? c.green("✓ ") : c.red("✗ ")) + r.msg + "\n");
+});
+cronCmd
+  .command("logs <id>")
+  .description("show a job's recent run output")
+  .action((id: string) => {
+    const job = findJob(id);
+    if (!job) return void out(c.red(`no such job: ${id}\n`));
+    const p = logPath(job.id);
+    out(existsSync(p) ? readFileSync(p, "utf8").slice(-4000) + "\n" : c.dim("(no runs yet)\n"));
   });
 
 const rolesCmd = program.command("roles").description("manage org roles (.hara/roles)");

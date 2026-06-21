@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.58.0 — unreleased (`hara cron` — scheduled tasks)
+
+- **Scheduled tasks.** `hara cron add "<schedule>" "<task>"` runs a task on a schedule — the fired job is a
+  fresh `hara` session (the run *is* the agent, like openclaw/hermes). Schedules: a 5-field **cron expr**
+  (`"0 9 * * 1-5"`), an **interval** (`"every 30m"`), or a **one-shot** (`"in 2h"` / an ISO timestamp).
+  `--org` routes it through the role org instead of a plain prompt.
+- **Fires via your OS, no daemon to babysit.** `hara cron install` registers a per-minute `hara cron tick`
+  with **launchd** (macOS) or **crontab** (Linux); `tick` runs whatever's due (lock-guarded so a slow job
+  doesn't double-fire) and logs each run. Manage with `hara cron list / run <id> / enable / disable /
+  remove / logs / uninstall`. Jobs persist atomically in `~/.hara/cron/jobs.json`; `hara doctor` shows the
+  count + scheduler status. Cron matching is hand-rolled (no new dependency), minute-granular, local-time.
+
 ## 0.57.0 — unreleased (in-session `/diff`, `/review`, `/commit` in the TUI)
 
 - The default TUI now wires three more slash commands so the **change → review → commit** loop happens
