@@ -71,6 +71,7 @@ import "./tools/agent.js"; // register agent (subagent spawn)
 import "./tools/memory.js"; // register memory_search/get/write/forget/skill_create
 import "./tools/skill.js"; // register the skill loader tool
 import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
+import "./tools/todo.js"; // register todo_write (inline task checklist)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -306,7 +307,7 @@ async function runResume(o: OrgOpts): Promise<void> {
   await executePlan(plan, roles, o);
 }
 
-const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "codebase_search"]);
+const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "codebase_search", "todo_write"]);
 const REVIEW_SYSTEM =
   "You are a senior code reviewer. Review the git diff the user provides for: correctness bugs, security " +
   "issues, missing error handling, unclear naming, and missing/weak tests. You may read files (read-only) " +

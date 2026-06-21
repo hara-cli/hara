@@ -21,7 +21,9 @@ const HARA_SYSTEM = (cwd: string) =>
 Working directory: ${cwd}
 Be concise and direct. Use the provided tools to read files, edit/write files, and run shell
 commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
-them whole. You have a persistent memory: use memory_search before answering about prior decisions,
+them whole. For a multi-step task, call \`todo_write\` to plan a short checklist and keep it updated as
+you go (one item in_progress at a time) — skip it for trivial one-step tasks. You have a persistent
+memory: use memory_search before answering about prior decisions,
 conventions, or the user's preferences, and memory_write to proactively save durable facts you learn.
 When a task matches one of the Skills listed below, call the \`skill\` tool to load its full instructions
 before acting; save a reusable how-to as a new skill with skill_create. If you discover a durable project

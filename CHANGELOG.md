@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.49.0 — unreleased (inline todo tool — `todo_write`)
+
+- New **`todo_write`** tool — the agent maintains a live task checklist during multi-step work (codex's
+  `update_plan` / Claude Code's `TodoWrite`, which hara lacked). Plan up front, keep one item `in_progress`,
+  flip to `done` as you go; pass the full list each call. Read-kind (never prompts); the system prompt nudges
+  its use for multi-step tasks; sub-agents can use it too. Renders a `☐/▶/☑` checklist with a done count.
+  *(Gap analysis vs codex + cc-haha: this was the top missing capability.)*
+
 ## 0.48.0 — unreleased (chrome plugin: drive your real logged-in Chrome)
 
 - New first-party **`chrome` plugin** — web automation via **`chrome-devtools-mcp`** against a **real Chrome with
