@@ -31,6 +31,16 @@ curl -fsSL https://raw.githubusercontent.com/hara-cli/hara/main/install.sh | sh
 
 Tab completion (optional): `eval "$(hara completions zsh)"` in your `~/.zshrc` (or `bash`/`fish`).
 
+Or in **Docker** — run hara against any repo without installing Node, and as an isolated/ephemeral
+environment (handy for CI):
+
+```bash
+docker run --rm -v "$PWD:/workspace" -e HARA_API_KEY=sk-... ghcr.io/hara-cli/hara -p "summarize this repo"
+# interactive TUI:
+docker run --rm -it -v "$PWD:/workspace" -e HARA_API_KEY=sk-... ghcr.io/hara-cli/hara
+# or build it yourself: docker build -t hara . && docker run --rm -v "$PWD:/workspace" -e HARA_API_KEY=sk-... hara
+```
+
 Or from source:
 
 ```bash
@@ -233,7 +243,7 @@ turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review
 
 ### Roadmap
 
-**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · **single-binary distribution** · `/compact` context management.
+**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · **single-binary distribution** · **Docker image** · `/compact` context management.
 **Next:** SSOT data authority · an enterprise control-plane (fleet + central token management).
 
 ## Security

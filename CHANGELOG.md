@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.68.0 — unreleased (run hara in Docker)
+
+- **Dockerfile** — run hara in a container against any mounted repo, no Node install needed, and as an
+  isolated/ephemeral environment (handy for CI). Multi-stage build → a slim runtime that still ships a
+  shell + `git` + `ripgrep` (the bash/search tools need them; a distroless image would break them).
+  `docker run --rm -v "$PWD:/workspace" -e HARA_API_KEY=… ghcr.io/hara-cli/hara -p "…"`.
+- **Release pipeline** now also builds + pushes a multi-arch (amd64/arm64) image to
+  `ghcr.io/hara-cli/hara` on a version tag, alongside the existing standalone binaries — so the Docker
+  and binary distributions stay in lockstep. (Single-binary distribution shipped in 0.60.0; this
+  rounds out "install hara any way you like": npm · binary · Docker.)
+
 ## 0.67.0 — unreleased (bounded parallel concurrency)
 
 - hara already runs work in parallel — fan-out **`agent`** sub-agents, concurrent read-kind tools in a turn,
