@@ -1,0 +1,9 @@
+{
+  "name": "chrome",
+  "version": "0.1.0",
+  "description": "Drive a real, persistent-login Chrome from hara via chrome-devtools-mcp (CDP) — for web tasks on sites you're already signed into (logins persist across runs). Alternative to the `browser` plugin's isolated Playwright browser — enable one, not both.",
+  "skills": ["skills"],
+  "mcpServers": {
+    "chrome": { "command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"] }
+  }
+}

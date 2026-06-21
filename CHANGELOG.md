@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.48.0 — unreleased (chrome plugin: drive your real logged-in Chrome)
+
+- New first-party **`chrome` plugin** — web automation via **`chrome-devtools-mcp`** against a **real Chrome with
+  a persistent-login profile** (sign into a site once, reused across runs), or attach to your running Chrome via
+  `--browserUrl http://127.0.0.1:9222`. The "drive my actual sessions" complement to the isolated-Playwright
+  `browser` plugin (enable one, not both) — this is the openclaw/cc-haha route.
+- Shipped as an option (not auto-installed — `browser` stays the default). `chrome-devtools-mcp` verified
+  resolvable; both plugin manifests validated.
+
 ## 0.47.0 — unreleased (browser plugin: reliable web automation via Playwright MCP)
 
 - New first-party **`browser` plugin** wires the **Playwright MCP** (`@playwright/mcp`) into hara → the agent gets
