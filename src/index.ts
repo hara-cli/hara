@@ -31,6 +31,7 @@ import { runAgent } from "./agent/loop.js";
 import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { completionScript } from "./completions.js";
+import { renderSessionMarkdown } from "./export.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
 import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
@@ -784,6 +785,22 @@ program
   .command("setup")
   .description("interactive first-run setup — pick a provider, API key, and model")
   .action(runSetup);
+
+program
+  .command("export [session]")
+  .description("export a session to a Markdown transcript (default: the latest in this directory)")
+  .option("--out <file>", "write to a file instead of stdout")
+  .action((sessionArg: string | undefined, opts: { out?: string }) => {
+    const data = sessionArg ? (() => { const id = resolveSessionId(sessionArg); return id ? loadSession(id) : null; })() : latestForCwd(process.cwd());
+    if (!data) return void out(c.red(sessionArg ? `No session matching '${sessionArg}'.\n` : "No session for this directory — pass an id (see `hara sessions`).\n"));
+    const md = renderSessionMarkdown(data);
+    if (opts.out) {
+      writeFileSync(opts.out, md, "utf8");
+      out(c.green(`✓ wrote ${opts.out}`) + c.dim(` (${md.length} chars)\n`));
+    } else {
+      out(md);
+    }
+  });
 
 program
   .command("completions <shell>")

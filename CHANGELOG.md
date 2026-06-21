@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.64.0 — unreleased (session export)
+
+- **`hara export [session] [--out file]`** renders a saved session to a Markdown transcript — the header
+  (title/model/cwd/date), each turn (you / hara), tool calls inline, and tool results in collapsible
+  `<details>` blocks (capped). Default is the latest session in the current directory. For sharing a
+  decision, pasting into a PR, or archiving. Pure renderer (`src/export.ts`), unit-tested.
+
 ## 0.63.0 — unreleased (first-run setup wizard)
 
 - **`hara setup`** — an interactive wizard (provider → optional base URL → API key → model) that writes
