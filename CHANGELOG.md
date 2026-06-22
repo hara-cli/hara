@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.69.1 — unreleased (@file expands inline, not appended at the bottom)
+
+- `@path` mentions now expand **in place** — the referenced file/dir content lands exactly where it's
+  written, so "compare `@a.ts` with `@b.ts`" reads in context instead of keeping the bare `@a.ts`
+  tokens and dumping both files in a block at the very end. A repeated mention keeps the bare `@path`
+  the second time (no double-inlining); a non-readable ref is left as typed. Labels ("Referenced file
+  `x`:") and the image/dir handling are unchanged — only the position moved.
+
 ## 0.69.0 — unreleased (real local vector store via zvec)
 
 - Local semantic search now uses **zvec** (`@zvec/zvec`, an in-process native vector DB) for ANN

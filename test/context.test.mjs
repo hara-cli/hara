@@ -58,6 +58,9 @@ test("mentions: @path expands to fenced file contents", () => {
     const o = expandMentions("please read @note.txt now", dir);
     assert.match(o, /Referenced file `note\.txt`/);
     assert.match(o, /hello-from-file/);
+    // expanded INLINE at the @ position, not appended at the bottom: content lands before "now"
+    assert.ok(o.indexOf("hello-from-file") < o.lastIndexOf("now"), "file content is inline, before the trailing text");
+    assert.ok(o.startsWith("please read "), "text before the mention is preserved");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

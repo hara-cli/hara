@@ -10,40 +10,44 @@ const MAX_FILE = 50_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
 const MENTION_RE = /(?:^|\s)@([^\s@]+)/g;
 
-/** Append the contents of any @mentioned files to the input as fenced blocks. */
+/** Expand `@path` references **in place** — the file/dir content lands where it's referenced, not
+ *  dumped at the bottom (so "compare @a.ts with @b.ts" reads in context). A repeated mention keeps
+ *  the bare `@path` the second time (no double-inlining), and a non-readable ref is left untouched. */
 export function expandMentions(input: string, cwd: string): string {
   const seen = new Set<string>();
-  const blocks: string[] = [];
-  let m: RegExpExecArray | null;
   MENTION_RE.lastIndex = 0;
-  while ((m = MENTION_RE.exec(input)) !== null) {
-    const ref = m[1];
-    if (seen.has(ref)) continue;
+  return input.replace(MENTION_RE, (whole: string, ref: string) => {
+    const prefix = whole.slice(0, whole.length - ref.length - 1); // BOL "" or the captured leading whitespace
+    if (seen.has(ref)) return whole; // already inlined above → leave this occurrence as the bare @ref
+    const block = expandRef(ref, cwd);
+    if (block === null) return whole; // not a readable file/dir → leave the token as typed
     seen.add(ref);
-    const abs = isAbsolute(ref) ? ref : resolve(cwd, ref);
-    try {
-      if (existsSync(abs)) {
-        const st = statSync(abs);
-        if (st.isFile()) {
-          if (mediaTypeFor(abs)) {
-            // don't inline binary image bytes as text — paste it with Ctrl+V (or drag the file in) to attach visually
-            blocks.push(`Referenced \`${ref}\` is an image — paste it with Ctrl+V to attach it visually.`);
-          } else {
-            let txt = readFileSync(abs, "utf8");
-            if (txt.length > MAX_FILE) txt = txt.slice(0, MAX_FILE) + "\n…[truncated]";
-            blocks.push(`Referenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\``);
-          }
-        } else if (st.isDirectory()) {
-          // `@dir` loads a listing of the directory's files (the agent can then read specific ones)
-          const files = walkFiles(abs, 300);
-          blocks.push(`Referenced directory \`${ref}\` (${files.length} files):\n\`\`\`\n${files.join("\n") || "(empty)"}\n\`\`\``);
-        }
-      }
-    } catch {
-      /* ignore unreadable mention */
+    return `${prefix}${block}`;
+  });
+}
+
+/** Render one mention as an inline block, or null if it isn't a readable file/dir. */
+function expandRef(ref: string, cwd: string): string | null {
+  const abs = isAbsolute(ref) ? ref : resolve(cwd, ref);
+  try {
+    if (!existsSync(abs)) return null;
+    const st = statSync(abs);
+    if (st.isFile()) {
+      // don't inline binary image bytes as text — paste with Ctrl+V (or drag the file in) to attach visually
+      if (mediaTypeFor(abs)) return `Referenced \`${ref}\` is an image — paste it with Ctrl+V to attach it visually.`;
+      let txt = readFileSync(abs, "utf8");
+      if (txt.length > MAX_FILE) txt = txt.slice(0, MAX_FILE) + "\n…[truncated]";
+      return `\nReferenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\`\n`;
     }
+    if (st.isDirectory()) {
+      // `@dir` loads a listing of the directory's files (the agent can then read specific ones)
+      const files = walkFiles(abs, 300);
+      return `\nReferenced directory \`${ref}\` (${files.length} files):\n\`\`\`\n${files.join("\n") || "(empty)"}\n\`\`\`\n`;
+    }
+  } catch {
+    /* ignore unreadable mention */
   }
-  return blocks.length ? `${input}\n\n${blocks.join("\n\n")}` : input;
+  return null;
 }
 
 // Short-lived per-cwd cache so Tab completion stays snappy without re-scanning every press.
