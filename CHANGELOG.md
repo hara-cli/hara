@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.69.0 — unreleased (real local vector store via zvec)
+
+- Local semantic search now uses **zvec** (`@zvec/zvec`, an in-process native vector DB) for ANN
+  retrieval, replacing the brute-force-cosine scan as the query path. zvec was previously referenced
+  only in comments as the "scale-up path"; it's now actually wired (it ships a darwin-arm64/linux
+  prebuilt, added as an **optionalDependency**).
+- Design keeps the JSON store as the durable embedding cache + SSOT for hit text, and recomputes the
+  cosine **score from the JSON vectors** after zvec returns candidate ids — so ranking/threshold
+  semantics are byte-identical to before (no change to `hybrid.ts`), zvec just does fast candidate
+  retrieval. Build writes the zvec index alongside the JSON cache (`~/.hara/index/<name>.zvec`).
+- **Graceful fallback preserved**: if `@zvec/zvec` is absent or its native binding fails to load (a
+  platform with no prebuilt), `queryIndex` falls back to the JSON brute-force — so installs without
+  the binding keep working. Lexical remains the zero-dep floor when no embedder is configured at all.
+- New `src/search/zvec-store.ts` (lazy load · read-only open for queries · best-effort build) + test.
+
 ## 0.68.0 — unreleased (run hara in Docker)
 
 - **Dockerfile** — run hara in a container against any mounted repo, no Node install needed, and as an

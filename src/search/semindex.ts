@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { findProjectRoot } from "../context/agents-md.js";
 import { listProjectFiles, walkFiles, isProbablyBinary, fileSize } from "../fs-walk.js";
+import { zvecBuild, zvecQueryIds } from "./zvec-store.js";
 
 // Same code/text extensions codebase_search ranks lexically — keep the two walks in sync.
 const CODE_RE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|c|h|cc|cpp|hpp|cs|swift|scala|sh|bash|sql|md|mdx|json|ya?ml|toml|html|css|scss|less|vue|svelte|astro|tf|proto|graphql|gql|gradle|txt)$/i;
@@ -137,6 +138,8 @@ export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder,
   // The index is derived + rebuildable (and may embed file contents) — never let it be committed.
   if (!existsSync(join(dir, ".gitignore"))) writeFileSync(join(dir, ".gitignore"), "*\n", "utf8");
   writeFileSync(p, JSON.stringify({ model, items } satisfies IndexFile), "utf8");
+  // Build a zvec ANN index alongside the JSON cache (best-effort; queryIndex prefers it for retrieval).
+  await zvecBuild(name, items.map((it) => ({ id: it.id, vec: it.vec })), cwd);
   return { total: items.length, embedded: toEmbed.length, reused };
 }
 
@@ -205,6 +208,21 @@ export async function queryIndex(name: string, query: string, embed: Embedder, c
   if (!idx.items?.length) return [];
   const [qv] = await embed([query]);
   if (!qv) return [];
+
+  // Prefer the zvec ANN index for candidate retrieval; re-rank candidates by EXACT cosine from the JSON
+  // store (identical score semantics to the brute-force path). Fall back to full brute-force if zvec is
+  // unavailable / has no index / errors.
+  const ids = await zvecQueryIds(name, qv, cwd, k);
+  if (ids?.length) {
+    const byId = new Map(idx.items.map((it) => [it.id, it]));
+    const hits = ids
+      .map((id) => byId.get(id))
+      .filter((it): it is Item => Boolean(it))
+      .map((it) => ({ file: it.file, source: it.source, text: it.text, score: cosine(qv, it.vec) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, k);
+    if (hits.length) return hits;
+  }
   return idx.items
     .map((it) => ({ file: it.file, source: it.source, text: it.text, score: cosine(qv, it.vec) }))
     .sort((a, b) => b.score - a.score)
