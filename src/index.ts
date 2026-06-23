@@ -36,6 +36,7 @@ import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseUR
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
 import { shouldAutoCompact } from "./agent/compact.js";
+import { formatContextReport } from "./agent/context-report.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
@@ -1626,6 +1627,11 @@ program.action(async (opts) => {
       },
     },
     {
+      name: "context",
+      desc: "show what's filling the context window (token breakdown by category)",
+      run: () => void out(formatContextReport(history, cfg.model) + "\n"),
+    },
+    {
       name: "compact",
       desc: "summarize the conversation so far to free up context",
       run: async () => {
@@ -1831,6 +1837,7 @@ program.action(async (opts) => {
             saveSession(meta, history);
             return void h.sink.notice(`(renamed → ${meta.title})`);
           }
+          if (nm === "context") return void h.sink.notice(formatContextReport(history, cfg.model));
           if (nm === "compact") {
             if (history.length < 2) return void h.sink.notice("(nothing to compact)");
             h.sink.notice("✻ compacting…");

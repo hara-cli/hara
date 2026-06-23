@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.76.0 — unreleased (/context — see what's filling the context window)
+
+- New **`/context`** command: a token-spend breakdown of the conversation — which tool's output, assistant
+  text, and your messages are using the window (biggest first, with the share of the model's window) — so on a
+  long session you can see *why* you're near the limit, not just the `ctx%` number. Pairs with auto-compaction.
+  chars/4 estimate, zero-dep, both UIs. `src/agent/context-report.ts` + tests (237 total).
+
 ## 0.75.0 — unreleased (lazy subdirectory AGENTS.md / CLAUDE.md — monorepo-local conventions reach the model)
 
 - When a tool touches a directory not seen yet this session, hara loads that directory's **`AGENTS.md` /
