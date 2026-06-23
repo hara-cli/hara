@@ -45,6 +45,11 @@ export interface HaraConfig {
   embedModel: string | undefined;
   embedBaseURL: string | undefined;
   embedApiKey: string | undefined;
+  /** Per-turn model routing (opt-in): trivial/non-coding turns route to `routeModel`; real coding/action
+   *  turns stay on `model`. routeBaseURL/routeApiKey default to the primary's (same provider, diff model). */
+  routeModel: string | undefined;
+  routeBaseURL: string | undefined;
+  routeApiKey: string | undefined;
   /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
   hooks: HooksConfig;
   /** ping when a (non-trivial) turn finishes: off | bell (terminal BEL) | system (OS notification + bell) */
@@ -67,7 +72,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   "hara-gateway": { model: "", envKey: "HARA_GATEWAY_TOKEN" }, // B-end: enrolled device → token in ~/.hara/org.json, routed by the gateway
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "notify", "vimMode"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "notify", "vimMode"] as const;
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
@@ -167,6 +172,9 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const embedModel = process.env.HARA_EMBED_MODEL ?? merged.embedModel;
   const embedBaseURL = process.env.HARA_EMBED_BASE_URL ?? merged.embedBaseURL;
   const embedApiKey = process.env.HARA_EMBED_API_KEY ?? merged.embedApiKey;
+  const routeModel = process.env.HARA_ROUTE_MODEL ?? merged.routeModel;
+  const routeBaseURL = process.env.HARA_ROUTE_BASE_URL ?? merged.routeBaseURL;
+  const routeApiKey = process.env.HARA_ROUTE_API_KEY ?? merged.routeApiKey;
   const mcpServers: Record<string, McpServerConfig> = {
     ...(globalBase.mcpServers ?? {}),
     ...(project.mcpServers ?? {}),
@@ -176,7 +184,7 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const notify = (process.env.HARA_NOTIFY ?? merged.notify ?? "off") as NotifyMode;
   const vimMode = process.env.HARA_VIM === "1" || merged.vimMode === true || merged.vimMode === "true";
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, hooks, notify, vimMode, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, hooks, notify, vimMode, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

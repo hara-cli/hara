@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.72.0 — unreleased (per-turn model routing: strong model for code, cheap/general for trivial turns)
+
+- **Opt-in per-turn model routing** — the answer to "use a coding model for real work, a cheap/general model
+  for trivial chat" *without* splitting hara into two tools. Set `routeModel` (+ optional `routeBaseURL` /
+  `routeApiKey`, which default to the primary's) and each turn routes by its latest user message: trivial,
+  non-coding turns (short · single-line · no code / URL · no action keyword) go to `routeModel`; anything with
+  a coding/action signal stays on the primary `model`. **Conservative by design** — a coding tool errs toward
+  the strong model, so routing only fires on clear Q&A / chit-chat.
+- Implemented as a transparent provider wrapper at the single main-chat entry (`withRouting`), so every
+  interactive / `-p` / TUI turn gets it while role / review / sub-agent providers stay untouched. The decision
+  reads the last `role:"user"` message (tool results are `role:"tool"`), so it's stable across a turn's tool
+  rounds. New `src/agent/route.ts` + tests. Env: `HARA_ROUTE_MODEL` / `HARA_ROUTE_BASE_URL` / `HARA_ROUTE_API_KEY`.
+
 ## 0.71.0 — unreleased (Sprint 1: governance + safety — command permissions · untrusted-content wrapping · structured compaction)
 
 Three zero-dep items distilled from a 4-expert (codex/cc-haha/hermes/openclaw) C-end gap analysis; all reinforce hara's governance moat.

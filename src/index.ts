@@ -34,6 +34,7 @@ import { completionScript } from "./completions.js";
 import { renderSessionMarkdown } from "./export.js";
 import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL, syncOrgRoles } from "./org-fleet/enroll.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
+import { routingProvider } from "./agent/route.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
@@ -120,6 +121,15 @@ async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
     return createAnthropicProvider({ apiKey: cfg.apiKey, model: cfg.model, baseURL: cfg.baseURL });
   }
   return createOpenAIProvider({ apiKey: cfg.apiKey, model: cfg.model, baseURL: cfg.baseURL, label: cfg.provider });
+}
+
+/** Wrap the main provider with per-turn model routing when `routeModel` is configured: trivial/non-coding
+ *  turns go to the alternate (cheap/general) model, real coding/action work stays on the primary. No-op when
+ *  routeModel is unset or equals the primary model. routeBaseURL/routeApiKey default to the primary's. */
+async function withRouting(primary: Provider | null, cfg: HaraConfig): Promise<Provider | null> {
+  if (!primary || !cfg.routeModel || cfg.routeModel === cfg.model) return primary;
+  const alt = await buildProvider({ ...cfg, model: cfg.routeModel, baseURL: cfg.routeBaseURL ?? cfg.baseURL, apiKey: cfg.routeApiKey ?? cfg.apiKey });
+  return alt ? routingProvider(primary, alt) : primary;
 }
 
 function authHint(cfg: HaraConfig): string {
@@ -1290,7 +1300,7 @@ config
 program.action(async (opts) => {
   const cfg = loadConfig({ profile: opts.profile });
   if (opts.model) cfg.model = opts.model;
-  const provider0 = await buildProvider(cfg);
+  const provider0 = await withRouting(await buildProvider(cfg), cfg);
   if (!provider0) {
     // First-run friendliness: offer the setup wizard instead of just erroring (interactive TTY only).
     if (stdin.isTTY && !opts.print) {
