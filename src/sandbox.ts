@@ -46,23 +46,29 @@ export interface ShellOpts {
  * Streams output via `opts.onData` while capturing it for the resolved value.
  * Resolves on exit 0; rejects (with `.stdout`/`.stderr`/`.code`) on nonzero exit or timeout.
  */
-export function runShell(command: string, cwd: string, mode: SandboxMode, opts: ShellOpts): Promise<{ stdout: string; stderr: string }> {
-  let cmd: string;
-  let args: string[];
+/** Build the (sandboxed, when supported) argv for a shell command — shared by runShell + background jobs
+ *  so the seatbelt write-confinement is identical for both. */
+export function shellCommand(command: string, cwd: string, mode: SandboxMode): { cmd: string; args: string[] } {
   if (mode !== "off" && platform() === "darwin") {
     const dir = mkdtempSync(join(tmpdir(), "hara-sb-"));
     const profileFile = join(dir, "policy.sb");
     writeFileSync(profileFile, seatbeltProfile(cwd, mode));
-    cmd = "sandbox-exec";
-    args = ["-f", profileFile, "/bin/bash", "-lc", command];
-  } else {
-    if (mode !== "off" && !warnedUnsandboxed) {
-      warnedUnsandboxed = true;
-      process.stderr.write(`hara: --sandbox ${mode} is macOS-only — the shell runs UNSANDBOXED on ${platform()}.\n`);
-    }
-    cmd = "/bin/sh";
-    args = ["-c", command];
+    return { cmd: "sandbox-exec", args: ["-f", profileFile, "/bin/bash", "-lc", command] };
   }
+  maybeWarnUnsandboxed(mode);
+  return { cmd: "/bin/sh", args: ["-c", command] };
+}
+
+/** One-time-per-process notice that --sandbox is a no-op off macOS (covers every entry point). */
+export function maybeWarnUnsandboxed(mode: SandboxMode): void {
+  if (mode !== "off" && !warnedUnsandboxed) {
+    warnedUnsandboxed = true;
+    process.stderr.write(`hara: --sandbox ${mode} is macOS-only — the shell runs UNSANDBOXED on ${platform()}.\n`);
+  }
+}
+
+export function runShell(command: string, cwd: string, mode: SandboxMode, opts: ShellOpts): Promise<{ stdout: string; stderr: string }> {
+  const { cmd, args } = shellCommand(command, cwd, mode);
 
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd });

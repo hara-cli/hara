@@ -6,6 +6,7 @@ import { runShell } from "../sandbox.js";
 import { nearestPaths } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
+import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
 
 const MAX = 100_000;
 
@@ -74,11 +75,16 @@ registerTool({
     properties: {
       command: { type: "string" },
       timeout_ms: { type: "number", description: "default 120000" },
+      background: { type: "boolean", description: "run as a background job (dev server, watcher, long task); returns a job id immediately — tail/kill it with the `job` tool" },
     },
     required: ["command"],
   },
   kind: "exec",
   async run(input, ctx) {
+    if (input.background) {
+      const id = startJob(input.command, ctx.cwd, ctx.sandbox ?? "off");
+      return `Started background job ${id}: \`${input.command}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all.`;
+    }
     let buf = ""; // TUI: line-buffer live output into the sink (one notice per line)
     const live = ctx.ui
       ? (s: string) => {
@@ -104,5 +110,36 @@ registerTool({
     } catch (e: any) {
       return cap(`Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`);
     }
+  },
+});
+
+registerTool({
+  name: "job",
+  description: "Manage background shell jobs (started via bash {background:true}) — dev servers, watchers, long tasks. action: list | tail | kill.",
+  input_schema: {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["list", "tail", "kill"] },
+      id: { type: "string", description: "job id (required for tail/kill)" },
+      lines: { type: "number", description: "tail: number of trailing lines to show (default 40)" },
+    },
+    required: ["action"],
+  },
+  kind: "read", // manages only the agent's own background jobs; safe to run unconfirmed
+  async run(input) {
+    const action = String(input.action);
+    if (action === "list") {
+      const js = listJobs();
+      if (!js.length) return "(no background jobs)";
+      return js.map((j) => `${j.id}  [${j.status}${j.code != null ? " " + j.code : ""}]  ${Math.round(j.ageMs / 1000)}s  ${j.command}`).join("\n");
+    }
+    const id = String(input.id ?? "");
+    if (!id) return "Error: `id` is required for tail/kill.";
+    if (action === "tail") {
+      const t = tailJob(id, Number(input.lines) || 40);
+      return t == null ? `No job ${id}.` : t.trim() || "(no output yet)";
+    }
+    if (action === "kill") return killJob(id) ? `Killed ${id}.` : `No running job ${id} (already exited/killed or unknown).`;
+    return `Error: unknown action '${action}'.`;
   },
 });

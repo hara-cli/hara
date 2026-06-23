@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.73.0 — unreleased (Sprint 2: background shell jobs — run dev servers / watchers without blocking)
+
+- **`bash {background: true}`** starts a long-lived command (dev server, `tsc --watch`, a long build) as a
+  background job and returns a job id immediately — the agent keeps working instead of blocking on a command
+  that never exits. New **`job` tool** (`list` / `tail` / `kill`) manages them; output is captured to a capped
+  tail buffer. Background jobs reuse `bash`'s exact **sandbox write-confinement** (shared `shellCommand`) and
+  pass the same permission gate when started; they're the agent's own children and are **terminated when hara
+  exits** (no orphaned dev servers). `src/exec/jobs.ts` + tests (231 total). First slice of the exec-subsystem
+  gap from the 4-expert analysis — persistent/interactive PTY + docker/ssh backends come next.
+
 ## 0.72.0 — unreleased (per-turn model routing: strong model for code, cheap/general for trivial turns)
 
 - **Opt-in per-turn model routing** — the answer to "use a coding model for real work, a cheap/general model

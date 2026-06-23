@@ -6,9 +6,9 @@ import { join } from "node:path";
 import "../dist/tools/builtin.js"; // registers built-ins (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
 
-test("registry contains the three built-in tools", () => {
+test("registry contains the built-in tools", () => {
   const names = getTools().map((t) => t.name).sort();
-  assert.deepEqual(names, ["bash", "read_file", "write_file"]);
+  assert.deepEqual(names, ["bash", "job", "read_file", "write_file"]);
 });
 
 test("write_file → read_file round-trips in cwd", async () => {
