@@ -9,6 +9,7 @@ import { runHooks } from "../hooks.js";
 import { mapLimit, maxParallel } from "../concurrency.js";
 import type { ApprovalMode } from "../config.js";
 import { decideCommand, loadPermissionRules } from "../security/permissions.js";
+import { subdirHint } from "../context/subdir-hints.js";
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
 export function needsConfirm(kind: string | undefined, mode: ApprovalMode): boolean {
@@ -210,7 +211,8 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
           return;
         }
         const res = await p.tool!.run(p.tu.input, ctx);
-        results[idx] = { id: p.tu.id, name: p.tu.name, content: res };
+        // append any not-yet-seen subdirectory AGENTS.md/CLAUDE.md this call touched (monorepo-local conventions)
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) };
         runHooks("PostToolUse", p.tu.name, { input: p.tu.input, result: res }, ctx.cwd); // observe-only
       } catch (e: any) {
         results[idx] = { id: p.tu.id, name: p.tu.name, content: `Error: ${e.message}`, isError: true };

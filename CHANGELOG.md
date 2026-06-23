@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.75.0 — unreleased (lazy subdirectory AGENTS.md / CLAUDE.md — monorepo-local conventions reach the model)
+
+- When a tool touches a directory not seen yet this session, hara loads that directory's **`AGENTS.md` /
+  `CLAUDE.md`** (the local conventions for that package) and appends it to the tool result — so in a monorepo,
+  `packages/api/AGENTS.md` or `growth/CLAUDE.md` reaches the model exactly when work moves there, not just the
+  root doc loaded at startup. Each directory loads once per session; only dirs **under cwd** (startup already
+  covers cwd→root); paths are taken from a tool's `path` or path-like tokens in a `bash` command. Zero-dep,
+  additive (never removes context). `src/context/subdir-hints.ts` + tests (235 total).
+
 ## 0.74.1 — unreleased (bash output keeps head + tail, not just head)
 
 - Long command output (build / test logs) is now truncated **keeping both the head and the tail** instead of
