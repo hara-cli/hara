@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.74.0 — unreleased (auto-compaction — summarize before the context overflows, like Claude Code)
+
+- **Auto-compaction**: when a turn fills the model's context past ~85%, hara now **summarizes the conversation
+  and continues automatically** (a "✻ Auto-compacting conversation…" notice) instead of only warning — so a
+  long session no longer dead-ends at the context limit. Opt out with `autoCompact: false` (or
+  `HARA_AUTO_COMPACT=0`); below the threshold the ≥80% warning still shows. Works in the TUI **and** the classic
+  REPL.
+- The summarize-and-replace logic is now a single shared `compactConversation` (manual `/compact` and auto both
+  use it — no drift); it keeps the working-memory notes that survive the wipe and resets the context gauge off
+  the (small) summary. New `src/agent/compact.ts` (`shouldAutoCompact` trigger) + test (232 total).
+- The two distinct controls (unchanged, just clarified): **`/compact`** summarizes → replaces history to free
+  tokens while keeping the thread; **`/clear`** (= `/reset`) wipes the conversation for a fresh start.
+
 ## 0.73.0 — unreleased (Sprint 2: background shell jobs — run dev servers / watchers without blocking)
 
 - **`bash {background: true}`** starts a long-lived command (dev server, `tsc --watch`, a long build) as a

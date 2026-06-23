@@ -35,6 +35,7 @@ import { renderSessionMarkdown } from "./export.js";
 import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL, syncOrgRoles } from "./org-fleet/enroll.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
+import { shouldAutoCompact } from "./agent/compact.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
@@ -548,6 +549,41 @@ const workingSetFromSummary = (s: string): string[] =>
     .filter((l) => l.length > 3)
     .slice(0, 12)
     .map((l) => l.slice(0, 140));
+
+/** Summarize the conversation and replace history with the summary (keeping working-memory notes). Shared by
+ *  /compact (manual) and auto-compaction. Returns the summary, or null on failure / nothing to do. */
+async function compactConversation(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }): Promise<string | null> {
+  if (history.length < 2) return null;
+  const r = await provider.turn({
+    system: COMPACT_SYSTEM,
+    history: [...history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
+    tools: [],
+    onText: () => {},
+  });
+  if (r.stop === "error") return null;
+  const summary = r.text.trim();
+  if (!summary) return null;
+  meta.workingSet = workingSetFromSummary(summary); // survives the history wipe + injects into the next turns
+  history.length = 0;
+  history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
+  stats.input += r.usage?.input ?? 0;
+  stats.output += r.usage?.output ?? 0;
+  stats.lastInput = r.usage?.input ?? 0; // ctx% now reflects the (small) summary, not the old full turn
+  saveSession(meta, history);
+  return summary;
+}
+
+/** Auto-compact (à la Claude Code) when the last turn filled the context past the threshold, so the NEXT turn
+ *  doesn't overflow. Opt-out via `autoCompact: false` / `HARA_AUTO_COMPACT=0`. Best-effort; `notify` surfaces
+ *  a one-line status. Returns true if it compacted. */
+async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, cfg: HaraConfig, notify: (m: string) => void): Promise<boolean> {
+  const pct = bar.ctxPctFor(cfg.model, stats.lastInput ?? 0);
+  if (!shouldAutoCompact(pct, history.length, cfg.autoCompact)) return false;
+  notify(`✻ Auto-compacting conversation (context ${pct}% full)…`);
+  const summary = await compactConversation(provider, history, meta, stats);
+  notify(summary ? `(auto-compacted — context replaced with a summary; ${meta.workingSet?.length ?? 0} notes kept)` : "(auto-compact failed — use /compact or /clear)");
+  return !!summary;
+}
 
 /** Run a (read-only by default) sub-agent to completion, quietly, and return its final text. */
 async function runSubagent(
@@ -1593,24 +1629,9 @@ program.action(async (opts) => {
       name: "compact",
       desc: "summarize the conversation so far to free up context",
       run: async () => {
-        if (history.length < 2) return void out(c.dim("(nothing to compact)\n"));
         out(c.dim("Compacting…\n"));
-        const r = await provider.turn({
-          system: COMPACT_SYSTEM,
-          history: [...history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
-          tools: [],
-          onText: () => {},
-        });
-        if (r.stop === "error") return void out(c.red(`(compact failed: ${r.errorMsg})\n`));
-        const summary = r.text.trim();
-        if (!summary) return void out(c.dim("(compact produced nothing)\n"));
-        meta.workingSet = workingSetFromSummary(summary); // survives the history wipe + injects next turns
-        history.length = 0;
-        history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
-        stats.input += r.usage?.input ?? 0;
-        stats.output += r.usage?.output ?? 0;
-        saveSession(meta, history);
-        out(c.green(`(compacted — ${summary.length} chars; context replaced with the summary)\n`));
+        const summary = await compactConversation(provider, history, meta, stats);
+        out(summary ? c.green(`(compacted — ${summary.length} chars; context replaced with the summary)\n`) : c.dim("(nothing to compact / compact failed)\n"));
       },
     },
     {
@@ -1831,23 +1852,8 @@ program.action(async (opts) => {
                 /* flush is best-effort */
               }
             }
-            const cr = await provider.turn({
-              system: COMPACT_SYSTEM,
-              history: [...history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
-              tools: [],
-              onText: () => {},
-            });
-            if (cr.stop === "error") return void h.sink.notice(`(compact failed: ${cr.errorMsg})`);
-            const summary = cr.text.trim();
-            if (!summary) return void h.sink.notice("(compact produced nothing)");
-            meta.workingSet = workingSetFromSummary(summary);
-            history.length = 0;
-            history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
-            stats.input += cr.usage?.input ?? 0;
-            stats.output += cr.usage?.output ?? 0;
-            h.sink.usage(cr.usage?.input ?? 0, cr.usage?.output ?? 0);
-            saveSession(meta, history);
-            return void h.sink.notice(`(compacted — kept ${meta.workingSet.length} working-memory notes)`);
+            const summary = await compactConversation(provider, history, meta, stats);
+            return void h.sink.notice(summary ? `(compacted — kept ${meta.workingSet?.length ?? 0} working-memory notes)` : "(nothing to compact / compact failed)");
           }
           if (nm === "sessions") {
             const ms = listSessions();
@@ -2022,6 +2028,7 @@ program.action(async (opts) => {
         h.sink.usage(stats.input - beforeIn, stats.output - beforeOut);
         notifyDone(cfg.notify, { message: meta.title || "turn complete", elapsedMs: Date.now() - turnStart });
         saveSession(meta, history);
+        await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => h.sink.notice(m));
       },
     });
     await closeMcp();
@@ -2087,8 +2094,10 @@ program.action(async (opts) => {
       out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
     }
     saveSession(meta, history);
-    const ctxPct = bar.ctxPctFor(cfg.model, stats.lastInput ?? 0);
-    if (ctxPct >= 80) out(c.yellow(`  ⚠ context ${ctxPct}% full — /compact to summarize, or /reset to clear\n`));
+    if (!(await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => out(c.dim(`${m}\n`))))) {
+      const ctxPct = bar.ctxPctFor(cfg.model, stats.lastInput ?? 0);
+      if (ctxPct >= 80) out(c.yellow(`  ⚠ context ${ctxPct}% full — /compact to summarize, or /clear to reset\n`));
+    }
   }
   bar.uninstall();
   rl.close();

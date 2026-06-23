@@ -50,6 +50,8 @@ export interface HaraConfig {
   routeModel: string | undefined;
   routeBaseURL: string | undefined;
   routeApiKey: string | undefined;
+  /** auto-compact the conversation when the last turn fills context past ~85% (à la Claude Code). default on. */
+  autoCompact: boolean;
   /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
   hooks: HooksConfig;
   /** ping when a (non-trivial) turn finishes: off | bell (terminal BEL) | system (OS notification + bell) */
@@ -72,7 +74,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   "hara-gateway": { model: "", envKey: "HARA_GATEWAY_TOKEN" }, // B-end: enrolled device → token in ~/.hara/org.json, routed by the gateway
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "notify", "vimMode"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "notify", "vimMode", "autoCompact"] as const;
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
@@ -183,8 +185,9 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const hooks = (merged.hooks && typeof merged.hooks === "object" ? merged.hooks : {}) as HooksConfig;
   const notify = (process.env.HARA_NOTIFY ?? merged.notify ?? "off") as NotifyMode;
   const vimMode = process.env.HARA_VIM === "1" || merged.vimMode === true || merged.vimMode === "true";
+  const autoCompact = !(process.env.HARA_AUTO_COMPACT === "0" || merged.autoCompact === false || merged.autoCompact === "false"); // default ON
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, hooks, notify, vimMode, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, hooks, notify, vimMode, autoCompact, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {
