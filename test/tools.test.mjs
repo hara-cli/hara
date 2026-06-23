@@ -3,8 +3,18 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import "../dist/tools/builtin.js"; // registers built-ins (run `npm run build` first)
+import { capHeadTail } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
+
+test("capHeadTail: keeps head + tail of long output (errors live at the end)", () => {
+  const s = "HEAD_START" + "x".repeat(200_000) + "TAIL_ERROR";
+  const out = capHeadTail(s);
+  assert.ok(out.startsWith("HEAD_START"), "keeps the head");
+  assert.ok(out.endsWith("TAIL_ERROR"), "keeps the tail (where errors are)");
+  assert.match(out, /chars truncated/);
+  assert.ok(out.length < s.length);
+  assert.equal(capHeadTail("short output"), "short output"); // under the cap → unchanged
+});
 
 test("registry contains the built-in tools", () => {
   const names = getTools().map((t) => t.name).sort();

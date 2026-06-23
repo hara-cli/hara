@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.74.1 — unreleased (bash output keeps head + tail, not just head)
+
+- Long command output (build / test logs) is now truncated **keeping both the head and the tail** instead of
+  only the first 100k chars — so the model still sees the **end**, where the error/result usually is (plain
+  head-truncation cut exactly the part that matters). `read_file` truncation is unchanged. New `capHeadTail`
+  used on `bash` success + failure output; + test (233 total).
+
 ## 0.74.0 — unreleased (auto-compaction — summarize before the context overflows, like Claude Code)
 
 - **Auto-compaction**: when a turn fills the model's context past ~85%, hara now **summarizes the conversation

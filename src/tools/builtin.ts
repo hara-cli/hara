@@ -18,6 +18,14 @@ function cap(s: string): string {
   return s.length > MAX ? s.slice(0, MAX) + `\n…[truncated ${s.length - MAX} chars]` : s;
 }
 
+/** Truncate keeping the HEAD and the TAIL — for command output, where the start gives context but the END
+ *  usually holds the error/result, so plain head-truncation would cut exactly the part that matters most. */
+export function capHeadTail(s: string, max = MAX): string {
+  if (s.length <= max) return s;
+  const head = Math.floor(max * 0.6);
+  return s.slice(0, head) + `\n…[${s.length - max} chars truncated]…\n` + s.slice(s.length - (max - head));
+}
+
 registerTool({
   name: "read_file",
   description: "Read a UTF-8 text file and return its contents.",
@@ -106,9 +114,9 @@ registerTool({
       });
       if (ctx.ui && buf) ctx.ui.notice(buf); // flush trailing partial line
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
-      return cap(combined.trim() || "(no output)");
+      return capHeadTail(combined.trim() || "(no output)");
     } catch (e: any) {
-      return cap(`Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`);
+      return capHeadTail(`Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`);
     }
   },
 });
