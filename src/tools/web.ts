@@ -5,6 +5,7 @@
 import { registerTool } from "./registry.js";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { wrapUntrusted } from "../security/external-content.js";
 
 const MAX = 60_000;
 
@@ -147,7 +148,7 @@ registerTool({
         if (res.ok) {
           const j = (await res.json()) as { results?: { title?: string; url?: string; content?: string }[] };
           const rs = (j.results ?? []).map((x) => ({ title: String(x.title ?? x.url ?? ""), url: String(x.url ?? ""), snippet: String(x.content ?? "").slice(0, 200) }));
-          if (rs.length) return fmt(rs);
+          if (rs.length) return wrapUntrusted(fmt(rs), `web_search: ${q}`);
         }
         // Tavily failed → fall through to the keyless best-effort path.
       }
@@ -166,7 +167,7 @@ registerTool({
       if (!res.ok) return `Search failed: HTTP ${res.status}. Keyless search is rate-limited — set HARA_SEARCH_API_KEY (Tavily) for reliable search, or web_fetch a known URL.`;
       const results = parseSearchResults(await res.text(), limit);
       if (!results.length) return "(no results — the keyless endpoint is rate-limited or changed. Set HARA_SEARCH_API_KEY (Tavily) for reliable search, or web_fetch a known URL.)";
-      return fmt(results);
+      return wrapUntrusted(fmt(results), `web_search: ${q}`);
     } catch (e: any) {
       return `Search failed: ${e?.name === "AbortError" ? "timed out (20s)" : (e?.message ?? e)}`;
     } finally {
@@ -221,7 +222,7 @@ registerTool({
       const raw = await readCapped(res, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
       let text = /html/i.test(ct) ? htmlToText(raw) : raw;
       if (text.length > cap) text = text.slice(0, cap) + `\n…[truncated ${text.length - cap} chars]`;
-      return `# ${current.href} (HTTP ${res.status})\n\n${text || "(empty body)"}`;
+      return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(text || "(empty body)", current.href)}`;
     } catch (e: any) {
       return `Error fetching ${url.href}: ${e?.name === "AbortError" ? "timed out (30s)" : (e?.message ?? e)}`;
     } finally {

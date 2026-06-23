@@ -33,6 +33,7 @@ import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { completionScript } from "./completions.js";
 import { renderSessionMarkdown } from "./export.js";
 import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL, syncOrgRoles } from "./org-fleet/enroll.js";
+import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
@@ -520,9 +521,16 @@ const MEMORY_DISTILL_SYSTEM =
   "memory_write (target=memory, or target=user for preferences; pick the right scope=project|global). " +
   "Skip the ephemeral, the one-off, and anything already known. Be terse and de-duplicated. Then reply DONE.";
 const COMPACT_SYSTEM =
-  "Summarize the conversation so far into a concise but complete brief so the assistant can " +
-  "continue seamlessly: the user's goal, key decisions, files changed, current state, and open next steps. " +
-  "Be specific. Output only the summary.";
+  "Summarize the conversation so far into a structured, complete brief so the assistant can continue with NO " +
+  "loss of context. First think privately in a brief <analysis> scratchpad (what matters, what's in flight), " +
+  "then output ONLY the summary under these exact headings:\n" +
+  "1. Goal — the user's overall intent, in their own framing.\n" +
+  "2. Key decisions — choices made and why (so they aren't relitigated).\n" +
+  "3. Files & code — files created/changed and the important snippets, with why each matters.\n" +
+  "4. Errors & fixes — failures hit, how they were resolved, and any correction the user gave (quote pointed feedback verbatim).\n" +
+  "5. Current state — what works now / what is verified.\n" +
+  "6. Next step — the immediate next action, INCLUDING a direct verbatim quote of the user's most recent request so there is no drift.\n" +
+  "Be specific and concrete. Drop the <analysis>; output only the headed summary.";
 const workingSetFromSummary = (s: string): string[] =>
   s
     .split("\n")
@@ -817,6 +825,30 @@ program
     } catch (err) {
       out(c.red(`Enroll failed: ${err instanceof Error ? err.message : String(err)}\n`));
     }
+  });
+
+program
+  .command("permissions")
+  .description("show or scaffold command permission rules (bash allow/ask/deny + read-only autorun)")
+  .option("--init", "write a starter permissions.json")
+  .option("--project", "with --init, write it in this project (.hara/permissions.json) instead of globally")
+  .action((opts: { init?: boolean; project?: boolean }) => {
+    if (opts.init) {
+      const p = scaffoldPermissions(process.cwd(), opts.project ? "project" : "global");
+      return void out(p ? c.green(`✓ wrote ${p}\n`) : c.dim("(permissions file already exists — edit it directly)\n"));
+    }
+    const r = loadPermissionRules(process.cwd());
+    const pp = projectPermissionsPath(process.cwd());
+    out(
+      c.bold("Command permissions") +
+        c.dim(" (bash) — deny blocks even in full-auto; allow / read-only auto-runs even in suggest\n") +
+        `  ${c.dim("global: ")} ${globalPermissionsPath()}\n` +
+        `  ${c.dim("project:")} ${pp ?? "(none)"}\n` +
+        `  ${c.dim("read-only autorun:")} ${r.readonlyAutorun ? c.green("on") : "off"}\n` +
+        `  ${c.green("allow")}: ${r.allow.length ? r.allow.join(", ") : c.dim("(none)")}\n` +
+        `  ${c.red("deny")} : ${r.deny.length ? r.deny.join(", ") : c.dim("(none)")}\n` +
+        c.dim("  edit the JSON to customize, or `hara permissions --init` for a starter.\n"),
+    );
   });
 
 program

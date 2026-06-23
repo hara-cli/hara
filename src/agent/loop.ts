@@ -8,6 +8,7 @@ import { skillsDigest } from "../skills/skills.js";
 import { runHooks } from "../hooks.js";
 import { mapLimit, maxParallel } from "../concurrency.js";
 import type { ApprovalMode } from "../config.js";
+import { decideCommand, loadPermissionRules } from "../security/permissions.js";
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
 export function needsConfirm(kind: string | undefined, mode: ApprovalMode): boolean {
@@ -71,6 +72,7 @@ export interface RunOpts {
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
 export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<void> {
   const { provider, ctx } = opts;
+  const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
 
   for (;;) {
     // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
@@ -170,7 +172,14 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         .trim();
       // Screen control is gated on EVERY action — a prior "don't ask again" must never satisfy it.
       const alwaysGate = tool.kind === "computer";
-      if (needsConfirm(tool.kind, opts.approval) && (alwaysGate || !opts.autoApprove?.has(tu.name))) {
+      // Command-level policy for shell commands: a deny rule blocks even in full-auto; an allow rule (or a
+      // read-only command) auto-runs even in suggest mode. Composes with, doesn't replace, the approval mode.
+      const cmdDecision = tool.kind === "exec" && typeof input.command === "string" ? decideCommand(input.command, permRules) : null;
+      if (cmdDecision === "deny") {
+        plans.push({ tu, tool, denied: "Denied by a permission rule (~/.hara/permissions.json). Loosen the rule or run it yourself." });
+        continue;
+      }
+      if (cmdDecision !== "allow" && needsConfirm(tool.kind, opts.approval) && (alwaysGate || !opts.autoApprove?.has(tu.name))) {
         const reply = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
         if (reply === false) {
           plans.push({ tu, tool, denied: "User denied this action." });
