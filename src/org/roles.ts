@@ -24,6 +24,12 @@ export function rolesDir(cwd: string): string {
 export function globalRolesDir(): string {
   return join(homedir(), ".hara", "roles");
 }
+/** Org-pushed roles (B-end): the digital-employee bundle synced from hara-control's `/v1/roles` into
+ *  `~/.hara/org-roles/*.md` (see org-fleet/enroll.ts syncOrgRoles). A managed baseline — above
+ *  third-party plugins, but a dev's own global/project roles still win. */
+export function orgRolesDir(): string {
+  return join(homedir(), ".hara", "org-roles");
+}
 /** Claude-Code subagents (`.claude/agents/*.md`) — consumed for ecosystem interop (project scope). */
 export function claudeAgentsDir(cwd: string): string {
   return join(findProjectRoot(cwd), ".claude", "agents");
@@ -72,8 +78,8 @@ export function subagentToolFilter(role: Role | undefined, isReadonly: (n: strin
 
 export function loadRoles(cwd: string): Role[] {
   const byId = new Map<string, Role>();
-  // lowest→highest precedence: plugins < global < .claude/agents < .hara/roles (project wins, same as memory/config)
-  for (const dir of [...pluginRoleDirs(), globalRolesDir(), claudeAgentsDir(cwd), rolesDir(cwd)]) {
+  // lowest→highest precedence: plugins < org(B-end push) < global < .claude/agents < .hara/roles (project wins)
+  for (const dir of [...pluginRoleDirs(), orgRolesDir(), globalRolesDir(), claudeAgentsDir(cwd), rolesDir(cwd)]) {
     if (!existsSync(dir)) continue;
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".md") || f === "README.md") continue;

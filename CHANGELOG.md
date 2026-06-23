@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.70.0 — unreleased (B-end: devices pull their governed org-role bundle)
+
+- An enrolled device now **syncs its digital-employee roles from hara-control** — `GET {gateway}/v1/roles`
+  (Bearer device token) returns the governed bundle the control plane resolved for this device's
+  person/team, and hara materializes it into `~/.hara/org-roles/*.md`. This closes the B3 gap where the
+  server could resolve+govern roles but the CLI never consumed them (it only read local `.hara/roles/`).
+- **Precedence layer** (in `loadRoles`): `plugins < org(B-end push) < global < .claude/agents < project`
+  — the org baseline sits above third-party plugins, but a dev's own global/project roles still win, so
+  pushed roles are a managed default, not a lock. (Org policy can tighten this later.)
+- **Authoritative replace**: the org bundle owns `~/.hara/org-roles/` — each sync wipes and rewrites it,
+  so a server-side role revoke/rename actually removes the local file. A `_policy.json` sidecar carries
+  the org governance floor (model/tool/approval) for later enforcement.
+- Wired on `hara enroll` (reports the count) and best-effort in the background on startup when
+  `provider=hara-gateway` (alongside the heartbeat). Never throws / never blocks — returns 0 on any
+  failure or when not enrolled. snake_case wire fields (`allow_tools`/`deny_tools`) map to the CLI's
+  `allowTools`/`denyTools` frontmatter. New `syncOrgRoles()` in `src/org-fleet/enroll.ts` + test.
+
 ## 0.69.1 — unreleased (@file expands inline, not appended at the bottom)
 
 - `@path` mentions now expand **in place** — the referenced file/dir content lands exactly where it's

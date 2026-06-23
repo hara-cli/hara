@@ -32,7 +32,7 @@ import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { completionScript } from "./completions.js";
 import { renderSessionMarkdown } from "./export.js";
-import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL } from "./org-fleet/enroll.js";
+import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL, syncOrgRoles } from "./org-fleet/enroll.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
@@ -812,6 +812,8 @@ program
       writeConfigValue("provider", "hara-gateway");
       if (e.model) writeConfigValue("model", e.model);
       out(c.green(`✓ enrolled with ${e.gatewayUrl}`) + c.dim(` · device ${e.deviceId || "?"} · model ${e.model || "(gateway default)"}\n`) + c.dim("hara routes through the gateway now — the real provider key stays server-side.\n"));
+      const nRoles = await syncOrgRoles(); // pull this device's governed digital-employee bundle (B3)
+      if (nRoles > 0) out(c.dim(`  ↳ synced ${nRoles} org role${nRoles === 1 ? "" : "s"} → ~/.hara/org-roles/\n`));
     } catch (err) {
       out(c.red(`Enroll failed: ${err instanceof Error ? err.message : String(err)}\n`));
     }
@@ -1273,7 +1275,10 @@ program.action(async (opts) => {
     process.exit(1);
   }
   let provider: Provider = provider0;
-  if (cfg.provider === "hara-gateway") void heartbeat(); // fleet visibility — fire-and-forget, never blocks startup
+  if (cfg.provider === "hara-gateway") {
+    void heartbeat(); // fleet visibility — fire-and-forget, never blocks startup
+    void syncOrgRoles(); // refresh governed org-role bundle (B3) in the background; best-effort, never blocks
+  }
   const cwd = cfg.cwd;
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
   let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it
