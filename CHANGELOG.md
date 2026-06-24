@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.82.0 — unreleased (gateway: roam projects + threads from chat — /cd, /pwd, project-scoped /sessions)
+
+- A chat can now **switch working directory at runtime**, and its session follows: `/cd <dir>` (absolute, `~`,
+  or relative to the current dir) moves the chat into that project and opens that project's own thread; `/pwd`
+  shows the current dir + thread; `/sessions` lists the **current dir's** threads; `/new` forks the current
+  dir's thread; `/resume <id>` jumps to a thread and adopts its dir so it runs in the right place. Each
+  (chat, dir) pair gets its own stable, resumable session id (`<platform>-<chatId>-<cwdTag>[-fork]`) — so one
+  gateway roams across projects while keeping per-project history, and switching back resumes. Foundation for
+  a future desktop client.
+- The chat-session store (`~/.hara/gateway/chats.json`) is now cwd-aware (`chatContext`/`chatCd`); old entries
+  migrate in place (keep their existing thread). Tested.
+
 ## 0.81.6 — unreleased (headless `-p --resume`: auto-compact long sessions)
 
 - The `hara -p … --resume <id>` / `--continue` path (used by the chat gateway and cron) now runs

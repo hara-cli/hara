@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseTelegramUpdate, chunkText } from "../dist/gateway/telegram.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
-import { chatSessionId, newChatSession, setChatSession } from "../dist/gateway/sessions.js";
+import { chatContext, chatCd, newChatSession, setChatSession, cwdTag } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired } from "../dist/gateway/weixin.js";
 
 test("parseTelegramUpdate: text message → InboundMsg; non-text → null", () => {
@@ -56,17 +56,32 @@ test("cleanReply: strips mcp status lines + token footer, keeps the answer", () 
   assert.equal(cleanReply("just an answer\nwith two lines"), "just an answer\nwith two lines"); // no chrome → untouched
 });
 
-test("chat→session map: stable id, /new forks, /resume sets (isolated HOME)", () => {
+test("chat ctx: cwd-scoped session; /cd switches project+thread, /new forks, /resume sets id+cwd (isolated HOME)", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-gw-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
   try {
-    assert.equal(chatSessionId("telegram", 42), "telegram-42");
-    assert.equal(chatSessionId("telegram", 42), "telegram-42"); // stable
-    assert.equal(newChatSession("telegram", 42), "telegram-42-1"); // /new forks
-    assert.equal(chatSessionId("telegram", 42), "telegram-42-1"); // now the forked one
-    setChatSession("telegram", 42, "some-other-session");
-    assert.equal(chatSessionId("telegram", 42), "some-other-session"); // /resume points elsewhere
+    const def = "/work/default";
+    const a = chatContext("telegram", 42, def);
+    assert.equal(a.cwd, def);
+    assert.equal(a.sessionId, `telegram-42-${cwdTag(def)}`);
+    assert.deepEqual(chatContext("telegram", 42, def), a); // stable
+
+    const projSid = chatCd("telegram", 42, "/work/projB"); // /cd → that project's own thread
+    assert.equal(projSid, `telegram-42-${cwdTag("/work/projB")}`);
+    assert.notEqual(cwdTag("/work/projB"), cwdTag(def)); // different dirs → different threads
+    const b = chatContext("telegram", 42, def);
+    assert.equal(b.cwd, "/work/projB");
+    assert.equal(b.sessionId, projSid);
+
+    const forked = newChatSession("telegram", 42, def); // /new forks the CURRENT dir's thread
+    assert.equal(forked, `telegram-42-${cwdTag("/work/projB")}-1`);
+    assert.equal(chatContext("telegram", 42, def).sessionId, forked);
+
+    setChatSession("telegram", 42, "explicit-session", "/work/other"); // /resume sets id + follows its cwd
+    const c = chatContext("telegram", 42, def);
+    assert.equal(c.sessionId, "explicit-session");
+    assert.equal(c.cwd, "/work/other");
   } finally {
     if (prev === undefined) delete process.env.HOME;
     else process.env.HOME = prev;

@@ -4,12 +4,12 @@
 // persistent process; it is never required by the core CLI.
 import { spawn } from "node:child_process";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
-import { chatSessionId, newChatSession, setChatSession } from "./sessions.js";
+import { chatContext, chatCd, newChatSession, setChatSession } from "./sessions.js";
 import { selfArgv } from "../cron/runner.js";
-import { listSessions, resolveSessionId } from "../session/store.js";
+import { listSessions, resolveSessionId, loadSession } from "../session/store.js";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { mkdirSync, writeFileSync, existsSync, statSync } from "node:fs";
 
 /** Parse a leading slash-command from a chat message (pure). null if it isn't one. */
 export function parseCommand(text: string): { cmd: string; arg: string } | null {
@@ -116,24 +116,37 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       await adapter.send(m.chatId, "⛔ not authorized.");
       return;
     }
+    const ctx = chatContext(adapter.name, m.chatId, cwd); // this chat's current { cwd, sessionId }
     const cmd = parseCommand(m.text);
     if (cmd) {
-      if (cmd.cmd === "help") return adapter.send(m.chatId, "commands: /new (fresh session) · /sessions · /resume <id> · /help — anything else runs hara on this chat's session.");
-      if (cmd.cmd === "new") return adapter.send(m.chatId, `✨ new session: ${newChatSession(adapter.name, m.chatId)}`);
+      if (cmd.cmd === "help")
+        return adapter.send(
+          m.chatId,
+          "commands:\n/pwd — current project dir + thread\n/cd <dir> — switch project (thread follows)\n/sessions — threads in this dir\n/new — fresh thread\n/resume <id> — jump to a thread\n/help\nanything else = run hara here",
+        );
+      if (cmd.cmd === "pwd") return adapter.send(m.chatId, `📂 ${ctx.cwd}\n🧵 ${ctx.sessionId.slice(-18)}`);
+      if (cmd.cmd === "cd" || cmd.cmd === "project") {
+        if (!cmd.arg) return adapter.send(m.chatId, `📂 ${ctx.cwd}\nusage: /cd <dir> (absolute, ~, or relative to here)`);
+        const target = resolve(ctx.cwd, cmd.arg.replace(/^~(?=\/|$)/, homedir()));
+        if (!existsSync(target) || !statSync(target).isDirectory()) return adapter.send(m.chatId, `✗ not a directory: ${target}`);
+        const sid = chatCd(adapter.name, m.chatId, target);
+        return adapter.send(m.chatId, `📂 now in ${target}\n🧵 ${sid.slice(-18)} · /sessions lists this dir's threads`);
+      }
+      if (cmd.cmd === "new") return adapter.send(m.chatId, `✨ new thread: ${newChatSession(adapter.name, m.chatId, cwd).slice(-18)}`);
       if (cmd.cmd === "sessions") {
-        const list = listSessions(cwd).slice(0, 10).map((x) => `${x.id.slice(0, 14)}  ${x.title || "(untitled)"}`).join("\n");
-        return adapter.send(m.chatId, list || "(no sessions yet)");
+        const list = listSessions(ctx.cwd).slice(0, 10).map((x) => `${x.id.slice(-18)}  ${x.title || "(untitled)"}`).join("\n");
+        return adapter.send(m.chatId, `📂 ${ctx.cwd}\n${list || "(no threads in this dir yet)"}`);
       }
       if (cmd.cmd === "resume") {
         const id = resolveSessionId(cmd.arg);
         if (!id) return adapter.send(m.chatId, `no session '${cmd.arg}'`);
-        setChatSession(adapter.name, m.chatId, id);
-        return adapter.send(m.chatId, `↩ now chatting on ${id.slice(0, 14)}`);
+        const target = loadSession(id)?.meta.cwd || ctx.cwd; // follow the session's own dir so it runs in the right place
+        setChatSession(adapter.name, m.chatId, id, target);
+        return adapter.send(m.chatId, `↩ resumed ${id.slice(-18)}\n📂 ${target}`);
       }
       // any other slash word → treat as a normal task
     }
-    const sessionId = chatSessionId(adapter.name, m.chatId);
     await adapter.send(m.chatId, "⟳ working…");
-    await adapter.send(m.chatId, await runHara(m.text, sessionId, cwd));
+    await adapter.send(m.chatId, await runHara(m.text, ctx.sessionId, ctx.cwd));
   }, ac.signal);
 }
