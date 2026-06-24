@@ -38,6 +38,7 @@ import { routingProvider } from "./agent/route.js";
 import { shouldAutoCompact } from "./agent/compact.js";
 import { formatContextReport } from "./agent/context-report.js";
 import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
+import { checkpoint, listCheckpoints, restoreCheckpoint } from "./checkpoints.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
@@ -1650,6 +1651,21 @@ program.action(async (opts) => {
       },
     },
     {
+      name: "checkpoint",
+      desc: "file-state checkpoints: /checkpoint (list) · /checkpoint restore <n> (revert files to a checkpoint)",
+      run: (a) => {
+        const parts = (a ?? "").trim().split(/\s+/);
+        const cps = listCheckpoints(cwd);
+        if (parts[0] !== "restore") {
+          return void out(cps.length ? "File checkpoints (newest first) — `/checkpoint restore <n>` reverts files to it:\n" + cps.map((cp, i) => `  ${i + 1}. ${cp.sha}  ${cp.label}`).join("\n") + "\n" : c.dim("(no checkpoints yet — taken before each turn when fileCheckpoints is on)\n"));
+        }
+        const cp = cps[Number(parts[1]) - 1];
+        if (!cp) return void out(c.dim(`(no checkpoint ${parts[1] ?? ""})\n`));
+        const k = restoreCheckpoint(cwd, cp.sha);
+        out(k == null ? c.red("(restore failed)\n") : c.green(`(restored ${k} file(s) to ${cp.sha} — '${cp.label}'; prior state snapshotted too)\n`));
+      },
+    },
+    {
       name: "compact",
       desc: "summarize the conversation so far to free up context",
       run: async () => {
@@ -1868,6 +1884,17 @@ program.action(async (opts) => {
             saveSession(meta, history);
             return void h.sink.notice(`(rewound — kept ${history.length} messages; files unchanged. Type your next message.)`);
           }
+          if (nm === "checkpoint") {
+            const parts = arg.split(/\s+/);
+            const cps = listCheckpoints(cwd);
+            if (parts[0] !== "restore") {
+              return void h.sink.notice(cps.length ? "File checkpoints (newest first) — /checkpoint restore <n>:\n" + cps.map((cp, i) => `  ${i + 1}. ${cp.sha}  ${cp.label}`).join("\n") : "(no checkpoints yet)");
+            }
+            const cp = cps[Number(parts[1]) - 1];
+            if (!cp) return void h.sink.notice(`(no checkpoint ${parts[1] ?? ""})`);
+            const k = restoreCheckpoint(cwd, cp.sha);
+            return void h.sink.notice(k == null ? "(restore failed)" : `(restored ${k} file(s) to ${cp.sha} — '${cp.label}')`);
+          }
           if (nm === "compact") {
             if (history.length < 2) return void h.sink.notice("(nothing to compact)");
             h.sink.notice("✻ compacting…");
@@ -2044,6 +2071,7 @@ program.action(async (opts) => {
         const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + (ri.extraText ?? "");
         recalledContext = "";
         history.push({ role: "user", content: userContent, ...(ri.attach?.length ? { images: ri.attach } : {}) });
+        if (cfg.fileCheckpoints) checkpoint(cwd, line.slice(0, 80)); // shadow-git snapshot before the turn mutates
         const beforeIn = stats.input;
         const beforeOut = stats.output;
         await runAgent(history, {
@@ -2109,6 +2137,7 @@ program.action(async (opts) => {
     const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd);
     recalledContext = "";
     history.push({ role: "user", content: userContent });
+    if (cfg.fileCheckpoints) checkpoint(cwd, userContent.slice(0, 80)); // shadow-git snapshot before the turn mutates
     currentTurn = new AbortController();
     const t0 = Date.now();
     try {

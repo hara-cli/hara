@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.78.0 — unreleased (file-state checkpoints — shadow-git "undo the agent's edits")
+
+- **Durable file checkpoints** complete the rewind story (beyond the edit-only in-memory undo, which missed
+  `bash`-made changes). Before each turn, hara snapshots the whole working tree into a **shadow git repo** kept
+  OUTSIDE the project (`~/.hara/checkpoints/<hash>`, `GIT_DIR` there + `GIT_WORK_TREE` = project root) — so it
+  captures everything (incl. `bash`), **never touches your real `.git`/index**, and the model never sees it.
+  **`/checkpoint`** lists them; **`/checkpoint restore <n>`** reverts files to one.
+- **Safe by construction**: restore snapshots the current state first (so it's undoable) and only reverts
+  changed/deleted files — it **never deletes files created since** the checkpoint. Heavy/derived dirs
+  (`node_modules`, `.git`, `dist`, …) are excluded; only the first snapshot is a full scan (git's index makes
+  the rest incremental). Default on; opt out with `fileCheckpoints:false` / `HARA_CHECKPOINTS=0`.
+  `src/checkpoints.ts` + tests (241 total).
+
 ## 0.77.0 — unreleased (/rewind — fork the conversation back to an earlier turn)
 
 - New **`/rewind`** — `/rewind` lists recent user turns; `/rewind <n>` forks the conversation back to before
