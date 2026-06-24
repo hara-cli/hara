@@ -115,17 +115,23 @@ test("hardening: resolveJob — exact wins, unique prefix resolves, ambiguous ne
   }
 });
 
-test("selfArgv: node-script mode includes the script; compiled-binary mode is just the binary", () => {
-  const saved = process.argv[1];
+test("selfArgv: under node re-invokes the entry (script OR bin symlink); compiled binary re-invokes itself", () => {
+  const savedArgv = process.argv[1];
+  const savedExec = process.execPath;
   try {
+    process.execPath = "/usr/bin/node";
     process.argv[1] = "/x/dist/index.js";
-    assert.deepEqual(selfArgv(), [process.execPath, "/x/dist/index.js"], "node: re-invoke with the script");
-    process.argv[1] = "cron"; // binary: argv[1] is a user arg, not a script
-    assert.deepEqual(selfArgv(), [process.execPath], "binary: re-invoke the binary directly");
-    process.argv[1] = undefined;
-    assert.deepEqual(selfArgv(), [process.execPath]);
+    assert.deepEqual(selfArgv(), ["/usr/bin/node", "/x/dist/index.js"], "node + .js script");
+    // the installed `hara` bin symlink has no .js extension — the case that broke the gateway spawn
+    process.argv[1] = "/Users/me/.nvm/bin/hara";
+    assert.deepEqual(selfArgv(), ["/usr/bin/node", "/Users/me/.nvm/bin/hara"], "node + bin symlink");
+    // compiled single-binary: execPath IS hara (not node), so re-invoke it directly
+    process.execPath = "/usr/local/bin/hara";
+    process.argv[1] = "gateway";
+    assert.deepEqual(selfArgv(), ["/usr/local/bin/hara"], "compiled binary re-invokes itself");
   } finally {
-    process.argv[1] = saved;
+    process.argv[1] = savedArgv;
+    process.execPath = savedExec;
   }
 });
 

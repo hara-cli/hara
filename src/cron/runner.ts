@@ -12,11 +12,14 @@ export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
   return jobs.filter((j) => j.enabled && isDue(j, nowMs));
 }
 
-/** How to invoke hara again — handles both `node dist/index.js` (argv[1] is a script) and the compiled
- *  single-binary (argv[1] is a user arg, so re-invoke the binary directly). Used by the tick + by install. */
+/** How to invoke hara again. Under node, argv[1] is the entry to hand back to node — either `dist/index.js`
+ *  OR the installed `hara` bin symlink (node runs both); as a compiled single-binary, execPath itself IS hara
+ *  (argv[1] is a user arg), so re-invoke the binary directly. Used by the cron tick + the chat gateway.
+ *  Discriminator is whether execPath is node — NOT argv[1]'s extension (the bin symlink has no `.js`). */
 export function selfArgv(): string[] {
-  const a1 = process.argv[1];
-  return a1 && /\.[cm]?js$|\.ts$/.test(a1) ? [process.execPath, a1] : [process.execPath];
+  const exec = process.execPath;
+  const underNode = /(^|[\\/])node(\.exe)?$/i.test(exec);
+  return underNode && process.argv[1] ? [exec, process.argv[1]] : [exec];
 }
 
 const lockPath = (): string => join(cronDir(), ".tick.lock");
