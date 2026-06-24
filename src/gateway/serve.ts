@@ -19,7 +19,17 @@ export function isAllowed(userId: number | string, allowlist: Set<string>): bool
   return allowlist.size > 0 && allowlist.has(String(userId));
 }
 
-/** Run hara headlessly on a chat's session, returning its combined output (tail-capped — replies are short). */
+/** Strip hara's CLI chrome from captured `-p` output so a chat reply is just the answer: MCP status lines
+ *  (`mcp: …`) and the token-usage footer (`… · ↑N ↓N tok`). Colors are off when piped, so no ANSI to strip. */
+export function cleanReply(raw: string): string {
+  return raw
+    .split("\n")
+    .filter((ln) => !/^\s*mcp: /.test(ln) && !/·\s*↑\d+\s*↓\d+\s*tok\s*$/.test(ln))
+    .join("\n")
+    .trim();
+}
+
+/** Run hara headlessly on a chat's session, returning its cleaned output (tail-capped — replies are short). */
 function runHara(text: string, sessionId: string, cwd: string): Promise<string> {
   return new Promise((resolve) => {
     const self = selfArgv();
@@ -31,7 +41,7 @@ function runHara(text: string, sessionId: string, cwd: string): Promise<string> 
     child.stdout.on("data", cap);
     child.stderr.on("data", cap);
     child.on("error", (e) => resolve(`(error: ${e.message})`));
-    child.on("close", () => resolve(out.trim() || "(no output)"));
+    child.on("close", () => resolve(cleanReply(out) || "(no output)"));
   });
 }
 

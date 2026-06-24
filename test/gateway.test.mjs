@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseTelegramUpdate, chunkText } from "../dist/gateway/telegram.js";
-import { parseCommand, isAllowed, resolveAllowlist } from "../dist/gateway/serve.js";
+import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatSessionId, newChatSession, setChatSession } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired } from "../dist/gateway/weixin.js";
 
@@ -42,6 +42,18 @@ test("resolveAllowlist: env ids ∪ bot owner (weixin auto-allows the scanner)",
   assert.deepEqual([...resolveAllowlist("", "owner")], ["owner"]); // owner alone — no env needed
   assert.deepEqual([...resolveAllowlist("a, a ", undefined)], ["a"]); // trims + dedups, no owner
   assert.equal(resolveAllowlist("", undefined).size, 0); // telegram, no env = nobody
+});
+
+test("cleanReply: strips mcp status lines + token footer, keeps the answer", () => {
+  const raw = [
+    "mcp: browser → 23 tool(s)",
+    "mcp: wechat failed (spawn pyweixin-rpa ENOENT)",
+    "你好！有什么我可以帮你的吗？",
+    "  glm-5 · ↑8163 ↓54 tok",
+  ].join("\n");
+  assert.equal(cleanReply(raw), "你好！有什么我可以帮你的吗？");
+  assert.equal(cleanReply("mcp: x → 1 tool(s)\n\npong\n  glm-5 · ↑1 ↓2 tok"), "pong"); // blank lines collapse via trim
+  assert.equal(cleanReply("just an answer\nwith two lines"), "just an answer\nwith two lines"); // no chrome → untouched
 });
 
 test("chat→session map: stable id, /new forks, /resume sets (isolated HOME)", () => {

@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.81.4 — unreleased (gateway: clean chat replies — strip MCP logs + token footer)
+
+- The chat gateway scraped the `hara -p` subprocess output and sent it verbatim, so WeChat/Telegram replies
+  were wrapped in CLI chrome — `mcp: … → N tool(s)`, `mcp: … failed …`, and the `model · ↑N ↓N tok` footer.
+  New `cleanReply()` strips those, leaving just the assistant's answer. (Tool/diff streaming for multi-step
+  tasks is untouched; this only removes the always-present MCP-startup + token-footer noise.) Tested.
+
 ## 0.81.3 — unreleased (fix: gateway/cron subprocess spawn when hara runs via the `hara` bin symlink)
 
 - `selfArgv()` (used by the chat gateway and the cron tick to spawn a fresh `hara` per task) **dropped the
