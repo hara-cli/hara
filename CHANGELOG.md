@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.82.2 — unreleased (gateway: fix the voice tag that made hara disclaim)
+
+- 0.82.1's bare `[voice message]` prefix backfired — hara read it as raw audio to process and replied "I can't
+  handle voice," even though the message was already transcribed text (verified: the transcription reaches hara
+  correctly). Replaced with an explicit note ("…already transcribed to text below — just reply to it normally,
+  you don't have or need the audio") so hara answers the content instead of disclaiming.
+
 ## 0.82.1 — unreleased (gateway: tag transcribed WeChat voice messages)
 
 - WeChat **voice input already works** — iLink transcribes voice server-side (`voice_item.text`) and the gateway

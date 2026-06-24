@@ -107,10 +107,11 @@ export function parseWeixinMessage(msg: any, accountId: string): { inbound: Inbo
   const items = Array.isArray(msg?.item_list) ? msg.item_list : [];
   const text = extractText(items);
   if (!text) return null;
-  // A voice message arrives as iLink's server-side transcription (voice_item.text). Tag it so hara knows the
-  // text came from voice — otherwise it can't reason about "this voice" and replies as if it only got text.
+  // A voice message arrives as iLink's server-side transcription (voice_item.text). Prefix an explicit note —
+  // NOT a bare "[voice message]" label, which hara misreads as raw audio it must process (and then disclaims).
+  // This tells it the text is already transcribed so it just answers.
   const isVoice = !items.some((i: any) => i?.type === ITEM_TEXT) && items.some((i: any) => i?.type === 3);
-  const tagged = isVoice ? `[voice message] ${text}` : text;
+  const tagged = isVoice ? `(The user sent this as a voice message; it is already transcribed to text below — just reply to it normally, you don't have or need the audio.)\n\n${text}` : text;
   return { inbound: { chatId: from, userId: from, userName: from, text: tagged }, contextToken: str(msg?.context_token).trim() };
 }
 
