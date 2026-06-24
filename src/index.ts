@@ -905,13 +905,15 @@ program
   .description("run a chat gateway (Telegram or WeChat) so you can drive your local hara from your phone — opt-in daemon")
   .option("--platform <name>", "chat platform: telegram | weixin", "telegram")
   .option("--login", "(weixin) scan a QR to log in and save credentials, then exit")
+  .option("--cwd <dir>", "directory hara operates in for each message (default: current dir)")
   .action(async (opts) => {
     const mod = await import("./gateway/serve.js");
     if (opts.platform === "weixin" && opts.login) {
       await mod.weixinLogin();
       return;
     }
-    await mod.runGateway({ cwd: process.cwd(), platform: opts.platform });
+    const cwd = opts.cwd ? (await import("node:path")).resolve(opts.cwd) : process.cwd();
+    await mod.runGateway({ cwd, platform: opts.platform });
   });
 
 program

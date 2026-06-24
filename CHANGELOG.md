@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.81.2 — unreleased (gateway: `--cwd` flag to point at a workspace without `cd`)
+
+- `hara gateway [--platform …] --cwd <dir>` sets the directory hara operates in for each incoming message,
+  so you can launch the daemon against a chosen workspace without `cd`-ing first (resolved to an absolute
+  path). Defaults to the current dir as before. Recommended pattern: a dedicated safe scratch dir (e.g.
+  `~/work/projects/tools/hara`) rather than a sensitive repo, since each message runs `--approval full-auto`.
+
 ## 0.81.1 — unreleased (WeChat gateway: auto-allowlist the bot owner)
 
 - `hara gateway --platform weixin` now **auto-allows the bot owner** (the iLink `user_id` from login — i.e.
