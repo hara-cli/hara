@@ -7,6 +7,9 @@ import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.j
 import { chatSessionId, newChatSession, setChatSession } from "./sessions.js";
 import { selfArgv } from "../cron/runner.js";
 import { listSessions, resolveSessionId } from "../session/store.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 
 /** Parse a leading slash-command from a chat message (pure). null if it isn't one. */
 export function parseCommand(text: string): { cmd: string; arg: string } | null {
@@ -74,8 +77,24 @@ export function resolveAllowlist(envValue: string | undefined, ownerId?: string)
   return set;
 }
 
-export async function runGateway(opts: { cwd: string; platform?: string }): Promise<void> {
+/** The gateway's default workspace when no --cwd is given: a dedicated safe home under ~/.hara (like Hermes'
+ *  ~/.hermes), NOT the launch dir — so a full-auto chat bot never lands on a real repo by accident. */
+export function defaultWorkspace(): string {
+  const dir = join(homedir(), ".hara", "workspace");
+  mkdirSync(dir, { recursive: true });
+  const agents = join(dir, "AGENTS.md");
+  if (!existsSync(agents)) {
+    writeFileSync(
+      agents,
+      "# hara chat workspace\n\nDefault working directory for `hara gateway` (Telegram/WeChat). Each message runs here with `--approval full-auto`. A safe scratch — pass `--cwd <dir>` to point the gateway at a real project instead.\n",
+    );
+  }
+  return dir;
+}
+
+export async function runGateway(opts: { cwd?: string; platform?: string }): Promise<void> {
   const platform = opts.platform || "telegram";
+  const cwd = opts.cwd ?? defaultWorkspace(); // dir-free default: hara's own ~/.hara/workspace, like Hermes' ~/.hermes
   const built = await buildAdapter(platform);
   if (!built) process.exit(1);
   const { adapter, ownerId } = built;
@@ -89,7 +108,7 @@ export async function runGateway(opts: { cwd: string; platform?: string }): Prom
   const ac = new AbortController();
   process.on("SIGINT", () => ac.abort());
   process.on("SIGTERM", () => ac.abort());
-  console.error(`hara gateway: ${adapter.name} up · cwd=${opts.cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
+  console.error(`hara gateway: ${adapter.name} up · cwd=${cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
 
   await adapter.start(async (m: InboundMsg) => {
     if (!isAllowed(m.userId, allowlist)) {
@@ -102,7 +121,7 @@ export async function runGateway(opts: { cwd: string; platform?: string }): Prom
       if (cmd.cmd === "help") return adapter.send(m.chatId, "commands: /new (fresh session) · /sessions · /resume <id> · /help — anything else runs hara on this chat's session.");
       if (cmd.cmd === "new") return adapter.send(m.chatId, `✨ new session: ${newChatSession(adapter.name, m.chatId)}`);
       if (cmd.cmd === "sessions") {
-        const list = listSessions(opts.cwd).slice(0, 10).map((x) => `${x.id.slice(0, 14)}  ${x.title || "(untitled)"}`).join("\n");
+        const list = listSessions(cwd).slice(0, 10).map((x) => `${x.id.slice(0, 14)}  ${x.title || "(untitled)"}`).join("\n");
         return adapter.send(m.chatId, list || "(no sessions yet)");
       }
       if (cmd.cmd === "resume") {
@@ -115,6 +134,6 @@ export async function runGateway(opts: { cwd: string; platform?: string }): Prom
     }
     const sessionId = chatSessionId(adapter.name, m.chatId);
     await adapter.send(m.chatId, "⟳ working…");
-    await adapter.send(m.chatId, await runHara(m.text, sessionId, opts.cwd));
+    await adapter.send(m.chatId, await runHara(m.text, sessionId, cwd));
   }, ac.signal);
 }

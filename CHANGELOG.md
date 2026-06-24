@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.81.5 — unreleased (gateway: default workspace = ~/.hara/workspace — dir-free, Hermes-style)
+
+- `hara gateway` (no `--cwd`) now operates in a dedicated **`~/.hara/workspace`** (created + seeded on first
+  run) instead of the launch directory — so the chat bot is dir-free + safe-by-default (like Hermes' own
+  `~/.hermes`), never landing full-auto on whatever repo you happened to launch from. `--cwd <dir>` still
+  targets a real project.
+- This only sets where *files* are created. hara's **global memory (`~/.hara/memory`) and roles
+  (`~/.hara/roles` + B-end `~/.hara/org-roles`) are cwd-independent and always loaded**, so a chat session
+  shares the same global brain as the terminal CLI regardless of workspace. `~/.hara/` is hara's home:
+  memory · roles · sessions · skills · checkpoints · config · per-platform gateway state.
+
 ## 0.81.4 — unreleased (gateway: clean chat replies — strip MCP logs + token footer)
 
 - The chat gateway scraped the `hara -p` subprocess output and sent it verbatim, so WeChat/Telegram replies
