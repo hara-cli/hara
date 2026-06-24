@@ -35,22 +35,44 @@ function runHara(text: string, sessionId: string, cwd: string): Promise<string> 
   });
 }
 
-export async function runGateway(opts: { cwd: string }): Promise<void> {
+/** Re-exported so `hara gateway --platform weixin --login` can run the QR flow. */
+export { weixinLogin } from "./weixin.js";
+
+async function buildAdapter(platform: string): Promise<ChatAdapter | null> {
+  if (platform === "weixin") {
+    const { loadWeixinCreds, weixinAdapter } = await import("./weixin.js");
+    const creds = loadWeixinCreds();
+    if (!creds) {
+      console.error("hara gateway: no WeChat login found. Run `hara gateway --platform weixin --login` first.");
+      return null;
+    }
+    return weixinAdapter(creds);
+  }
   const token = process.env.HARA_TELEGRAM_TOKEN;
   if (!token) {
     console.error("hara gateway: set HARA_TELEGRAM_TOKEN (from @BotFather) and HARA_GATEWAY_ALLOWED=<your telegram user id>.");
-    process.exit(1);
+    return null;
   }
+  return telegramAdapter(token);
+}
+
+export async function runGateway(opts: { cwd: string; platform?: string }): Promise<void> {
+  const platform = opts.platform || "telegram";
+  const adapter = await buildAdapter(platform);
+  if (!adapter) process.exit(1);
   const allowlist = new Set((process.env.HARA_GATEWAY_ALLOWED ?? "").split(",").map((s) => s.trim()).filter(Boolean));
-  if (allowlist.size === 0) console.error("hara gateway: ⚠ HARA_GATEWAY_ALLOWED is empty — nobody is allowed. Set it to your Telegram user id.");
-  const adapter: ChatAdapter = telegramAdapter(token);
+  if (allowlist.size === 0) {
+    const hint = platform === "weixin" ? "your WeChat id (printed below when you first message the bot)" : "your Telegram user id (DM @userinfobot)";
+    console.error(`hara gateway: ⚠ HARA_GATEWAY_ALLOWED is empty — nobody is allowed. Set it to ${hint}.`);
+  }
   const ac = new AbortController();
   process.on("SIGINT", () => ac.abort());
   process.on("SIGTERM", () => ac.abort());
-  console.error(`hara gateway: telegram up · cwd=${opts.cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
+  console.error(`hara gateway: ${adapter.name} up · cwd=${opts.cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
 
   await adapter.start(async (m: InboundMsg) => {
     if (!isAllowed(m.userId, allowlist)) {
+      console.error(`hara gateway: ✗ message from ${m.userId} — not in allowlist. Add it to HARA_GATEWAY_ALLOWED to authorize.`);
       await adapter.send(m.chatId, "⛔ not authorized.");
       return;
     }

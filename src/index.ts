@@ -902,10 +902,16 @@ program
 
 program
   .command("gateway")
-  .description("run a chat gateway (Telegram) so you can drive your local hara from your phone — opt-in daemon")
-  .action(async () => {
-    const { runGateway } = await import("./gateway/serve.js");
-    await runGateway({ cwd: process.cwd() });
+  .description("run a chat gateway (Telegram or WeChat) so you can drive your local hara from your phone — opt-in daemon")
+  .option("--platform <name>", "chat platform: telegram | weixin", "telegram")
+  .option("--login", "(weixin) scan a QR to log in and save credentials, then exit")
+  .action(async (opts) => {
+    const mod = await import("./gateway/serve.js");
+    if (opts.platform === "weixin" && opts.login) {
+      await mod.weixinLogin();
+      return;
+    }
+    await mod.runGateway({ cwd: process.cwd(), platform: opts.platform });
   });
 
 program

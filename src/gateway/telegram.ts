@@ -5,15 +5,15 @@ const API = "https://api.telegram.org";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export interface InboundMsg {
-  chatId: number;
-  userId: number;
+  chatId: number | string; // Telegram numeric chat id; WeChat wxid string
+  userId: number | string;
   userName: string;
   text: string;
 }
 export interface ChatAdapter {
   name: string;
   start(onMessage: (m: InboundMsg) => Promise<void>, signal: AbortSignal): Promise<void>;
-  send(chatId: number, text: string): Promise<void>;
+  send(chatId: number | string, text: string): Promise<void>;
 }
 
 /** Extract an InboundMsg from a Telegram getUpdates result item (pure). null if it isn't a text message. */

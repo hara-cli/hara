@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.81.0 — unreleased (WeChat (iLink) gateway adapter — drive your local hara from personal WeChat)
+
+- **`hara gateway --platform weixin`** adds **WeChat (personal)** as a second chat channel, via Tencent's
+  official iLink bot API (`ilinkai.weixin.qq.com`, no ban risk) — the same `ChatAdapter` seam as Telegram,
+  so per-chat resumable sessions / allowlist / `/new` `/sessions` `/resume` all carry over. Text DMs (v1):
+  the bot reads & edits files and runs bash in the gateway's cwd, and replies in WeChat.
+- **`hara gateway --platform weixin --login`** — interactive QR login (scan with WeChat); saves
+  `{account_id, token, base_url}` to `~/.hara/weixin/creds.json`. The per-peer `context_token` and the
+  long-poll cursor are persisted, so replies route correctly and a restart resumes mid-stream. Handles
+  iLink's `-14` / stale-`-2` session-expiry (tokenless retry on send; re-login prompt on poll). Built-in
+  fetch; the login QR renders via the **optional** `qrcode-terminal` dep (falls back to printing the URL).
+  No crypto needed on the text path.
+- The allowlist now logs the sender id of unauthorized messages, so you can discover your WeChat id to add
+  to `HARA_GATEWAY_ALLOWED`. 256 tests.
+
 ## 0.80.0 — unreleased (chat gateway — drive your local hara from Telegram; + headless session continuity)
 
 - **`hara gateway`** (opt-in daemon, hara's first long-running process) lets you drive your **local** hara from

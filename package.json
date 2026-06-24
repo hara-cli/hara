@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.80.0",
+  "version": "0.81.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "dist/index.js"
@@ -65,6 +65,7 @@
     "typescript": "^6.0.3"
   },
   "optionalDependencies": {
-    "@zvec/zvec": "^0.5.0"
+    "@zvec/zvec": "^0.5.0",
+    "qrcode-terminal": "^0.12.0"
   }
 }
