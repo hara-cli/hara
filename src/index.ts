@@ -1340,6 +1340,8 @@ program.action(async (opts) => {
   const cfg = loadConfig({ profile: opts.profile });
   if (opts.model) cfg.model = opts.model;
   const provider0 = await withRouting(await buildProvider(cfg), cfg);
+  const fallbackProvider = provider0 && cfg.fallbackModel && cfg.fallbackModel !== cfg.model ? await buildProvider({ ...cfg, model: cfg.fallbackModel, baseURL: cfg.fallbackBaseURL ?? cfg.baseURL, apiKey: cfg.fallbackApiKey ?? cfg.apiKey }) : null;
+  const fbOpt = fallbackProvider ? { provider: fallbackProvider } : undefined; // app-failover for the main chat turns
   if (!provider0) {
     // First-run friendliness: offer the setup wizard instead of just erroring (interactive TTY only).
     if (stdin.isTTY && !opts.print) {
@@ -2085,6 +2087,7 @@ program.action(async (opts) => {
           stats,
           signal: h.signal,
           pendingInput,
+          fallback: fbOpt,
         });
         if (!meta.title) {
           meta.title = await nameSession(provider, history);
@@ -2141,7 +2144,7 @@ program.action(async (opts) => {
     currentTurn = new AbortController();
     const t0 = Date.now();
     try {
-      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal });
+      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     } finally {

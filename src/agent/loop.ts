@@ -10,6 +10,7 @@ import { mapLimit, maxParallel } from "../concurrency.js";
 import type { ApprovalMode } from "../config.js";
 import { decideCommand, loadPermissionRules } from "../security/permissions.js";
 import { subdirHint } from "../context/subdir-hints.js";
+import { classifyError, failoverAction, errorHint } from "./failover.js";
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
 export function needsConfirm(kind: string | undefined, mode: ApprovalMode): boolean {
@@ -68,12 +69,17 @@ export interface RunOpts {
    *  inject them before the next model call — so an addition/clarification reaches the model mid-task
    *  (codex-style) instead of waiting for the turn to end. Returns image-resolved user messages, or []. */
   pendingInput?: () => Promise<NeutralMsg[]>;
+  /** App-level failover (wired only at the main chat entry): retry an errored, recoverable turn once on a
+   *  fallback-model `provider` (overload / rate-limit / timeout / context-overflow → a different model). */
+  fallback?: { provider?: Provider };
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
 export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<void> {
   const { provider, ctx } = opts;
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
+  let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
+  let triedFallback = false;
 
   for (;;) {
     // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
@@ -101,7 +107,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       let fi = 0;
       spin = setInterval(() => out(`\r${c.dim(`${frames[fi++ % frames.length]} working ${Math.floor((Date.now() - t0) / 1000)}s`)}`), 100);
     }
-    const r = await provider.turn({
+    const r = await activeProvider.turn({
       system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
       history,
       tools: specs,
@@ -145,10 +151,22 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 
     if (r.stop === "error") {
-      const msg = r.errorMsg === "interrupted" ? "(interrupted)" : `[${provider.id} error] ${r.errorMsg ?? "unknown"}`;
+      const kind = classifyError(r.errorMsg ?? "");
+      if (failoverAction(kind, { hasFallback: !!opts.fallback?.provider, triedFallback }) === "fallback") {
+        triedFallback = true;
+        history.pop(); // drop the errored (partial/empty) assistant turn before retrying
+        activeProvider = opts.fallback!.provider!;
+        if (!opts.quiet) {
+          const note = `✻ ${kind} → falling back to ${activeProvider.model}…`;
+          if (sink) sink.notice(note);
+          else out(c.dim(`${note}\n`));
+        }
+        continue; // retry once on the fallback model (guarded by triedFallback)
+      }
+      const msg = kind === "interrupted" ? "(interrupted)" : `[${activeProvider.id} error] ${r.errorMsg ?? "unknown"}${errorHint(kind)}`;
       if (!opts.quiet) {
         if (sink) sink.notice(msg);
-        else out(r.errorMsg === "interrupted" ? c.dim(`\n${msg}\n`) : c.red(`${msg}\n`));
+        else out(kind === "interrupted" ? c.dim(`\n${msg}\n`) : c.red(`${msg}\n`));
       }
       return;
     }

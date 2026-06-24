@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.79.0 — unreleased (app-level failover — retry an errored turn on a fallback model)
+
+- **`fallbackModel`** (opt-in): when a turn ends in a *recoverable* provider error — overload (529/503),
+  rate-limit (429), timeout, transient 5xx, or context-overflow — hara retries it **once on the fallback
+  model** instead of dying (a different model may not be overloaded / may have a larger window). `auth` errors
+  and user interrupts are never auto-retried. The SDK's transient `maxRetries:4` still handles the first line;
+  this is the app layer for what's left. `fallbackBaseURL`/`fallbackApiKey` default to the primary's.
+- Errors now also carry a short **actionable hint** by kind (auth → check key · overloaded → set fallbackModel
+  · context-overflow → /compact). Classification handles DashScope/GLM/Qwen **Chinese** error strings too. New
+  `src/agent/failover.ts` (pure classify + decide, fully tested); runAgent just executes the decision, guarded
+  to one retry. Tests (244 total). Completes the Sprint-2 spine (⑤ rewind + ⑥ failover).
+
 ## 0.78.0 — unreleased (file-state checkpoints — shadow-git "undo the agent's edits")
 
 - **Durable file checkpoints** complete the rewind story (beyond the edit-only in-memory undo, which missed
