@@ -901,6 +901,14 @@ program
   });
 
 program
+  .command("gateway")
+  .description("run a chat gateway (Telegram) so you can drive your local hara from your phone — opt-in daemon")
+  .action(async () => {
+    const { runGateway } = await import("./gateway/serve.js");
+    await runGateway({ cwd: process.cwd() });
+  });
+
+program
   .command("export [session]")
   .description("export a session to a Markdown transcript (default: the latest in this directory)")
   .option("--out <file>", "write to a file instead of stdout")
@@ -1381,7 +1389,18 @@ program.action(async (opts) => {
   // one-shot
   if (opts.print) {
     const projectContext = loadAgentsMd(cwd) || undefined;
-    const history: NeutralMsg[] = [{ role: "user", content: expandMentions(String(opts.print), cwd) }];
+    // Headless session continuity: --resume <id> / --continue loads the session, appends this prompt, and
+    // saves it back — so `hara -p … --resume <id>` continues a thread (used by cron, scripts, the chat gateway).
+    // Plain `hara -p` stays stateless. A --resume id with no match is created WITH that id (stable per caller).
+    let meta: SessionMeta | null = null;
+    const history: NeutralMsg[] = [];
+    if (opts.resume || opts.continue) {
+      const rid = opts.resume ? (resolveSessionId(opts.resume) ?? opts.resume) : latestForCwd(cwd)?.meta.id;
+      const prior = rid ? loadSession(rid) : null;
+      if (prior?.history) history.push(...prior.history);
+      meta = prior?.meta ?? { id: rid ?? newSessionId(), cwd, provider: cfg.provider, model: cfg.model, title: "", createdAt: new Date().toISOString(), updatedAt: "" };
+    }
+    history.push({ role: "user", content: expandMentions(String(opts.print), cwd) });
     await runAgent(history, {
       provider,
       ctx: { cwd, sandbox, spawn: (t, role) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role) },
@@ -1391,6 +1410,7 @@ program.action(async (opts) => {
       memory: memoryDigest(cwd),
       stats,
     });
+    if (meta) saveSession(meta, history); // persist when resuming/continuing; plain -p stays stateless
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
     await closeMcp();
     return;

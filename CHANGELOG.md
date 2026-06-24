@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.80.0 — unreleased (chat gateway — drive your local hara from Telegram; + headless session continuity)
+
+- **`hara gateway`** (opt-in daemon, hara's first long-running process) lets you drive your **local** hara from
+  a chat app — **Telegram** first ("message your bot → hara reads/edits files, runs bash, replies"). Each chat
+  is a **continuous, resumable session**: `/new` forks a fresh thread · `/sessions` lists · `/resume <id>`
+  jumps to one — backed by the stored sessions. Access is **allowlist-gated** (`HARA_GATEWAY_ALLOWED` user ids;
+  empty = nobody, never wide-open); token from `HARA_TELEGRAM_TOKEN`. Generic `ChatAdapter` shape → WeChat-iLink
+  / Feishu are same-interface fast-follows. **Zero new dep** (built-in `fetch` long-poll). `src/gateway/` + tests.
+- **`hara -p "<task>" --resume <id>` / `--continue`** now does **headless session continuity** — loads the
+  session, appends the prompt, runs, saves it back (a `--resume <id>` with no match is created with that id);
+  plain `hara -p` stays stateless. Useful for cron, scripts, and the gateway's per-chat threads.
+- This is the chat layer of the multi-terminal plan; the ACP server (for a custom App / editors) is deferred
+  until that App exists. 249 tests.
+
 ## 0.79.0 — unreleased (app-level failover — retry an errored turn on a fallback model)
 
 - **`fallbackModel`** (opt-in): when a turn ends in a *recoverable* provider error — overload (529/503),
