@@ -1418,7 +1418,12 @@ program.action(async (opts) => {
       memory: memoryDigest(cwd),
       stats,
     });
-    if (meta) saveSession(meta, history); // persist when resuming/continuing; plain -p stays stateless
+    if (meta) {
+      // Long-session safety: auto-compact before saving so a long chat/cron thread never overflows context.
+      // Silent (no-op notify) in headless mode so nothing leaks into a captured -p reply. Opt-out via config.
+      await maybeAutoCompact(provider, history, meta, stats, cfg, () => {});
+      saveSession(meta, history); // persist when resuming/continuing; plain -p stays stateless
+    }
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
     await closeMcp();
     return;

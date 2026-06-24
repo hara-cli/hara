@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.81.6 — unreleased (headless `-p --resume`: auto-compact long sessions)
+
+- The `hara -p … --resume <id>` / `--continue` path (used by the chat gateway and cron) now runs
+  `maybeAutoCompact` before saving, so a long chat/cron thread **auto-compacts** (summarizes old turns)
+  instead of growing until it overflows the model's context window. Silent in headless mode (no notify) so
+  nothing leaks into a captured reply. Opt-out via `autoCompact: false` / `HARA_AUTO_COMPACT=0`. Previously
+  auto-compaction was wired only into the interactive/TUI loops, so gateway/cron sessions could overflow.
+
 ## 0.81.5 — unreleased (gateway: default workspace = ~/.hara/workspace — dir-free, Hermes-style)
 
 - `hara gateway` (no `--cwd`) now operates in a dedicated **`~/.hara/workspace`** (created + seeded on first
