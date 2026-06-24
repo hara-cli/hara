@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.81.1 — unreleased (WeChat gateway: auto-allowlist the bot owner)
+
+- `hara gateway --platform weixin` now **auto-allows the bot owner** (the iLink `user_id` from login — i.e.
+  whoever scanned the QR), since on a personal-WeChat bot that id equals the `from_user_id` on your own
+  messages. Removes the "run once with an empty allowlist to discover your wxid, then re-run" dance — just
+  log in and run the daemon. Additional ids can still be added via `HARA_GATEWAY_ALLOWED`. (Validated the full
+  receive→reply round-trip against the live iLink server.)
+
 ## 0.81.0 — unreleased (WeChat (iLink) gateway adapter — drive your local hara from personal WeChat)
 
 - **`hara gateway --platform weixin`** adds **WeChat (personal)** as a second chat channel, via Tencent's

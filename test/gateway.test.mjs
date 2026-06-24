@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseTelegramUpdate, chunkText } from "../dist/gateway/telegram.js";
-import { parseCommand, isAllowed } from "../dist/gateway/serve.js";
+import { parseCommand, isAllowed, resolveAllowlist } from "../dist/gateway/serve.js";
 import { chatSessionId, newChatSession, setChatSession } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired } from "../dist/gateway/weixin.js";
 
@@ -35,6 +35,13 @@ test("isAllowed: empty allowlist = nobody (safe); else membership", () => {
   assert.equal(isAllowed(7, new Set()), false); // never wide-open
   assert.equal(isAllowed(7, new Set(["7"])), true);
   assert.equal(isAllowed(8, new Set(["7"])), false);
+});
+
+test("resolveAllowlist: env ids ∪ bot owner (weixin auto-allows the scanner)", () => {
+  assert.deepEqual([...resolveAllowlist("a,b", "owner")].sort(), ["a", "b", "owner"]);
+  assert.deepEqual([...resolveAllowlist("", "owner")], ["owner"]); // owner alone — no env needed
+  assert.deepEqual([...resolveAllowlist("a, a ", undefined)], ["a"]); // trims + dedups, no owner
+  assert.equal(resolveAllowlist("", undefined).size, 0); // telegram, no env = nobody
 });
 
 test("chat→session map: stable id, /new forks, /resume sets (isolated HOME)", () => {

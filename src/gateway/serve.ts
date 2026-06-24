@@ -38,7 +38,7 @@ function runHara(text: string, sessionId: string, cwd: string): Promise<string> 
 /** Re-exported so `hara gateway --platform weixin --login` can run the QR flow. */
 export { weixinLogin } from "./weixin.js";
 
-async function buildAdapter(platform: string): Promise<ChatAdapter | null> {
+async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; ownerId?: string } | null> {
   if (platform === "weixin") {
     const { loadWeixinCreds, weixinAdapter } = await import("./weixin.js");
     const creds = loadWeixinCreds();
@@ -46,24 +46,35 @@ async function buildAdapter(platform: string): Promise<ChatAdapter | null> {
       console.error("hara gateway: no WeChat login found. Run `hara gateway --platform weixin --login` first.");
       return null;
     }
-    return weixinAdapter(creds);
+    // The iLink user_id is whoever scanned the QR — the bot owner. Auto-allow them so there's no wxid dance.
+    return { adapter: weixinAdapter(creds), ownerId: creds.user_id || undefined };
   }
   const token = process.env.HARA_TELEGRAM_TOKEN;
   if (!token) {
     console.error("hara gateway: set HARA_TELEGRAM_TOKEN (from @BotFather) and HARA_GATEWAY_ALLOWED=<your telegram user id>.");
     return null;
   }
-  return telegramAdapter(token);
+  return { adapter: telegramAdapter(token) };
+}
+
+/** Allowlist = the env ids ∪ the bot owner (on WeChat, whoever scanned the QR is always allowed). */
+export function resolveAllowlist(envValue: string | undefined, ownerId?: string): Set<string> {
+  const set = new Set((envValue ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+  if (ownerId) set.add(ownerId);
+  return set;
 }
 
 export async function runGateway(opts: { cwd: string; platform?: string }): Promise<void> {
   const platform = opts.platform || "telegram";
-  const adapter = await buildAdapter(platform);
-  if (!adapter) process.exit(1);
-  const allowlist = new Set((process.env.HARA_GATEWAY_ALLOWED ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+  const built = await buildAdapter(platform);
+  if (!built) process.exit(1);
+  const { adapter, ownerId } = built;
+  const allowlist = resolveAllowlist(process.env.HARA_GATEWAY_ALLOWED, ownerId);
   if (allowlist.size === 0) {
-    const hint = platform === "weixin" ? "your WeChat id (printed below when you first message the bot)" : "your Telegram user id (DM @userinfobot)";
+    const hint = platform === "weixin" ? "your WeChat id" : "your Telegram user id (DM @userinfobot)";
     console.error(`hara gateway: ⚠ HARA_GATEWAY_ALLOWED is empty — nobody is allowed. Set it to ${hint}.`);
+  } else if (ownerId) {
+    console.error(`hara gateway: bot owner auto-allowed (${ownerId}).`);
   }
   const ac = new AbortController();
   process.on("SIGINT", () => ac.abort());
