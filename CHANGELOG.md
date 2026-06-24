@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.82.1 — unreleased (gateway: tag transcribed WeChat voice messages)
+
+- WeChat **voice input already works** — iLink transcribes voice server-side (`voice_item.text`) and the gateway
+  reads it. But the text reached hara unlabeled, so when the spoken words referenced "this voice," hara replied
+  as if it only got text. Now a transcribed voice message is tagged `[voice message] <text>`, so hara knows the
+  input came from voice. (Sending voice back is deferred — iLink's native voice bubble is unreliable per the
+  Hermes reference; only audio-file attachments are possible, and that needs the media-upload + TTS path.)
+
 ## 0.82.0 — unreleased (gateway: roam projects + threads from chat — /cd, /pwd, project-scoped /sessions)
 
 - A chat can now **switch working directory at runtime**, and its session follows: `/cd <dir>` (absolute, `~`,

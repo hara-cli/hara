@@ -104,9 +104,14 @@ export function parseWeixinMessage(msg: any, accountId: string): { inbound: Inbo
   const from = str(msg?.from_user_id).trim();
   if (!from || from === accountId) return null; // missing sender, or our own echo
   if (guessChatType(msg, accountId).kind !== "dm") return null; // v1 = text DM only
-  const text = extractText(msg?.item_list);
+  const items = Array.isArray(msg?.item_list) ? msg.item_list : [];
+  const text = extractText(items);
   if (!text) return null;
-  return { inbound: { chatId: from, userId: from, userName: from, text }, contextToken: str(msg?.context_token).trim() };
+  // A voice message arrives as iLink's server-side transcription (voice_item.text). Tag it so hara knows the
+  // text came from voice — otherwise it can't reason about "this voice" and replies as if it only got text.
+  const isVoice = !items.some((i: any) => i?.type === ITEM_TEXT) && items.some((i: any) => i?.type === 3);
+  const tagged = isVoice ? `[voice message] ${text}` : text;
+  return { inbound: { chatId: from, userId: from, userName: from, text: tagged }, contextToken: str(msg?.context_token).trim() };
 }
 
 /** iLink signals expiry via -14, or -2 + errmsg "unknown error" (a stale-session masquerading as rate-limit). */
