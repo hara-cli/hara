@@ -14,6 +14,8 @@ export interface ChatAdapter {
   name: string;
   start(onMessage: (m: InboundMsg) => Promise<void>, signal: AbortSignal): Promise<void>;
   send(chatId: number | string, text: string): Promise<void>;
+  /** Optional: send a local audio file (voice reply). Adapters without it just don't speak. */
+  sendAudio?(chatId: number | string, audioPath: string): Promise<void>;
 }
 
 /** Extract an InboundMsg from a Telegram getUpdates result item (pure). null if it isn't a text message. */

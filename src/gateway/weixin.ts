@@ -6,7 +6,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { randomBytes, randomUUID } from "node:crypto";
+import { basename } from "node:path";
+import { randomBytes, randomUUID, createHash, createCipheriv } from "node:crypto";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
 const ILINK_BASE_URL = "https://ilinkai.weixin.qq.com";
@@ -14,11 +15,13 @@ const CHANNEL_VERSION = "2.2.0";
 const ILINK_APP_ID = "bot";
 const ILINK_APP_CLIENT_VERSION = String((2 << 16) | (2 << 8) | 0); // 131584
 
+const WEIXIN_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 const EP = {
   getUpdates: "ilink/bot/getupdates",
   sendMessage: "ilink/bot/sendmessage",
   getBotQr: "ilink/bot/get_bot_qrcode",
   getQrStatus: "ilink/bot/get_qrcode_status",
+  getUploadUrl: "ilink/bot/getuploadurl",
 };
 
 const LONG_POLL_TIMEOUT_MS = 35_000;
@@ -29,6 +32,8 @@ const RATE_LIMIT = -2;
 const MSG_TYPE_BOT = 2;
 const MSG_STATE_FINISH = 2;
 const ITEM_TEXT = 1;
+const ITEM_FILE = 4; // item.type for a file attachment (audio is sent as a file — iLink voice bubbles unreliable)
+const MEDIA_FILE = 3; // media_type for getuploadurl when sending a file/audio
 
 export interface WeixinCreds {
   account_id: string;
@@ -78,6 +83,24 @@ export function buildSendBody(to: string, text: string, contextToken: string | u
   };
   if (contextToken) msg.context_token = contextToken;
   return { msg };
+}
+
+/** iLink wants the AES key as base64 of the key's HEX-string ASCII bytes — NOT base64 of the raw key bytes.
+ *  (Getting this wrong = the receiver can't decrypt → unplayable/grey media.) */
+export function apiAesKey(keyHex: string): string {
+  return Buffer.from(keyHex, "ascii").toString("base64");
+}
+
+/** The sendmessage item_list entry for an audio/file attachment (iLink has no reliable native voice bubble). */
+export function audioFileItem(encryptQueryParam: string, aesKeyForApi: string, rawsize: number, filename: string): Record<string, unknown> {
+  return {
+    type: ITEM_FILE,
+    file_item: {
+      media: { encrypt_query_param: encryptQueryParam, aes_key: aesKeyForApi, encrypt_type: 1 },
+      file_name: filename,
+      len: String(rawsize), // plaintext size, as a STRING (a file_item quirk — image/video use ciphertext size as int)
+    },
+  };
 }
 
 /** First text item's text (iLink puts text under item_list[].text_item.text; voice falls back to type 3). */
@@ -304,6 +327,63 @@ async function sendChunk(creds: WeixinCreds, tokenStore: TokenStore, peer: strin
   if (ret !== 0 || errcode !== 0) console.error(`weixin send: ret=${ret} errcode=${errcode} errmsg=${errmsg}`);
 }
 
+function aes128EcbEncrypt(plaintext: Buffer, key: Buffer): Buffer {
+  const c = createCipheriv("aes-128-ecb", key, null); // PKCS7 auto-padding (Node default) matches iLink
+  return Buffer.concat([c.update(plaintext), c.final()]);
+}
+
+async function cdnUpload(uploadUrl: string, ciphertext: Buffer): Promise<string> {
+  const res = await fetch(uploadUrl, { method: "POST", body: new Uint8Array(ciphertext), headers: { "Content-Type": "application/octet-stream" }, signal: AbortSignal.timeout(120_000) });
+  await res.arrayBuffer().catch(() => undefined); // drain body
+  if (!res.ok) throw new Error(`CDN upload HTTP ${res.status}`);
+  const ep = res.headers.get("x-encrypted-param");
+  if (!ep) throw new Error("CDN upload missing x-encrypted-param header");
+  return ep;
+}
+
+/** Send a local audio file to a peer as a WeChat file attachment (the TTS voice-reply path). Ported byte-exact
+ *  from iLink's media protocol: getuploadurl → AES-128-ECB encrypt → CDN POST → sendmessage(file_item). */
+export async function sendAudioFile(creds: WeixinCreds, tokenStore: TokenStore, peer: string, audioPath: string): Promise<boolean> {
+  try {
+    const plaintext = readFileSync(audioPath);
+    const rawsize = plaintext.length;
+    const rawfilemd5 = createHash("md5").update(plaintext).digest("hex");
+    const filekey = randomBytes(16).toString("hex");
+    const key = randomBytes(16);
+    const keyHex = key.toString("hex");
+    const filesize = Math.ceil((rawsize + 1) / 16) * 16; // AES-padded size == ciphertext length
+    const up = await apiPost(creds.base_url, EP.getUploadUrl, { filekey, media_type: MEDIA_FILE, to_user_id: peer, rawsize, rawfilemd5, filesize, no_need_thumb: true, aeskey: keyHex }, creds.token, API_TIMEOUT_MS);
+    const ciphertext = aes128EcbEncrypt(plaintext, key);
+    const fullUrl = str(up.upload_full_url);
+    const param = str(up.upload_param);
+    const uploadUrl = fullUrl || (param ? `${WEIXIN_CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(param)}&filekey=${encodeURIComponent(filekey)}` : "");
+    if (!uploadUrl) throw new Error("getuploadurl returned neither upload_full_url nor upload_param");
+    const encryptedParam = await cdnUpload(uploadUrl, ciphertext);
+    const item = audioFileItem(encryptedParam, apiAesKey(keyHex), rawsize, basename(audioPath));
+    const clientId = `hara-weixin-${randomUUID().replace(/-/g, "")}`; // reused across the -14 retry for dedup
+    const send = (ctx: string | undefined): Promise<any> => {
+      const msg: Record<string, unknown> = { from_user_id: "", to_user_id: peer, client_id: clientId, message_type: MSG_TYPE_BOT, message_state: MSG_STATE_FINISH, item_list: [item] };
+      if (ctx) msg.context_token = ctx;
+      return apiPost(creds.base_url, EP.sendMessage, { msg }, creds.token, API_TIMEOUT_MS);
+    };
+    let res = await send(tokenStore.get(peer));
+    let [ret, errcode, errmsg] = [num(res.ret), num(res.errcode), str(res.errmsg ?? res.msg)];
+    if (isSessionExpired(ret, errcode, errmsg)) {
+      tokenStore.del(peer);
+      res = await send(undefined); // tokenless retry (degraded fallback iLink accepts)
+      [ret, errcode, errmsg] = [num(res.ret), num(res.errcode), str(res.errmsg ?? res.msg)];
+    }
+    if (ret !== 0 || errcode !== 0) {
+      console.error(`weixin sendAudio: ret=${ret} errcode=${errcode} errmsg=${errmsg}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error(`weixin sendAudio: ${(e as Error)?.message ?? e}`);
+    return false;
+  }
+}
+
 export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
   const tokenStore = new TokenStore(creds.account_id);
   return {
@@ -311,6 +391,9 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
     async send(chatId, text) {
       const peer = String(chatId);
       for (const part of chunkText(text || "(empty)")) await sendChunk(creds, tokenStore, peer, part);
+    },
+    async sendAudio(chatId, audioPath) {
+      await sendAudioFile(creds, tokenStore, String(chatId), audioPath);
     },
     async start(onMessage, signal) {
       let buf = loadCursor(creds.account_id);

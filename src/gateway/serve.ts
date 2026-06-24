@@ -4,12 +4,13 @@
 // persistent process; it is never required by the core CLI.
 import { spawn } from "node:child_process";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
-import { chatContext, chatCd, newChatSession, setChatSession } from "./sessions.js";
+import { chatContext, chatCd, newChatSession, setChatSession, toggleVoice } from "./sessions.js";
+import { synthesize } from "./tts.js";
 import { selfArgv } from "../cron/runner.js";
 import { listSessions, resolveSessionId, loadSession } from "../session/store.js";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { mkdirSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, statSync, rmSync } from "node:fs";
 
 /** Parse a leading slash-command from a chat message (pure). null if it isn't one. */
 export function parseCommand(text: string): { cmd: string; arg: string } | null {
@@ -122,7 +123,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       if (cmd.cmd === "help")
         return adapter.send(
           m.chatId,
-          "commands:\n/pwd — current project dir + thread\n/cd <dir> — switch project (thread follows)\n/sessions — threads in this dir\n/new — fresh thread\n/resume <id> — jump to a thread\n/help\nanything else = run hara here",
+          "commands:\n/pwd · /cd <dir> — switch project\n/sessions · /new · /resume <id> — threads\n/voice — toggle spoken replies · /say <text> — speak text\n/help\nanything else = run hara here",
         );
       if (cmd.cmd === "pwd") return adapter.send(m.chatId, `📂 ${ctx.cwd}\n🧵 ${ctx.sessionId.slice(-18)}`);
       if (cmd.cmd === "cd" || cmd.cmd === "project") {
@@ -144,9 +145,31 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         setChatSession(adapter.name, m.chatId, id, target);
         return adapter.send(m.chatId, `↩ resumed ${id.slice(-18)}\n📂 ${target}`);
       }
+      if (cmd.cmd === "voice") {
+        if (!adapter.sendAudio) return adapter.send(m.chatId, "this platform can't send voice yet.");
+        const on = toggleVoice(adapter.name, m.chatId);
+        return adapter.send(m.chatId, on ? "🔊 voice replies ON — I'll speak each reply too." : "🔇 voice replies OFF.");
+      }
+      if (cmd.cmd === "say") {
+        if (!adapter.sendAudio) return adapter.send(m.chatId, "this platform can't send voice yet.");
+        if (!cmd.arg) return adapter.send(m.chatId, "usage: /say <text to speak>");
+        const audio = await synthesize(cmd.arg);
+        if (!audio) return adapter.send(m.chatId, "✗ TTS failed (check HARA_TTS_* config).");
+        await adapter.sendAudio(m.chatId, audio);
+        rmSync(audio, { force: true });
+        return;
+      }
       // any other slash word → treat as a normal task
     }
     await adapter.send(m.chatId, "⟳ working…");
-    await adapter.send(m.chatId, await runHara(m.text, ctx.sessionId, ctx.cwd));
+    const reply = await runHara(m.text, ctx.sessionId, ctx.cwd);
+    await adapter.send(m.chatId, reply);
+    if (ctx.voice && adapter.sendAudio) {
+      const audio = await synthesize(reply);
+      if (audio) {
+        await adapter.sendAudio(m.chatId, audio);
+        rmSync(audio, { force: true });
+      }
+    }
   }, ac.signal);
 }

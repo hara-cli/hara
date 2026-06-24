@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseTelegramUpdate, chunkText } from "../dist/gateway/telegram.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
-import { chatContext, chatCd, newChatSession, setChatSession, cwdTag } from "../dist/gateway/sessions.js";
-import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired } from "../dist/gateway/weixin.js";
+import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
+import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem } from "../dist/gateway/weixin.js";
+import { ttsConfigFromEnv, ttsCleanText } from "../dist/gateway/tts.js";
 
 test("parseTelegramUpdate: text message → InboundMsg; non-text → null", () => {
   const m = parseTelegramUpdate({ update_id: 5, message: { text: "hi", chat: { id: 42 }, from: { id: 7, username: "jeff" } } });
@@ -82,6 +83,11 @@ test("chat ctx: cwd-scoped session; /cd switches project+thread, /new forks, /re
     const c = chatContext("telegram", 42, def);
     assert.equal(c.sessionId, "explicit-session");
     assert.equal(c.cwd, "/work/other");
+
+    assert.equal(chatContext("telegram", 42, def).voice, false); // /voice off by default
+    assert.equal(toggleVoice("telegram", 42), true); // toggles on
+    assert.equal(chatContext("telegram", 42, def).voice, true);
+    assert.equal(toggleVoice("telegram", 42), false); // and back off
   } finally {
     if (prev === undefined) delete process.env.HOME;
     else process.env.HOME = prev;
@@ -153,4 +159,29 @@ test("weixin isSessionExpired: -14, or -2 + 'unknown error'; genuine -2 rate-lim
   assert.equal(isSessionExpired(-2, 0, "UNKNOWN ERROR"), true); // case-insensitive
   assert.equal(isSessionExpired(-2, 0, "freq limit"), false); // genuine rate limit
   assert.equal(isSessionExpired(0, 0, ""), false);
+});
+
+test("weixin apiAesKey: base64 of the hex string's ASCII bytes — NOT base64 of the raw key", () => {
+  const keyHex = "00112233445566778899aabbccddeeff";
+  assert.equal(apiAesKey(keyHex), Buffer.from(keyHex, "ascii").toString("base64"));
+  assert.notEqual(apiAesKey(keyHex), Buffer.from(keyHex, "hex").toString("base64")); // the classic mistake
+});
+
+test("weixin audioFileItem: file_item shape — string len, encrypt_type 1, type 4", () => {
+  assert.deepEqual(audioFileItem("ENC", "AESB64", 12345, "reply.m4a"), {
+    type: 4,
+    file_item: {
+      media: { encrypt_query_param: "ENC", aes_key: "AESB64", encrypt_type: 1 },
+      file_name: "reply.m4a",
+      len: "12345",
+    },
+  });
+});
+
+test("tts: ttsConfigFromEnv defaults + ttsCleanText (collapse ws, strip fences, cap)", () => {
+  assert.equal(ttsConfigFromEnv({}).provider, "say"); // default provider
+  assert.equal(ttsConfigFromEnv({ HARA_TTS_PROVIDER: "openai", HARA_TTS_VOICE: "alloy" }).voice, "alloy");
+  assert.equal(ttsCleanText("  hello\n\nworld  "), "hello world");
+  assert.match(ttsCleanText("a ```code\nblock``` b"), /code omitted/);
+  assert.ok(ttsCleanText("x".repeat(5000)).length <= 1200);
 });

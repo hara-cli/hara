@@ -13,6 +13,7 @@ interface ChatEntry {
   cwd: string;
   sessionId: string;
   fork: number;
+  voice?: boolean; // /voice toggle — speak replies as TTS audio
 }
 interface ChatMap {
   [key: string]: ChatEntry;
@@ -45,7 +46,7 @@ function deriveId(platform: string, chatId: number | string, cwd: string, fork: 
 
 /** Get (or initialize) the chat's context: current working dir + the session id it drives. `defaultCwd` (the
  *  gateway's launch dir) is used only on first contact; a pre-cwd entry is migrated in place (keeps its id). */
-export function chatContext(platform: string, chatId: number | string, defaultCwd: string): { cwd: string; sessionId: string } {
+export function chatContext(platform: string, chatId: number | string, defaultCwd: string): { cwd: string; sessionId: string; voice: boolean } {
   const m = load();
   const k = mapKey(platform, chatId);
   const e = m[k];
@@ -53,13 +54,24 @@ export function chatContext(platform: string, chatId: number | string, defaultCw
     const fresh: ChatEntry = { cwd: defaultCwd, sessionId: deriveId(platform, chatId, defaultCwd, 0), fork: 0 };
     m[k] = fresh;
     save(m);
-    return { cwd: fresh.cwd, sessionId: fresh.sessionId };
+    return { cwd: fresh.cwd, sessionId: fresh.sessionId, voice: false };
   }
   if (!e.cwd) {
     e.cwd = defaultCwd; // migrate an old (pre-cwd) entry, preserving its existing sessionId
     save(m);
   }
-  return { cwd: e.cwd, sessionId: e.sessionId };
+  return { cwd: e.cwd, sessionId: e.sessionId, voice: !!e.voice };
+}
+
+/** `/voice` — toggle whether this chat's replies are spoken (TTS audio); returns the new state. */
+export function toggleVoice(platform: string, chatId: number | string): boolean {
+  const m = load();
+  const k = mapKey(platform, chatId);
+  const e = m[k];
+  if (!e) return false; // chatContext always runs first, so an entry exists; defensive no-op otherwise
+  e.voice = !e.voice;
+  save(m);
+  return !!e.voice;
 }
 
 /** `/cd <dir>` — switch the chat to a working dir; the session follows (its own per-project thread). */

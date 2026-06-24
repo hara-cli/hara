@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.83.0 — unreleased (gateway: voice replies — pluggable TTS, /voice + /say)
+
+- The gateway can now **reply with voice** — a WeChat audio-file attachment (iLink's native voice bubble is
+  unreliable). `/voice` toggles spoken replies for a chat (each reply is also sent as audio); `/say <text>`
+  speaks one message. Ported iLink's media-upload path (getuploadurl → AES-128-ECB → CDN → `file_item`) into
+  `weixin.ts` byte-exact (incl. the dual AES-key encoding: hex in getuploadurl, base64-of-hex in sendmessage)
+  + live-validated end-to-end.
+- **Pluggable TTS** (`src/gateway/tts.ts`) — config-driven via env, nothing vendor-hardcoded, mirrors the video
+  project's provider design; both API and local:
+  - `say` (default) — local macOS, ~0.5s, Chinese voices (Tingting…), zero config → m4a.
+  - `openai` — any OpenAI-compatible `/audio/speech` endpoint (point `HARA_TTS_BASE_URL` at Aliyun DashScope or
+    a local TTS server); reuses the existing `openai` dep, no new dependency.
+  - `cmd` — a configurable local command (point `HARA_TTS_CMD` at VoxCPM or any local TTS; text on stdin).
+  - Select via `HARA_TTS_PROVIDER` (+ `HARA_TTS_VOICE`/`MODEL`/`BASE_URL`/`API_KEY`/`CMD`); a failed API
+    provider falls back to local `say`. New optional `ChatAdapter.sendAudio?` seam (weixin implements it).
+
 ## 0.82.2 — unreleased (gateway: fix the voice tag that made hara disclaim)
 
 - 0.82.1's bare `[voice message]` prefix backfired — hara read it as raw audio to process and replied "I can't
