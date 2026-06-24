@@ -37,6 +37,7 @@ import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projec
 import { routingProvider } from "./agent/route.js";
 import { shouldAutoCompact } from "./agent/compact.js";
 import { formatContextReport } from "./agent/context-report.js";
+import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
@@ -1632,6 +1633,23 @@ program.action(async (opts) => {
       run: () => void out(formatContextReport(history, cfg.model) + "\n"),
     },
     {
+      name: "rewind",
+      desc: "fork the conversation back to an earlier turn: /rewind (list) · /rewind <n> (files unchanged)",
+      run: (a) => {
+        const arg = (a ?? "").trim();
+        if (!arg) {
+          const turns = userTurnPreviews(history);
+          return void out(turns.length ? "Recent turns (newest first) — `/rewind <n>` forks from before it (files unchanged):\n" + turns.map((t) => `  ${t.n}. ${t.preview}`).join("\n") + "\n" : c.dim("(nothing to rewind)\n"));
+        }
+        const nh = rewindTo(history, Number(arg));
+        if (!nh) return void out(c.dim(`(no such turn: ${arg})\n`));
+        history.length = 0;
+        history.push(...nh);
+        saveSession(meta, history);
+        out(c.green(`(rewound — dropped the last ${arg} turn(s); ${history.length} messages kept. Files are unchanged. Type your next message.)\n`));
+      },
+    },
+    {
       name: "compact",
       desc: "summarize the conversation so far to free up context",
       run: async () => {
@@ -1838,6 +1856,18 @@ program.action(async (opts) => {
             return void h.sink.notice(`(renamed → ${meta.title})`);
           }
           if (nm === "context") return void h.sink.notice(formatContextReport(history, cfg.model));
+          if (nm === "rewind") {
+            if (!arg) {
+              const turns = userTurnPreviews(history);
+              return void h.sink.notice(turns.length ? "Recent turns (newest first) — /rewind <n> (files unchanged):\n" + turns.map((t) => `  ${t.n}. ${t.preview}`).join("\n") : "(nothing to rewind)");
+            }
+            const nh = rewindTo(history, Number(arg));
+            if (!nh) return void h.sink.notice(`(no such turn: ${arg})`);
+            history.length = 0;
+            history.push(...nh);
+            saveSession(meta, history);
+            return void h.sink.notice(`(rewound — kept ${history.length} messages; files unchanged. Type your next message.)`);
+          }
           if (nm === "compact") {
             if (history.length < 2) return void h.sink.notice("(nothing to compact)");
             h.sink.notice("✻ compacting…");

@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.77.0 — unreleased (/rewind — fork the conversation back to an earlier turn)
+
+- New **`/rewind`** — `/rewind` lists recent user turns; `/rewind <n>` forks the conversation back to before
+  one, so when the agent goes down a wrong path you can snip back to a good turn and re-steer, instead of
+  `/clear` (lose everything) or living with a poisoned context (codex's backtrack). **Conversation only —
+  file edits are NOT reverted** (durable file-state checkpoints via shadow-git are the planned heavier
+  follow-up). Both UIs; pure in-memory + session store. `src/agent/rewind.ts` + tests (239 total).
+
 ## 0.76.0 — unreleased (/context — see what's filling the context window)
 
 - New **`/context`** command: a token-spend breakdown of the conversation — which tool's output, assistant
