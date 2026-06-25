@@ -237,8 +237,20 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         console.error(`hara gateway: routed reply → tmux pane ${pane}`);
         const before = capturePane(pane) ?? "";
         injectTmux(pane, m.text);
-        await new Promise((r) => setTimeout(r, 3000)); // give the session a moment to react
-        const after = capturePane(pane) ?? "";
+        // wait for the session's output to SETTLE (poll every 800ms; stable for ~1.6s → done; cap ~10s) so a
+        // slow response isn't missed and we don't capture mid-stream.
+        let after = "";
+        let stable = 0;
+        for (let i = 0; i < 12; i++) {
+          await new Promise((r) => setTimeout(r, 800));
+          const cur = capturePane(pane) ?? "";
+          if (cur === after) {
+            if (++stable >= 2) break;
+          } else {
+            stable = 0;
+            after = cur;
+          }
+        }
         const delta = outputDelta(before, after).trim();
         const body = delta ? (delta.length > 1500 ? "…\n" + delta.slice(-1500) : delta) : "(已注入,暂无新输出 — 发 ? 再看)";
         await adapter.send(m.chatId, `🖥 ${pane}\n${body}`);
