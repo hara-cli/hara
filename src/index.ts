@@ -3,7 +3,7 @@ import { Command } from "commander";
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui } from "./tui/run.js";
-import { readClipboardImage } from "./images.js";
+import { readClipboardImage, mediaTypeFor } from "./images.js";
 import { describeImages, locateImage, classifyVision, SCREENSHOT_SYSTEM } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir, readRecentLogs, scaffoldMemory, type Scope } from "./memory/store.js";
@@ -1426,7 +1426,33 @@ program.action(async (opts) => {
       if (prior?.history) history.push(...prior.history);
       meta = prior?.meta ?? { id: rid ?? newSessionId(), cwd, provider: cfg.provider, model: cfg.model, title: "", createdAt: new Date().toISOString(), updatedAt: "" };
     }
-    history.push({ role: "user", content: expandMentions(String(opts.print), cwd) });
+    // Inbound images (gateway): the platform downloaded the user's photo(s) and passed their paths via env.
+    // Let the agent actually SEE them — attached inline for a vision-capable main model, else described via the
+    // visionModel sidecar and folded into the message (text-only models can't take image blocks).
+    const userText = expandMentions(String(opts.print), cwd);
+    const inboundImgs = (process.env.HARA_GATEWAY_IMAGES ?? "")
+      .split("\n")
+      .map((s) => s.trim())
+      .filter((p) => p && existsSync(p))
+      .map((p) => ({ path: p, mediaType: mediaTypeFor(p) ?? "image/jpeg" }));
+    if (inboundImgs.length && classifyVision(cfg.provider, cfg.model, cfg.modelVision) === "vision") {
+      history.push({ role: "user", content: userText, images: inboundImgs }); // native vision → inline
+    } else if (inboundImgs.length && cfg.visionModel) {
+      let desc = "";
+      try {
+        const vp = await buildProvider({ ...cfg, model: cfg.visionModel, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey });
+        if (vp) desc = await describeImages(vp, inboundImgs);
+      } catch {
+        /* describe is best-effort — fall back to the marker-only text */
+      }
+      const n = inboundImgs.length;
+      history.push({
+        role: "user",
+        content: desc ? `${userText}\n\n[${n} image${n > 1 ? "s" : ""} the user sent — described by ${cfg.visionModel}]\n${desc}` : userText,
+      });
+    } else {
+      history.push({ role: "user", content: userText });
+    }
     await runAgent(history, {
       provider,
       ctx: { cwd, sandbox, spawn: (t, role) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role), describeImage },

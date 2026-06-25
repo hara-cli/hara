@@ -520,16 +520,23 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
     if (!from || from === creds.account_id) return null;
     if (guessChatType(msg, creds.account_id).kind !== "dm") return null;
     let text = parsed?.inbound.text ?? "";
+    const images: string[] = [];
     for (const ref of inboundMediaRefs(msg?.item_list)) {
       const dl = await downloadInboundMedia(ref);
       if (!dl) continue;
-      const label = ref.kind === "image" ? "图片" : ref.kind === "voice" ? "语音" : `文件 ${ref.fileName ?? ""}`.trim();
-      text += `${text ? "\n" : ""}[${label}: ${dl.path}]`;
+      if (ref.kind === "image") {
+        // images go through as real attachments (seen/described downstream); leave only a light marker in text
+        images.push(dl.path);
+        text += `${text ? "\n" : ""}[图片]`;
+      } else {
+        const label = ref.kind === "voice" ? "语音" : `文件 ${ref.fileName ?? ""}`.trim();
+        text += `${text ? "\n" : ""}[${label}: ${dl.path}]`;
+      }
     }
     text = text.trim();
-    if (!text) return null;
+    if (!text && !images.length) return null;
     tokenStore.set(from, parsed?.contextToken || str(msg?.context_token).trim());
-    return { chatId: from, userId: from, userName: from, text };
+    return { chatId: from, userId: from, userName: from, text: text || "[图片]", images: images.length ? images : undefined };
   };
   return {
     name: "weixin",

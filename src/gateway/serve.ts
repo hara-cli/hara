@@ -43,13 +43,18 @@ export interface HaraRun {
 /** Run hara headlessly on a chat's session. Returns its cleaned text reply plus any files the agent queued
  *  via send_file. The gateway env (HARA_GATEWAY + a per-message outbox file) is what makes send_file and the
  *  in-chat system context active in the subprocess; the daemon delivers the queued files after it exits. */
-function runHara(text: string, sessionId: string, cwd: string, platform: string): Promise<HaraRun> {
+function runHara(text: string, sessionId: string, cwd: string, platform: string, images?: string[]): Promise<HaraRun> {
   const outbox = join(tmpdir(), `hara-outbox-${process.pid}-${Date.now()}-${outboxSeq++}.txt`);
   return new Promise((res) => {
     const self = selfArgv();
     const child = spawn(self[0], [...self.slice(1), "-p", text, "--approval", "full-auto", "--resume", sessionId], {
       cwd,
-      env: { ...process.env, HARA_GATEWAY: platform, HARA_GATEWAY_OUTBOX: outbox },
+      env: {
+        ...process.env,
+        HARA_GATEWAY: platform,
+        HARA_GATEWAY_OUTBOX: outbox,
+        ...(images?.length ? { HARA_GATEWAY_IMAGES: images.join("\n") } : {}),
+      },
     });
     let out = "";
     const cap = (d: Buffer): void => {
@@ -194,7 +199,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       // any other slash word → treat as a normal task
     }
     await adapter.send(m.chatId, "⟳ working…");
-    const { reply, files } = await runHara(m.text, ctx.sessionId, ctx.cwd, adapter.name);
+    const { reply, files } = await runHara(m.text, ctx.sessionId, ctx.cwd, adapter.name, m.images);
     const hasReply = reply && reply !== "(no output)";
     if (hasReply) await adapter.send(m.chatId, reply);
     else if (files.length) await adapter.send(m.chatId, "📎");

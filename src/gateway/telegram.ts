@@ -9,6 +9,8 @@ export interface InboundMsg {
   userId: number | string;
   userName: string;
   text: string;
+  /** local paths to inbound images the agent should SEE (attached inline / described downstream) */
+  images?: string[];
 }
 export interface ChatAdapter {
   name: string;

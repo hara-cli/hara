@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.86.0 — unreleased (gateway: the agent SEES inbound images)
+
+- **Inbound image understanding** — a photo you send in chat now reaches the model as a real image, not just a
+  `[图片: /path]` text breadcrumb. The WeChat adapter routes downloaded images into `InboundMsg.images`; the
+  gateway forwards their paths to the headless run (`HARA_GATEWAY_IMAGES`); the `-p` handler attaches them inline
+  for a vision-capable main model, or describes them via the configured `visionModel` sidecar and folds the
+  description into the message for a text-only model (e.g. glm-5 main + qwen3.7-plus vision). Together with 0.85's
+  `send_file`, the chat is now two-way for images. Verified live: glm-5 correctly described a sent picture via the
+  qwen3.7-plus sidecar.
+
 ## 0.85.0 — unreleased (gateway: agent sends files in conversation + stuck-guard)
 
 - **`send_file` tool** — the agent can now deliver a file/image to the chat *conversationally* ("生成 X 发我"),
