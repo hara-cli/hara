@@ -91,6 +91,7 @@ import "./tools/skill.js"; // register the skill loader tool
 import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
 import "./tools/todo.js"; // register todo_write (inline task checklist)
 import "./tools/send.js"; // register send_file (self-gates on HARA_GATEWAY — pushes a file to the chat)
+import "./tools/external_agent.js"; // register external_agent (delegate to claude-code / codex headless)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 
 const here = dirname(fileURLToPath(import.meta.url));

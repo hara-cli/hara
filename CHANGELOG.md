@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.91.0 — unreleased (external_agent: delegate to Claude Code / Codex)
+
+- **`external_agent` tool** — hand a self-contained task to an EXTERNAL coding agent (**`claude`** / **`codex`**)
+  running headless in the current dir, and get its result back. Zero new deps — drives each agent's native
+  headless flag (`claude -p … --output-format text --permission-mode …`, `codex exec … --cd … --sandbox …`)
+  over `node:child_process`, not openclaw's heavier ACP/acpx stack. Pick the best engine per task.
+  - **Gated**: `kind:"exec"` → inherits the approval flow; and because read-only fan-out sub-agents only get the
+    `READONLY_TOOLS` allow-list, this privileged tool is **never** exposed to them.
+  - **Trust tiers** `externalAgentTrust` / `HARA_EXTERNAL_AGENT_TRUST` = `off | gated (default) | full`. `gated`
+    runs the external agent in its safe sub-mode (`claude --permission-mode plan/acceptEdits`,
+    `codex --sandbox read-only/workspace-write`); the dangerous bypass/full-access sub-modes are only reachable at
+    `full`. Backend allow-list (claude/codex), timeout + output cap. Pure `buildExternalArgv` unit-tested.
+
 ## 0.90.0 — unreleased (gateway: WeCom + Signal → 10 platforms)
 
 - **WeCom (企业微信)** — connects out to WeCom's AI-Bot WebSocket gateway (no public webhook). `HARA_WECOM_BOT_ID`
