@@ -6,6 +6,10 @@ import { join } from "node:path";
 import { parseTelegramUpdate, chunkText, photoFileId } from "../dist/gateway/telegram.js";
 import { parseDiscordMessage } from "../dist/gateway/discord.js";
 import { parseFeishuContent, flattenPost } from "../dist/gateway/feishu.js";
+import { parseSlackEvent } from "../dist/gateway/slack.js";
+import { parseMattermostPost } from "../dist/gateway/mattermost.js";
+import { parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
+import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
@@ -60,6 +64,53 @@ test("flattenPost: rich-text post → joined text runs", () => {
   assert.equal(flattenPost(post), "hi link line2");
   assert.equal(flattenPost({ zh_cn: { content: [[{ tag: "text", text: "中文" }]] } }), "中文"); // locale-wrapped
   assert.equal(flattenPost({}), "");
+});
+
+test("parseSlackEvent: filters non-messages/bots/subtypes, parses text + image file_share", () => {
+  const self = "UBOT";
+  assert.equal(parseSlackEvent({ type: "reaction_added" }, self), null);
+  assert.equal(parseSlackEvent({ type: "message", bot_id: "B1", channel: "C", user: "U1", text: "hi" }, self), null);
+  assert.equal(parseSlackEvent({ type: "message", user: "UBOT", channel: "C", text: "hi" }, self), null); // self
+  assert.equal(parseSlackEvent({ type: "message", subtype: "message_changed", channel: "C", user: "U1", text: "x" }, self), null);
+  const t = parseSlackEvent({ type: "message", channel: "C9", user: "U1", text: "yo" }, self);
+  assert.deepEqual(t.msg, { chatId: "C9", userId: "U1", userName: "U1", text: "yo" });
+  const img = parseSlackEvent({ type: "message", subtype: "file_share", channel: "C9", user: "U1", text: "", files: [{ name: "p.png", mimetype: "image/png", url_private_download: "https://s/p.png" }] }, self);
+  assert.equal(img.msg.text, "[图片]");
+  assert.deepEqual(img.imageUrls, [{ url: "https://s/p.png", name: "p.png" }]);
+});
+
+test("parseMattermostPost: ignores self/system posts, surfaces file_ids", () => {
+  const self = "ubot";
+  assert.equal(parseMattermostPost({ channel_id: "c", user_id: "ubot", message: "hi" }, self), null); // self
+  assert.equal(parseMattermostPost({ channel_id: "c", user_id: "u1", type: "system_join_channel", message: "x" }, self), null);
+  const t = parseMattermostPost({ channel_id: "c1", user_id: "u1", message: "yo" }, self);
+  assert.deepEqual(t.msg, { chatId: "c1", userId: "u1", userName: "u1", text: "yo" });
+  const f = parseMattermostPost({ channel_id: "c1", user_id: "u1", message: "", file_ids: ["f1", "f2"] }, self);
+  assert.equal(f.msg.text, "[图片]");
+  assert.deepEqual(f.imageFileIds, ["f1", "f2"]);
+});
+
+test("parseMxc + parseMatrixEvent: text/image, self + non-message filtering", () => {
+  assert.deepEqual(parseMxc("mxc://matrix.org/abc123"), { server: "matrix.org", mediaId: "abc123" });
+  assert.equal(parseMxc("https://x/y"), null);
+  const self = "@bot:s";
+  assert.equal(parseMatrixEvent({ type: "m.room.encrypted", sender: "@u:s", __roomId: "!r" }, self), null);
+  assert.equal(parseMatrixEvent({ type: "m.room.message", sender: "@bot:s", __roomId: "!r", content: { msgtype: "m.text", body: "hi" } }, self), null); // self
+  const t = parseMatrixEvent({ type: "m.room.message", sender: "@u:s", __roomId: "!r1", content: { msgtype: "m.text", body: "yo" } }, self);
+  assert.deepEqual(t.msg, { chatId: "!r1", userId: "@u:s", userName: "@u:s", text: "yo" });
+  assert.equal(t.imageMxc, null);
+  const img = parseMatrixEvent({ type: "m.room.message", sender: "@u:s", __roomId: "!r1", content: { msgtype: "m.image", body: "pic.png", url: "mxc://s/m1" } }, self);
+  assert.equal(img.msg.text, "pic.png");
+  assert.equal(img.imageMxc, "mxc://s/m1");
+});
+
+test("parseDingtalkMessage: text/picture/richText, captures sessionWebhook", () => {
+  assert.equal(parseDingtalkMessage(null), null);
+  assert.equal(parseDingtalkMessage({ msgtype: "audio", conversationId: "c" }), null); // unsupported → empty → null
+  const t = parseDingtalkMessage({ msgtype: "text", conversationId: "cid", senderStaffId: "s1", senderNick: "Jeff", text: { content: "hi" }, sessionWebhook: "https://wh" });
+  assert.deepEqual(t.msg, { chatId: "cid", userId: "s1", userName: "Jeff", text: "hi" });
+  assert.equal(t.sessionWebhook, "https://wh");
+  assert.equal(parseDingtalkMessage({ msgtype: "picture", conversationId: "cid", senderId: "s2" }).msg.text, "[图片]");
 });
 
 test("chunkText: splits at the Telegram limit", () => {

@@ -112,6 +112,47 @@ async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; o
     const { feishuAdapter } = await import("./feishu.js");
     return { adapter: feishuAdapter(appId, appSecret) };
   }
+  if (platform === "slack") {
+    const appToken = process.env.HARA_SLACK_APP_TOKEN;
+    const botToken = process.env.HARA_SLACK_BOT_TOKEN;
+    if (!appToken || !botToken) {
+      console.error("hara gateway: set HARA_SLACK_APP_TOKEN (xapp-, Socket Mode app-level token w/ connections:write) + HARA_SLACK_BOT_TOKEN (xoxb-, bot token w/ chat:write,files:write,files:read,*:history) and HARA_GATEWAY_ALLOWED=<your slack user id>.");
+      return null;
+    }
+    const { slackAdapter } = await import("./slack.js");
+    return { adapter: slackAdapter(appToken, botToken) };
+  }
+  if (platform === "mattermost") {
+    const url = process.env.HARA_MATTERMOST_URL;
+    const token = process.env.HARA_MATTERMOST_TOKEN;
+    if (!url || !token) {
+      console.error("hara gateway: set HARA_MATTERMOST_URL (e.g. https://mm.example.com) + HARA_MATTERMOST_TOKEN (bot or personal-access token) and HARA_GATEWAY_ALLOWED=<your mattermost user id>.");
+      return null;
+    }
+    const { mattermostAdapter } = await import("./mattermost.js");
+    return { adapter: mattermostAdapter(url, token) };
+  }
+  if (platform === "matrix") {
+    const homeserver = process.env.HARA_MATRIX_HOMESERVER;
+    const token = process.env.HARA_MATRIX_TOKEN;
+    const userId = process.env.HARA_MATRIX_USER_ID;
+    if (!homeserver || !token || !userId) {
+      console.error("hara gateway: set HARA_MATRIX_HOMESERVER (e.g. https://matrix.org), HARA_MATRIX_TOKEN (access token), HARA_MATRIX_USER_ID (@bot:server) and HARA_GATEWAY_ALLOWED=<@you:server>. Unencrypted rooms only (no E2EE in v1).");
+      return null;
+    }
+    const { matrixAdapter } = await import("./matrix.js");
+    return { adapter: matrixAdapter(homeserver, token, userId), ownerId: userId };
+  }
+  if (platform === "dingtalk" || platform === "ding") {
+    const clientId = process.env.HARA_DINGTALK_CLIENT_ID;
+    const clientSecret = process.env.HARA_DINGTALK_CLIENT_SECRET;
+    if (!clientId || !clientSecret) {
+      console.error("hara gateway: set HARA_DINGTALK_CLIENT_ID + HARA_DINGTALK_CLIENT_SECRET (钉钉开放平台 app AppKey/AppSecret, Stream mode enabled on the bot) and HARA_GATEWAY_ALLOWED=<your senderStaffId>.");
+      return null;
+    }
+    const { dingtalkAdapter } = await import("./dingtalk.js");
+    return { adapter: dingtalkAdapter(clientId, clientSecret) };
+  }
   const token = process.env.HARA_TELEGRAM_TOKEN;
   if (!token) {
     console.error("hara gateway: set HARA_TELEGRAM_TOKEN (from @BotFather) and HARA_GATEWAY_ALLOWED=<your telegram user id>.");

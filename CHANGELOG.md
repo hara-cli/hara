@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.89.0 — unreleased (gateway: Slack · Mattermost · Matrix · DingTalk + docs)
+
+- **Four more platforms**, all zero-new-dep (native WebSocket / `fetch`), same `ChatAdapter` seam:
+  - **Slack** — Socket Mode (connects out, no public URL). `HARA_SLACK_APP_TOKEN` (xapp-) + `HARA_SLACK_BOT_TOKEN`
+    (xoxb-). Inbound text + image files (downloaded via the bot token); outbound text + file upload.
+  - **Mattermost** — v4 WebSocket + REST. `HARA_MATTERMOST_URL` + `HARA_MATTERMOST_TOKEN` (bot/PAT). Two-way images.
+  - **Matrix** — `/sync` long-poll. `HARA_MATRIX_HOMESERVER` + `HARA_MATRIX_TOKEN` + `HARA_MATRIX_USER_ID`.
+    Two-way images; **unencrypted rooms only in v1** (no E2EE).
+  - **DingTalk (钉钉)** — Stream Mode (connects out). `HARA_DINGTALK_CLIENT_ID` + `HARA_DINGTALK_CLIENT_SECRET`.
+    Text in/out via the per-message `sessionWebhook`; **v1: no file send, inbound images arrive as `[图片]`**.
+  - Each platform's wire parser (`parseSlackEvent` / `parseMattermostPost` / `parseMatrixEvent` / `parseMxc` /
+    `parseDingtalkMessage`) is pure + unit-tested.
+- **Docs** — new **[docs/gateway.md](docs/gateway.md)** documents all 8 platforms (Telegram · WeChat · Discord ·
+  Feishu/Lark · Slack · Mattermost · Matrix · DingTalk): a capabilities table, common config
+  (`HARA_GATEWAY_ALLOWED`, `--cwd`, slash commands, two-way images), and per-platform setup. Linked from README.
+- Ported by studying the openclaw + hermes adapter implementations; live-tested per platform as tokens become
+  available.
+
 ## 0.88.0 — unreleased (gateway: Feishu/Lark adapter)
 
 - **Feishu/Lark** — `hara gateway --platform feishu` via the official `@larksuiteoapi/node-sdk` (the one new

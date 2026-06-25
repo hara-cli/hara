@@ -240,10 +240,11 @@ turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
 - **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. `@<dir>` loads a directory listing, `@src/`+Tab drills into a folder, and mistyped tool/file paths get a "did you mean" suggestion.
 - **Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) — **all streamed live**.
+- **Chat gateway**: drive your local hara from a chat app — **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk**. The daemon connects out (no public webhook), with per-chat sessions, project roaming (`/cd`), and **two-way images** (send a photo → it sees it; ask for a file → it sends one). Setup per platform: **[docs/gateway.md](docs/gateway.md)**.
 
 ### Roadmap
 
-**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · **single-binary distribution** · **Docker image** · `/compact` context management.
+**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · **chat gateway (8 platforms, two-way images)** · **single-binary distribution** · **Docker image** · `/compact` context management.
 **Next:** SSOT data authority · an enterprise control-plane (fleet + central token management).
 
 ## Security
