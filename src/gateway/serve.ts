@@ -102,6 +102,16 @@ async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; o
     const { discordAdapter } = await import("./discord.js");
     return { adapter: discordAdapter(token) };
   }
+  if (platform === "feishu" || platform === "lark") {
+    const appId = process.env.HARA_FEISHU_APP_ID;
+    const appSecret = process.env.HARA_FEISHU_APP_SECRET;
+    if (!appId || !appSecret) {
+      console.error("hara gateway: set HARA_FEISHU_APP_ID + HARA_FEISHU_APP_SECRET (Feishu app console) and HARA_GATEWAY_ALLOWED=<your open_id>. (HARA_FEISHU_DOMAIN=lark for larksuite.com.)");
+      return null;
+    }
+    const { feishuAdapter } = await import("./feishu.js");
+    return { adapter: feishuAdapter(appId, appSecret) };
+  }
   const token = process.env.HARA_TELEGRAM_TOKEN;
   if (!token) {
     console.error("hara gateway: set HARA_TELEGRAM_TOKEN (from @BotFather) and HARA_GATEWAY_ALLOWED=<your telegram user id>.");

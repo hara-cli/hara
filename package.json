@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.87.0",
+  "version": "0.88.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "dist/index.js"
@@ -51,6 +51,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.2",
+    "@larksuiteoapi/node-sdk": "^1.68.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "commander": "^15.0.0",
     "ink": "^6.8.0",

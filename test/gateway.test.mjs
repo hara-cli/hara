@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseTelegramUpdate, chunkText, photoFileId } from "../dist/gateway/telegram.js";
 import { parseDiscordMessage } from "../dist/gateway/discord.js";
+import { parseFeishuContent, flattenPost } from "../dist/gateway/feishu.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
@@ -44,6 +45,21 @@ test("parseDiscordMessage: ignores self+bots, parses text, surfaces image attach
   assert.equal(img.msg.text, "[图片]");
   assert.equal(img.msg.userName, "Jeff");
   assert.deepEqual(img.imageUrls, [{ url: "https://cdn/x.png", name: "x.png" }]); // pdf excluded
+});
+
+test("parseFeishuContent: text/image/file/audio/post normalization", () => {
+  assert.deepEqual(parseFeishuContent("text", { text: "hello" }), { text: "hello" });
+  assert.deepEqual(parseFeishuContent("image", { image_key: "img_k" }), { text: "", imageKey: "img_k" });
+  assert.deepEqual(parseFeishuContent("file", { file_key: "f_k", file_name: "a.pdf" }), { text: "", fileKey: "f_k", fileName: "a.pdf" });
+  assert.deepEqual(parseFeishuContent("audio", { file_key: "v_k" }), { text: "", fileKey: "v_k", fileName: "audio" });
+  assert.equal(parseFeishuContent("sticker", {}).text, ""); // unknown type → empty
+});
+
+test("flattenPost: rich-text post → joined text runs", () => {
+  const post = { title: "t", content: [[{ tag: "text", text: "hi" }, { tag: "a", text: "link" }], [{ tag: "text", text: "line2" }]] };
+  assert.equal(flattenPost(post), "hi link line2");
+  assert.equal(flattenPost({ zh_cn: { content: [[{ tag: "text", text: "中文" }]] } }), "中文"); // locale-wrapped
+  assert.equal(flattenPost({}), "");
 });
 
 test("chunkText: splits at the Telegram limit", () => {

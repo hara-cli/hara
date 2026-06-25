@@ -904,7 +904,7 @@ program
 program
   .command("gateway")
   .description("run a chat gateway (Telegram or WeChat) so you can drive your local hara from your phone — opt-in daemon")
-  .option("--platform <name>", "chat platform: telegram | weixin | discord", "telegram")
+  .option("--platform <name>", "chat platform: telegram | weixin | discord | feishu", "telegram")
   .option("--login", "(weixin) scan a QR to log in and save credentials, then exit")
   .option("--cwd <dir>", "directory hara operates in per message (default: ~/.hara/workspace)")
   .action(async (opts) => {

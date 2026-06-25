@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.88.0 — unreleased (gateway: Feishu/Lark adapter)
+
+- **Feishu/Lark** — `hara gateway --platform feishu` via the official `@larksuiteoapi/node-sdk` (the one new
+  dependency): a **WSClient long-connection** for inbound (no public webhook needed — fits the local daemon) and
+  the REST Client for outbound. Inbound text / rich-text post / image / file / audio (media downloaded to
+  `~/.hara/feishu/media` → the agent SEES images); outbound text + `sendFile` (image upload → image message,
+  else file upload → file message) so `send_file` / `/send` work. Creds via `HARA_FEISHU_APP_ID` /
+  `HARA_FEISHU_APP_SECRET` (+ `HARA_FEISHU_DOMAIN=lark` for larksuite.com), users via `HARA_GATEWAY_ALLOWED`
+  (open_id). v1 = p2p DMs; group support is a fast-follow. `parseFeishuContent` / `flattenPost` are pure + tested.
+
 ## 0.87.0 — unreleased (gateway: Discord adapter)
 
 - **Discord** — `hara gateway --platform discord` connects to the Discord gateway over Node's native global
