@@ -23,6 +23,8 @@ it runs fine on your laptop behind NAT.
 | Mattermost | WebSocket + REST | none | ✅ in / ✅ out | self-host or cloud |
 | Matrix | `/sync` long-poll | none | ✅ in / ✅ out | unencrypted rooms only (v1) |
 | DingTalk (钉钉) | Stream Mode (WS) | none | ⬜ in / ⬜ out | text only in v1 |
+| WeCom (企业微信) | AI-Bot WS gateway | none | ✅ in / ✅ out | connects out; AES media |
+| Signal | local signal-cli (JSON-RPC) | none* | ✅ in / ✅ out | *needs the signal-cli daemon |
 
 ## Common setup (every platform)
 
@@ -154,6 +156,39 @@ HARA_DINGTALK_CLIENT_ID=… HARA_DINGTALK_CLIENT_SECRET=… HARA_GATEWAY_ALLOWED
 message, so the bot can only reply after it has received a message in that chat (the window expires after a few
 hours of silence). Sending files/voice is not supported, and inbound images arrive as a `[图片]` marker (not
 downloaded).
+
+## WeCom (企业微信 / Enterprise WeChat)
+
+Connects out to WeCom's AI-Bot WebSocket gateway — no public webhook, works behind NAT.
+
+1. In the WeCom Admin Console (work.weixin.qq.com) → Applications → create an **AI Bot** → copy its **Bot ID** + **Secret**.
+2. `HARA_GATEWAY_ALLOWED` = your WeCom userid.
+
+```bash
+HARA_WECOM_BOT_ID=… HARA_WECOM_SECRET=… HARA_GATEWAY_ALLOWED=<your-userid> hara gateway --platform wecom
+```
+
+Inbound images (incl. AES-encrypted attachments) are downloaded to `~/.hara/wecom/media`; text/markdown replies are
+chunked; outbound images/files supported. (`HARA_WECOM_WS_URL` overrides the gateway URL.)
+
+## Signal
+
+Signal has no official cloud API, so hara talks to a **local [signal-cli](https://github.com/AsamK/signal-cli)
+daemon** you run yourself.
+
+1. Install: `brew install signal-cli` (needs a JRE).
+2. Register a new number (`signal-cli -a +1555… register` → `verify <code>`) **or** link as a secondary device
+   (`signal-cli link -n hara` → scan from Signal → Linked devices).
+3. Run the daemon: `signal-cli -a +1555… daemon --http localhost:8080`.
+4. `HARA_GATEWAY_ALLOWED` = your Signal number/uuid.
+
+```bash
+HARA_SIGNAL_RPC_URL=http://localhost:8080 HARA_SIGNAL_NUMBER=+1555… HARA_GATEWAY_ALLOWED=<your-number> \
+  hara gateway --platform signal
+```
+
+The signal-cli daemon must stay running alongside the gateway; phone numbers are redacted in logs. Inbound image
+attachments are downloaded to `~/.hara/signal/media`.
 
 ---
 

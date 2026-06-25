@@ -153,6 +153,26 @@ async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; o
     const { dingtalkAdapter } = await import("./dingtalk.js");
     return { adapter: dingtalkAdapter(clientId, clientSecret) };
   }
+  if (platform === "wecom" || platform === "wework") {
+    const botId = process.env.HARA_WECOM_BOT_ID;
+    const secret = process.env.HARA_WECOM_SECRET;
+    if (!botId || !secret) {
+      console.error("hara gateway: set HARA_WECOM_BOT_ID + HARA_WECOM_SECRET (企业微信 admin console → AI Bot credentials) and HARA_GATEWAY_ALLOWED=<your wecom userid>. (HARA_WECOM_WS_URL overrides the gateway URL.)");
+      return null;
+    }
+    const { wecomAdapter } = await import("./wecom.js");
+    return { adapter: wecomAdapter(botId, secret, process.env.HARA_WECOM_WS_URL) };
+  }
+  if (platform === "signal") {
+    const rpcUrl = process.env.HARA_SIGNAL_RPC_URL;
+    const number = process.env.HARA_SIGNAL_NUMBER;
+    if (!rpcUrl || !number) {
+      console.error("hara gateway: set HARA_SIGNAL_RPC_URL (e.g. http://localhost:8080) + HARA_SIGNAL_NUMBER (the bot's registered phone, E.164) and HARA_GATEWAY_ALLOWED=<your signal number/uuid>. Requires a local signal-cli daemon: `signal-cli -a <number> daemon --http localhost:8080`.");
+      return null;
+    }
+    const { signalAdapter } = await import("./signal.js");
+    return { adapter: signalAdapter(rpcUrl, number), ownerId: number };
+  }
   const token = process.env.HARA_TELEGRAM_TOKEN;
   if (!token) {
     console.error("hara gateway: set HARA_TELEGRAM_TOKEN (from @BotFather) and HARA_GATEWAY_ALLOWED=<your telegram user id>.");

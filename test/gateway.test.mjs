@@ -10,6 +10,8 @@ import { parseSlackEvent } from "../dist/gateway/slack.js";
 import { parseMattermostPost } from "../dist/gateway/mattermost.js";
 import { parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
 import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
+import { parseSignalMessage } from "../dist/gateway/signal.js";
+import { parseWecomMessage } from "../dist/gateway/wecom.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
@@ -111,6 +113,29 @@ test("parseDingtalkMessage: text/picture/richText, captures sessionWebhook", () 
   assert.deepEqual(t.msg, { chatId: "cid", userId: "s1", userName: "Jeff", text: "hi" });
   assert.equal(t.sessionWebhook, "https://wh");
   assert.equal(parseDingtalkMessage({ msgtype: "picture", conversationId: "cid", senderId: "s2" }).msg.text, "[图片]");
+});
+
+test("parseSignalMessage: skips sync/self, parses text/group/image", () => {
+  const self = "+1555";
+  assert.equal(parseSignalMessage({ envelope: { syncMessage: {} } }, self), null);
+  assert.equal(parseSignalMessage({ envelope: { sourceNumber: "+1555", dataMessage: { message: "hi" } } }, self), null); // self
+  const t = parseSignalMessage({ envelope: { sourceNumber: "+1666", sourceName: "Jeff", dataMessage: { message: "yo" } } }, self);
+  assert.deepEqual(t.msg, { chatId: "+1666", userId: "+1666", userName: "Jeff", text: "yo" });
+  const g = parseSignalMessage({ envelope: { sourceNumber: "+1666", dataMessage: { message: "hey", groupInfo: { groupId: "GRP" } } } }, self);
+  assert.equal(g.msg.chatId, "group:GRP");
+  const img = parseSignalMessage({ envelope: { sourceNumber: "+1666", dataMessage: { message: "", attachments: [{ id: "a1", contentType: "image/jpeg" }] } } }, self);
+  assert.equal(img.msg.text, "[图片]");
+  assert.equal(img.images.length, 1);
+});
+
+test("parseWecomMessage: needs body, skips self, parses text", () => {
+  const self = "botX";
+  assert.equal(parseWecomMessage({}, self), null);
+  assert.equal(parseWecomMessage({ body: { from: { userid: "botX" }, msgtype: "text", text: { content: "hi" } } }, self), null); // self
+  const t = parseWecomMessage({ body: { from: { userid: "u1", name: "Jeff" }, chatid: "c1", msgtype: "text", text: { content: "yo" } } }, self);
+  assert.equal(t.msg.chatId, "c1");
+  assert.equal(t.msg.userId, "u1");
+  assert.equal(t.msg.text, "yo");
 });
 
 test("chunkText: splits at the Telegram limit", () => {

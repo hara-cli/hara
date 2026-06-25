@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.90.0 — unreleased (gateway: WeCom + Signal → 10 platforms)
+
+- **WeCom (企业微信)** — connects out to WeCom's AI-Bot WebSocket gateway (no public webhook). `HARA_WECOM_BOT_ID`
+  + `HARA_WECOM_SECRET`. Two-way: inbound text + images (incl. AES-decrypted attachments → `~/.hara/wecom/media`),
+  outbound text/image/file. Zero new deps (native WebSocket + node:crypto).
+- **Signal** — talks to a local **signal-cli** daemon (JSON-RPC). `HARA_SIGNAL_RPC_URL` + `HARA_SIGNAL_NUMBER`.
+  Inbound text + image attachments, outbound text/file; phone numbers redacted in logs. signal-cli is an external
+  daemon the user runs (documented). Zero new npm deps.
+- Pure parsers `parseWecomMessage` / `parseSignalMessage` unit-tested. docs/gateway.md + README updated to 10
+  platforms. Ported from the openclaw + hermes adapters.
+
 ## 0.89.0 — unreleased (gateway: Slack · Mattermost · Matrix · DingTalk + docs)
 
 - **Four more platforms**, all zero-new-dep (native WebSocket / `fetch`), same `ChatAdapter` seam:
