@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.87.0 — unreleased (gateway: Discord adapter)
+
+- **Discord** — `hara gateway --platform discord` connects to the Discord gateway over Node's native global
+  WebSocket (zero new dep on Node ≥ 22): HELLO→heartbeat→IDENTIFY, dispatches MESSAGE_CREATE, auto-reconnects.
+  Inbound text + image attachments (downloaded to `~/.hara/discord/media` → the agent SEES them); outbound text
+  (2000-char chunks) and `sendFile` (multipart) so `send_file` / `/send` work. Token via `HARA_DISCORD_TOKEN`,
+  users via `HARA_GATEWAY_ALLOWED` (Discord user ids). Needs the bot's privileged Message Content Intent.
+  Same `ChatAdapter` seam as Telegram/WeChat — all cross-platform gateway logic worked unchanged.
+
 ## 0.86.1 — unreleased (gateway: Telegram reaches image parity with WeChat)
 
 - **Telegram two-way images** — `parseTelegramUpdate` now accepts photo messages (caption or a `[图片]` marker)

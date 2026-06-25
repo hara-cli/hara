@@ -93,6 +93,15 @@ async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; o
     // The iLink user_id is whoever scanned the QR — the bot owner. Auto-allow them so there's no wxid dance.
     return { adapter: weixinAdapter(creds), ownerId: creds.user_id || undefined };
   }
+  if (platform === "discord") {
+    const token = process.env.HARA_DISCORD_TOKEN;
+    if (!token) {
+      console.error("hara gateway: set HARA_DISCORD_TOKEN (Discord bot token) and HARA_GATEWAY_ALLOWED=<your discord user id>. Enable the Message Content Intent on the bot.");
+      return null;
+    }
+    const { discordAdapter } = await import("./discord.js");
+    return { adapter: discordAdapter(token) };
+  }
   const token = process.env.HARA_TELEGRAM_TOKEN;
   if (!token) {
     console.error("hara gateway: set HARA_TELEGRAM_TOKEN (from @BotFather) and HARA_GATEWAY_ALLOWED=<your telegram user id>.");

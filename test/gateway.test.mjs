@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseTelegramUpdate, chunkText, photoFileId } from "../dist/gateway/telegram.js";
+import { parseDiscordMessage } from "../dist/gateway/discord.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
@@ -24,6 +25,25 @@ test("parseTelegramUpdate: photo message → caption (or [图片]) text; photoFi
   assert.equal(noCaption.text, "[图片]");
   assert.equal(photoFileId({ message: { photo } }), "big"); // largest = last
   assert.equal(photoFileId({ message: { text: "hi" } }), null);
+});
+
+test("parseDiscordMessage: ignores self+bots, parses text, surfaces image attachments", () => {
+  const self = "999";
+  assert.equal(parseDiscordMessage({ channel_id: "c", author: { id: "999" }, content: "hi" }, self), null); // own message
+  assert.equal(parseDiscordMessage({ channel_id: "c", author: { id: "5", bot: true }, content: "hi" }, self), null); // another bot
+  assert.equal(parseDiscordMessage({ channel_id: "c", author: { id: "5" }, content: "" }, self), null); // empty, no media
+
+  const txt = parseDiscordMessage({ channel_id: "c1", author: { id: "5", username: "jeff" }, content: "yo" }, self);
+  assert.deepEqual(txt.msg, { chatId: "c1", userId: "5", userName: "jeff", text: "yo" });
+  assert.deepEqual(txt.imageUrls, []);
+
+  const img = parseDiscordMessage(
+    { channel_id: "c1", author: { id: "5", global_name: "Jeff" }, content: "", attachments: [{ url: "https://cdn/x.png", filename: "x.png", content_type: "image/png" }, { url: "https://cdn/d.pdf", filename: "d.pdf", content_type: "application/pdf" }] },
+    self,
+  );
+  assert.equal(img.msg.text, "[图片]");
+  assert.equal(img.msg.userName, "Jeff");
+  assert.deepEqual(img.imageUrls, [{ url: "https://cdn/x.png", name: "x.png" }]); // pdf excluded
 });
 
 test("chunkText: splits at the Telegram limit", () => {
