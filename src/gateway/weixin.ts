@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename } from "node:path";
-import { randomBytes, randomUUID, createHash, createCipheriv } from "node:crypto";
+import { randomBytes, randomUUID, createHash, createCipheriv, createDecipheriv } from "node:crypto";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
 const ILINK_BASE_URL = "https://ilinkai.weixin.qq.com";
@@ -32,8 +32,22 @@ const RATE_LIMIT = -2;
 const MSG_TYPE_BOT = 2;
 const MSG_STATE_FINISH = 2;
 const ITEM_TEXT = 1;
+const ITEM_IMAGE = 2;
+const ITEM_VOICE = 3;
 const ITEM_FILE = 4; // item.type for a file attachment (audio is sent as a file — iLink voice bubbles unreliable)
+const MEDIA_IMAGE = 1; // media_type for getuploadurl when sending an image (inline)
 const MEDIA_FILE = 3; // media_type for getuploadurl when sending a file/audio
+const WEIXIN_CDN_ALLOWLIST = new Set([
+  "novac2c.cdn.weixin.qq.com",
+  "ilinkai.weixin.qq.com",
+  "wx.qlogo.cn",
+  "thirdwx.qlogo.cn",
+  "res.wx.qq.com",
+  "mmbiz.qpic.cn",
+  "mmbiz.qlogo.cn",
+]);
+const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp"]);
+const INBOUND_MEDIA_MAX = 128 * 1024 * 1024; // 128 MiB cap, per the reference
 
 export interface WeixinCreds {
   account_id: string;
@@ -91,14 +105,25 @@ export function apiAesKey(keyHex: string): string {
   return Buffer.from(keyHex, "ascii").toString("base64");
 }
 
-/** The sendmessage item_list entry for an audio/file attachment (iLink has no reliable native voice bubble). */
+/** The sendmessage item for a file attachment (audio/zip/pdf/doc/… — anything not shown inline). */
 export function audioFileItem(encryptQueryParam: string, aesKeyForApi: string, rawsize: number, filename: string): Record<string, unknown> {
   return {
     type: ITEM_FILE,
     file_item: {
       media: { encrypt_query_param: encryptQueryParam, aes_key: aesKeyForApi, encrypt_type: 1 },
       file_name: filename,
-      len: String(rawsize), // plaintext size, as a STRING (a file_item quirk — image/video use ciphertext size as int)
+      len: String(rawsize), // plaintext size, as a STRING (a file_item quirk — image uses ciphertext size as int)
+    },
+  };
+}
+
+/** The sendmessage item for an inline image (shows in the chat, not as a file). mid_size = CIPHERTEXT size (int). */
+export function imageInlineItem(encryptQueryParam: string, aesKeyForApi: string, ciphertextSize: number): Record<string, unknown> {
+  return {
+    type: ITEM_IMAGE,
+    image_item: {
+      media: { encrypt_query_param: encryptQueryParam, aes_key: aesKeyForApi, encrypt_type: 1 },
+      mid_size: ciphertextSize,
     },
   };
 }
@@ -332,6 +357,103 @@ function aes128EcbEncrypt(plaintext: Buffer, key: Buffer): Buffer {
   return Buffer.concat([c.update(plaintext), c.final()]);
 }
 
+// ── inbound media (receive a file/image/voice the user sent) ──────────────────
+
+/** Parse an inbound `media.aes_key`: base64 → 16 raw bytes, OR base64 → 32-char ascii hex → hex-decode. */
+export function parseAesKey(aesKeyB64: string): Buffer {
+  const decoded = Buffer.from(aesKeyB64, "base64");
+  if (decoded.length === 16) return decoded;
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString("ascii"))) return Buffer.from(decoded.toString("ascii"), "hex");
+  throw new Error(`unexpected aes_key format (${decoded.length} bytes)`);
+}
+
+function aes128EcbDecrypt(ciphertext: Buffer, key: Buffer): Buffer {
+  const d = createDecipheriv("aes-128-ecb", key, null);
+  d.setAutoPadding(false); // iLink's strip is conditional (tolerates non-PKCS7) — replicate it ourselves
+  const padded = Buffer.concat([d.update(ciphertext), d.final()]);
+  if (!padded.length) return padded;
+  const pad = padded[padded.length - 1];
+  if (pad >= 1 && pad <= 16 && padded.length >= pad) {
+    let ok = true;
+    for (let i = padded.length - pad; i < padded.length; i++) if (padded[i] !== pad) ok = false;
+    if (ok) return padded.subarray(0, padded.length - pad);
+  }
+  return padded;
+}
+
+export interface InboundMediaRef {
+  kind: "image" | "file" | "voice";
+  encryptQueryParam?: string;
+  fullUrl?: string;
+  aesKeyB64?: string;
+  fileName?: string;
+}
+
+/** Downloadable media items in an inbound message (pure). Skips voice that already carries a transcription. */
+export function inboundMediaRefs(itemList: unknown): InboundMediaRef[] {
+  const items = Array.isArray(itemList) ? itemList : [];
+  const out: InboundMediaRef[] = [];
+  for (const it of items) {
+    if (it?.type === ITEM_IMAGE) {
+      const media = it.image_item?.media ?? {};
+      // image key hack: prefer image_item.aeskey (hex) re-encoded as base64(ascii(hex)); else media.aes_key
+      const hex = str(it.image_item?.aeskey);
+      const aesKeyB64 = (hex && Buffer.from(hex, "ascii").toString("base64")) || str(media.aes_key) || undefined;
+      out.push({ kind: "image", encryptQueryParam: str(media.encrypt_query_param) || undefined, fullUrl: str(media.full_url) || undefined, aesKeyB64 });
+    } else if (it?.type === ITEM_FILE) {
+      const media = it.file_item?.media ?? {};
+      out.push({ kind: "file", encryptQueryParam: str(media.encrypt_query_param) || undefined, fullUrl: str(media.full_url) || undefined, aesKeyB64: str(media.aes_key) || undefined, fileName: str(it.file_item?.file_name) || "document.bin" });
+    } else if (it?.type === ITEM_VOICE && !str(it.voice_item?.text)) {
+      const media = it.voice_item?.media ?? {};
+      out.push({ kind: "voice", encryptQueryParam: str(media.encrypt_query_param) || undefined, fullUrl: str(media.full_url) || undefined, aesKeyB64: str(media.aes_key) || undefined });
+    }
+  }
+  return out;
+}
+
+const cdnDownloadUrl = (param: string): string => `${WEIXIN_CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(param)}`;
+const mediaDir = (): string => join(weixinDir(), "media");
+const sanitizeName = (name: string): string => name.replace(/[^\w.\- ]+/g, "_").slice(-80) || "file.bin";
+
+function assertCdnHost(url: string): void {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new Error(`unparseable media URL: ${url}`);
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error(`disallowed scheme ${u.protocol}`);
+  if (!WEIXIN_CDN_ALLOWLIST.has(u.hostname)) throw new Error(`host ${u.hostname} not in WeChat CDN allowlist (SSRF guard)`);
+}
+
+/** Download (+ AES-decrypt if keyed) an inbound media item to a local file. Returns its path + mime, or null. */
+export async function downloadInboundMedia(ref: InboundMediaRef): Promise<{ path: string; mime: string } | null> {
+  try {
+    let url: string;
+    if (ref.encryptQueryParam) url = cdnDownloadUrl(ref.encryptQueryParam);
+    else if (ref.fullUrl) {
+      assertCdnHost(ref.fullUrl);
+      url = ref.fullUrl;
+    } else return null;
+    const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+    if (!res.ok) throw new Error(`media download HTTP ${res.status}`);
+    const ab = await res.arrayBuffer();
+    if (ab.byteLength > INBOUND_MEDIA_MAX) throw new Error("media exceeds size cap");
+    let buf: Buffer = Buffer.from(ab);
+    if (ref.aesKeyB64) buf = aes128EcbDecrypt(buf, parseAesKey(ref.aesKeyB64));
+    if (!buf.length) return null;
+    mkdirSync(mediaDir(), { recursive: true });
+    const tag = randomUUID().slice(0, 8);
+    const name = ref.kind === "image" ? `img_${tag}.jpg` : ref.kind === "voice" ? `audio_${tag}.silk` : `${tag}_${sanitizeName(ref.fileName || "document.bin")}`;
+    const path = join(mediaDir(), name);
+    writeFileSync(path, buf);
+    return { path, mime: ref.kind === "image" ? "image/jpeg" : ref.kind === "voice" ? "audio/silk" : "application/octet-stream" };
+  } catch (e) {
+    console.error(`weixin inbound media (${ref.kind}): ${(e as Error)?.message ?? e}`);
+    return null;
+  }
+}
+
 async function cdnUpload(uploadUrl: string, ciphertext: Buffer): Promise<string> {
   const res = await fetch(uploadUrl, { method: "POST", body: new Uint8Array(ciphertext), headers: { "Content-Type": "application/octet-stream" }, signal: AbortSignal.timeout(120_000) });
   await res.arrayBuffer().catch(() => undefined); // drain body
@@ -341,25 +463,29 @@ async function cdnUpload(uploadUrl: string, ciphertext: Buffer): Promise<string>
   return ep;
 }
 
-/** Send a local audio file to a peer as a WeChat file attachment (the TTS voice-reply path). Ported byte-exact
- *  from iLink's media protocol: getuploadurl → AES-128-ECB encrypt → CDN POST → sendmessage(file_item). */
-export async function sendAudioFile(creds: WeixinCreds, tokenStore: TokenStore, peer: string, audioPath: string): Promise<boolean> {
+/** Send a local file to a peer. Images go inline (image_item); everything else (audio/zip/pdf/doc/…) goes as a
+ *  file attachment (file_item) carrying the filename. Ported byte-exact from iLink's media protocol:
+ *  getuploadurl → AES-128-ECB encrypt → CDN POST → sendmessage(item). */
+export async function sendMediaFile(creds: WeixinCreds, tokenStore: TokenStore, peer: string, filePath: string): Promise<boolean> {
   try {
-    const plaintext = readFileSync(audioPath);
+    const plaintext = readFileSync(filePath);
     const rawsize = plaintext.length;
+    const isImage = IMAGE_EXTS.has((filePath.split(".").pop() || "").toLowerCase());
     const rawfilemd5 = createHash("md5").update(plaintext).digest("hex");
     const filekey = randomBytes(16).toString("hex");
     const key = randomBytes(16);
     const keyHex = key.toString("hex");
     const filesize = Math.ceil((rawsize + 1) / 16) * 16; // AES-padded size == ciphertext length
-    const up = await apiPost(creds.base_url, EP.getUploadUrl, { filekey, media_type: MEDIA_FILE, to_user_id: peer, rawsize, rawfilemd5, filesize, no_need_thumb: true, aeskey: keyHex }, creds.token, API_TIMEOUT_MS);
+    const up = await apiPost(creds.base_url, EP.getUploadUrl, { filekey, media_type: isImage ? MEDIA_IMAGE : MEDIA_FILE, to_user_id: peer, rawsize, rawfilemd5, filesize, no_need_thumb: true, aeskey: keyHex }, creds.token, API_TIMEOUT_MS);
     const ciphertext = aes128EcbEncrypt(plaintext, key);
     const fullUrl = str(up.upload_full_url);
     const param = str(up.upload_param);
     const uploadUrl = fullUrl || (param ? `${WEIXIN_CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(param)}&filekey=${encodeURIComponent(filekey)}` : "");
     if (!uploadUrl) throw new Error("getuploadurl returned neither upload_full_url nor upload_param");
     const encryptedParam = await cdnUpload(uploadUrl, ciphertext);
-    const item = audioFileItem(encryptedParam, apiAesKey(keyHex), rawsize, basename(audioPath));
+    const item = isImage
+      ? imageInlineItem(encryptedParam, apiAesKey(keyHex), ciphertext.length)
+      : audioFileItem(encryptedParam, apiAesKey(keyHex), rawsize, basename(filePath));
     const clientId = `hara-weixin-${randomUUID().replace(/-/g, "")}`; // reused across the -14 retry for dedup
     const send = (ctx: string | undefined): Promise<any> => {
       const msg: Record<string, unknown> = { from_user_id: "", to_user_id: peer, client_id: clientId, message_type: MSG_TYPE_BOT, message_state: MSG_STATE_FINISH, item_list: [item] };
@@ -374,26 +500,45 @@ export async function sendAudioFile(creds: WeixinCreds, tokenStore: TokenStore, 
       [ret, errcode, errmsg] = [num(res.ret), num(res.errcode), str(res.errmsg ?? res.msg)];
     }
     if (ret !== 0 || errcode !== 0) {
-      console.error(`weixin sendAudio: ret=${ret} errcode=${errcode} errmsg=${errmsg}`);
+      console.error(`weixin sendMedia: ret=${ret} errcode=${errcode} errmsg=${errmsg}`);
       return false;
     }
     return true;
   } catch (e) {
-    console.error(`weixin sendAudio: ${(e as Error)?.message ?? e}`);
+    console.error(`weixin sendMedia: ${(e as Error)?.message ?? e}`);
     return false;
   }
 }
 
 export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
   const tokenStore = new TokenStore(creds.account_id);
+  // Reuse parseWeixinMessage for text/voice-transcription, then download any image/file/voice media and append
+  // a `[kind: localpath]` reference so hara can read the file. Handles media-only messages (no text) too.
+  const buildInbound = async (msg: any): Promise<InboundMsg | null> => {
+    const parsed = parseWeixinMessage(msg, creds.account_id);
+    const from = str(msg?.from_user_id).trim();
+    if (!from || from === creds.account_id) return null;
+    if (guessChatType(msg, creds.account_id).kind !== "dm") return null;
+    let text = parsed?.inbound.text ?? "";
+    for (const ref of inboundMediaRefs(msg?.item_list)) {
+      const dl = await downloadInboundMedia(ref);
+      if (!dl) continue;
+      const label = ref.kind === "image" ? "图片" : ref.kind === "voice" ? "语音" : `文件 ${ref.fileName ?? ""}`.trim();
+      text += `${text ? "\n" : ""}[${label}: ${dl.path}]`;
+    }
+    text = text.trim();
+    if (!text) return null;
+    tokenStore.set(from, parsed?.contextToken || str(msg?.context_token).trim());
+    return { chatId: from, userId: from, userName: from, text };
+  };
   return {
     name: "weixin",
     async send(chatId, text) {
       const peer = String(chatId);
       for (const part of chunkText(text || "(empty)")) await sendChunk(creds, tokenStore, peer, part);
     },
-    async sendAudio(chatId, audioPath) {
-      await sendAudioFile(creds, tokenStore, String(chatId), audioPath);
+    async sendFile(chatId, filePath) {
+      await sendMediaFile(creds, tokenStore, String(chatId), filePath);
     },
     async start(onMessage, signal) {
       let buf = loadCursor(creds.account_id);
@@ -422,10 +567,8 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
         buf = str(resp.get_updates_buf) || buf;
         saveCursor(creds.account_id, buf);
         for (const msg of Array.isArray(resp.msgs) ? resp.msgs : []) {
-          const parsed = parseWeixinMessage(msg, creds.account_id);
-          if (!parsed) continue;
-          tokenStore.set(String(parsed.inbound.userId), parsed.contextToken);
-          await onMessage(parsed.inbound).catch(() => {});
+          const inbound = await buildInbound(msg);
+          if (inbound) await onMessage(inbound).catch(() => {});
         }
         const lp = num(resp.longpolling_timeout_ms);
         pollMs = lp > 0 ? lp : LONG_POLL_TIMEOUT_MS;

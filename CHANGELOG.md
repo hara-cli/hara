@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.84.0 — unreleased (gateway: file + image send/receive)
+
+- **Receive** — a file / image / (untranscribed) voice you send is now downloaded + AES-decrypted to a local
+  file under `~/.hara/weixin/media/`, and hara is handed a `[图片|文件 name|语音: /path]` reference so it can
+  read/process it (images → a vision-capable model). Ported iLink's inbound media path (CDN download →
+  AES-128-ECB decrypt) including the image `aeskey` hex-hack, the `encrypt_query_param` vs `encrypted_query_param`
+  naming, the conditional PKCS7 strip, the CDN-host SSRF allowlist, and a 128 MiB cap. Media-only messages
+  (no text) are now processed too.
+- **Send** — `sendMediaFile` sends any local file: images go **inline** (`image_item`), everything else
+  (zip / pdf / doc / audio / …) as a **file attachment** (`file_item`) carrying the filename. New `/send <path>`
+  command (absolute / `~` / relative to the chat's dir). Voice replies + `/say` now ride the same generic path.
+- `ChatAdapter.sendAudio?` → **`sendFile?`** (generic seam). Live-validated end-to-end: ZIP attachment + inline
+  image delivered. 265 tests.
+
 ## 0.83.0 — unreleased (gateway: voice replies — pluggable TTS, /voice + /say)
 
 - The gateway can now **reply with voice** — a WeChat audio-file attachment (iLink's native voice bubble is

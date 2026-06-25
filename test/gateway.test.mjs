@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { parseTelegramUpdate, chunkText } from "../dist/gateway/telegram.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
-import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem } from "../dist/gateway/weixin.js";
+import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
 import { ttsConfigFromEnv, ttsCleanText } from "../dist/gateway/tts.js";
 
 test("parseTelegramUpdate: text message → InboundMsg; non-text → null", () => {
@@ -176,6 +176,38 @@ test("weixin audioFileItem: file_item shape — string len, encrypt_type 1, type
       len: "12345",
     },
   });
+});
+
+test("weixin imageInlineItem: image_item shape — mid_size is the ciphertext size (int), type 2", () => {
+  assert.deepEqual(imageInlineItem("ENC", "AESB64", 4096), {
+    type: 2,
+    image_item: { media: { encrypt_query_param: "ENC", aes_key: "AESB64", encrypt_type: 1 }, mid_size: 4096 },
+  });
+});
+
+test("weixin parseAesKey: recovers 16 raw key bytes from apiAesKey(hex), and from raw-16 base64", () => {
+  const key = Buffer.from("00112233445566778899aabbccddeeff", "hex"); // 16 bytes
+  assert.deepEqual(parseAesKey(apiAesKey(key.toString("hex"))), key); // base64(ascii(hex)) → hex branch
+  assert.deepEqual(parseAesKey(key.toString("base64")), key); // raw-16 branch
+});
+
+test("weixin inboundMediaRefs: image/file/(untranscribed)voice; skips text + transcribed voice", () => {
+  const refs = inboundMediaRefs([
+    { type: 1, text_item: { text: "hi" } },
+    { type: 2, image_item: { media: { encrypt_query_param: "e1", aes_key: "k1" } } },
+    { type: 4, file_item: { file_name: "a.zip", media: { full_url: "https://novac2c.cdn.weixin.qq.com/x", aes_key: "k2" } } },
+    { type: 3, voice_item: { text: "已转写" } }, // transcribed → surfaced as text, not downloaded
+    { type: 3, voice_item: { media: { encrypt_query_param: "e3", aes_key: "k3" } } },
+  ]);
+  assert.deepEqual(refs.map((r) => r.kind), ["image", "file", "voice"]);
+  assert.equal(refs[1].fileName, "a.zip");
+  assert.equal(refs[2].encryptQueryParam, "e3");
+});
+
+test("weixin inboundMediaRefs: image aeskey hex-hack re-encodes to base64(ascii(hex))", () => {
+  const hex = "00112233445566778899aabbccddeeff";
+  const [ref] = inboundMediaRefs([{ type: 2, image_item: { aeskey: hex, media: { encrypt_query_param: "e" } } }]);
+  assert.equal(ref.aesKeyB64, Buffer.from(hex, "ascii").toString("base64"));
 });
 
 test("tts: ttsConfigFromEnv defaults + ttsCleanText (collapse ws, strip fences, cap)", () => {

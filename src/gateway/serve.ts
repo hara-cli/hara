@@ -123,7 +123,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       if (cmd.cmd === "help")
         return adapter.send(
           m.chatId,
-          "commands:\n/pwd · /cd <dir> — switch project\n/sessions · /new · /resume <id> — threads\n/voice — toggle spoken replies · /say <text> — speak text\n/help\nanything else = run hara here",
+          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/voice · /say <text> — speech · /send <path> — send a file\n/help\nanything else = run hara here",
         );
       if (cmd.cmd === "pwd") return adapter.send(m.chatId, `📂 ${ctx.cwd}\n🧵 ${ctx.sessionId.slice(-18)}`);
       if (cmd.cmd === "cd" || cmd.cmd === "project") {
@@ -146,17 +146,24 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         return adapter.send(m.chatId, `↩ resumed ${id.slice(-18)}\n📂 ${target}`);
       }
       if (cmd.cmd === "voice") {
-        if (!adapter.sendAudio) return adapter.send(m.chatId, "this platform can't send voice yet.");
+        if (!adapter.sendFile) return adapter.send(m.chatId, "this platform can't send voice yet.");
         const on = toggleVoice(adapter.name, m.chatId);
         return adapter.send(m.chatId, on ? "🔊 voice replies ON — I'll speak each reply too." : "🔇 voice replies OFF.");
       }
       if (cmd.cmd === "say") {
-        if (!adapter.sendAudio) return adapter.send(m.chatId, "this platform can't send voice yet.");
+        if (!adapter.sendFile) return adapter.send(m.chatId, "this platform can't send voice yet.");
         if (!cmd.arg) return adapter.send(m.chatId, "usage: /say <text to speak>");
         const audio = await synthesize(cmd.arg);
         if (!audio) return adapter.send(m.chatId, "✗ TTS failed (check HARA_TTS_* config).");
-        await adapter.sendAudio(m.chatId, audio);
+        await adapter.sendFile(m.chatId, audio);
         rmSync(audio, { force: true });
+        return;
+      }
+      if (cmd.cmd === "send") {
+        if (!adapter.sendFile) return adapter.send(m.chatId, "this platform can't send files yet.");
+        const p = cmd.arg ? resolve(ctx.cwd, cmd.arg.replace(/^~(?=\/|$)/, homedir())) : "";
+        if (!p || !existsSync(p) || !statSync(p).isFile()) return adapter.send(m.chatId, `✗ not a file: ${p || "(none)"}\nusage: /send <path> (abs, ~, or relative to current dir)`);
+        await adapter.sendFile(m.chatId, p);
         return;
       }
       // any other slash word → treat as a normal task
@@ -164,10 +171,10 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     await adapter.send(m.chatId, "⟳ working…");
     const reply = await runHara(m.text, ctx.sessionId, ctx.cwd);
     await adapter.send(m.chatId, reply);
-    if (ctx.voice && adapter.sendAudio) {
+    if (ctx.voice && adapter.sendFile) {
       const audio = await synthesize(reply);
       if (audio) {
-        await adapter.sendAudio(m.chatId, audio);
+        await adapter.sendFile(m.chatId, audio);
         rmSync(audio, { force: true });
       }
     }
