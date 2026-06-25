@@ -35,11 +35,27 @@ before acting; save a reusable how-to as a new skill with skill_create. If you d
 convention, you may propose an edit to AGENTS.md via edit_file (the user reviews the diff). After completing
 a task, give a one-line summary.`;
 
+/** When running inside `hara gateway`, tell the agent it's in a chat — so it delivers files via send_file
+ *  (the only channel that reaches the peer) and never reaches for the desktop client / computer tool. */
+function gatewayNote(): string {
+  const plat = process.env.HARA_GATEWAY;
+  if (!plat) return "";
+  return (
+    `\n\n# You are in a chat gateway (${plat})\n` +
+    `You are talking to the user through the ${plat} chat — not a terminal, and NOT the desktop ${plat} app. ` +
+    `To send a file or image to them, call the \`send_file\` tool with an absolute path; that is the ONLY channel ` +
+    `that reaches this chat. Do NOT use the \`computer\` tool, AppleScript, or any desktop/${plat}-client automation ` +
+    `to deliver files — that drives a different window and silently fails to reach the user. Never tell the user a ` +
+    `file was sent unless \`send_file\` returned success. Keep replies short and chat-friendly.`
+  );
+}
+
 function composeSystem(cwd: string, projectContext?: string, override?: string, memory?: string): string {
   const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
   const skills = skillsDigest(cwd);
   return (
     head +
+    gatewayNote() +
     (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "") +
     (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "") +
     (skills ? `\n\n# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
@@ -80,6 +96,14 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
   let triedFallback = false;
+
+  // Stuck/loop guard — only in headless chat (`hara gateway`), where a wrong approach can grind forever with
+  // nobody to hit Esc (e.g. screenshots it can't read). Once per run, when the agent keeps repeating one
+  // non-read tool or acting blind, we inject a reflection nudge so it steps back instead of spinning.
+  const guard = !!process.env.HARA_GATEWAY;
+  const toolCounts = new Map<string, number>();
+  let blindShots = 0;
+  let nudged = false;
 
   for (;;) {
     // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
@@ -256,5 +280,22 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     }
     await flush();
     history.push({ role: "tool", results });
+
+    if (guard && !nudged) {
+      for (const p of plans) if (p.tool && p.tool.kind !== "read") toolCounts.set(p.tu.name, (toolCounts.get(p.tu.name) ?? 0) + 1);
+      for (const res of results) if (typeof res.content === "string" && /Configure a vision model/.test(res.content)) blindShots++;
+      const maxRepeat = Math.max(0, ...toolCounts.values());
+      const blind = blindShots >= 2;
+      if (blind || maxRepeat >= 5) {
+        nudged = true;
+        history.push({
+          role: "user",
+          content: blind
+            ? "⚠ Self-check: your screenshots come back unreadable (no vision model) — you are acting blind, so this approach cannot work. Stop using the computer tool. Reach the user through a non-visual path instead (a CLI, an API, or the send_file tool). State the new plan in one line, then do it."
+            : "⚠ Self-check: you've repeated the same action several times without resolving the task. Stop and reconsider — is there a more direct tool or channel (e.g. send_file to deliver a file)? Don't keep retrying the same thing. State your revised plan in one line, then act.",
+        });
+        if (!opts.quiet && !ctx.ui) out(c.dim("  ⟲ stuck-guard: nudging a rethink\n"));
+      }
+    }
   }
 }

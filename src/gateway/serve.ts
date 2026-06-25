@@ -8,9 +8,9 @@ import { chatContext, chatCd, newChatSession, setChatSession, toggleVoice } from
 import { synthesize } from "./tts.js";
 import { selfArgv } from "../cron/runner.js";
 import { listSessions, resolveSessionId, loadSession } from "../session/store.js";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { mkdirSync, writeFileSync, existsSync, statSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
 
 /** Parse a leading slash-command from a chat message (pure). null if it isn't one. */
 export function parseCommand(text: string): { cmd: string; arg: string } | null {
@@ -33,19 +33,44 @@ export function cleanReply(raw: string): string {
     .trim();
 }
 
-/** Run hara headlessly on a chat's session, returning its cleaned output (tail-capped — replies are short). */
-function runHara(text: string, sessionId: string, cwd: string): Promise<string> {
-  return new Promise((resolve) => {
+let outboxSeq = 0;
+export interface HaraRun {
+  reply: string;
+  /** absolute paths the agent asked to deliver to the chat via the send_file tool (drained from the outbox) */
+  files: string[];
+}
+
+/** Run hara headlessly on a chat's session. Returns its cleaned text reply plus any files the agent queued
+ *  via send_file. The gateway env (HARA_GATEWAY + a per-message outbox file) is what makes send_file and the
+ *  in-chat system context active in the subprocess; the daemon delivers the queued files after it exits. */
+function runHara(text: string, sessionId: string, cwd: string, platform: string): Promise<HaraRun> {
+  const outbox = join(tmpdir(), `hara-outbox-${process.pid}-${Date.now()}-${outboxSeq++}.txt`);
+  return new Promise((res) => {
     const self = selfArgv();
-    const child = spawn(self[0], [...self.slice(1), "-p", text, "--approval", "full-auto", "--resume", sessionId], { cwd, env: process.env });
+    const child = spawn(self[0], [...self.slice(1), "-p", text, "--approval", "full-auto", "--resume", sessionId], {
+      cwd,
+      env: { ...process.env, HARA_GATEWAY: platform, HARA_GATEWAY_OUTBOX: outbox },
+    });
     let out = "";
     const cap = (d: Buffer): void => {
       out = (out + d.toString()).slice(-12000);
     };
     child.stdout.on("data", cap);
     child.stderr.on("data", cap);
-    child.on("error", (e) => resolve(`(error: ${e.message})`));
-    child.on("close", () => resolve(cleanReply(out) || "(no output)"));
+    const finish = (reply: string): void => {
+      let files: string[] = [];
+      try {
+        if (existsSync(outbox)) {
+          files = readFileSync(outbox, "utf8").split("\n").map((s) => s.trim()).filter(Boolean);
+          rmSync(outbox, { force: true });
+        }
+      } catch {
+        /* outbox is best-effort; a missing/unreadable file just means nothing to send */
+      }
+      res({ reply, files });
+    };
+    child.on("error", (e) => finish(`(error: ${e.message})`));
+    child.on("close", () => finish(cleanReply(out) || "(no output)"));
   });
 }
 
@@ -169,9 +194,23 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       // any other slash word → treat as a normal task
     }
     await adapter.send(m.chatId, "⟳ working…");
-    const reply = await runHara(m.text, ctx.sessionId, ctx.cwd);
-    await adapter.send(m.chatId, reply);
-    if (ctx.voice && adapter.sendFile) {
+    const { reply, files } = await runHara(m.text, ctx.sessionId, ctx.cwd, adapter.name);
+    const hasReply = reply && reply !== "(no output)";
+    if (hasReply) await adapter.send(m.chatId, reply);
+    else if (files.length) await adapter.send(m.chatId, "📎");
+    // Deliver any files the agent queued via send_file (images inline, others as attachments).
+    for (const f of files) {
+      if (!adapter.sendFile) {
+        await adapter.send(m.chatId, "(this platform can't send files yet)");
+        break;
+      }
+      try {
+        await adapter.sendFile(m.chatId, f);
+      } catch (e: any) {
+        await adapter.send(m.chatId, `✗ couldn't send ${f}: ${e.message}`);
+      }
+    }
+    if (hasReply && ctx.voice && adapter.sendFile) {
       const audio = await synthesize(reply);
       if (audio) {
         await adapter.sendFile(m.chatId, audio);

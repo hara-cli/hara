@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.85.0 — unreleased (gateway: agent sends files in conversation + stuck-guard)
+
+- **`send_file` tool** — the agent can now deliver a file/image to the chat *conversationally* ("生成 X 发我"),
+  not just via the manual `/send` command. Self-gates on `HARA_GATEWAY`, so it appears only inside `hara gateway`.
+  It queues the path to a per-message outbox file; the daemon drains it after the headless run and delivers each
+  file via the platform adapter (`sendMediaFile` — images inline, others as attachments). This closes the gap
+  where hara, asked to "send an image", would generate it fine but then try to UI-automate the desktop WeChat
+  client with the `computer` tool (wrong surface, and blind without a vision model) and silently deliver nothing.
+- **In-chat system context** — when running under the gateway, the agent is told it's in a `${platform}` chat:
+  deliver files via `send_file` (the only channel that reaches the peer), do **not** drive the desktop client /
+  `computer` tool, and never claim a file was sent unless `send_file` succeeded.
+- **Stuck-guard (gateway only)** — once per run, if the agent keeps repeating one non-read tool (≥5×) or acts
+  blind (≥2 screenshots it can't read), a one-shot self-check nudge is injected so it steps back and picks a
+  working path instead of grinding forever (no human there to hit Esc). Off outside the gateway.
+
 ## 0.84.0 — unreleased (gateway: file + image send/receive)
 
 - **Receive** — a file / image / (untranscribed) voice you send is now downloaded + AES-decrypted to a local

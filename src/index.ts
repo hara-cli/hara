@@ -90,6 +90,7 @@ import "./tools/memory.js"; // register memory_search/get/write/forget/skill_cre
 import "./tools/skill.js"; // register the skill loader tool
 import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
 import "./tools/todo.js"; // register todo_write (inline task checklist)
+import "./tools/send.js"; // register send_file (self-gates on HARA_GATEWAY — pushes a file to the chat)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1397,6 +1398,23 @@ program.action(async (opts) => {
   // one-shot
   if (opts.print) {
     const projectContext = loadAgentsMd(cwd) || undefined;
+    // Vision sidecar for headless runs (gateway/cron): without it the computer tool's screenshots come back
+    // "configure a vision model" even when one is set, leaving a headless agent blind. Mirrors the interactive
+    // describeScreenshot — a configured visionModel, else the main model if it's vision-capable.
+    const describeImage = async (path: string, hint?: string): Promise<string> => {
+      const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+      const vp = cfg.visionModel
+        ? ((await buildProvider({ ...cfg, model: cfg.visionModel, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey })) ?? null)
+        : cap === "vision"
+          ? provider
+          : null;
+      if (!vp) return "";
+      try {
+        return await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint });
+      } catch {
+        return "";
+      }
+    };
     // Headless session continuity: --resume <id> / --continue loads the session, appends this prompt, and
     // saves it back — so `hara -p … --resume <id>` continues a thread (used by cron, scripts, the chat gateway).
     // Plain `hara -p` stays stateless. A --resume id with no match is created WITH that id (stable per caller).
@@ -1411,7 +1429,7 @@ program.action(async (opts) => {
     history.push({ role: "user", content: expandMentions(String(opts.print), cwd) });
     await runAgent(history, {
       provider,
-      ctx: { cwd, sandbox, spawn: (t, role) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role) },
+      ctx: { cwd, sandbox, spawn: (t, role) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role), describeImage },
       approval: "full-auto",
       confirm: async () => true,
       projectContext,
