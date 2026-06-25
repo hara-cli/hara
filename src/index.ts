@@ -919,6 +919,62 @@ program
   });
 
 program
+  .command("remote [action] [text]")
+  .description("drive THIS tmux session from chat: register the pane so WeChat replies inject back into it. actions: ask \"<q>\" | bind | unbind | status")
+  .action(async (action = "status", text?: string) => {
+    const { registerTmuxRoute, unbindPane, listRoutes } = await import("./gateway/tmux-routes.js");
+    const pane = process.env.TMUX_PANE; // set by tmux inside every pane
+    const needPane = (): void => {
+      if (!pane) {
+        out(c.red("`hara remote` must run inside tmux ($TMUX_PANE unset) — it injects chat replies into a tmux pane.\n"));
+        process.exit(2);
+      }
+    };
+    if (action === "status") {
+      const rs = listRoutes();
+      out(rs.length ? rs.map((r) => `${r.pane}  [${r.mode ?? "once"}]  ${r.cwd ?? ""}`).join("\n") + "\n" : "(no panes registered)\n");
+      return;
+    }
+    if (action === "unbind") {
+      needPane();
+      out(unbindPane(pane!) ? `✓ unbound ${pane}\n` : `${pane} was not registered\n`);
+      return;
+    }
+    if (action === "bind") {
+      needPane();
+      registerTmuxRoute(pane!, undefined, process.cwd(), "bind");
+      out(c.green(`🔗 bound ${pane}`) + ` — every WeChat reply now injects here until \`hara remote unbind\` (or send /detach in chat). Daemon must be running.\n`);
+      return;
+    }
+    if (action === "ask") {
+      needPane();
+      if (!text) return void out(c.red('usage: hara remote ask "<question>"\n'));
+      registerTmuxRoute(pane!, undefined, process.cwd(), "once"); // register first — inbound inject works even if the push is throttled
+      try {
+        const wx = await import("./gateway/weixin.js");
+        const creds = wx.loadWeixinCreds();
+        if (!creds) return void out(c.yellow(`↩ ${pane} registered, but no WeChat login (run \`hara gateway --platform weixin --login\`). Your next reply to the bot still injects here.\n`));
+        let peer = process.env.HARA_WX_PEER;
+        if (!peer) {
+          try {
+            const f = join(homedir(), ".hara", "weixin", `${creds.account_id}.context-tokens.json`);
+            const keys = Object.keys(JSON.parse(readFileSync(f, "utf8")));
+            peer = keys.find((k) => k.endsWith("@im.wechat")) || keys[0];
+          } catch {
+            /* no peer file */
+          }
+        }
+        if (peer) await wx.weixinAdapter(creds).send(peer, text);
+        out(c.green(`↩ asked on WeChat + registered ${pane}`) + ` — reply on WeChat and it'll be injected here. Daemon must be running.\n`);
+      } catch (e: any) {
+        out(c.yellow(`↩ ${pane} registered; WeChat push failed (${e.message}) — your next reply to the bot still injects here.\n`));
+      }
+      return;
+    }
+    out(c.red(`unknown action '${action}'. use: ask "<q>" | bind | unbind | status\n`));
+  });
+
+program
   .command("export [session]")
   .description("export a session to a Markdown transcript (default: the latest in this directory)")
   .option("--out <file>", "write to a file instead of stdout")

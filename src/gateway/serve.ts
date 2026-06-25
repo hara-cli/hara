@@ -244,8 +244,13 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       if (cmd.cmd === "help")
         return adapter.send(
           m.chatId,
-          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/voice · /say <text> — speech · /send <path> — send a file\n/help\nanything else = run hara here",
+          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/voice · /say <text> — speech · /send <path> — send a file\n/detach — stop injecting replies into bound tmux panes\n/help\nanything else = run hara here",
         );
+      if (cmd.cmd === "detach") {
+        const { unbindBinds } = await import("./tmux-routes.js");
+        const n = unbindBinds();
+        return adapter.send(m.chatId, n ? `🔓 detached ${n} bound tmux pane(s) — replies go to hara again.` : "(no tmux panes were bound)");
+      }
       if (cmd.cmd === "pwd") return adapter.send(m.chatId, `📂 ${ctx.cwd}\n🧵 ${ctx.sessionId.slice(-18)}`);
       if (cmd.cmd === "cd" || cmd.cmd === "project") {
         if (!cmd.arg) return adapter.send(m.chatId, `📂 ${ctx.cwd}\nusage: /cd <dir> (absolute, ~, or relative to here)`);

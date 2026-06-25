@@ -16,6 +16,8 @@ export interface TmuxRoute {
   peer?: string; // the chat peer that should answer (informational; matching is owner-gated upstream)
   cwd?: string;
   ts: number;
+  /** "once" (default) = consumed after one injected reply; "bind" = persistent, every reply injects until unbound. */
+  mode?: "once" | "bind";
 }
 
 function dir(): string {
@@ -38,19 +40,41 @@ function save(routes: TmuxRoute[]): void {
   writeFileSync(storePath(), JSON.stringify({ routes }, null, 2));
 }
 
-/** Register (or refresh) a pane as awaiting a reply. De-dups by pane. */
-export function registerTmuxRoute(pane: string, peer?: string, cwd?: string, now = Date.now()): void {
+/** Register (or refresh) a pane as awaiting a reply. De-dups by pane. mode "once" (default) = consumed after one
+ *  reply; "bind" = persistent (every reply injects until unbound). */
+export function registerTmuxRoute(pane: string, peer?: string, cwd?: string, mode: "once" | "bind" = "once", now = Date.now()): void {
   const routes = load().filter((r) => r.pane !== pane);
-  routes.push({ pane, peer, cwd, ts: now });
+  routes.push({ pane, peer, cwd, ts: now, mode });
   save(routes);
 }
 
+/** Remove a pane's route(s). Returns how many were removed. */
+export function unbindPane(pane: string): number {
+  const before = load();
+  const after = before.filter((r) => r.pane !== pane);
+  save(after);
+  return before.length - after.length;
+}
+
+/** All current routes (for `hara remote status`). */
+export function listRoutes(): TmuxRoute[] {
+  return load();
+}
+
+/** Remove all persistent "bind" routes (the chat `/detach` command). Returns how many were removed. */
+export function unbindBinds(): number {
+  const before = load();
+  const after = before.filter((r) => r.mode === "bind" ? false : true);
+  save(after);
+  return before.length - after.length;
+}
+
 /** Pure: pick the OLDEST live registered pane (FIFO — the longest-waiting ask answers first); return it plus the
- *  routes to keep (chosen consumed one-shot + dead panes pruned). */
+ *  routes to keep. A "once" route is consumed after use; a "bind" route persists. Dead panes are always pruned. */
 export function pickRoute(routes: TmuxRoute[], isAlive: (pane: string) => boolean): { chosen: TmuxRoute | null; remaining: TmuxRoute[] } {
   const live = routes.filter((r) => isAlive(r.pane)).sort((a, b) => a.ts - b.ts);
   const chosen = live[0] ?? null;
-  const remaining = live.filter((r) => !chosen || r.pane !== chosen.pane);
+  const remaining = chosen && chosen.mode !== "bind" ? live.filter((r) => r.pane !== chosen.pane) : live;
   return { chosen, remaining };
 }
 

@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.93.0 — unreleased (hara remote — universal chat-driven HITL for any tmux session)
+
+- **`hara remote`** — a first-class, agent-agnostic command so ANY terminal session in tmux (Claude Code, codex,
+  hara, a plain REPL) can be driven from chat, not just via the Claude-Code wechat-send skill:
+  - `hara remote ask "<q>"` — register this pane (one-shot) + push the question to WeChat; your reply injects back.
+  - `hara remote bind` — **persistent bind**: every WeChat reply injects into this pane until `unbind` / `/detach`
+    (drive a whole session from your phone while you're out, many messages, not just one).
+  - `hara remote unbind` · `hara remote status`.
+- Route store gains `mode: "once" | "bind"`; the daemon consumes "once" routes but keeps "bind" ones
+  (`pickRoute`/`deliverToTmux`). New `/detach` chat command unbinds all persistent panes from your phone.
+- Generic by design: the injection is just `tmux send-keys`, so it works for any program reading stdin in the
+  pane — the agent only needs to call `hara remote ask` when it wants your input (the confirm-loop pattern).
+- 284 tests (+ bind-mode `pickRoute`); persistent-bind verified live (two replies → same pane, route persists).
+
 ## 0.92.0 — unreleased (gateway: reply-into-tmux — two-way HITL for any running session)
 
 - **Reply routing into an already-running tmux session** — a session you started yourself (Claude Code / codex /

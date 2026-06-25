@@ -150,6 +150,16 @@ test("pickRoute: oldest live pane chosen (FIFO), dead pruned, chosen consumed", 
   assert.deepEqual(allDead.remaining, []); // dead pruned even when nothing chosen
 });
 
+test("pickRoute: a persistent 'bind' route is chosen but NOT consumed", () => {
+  const alive = () => true;
+  const r = pickRoute([{ pane: "%1", ts: 1, mode: "bind" }, { pane: "%2", ts: 2, mode: "once" }], alive);
+  assert.equal(r.chosen.pane, "%1"); // oldest
+  assert.deepEqual(r.remaining.map((x) => x.pane).sort(), ["%1", "%2"]); // bind kept (not consumed)
+  const r2 = pickRoute([{ pane: "%2", ts: 2, mode: "once" }], alive);
+  assert.equal(r2.chosen.pane, "%2");
+  assert.deepEqual(r2.remaining, []); // once consumed
+});
+
 test("chunkText: splits at the Telegram limit", () => {
   assert.deepEqual(chunkText("short"), ["short"]);
   const big = "x".repeat(9000);
