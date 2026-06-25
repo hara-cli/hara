@@ -920,7 +920,7 @@ program
 
 program
   .command("remote [action] [text]")
-  .description("drive THIS tmux session from chat: register the pane so WeChat replies inject back into it. actions: ask \"<q>\" | bind | unbind | status")
+  .description("drive THIS tmux session from chat: register the pane so WeChat replies inject back into it. actions: ask \"<q>\" | bind | back | status")
   .action(async (action = "status", text?: string) => {
     const { registerTmuxRoute, unbindPane, listRoutes } = await import("./gateway/tmux-routes.js");
     const pane = process.env.TMUX_PANE; // set by tmux inside every pane
@@ -935,9 +935,9 @@ program
       out(rs.length ? rs.map((r) => `${r.pane}  [${r.mode ?? "once"}]  ${r.cwd ?? ""}`).join("\n") + "\n" : "(no panes registered)\n");
       return;
     }
-    if (action === "unbind") {
+    if (action === "unbind" || action === "back") {
       needPane();
-      out(unbindPane(pane!) ? `✓ unbound ${pane}\n` : `${pane} was not registered\n`);
+      out(unbindPane(pane!) ? `✓ ${action === "back" ? "back from remote — unbound" : "unbound"} ${pane}\n` : `${pane} was not registered\n`);
       return;
     }
     if (action === "bind") {
@@ -971,7 +971,7 @@ program
       }
       return;
     }
-    out(c.red(`unknown action '${action}'. use: ask "<q>" | bind | unbind | status\n`));
+    out(c.red(`unknown action '${action}'. use: ask "<q>" | bind | back | status\n`));
   });
 
 program
