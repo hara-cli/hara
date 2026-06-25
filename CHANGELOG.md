@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.92.0 — unreleased (gateway: reply-into-tmux — two-way HITL for any running session)
+
+- **Reply routing into an already-running tmux session** — a session you started yourself (Claude Code / codex /
+  hara, in tmux) can ping you on WeChat and, while you're away, your reply gets **injected back into that exact
+  session** so it continues. No need to launch it under a supervisor or use a blocking tool — borrows the ccgram
+  keystroke-injection pattern (the only way to retrofit a session the daemon doesn't own).
+  - `src/gateway/tmux-routes.ts`: a route store (`~/.hara/gateway/tmux-routes.json`) + `tmux send-keys` injection.
+    The gateway daemon, on an owner reply, injects it into the **oldest live registered pane** (`deliverToTmux`),
+    one-shot per ask, dead panes pruned. Pure `pickRoute` + `paneAlive` (list-panes membership) unit-tested.
+  - `serve.ts` `onMessage`: a non-slash reply is routed to a waiting pane (and the task isn't re-run) — owner-gated
+    by the existing allowlist; only panes that **opted in** are ever touched.
+  - The `wechat-send` skill gains `--ask`: send a question + register this tmux pane for the reply.
+- Live-verified the injection path (send-keys → pane received the line); fixed `paneAlive` (display-message was
+  too lenient → use `list-panes -a` membership). 283 tests.
+
 ## 0.91.0 — unreleased (external_agent: delegate to Claude Code / Codex)
 
 - **`external_agent` tool** — hand a self-contained task to an EXTERNAL coding agent (**`claude`** / **`codex`**)

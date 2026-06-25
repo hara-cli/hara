@@ -5,6 +5,7 @@
 import { spawn } from "node:child_process";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import { chatContext, chatCd, newChatSession, setChatSession, toggleVoice } from "./sessions.js";
+import { deliverToTmux } from "./tmux-routes.js";
 import { synthesize } from "./tts.js";
 import { selfArgv } from "../cron/runner.js";
 import { listSessions, resolveSessionId, loadSession } from "../session/store.js";
@@ -226,6 +227,16 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       console.error(`hara gateway: ✗ message from ${m.userId} — not in allowlist. Add it to HARA_GATEWAY_ALLOWED to authorize.`);
       await adapter.send(m.chatId, "⛔ not authorized.");
       return;
+    }
+    // If a tmux session opted in (via wechat-send --ask), this reply is its answer → inject it into that pane
+    // and stop (don't start a new task). One-shot per ask. Owner-gated by the allowlist check above.
+    if (!parseCommand(m.text)) {
+      const pane = deliverToTmux(m.text);
+      if (pane) {
+        console.error(`hara gateway: routed reply → tmux pane ${pane}`);
+        await adapter.send(m.chatId, `✅ 注入到 tmux ${pane}`);
+        return;
+      }
     }
     const ctx = chatContext(adapter.name, m.chatId, cwd); // this chat's current { cwd, sessionId }
     const cmd = parseCommand(m.text);

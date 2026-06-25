@@ -12,6 +12,7 @@ import { parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
 import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
 import { parseSignalMessage } from "../dist/gateway/signal.js";
 import { parseWecomMessage } from "../dist/gateway/wecom.js";
+import { pickRoute } from "../dist/gateway/tmux-routes.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
@@ -136,6 +137,17 @@ test("parseWecomMessage: needs body, skips self, parses text", () => {
   assert.equal(t.msg.chatId, "c1");
   assert.equal(t.msg.userId, "u1");
   assert.equal(t.msg.text, "yo");
+});
+
+test("pickRoute: oldest live pane chosen (FIFO), dead pruned, chosen consumed", () => {
+  const alive = (p) => p !== "dead";
+  const r = pickRoute([{ pane: "a", ts: 3 }, { pane: "dead", ts: 1 }, { pane: "b", ts: 2 }], alive);
+  assert.equal(r.chosen.pane, "b"); // oldest LIVE (dead ts:1 skipped, b ts:2 < a ts:3)
+  assert.deepEqual(r.remaining.map((x) => x.pane), ["a"]); // b consumed, dead pruned, a kept
+  assert.equal(pickRoute([], alive).chosen, null);
+  const allDead = pickRoute([{ pane: "dead", ts: 1 }], alive);
+  assert.equal(allDead.chosen, null);
+  assert.deepEqual(allDead.remaining, []); // dead pruned even when nothing chosen
 });
 
 test("chunkText: splits at the Telegram limit", () => {
