@@ -125,6 +125,14 @@ export function outputDelta(lastSent: string, current: string): string {
   return current.split("\n").slice(-20).join("\n"); // scrolled past our anchor → send the tail
 }
 
+/** Pick (and consume per mode) the oldest live registered pane WITHOUT injecting — so the caller can capture the
+ *  pane before/after injecting and relay just the new output. Returns the pane id, or null if none pending. */
+export function pickPaneForReply(): string | null {
+  const { chosen, remaining } = pickRoute(load(), paneAlive);
+  save(remaining);
+  return chosen?.pane ?? null;
+}
+
 /** Daemon entrypoint: deliver an inbound reply to the oldest live registered pane. Returns the pane id injected
  *  into, or null if there was no pending route (→ caller treats the message as a normal task). One-shot: the
  *  chosen route is consumed and dead panes are pruned. */

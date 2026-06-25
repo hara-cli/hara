@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.94.1 — unreleased (gateway: relay is on-inbound, not a noisy push)
+
+- **Fix the bind output relay to be quiet + platform-correct.** 0.94.0's continuous 3s timer-push flooded chat
+  (a message every few seconds) and hit iLink's `ret=-2` (its bot model is passive-reply, no continuous push).
+  Replaced with **on-inbound relay**: when you message a bound/registered pane, the daemon captures the pane,
+  injects your text, waits ~3s, and replies **once** with the session's NEW output (`🖥 <pane>\n<delta>`). One
+  reply per message — no spam, and it fits iLink's "one inbound → one reply" model. Send `?` to peek again.
+  - `tmux-routes.ts`: `pickPaneForReply()` (pick+consume, no inject); the timer loop is gone.
+  - `serve.ts` onMessage: capture-before → inject → settle → reply with `outputDelta`.
+
 ## 0.94.0 — unreleased (gateway: bind output relay — two-way remote terminal)
 
 - **Output relay for `hara remote bind`** — the daemon now polls each bound tmux pane and pushes its NEW output

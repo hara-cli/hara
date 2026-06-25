@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import { chatContext, chatCd, newChatSession, setChatSession, toggleVoice } from "./sessions.js";
-import { deliverToTmux, boundRoutes, capturePane, paneAlive, outputDelta } from "./tmux-routes.js";
+import { pickPaneForReply, capturePane, injectTmux, outputDelta } from "./tmux-routes.js";
 import { synthesize } from "./tts.js";
 import { selfArgv } from "../cron/runner.js";
 import { listSessions, resolveSessionId, loadSession } from "../session/store.js";
@@ -222,52 +222,26 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   process.on("SIGTERM", () => ac.abort());
   console.error(`hara gateway: ${adapter.name} up · cwd=${cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
 
-  // Output relay (two-way remote terminal): for each `hara remote bind` pane, poll its output and push NEW
-  // content back to chat once it settles — so you can SEE the driven session from your phone. Only bound panes;
-  // first sighting is baselined (no dump of pre-existing screen). Best-effort send (iLink cold-push may drop it).
-  const defaultPeer = ownerId ?? [...allowlist][0];
-  const relayState = new Map<string, { lastCapture: string; lastSent: string }>();
-  const relay = setInterval(() => {
-    for (const r of boundRoutes()) {
-      if (!paneAlive(r.pane)) {
-        relayState.delete(r.pane);
-        continue;
-      }
-      const cur = capturePane(r.pane);
-      if (cur == null) continue;
-      const st = relayState.get(r.pane);
-      if (!st) {
-        relayState.set(r.pane, { lastCapture: cur, lastSent: cur }); // baseline: don't dump the existing screen
-        continue;
-      }
-      if (cur !== st.lastCapture) {
-        relayState.set(r.pane, { lastCapture: cur, lastSent: st.lastSent }); // still changing → wait for it to settle
-        continue;
-      }
-      const delta = outputDelta(st.lastSent, cur).trim();
-      if (delta) {
-        const target = r.peer ?? defaultPeer;
-        const body = delta.length > 1500 ? "…\n" + delta.slice(-1500) : delta;
-        if (target) void adapter.send(target, `🖥 ${r.pane}\n${body}`).catch(() => {});
-      }
-      relayState.set(r.pane, { lastCapture: cur, lastSent: cur });
-    }
-  }, 3000);
-  ac.signal.addEventListener("abort", () => clearInterval(relay), { once: true });
-
   await adapter.start(async (m: InboundMsg) => {
     if (!isAllowed(m.userId, allowlist)) {
       console.error(`hara gateway: ✗ message from ${m.userId} — not in allowlist. Add it to HARA_GATEWAY_ALLOWED to authorize.`);
       await adapter.send(m.chatId, "⛔ not authorized.");
       return;
     }
-    // If a tmux session opted in (via wechat-send --ask), this reply is its answer → inject it into that pane
-    // and stop (don't start a new task). One-shot per ask. Owner-gated by the allowlist check above.
+    // If a tmux session opted in (via `hara remote ask/bind`), this reply is its input → inject it into that
+    // pane, let it react, and reply with the session's NEW output (on-inbound relay — quiet + iLink-friendly:
+    // one reply per message, no continuous push). Owner-gated by the allowlist check above.
     if (!parseCommand(m.text)) {
-      const pane = deliverToTmux(m.text);
+      const pane = pickPaneForReply();
       if (pane) {
         console.error(`hara gateway: routed reply → tmux pane ${pane}`);
-        await adapter.send(m.chatId, `✅ 注入到 tmux ${pane}`);
+        const before = capturePane(pane) ?? "";
+        injectTmux(pane, m.text);
+        await new Promise((r) => setTimeout(r, 3000)); // give the session a moment to react
+        const after = capturePane(pane) ?? "";
+        const delta = outputDelta(before, after).trim();
+        const body = delta ? (delta.length > 1500 ? "…\n" + delta.slice(-1500) : delta) : "(已注入,暂无新输出 — 发 ? 再看)";
+        await adapter.send(m.chatId, `🖥 ${pane}\n${body}`);
         return;
       }
     }
