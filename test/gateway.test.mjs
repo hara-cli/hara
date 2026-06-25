@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseTelegramUpdate, chunkText } from "../dist/gateway/telegram.js";
+import { parseTelegramUpdate, chunkText, photoFileId } from "../dist/gateway/telegram.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
@@ -12,8 +12,18 @@ import { ttsConfigFromEnv, ttsCleanText } from "../dist/gateway/tts.js";
 test("parseTelegramUpdate: text message → InboundMsg; non-text → null", () => {
   const m = parseTelegramUpdate({ update_id: 5, message: { text: "hi", chat: { id: 42 }, from: { id: 7, username: "jeff" } } });
   assert.deepEqual(m, { chatId: 42, userId: 7, userName: "jeff", text: "hi" });
-  assert.equal(parseTelegramUpdate({ update_id: 6, message: { photo: [], chat: { id: 1 } } }), null);
+  assert.equal(parseTelegramUpdate({ update_id: 6, message: { photo: [], chat: { id: 1 } } }), null); // empty photo array
   assert.equal(parseTelegramUpdate({}), null);
+});
+
+test("parseTelegramUpdate: photo message → caption (or [图片]) text; photoFileId picks the largest", () => {
+  const photo = [{ file_id: "small" }, { file_id: "big" }]; // Telegram sends ascending sizes
+  const withCaption = parseTelegramUpdate({ message: { photo, caption: "look", chat: { id: 9 }, from: { id: 1, first_name: "J" } } });
+  assert.deepEqual(withCaption, { chatId: 9, userId: 1, userName: "J", text: "look" });
+  const noCaption = parseTelegramUpdate({ message: { photo, chat: { id: 9 }, from: { id: 1, username: "j" } } });
+  assert.equal(noCaption.text, "[图片]");
+  assert.equal(photoFileId({ message: { photo } }), "big"); // largest = last
+  assert.equal(photoFileId({ message: { text: "hi" } }), null);
 });
 
 test("chunkText: splits at the Telegram limit", () => {

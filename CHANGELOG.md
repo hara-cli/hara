@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.86.1 — unreleased (gateway: Telegram reaches image parity with WeChat)
+
+- **Telegram two-way images** — `parseTelegramUpdate` now accepts photo messages (caption or a `[图片]` marker)
+  and the receive loop downloads the largest photo to `~/.hara/telegram/media` → `InboundMsg.images`, so the
+  agent sees it just like on WeChat. Added `sendFile` (sendPhoto for images, sendDocument otherwise) so `send_file`
+  and `/send` work on Telegram too. All the cross-platform gateway plumbing (send_file tool, in-chat system
+  context, stuck-guard, `-p` image attach/describe) was already platform-agnostic — only the adapter changed.
+
 ## 0.86.0 — unreleased (gateway: the agent SEES inbound images)
 
 - **Inbound image understanding** — a photo you send in chat now reaches the model as a real image, not just a
