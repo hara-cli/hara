@@ -2,6 +2,8 @@
 
 **A coding agent CLI that runs like an engineering org.**
 
+![hara — your coding agent, driven from 10 chat platforms](docs/assets/hara-gateway-hero.png)
+
 > Think "Claude Code, but it operates as a configurable, governed *organization* of role-agents" —
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
