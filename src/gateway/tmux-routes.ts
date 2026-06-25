@@ -95,6 +95,36 @@ export function injectTmux(pane: string, text: string): void {
   execFileSync("tmux", ["send-keys", "-t", pane, "Enter"], { timeout: 3000 });
 }
 
+/** Persistent ("bind") routes only — the panes whose OUTPUT we relay back to chat (two-way remote terminal). */
+export function boundRoutes(): TmuxRoute[] {
+  return load().filter((r) => r.mode === "bind");
+}
+
+/** Capture a tmux pane's visible text (plain, no ANSI). null if unavailable. */
+export function capturePane(pane: string): string | null {
+  try {
+    return execFileSync("tmux", ["capture-pane", "-p", "-t", pane], { encoding: "utf8", timeout: 3000 });
+  } catch {
+    return null;
+  }
+}
+
+/** Pure: the NEW output to relay, given what we last sent and the current pane capture. "" = nothing new.
+ *  Handles the common append case, anchors on the last sent line when the pane has scrolled, and falls back to
+ *  the tail when it can't re-anchor. */
+export function outputDelta(lastSent: string, current: string): string {
+  if (current === lastSent) return "";
+  if (!lastSent) return current; // caller decides whether to baseline (skip) or send on first sight
+  if (current.startsWith(lastSent)) return current.slice(lastSent.length);
+  const lines = lastSent.split("\n").filter((l) => l.trim());
+  const anchor = lines[lines.length - 1];
+  if (anchor) {
+    const idx = current.lastIndexOf(anchor);
+    if (idx >= 0) return current.slice(idx + anchor.length);
+  }
+  return current.split("\n").slice(-20).join("\n"); // scrolled past our anchor → send the tail
+}
+
 /** Daemon entrypoint: deliver an inbound reply to the oldest live registered pane. Returns the pane id injected
  *  into, or null if there was no pending route (→ caller treats the message as a normal task). One-shot: the
  *  chosen route is consumed and dead panes are pruned. */

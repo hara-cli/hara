@@ -5,7 +5,7 @@
 import { spawn } from "node:child_process";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import { chatContext, chatCd, newChatSession, setChatSession, toggleVoice } from "./sessions.js";
-import { deliverToTmux } from "./tmux-routes.js";
+import { deliverToTmux, boundRoutes, capturePane, paneAlive, outputDelta } from "./tmux-routes.js";
 import { synthesize } from "./tts.js";
 import { selfArgv } from "../cron/runner.js";
 import { listSessions, resolveSessionId, loadSession } from "../session/store.js";
@@ -221,6 +221,39 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   process.on("SIGINT", () => ac.abort());
   process.on("SIGTERM", () => ac.abort());
   console.error(`hara gateway: ${adapter.name} up · cwd=${cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
+
+  // Output relay (two-way remote terminal): for each `hara remote bind` pane, poll its output and push NEW
+  // content back to chat once it settles — so you can SEE the driven session from your phone. Only bound panes;
+  // first sighting is baselined (no dump of pre-existing screen). Best-effort send (iLink cold-push may drop it).
+  const defaultPeer = ownerId ?? [...allowlist][0];
+  const relayState = new Map<string, { lastCapture: string; lastSent: string }>();
+  const relay = setInterval(() => {
+    for (const r of boundRoutes()) {
+      if (!paneAlive(r.pane)) {
+        relayState.delete(r.pane);
+        continue;
+      }
+      const cur = capturePane(r.pane);
+      if (cur == null) continue;
+      const st = relayState.get(r.pane);
+      if (!st) {
+        relayState.set(r.pane, { lastCapture: cur, lastSent: cur }); // baseline: don't dump the existing screen
+        continue;
+      }
+      if (cur !== st.lastCapture) {
+        relayState.set(r.pane, { lastCapture: cur, lastSent: st.lastSent }); // still changing → wait for it to settle
+        continue;
+      }
+      const delta = outputDelta(st.lastSent, cur).trim();
+      if (delta) {
+        const target = r.peer ?? defaultPeer;
+        const body = delta.length > 1500 ? "…\n" + delta.slice(-1500) : delta;
+        if (target) void adapter.send(target, `🖥 ${r.pane}\n${body}`).catch(() => {});
+      }
+      relayState.set(r.pane, { lastCapture: cur, lastSent: cur });
+    }
+  }, 3000);
+  ac.signal.addEventListener("abort", () => clearInterval(relay), { once: true });
 
   await adapter.start(async (m: InboundMsg) => {
     if (!isAllowed(m.userId, allowlist)) {

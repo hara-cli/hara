@@ -12,7 +12,7 @@ import { parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
 import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
 import { parseSignalMessage } from "../dist/gateway/signal.js";
 import { parseWecomMessage } from "../dist/gateway/wecom.js";
-import { pickRoute } from "../dist/gateway/tmux-routes.js";
+import { pickRoute, outputDelta } from "../dist/gateway/tmux-routes.js";
 import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
@@ -158,6 +158,15 @@ test("pickRoute: a persistent 'bind' route is chosen but NOT consumed", () => {
   const r2 = pickRoute([{ pane: "%2", ts: 2, mode: "once" }], alive);
   assert.equal(r2.chosen.pane, "%2");
   assert.deepEqual(r2.remaining, []); // once consumed
+});
+
+test("outputDelta: append/unchanged/scroll-anchor/tail", () => {
+  assert.equal(outputDelta("abc", "abc"), ""); // unchanged
+  assert.equal(outputDelta("abc", "abcdef"), "def"); // pure append
+  assert.equal(outputDelta("", "hello"), "hello"); // no baseline → all
+  assert.equal(outputDelta("old\nlast", "scrolled\nlast\nnew"), "\nnew"); // re-anchor on last line
+  const big = Array.from({ length: 30 }, (_, i) => `L${i}`).join("\n");
+  assert.equal(outputDelta("gone\nvanished", big).split("\n").length, 20); // can't anchor → last 20 lines
 });
 
 test("chunkText: splits at the Telegram limit", () => {

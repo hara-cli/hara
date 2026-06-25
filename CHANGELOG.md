@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.94.0 — unreleased (gateway: bind output relay — two-way remote terminal)
+
+- **Output relay for `hara remote bind`** — the daemon now polls each bound tmux pane and pushes its NEW output
+  back to chat once it settles, so a session you drive from your phone is **two-way**: your replies inject in
+  (existing), and you SEE the session's output come back (`🖥 <pane>\n<delta>`). Only bound (`bind`) panes; the
+  first sighting is baselined (no dump of the pre-existing screen); best-effort send (iLink cold-push may drop a
+  message when the chat is cold). Pure `outputDelta` (append / unchanged / scroll-anchor / tail) unit-tested.
+  - `src/gateway/tmux-routes.ts`: `boundRoutes`, `capturePane`, `outputDelta`.
+  - `src/gateway/serve.ts`: a 3s relay loop in `runGateway` (capture → settle → send delta), cleared on abort.
+  - Caveat: a full-screen TUI session (e.g. Claude Code's ink UI) relays the rendered frame; a non-TUI /
+    `HARA_TUI=0` / `-p`-style session relays cleaner. 285 tests.
 ## 0.93.0 — unreleased (hara remote — universal chat-driven HITL for any tmux session)
 
 - **`hara remote`** — a first-class, agent-agnostic command so ANY terminal session in tmux (Claude Code, codex,
