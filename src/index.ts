@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
-import { runTui } from "./tui/run.js";
+import { runTui, askConfirm } from "./tui/run.js";
 import { readClipboardImage, mediaTypeFor } from "./images.js";
 import { describeImages, locateImage, classifyVision, SCREENSHOT_SYSTEM } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
@@ -1564,7 +1564,10 @@ program.action(async (opts) => {
     }
   }
 
-  if (!hasAgentsMd(cwd)) {
+  // First-run AGENTS.md offer — classic REPL only. In TUI mode we must NOT call rl.question before ink
+  // mounts: a readline question puts stdin in a state ink can't read from, leaving the input box dead
+  // (the TUI shows a `/init` tip instead, below). See the `tip` in the runTui header.
+  if (!hasAgentsMd(cwd) && !useTui) {
     const ans = (await rl.question(`${c.dim("No AGENTS.md here — analyze this project and create one?")} ${c.dim("[Y/n]")} `)).trim().toLowerCase();
     if (ans === "" || ans.startsWith("y")) {
       out(c.dim("Analyzing project…\n"));
@@ -1844,6 +1847,20 @@ program.action(async (opts) => {
 
   if (useTui) {
     rl.close(); // hand stdin over to ink
+    // First-run AGENTS.md offer — via a tiny ink prompt, NOT readline. A readline question before the
+    // main TUI leaves stdin unreadable by ink (dead input box); ink cleans up on unmount, so the TUI
+    // mounted right after gets working input. Runs before mount, like the classic path.
+    if (!hasAgentsMd(cwd)) {
+      if (await askConfirm("No AGENTS.md here — analyze this project and create one?")) {
+        out(c.dim("Analyzing project…\n"));
+        try {
+          await runInit(provider, cwd, sandbox);
+        } catch (e: any) {
+          out(c.red(`[init error] ${e.message}\n`));
+        }
+        projectContext = loadAgentsMd(cwd) || undefined;
+      }
+    }
     setTheme(cfg.theme);
     // Vision: a text-only main model routes pasted images through a describer (`visionModel`); a
     // vision-capable main model gets them inline (describer auto-suspended). Unknown models are asked
@@ -1939,7 +1956,7 @@ program.action(async (opts) => {
       initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
       cwd,
-      header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : ""}` },
+      header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : " · no AGENTS.md — type /init to create one"}` },
       cycleApproval: (m) => cycleMode(m),
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
