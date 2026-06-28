@@ -49,17 +49,44 @@ export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
   return msgs;
 }
 
-export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string }): Provider {
+/** Anthropic models whose only valid `thinking` setting is `{type: "adaptive"}` — they reject any
+ *  explicit `budget_tokens`. We detect them by id family so "off"/low/high still degrade gracefully
+ *  (we just omit the field or stay on adaptive instead of sending a 400-triggering body). */
+function isAdaptiveOnly(model: string): boolean {
+  // Known adaptive-only families per Anthropic docs: opus-4-7 / opus-4-8 / claude-fable.
+  // Conservative: regex on the family slug so future micro-versions (opus-4-8-20260101) match.
+  return /^(claude-)?(opus-4-7|opus-4-8|fable)/i.test(model) || /(opus-4-7|opus-4-8|fable)/i.test(model);
+}
+
+/** Map hara's reasoningEffort dial to Anthropic's `thinking` parameter (or omit it).
+ *  Exported for unit testing. */
+export function buildThinkingParam(model: string, effort?: "off" | "low" | "medium" | "high"):
+  | { type: "enabled"; budget_tokens: number }
+  | { type: "adaptive" }
+  | undefined {
+  // Unset = preserve hara's prior behavior (adaptive thinking on by default).
+  if (effort === undefined) return { type: "adaptive" };
+  if (effort === "off") return undefined; // omit thinking entirely (works on every model, incl. adaptive-only)
+  const adaptiveOnly = isAdaptiveOnly(model);
+  if (adaptiveOnly) return { type: "adaptive" }; // can't honor budget on these — fall back to adaptive instead of 400'ing
+  if (effort === "low") return { type: "enabled", budget_tokens: 4096 };
+  if (effort === "medium") return { type: "adaptive" };
+  // high
+  return { type: "enabled", budget_tokens: 24000 };
+}
+
+export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: "off" | "low" | "medium" | "high" }): Provider {
   const client = new Anthropic({ apiKey: opts.apiKey, maxRetries: 4, ...(opts.baseURL ? { baseURL: opts.baseURL } : {}) });
   return {
     id: "anthropic",
     model: opts.model,
     async turn({ system, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
+      const thinking = buildThinkingParam(opts.model, opts.reasoningEffort);
       const stream = client.messages.stream(
         {
           model: opts.model,
           max_tokens: 32000,
-          thinking: { type: "adaptive" },
+          ...(thinking ? { thinking } : {}),
           system,
           tools: tools as Anthropic.Tool[],
           messages: toAnthropic(history),

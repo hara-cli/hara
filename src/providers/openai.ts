@@ -43,12 +43,20 @@ export function toOpenAI(system: string, history: NeutralMsg[]): any[] {
   return msgs;
 }
 
+/** Reasoning models on OpenAI (o-series + gpt-5) accept `reasoning_effort` on chat-completions.
+ *  Non-reasoning models reject it. We only attach the param when the model id matches a known
+ *  reasoning family — keeps DeepSeek/GLM/Qwen requests clean. Exported for tests. */
+export function isReasoningModel(model: string): boolean {
+  return /^(o1|o3|o4|gpt-5)/i.test(model);
+}
+
 /** OpenAI-compatible provider (works with OpenAI, Qwen/DashScope, GLM, Kimi, …). */
 export function createOpenAIProvider(opts: {
   apiKey: string;
   model: string;
   baseURL?: string;
   label?: string;
+  reasoningEffort?: "off" | "low" | "medium" | "high";
 }): Provider {
   const client = new OpenAI({ apiKey: opts.apiKey, maxRetries: 4, ...(opts.baseURL ? { baseURL: opts.baseURL } : {}) });
   return {
@@ -67,6 +75,13 @@ export function createOpenAIProvider(opts: {
         stream_options: { include_usage: true },
       };
       if (oaiTools.length) params.tools = oaiTools;
+      // reasoning_effort: only attach for OpenAI reasoning models, and only when the user picked a
+      // non-default level. "off" means "don't ask the model to reason" — for reasoning models we
+      // pass "minimal" (gpt-5 / o-series accept it); on chat-style models that put reasoning in
+      // the stream (DeepSeek/GLM) we can't silence it server-side, so the UI just won't render.
+      if (opts.reasoningEffort && opts.reasoningEffort !== undefined && isReasoningModel(opts.model)) {
+        params.reasoning_effort = opts.reasoningEffort === "off" ? "minimal" : opts.reasoningEffort;
+      }
 
       // Stream: emit text deltas live; accumulate tool-call args by index; grab usage from the tail chunk.
       let text = "";
@@ -83,7 +98,9 @@ export function createOpenAIProvider(opts: {
             onText(delta.content);
           }
           const rc = (delta as any)?.reasoning_content ?? (delta as any)?.reasoning; // GLM-5 / DeepSeek
-          if (rc) onReasoning?.(rc);
+          // reasoningEffort="off" + a stream-reasoning model: server can't be silenced, so we just
+          // don't surface it. Anything else (incl. undefined) shows the reasoning live.
+          if (rc && opts.reasoningEffort !== "off") onReasoning?.(rc);
           if (delta?.tool_calls) {
             for (const tc of delta.tool_calls) {
               const idx = tc.index ?? 0;

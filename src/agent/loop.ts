@@ -11,6 +11,19 @@ import type { ApprovalMode } from "../config.js";
 import { decideCommand, loadPermissionRules } from "../security/permissions.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
+import { currentTodos, type Todo } from "../tools/todo.js";
+
+/** Spinner verb (terminal mode + reused by TUI tests): when the agent has an in_progress todo,
+ *  surface its activeForm/text so the bottom-of-screen line reads concretely ("▶ updating tests… 3s")
+ *  instead of "working 3s". Pure: takes a snapshot + elapsed seconds. */
+export function spinnerVerb(list: Todo[], elapsedSec: number): string {
+  const active = list.find((t) => t.status === "in_progress");
+  if (active) {
+    const phrase = active.activeForm?.trim() || active.text;
+    return `${phrase}… ${elapsedSec}s`;
+  }
+  return `working ${elapsedSec}s`;
+}
 
 /** Whether a tool call needs user confirmation under the given approval mode. */
 export function needsConfirm(kind: string | undefined, mode: ApprovalMode): boolean {
@@ -115,7 +128,17 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
     const tty = stdout.isTTY && !opts.quiet && !sink;
     const md = tty && process.env.HARA_MD !== "0" ? makeRenderer(out) : null;
-    let sawReasoning = false;
+    // Reasoning rendering in plain-terminal mode: we put reasoning on its OWN dim lines (prefixed
+    // "│ ") instead of sharing a line with the spinner — that's what was eating DeepSeek's
+    // reasoning_content in non-TUI mode (each spinner tick `\r`-overwrote it). The TUI keeps its
+    // existing 5-line scroll window via the ink Block; this is the terminal equivalent.
+    let reasoningOpen = false;
+    const flushReasoningTail = (): void => {
+      if (reasoningOpen) {
+        out("\n");
+        reasoningOpen = false;
+      }
+    };
     // "working Ns" spinner until the first output arrives (cleared on text/reasoning or turn end)
     let spin: ReturnType<typeof setInterval> | null = null;
     const stopSpin = (): void => {
@@ -129,7 +152,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
       const t0 = Date.now();
       let fi = 0;
-      spin = setInterval(() => out(`\r${c.dim(`${frames[fi++ % frames.length]} working ${Math.floor((Date.now() - t0) / 1000)}s`)}`), 100);
+      spin = setInterval(() => {
+        const verb = spinnerVerb(currentTodos(), Math.floor((Date.now() - t0) / 1000));
+        out(`\r\x1b[K${c.dim(`${frames[fi++ % frames.length]} ${verb}`)}`);
+      }, 100);
     }
     const r = await activeProvider.turn({
       system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
@@ -142,10 +168,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
           return;
         }
         stopSpin();
-        if (sawReasoning) {
-          out("\n");
-          sawReasoning = false;
-        }
+        flushReasoningTail();
         if (md) md.push(d);
         else out(d);
       },
@@ -157,14 +180,29 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
                 sink.reasoning(d);
                 return;
               }
+              // Terminal mode: render reasoning on its own dim lines (prefix `│ ` per line). Each
+              // line is committed once and never overwritten — so a subsequent spinner tick can't
+              // clobber it (the old `out(c.dim(d))` bug). Multi-line deltas split cleanly; the
+              // current line resumes mid-output when the next delta arrives.
               stopSpin();
-              sawReasoning = true;
-              out(c.dim(d));
+              const lines = d.split("\n");
+              for (let i = 0; i < lines.length; i++) {
+                if (!reasoningOpen) {
+                  out(c.dim("│ "));
+                  reasoningOpen = true;
+                }
+                out(c.dim(lines[i]));
+                if (i < lines.length - 1) {
+                  out("\n");
+                  reasoningOpen = false;
+                }
+              }
             }
           : undefined,
       signal: opts.signal,
     });
     stopSpin();
+    flushReasoningTail();
     md?.end();
     if (!opts.quiet && !sink) out("\n");
     if (r.usage && opts.stats) {

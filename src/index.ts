@@ -9,6 +9,7 @@ import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir, readRecentLogs, scaffoldMemory, type Scope } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
+import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -23,6 +24,7 @@ import {
   CONFIG_KEYS,
   APPROVAL_MODES,
   SANDBOX_MODES,
+  REASONING_EFFORTS,
   type HaraConfig,
   type ApprovalMode,
   type ProviderId,
@@ -151,7 +153,7 @@ async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
     if (!ap.gatewayUrl || !ap.deviceToken) return null;
     const baseURL = ap.baseURL || `${ap.gatewayUrl.replace(/\/$/, "")}/v1`;
     const model = cfg.model || effectiveModel(ap);
-    return createOpenAIProvider({ apiKey: ap.deviceToken, baseURL, model, label: "hara-gateway" });
+    return createOpenAIProvider({ apiKey: ap.deviceToken, baseURL, model, label: "hara-gateway", reasoningEffort: cfg.reasoningEffort });
   }
 
   // BYOK paths — use the active profile's provider/key/baseURL by default, but let the merged cfg
@@ -164,13 +166,13 @@ async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
   if (provider === "qwen-oauth") {
     const auth = await getValidQwenAuth();
     if (!auth) return null;
-    return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model, label: "qwen-oauth" });
+    return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model, label: "qwen-oauth", reasoningEffort: cfg.reasoningEffort });
   }
   if (!apiKey) return null;
   if (provider === "anthropic") {
-    return createAnthropicProvider({ apiKey, model, baseURL });
+    return createAnthropicProvider({ apiKey, model, baseURL, reasoningEffort: cfg.reasoningEffort });
   }
-  return createOpenAIProvider({ apiKey, model, baseURL, label: provider });
+  return createOpenAIProvider({ apiKey, model, baseURL, label: provider, reasoningEffort: cfg.reasoningEffort });
 }
 
 /** Wrap the main provider with per-turn model routing when `routeModel` is configured: trivial/non-coding
@@ -785,8 +787,33 @@ program
       return;
     }
     for (const m of metas) {
-      out(`${c.bold(m.id)}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${m.provider}:${m.model}  ${m.title}\n`);
+      out(`${c.bold(shortId(m.id))}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${c.dim(m.provider + ":" + m.model)}  ${m.title || c.dim("(untitled)")}\n`);
     }
+    out(c.dim("\nResume:  hara resume <id>\n"));
+  });
+
+program
+  .command("resume [id]")
+  .description("resume a session — no id resumes the most recent here (list ids with `hara sessions`)")
+  .action((id?: string) => {
+    let full: string | undefined;
+    if (id) {
+      full = resolveSessionId(id) ?? undefined;
+      if (!full) {
+        out(c.red(`No session matching '${id}'.`) + c.dim(" Run `hara sessions` to list.\n"));
+        process.exit(1);
+      }
+    } else {
+      const latest = latestForCwd(process.cwd());
+      if (!latest) {
+        out(c.dim("No sessions for this directory yet — `hara sessions` lists all.\n"));
+        process.exit(0);
+      }
+      full = latest.meta.id;
+    }
+    out(c.dim(`↩ resuming ${shortId(full)}…\n`));
+    // reuse the existing --resume path exactly (one engine), inheriting this terminal
+    execFileSync(process.execPath, [process.argv[1], "--resume", full], { stdio: "inherit" });
   });
 
 program
@@ -1830,6 +1857,10 @@ config
       out(c.red(`Invalid sandbox mode. One of: ${SANDBOX_MODES.join(", ")}.\n`));
       process.exit(1);
     }
+    if (key === "reasoningEffort" && !REASONING_EFFORTS.includes(value as typeof REASONING_EFFORTS[number])) {
+      out(c.red(`Invalid reasoning effort. One of: ${REASONING_EFFORTS.join(", ")}.\n`));
+      process.exit(1);
+    }
     writeConfigValue(key, value);
     out(c.green(`Set ${key} → ${configPath()}\n`));
   });
@@ -2707,6 +2738,14 @@ program.action(async (opts) => {
           }
           if (byName.has(nm))
             return void h.sink.notice(`/${nm} isn't wired into the TUI yet — use \`hara ${nm} …\` as a subcommand, or HARA_TUI=0.`);
+          // /<skill> — a user-invocable skill (built-in, global, or plugin) loads its body into your next message
+          {
+            const sk = loadSkillIndex(cwd).find((s) => s.id === nm && s.userInvocable);
+            if (sk) {
+              recalledContext += (recalledContext ? "\n\n" : "") + `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}${arg ? `\n\nThe user's request: ${arg}` : ""}`;
+              return void h.sink.notice(`↗ loaded skill ${sk.id} — ${arg ? "send your next message to run it" : "now describe what you want"}`);
+            }
+          }
           const near = nearest(nm, [...byName.keys()]);
           return void h.sink.notice(`Unknown command /${nm}.${near.length ? " Did you mean " + near.map((n) => "/" + n).join(", ") + "?" : ""}`);
         }
@@ -2842,6 +2881,12 @@ program.action(async (opts) => {
       const [name, ...rest] = line.slice(1).split(/\s+/);
       const cmd = byName.get(name);
       if (!cmd) {
+        const sk = loadSkillIndex(cwd).find((s) => s.id === name && s.userInvocable);
+        if (sk) {
+          recalledContext += (recalledContext ? "\n\n" : "") + `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}${rest.length ? `\n\nThe user's request: ${rest.join(" ")}` : ""}`;
+          out(c.dim(`↗ loaded skill ${sk.id} — ${rest.length ? "send your next message to run it" : "now describe what you want"}\n`));
+          continue;
+        }
         const near = nearest(name, [...byName.keys()]);
         const hint = near.length ? c.dim(` Did you mean ${near.map((n) => "/" + n).join(", ")}?`) : "";
         out(c.red(`Unknown command /${name}.`) + hint + c.dim(" — /help for the list.\n"));

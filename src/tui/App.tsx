@@ -14,6 +14,7 @@ import { activity } from "../activity.js";
 import { ctxPctFor } from "../statusbar.js";
 import { accent } from "./theme.js";
 import { renderMarkdown } from "../md.js";
+import { currentTodos, onTodosChange, type Todo } from "../tools/todo.js";
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -126,7 +127,19 @@ function HeaderCard({ version, model, cwd, tip, vision, session }: { version: st
   );
 }
 
-function Working() {
+// Spinner verb: while a turn is running, prefer the in_progress todo's activeForm (or its text),
+// so the bottom line reads "▶ updating tests…" instead of an abstract "working". Falls back to
+// the elapsed-seconds form when no checklist is active. Exported for unit testing.
+export function spinnerVerb(list: Todo[], elapsedSec: number): string {
+  const active = list.find((t) => t.status === "in_progress");
+  if (active) {
+    const phrase = active.activeForm?.trim() || active.text;
+    return `${phrase}… ${elapsedSec}s · esc to interrupt`;
+  }
+  return `working ${elapsedSec}s · esc to interrupt`;
+}
+
+function Working({ todos }: { todos: Todo[] }) {
   const [n, setN] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setN((x) => x + 1), 100);
@@ -136,7 +149,48 @@ function Working() {
   return (
     <Box marginTop={1}>
       <Text color="yellow">{frames[n % frames.length]}</Text>
-      <Text dimColor>{` working ${Math.floor(n / 10)}s · esc to interrupt`}</Text>
+      <Text dimColor>{` ${spinnerVerb(todos, Math.floor(n / 10))}`}</Text>
+    </Box>
+  );
+}
+
+// Live task panel: renders the current todo_write checklist between the in-progress turn output
+// and the input box. Highlights the in_progress item; caps at 8 rows and folds the rest into
+// `… +N pending/done`. Hidden when the list is empty.
+const PANEL_MAX_ROWS = 8;
+const TODO_MARK: Record<Todo["status"], string> = { pending: "☐", in_progress: "▶", done: "☑" };
+function TodoPanel({ todos }: { todos: Todo[] }) {
+  if (!todos.length) return null;
+  const doneCount = todos.filter((t) => t.status === "done").length;
+  // Prioritize visible rows: in_progress first, then pending, then done — show the most informative
+  // slice when the list outgrows the cap. Stable order within each group via the original index.
+  const indexed = todos.map((t, i) => ({ t, i }));
+  const rank = (s: Todo["status"]): number => (s === "in_progress" ? 0 : s === "pending" ? 1 : 2);
+  const prioritized = [...indexed].sort((a, b) => rank(a.t.status) - rank(b.t.status) || a.i - b.i);
+  const visible = prioritized.slice(0, PANEL_MAX_ROWS).sort((a, b) => a.i - b.i).map((x) => x.t);
+  const hidden = todos.length - visible.length;
+  const hiddenSummary = hidden > 0 ? (() => {
+    const remaining = prioritized.slice(PANEL_MAX_ROWS).map((x) => x.t);
+    const p = remaining.filter((t) => t.status === "pending").length;
+    const d = remaining.filter((t) => t.status === "done").length;
+    const parts: string[] = [];
+    if (p) parts.push(`${p} pending`);
+    if (d) parts.push(`${d} done`);
+    return ` … +${parts.join(", ")}`;
+  })() : "";
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Text color={accent()}>{`  Todos (${doneCount}/${todos.length} done)`}</Text>
+      {visible.map((t, i) => {
+        const inProg = t.status === "in_progress";
+        const done = t.status === "done";
+        return (
+          <Text key={i} color={inProg ? accent() : undefined} bold={inProg} dimColor={done}>
+            {`  ${TODO_MARK[t.status]} ${t.text}`}
+          </Text>
+        );
+      })}
+      {hiddenSummary ? <Text dimColor>{hiddenSummary}</Text> : null}
     </Box>
   );
 }
@@ -150,6 +204,13 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [prompt, setPrompt] = useState<{ title: string; options: { label: string; value: unknown; key?: string }[]; resolve: (v: unknown) => void } | null>(null);
   const [promptSel, setPromptSel] = useState(0);
   const [reasoningOpen, setReasoningOpen] = useState(false);
+  // Live checklist mirror: TodoPanel reads this, and `Working` derives its spinner verb from the
+  // in_progress item. The tool emits on every todo_write — keeps the UI in lockstep with the agent.
+  const [todos, setTodos] = useState<Todo[]>(() => currentTodos());
+  // Collapse-after-turn: once a turn ends, leave the panel visible briefly (so the user sees the
+  // final state) then fold it into a single-line "Todos: N/M done" notice in history. Cleared if
+  // a new turn starts before the timer fires.
+  const collapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ctrlRef = useRef<AbortController | null>(null);
   const queueRef = useRef<{ line: string; images?: ImageAttachment[] }[]>([]); // type-ahead: FIFO of messages entered while working
   const [pool, setPool] = useState<string[]>([]); // type-ahead pool: queued message lines, shown above the input
@@ -163,6 +224,22 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     const fn = (): void => setStatus((s) => ({ ...s, agents: activity.running }));
     activity.onChange(fn);
     return () => activity.onChange(null);
+  }, []);
+
+  // Subscribe to todo_write updates so the panel re-renders when the agent edits the checklist.
+  useEffect(() => {
+    const unsub = onTodosChange((list) => {
+      setTodos([...list]); // copy so React sees a new array (the tool reuses one)
+      // A change mid-turn cancels any pending collapse — the user is still working with this list.
+      if (collapseTimerRef.current) {
+        clearTimeout(collapseTimerRef.current);
+        collapseTimerRef.current = null;
+      }
+    });
+    return () => {
+      unsub();
+      if (collapseTimerRef.current) clearTimeout(collapseTimerRef.current);
+    };
   }, []);
 
   const pushCurrent = useCallback((kind: Kind, text: string, merge = false): void => {
@@ -236,6 +313,18 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       setCurrent([]);
       setWorking(false);
       ctrlRef.current = null;
+      // Schedule a panel collapse: if there was a checklist this turn, fold it to a one-line summary
+      // in scrollback after ~30s of quiet (i.e. no new todo_write or new turn).
+      if (collapseTimerRef.current) clearTimeout(collapseTimerRef.current);
+      if (currentTodos().length) {
+        collapseTimerRef.current = setTimeout(() => {
+          const list = currentTodos();
+          if (!list.length) return;
+          const done = list.filter((t) => t.status === "done").length;
+          setHistory((h) => [...h, { id: nid(), kind: "notice" as const, text: `  ✓ Todos: ${done}/${list.length} done` }]);
+          collapseTimerRef.current = null;
+        }, 30_000);
+      }
     },
     [working, prompt, onSubmit, pushCurrent, model, exit, drainQueue],
   );
@@ -298,7 +387,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       {current.map((item) => (
         <Block key={item.id} item={item} open={reasoningOpen} />
       ))}
-      {working && !prompt && <Working />}
+      {!prompt && <TodoPanel todos={todos} />}
+      {working && !prompt && <Working todos={todos} />}
       {prompt && (
         <Box flexDirection="column" marginTop={1}>
           <Text color="yellow">{`  ${stripAnsi(prompt.title)}`}</Text>
