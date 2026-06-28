@@ -13,6 +13,7 @@ import { homedir, hostname, platform } from "node:os";
 import { join } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmSync } from "node:fs";
 import { orgRolesDir } from "../org/roles.js";
+import { loadActiveProfile, upsertProfile, useProfile, getProfile, DEFAULT_ORG_ID } from "../profile/profile.js";
 
 export interface Enrollment {
   gatewayUrl: string; // e.g. https://hara-gw.acme.internal  (no trailing slash)
@@ -32,14 +33,35 @@ export function gatewayBaseURL(e: Enrollment): string {
 }
 
 export function loadEnrollment(): Enrollment | null {
+  // 1) Legacy storage (~/.hara/org.json) for back-compat with pre-profile builds. After the
+  //    profile migration runs (lazily on any profile.ts read), org.json is renamed to .legacy
+  //    so this branch only fires for users who never touched the new profile layer yet.
   const p = orgPath();
-  if (!existsSync(p)) return null;
-  try {
-    const e = JSON.parse(readFileSync(p, "utf8")) as Enrollment;
-    return e && typeof e === "object" && e.gatewayUrl && e.deviceToken ? e : null;
-  } catch {
-    return null;
+  if (existsSync(p)) {
+    try {
+      const e = JSON.parse(readFileSync(p, "utf8")) as Enrollment;
+      if (e && typeof e === "object" && e.gatewayUrl && e.deviceToken) return e;
+    } catch {
+      /* fall through to profile-derived */
+    }
   }
+  // 2) Active-profile path. profile.ts doesn't import enroll.ts so this static import is safe.
+  try {
+    const ap = loadActiveProfile();
+    if (ap.kind === "gateway" && ap.gatewayUrl && ap.deviceToken) {
+      return {
+        gatewayUrl: ap.gatewayUrl,
+        deviceToken: ap.deviceToken,
+        deviceId: ap.deviceId || "",
+        model: ap.defaultModel || "",
+        baseURL: ap.baseURL,
+        enrolledAt: ap.enrolledAt || new Date().toISOString(),
+      };
+    }
+  } catch {
+    /* not yet migrated */
+  }
+  return null;
 }
 
 function saveEnrollment(e: Enrollment): void {

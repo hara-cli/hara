@@ -1,0 +1,459 @@
+// ────────────────────────────────────────────────────────────────────────────────
+// Profile = identity layer for hara (Personal ↔ Org A ↔ Org B). Switching a profile
+// connects through to *every* downstream decision: provider (BYOK direct vs gateway),
+// API key / device token, base URL, **default model** the gateway / setup chose, and
+// the user's model override within that profile. Plus presentation: a `kind` badge
+// ("ORG" vs "PERSONAL"), a label, a routing display.
+//
+// Single source of truth at runtime. `~/.hara/profiles.json` (0600) stores the *list*
+// of profiles + which one is `active`. The legacy `~/.hara/config.json` keeps acting
+// as the storage for the "personal" profile so existing users with only a config.json
+// don't have to migrate anything (their config.json IS their personal profile).
+//
+// Migration (run lazily on first read):
+//   • config.json exists, no profiles.json   → personal profile is config.json itself,
+//                                              profiles.json is created with active=personal.
+//   • org.json exists (legacy enrolled)      → injected as a `default-org` gateway profile,
+//                                              active is set to it (the user IS using a gateway
+//                                              right now — preserve that), org.json renamed
+//                                              `.legacy` so we never re-migrate.
+//   • Both exist → both become profiles; active = default-org (the gateway, since that's the
+//                                              live routing today).
+//
+// Idempotent: re-running the migration after it's done is a no-op.
+//
+// Provider resolution (in src/index.ts buildProvider):
+//   profile.kind === 'gateway' → OpenAI-compatible w/ deviceToken + (baseURL || gatewayUrl+'/v1')
+//   profile.kind === 'byok'    → existing anthropic / qwen / openai / qwen-oauth dispatch
+//
+// The `hara-gateway` ProviderId enum value is retired from new writes — buildProvider still
+// tolerates reading it from a legacy config.json (it just maps to the migrated gateway profile).
+// ────────────────────────────────────────────────────────────────────────────────
+import { homedir } from "node:os";
+import { join, dirname, parse as parsePath, relative, resolve as resolvePath } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, renameSync, unlinkSync } from "node:fs";
+import type { ProviderId } from "../config.js";
+
+export type ProfileKind = "byok" | "gateway";
+
+export interface Profile {
+  id: string;
+  kind: ProfileKind;
+  label?: string;
+  // byok-only
+  provider?: ProviderId; // anthropic | qwen | openai | qwen-oauth (NOT hara-gateway)
+  apiKey?: string;
+  baseURL?: string;
+  // gateway-only (mirrors Enrollment)
+  gatewayUrl?: string;
+  deviceId?: string;
+  deviceToken?: string;
+  // shared
+  /** what the gateway told us to use (gateway) or the user picked at setup time (byok). */
+  defaultModel?: string;
+  /** the user's per-profile override of `defaultModel`. Cleared by `model reset`. */
+  model?: string;
+  /** P0: gateway populates with [defaultModel] (or empty if the gateway didn't say);
+   *  byok stays empty (no list constraint). P1 may pull this from /v1/models. */
+  availableModels?: string[];
+  enrolledAt?: string;
+}
+
+export interface ProfilesFile {
+  active: string;
+  profiles: Profile[];
+}
+
+const PERSONAL_ID = "personal";
+const DEFAULT_ORG_ID = "default-org";
+
+function haraDir(): string {
+  return join(homedir(), ".hara");
+}
+function profilesPath(): string {
+  return join(haraDir(), "profiles.json");
+}
+function configPath(): string {
+  return join(haraDir(), "config.json");
+}
+function orgPath(): string {
+  return join(haraDir(), "org.json");
+}
+
+function readJSON<T>(p: string): T | null {
+  if (!existsSync(p)) return null;
+  try {
+    return JSON.parse(readFileSync(p, "utf8")) as T;
+  } catch {
+    return null;
+  }
+}
+
+/** Write the profiles file 0600 (it can hold device tokens / api keys). */
+function persistProfilesFile(f: ProfilesFile): void {
+  const p = profilesPath();
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(f, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Synthesize the "personal" profile view from the legacy config.json. The config.json itself
+ *  stays the *storage* — this just presents it as a Profile object. */
+function readPersonalFromConfig(): Profile {
+  const cfg = readJSON<Record<string, any>>(configPath()) ?? {};
+  // A legacy user that ran `hara enroll` had their provider written as "hara-gateway" in config.json.
+  // After migration that case is handled separately (default-org profile), so when synthesizing the
+  // personal profile we coerce a stray "hara-gateway" provider to anthropic (the BYOK default) — the
+  // user can always fix it with `hara setup`.
+  const rawProvider: string | undefined = cfg.provider;
+  const provider: ProviderId = rawProvider && rawProvider !== "hara-gateway" ? (rawProvider as ProviderId) : "anthropic";
+  return {
+    id: PERSONAL_ID,
+    kind: "byok",
+    label: "Personal",
+    provider,
+    apiKey: cfg.apiKey,
+    baseURL: cfg.baseURL,
+    defaultModel: cfg.model,
+    // No per-profile override yet for the personal slot — `model` (override) and `defaultModel`
+    // come from the same field in config.json. `hara model use X` writes `model` to config.json,
+    // `hara model reset` clears it. Conceptually one slot, but the rest of the codebase only ever
+    // reads "effective model" so this is fine.
+  };
+}
+
+/** Synthesize a `default-org` profile from the legacy org.json (Enrollment). */
+function readDefaultOrgFromOrgJson(): Profile | null {
+  const e = readJSON<Record<string, any>>(orgPath());
+  if (!e || !e.gatewayUrl || !e.deviceToken) return null;
+  const defaultModel: string = e.model || "";
+  return {
+    id: DEFAULT_ORG_ID,
+    kind: "gateway",
+    label: "Default Org",
+    gatewayUrl: e.gatewayUrl,
+    deviceId: e.deviceId || "",
+    deviceToken: e.deviceToken,
+    baseURL: e.baseURL,
+    defaultModel,
+    availableModels: defaultModel ? [defaultModel] : [],
+    enrolledAt: e.enrolledAt || new Date().toISOString(),
+  };
+}
+
+/** First-time migration. Idempotent — running again is a no-op (profiles.json already present). */
+function maybeMigrate(): ProfilesFile {
+  const existing = readJSON<ProfilesFile>(profilesPath());
+  if (existing && Array.isArray(existing.profiles) && existing.profiles.length > 0) return existing;
+
+  const personal = readPersonalFromConfig();
+  const org = readDefaultOrgFromOrgJson();
+  const profiles: Profile[] = [personal];
+  let active = PERSONAL_ID;
+  if (org) {
+    profiles.push(org);
+    active = DEFAULT_ORG_ID; // legacy enrolled user IS using the gateway right now — preserve
+  }
+  const f: ProfilesFile = { active, profiles };
+  persistProfilesFile(f);
+
+  // Park org.json so we never re-migrate. We keep the file (don't delete data), just rename.
+  if (org && existsSync(orgPath())) {
+    try {
+      renameSync(orgPath(), orgPath() + ".legacy");
+    } catch {
+      /* best-effort */
+    }
+  }
+  return f;
+}
+
+export function listProfiles(): Profile[] {
+  return maybeMigrate().profiles;
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// `.hara-profile` project pin — like .nvmrc, but personal identity rather than
+// runtime version, so we keep it out of repos by default (the printed hint nudges
+// the user to add it to their *global* gitignore — see `profile pin`). Lookup is
+// "walk up from startDir until we hit a `.hara-profile`, fs root, or home". The
+// walk stops at $HOME to prevent a stray ~/.hara-profile from silently overriding
+// the global default (~/.hara/profiles.json `active`).
+// ────────────────────────────────────────────────────────────────────────────────
+const PIN_FILE = ".hara-profile";
+
+export function pinFilePath(dir: string): string {
+  return join(dir, PIN_FILE);
+}
+
+/** Walk up from `startDir` looking for `.hara-profile`; return the first hit whose
+ *  contents name a real profile. Returns `{ id, file }` (absolute file path) or null.
+ *  If a pin file exists but names an unknown profile, we emit a one-line stderr warn
+ *  and return null (non-fatal — the active resolution falls through to the next layer). */
+export function findPinnedProfile(startDir: string): { id: string; file: string } | null {
+  const home = homedir();
+  const { root } = parsePath(startDir);
+  let dir = resolvePath(startDir);
+  // Track visited to defend against pathological symlink loops (best-effort).
+  const seen = new Set<string>();
+  while (!seen.has(dir)) {
+    seen.add(dir);
+    const file = pinFilePath(dir);
+    if (existsSync(file)) {
+      try {
+        const id = readFileSync(file, "utf8").split(/\r?\n/)[0].trim();
+        if (id && getProfile(id)) return { id, file };
+        if (id) {
+          // pin points to a profile that no longer exists — warn once, fall through.
+          try {
+            process.stderr.write(`hara: ${file} pins profile '${id}', but it doesn't exist — falling back. Run \`hara profile pin <id>\` or \`hara profile unpin\` to fix.\n`);
+          } catch {
+            /* ignore */
+          }
+        }
+      } catch {
+        /* unreadable pin — skip */
+      }
+    }
+    // Stop walking once we're at $HOME or the fs root (don't escape into shared parent dirs).
+    if (dir === home || dir === root) return null;
+    const parent = dirname(dir);
+    if (!parent || parent === dir) return null;
+    dir = parent;
+  }
+  return null;
+}
+
+/** Write `.hara-profile` in the given dir with `id` as the only line. */
+export function writePin(dir: string, id: string): { file: string } {
+  if (!getProfile(id)) throw new Error(`no profile '${id}' — list with \`hara profile list\``);
+  const file = pinFilePath(dir);
+  writeFileSync(file, id + "\n", "utf8");
+  return { file };
+}
+
+/** Remove `.hara-profile` from the given dir. Returns true if it was there. */
+export function removePin(dir: string): boolean {
+  const file = pinFilePath(dir);
+  if (!existsSync(file)) return false;
+  try {
+    unlinkSync(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Active profile resolution — single chain, transparent provenance.
+//
+//   1. `--profile <id>` CLI flag    (set via setFlagOverride() from the top-level
+//                                    program parse; never written to disk)
+//   2. `HARA_PROFILE` env           (also transient; useful in cron / scripts)
+//   3. `.hara-profile` project pin  (walked up from cwd)
+//   4. profiles.json `active`       (global default — `hara profile use <id>`)
+//   5. "personal" fallback          (if even that's gone)
+//
+// `resolveActive()` returns the chosen id *with* its source so whoami / list can
+// show "(active · pinned by ./.hara-profile)" and friends. `activeId()` stays as
+// a thin wrapper for callers that just need the string.
+// ────────────────────────────────────────────────────────────────────────────────
+export type ActiveSource = "flag" | "env" | "pin" | "default" | "fallback";
+export interface ActiveResolution {
+  id: string;
+  source: ActiveSource;
+  /** when source === "pin", the absolute pin file path (formatters render relative to cwd). */
+  pinFile?: string;
+}
+
+let _flagProfile: string | null = null;
+/** Set by the top-level `--profile <id>` flag handler. Cleared between processes
+ *  (we never persist this — it's a one-shot override). Pass null to clear. */
+export function setFlagOverride(id: string | null): void {
+  _flagProfile = id && id.trim() ? id.trim() : null;
+}
+export function getFlagOverride(): string | null {
+  return _flagProfile;
+}
+
+export function resolveActive(cwd: string = process.cwd()): ActiveResolution {
+  // 1. CLI flag (one-shot).
+  if (_flagProfile && getProfile(_flagProfile)) return { id: _flagProfile, source: "flag" };
+  // 2. env (also one-shot — scripts / cron).
+  const env = process.env.HARA_PROFILE;
+  if (env && getProfile(env)) return { id: env, source: "env" };
+  // 3. project pin — walk up from cwd to home/root.
+  const pin = findPinnedProfile(cwd);
+  if (pin) return { id: pin.id, source: "pin", pinFile: pin.file };
+  // 4. global default.
+  const f = maybeMigrate();
+  if (f.active && getProfile(f.active)) return { id: f.active, source: "default" };
+  // 5. ultimate fallback — personal always exists (migration guarantees it).
+  return { id: PERSONAL_ID, source: "fallback" };
+}
+
+/** Thin wrapper for the (many) call sites that just need "which profile am I as". */
+export function activeId(): string {
+  return resolveActive().id;
+}
+
+export function getProfile(id: string): Profile | undefined {
+  return maybeMigrate().profiles.find((p) => p.id === id);
+}
+
+/** The effective, runtime view of the active profile. For id==='personal' we re-read from
+ *  config.json on each call so external edits (config set / setup) are picked up live. */
+export function loadActiveProfile(): Profile {
+  const id = activeId();
+  const f = maybeMigrate();
+  if (id === PERSONAL_ID) {
+    // Always re-sync personal from config.json (the storage of record). Other profile fields in
+    // profiles.json for "personal" are presentation only (label).
+    const p = readPersonalFromConfig();
+    const stored = f.profiles.find((x) => x.id === PERSONAL_ID);
+    if (stored?.label) p.label = stored.label;
+    return p;
+  }
+  const p = f.profiles.find((x) => x.id === id);
+  if (p) return p;
+  // Active points to nothing → degrade to personal silently and persist.
+  const personal = readPersonalFromConfig();
+  return personal;
+}
+
+export function useProfile(id: string): { ok: true; profile: Profile } | { ok: false; reason: string } {
+  const f = maybeMigrate();
+  const p = f.profiles.find((x) => x.id === id);
+  if (!p) return { ok: false, reason: `no profile '${id}' — try \`hara profile list\`` };
+  f.active = id;
+  persistProfilesFile(f);
+  return { ok: true, profile: p };
+}
+
+export function addProfile(p: Profile): { ok: true } | { ok: false; reason: string } {
+  if (!p.id || /[\s/]/.test(p.id)) return { ok: false, reason: "profile id must be non-empty and contain no whitespace or '/'" };
+  const f = maybeMigrate();
+  if (f.profiles.some((x) => x.id === p.id)) return { ok: false, reason: `profile '${p.id}' already exists` };
+  if (p.kind === "gateway" && (!p.gatewayUrl || !p.deviceToken)) return { ok: false, reason: "gateway profile needs gatewayUrl + deviceToken" };
+  if (p.kind === "byok" && !p.provider) return { ok: false, reason: "byok profile needs a provider" };
+  f.profiles.push(p);
+  persistProfilesFile(f);
+  return { ok: true };
+}
+
+/** Replace an existing profile (same id) — used by `hara enroll <url> --code` when the
+ *  default-org profile already exists (re-enrollment / token rotation). */
+export function upsertProfile(p: Profile): void {
+  const f = maybeMigrate();
+  const i = f.profiles.findIndex((x) => x.id === p.id);
+  if (i >= 0) f.profiles[i] = p;
+  else f.profiles.push(p);
+  persistProfilesFile(f);
+}
+
+export function removeProfile(id: string): { ok: true; activeChanged: boolean; removedKind: ProfileKind; removed: Profile } | { ok: false; reason: string } {
+  if (id === PERSONAL_ID) return { ok: false, reason: "personal is your base profile — switch away with `hara profile use <other>`; it stays." };
+  const f = maybeMigrate();
+  const i = f.profiles.findIndex((x) => x.id === id);
+  if (i < 0) return { ok: false, reason: `no profile '${id}' — list with \`hara profile list\`` };
+  const removed = f.profiles[i];
+  f.profiles.splice(i, 1);
+  let activeChanged = false;
+  if (f.active === id) {
+    f.active = PERSONAL_ID;
+    activeChanged = true;
+  }
+  persistProfilesFile(f);
+  return { ok: true, activeChanged, removedKind: removed.kind, removed };
+}
+
+/** Override the effective model within a profile. For "personal" this writes to config.json
+ *  (the storage of record). For others it writes to profiles.json. P0: when availableModels
+ *  is non-empty on a gateway profile we validate the choice is in the set. */
+export function setModel(id: string, model: string): { ok: true } | { ok: false; reason: string } {
+  if (id === PERSONAL_ID) {
+    // delegate to config.ts so this stays single-storage for personal
+    return setModelOnPersonal(model);
+  }
+  const f = maybeMigrate();
+  const i = f.profiles.findIndex((x) => x.id === id);
+  if (i < 0) return { ok: false, reason: `no profile '${id}'` };
+  const p = f.profiles[i];
+  if (p.kind === "gateway" && p.availableModels && p.availableModels.length > 0 && !p.availableModels.includes(model)) {
+    return { ok: false, reason: `'${model}' not in this profile's availableModels (${p.availableModels.join(", ")})` };
+  }
+  f.profiles[i] = { ...p, model };
+  persistProfilesFile(f);
+  return { ok: true };
+}
+
+/** Clear a per-profile model override (revert to defaultModel). */
+export function resetModel(id: string): { ok: true } | { ok: false; reason: string } {
+  if (id === PERSONAL_ID) {
+    // For personal we don't have a distinct override slot — `model` IS the value. Reset means
+    // remove the model line from config.json so the provider default kicks in.
+    return clearModelOnPersonal();
+  }
+  const f = maybeMigrate();
+  const i = f.profiles.findIndex((x) => x.id === id);
+  if (i < 0) return { ok: false, reason: `no profile '${id}'` };
+  const { model: _drop, ...rest } = f.profiles[i];
+  f.profiles[i] = rest;
+  persistProfilesFile(f);
+  return { ok: true };
+}
+
+/** The effective model for a profile = override (model) || defaultModel || "" (caller decides default). */
+export function effectiveModel(p: Profile): string {
+  return process.env.HARA_MODEL || p.model || p.defaultModel || "";
+}
+
+/** Routing display string — the user-visible "where this profile sends requests". */
+export function routingLabel(p: Profile): string {
+  if (p.kind === "gateway") {
+    try {
+      const host = new URL(p.gatewayUrl || "").host;
+      return `${host}${p.deviceId ? " · device " + p.deviceId.slice(-8) : ""}`;
+    } catch {
+      return p.gatewayUrl || "gateway";
+    }
+  }
+  return `${p.provider}${p.baseURL ? " · " + p.baseURL : ""}`;
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Personal-profile model storage helpers — split out so they can be re-exported via
+// config.ts without circular imports. Implemented inline to avoid pulling config.ts.
+// ────────────────────────────────────────────────────────────────────────────────
+function setModelOnPersonal(model: string): { ok: true } | { ok: false; reason: string } {
+  const p = configPath();
+  const cfg = readJSON<Record<string, any>>(p) ?? {};
+  cfg.model = model;
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* best-effort */
+  }
+  return { ok: true };
+}
+function clearModelOnPersonal(): { ok: true } | { ok: false; reason: string } {
+  const p = configPath();
+  const cfg = readJSON<Record<string, any>>(p) ?? {};
+  delete cfg.model;
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* best-effort */
+  }
+  return { ok: true };
+}
+
+export { PERSONAL_ID, DEFAULT_ORG_ID };

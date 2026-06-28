@@ -9,6 +9,9 @@ export interface SessionMeta {
   id: string;
   cwd: string;
   provider: string;
+  /** Per-session pinned model. Set at session creation from cfg.model, **updated by `/model X`**,
+   *  and restored into cfg.model on resume so a session keeps the model the user picked.
+   *  Resume precedence (see index.ts session init): `--model` flag > meta.model > profile defaults. */
   model: string;
   title: string;
   createdAt: string;

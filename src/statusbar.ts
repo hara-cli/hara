@@ -15,6 +15,10 @@ export interface BarState {
   input: number;
   output: number;
   ctxPct: number;
+  /** Active identity profile id ("personal" / "default-org" / …). Empty = legacy/no-profile build. */
+  profileId?: string;
+  /** Profile kind controls the badge color and label in the bottom border. */
+  profileKind?: "byok" | "gateway";
 }
 
 let state: BarState = { sessionName: "new session", model: "", approval: "suggest", input: 0, output: 0, ctxPct: 0 };
@@ -35,11 +39,20 @@ export function contextWindow(model: string): number {
 export const ctxPctFor = (model: string, lastInput: number): number =>
   lastInput > 0 ? Math.min(99, Math.round((lastInput / contextWindow(model)) * 100)) : 0;
 
-/** Top border with the session name in the right corner: `────────── ⏺ session ─` */
+/** Top border with the session name in the right corner: `────── [profile] ⏺ session ─`.
+ *  The profile chip on the left flank surfaces "which identity am I as right now". gateway
+ *  profiles get a cyan ORG badge (drawing the eye — your traffic is going somewhere else),
+ *  personal/byok profiles get a dim badge so they fade into the background. */
 export function borderTop(s: BarState, cols: number): string {
   const name = truncate(s.sessionName || "new session", Math.max(8, cols - 14));
-  const label = `${c.cyan("⏺")} ${c.bold(name)}`;
-  return rule(cols - vlen(label) - 3) + " " + label + " " + rule(1);
+  const right = `${c.cyan("⏺")} ${c.bold(name)}`;
+  const chip = s.profileId
+    ? (s.profileKind === "gateway" ? c.cyan(`[${s.profileId} · ORG]`) : c.dim(`[${s.profileId}]`))
+    : "";
+  const left = chip ? chip + " " : "";
+  const innerLen = vlen(left) + vlen(right);
+  const pad = Math.max(0, cols - innerLen - 4);
+  return rule(1) + " " + left + rule(pad) + " " + right + " " + rule(1);
 }
 
 /** Bottom border carrying mode · tokens · concurrency: `── ◆suggest auto-edit full-auto · ↑0 ↓0 · ⛁ ──` */

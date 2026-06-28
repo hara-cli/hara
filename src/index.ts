@@ -12,7 +12,7 @@ import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import {
   loadConfig,
   configPath,
@@ -33,6 +33,29 @@ import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { completionScript } from "./completions.js";
 import { renderSessionMarkdown } from "./export.js";
 import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL, syncOrgRoles } from "./org-fleet/enroll.js";
+import {
+  loadActiveProfile,
+  listProfiles,
+  useProfile,
+  addProfile,
+  upsertProfile,
+  removeProfile,
+  setModel as setProfileModel,
+  resetModel as resetProfileModel,
+  getProfile,
+  effectiveModel,
+  routingLabel,
+  activeId,
+  resolveActive,
+  setFlagOverride,
+  writePin,
+  removePin,
+  pinFilePath,
+  DEFAULT_ORG_ID,
+  PERSONAL_ID,
+  type Profile,
+  type ActiveResolution,
+} from "./profile/profile.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
 import { shouldAutoCompact } from "./agent/compact.js";
@@ -67,6 +90,7 @@ import {
   type SessionMeta,
   type SessionData,
 } from "./session/store.js";
+import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
 import { loadRoles, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks, haraBinDir } from "./plugins/plugins.js";
@@ -112,21 +136,41 @@ const pkg = {
 const maskKey = (v?: string) => (v ? `${v.slice(0, 7)}…${v.slice(-4)}` : "(unset)");
 
 async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
-  if (cfg.provider === "qwen-oauth") {
+  // Identity-profile is the source of truth for routing. `cfg` is the *merged* HaraConfig (env +
+  // project + global) and still drives non-routing concerns (model overrides, baseURL fallbacks
+  // for things like vision/route/fallback sidecars). The active profile decides "where to send
+  // requests" — gateway (deviceToken at the gateway) vs BYOK (user's key direct to the provider).
+  const ap = loadActiveProfile();
+  // CFG-OVERRIDE PATH: when a sidecar (vision / route / fallback) calls buildProvider with a tweaked
+  // cfg that explicitly carries an apiKey + baseURL, honor those over the profile — they're the
+  // sidecar's intended target. Detected by "cfg.apiKey present + cfg.baseURL present and we're not
+  // routing to a gateway." This keeps `withRouting`/vision unchanged.
+  const isSidecarOverride = !!cfg.apiKey && !!cfg.baseURL && ap.kind === "byok" && cfg.apiKey !== ap.apiKey;
+
+  if (ap.kind === "gateway" && !isSidecarOverride) {
+    if (!ap.gatewayUrl || !ap.deviceToken) return null;
+    const baseURL = ap.baseURL || `${ap.gatewayUrl.replace(/\/$/, "")}/v1`;
+    const model = cfg.model || effectiveModel(ap);
+    return createOpenAIProvider({ apiKey: ap.deviceToken, baseURL, model, label: "hara-gateway" });
+  }
+
+  // BYOK paths — use the active profile's provider/key/baseURL by default, but let the merged cfg
+  // override (so `--profile`/`HARA_PROFILE`-overridden values flow + sidecar provider builds work).
+  const provider: ProviderId = (cfg.provider && cfg.provider !== "hara-gateway" ? cfg.provider : ap.provider) || "anthropic";
+  const apiKey = cfg.apiKey ?? ap.apiKey;
+  const baseURL = cfg.baseURL ?? ap.baseURL;
+  const model = cfg.model || effectiveModel(ap);
+
+  if (provider === "qwen-oauth") {
     const auth = await getValidQwenAuth();
     if (!auth) return null;
-    return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model: cfg.model, label: "qwen-oauth" });
+    return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model, label: "qwen-oauth" });
   }
-  if (cfg.provider === "hara-gateway") {
-    const e = loadEnrollment();
-    if (!e) return null; // not enrolled → `hara enroll`
-    return createOpenAIProvider({ apiKey: e.deviceToken, baseURL: gatewayBaseURL(e), model: cfg.model || e.model, label: "hara-gateway" });
+  if (!apiKey) return null;
+  if (provider === "anthropic") {
+    return createAnthropicProvider({ apiKey, model, baseURL });
   }
-  if (!cfg.apiKey) return null;
-  if (cfg.provider === "anthropic") {
-    return createAnthropicProvider({ apiKey: cfg.apiKey, model: cfg.model, baseURL: cfg.baseURL });
-  }
-  return createOpenAIProvider({ apiKey: cfg.apiKey, model: cfg.model, baseURL: cfg.baseURL, label: cfg.provider });
+  return createOpenAIProvider({ apiKey, model, baseURL, label: provider });
 }
 
 /** Wrap the main provider with per-turn model routing when `routeModel` is configured: trivial/non-coding
@@ -139,8 +183,11 @@ async function withRouting(primary: Provider | null, cfg: HaraConfig): Promise<P
 }
 
 function authHint(cfg: HaraConfig): string {
-  if (cfg.provider === "qwen-oauth") return `Run ${c.bold("hara login qwen")} to authenticate.`;
-  return `Set ${c.bold(providerEnvKey(cfg.provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara setup")}.`;
+  const ap = loadActiveProfile();
+  if (ap.kind === "gateway") return `Active profile '${ap.id}' is a gateway profile but is missing deviceToken — re-enroll with \`hara profile add ${ap.id} --gateway <url> --code <code>\`.`;
+  const provider = ap.provider ?? cfg.provider;
+  if (provider === "qwen-oauth") return `Run ${c.bold("hara login qwen")} to authenticate.`;
+  return `Set ${c.bold(providerEnvKey(provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara setup")}.`;
 }
 
 const SETUP_DEFAULT_MODEL: Record<string, string> = { anthropic: "claude-opus-4-8", qwen: "qwen-plus", openai: "gpt-4o-mini", "qwen-oauth": "coder-model" };
@@ -270,10 +317,11 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
   }
   out(c.dim(`→ ${role.id} owns this task\n`));
 
-  const roleProvider =
-    role.model && role.model !== o.cfg.model
-      ? ((await buildProvider({ ...o.cfg, model: role.model })) ?? o.baseProvider)
-      : o.baseProvider;
+  // Role-model resolution: respect role.model by default; --force collapses everything to cfg.model.
+  const __roleModel = effectiveRoleModel(role.model, o.cfg.model);
+  const roleProvider = __roleModel
+    ? ((await buildProvider({ ...o.cfg, model: __roleModel })) ?? o.baseProvider)
+    : o.baseProvider;
   const toolFilter = role.allowTools
     ? (n: string) => role!.allowTools!.includes(n)
     : role.denyTools
@@ -309,8 +357,8 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
 
   // Review chain: a reviewer role inspects the diff and APPROVES or sends it back, looping until clean.
   const reviewer = roles.find((r) => r.id === "reviewer");
-  const revProvider =
-    reviewer?.model && reviewer.model !== o.cfg.model ? ((await buildProvider({ ...o.cfg, model: reviewer.model })) ?? o.baseProvider) : o.baseProvider;
+  const __revModel = effectiveRoleModel(reviewer?.model, o.cfg.model);
+  const revProvider = __revModel ? ((await buildProvider({ ...o.cfg, model: __revModel })) ?? o.baseProvider) : o.baseProvider;
   const revSystem = reviewer?.system ?? REVIEWER_SYSTEM;
   const revTools = reviewer?.allowTools ? (n: string) => reviewer.allowTools!.includes(n) : (n: string) => READONLY_TOOLS.has(n);
   const maxRounds = Math.max(1, o.rounds ?? 3);
@@ -363,8 +411,8 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
   atom.status = "running";
   savePlan(o.cwd, plan);
   const role = atom.role ? roles.find((r) => r.id === atom.role) : undefined;
-  const roleProvider =
-    role?.model && role.model !== o.cfg.model ? ((await buildProvider({ ...o.cfg, model: role.model })) ?? o.baseProvider) : o.baseProvider;
+  const __atomModel = effectiveRoleModel(role?.model, o.cfg.model);
+  const roleProvider = __atomModel ? ((await buildProvider({ ...o.cfg, model: __atomModel })) ?? o.baseProvider) : o.baseProvider;
   const toolFilter = role?.allowTools
     ? (n: string) => role.allowTools!.includes(n)
     : role?.denyTools
@@ -603,8 +651,8 @@ async function runSubagent(
 ): Promise<string> {
   const roles = loadRoles(cwd);
   const role = roleId ? roles.find((r) => r.id === roleId) : undefined;
-  const provider =
-    role?.model && role.model !== cfg.model ? ((await buildProvider({ ...cfg, model: role.model })) ?? baseProvider) : baseProvider;
+  const __subModel = effectiveRoleModel(role?.model, cfg.model);
+  const provider = __subModel ? ((await buildProvider({ ...cfg, model: __subModel })) ?? baseProvider) : baseProvider;
   // A sub-agent runs full-auto + UNCONFIRMED + parallel, so it is ALWAYS read-only — a role may narrow
   // further but can never GRANT write/exec to a fan-out sub-agent (that would bypass the approval gate).
   // Write-capable roles run in the main loop via `hara org`, behind the user's gate.
@@ -691,10 +739,27 @@ program
   .option("-y, --yes", "auto-approve all tool actions (= --approval full-auto)")
   .option("-m, --model <model>", "model id (overrides config)")
   .option("--approval <mode>", "approval mode: suggest | auto-edit | full-auto")
-  .option("--profile <name>", "use a named profile from ~/.hara/config.json")
+  .option("--profile <id>", "use this identity profile for this run (personal / org id) — see `hara profile list`")
+  .option("--overlay <name>", "apply a named config overlay from ~/.hara/config.json (legacy: --profile)")
   .option("-c, --continue", "resume the most recent session in this directory")
   .option("--resume <id>", "resume a specific session by id")
   .option("--sandbox <mode>", "sandbox the shell: off | workspace-write | read-only");
+
+// Wire the global `--profile <id>` flag into the resolution chain BEFORE any subcommand
+// action runs. resolveActive() consults setFlagOverride() at the top of the priority chain,
+// so this single hook covers `hara whoami`, `hara profile list`, `hara model …`, and the
+// default REPL action — without each subcommand having to reach into program.opts() itself.
+// Validation: unknown id is a hard fail (don't silently fall through to default; the user
+// asked for a specific identity, surface the mistake).
+program.hook("preAction", (thisCmd) => {
+  const flag = thisCmd.opts().profile as string | undefined;
+  if (!flag) return;
+  if (!getProfile(flag)) {
+    out(c.red(`No identity profile '${flag}'.\n`) + c.dim("List: `hara profile list`\n"));
+    process.exit(1);
+  }
+  setFlagOverride(flag);
+});
 
 program
   .command("init")
@@ -852,26 +917,402 @@ program
   .description("interactive first-run setup — pick a provider, API key, and model")
   .action(runSetup);
 
+// ────────────────────────────────────────────────────────────────────────────────
+// Identity profiles — the single switch for "who am I as right now" (personal vs each
+// org I belong to). Switching a profile flips provider, key/token, base URL, AND the
+// default model the gateway / setup chose. See src/profile/profile.ts.
+// ────────────────────────────────────────────────────────────────────────────────
+
+function fmtProfile(p: Profile, mark = ""): string {
+  const kindBadge = p.kind === "gateway" ? c.bold(c.cyan("ORG")) : c.bold(c.dim("PERSONAL"));
+  const label = p.label ? `${c.bold(p.label)} ` : "";
+  const model = effectiveModel(p) || c.dim("(unset)");
+  const route = routingLabel(p);
+  return `${mark} ${kindBadge}  ${label}${c.dim("[" + p.id + "]")}  ${c.dim("· model")} ${model}  ${c.dim("· →")} ${route}`;
+}
+
+/** Human-readable suffix for the active row: "(active · <where it came from>)".
+ *  pin gets a relative file path; flag/env/default each get their own tag. */
+function activeSuffix(r: ActiveResolution): string {
+  switch (r.source) {
+    case "flag":
+      return c.dim("(active · ") + c.bold("--profile flag") + c.dim(")");
+    case "env":
+      return c.dim("(active · ") + c.bold("HARA_PROFILE env") + c.dim(")");
+    case "pin": {
+      const rel = r.pinFile ? relPath(r.pinFile) : ".hara-profile";
+      return c.dim("(active · ") + c.bold("pinned by " + rel) + c.dim(")");
+    }
+    case "default":
+      return c.dim("(active · ") + c.bold("global default") + c.dim(")");
+    case "fallback":
+      return c.dim("(active · fallback)");
+  }
+}
+
+/** Render an absolute path relative to cwd. Same-dir paths get `./` for clarity
+ *  ("pinned by ./.hara-profile" reads better than "pinned by .hara-profile" because
+ *  the leading `.` of the filename is otherwise hard to spot). Parent-dir pins keep
+ *  their relative form (`../../.hara-profile`) — still way more readable than absolute. */
+function relPath(abs: string): string {
+  try {
+    const r = relative(process.cwd(), abs);
+    if (!r) return ".";
+    // r could be: ".hara-profile", "sub/.hara-profile", "../.hara-profile".
+    // For the same-cwd hit we want `./.hara-profile` — start with "./" unless it already
+    // navigates with ".." (which speaks for itself).
+    if (r.startsWith("..")) return r;
+    return "./" + r;
+  } catch {
+    return abs;
+  }
+}
+
+/** Stable "▶ active" line — first thing printed at startup so the user always sees where requests
+ *  are going. Tests look for this prefix; keep the format. */
+export function activeProfileLine(p: Profile): string {
+  const route = routingLabel(p);
+  const model = effectiveModel(p) || "(unset)";
+  return `▶ ${p.label || p.id} · ${model} · ${route}`;
+}
+
+/** Shared whoami body so the `profile current` alias reuses the same output exactly. */
+function printWhoami(): void {
+  const r = resolveActive();
+  const p = loadActiveProfile();
+  out(c.bold("active profile") + "  " + activeSuffix(r) + "\n" + fmtProfile(p, " ") + "\n");
+  if (p.kind === "gateway") {
+    out(c.dim(`  gateway:  ${p.gatewayUrl}\n`));
+    if (p.deviceId) out(c.dim(`  device:   ${p.deviceId.length > 8 ? "…" + p.deviceId.slice(-8) : p.deviceId}\n`));
+    if (p.availableModels?.length) out(c.dim(`  available: ${p.availableModels.join(", ")}\n`));
+  } else {
+    out(c.dim(`  provider: ${p.provider}\n`));
+    if (p.baseURL) out(c.dim(`  baseURL:  ${p.baseURL}\n`));
+    out(c.dim(`  key:      ${p.apiKey ? maskKey(p.apiKey) : "(env / unset)"}\n`));
+  }
+}
+
+program
+  .command("whoami")
+  .description("show the active identity profile (label · model · routing target · source)")
+  .action(printWhoami);
+
+const profileCmd = program.command("profile").description("manage identity profiles (personal / org A / org B…)");
+
+// `profile current` — nvm muscle-memory ("nvm current" → "hara profile current"). Same as `hara whoami`.
+profileCmd
+  .command("current")
+  .description("alias of `hara whoami` — print the active identity profile (with source)")
+  .action(printWhoami);
+
+// ── `profile list` (alias `ls`) ────────────────────────────────────────────────
+// Layout: profiles grouped by kind (PERSONAL above ORG), one line per profile, columns
+// aligned across the whole table (so id/model/routing visually stack). Active row is
+// prefixed with `→ *` (so you can read it at a glance even in copy-pasted output) and
+// suffixed with the source tag. Footer is a 2-line hint pointing at the two switching
+// gestures: `profile use <id>` (write the default), `profile pin <id>` (lock this dir).
+function renderProfileList(): string {
+  const r = resolveActive();
+  const ps = listProfiles();
+  const lines: string[] = [];
+  // Group by kind so the "where am I in the world" stratification is visible.
+  const groups: Array<{ kind: "byok" | "gateway"; title: string; rows: Profile[] }> = [
+    { kind: "byok", title: "PERSONAL", rows: ps.filter((p) => p.kind === "byok") },
+    { kind: "gateway", title: "ORG", rows: ps.filter((p) => p.kind === "gateway") },
+  ];
+  // Column widths from raw (un-styled) strings — styling never participates in padding.
+  const idW = Math.max(2, ...ps.map((p) => p.id.length));
+  const labelW = Math.max(0, ...ps.map((p) => (p.label || "").length));
+  const modelW = Math.max(5, ...ps.map((p) => (effectiveModel(p) || "(unset)").length));
+  for (const g of groups) {
+    if (!g.rows.length) continue;
+    if (lines.length) lines.push(""); // blank between groups
+    lines.push(c.dim(g.title));
+    for (const p of g.rows) {
+      const isActive = p.id === r.id;
+      const mark = isActive ? c.green("→ *") : "   ";
+      const id = p.id.padEnd(idW, " ");
+      const label = (p.label || "").padEnd(labelW, " ");
+      const model = (effectiveModel(p) || "(unset)").padEnd(modelW, " ");
+      const route = routingLabel(p);
+      const tail = isActive ? "  " + activeSuffix(r) : "";
+      const cols = `${mark}  ${c.dim("[")}${c.bold(id)}${c.dim("]")}  ${label}  ${c.dim("· model")} ${model}  ${c.dim("· →")} ${route}${tail}`;
+      lines.push(cols);
+    }
+  }
+  // Tail hint — nudge users toward the two everyday gestures.
+  lines.push("");
+  lines.push(c.dim("💡 use ") + "`hara profile use <id>`" + c.dim(" to switch · ") + "`hara profile pin <id>`" + c.dim(" to lock to this dir"));
+  return lines.join("\n");
+}
+
+profileCmd
+  .command("list")
+  .alias("ls")
+  .description("list all profiles (active marked with → *) — alias: `ls`")
+  .action(() => {
+    out(renderProfileList() + "\n");
+  });
+
+profileCmd
+  .command("use <id>")
+  .description("switch the active profile (echoes the diff: profile / model / routing)")
+  .option("-y, --yes", "skip confirmation when switching INTO a gateway profile from BYOK")
+  .action(async (id: string, opts: { yes?: boolean }) => {
+    const before = loadActiveProfile();
+    const target = getProfile(id);
+    if (!target) {
+      out(c.red(`No profile '${id}'.\n`) + c.dim("List: `hara profile list`\n"));
+      process.exit(1);
+    }
+    // Safety: BYOK → gateway is the direction that changes where your traffic goes (from your own
+    // key to a controlled gateway). Confirm unless -y. The reverse direction is allowed silently
+    // but the diff is still echoed.
+    if (before.kind === "byok" && target.kind === "gateway" && !opts.yes) {
+      const ok = await askConfirm(`Switch to gateway profile '${id}' (${target.gatewayUrl})? Traffic will route through the org gateway.`);
+      if (!ok) {
+        out(c.dim("(unchanged)\n"));
+        return;
+      }
+    }
+    const r = useProfile(id);
+    if (!r.ok) {
+      out(c.red(r.reason + "\n"));
+      process.exit(1);
+    }
+    const after = r.profile;
+    const modelBefore = effectiveModel(before) || "(unset)";
+    const modelAfter = effectiveModel(after) || "(unset)";
+    const routeBefore = routingLabel(before);
+    const routeAfter = routingLabel(after);
+    out(c.green("✓ switched\n"));
+    out(`  profile:  ${c.dim(before.id)} ${c.dim("→")} ${c.bold(after.id)}\n`);
+    out(`  model:    ${c.dim(modelBefore)} ${c.dim("→")} ${c.bold(modelAfter)}\n`);
+    out(`  routing:  ${c.dim(routeBefore)} ${c.dim("→")} ${c.bold(routeAfter)}\n`);
+  });
+
+profileCmd
+  .command("add <id>")
+  .description("add a new identity profile (gateway = `hara enroll`; byok = your own key)")
+  .option("--gateway <url>", "(gateway) join this hara-control gateway")
+  .option("--code <code>", "(gateway) enrollment code from your admin")
+  .option("--label <label>", "human-friendly label for the profile")
+  .option("--byok", "(byok) BYOK profile — bring your own provider key")
+  .option("--provider <id>", "(byok) anthropic | qwen | openai | qwen-oauth")
+  .option("--key <key>", "(byok) API key (else read from the provider's env var at use-time)")
+  .option("--base-url <url>", "(byok) override the provider base URL (OpenAI-compatible endpoints)")
+  .option("--model <model>", "(byok) default model for this profile")
+  .action(async (id: string, opts: { gateway?: string; code?: string; label?: string; byok?: boolean; provider?: string; key?: string; baseUrl?: string; model?: string }) => {
+    if (opts.gateway) {
+      if (!opts.code) return void out(c.red("gateway profile add needs --code <code> from your hara-control admin\n"));
+      try {
+        const e = await enrollDevice(opts.gateway, opts.code);
+        const p: Profile = {
+          id,
+          kind: "gateway",
+          label: opts.label || id,
+          gatewayUrl: e.gatewayUrl,
+          deviceId: e.deviceId,
+          deviceToken: e.deviceToken,
+          baseURL: e.baseURL,
+          defaultModel: e.model || "",
+          availableModels: e.model ? [e.model] : [],
+          enrolledAt: e.enrolledAt,
+        };
+        upsertProfile(p); // upsert: re-enrolling the same id rotates the token
+        const r = useProfile(id);
+        if (r.ok) {
+          out(c.green(`✓ enrolled and switched to '${id}' (${e.gatewayUrl})`) + c.dim(` · model ${p.defaultModel || "(gateway default)"}\n`));
+          const nRoles = await syncOrgRoles();
+          if (nRoles > 0) out(c.dim(`  ↳ synced ${nRoles} org role${nRoles === 1 ? "" : "s"} → ~/.hara/org-roles/\n`));
+        }
+      } catch (err) {
+        out(c.red(`Enroll failed: ${err instanceof Error ? err.message : String(err)}\n`));
+        process.exit(1);
+      }
+      return;
+    }
+    if (opts.byok || opts.provider) {
+      const provider = (opts.provider || "anthropic") as ProviderId;
+      if (provider === "hara-gateway") return void out(c.red("`--provider hara-gateway` is retired — use --gateway <url> --code <code> instead.\n"));
+      const p: Profile = {
+        id,
+        kind: "byok",
+        label: opts.label || id,
+        provider,
+        apiKey: opts.key,
+        baseURL: opts.baseUrl,
+        defaultModel: opts.model,
+      };
+      const r = addProfile(p);
+      if (!r.ok) {
+        out(c.red(r.reason + "\n"));
+        process.exit(1);
+      }
+      out(c.green(`✓ added BYOK profile '${id}'`) + c.dim(` · provider ${provider}${opts.model ? " · model " + opts.model : ""}\n`));
+      out(c.dim(`Switch to it with \`hara profile use ${id}\`.\n`));
+      return;
+    }
+    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|qwen|openai|qwen-oauth [--key … --base-url … --model …]\n"));
+    process.exit(1);
+  });
+
+profileCmd
+  .command("remove <id>")
+  .alias("rm")
+  .alias("uninstall")
+  .description("remove a profile (active falls back to personal) — aliases: `rm`, `uninstall`")
+  .action((id: string) => {
+    // Capture the profile before removal so we can mention the gateway host in the token-hint
+    // line (5 below). After removeProfile, getProfile(id) is gone.
+    const before = getProfile(id);
+    const r = removeProfile(id);
+    if (!r.ok) {
+      out(c.red(r.reason + "\n"));
+      process.exit(1);
+    }
+    if (r.activeChanged) {
+      // Single line that reads naturally: "removed 'X' · active → personal".
+      out(c.green(`✓ removed '${id}'`) + c.dim(` · active → ${PERSONAL_ID}\n`));
+    } else {
+      out(c.green(`✓ removed '${id}'\n`));
+    }
+    // For gateway profiles: we deliberately do NOT phone the control plane to revoke the device
+    // token (that's a privileged operation that needs admin auth + we don't want a stale CLI
+    // calling production). Print a one-line hint so the user knows the *server-side* identity
+    // outlives this local removal — and who to ask if they want it gone there too.
+    if (r.removedKind === "gateway") {
+      const host = (() => {
+        try {
+          return before?.gatewayUrl ? new URL(before.gatewayUrl).host : (before?.gatewayUrl || "the gateway");
+        } catch {
+          return before?.gatewayUrl || "the gateway";
+        }
+      })();
+      out(c.dim(`💡 token left registered at ${host}; ask your admin to revoke if needed\n`));
+    }
+  });
+
+// ── `.hara-profile` project pin (like .nvmrc but personal — keep it out of repos) ─────
+profileCmd
+  .command("pin [id]")
+  .description("write `.hara-profile` in this dir to lock the active profile here (omit id = pin current active)")
+  .action((id?: string) => {
+    const target = (id && id.trim()) || activeId();
+    if (!getProfile(target)) {
+      out(c.red(`No profile '${target}'.\n`) + c.dim("List: `hara profile list`\n"));
+      process.exit(1);
+    }
+    try {
+      const { file } = writePin(process.cwd(), target);
+      out(c.green(`✓ pinned ${target} to ${relPath(file)}\n`));
+      // .hara-profile carries personal identity (which org you're as), unlike .nvmrc which
+      // is project-level. Nudge user toward GLOBAL gitignore so they don't accidentally
+      // commit it. We intentionally do NOT modify .gitignore — that's user space.
+      out(c.dim("💡 .hara-profile is personal identity — add it to your global gitignore (unlike .nvmrc, don't commit it)\n"));
+    } catch (err) {
+      out(c.red(`pin failed: ${err instanceof Error ? err.message : String(err)}\n`));
+      process.exit(1);
+    }
+  });
+
+profileCmd
+  .command("unpin")
+  .description("remove `.hara-profile` from this dir")
+  .action(() => {
+    const file = pinFilePath(process.cwd());
+    const ok = removePin(process.cwd());
+    if (ok) out(c.green(`✓ unpinned`) + c.dim(` · removed ${relPath(file)}\n`));
+    else out(c.dim(`(no ${relPath(file)} here — nothing to unpin)\n`));
+  });
+
+// ── per-profile model switching ──────────────────────────────────────────────────
+const modelCmd = program.command("model").description("manage the model on the active profile");
+modelCmd
+  .command("list")
+  .description("list models for the active profile (gateway profiles list what the control plane advertised)")
+  .action(() => {
+    const p = loadActiveProfile();
+    const cur = effectiveModel(p);
+    if (p.kind === "gateway") {
+      const list = p.availableModels?.length ? p.availableModels : (p.defaultModel ? [p.defaultModel] : []);
+      if (!list.length) {
+        out(c.dim("(gateway didn't advertise any models — use the gateway default; `hara model use <id>` to override locally)\n"));
+        return;
+      }
+      for (const m of list) out(`${m === cur ? c.green("*") : " "} ${m}\n`);
+    } else {
+      // BYOK has no constrained list — show the current effective + suggestion.
+      out(`${c.green("*")} ${cur || c.dim("(unset)")}\n`);
+      out(c.dim("(BYOK profiles accept any model id the provider supports — `hara model use <id>` to switch)\n"));
+    }
+  });
+modelCmd
+  .command("use <model>")
+  .description("override the model on the active profile (validated against availableModels on gateway profiles)")
+  .action((model: string) => {
+    const id = activeId();
+    const r = setProfileModel(id, model);
+    if (!r.ok) {
+      out(c.red(r.reason + "\n"));
+      process.exit(1);
+    }
+    out(c.green(`✓ model → ${model}`) + c.dim(` (profile ${id})\n`));
+  });
+modelCmd
+  .command("reset")
+  .description("clear the per-profile model override → fall back to defaultModel")
+  .action(() => {
+    const id = activeId();
+    const r = resetProfileModel(id);
+    if (!r.ok) {
+      out(c.red(r.reason + "\n"));
+      process.exit(1);
+    }
+    const p = loadActiveProfile();
+    out(c.green(`✓ reset`) + c.dim(` · effective model → ${effectiveModel(p) || "(unset)"}\n`));
+  });
+
+// ── `hara enroll` — kept as a convenience alias mapping to the default-org gateway profile.
 program
   .command("enroll [gateway-url]")
-  .description("B-end: join a fleet — trade a one-time code for a device token (routes hara through your org's gateway; no provider key on this device)")
+  .description("alias of `hara profile add default-org --gateway <url> --code <code>` (B-end: join a fleet)")
   .option("--code <code>", "enrollment code from your hara-control admin")
-  .option("--status", "show the current enrollment")
-  .option("--clear", "remove the enrollment (revert to your own provider config)")
+  .option("--status", "alias of `hara whoami`")
+  .option("--clear", "switch active profile back to personal (does NOT delete the gateway profile)")
   .action(async (gatewayUrl: string | undefined, opts: { code?: string; status?: boolean; clear?: boolean }) => {
     if (opts.status) {
-      const e = loadEnrollment();
-      return void out(e ? c.green("enrolled") + c.dim(` · ${e.gatewayUrl} · device ${e.deviceId || "?"} · model ${e.model || "(gateway default)"} · since ${e.enrolledAt}\n`) : c.dim("Not enrolled — `hara enroll <gateway-url> --code <code>`.\n"));
+      const p = loadActiveProfile();
+      return void out(p.kind === "gateway" ? c.green("enrolled") + c.dim(` · ${p.gatewayUrl} · device ${p.deviceId || "?"} · model ${effectiveModel(p) || "(gateway default)"} · since ${p.enrolledAt || "?"}\n`) : c.dim("Not enrolled — `hara enroll <gateway-url> --code <code>`.\n"));
     }
-    if (opts.clear) return void out(clearEnrollment() ? c.green("✓ enrollment cleared — set your own provider with `hara setup`.\n") : c.dim("(not enrolled)\n"));
+    if (opts.clear) {
+      // Behavior change: don't *delete* the gateway profile (keeps the token around for re-use);
+      // just switch active back to personal. Legacy clearEnrollment() also called to remove any
+      // stray org.json file from pre-migration installs.
+      clearEnrollment();
+      const r = useProfile(PERSONAL_ID);
+      return void out(r.ok ? c.green("✓ active → personal") + c.dim(" — gateway profile preserved (remove with `hara profile remove default-org`)\n") : c.dim("(no change)\n"));
+    }
     if (!gatewayUrl) return void out(c.red("usage: hara enroll <gateway-url> --code <code>   (or --status / --clear)\n"));
     if (!opts.code) return void out(c.red("Need --code <code> — ask your hara-control admin to issue an enrollment code.\n"));
     try {
       const e = await enrollDevice(gatewayUrl, opts.code);
-      writeConfigValue("provider", "hara-gateway");
-      if (e.model) writeConfigValue("model", e.model);
-      out(c.green(`✓ enrolled with ${e.gatewayUrl}`) + c.dim(` · device ${e.deviceId || "?"} · model ${e.model || "(gateway default)"}\n`) + c.dim("hara routes through the gateway now — the real provider key stays server-side.\n"));
-      const nRoles = await syncOrgRoles(); // pull this device's governed digital-employee bundle (B3)
+      const p: Profile = {
+        id: DEFAULT_ORG_ID,
+        kind: "gateway",
+        label: "Default Org",
+        gatewayUrl: e.gatewayUrl,
+        deviceId: e.deviceId,
+        deviceToken: e.deviceToken,
+        baseURL: e.baseURL,
+        defaultModel: e.model || "",
+        availableModels: e.model ? [e.model] : [],
+        enrolledAt: e.enrolledAt,
+      };
+      upsertProfile(p);
+      useProfile(DEFAULT_ORG_ID);
+      out(c.green(`✓ enrolled with ${e.gatewayUrl}`) + c.dim(` · device ${e.deviceId || "?"} · model ${e.model || "(gateway default)"} · profile ${DEFAULT_ORG_ID}\n`) + c.dim("hara routes through the gateway now — the real provider key stays server-side.\n"));
+      const nRoles = await syncOrgRoles();
       if (nRoles > 0) out(c.dim(`  ↳ synced ${nRoles} org role${nRoles === 1 ? "" : "s"} → ~/.hara/org-roles/\n`));
     } catch (err) {
       out(c.red(`Enroll failed: ${err instanceof Error ? err.message : String(err)}\n`));
@@ -1418,7 +1859,11 @@ config
 
 // default action (interactive REPL / one-shot)
 program.action(async (opts) => {
-  const cfg = loadConfig({ profile: opts.profile });
+  // Identity-profile selection (--profile flag) is now handled by the program-level preAction
+  // hook above — see setFlagOverride() + resolveActive() in profile.ts. activeId() / loadActiveProfile()
+  // pick it up automatically. `HARA_PROFILE` env still works as a transient override (one slot lower
+  // in the priority chain than --profile).
+  const cfg = loadConfig({ overlay: opts.overlay });
   if (opts.model) cfg.model = opts.model;
   const provider0 = await withRouting(await buildProvider(cfg), cfg);
   const fallbackProvider = provider0 && cfg.fallbackModel && cfg.fallbackModel !== cfg.model ? await buildProvider({ ...cfg, model: cfg.fallbackModel, baseURL: cfg.fallbackBaseURL ?? cfg.baseURL, apiKey: cfg.fallbackApiKey ?? cfg.apiKey }) : null;
@@ -1439,7 +1884,18 @@ program.action(async (opts) => {
     process.exit(1);
   }
   let provider: Provider = provider0;
-  if (cfg.provider === "hara-gateway") {
+  // Active profile is the source of truth for gateway-side concerns (heartbeat / role sync).
+  // Legacy: cfg.provider==='hara-gateway' kept for users still pointing config.json at the old
+  // sentinel — but profile.kind is what the rest of the CLI now reasons about.
+  const __activeP = loadActiveProfile();
+  // Safety UX: first line of stdout = "where am I sending requests right now". Stable, scriptable,
+  // and reassuring at the start of every session. Suppressed in pure -p print mode to keep that
+  // path clean stdout-only (the user wants the model output, not banner noise). Set HARA_QUIET=1
+  // to suppress everywhere.
+  if (!opts.print && process.env.HARA_QUIET !== "1") {
+    out(c.dim(activeProfileLine(__activeP)) + "\n");
+  }
+  if (__activeP.kind === "gateway" || cfg.provider === "hara-gateway") {
     void heartbeat(); // fleet visibility — fire-and-forget, never blocks startup
     void syncOrgRoles(); // refresh governed org-role bundle (B3) in the background; best-effort, never blocks
   }
@@ -1489,6 +1945,28 @@ program.action(async (opts) => {
       const prior = rid ? loadSession(rid) : null;
       if (prior?.history) history.push(...prior.history);
       meta = prior?.meta ?? { id: rid ?? newSessionId(), cwd, provider: cfg.provider, model: cfg.model, title: "", createdAt: new Date().toISOString(), updatedAt: "" };
+      // Apply per-session pinned model on headless resume (mirrors the interactive path).
+      // --model flag wins (already on cfg.model) and is written back; otherwise restore meta.model.
+      if (prior) {
+        if (opts.model) {
+          meta.model = cfg.model;
+        } else if (meta.model && meta.model !== cfg.model) {
+          const __allowed = __activeP.kind === "gateway" && __activeP.availableModels && __activeP.availableModels.length > 0;
+          if (__allowed && !__activeP.availableModels!.includes(meta.model)) {
+            const __fb = __activeP.defaultModel || cfg.model;
+            // headless: log to stderr so it doesn't pollute the captured stdout reply
+            try { process.stderr.write(`hara: resumed session pinned '${meta.model}' not in availableModels — falling back to '${__fb}'.\n`); } catch { /* ignore */ }
+            cfg.model = __fb;
+            meta.model = __fb;
+            const __rb = await buildProvider(cfg);
+            if (__rb) provider = __rb;
+          } else {
+            cfg.model = meta.model;
+            const __rb = await buildProvider(cfg);
+            if (__rb) provider = __rb;
+          }
+        }
+      }
     }
     // Inbound images (gateway): the platform downloaded the user's photo(s) and passed their paths via env.
     // Let the agent actually SEE them — attached inline for a vision-capable main model, else described via the
@@ -1607,11 +2085,39 @@ program.action(async (opts) => {
     createdAt: new Date().toISOString(),
     updatedAt: "",
   };
+  // Per-session model precedence on resume:
+  //   1. --model flag (already applied to cfg.model up-top) → wins and is written back to meta.model.
+  //   2. resumed meta.model → restored into cfg.model (the user's last /model choice).
+  //   3. otherwise leave cfg.model as the profile-resolved default.
+  // Safety: if we're on a gateway profile with a finite availableModels list and the resumed
+  // meta.model isn't in it (e.g. user switched profiles between sessions), warn and degrade to
+  // profile.defaultModel — a stale pinned model shouldn't brick the resume.
+  if (resumed) {
+    if (opts.model) {
+      // explicit --model on the command line wins; persist it onto the session.
+      meta.model = cfg.model;
+    } else if (meta.model && meta.model !== cfg.model) {
+      const __ap = __activeP;
+      const __allowed = __ap.kind === "gateway" && __ap.availableModels && __ap.availableModels.length > 0;
+      if (__allowed && !__ap.availableModels!.includes(meta.model)) {
+        const __fallback = __ap.defaultModel || cfg.model;
+        out(c.yellow(`⚠ resumed session was pinned to '${meta.model}', which isn't in this profile's availableModels (${__ap.availableModels!.join(", ")}). Falling back to '${__fallback}'.\n`));
+        cfg.model = __fallback;
+        meta.model = __fallback;
+        const __rebuilt = await buildProvider(cfg);
+        if (__rebuilt) provider = __rebuilt;
+      } else {
+        cfg.model = meta.model;
+        const __rebuilt = await buildProvider(cfg);
+        if (__rebuilt) provider = __rebuilt;
+      }
+    }
+  }
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
   const memorySnap = memoryDigest(cwd); // durable memory, read once (frozen snapshot)
   const buildMemory = (): string =>
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
-  if (resumed) out(c.dim(`(resumed ${shortId(meta.id)} · ${history.length} msgs)\n`));
+  if (resumed) out(c.dim(`(resumed ${shortId(meta.id)} · ${history.length} msgs · model = ${cfg.model})\n`));
 
   // Vision describer state — shared by the `/vision` command (both REPLs) and the TUI image pipeline.
   let visionProvider: Provider | null | undefined;
@@ -1672,19 +2178,44 @@ program.action(async (opts) => {
     },
     {
       name: "model",
-      desc: "show or switch model: /model [id]",
+      desc: "show or switch model: /model [id [--force|all]]",
       run: async (a) => {
-        if (a) {
-          cfg.model = a;
-          visionProvider = undefined;
-          remindedVision = false;
-          const p = await buildProvider(cfg);
-          if (p) {
-            provider = p;
-            if (bar.isActive()) bar.update({ model: a });
-            out(c.dim(`(model → ${cfg.provider}:${a})\n`));
-          } else out(c.red("(could not rebuild provider)\n"));
-        } else out(`${cfg.provider}:${cfg.model}\n`);
+        const parts = (a || "").trim().split(/\s+/).filter(Boolean);
+        const force = parts.some((p) => p === "--force" || p === "all" || p === "-f");
+        const id = parts.find((p) => p !== "--force" && p !== "all" && p !== "-f");
+        if (!id) {
+          // Bare /model: pinned model + per-role overrides table, so the user sees what's pinned now
+          // and which roles deviate from it.
+          const __force = isSessionForceModel();
+          const __lines = [`${cfg.provider}:${cfg.model}`];
+          if (meta.model && meta.model !== cfg.model) {
+            __lines.push(c.dim(`session pinned: ${meta.model} (cfg drift — /model ${meta.model} to re-pin)`));
+          } else {
+            __lines.push(c.dim(`session pinned: ${meta.model || "(none)"}${__force ? c.yellow(" · forced (all roles use session model)") : ""}`));
+          }
+          const __roles = loadRoles(cwd);
+          if (__roles.length) {
+            __lines.push(c.dim("roles:"));
+            for (const r of __roles) {
+              const eff = __force ? cfg.model : (r.model || cfg.model);
+              const tag = __force && r.model && r.model !== cfg.model ? c.yellow(" (overridden by --force)") : r.model ? c.dim(" (role pin)") : c.dim(" (session)");
+              __lines.push(`  ${r.id}: ${eff}${tag}`);
+            }
+          }
+          return void out(__lines.join("\n") + "\n");
+        }
+        cfg.model = id;
+        meta.model = id;
+        setSessionForceModel(force);
+        visionProvider = undefined;
+        remindedVision = false;
+        const p = await buildProvider(cfg);
+        if (p) {
+          provider = p;
+          if (bar.isActive()) bar.update({ model: id });
+          saveSession(meta, history); // persist the session-pinned model so resume restores it
+          out(c.dim(`(model → ${cfg.provider}:${id}${force ? " · forced (all roles)" : ""})\n`));
+        } else out(c.red("(could not rebuild provider)\n"));
       },
     },
     {
@@ -1959,11 +2490,12 @@ program.action(async (opts) => {
           : mainCap === "text"
             ? `${cfg.model} is text-only — /vision <model> to read pasted images`
             : `${cfg.model} image support unknown — asked on first paste`;
+    const __profileBadge = __activeP.kind === "gateway" ? `[${__activeP.id} · ORG]` : `[${__activeP.id}]`;
     await runTui({
       initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
       cwd,
-      header: { version: pkg.version, model: `${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : " · no AGENTS.md — type /init to create one"}` },
+      header: { version: pkg.version, model: `${__profileBadge} ${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : " · no AGENTS.md — type /init to create one"}` },
       cycleApproval: (m) => cycleMode(m),
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
@@ -2006,14 +2538,38 @@ program.action(async (opts) => {
             return void h.sink.notice("error" in r ? `(${r.error})` : `↩ reverted: ${r.files.join(", ")}`);
           }
           if (nm === "model") {
-            if (!arg) return void h.sink.notice(`model: ${cfg.provider}:${cfg.model}`);
-            cfg.model = arg;
+            const parts = (arg || "").trim().split(/\s+/).filter(Boolean);
+            const force = parts.some((p) => p === "--force" || p === "all" || p === "-f");
+            const id = parts.find((p) => p !== "--force" && p !== "all" && p !== "-f");
+            if (!id) {
+              const __force = isSessionForceModel();
+              const __lines = [`model: ${cfg.provider}:${cfg.model}`];
+              if (meta.model && meta.model !== cfg.model) {
+                __lines.push(`session pinned: ${meta.model} (cfg drift — /model ${meta.model} to re-pin)`);
+              } else {
+                __lines.push(`session pinned: ${meta.model || "(none)"}${__force ? " · forced (all roles use session model)" : ""}`);
+              }
+              const __roles = loadRoles(cwd);
+              if (__roles.length) {
+                __lines.push("roles:");
+                for (const r of __roles) {
+                  const eff = __force ? cfg.model : (r.model || cfg.model);
+                  const tag = __force && r.model && r.model !== cfg.model ? " (overridden by --force)" : r.model ? " (role pin)" : " (session)";
+                  __lines.push(`  ${r.id}: ${eff}${tag}`);
+                }
+              }
+              return void h.sink.notice(__lines.join("\n"));
+            }
+            cfg.model = id;
+            meta.model = id;
+            setSessionForceModel(force);
             visionProvider = undefined; // new model may resolve a different describer / capability
             remindedVision = false;
             const p = await buildProvider(cfg);
             if (p) {
               provider = p;
-              return void h.sink.notice(`(model → ${cfg.provider}:${arg})`);
+              saveSession(meta, history); // persist the session-pinned model so resume restores it
+              return void h.sink.notice(`(model → ${cfg.provider}:${id}${force ? " · forced (all roles)" : ""})`);
             }
             return void h.sink.notice("(could not rebuild provider)");
           }
@@ -2263,7 +2819,7 @@ program.action(async (opts) => {
 
   out(c.dim(`Type a task. /help · @path attaches a file · shift+tab cycles mode · Esc interrupts · /exit to quit.${projectContext ? "  (AGENTS.md loaded)" : ""}\n\n`));
 
-  bar.install({ sessionName: meta.title || shortId(meta.id), model: cfg.model, approval, input: stats.input, output: stats.output });
+  bar.install({ sessionName: meta.title || shortId(meta.id), model: cfg.model, approval, input: stats.input, output: stats.output, profileId: __activeP.id, profileKind: __activeP.kind });
   process.on("exit", () => {
     try {
       bar.uninstall();

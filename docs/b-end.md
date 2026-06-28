@@ -11,7 +11,9 @@ Split the **data plane** (the LLM proxy — protocol conversion, routing to N ba
 
 - **Data plane = buy/embed.** It's a fast-moving commodity; embed a mature OSS gateway (Phase-1: LiteLLM,
   Apache/MIT) behind a thin adapter. Never fork it.
-- **Control plane = build + 100% own (TS).** This is the product, the moat, the open-core paid layer.
+- **Control plane = build + own (TS), shipped open-source (Apache).** A company can self-host the whole
+  fleet + gateway (CLI **and** hara-control) for free. The moat is **operating** it (hosted/managed) +
+  **enterprise plugins** (SSO/SCIM, org-scale RBAC, compliance) + curated governance content — not withheld code.
 
 **Core invariant:** the real provider key lives ONLY at the gateway. A device holds a scoped, revocable
 **device token** — never an upstream key.
@@ -43,19 +45,23 @@ cloud models  /  internal vLLM·Ollama
 - Device token + endpoint in `~/.hara/org.json` (0600); heartbeat fired on interactive start (fire-and-forget).
 - Protocol verified end-to-end against a stub control plane (`test/enroll.test.mjs`).
 
-**⬜ Next — `hara-control` (a SEPARATE repo; the paid control plane):**
-1. **Phase 0 spike:** stand up LiteLLM (docker) on a private net + one cloud model + one virtual key; point a
-   hara device at it with `provider=openai, baseURL=<gw>` (zero code) to validate `/v1` streaming + tool
-   calls end-to-end before building anything.
-2. **Phase 1 MVP:** `hara-control` v0 — enroll-code issuance → device-token mint (behind the LiteLLM adapter),
-   device registry, `/v1/heartbeat`, `audit_log`, a read-only **fleet view** (which machine / who / today's
-   tokens+cost / model / token status / revoke). Tailscale ACL; per-key budget + model scope.
-3. **Phase 2:** OIDC/SSO enrollment + short-lived JWT (reuse the qwen-oauth RFC-8628 flow); one-click revoke;
-   immutable audit; data-residency (repo_class → model_scope).
-4. **Phase 3:** multi-tenant SaaS — orgs/Postgres/managed gateways; pushed org policy (roles/models/MCP);
-   usage analytics / chargeback. The **company/public asset-sharing** dimension (team libraries, a public
-   marketplace) lives here — the one asset axis the C-end deliberately defers behind a human-confirmed egress.
+**`hara-control` (a SEPARATE repo — open-source Apache, self-hostable; see its `docs/selfhost.md` + `docs/AUTH_SPEC.md`):**
+1. **Phase 0 spike — ✅ done.** LiteLLM proxies `/v1` streaming + tool calls end-to-end.
+2. **Phase 1 MVP — ✅ done (built + dogfooded on a real gateway).** enroll-code → device-token mint (LiteLLM
+   adapter), device registry, `/v1/heartbeat`, hash-chained `audit_log`, read-only **fleet view** (machine /
+   who / today's tokens+cost / model / token status / revoke), org-unit hierarchy, per-key budget + model scope.
+3. **Phase 2 — next.** Built-in accounts + login + **RBAC** (open; the self-host "super-user" floor) and a
+   `hara login` **device flow (RFC 8628)** so devices self-onboard against a company URL — both spec'd in
+   `hara-control/docs/AUTH_SPEC.md`. enroll-code already covers onboarding until then. **2FA is delegated to
+   the IdP via SSO, not built in.**
+4. **Phase 3 — hosted / enterprise.** Not a multi-tenant-SaaS rewrite — `Organization` is a self-referential
+   tree (group → company → dept) that scales with no schema change. The paid bits live in **`hara-enterprise`**
+   (loads as a plugin): SSO/SCIM, org-scale RBAC gate, compliance audit-export, cross-fleet dashboard — plus a
+   hosted/managed control plane. The company/public **asset-sharing** dimension (team libraries / marketplace)
+   also lands here.
 
-**open-core line:** the CLI + `hara-gateway` provider + enroll + heartbeat are OSS (a solo dev can self-host a
-gateway and point at it). `hara-control` (fleet / SSO / audit / central token mgmt / multi-tenant) is the paid
-layer.
+**open-core line:** the CLI **and** `hara-control` are both **open-source (Apache) and self-hostable** — enroll,
+heartbeat, token lifecycle, fleet view, audit, governance + auth/RBAC are all in the open, so a company can run
+the entire fleet + gateway itself for free. The **paid layer is `hara-enterprise`** (SSO/SCIM, org-scale RBAC
+gate, compliance export, cross-fleet dashboard) + the hosted/managed option. We monetize **operating** it, not
+withholding it.

@@ -150,16 +150,27 @@ export function setModelVisionOverride(model: string, cap: "yes" | "no" | null):
 }
 
 /**
- * Effective config. Precedence (high→low): env vars > selected profile >
- * project `.hara/config.json` > global `~/.hara/config.json` > provider defaults.
+ * Effective config. Precedence (high→low): env vars > project `.hara/config.json` >
+ * named overlay (`overlays.<name>` in global config) > global `~/.hara/config.json`
+ * > provider defaults.
+ *
+ * NOTE: `--profile` / `HARA_PROFILE` is the IDENTITY-profile selector (personal ↔ org A
+ * ↔ org B) — see src/profile/profile.ts. The legacy `profiles:{name:partial}` overlay
+ * mechanism (a tiny in-config preset / overlay) has been renamed to `overlays:{...}`
+ * to free the "profile" word for identity. We still read the legacy `profiles:{...}`
+ * key for one release for back-compat. Overlays are addressed by env var
+ * `HARA_OVERLAY=<name>` (or `opts.overlay`).
  */
-export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
+export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
   const global = readRawConfig();
-  const { profiles, ...globalBase } = global;
+  // Strip both the new (`overlays`) and legacy (`profiles`) overlay containers from the base merge.
+  // The legacy `profiles` key is kept readable for back-compat with users who already have it.
+  const { overlays, profiles, ...globalBase } = global;
   const project = readProjectConfig(process.cwd());
-  const profileName = process.env.HARA_PROFILE ?? opts.profile;
-  const profile = profileName && profiles && profiles[profileName] ? profiles[profileName] : {};
-  const merged: Record<string, any> = { ...globalBase, ...project, ...profile };
+  const overlayName = process.env.HARA_OVERLAY ?? opts.overlay;
+  const overlayMap = overlays && typeof overlays === "object" ? overlays : profiles && typeof profiles === "object" ? profiles : null;
+  const overlay = overlayName && overlayMap && overlayMap[overlayName] ? overlayMap[overlayName] : {};
+  const merged: Record<string, any> = { ...globalBase, ...project, ...overlay };
 
   const provider = (process.env.HARA_PROVIDER ?? merged.provider ?? "anthropic") as ProviderId;
   const d = PROVIDER_DEFAULTS[provider] ?? PROVIDER_DEFAULTS.anthropic;
@@ -187,7 +198,7 @@ export function loadConfig(opts: { profile?: string } = {}): HaraConfig {
   const mcpServers: Record<string, McpServerConfig> = {
     ...(globalBase.mcpServers ?? {}),
     ...(project.mcpServers ?? {}),
-    ...(profile.mcpServers ?? {}),
+    ...(overlay.mcpServers ?? {}),
   };
   const hooks = (merged.hooks && typeof merged.hooks === "object" ? merged.hooks : {}) as HooksConfig;
   const notify = (process.env.HARA_NOTIFY ?? merged.notify ?? "off") as NotifyMode;
