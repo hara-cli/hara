@@ -2,7 +2,7 @@
 // runtime. The existing loaders pick the contents up (skillsDirs/loadRoles append the resolvers below;
 // index.ts merges pluginMcpServers into the MCP set). Manifest is Claude-Code-compatible: we read
 // .claude-plugin/plugin.json, .hara-plugin/plugin.json, or a bare plugin.json at the plugin root.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync, cpSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync, cpSync, symlinkSync, chmodSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -18,6 +18,7 @@ export interface PluginManifest {
   agents?: string[]; // dirs of role/subagent *.md, relative to the plugin root
   mcpServers?: Record<string, McpServerConfig>;
   hooks?: HooksConfig; // PreToolUse/PostToolUse shell commands
+  bin?: Record<string, string>; // command name → executable path (relative to plugin root); linked into ~/.hara/bin on install
 }
 export interface Plugin {
   name: string;
@@ -28,6 +29,46 @@ export interface Plugin {
 
 export function pluginsDir(): string {
   return join(homedir(), ".hara", "plugins");
+}
+/** Where plugin-contributed CLI commands are symlinked. Add to PATH to use them (e.g. `export PATH="$HOME/.hara/bin:$PATH"`). */
+export function haraBinDir(): string {
+  return join(homedir(), ".hara", "bin");
+}
+/** Symlink a plugin's `bin` entries into ~/.hara/bin (chmod +x the targets). Returns the command names linked. */
+function linkPluginBins(root: string, manifest: PluginManifest): string[] {
+  if (!manifest.bin) return [];
+  const dir = haraBinDir();
+  mkdirSync(dir, { recursive: true });
+  const linked: string[] = [];
+  for (const [name, rel] of Object.entries(manifest.bin)) {
+    const target = join(root, rel);
+    if (!existsSync(target)) continue;
+    try {
+      chmodSync(target, 0o755);
+    } catch {
+      /* best-effort */
+    }
+    const link = join(dir, name);
+    try {
+      rmSync(link, { force: true });
+      symlinkSync(target, link);
+      linked.push(name);
+    } catch {
+      /* skip a bin we can't link */
+    }
+  }
+  return linked;
+}
+/** Remove a plugin's linked bins (on uninstall). */
+function unlinkPluginBins(manifest: PluginManifest | null): void {
+  if (!manifest?.bin) return;
+  for (const name of Object.keys(manifest.bin)) {
+    try {
+      rmSync(join(haraBinDir(), name), { force: true });
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 const MANIFEST_PATHS = [".claude-plugin/plugin.json", ".hara-plugin/plugin.json", "plugin.json"];
@@ -125,6 +166,7 @@ export function installPlugin(source: string): Plugin {
     // move tmp → dest (rename within the same dir)
     cpSync(tmp, dest, { recursive: true });
     rmSync(tmp, { recursive: true, force: true });
+    linkPluginBins(dest, manifest); // expose any plugin CLI commands in ~/.hara/bin
     return { name: manifest.name, version: manifest.version || "0.0.0", root: dest, manifest };
   } catch (e) {
     rmSync(tmp, { recursive: true, force: true });
@@ -135,6 +177,7 @@ export function installPlugin(source: string): Plugin {
 export function uninstallPlugin(name: string): boolean {
   const dest = join(pluginsDir(), name);
   if (!existsSync(dest)) return false;
+  unlinkPluginBins(readManifest(dest)); // remove any linked CLI commands first
   rmSync(dest, { recursive: true, force: true });
   return true;
 }

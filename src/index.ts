@@ -69,7 +69,7 @@ import {
 } from "./session/store.js";
 import { loadRoles, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
-import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks } from "./plugins/plugins.js";
+import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks, haraBinDir } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
 import { decompose, topoOrder, topoWaves, savePlan, loadPlan, atomPrompt, verify, runCheck, type Atom, type Plan } from "./org/planner.js";
 import { connectMcpServers, closeMcp } from "./mcp/client.js";
@@ -1311,6 +1311,13 @@ pluginCmd
         m.mcpServers ? `${Object.keys(m.mcpServers).length} mcp server(s)` : "",
       ].filter(Boolean);
       out(c.green(`Installed ${p.name}@${p.version}${parts.length ? c.dim(" — " + parts.join(", ")) : ""}\n`));
+      // A plugin can ship CLI commands (manifest `bin`); they're linked into ~/.hara/bin. Tell the user to PATH it.
+      const bins = Object.keys(m.bin ?? {});
+      if (bins.length) {
+        const onPath = (process.env.PATH ?? "").split(":").includes(haraBinDir());
+        out(c.green(`Linked command(s): ${bins.join(", ")} → ${c.dim(haraBinDir())}\n`));
+        if (!onPath) out(c.yellow(`  add to PATH once:  echo 'export PATH="$HOME/.hara/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc\n`));
+      }
       // Surface the code-execution surface: a plugin's MCP servers + hooks run shell commands on every
       // hara launch with no prompt. Installing a plugin = trusting its author to run code; show what.
       const execs: string[] = [];
