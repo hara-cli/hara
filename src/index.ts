@@ -2852,6 +2852,7 @@ program.action(async (opts) => {
         await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => h.sink.notice(m));
       },
     });
+    out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
     await closeMcp();
     process.exit(0); // TUI done — exit cleanly (ink can leave stdin referenced)
   }
@@ -2928,6 +2929,7 @@ program.action(async (opts) => {
     }
   }
   bar.uninstall();
+  out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
   rl.close();
   await closeMcp();
 });
