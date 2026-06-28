@@ -41,7 +41,7 @@ export interface AppProps {
   initialStatus: Status;
   model: string;
   cwd: string;
-  header?: { version: string; model: string; cwd: string; tip?: string; vision?: string; session?: string };
+  header?: { version: string; model: string; cwd: string; tip?: string; vision?: string; session?: string; profile?: string };
   onSubmit: (line: string, h: Helpers, images?: ImageAttachment[]) => Promise<void>;
   cycleApproval?: (cur: Approval) => Approval;
   /** Read an image off the OS clipboard for Ctrl+V (injected; omitted in tests). */
@@ -105,7 +105,7 @@ const BANNER = [
   "██║  ██║██║  ██║██║  ██║██║  ██║",
   "╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝",
 ];
-function HeaderCard({ version, model, cwd, tip, vision, session }: { version: string; model: string; cwd: string; tip?: string; vision?: string; session?: string }) {
+function HeaderCard({ version, model, cwd, tip, vision, session, profile }: { version: string; model: string; cwd: string; tip?: string; vision?: string; session?: string; profile?: string }) {
   return (
     <Box flexDirection="column" marginBottom={1}>
       {BANNER.map((row, i) => (
@@ -115,6 +115,12 @@ function HeaderCard({ version, model, cwd, tip, vision, session }: { version: st
       ))}
       <Text dimColor>{` the coding agent that runs like an org   ·   v${version}`}</Text>
       <Text dimColor>{` ${model}  ·  ${cwd}`}</Text>
+      {profile ? (
+        <Text>
+          <Text color={accent()}>{` ${profile.split(" ")[0]}`}</Text>
+          <Text dimColor>{` ${profile.split(" ").slice(1).join(" ")}`}</Text>
+        </Text>
+      ) : null}
       {session ? <Text dimColor>{` session ${session}`}</Text> : null}
       {vision ? (
         <Text>

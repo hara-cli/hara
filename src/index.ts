@@ -2522,11 +2522,19 @@ program.action(async (opts) => {
             ? `${cfg.model} is text-only — /vision <model> to read pasted images`
             : `${cfg.model} image support unknown — asked on first paste`;
     const __profileBadge = __activeP.kind === "gateway" ? `[${__activeP.id} · ORG]` : `[${__activeP.id}]`;
+    const __pr = resolveActive();
+    const __prSrc =
+      __pr.source === "pin" ? `pinned by ${relPath(__pr.pinFile || ".hara-profile")}`
+      : __pr.source === "flag" ? "--profile flag"
+      : __pr.source === "env" ? "HARA_PROFILE env"
+      : __pr.source === "default" ? "global default"
+      : "fallback";
+    const __profileInfo = `${__activeP.kind === "gateway" ? "ORG" : "PERSONAL"} ${__activeP.label || __activeP.id} [${__activeP.id}] · ${routingLabel(__activeP)} · ${__prSrc}`;
     await runTui({
       initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
       cwd,
-      header: { version: pkg.version, model: `${__profileBadge} ${cfg.provider}:${cfg.model}`, cwd, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : " · no AGENTS.md — type /init to create one"}` },
+      header: { version: pkg.version, model: `${__profileBadge} ${cfg.provider}:${cfg.model}`, cwd, profile: __profileInfo, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : " · no AGENTS.md — type /init to create one"}` },
       cycleApproval: (m) => cycleMode(m),
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
