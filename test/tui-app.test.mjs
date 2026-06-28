@@ -216,6 +216,26 @@ test("App type-ahead: multiple pooled messages coalesce into one turn", async ()
   unmount();
 });
 
+test("App commits a notice from a fast (slash-like) turn — no awaited agent run, still lands in scrollback", async () => {
+  // Regression: /design, /help and other slash-only turns push a notice then return immediately. The commit
+  // used to read currentRef (synced only on render), which lagged a render behind for a fast turn → the notice
+  // was lost. Now the commit reads live state via the setCurrent updater.
+  const onSubmit = async (line, h) => {
+    h.sink.notice("↗ loaded skill design — now describe what you want");
+    // returns synchronously — no awaited runAgent (this is the slash-command case)
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("/design");
+  await tick();
+  stdin.write("\r"); // submit → fast turn
+  await tick(150);
+  assert.ok(strip(lastFrame()).includes("loaded skill design"), "notice from a fast slash-only turn is committed, not lost");
+  unmount();
+});
+
 test("App type-ahead: Esc while working clears the queue (stop means stop)", async () => {
   const seen = [];
   let release;

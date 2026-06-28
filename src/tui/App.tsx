@@ -310,13 +310,18 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       } catch (e: unknown) {
         pushCurrent("notice", `error: ${e instanceof Error ? e.message : String(e)}`);
       }
-      const committed = currentRef.current.map((it) =>
-        it.kind === "reasoning"
-          ? { ...it, kind: "notice" as const, text: `✻ thought · ${it.text.split("\n").filter((l) => l.trim()).length} lines` }
-          : it,
-      );
-      setHistory((h) => [...h, ...committed]);
-      setCurrent([]);
+      // Commit this turn's items to scrollback. Read the LIVE current via the updater — currentRef only
+      // syncs on render (line ~225), so a fast slash-only turn (/design, /help, /skills…) that pushes a
+      // notice and returns before any re-render would otherwise commit nothing and lose the notice.
+      setCurrent((cur) => {
+        const committed = cur.map((it) =>
+          it.kind === "reasoning"
+            ? { ...it, kind: "notice" as const, text: `✻ thought · ${it.text.split("\n").filter((l) => l.trim()).length} lines` }
+            : it,
+        );
+        if (committed.length) setHistory((h) => [...h, ...committed]);
+        return [];
+      });
       setWorking(false);
       ctrlRef.current = null;
       // Schedule a panel collapse: if there was a checklist this turn, fold it to a one-line summary
