@@ -107,11 +107,14 @@ function Block({ item, open }: { item: Item; open?: boolean }) {
     case "assistant":
       return <Text>{renderMarkdown(item.text)}</Text>; // headers/bold/inline-code/bullets + verbatim fences
     case "reasoning": {
-      // fixed-height window: show the last 5 lines while thinking; ctrl-r toggles the full text.
+      // Print the FULL reasoning up to MAX lines (Codex-style); collapse only when longer — keep the live
+      // tail visible with a clear toggle. ctrl-r expands/collapses the full text.
+      const MAX = 14;
       const lines = item.text.replace(/\n+$/, "").split("\n");
-      const long = lines.length > 5;
-      const shown = open || !long ? lines : lines.slice(-5);
-      const hint = long ? (open ? " · ctrl-r collapse" : " · ctrl-r expand") : "";
+      const long = lines.length > MAX;
+      const shown = open || !long ? lines : lines.slice(-MAX); // short or expanded → all; long & collapsed → live tail
+      const hidden = long && !open ? lines.length - MAX : 0;
+      const hint = long ? (open ? " · ctrl-r collapse" : ` · +${hidden} earlier · ctrl-r expand`) : "";
       return (
         <Box flexDirection="column">
           <Text color={accent()} dimColor>{`✻ thinking … ${lines.length} line${lines.length === 1 ? "" : "s"}${hint}`}</Text>
