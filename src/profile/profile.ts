@@ -412,7 +412,9 @@ export function effectiveModel(p: Profile): string {
   return process.env.HARA_MODEL || p.model || p.defaultModel || "";
 }
 
-/** Routing display string — the user-visible "where this profile sends requests". */
+/** Routing display string — the user-visible "where this profile sends requests".
+ *  Used by `whoami` / `profile list`; the TUI header uses `routeHost` for a tighter,
+ *  host-only render. */
 export function routingLabel(p: Profile): string {
   if (p.kind === "gateway") {
     try {
@@ -423,6 +425,28 @@ export function routingLabel(p: Profile): string {
     }
   }
   return `${p.provider}${p.baseURL ? " · " + p.baseURL : ""}`;
+}
+
+/** Host-only routing for the TUI header. Returns the URL host (no scheme, no path) plus
+ *  `isCustom`: true when the profile carries a non-default baseURL (BYOK) or always-true
+ *  for gateway profiles. View layer decides whether to show `→ host` (always for org;
+ *  only when `isCustom` for personal). Returns `null` if there's nothing to display
+ *  (BYOK on the provider's official endpoint). */
+export function routeHost(p: Profile): { host: string; isCustom: boolean } | null {
+  if (p.kind === "gateway") {
+    try {
+      return { host: new URL(p.gatewayUrl || "").host, isCustom: true };
+    } catch {
+      return p.gatewayUrl ? { host: p.gatewayUrl, isCustom: true } : null;
+    }
+  }
+  // BYOK: only surface a host when the user pointed at a non-default endpoint.
+  if (!p.baseURL) return null;
+  try {
+    return { host: new URL(p.baseURL).host, isCustom: true };
+  } catch {
+    return { host: p.baseURL, isCustom: true };
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────────

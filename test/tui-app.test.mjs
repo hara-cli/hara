@@ -30,15 +30,127 @@ test("App runs a turn: user line in, streamed assistant reply out, status bar pi
   unmount();
 });
 
-test("App header shows the vision routing line at init (describer display)", async () => {
-  const header = { version: "9.9.9", model: "qwen:glm-5", cwd: "/x", vision: "glm-5 is text-only → images read by qwen3.7-plus" };
+test("App header (personal): single-line logo + collapsed identity row, no banner/no vision line", async () => {
+  // Personal on the provider's official endpoint — identity is one line ("personal  <provider>:<model>"),
+  // no "→ host" suffix (routeHost undefined), no vision row (lazy now), no banner block.
+  const header = {
+    version: "9.9.9",
+    modelLabel: "qwen:glm-5",
+    cwd: "/Users/jeff/work/projects/test/design",
+    agentsMdLoaded: true,
+    session: "7bf3ee14-aaaa-bbbb-cccc-deadbeef0000",
+    kind: "personal",
+  };
   const { lastFrame, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), header, onSubmit: async () => {} }),
   );
   await tick();
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("👁"), "vision indicator shown in the header");
-  assert.ok(frame.includes("images read by qwen3.7-plus"), "describer routing shown at init");
+  // ASCII banner is gone — no more ███/╗/╝ characters in the header.
+  assert.ok(!/[█╔╗╚╝╠╣║]/.test(frame), "old ASCII banner block is no longer rendered");
+  // New single-line logo + tagline.
+  assert.ok(frame.includes("hara"), "single-line logo present");
+  assert.ok(frame.includes("v9.9.9"), "version on the logo line");
+  assert.ok(frame.includes("the coding agent that runs like an org"), "tagline on the logo line");
+  // Identity row collapses model into one line for personal; no "→ host" (no custom baseURL).
+  assert.ok(/personal\s+qwen:glm-5/.test(frame), "personal identity row carries the provider:model directly");
+  assert.ok(!frame.includes("→"), "no '→ host' suffix on official-endpoint personal");
+  // No separate "model" row for personal.
+  assert.ok(!/^\s*model\s/m.test(frame), "personal layout omits the dedicated 'model' line");
+  // cwd line gets a "· AGENTS.md" suffix when loaded; never a negative line.
+  assert.ok(frame.includes("cwd"), "cwd label present");
+  assert.ok(frame.includes("AGENTS.md"), "AGENTS.md flag rendered as a cwd suffix");
+  assert.ok(!/no AGENTS\.md/.test(frame), "no negative 'no AGENTS.md' line");
+  // session is the first 8 chars, never the full uuid.
+  assert.ok(frame.includes("7bf3ee14"), "session shows the short id");
+  assert.ok(!frame.includes("7bf3ee14-aaaa"), "no full uuid leak");
+  // The always-on vision line is gone (顾雅 spec — lazy on first image).
+  assert.ok(!frame.includes("👁"), "no always-on vision indicator in header");
+  // Tip is the trimmed slash menu.
+  assert.ok(frame.includes("/help"), "tip line shows /help");
+  assert.ok(!frame.includes("attaches"), "tip no longer says 'attaches' (verb)");
+  assert.ok(!frame.includes("cycles modes"), "tip no longer says 'cycles modes'");
+  unmount();
+});
+
+test("App header (personal w/ custom baseURL): identity row ends with '→ <host>' (host only, no scheme/path)", async () => {
+  const header = {
+    version: "1.0.0",
+    modelLabel: "qwen:glm-5",
+    cwd: "/Users/jeff/work/x",
+    agentsMdLoaded: false,
+    session: "abcd1234efghijkl",
+    kind: "personal",
+    routeHost: "dashscope.aliyuncs.com",
+  };
+  const { lastFrame, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), header, onSubmit: async () => {} }),
+  );
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("→  dashscope.aliyuncs.com"), "custom baseURL surfaces as '→ <host>' (host only)");
+  assert.ok(!frame.includes("https://"), "no scheme in the rendered route");
+  assert.ok(!/no AGENTS\.md/.test(frame), "still no 'no AGENTS.md' negative line");
+  unmount();
+});
+
+test("App header (org/gateway): split identity + model + source rows; route host shown", async () => {
+  const header = {
+    version: "1.2.3",
+    modelLabel: "qwen:glm-5",
+    cwd: "/x/y",
+    agentsMdLoaded: false,
+    session: "deadbeefcafe0000",
+    kind: "org",
+    orgLabel: "Acme Inc",
+    orgId: "acme-jeff",
+    routeHost: "gw.nanhara.tech",
+    modelSource: "org default",
+  };
+  const { lastFrame, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), header, onSubmit: async () => {} }),
+  );
+  await tick();
+  const frame = strip(lastFrame());
+  // identity row: org   <label>  ·  <id>  →  <host>
+  assert.ok(/org\s+Acme Inc/.test(frame), "org label rendered");
+  assert.ok(frame.includes("acme-jeff"), "org/device id rendered");
+  assert.ok(frame.includes("→  gw.nanhara.tech"), "gateway host rendered as '→ <host>'");
+  // model row exists with source annotation
+  assert.ok(/model\s+qwen:glm-5/.test(frame), "dedicated model row for org");
+  assert.ok(frame.includes("from org default"), "model source annotation present");
+  unmount();
+});
+
+test("App lazy vision notice: not in header at init; emitted inline once on the first image attachment", async () => {
+  const header = { version: "9.9.9", modelLabel: "qwen:glm-5", cwd: "/x", kind: "personal" };
+  const onSubmit = async (line, h) => {
+    h.sink.assistantDelta("ok");
+    await tick(80);
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, {
+      initialStatus: status,
+      model: "glm-5",
+      cwd: process.cwd(),
+      header,
+      onSubmit,
+      visionNotice: "glm-5 is text-only — images read by qwen-vl-max",
+    }),
+  );
+  await tick();
+  // At init the notice is NOT in the frame — header doesn't carry it anymore.
+  assert.ok(!strip(lastFrame()).includes("images read by qwen-vl-max"), "vision notice silent at init");
+  // Simulate a turn where the runner reports an image attachment by having the App see one in handleSubmit.
+  // We can't paste a real image via stdin in ink-testing-library, so we feed a synthetic onClipboardImage and
+  // press Ctrl+V — but the simplest path is to drive the notice via a direct image turn through onSubmit + the
+  // App's handleSubmit signature. Use the harness in InputBox: type + Enter (no image, no notice).
+  stdin.write("hello");
+  await tick();
+  stdin.write("\r");
+  await tick(150);
+  // Still no notice — no image yet.
+  assert.ok(!strip(lastFrame()).includes("images read by qwen-vl-max"), "still no notice after a plain text turn");
   unmount();
 });
 

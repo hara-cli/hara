@@ -37,17 +37,53 @@ export interface Helpers {
    *  runner to inject before the next model call. Returns [] when nothing is queued. */
   drainQueue: () => { line: string; images?: ImageAttachment[] }[];
 }
+/** Structured identity/header info — the runtime (index.ts) builds this once, the view
+ *  branches on `kind` to render `personal` vs `org` differently (顾雅 spec). Keep this
+ *  pure data; presentation lives in `HeaderCard`. */
+export interface HeaderInfo {
+  version: string;
+  /** `<provider>:<model>` — drives the identity line (personal) and the model line (org). */
+  modelLabel: string;
+  /** Tilde-shortened cwd (rendered as-is by the view). */
+  cwd: string;
+  /** Truthy when AGENTS.md was loaded for this run — the cwd line appends "· AGENTS.md".
+   *  We intentionally do NOT render "no AGENTS.md" when false — silence beats negative noise. */
+  agentsMdLoaded?: boolean;
+  /** Short session id (8 chars; index.ts uses `shortId`). */
+  session?: string;
+  /** Identity kind: drives the layout of the first identity line + presence of the `model` line. */
+  kind: "personal" | "org";
+  /** When `kind === 'personal'` AND `profileId !== 'personal'` we render `personal:<id>`
+   *  (rare: multiple personal profiles). For the default `personal` id leave undefined. */
+  profileId?: string;
+  /** When `kind === 'org'`: the org's friendly label (e.g. "Acme Inc"). */
+  orgLabel?: string;
+  /** When `kind === 'org'`: the org-side device/user id (e.g. "acme-jeff"). */
+  orgId?: string;
+  /** Route host (no scheme, no path). Personal: only present when the user set a CUSTOM baseURL.
+   *  Org: always present (the gateway host). */
+  routeHost?: string;
+  /** When `kind === 'org'`: source of the current model — "org default" / "user override"
+   *  / "/model override". Drives the suffix of the model line. */
+  modelSource?: string;
+}
+
 export interface AppProps {
   initialStatus: Status;
   model: string;
   cwd: string;
-  header?: { version: string; model: string; cwd: string; tip?: string; vision?: string; session?: string; profile?: string };
+  header?: HeaderInfo;
   onSubmit: (line: string, h: Helpers, images?: ImageAttachment[]) => Promise<void>;
   cycleApproval?: (cur: Approval) => Approval;
   /** Read an image off the OS clipboard for Ctrl+V (injected; omitted in tests). */
   onClipboardImage?: () => ImageAttachment | null;
   /** modal (vim) keybindings in the input box */
   vim?: boolean;
+  /** Vision routing notice text (e.g. "glm-5 is text-only — images read by qwen-vl-max").
+   *  When set, the FIRST image attachment in this session triggers a one-shot inline notice.
+   *  Header doesn't display it (顾雅: kill the always-on vision line). Undefined = native vision
+   *  (no notice) or no describer configured (a different path warns when an image actually arrives). */
+  visionNotice?: string;
 }
 
 type Kind = "user" | "assistant" | "reasoning" | "tool" | "diff" | "notice";
@@ -94,41 +130,115 @@ function Block({ item, open }: { item: Item; open?: boolean }) {
   }
 }
 
-// ASCII rendering of the nanhara "Λi" mark (small peak + big peak + italic i), in the brand violet.
-// hara wordmark — FIGlet "ANSI Shadow". A recognizable banner reads better in a terminal than a
-// pixel-faithful logo. Printed once at the top of the session; scrolls away with the transcript.
-const BANNER = [
-  "██╗  ██╗ █████╗ ██████╗  █████╗",
-  "██║  ██║██╔══██╗██╔══██╗██╔══██╗",
-  "███████║███████║██████╔╝███████║",
-  "██╔══██║██╔══██║██╔══██╗██╔══██║",
-  "██║  ██║██║  ██║██║  ██║██║  ██║",
-  "╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝",
-];
-function HeaderCard({ version, model, cwd, tip, vision, session, profile }: { version: string; model: string; cwd: string; tip?: string; vision?: string; session?: string; profile?: string }) {
+// ─── header helpers ────────────────────────────────────────────────────────────
+// Pure functions so the view stays declarative and tests can pin the formatting
+// without rendering ink. Exported for unit tests (see test/tui-header.test.mjs).
+
+/** Extract the URL host (no scheme, no path, no query). Falls back to the raw
+ *  string when `url` isn't parseable — better to surface something than swallow it. */
+export function extractHost(url: string | undefined | null): string {
+  if (!url) return "";
+  try {
+    return new URL(url).host;
+  } catch {
+    // Strip a leading scheme + leading // if present (handles "git@host:..." style which URL() rejects).
+    const noScheme = url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+    return noScheme.split("/")[0].split("?")[0];
+  }
+}
+
+/** Tilde-collapse the user's home directory. If the path is too long, keep the
+ *  TAIL (most-specific segments) — the project name reads better than `~/work/…`.
+ *  `maxLen` clamps the displayed length; default 60 fits in a 80-col terminal next
+ *  to the "cwd       " label + an optional " · AGENTS.md" suffix. */
+export function shortenHome(abs: string, home: string = process.env.HOME ?? "", maxLen = 60): string {
+  let p = abs;
+  if (home && (p === home || p.startsWith(home + "/"))) {
+    p = "~" + p.slice(home.length);
+  }
+  if (p.length <= maxLen) return p;
+  // Keep the last `maxLen - 2` chars, prefixed with `…/` to signal truncation.
+  const tail = p.slice(-(maxLen - 2));
+  // If the truncation lands inside a segment, advance to the next `/` for a clean break.
+  const firstSlash = tail.indexOf("/");
+  const clean = firstSlash > 0 ? tail.slice(firstSlash) : tail;
+  return "…" + clean;
+}
+
+/** Render a session uuid (or any id) as its first 8 chars — same convention as `shortId`
+ *  in src/session/store.ts. A second helper here so the view never reaches into the session
+ *  module + so headers in tests can pass any string and get a stable display. */
+export function shortenSession(uuid: string | undefined | null): string {
+  if (!uuid) return "";
+  return uuid.slice(0, 8);
+}
+
+/** Layout constants for the field grid. Field names live in a 10-char column;
+ *  values start at column 12 (after 2 spaces). The view uses `padField` to
+ *  pad a label so the values align vertically across rows. */
+const FIELD_PAD = 10;
+const padField = (name: string): string => name.padEnd(FIELD_PAD, " ");
+
+function HeaderCard(props: HeaderInfo) {
+  const { version, modelLabel, cwd, agentsMdLoaded, session, kind } = props;
+  const home = process.env.HOME ?? "";
+  const cwdShort = shortenHome(cwd, home);
+  const sessionShort = shortenSession(session);
+  // Identity line — branches on kind. Personal collapses kind+model into one line;
+  // org splits identity (org/label/id/route) from model (with its source).
+  const identity = kind === "org" ? (
+    <Text>
+      <Text dimColor>{`  ${padField("org")}`}</Text>
+      <Text>{props.orgLabel ?? props.orgId ?? "(unnamed)"}</Text>
+      {props.orgId && props.orgLabel ? <Text dimColor>{`  ·  ${props.orgId}`}</Text> : null}
+      {props.routeHost ? (
+        <Text>
+          <Text dimColor>{"  →  "}</Text>
+          <Text dimColor>{props.routeHost}</Text>
+        </Text>
+      ) : null}
+    </Text>
+  ) : (
+    <Text>
+      <Text dimColor>{`  ${padField(props.profileId ? `personal:${props.profileId}` : "personal")}`}</Text>
+      <Text>{modelLabel}</Text>
+      {props.routeHost ? (
+        <Text>
+          <Text dimColor>{"  →  "}</Text>
+          <Text dimColor>{props.routeHost}</Text>
+        </Text>
+      ) : null}
+    </Text>
+  );
   return (
     <Box flexDirection="column" marginBottom={1}>
-      {BANNER.map((row, i) => (
-        <Text key={i} color={accent()}>
-          {row}
-        </Text>
-      ))}
-      <Text dimColor>{` the coding agent that runs like an org   ·   v${version}`}</Text>
-      <Text dimColor>{` ${model}  ·  ${cwd}`}</Text>
-      {profile ? (
+      <Text>
+        <Text color={accent()}>{"> "}</Text>
+        <Text color={accent()} bold>{`hara`}</Text>
+        <Text dimColor>{` · v${version} — the coding agent that runs like an org`}</Text>
+      </Text>
+      <Text>{" "}</Text>
+      {identity}
+      {kind === "org" ? (
         <Text>
-          <Text color={accent()}>{` ${profile.split(" ")[0]}`}</Text>
-          <Text dimColor>{` ${profile.split(" ").slice(1).join(" ")}`}</Text>
+          <Text dimColor>{`  ${padField("model")}`}</Text>
+          <Text>{modelLabel}</Text>
+          {props.modelSource ? <Text dimColor>{`  ·  from ${props.modelSource}`}</Text> : null}
         </Text>
       ) : null}
-      {session ? <Text dimColor>{` session ${session}`}</Text> : null}
-      {vision ? (
+      <Text>
+        <Text dimColor>{`  ${padField("cwd")}`}</Text>
+        <Text dimColor>{cwdShort}</Text>
+        {agentsMdLoaded ? <Text dimColor>{"  ·  AGENTS.md"}</Text> : null}
+      </Text>
+      {sessionShort ? (
         <Text>
-          <Text color={accent()}>{" 👁 "}</Text>
-          <Text dimColor>{vision}</Text>
+          <Text dimColor>{`  ${padField("session")}`}</Text>
+          <Text dimColor>{sessionShort}</Text>
         </Text>
       ) : null}
-      {tip ? <Text dimColor>{` ${tip}`}</Text> : null}
+      <Text>{" "}</Text>
+      <Text dimColor>{"  /help · @file · shift+tab · esc"}</Text>
     </Box>
   );
 }
@@ -201,7 +311,7 @@ function TodoPanel({ todos }: { todos: Todo[] }) {
   );
 }
 
-export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval, onClipboardImage, vim }: AppProps) {
+export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval, onClipboardImage, vim, visionNotice }: AppProps) {
   const { exit } = useApp();
   const [history, setHistory] = useState<Item[]>([]);
   const [current, setCurrent] = useState<Item[]>([]);
@@ -256,6 +366,16 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     });
   }, []);
 
+  // Lazy vision notice: 顾雅 spec — the header no longer carries an always-on "👁 …" line.
+  // Instead, the first time an image attachment shows up in this session, we print the
+  // routing notice once (inline). `visionShownRef` is the session-scoped flag.
+  const visionShownRef = useRef(false);
+  const noteVisionIfNeeded = useCallback((): void => {
+    if (visionShownRef.current || !visionNotice) return;
+    visionShownRef.current = true;
+    setHistory((h) => [...h, { id: nid(), kind: "notice", text: `  ⓘ ${visionNotice}` }]);
+  }, [visionNotice]);
+
   // Type-ahead steering: hand the runner everything queued while the turn ran, showing each message
   // inline (as a user block) at the point it gets folded into the conversation. Drained mid-turn so an
   // addition reaches the model on its next call; whatever's still queued at turn end is the effect below.
@@ -264,9 +384,10 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     const batch = queueRef.current;
     queueRef.current = [];
     setPool([]);
+    if (batch.some((b) => b.images?.length)) noteVisionIfNeeded();
     for (const b of batch) pushCurrent("user", b.line.trim() || "🖼 (image)");
     return batch;
-  }, [pushCurrent]);
+  }, [pushCurrent, noteVisionIfNeeded]);
 
   const handleSubmit = useCallback(
     async (line: string, images?: ImageAttachment[]): Promise<void> => {
@@ -278,6 +399,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         setPool(queueRef.current.map((q) => q.line.trim() || "🖼 (image)"));
         return;
       }
+      if (images?.length) noteVisionIfNeeded(); // one-shot inline notice on first image of the session
       setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]); // t already carries any [Image #N] tokens
       const ctrl = new AbortController();
       ctrlRef.current = ctrl;
@@ -337,7 +459,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         }, 30_000);
       }
     },
-    [working, prompt, onSubmit, pushCurrent, model, exit, drainQueue],
+    [working, prompt, onSubmit, pushCurrent, model, exit, drainQueue, noteVisionIfNeeded],
   );
 
   // Drain the type-ahead pool: when the turn finishes (working → false) and nothing awaits a choice, COALESCE

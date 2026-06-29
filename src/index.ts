@@ -47,6 +47,7 @@ import {
   getProfile,
   effectiveModel,
   routingLabel,
+  routeHost,
   activeId,
   resolveActive,
   setFlagOverride,
@@ -2512,29 +2513,50 @@ program.action(async (opts) => {
         return { skip: true };
       }
     };
-    const mainCap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-    const visionLine =
-      mainCap === "vision"
-        ? `${cfg.model} reads images directly`
-        : cfg.visionModel
-          ? `${cfg.model} is text-only → images read by ${cfg.visionModel}`
-          : mainCap === "text"
-            ? `${cfg.model} is text-only — /vision <model> to read pasted images`
-            : `${cfg.model} image support unknown — asked on first paste`;
-    const __profileBadge = __activeP.kind === "gateway" ? `[${__activeP.id} · ORG]` : `[${__activeP.id}]`;
-    const __pr = resolveActive();
-    const __prSrc =
-      __pr.source === "pin" ? `pinned by ${relPath(__pr.pinFile || ".hara-profile")}`
-      : __pr.source === "flag" ? "--profile flag"
-      : __pr.source === "env" ? "HARA_PROFILE env"
-      : __pr.source === "default" ? "global default"
-      : "fallback";
-    const __profileInfo = `${__activeP.kind === "gateway" ? "ORG" : "PERSONAL"} ${__activeP.label || __activeP.id} [${__activeP.id}] · ${routingLabel(__activeP)} · ${__prSrc}`;
+    // ── Header (rebuilt per 顾雅 spec, 2026-06):
+    //   • Single-line logo + tagline (no ASCII banner block).
+    //   • Identity line branches on profile kind: personal collapses to `personal <provider>:<model>`
+    //     (route host only when baseURL is custom); org spreads to `org <label> · <id> → <host>`
+    //     plus its own `model` line annotated with the source (org default / user override).
+    //   • cwd line silently appends "· AGENTS.md" when loaded — we never show a negative noise line.
+    //   • Vision routing is NOT in the header anymore — App emits a one-shot inline notice via
+    //     `visionNotice` the first time an image lands in the session.
+    const __mainCap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+    const __routeForHeader = routeHost(__activeP);
+    // Model-source label (org only). `loadConfig` already merges env > project > overlay > globals,
+    // so cfg.model is whatever the runtime will actually use. If it equals the profile's defaultModel
+    // we treat it as "org default"; otherwise it's a user override (per-profile setModel, env, or flag).
+    const __modelSource =
+      __activeP.kind === "gateway"
+        ? cfg.model && __activeP.defaultModel && cfg.model === __activeP.defaultModel
+          ? "org default"
+          : "user override"
+        : undefined;
+    // Lazy vision notice: only set it for the "describer in use" path (header used to always-on it).
+    // Native-vision models stay silent (the routing IS direct, nothing to say). "Unknown" stays silent
+    // too — the existing per-image picker (resolveImages) handles that on first paste.
+    const __visionNotice =
+      __mainCap === "text" && cfg.visionModel
+        ? `${cfg.model} is text-only — images read by ${cfg.visionModel}`
+        : undefined;
     await runTui({
       initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
       cwd,
-      header: { version: pkg.version, model: `${__profileBadge} ${cfg.provider}:${cfg.model}`, cwd, profile: __profileInfo, vision: visionLine, session: meta.id, tip: `/help · @file attaches · shift+tab cycles modes · esc interrupts${projectContext ? " · AGENTS.md loaded" : " · no AGENTS.md — type /init to create one"}` },
+      header: {
+        version: pkg.version,
+        modelLabel: `${cfg.provider}:${cfg.model}`,
+        cwd,
+        agentsMdLoaded: !!projectContext,
+        session: meta.id,
+        kind: __activeP.kind === "gateway" ? "org" : "personal",
+        profileId: __activeP.kind === "gateway" || __activeP.id === PERSONAL_ID ? undefined : __activeP.id,
+        orgLabel: __activeP.kind === "gateway" ? __activeP.label : undefined,
+        orgId: __activeP.kind === "gateway" ? __activeP.deviceId || __activeP.id : undefined,
+        routeHost: __routeForHeader?.host,
+        modelSource: __modelSource,
+      },
+      visionNotice: __visionNotice,
       cycleApproval: (m) => cycleMode(m),
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
