@@ -6,7 +6,7 @@
 //
 // The agent machinery is injected via `onSubmit` (a turn runner) so this view is testable with
 // ink-testing-library against a fake runner — no provider/network needed.
-import { Box, Static, Text, useApp, useInput } from "ink";
+import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { InputBox, type Status, type Approval } from "./InputBox.js";
 import type { ImageAttachment } from "../providers/types.js";
@@ -91,6 +91,8 @@ interface Item {
   id: number;
   kind: Kind;
   text: string;
+  /** Unfolded content for the Ctrl+T transcript overlay (full reasoning / full tool output). Falls back to `text`. */
+  full?: string;
 }
 let _id = 0;
 const nid = (): number => ++_id;
@@ -131,6 +133,65 @@ function Block({ item, open }: { item: Item; open?: boolean }) {
     case "notice":
       return <Text dimColor>{item.text}</Text>;
   }
+}
+
+// ── Ctrl+T transcript overlay (Codex-style): the whole conversation with NOTHING folded — full reasoning,
+// full tool output, full text — scrollable. The folded live view stays the default; this is the "see everything"
+// escape hatch so information is hidden but never lost.
+type TLine = { t: string; dim?: boolean; italic?: boolean; color?: string };
+function flattenTranscript(items: Item[]): TLine[] {
+  const out: TLine[] = [];
+  for (const it of items) {
+    const body = (it.full ?? it.text).replace(/\n+$/, "");
+    if (!body && it.kind !== "user") continue;
+    out.push({ t: "" }); // blank line between blocks
+    if (it.kind === "user") {
+      body.split("\n").forEach((l, i) => out.push({ t: (i === 0 ? "› " : "  ") + l, color: "cyan" }));
+    } else if (it.kind === "reasoning" || (it.kind === "notice" && it.full !== undefined)) {
+      const lines = body.split("\n");
+      out.push({ t: `✻ thinking (${lines.length} line${lines.length === 1 ? "" : "s"})`, dim: true, color: accent() });
+      lines.forEach((l, i) => out.push({ t: (i === 0 ? "• " : "  ") + l, dim: true, italic: true }));
+    } else if (it.kind === "tool") {
+      out.push({ t: it.text, dim: true });
+      if (it.full && it.full !== it.text) it.full.replace(/\n+$/, "").split("\n").forEach((l) => out.push({ t: "    " + l, dim: true }));
+    } else if (it.kind === "diff") {
+      body.split("\n").forEach((l) => out.push({ t: l }));
+    } else {
+      body.split("\n").forEach((l) => out.push({ t: l, dim: it.kind === "notice" }));
+    }
+  }
+  return out;
+}
+
+function Transcript({ items, onClose }: { items: Item[]; onClose: () => void }) {
+  const { stdout } = useStdout();
+  const rows = Math.max(6, (stdout?.rows ?? 30) - 2); // leave a row for the header
+  const lines = flattenTranscript(items);
+  const maxScroll = Math.max(0, lines.length - rows);
+  const [scroll, setScroll] = useState(1e9); // open at the bottom (latest); clamped to maxScroll below
+  const at = Math.min(scroll, maxScroll);
+  useInput((input, key) => {
+    if (key.escape || (key.ctrl && input === "t")) return onClose();
+    if (key.upArrow) setScroll(Math.max(0, at - 1));
+    else if (key.downArrow) setScroll(Math.min(maxScroll, at + 1));
+    else if (key.pageUp) setScroll(Math.max(0, at - rows));
+    else if (key.pageDown) setScroll(Math.min(maxScroll, at + rows));
+    else if (input === "g") setScroll(0);
+    else if (input === "G") setScroll(maxScroll);
+  });
+  const view = lines.slice(at, at + rows);
+  return (
+    <Box flexDirection="column">
+      <Text color={accent()} bold>
+        {` TRANSCRIPT · full, nothing folded · ↑↓/PgUp·PgDn/g·G scroll · esc or ctrl+t closes · ${lines.length ? at + 1 : 0}–${Math.min(at + rows, lines.length)}/${lines.length}`}
+      </Text>
+      {view.map((l, i) => (
+        <Text key={i} color={l.color} dimColor={l.dim} italic={l.italic}>
+          {l.t || " "}
+        </Text>
+      ))}
+    </Box>
+  );
 }
 
 // ─── header helpers ────────────────────────────────────────────────────────────
@@ -323,6 +384,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [prompt, setPrompt] = useState<{ title: string; options: { label: string; value: unknown; key?: string }[]; resolve: (v: unknown) => void } | null>(null);
   const [promptSel, setPromptSel] = useState(0);
   const [reasoningOpen, setReasoningOpen] = useState(false);
+  const [showTranscript, setShowTranscript] = useState(false); // Ctrl+T full-transcript overlay
   // Live checklist mirror: TodoPanel reads this, and `Working` derives its spinner verb from the
   // in_progress item. The tool emits on every todo_write — keeps the UI in lockstep with the agent.
   const [todos, setTodos] = useState<Todo[]>(() => currentTodos());
@@ -441,7 +503,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       setCurrent((cur) => {
         const committed = cur.map((it) =>
           it.kind === "reasoning"
-            ? { ...it, kind: "notice" as const, text: `✻ thought · ${it.text.split("\n").filter((l) => l.trim()).length} lines` }
+            ? { ...it, kind: "notice" as const, text: `✻ thought · ${it.text.split("\n").filter((l) => l.trim()).length} lines`, full: it.text }
             : it,
         );
         if (committed.length) setHistory((h) => [...h, ...committed]);
@@ -481,6 +543,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   }, [working, prompt, handleSubmit]);
 
   useInput((input, key) => {
+    if (key.ctrl && input === "t") return setShowTranscript((x) => !x); // open/close the full-transcript overlay
+    if (showTranscript) return; // while open, the overlay's own useInput owns every key (scroll / esc)
     if (prompt) {
       const opts = prompt.options;
       if (key.upArrow) setPromptSel((s) => (s - 1 + opts.length) % opts.length);
@@ -514,6 +578,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     }
     else if (key.tab && key.shift && cycleApproval) setStatus((s) => ({ ...s, approval: cycleApproval(s.approval) }));
   });
+
+  if (showTranscript) return <Transcript items={[...history, ...current]} onClose={() => setShowTranscript(false)} />;
 
   return (
     <Box flexDirection="column">

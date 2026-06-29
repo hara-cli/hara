@@ -348,6 +348,34 @@ test("App commits a notice from a fast (slash-like) turn — no awaited agent ru
   unmount();
 });
 
+test("Ctrl+T transcript overlay: reasoning folds inline but shows FULL in the overlay; esc closes", async () => {
+  const onSubmit = async (line, h) => {
+    h.sink.reasoningDelta("first line of the secret reasoning\nsecond line\nthird line");
+    h.sink.assistantDelta("Done.");
+    await tick(60);
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("do it");
+  await tick();
+  stdin.write("\r");
+  await tick(160); // turn finishes → reasoning commits, folded to "✻ thought · N lines"
+  const folded = strip(lastFrame());
+  assert.ok(folded.includes("thought · 3 lines"), "committed reasoning is folded inline to one line");
+  assert.ok(!folded.includes("secret reasoning"), "full reasoning text is NOT inline once committed");
+  stdin.write("\x14"); // Ctrl+T → open overlay
+  await tick(80);
+  const overlay = strip(lastFrame());
+  assert.ok(overlay.includes("TRANSCRIPT"), "transcript overlay opened");
+  assert.ok(overlay.includes("secret reasoning"), "overlay shows the FULL reasoning (nothing folded)");
+  stdin.write("\x1b"); // Esc → close
+  await tick(80);
+  assert.ok(strip(lastFrame()).includes("Type a task"), "overlay closed — input box back");
+  unmount();
+});
+
 test("App type-ahead: Esc while working clears the queue (stop means stop)", async () => {
   const seen = [];
   let release;
