@@ -2768,12 +2768,34 @@ program.action(async (opts) => {
           }
           if (byName.has(nm))
             return void h.sink.notice(`/${nm} isn't wired into the TUI yet — use \`hara ${nm} …\` as a subcommand, or HARA_TUI=0.`);
-          // /<skill> — a user-invocable skill (built-in, global, or plugin) loads its body into your next message
+          // /<skill> — a user-invocable skill (built-in/global/plugin). ENTER it: load the skill + run a kickoff
+          // turn so the agent acts at once (e.g. design mode opens its live workspace + surfaces prior progress).
           {
             const sk = loadSkillIndex(cwd).find((s) => s.id === nm && s.userInvocable);
             if (sk) {
-              recalledContext += (recalledContext ? "\n\n" : "") + `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}${arg ? `\n\nThe user's request: ${arg}` : ""}`;
-              return void h.sink.notice(`↗ loaded skill ${sk.id} — ${arg ? "send your next message to run it" : "now describe what you want"}`);
+              h.sink.notice(`↗ entering ${sk.id}…`);
+              history.push({
+                role: "user",
+                content: `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${arg ? ` — request: ${arg}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`,
+              });
+              const skin = stats.input;
+              const skout = stats.output;
+              // `h.approval` is the TUI-level union (includes "plan"); runAgent wants the config-level
+              // ApprovalMode (no "plan"). Inside a /<skill> kickoff "plan" wouldn't make sense anyway —
+              // fall back to "suggest" so we keep the user's confirm gate without crashing the type check.
+              const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
+              try {
+                await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: h.signal, fallback: fbOpt });
+              } catch (e: any) {
+                h.sink.notice(`[error] ${e?.message ?? e}`);
+              }
+              if (!meta.title) {
+                meta.title = await nameSession(provider, history);
+                h.sink.session(meta.title);
+              }
+              h.sink.usage(stats.input - skin, stats.output - skout);
+              saveSession(meta, history);
+              return;
             }
           }
           const near = nearest(nm, [...byName.keys()]);
