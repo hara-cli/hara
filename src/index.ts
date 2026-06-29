@@ -2936,8 +2936,23 @@ program.action(async (opts) => {
       if (!cmd) {
         const sk = loadSkillIndex(cwd).find((s) => s.id === name && s.userInvocable);
         if (sk) {
-          recalledContext += (recalledContext ? "\n\n" : "") + `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}${rest.length ? `\n\nThe user's request: ${rest.join(" ")}` : ""}`;
-          out(c.dim(`↗ loaded skill ${sk.id} — ${rest.length ? "send your next message to run it" : "now describe what you want"}\n`));
+          // ENTER the mode: load the skill + run a kickoff turn now (mirrors the TUI path) so e.g. /design
+          // opens its workspace + surfaces prior progress immediately, instead of just staging context.
+          out(c.dim(`↗ entering ${sk.id}…\n`));
+          history.push({
+            role: "user",
+            content: `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest.length ? ` — request: ${rest.join(" ")}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`,
+          });
+          currentTurn = new AbortController();
+          try {
+            await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt });
+          } catch (e: any) {
+            out(c.red(`\n[error] ${e.message}\n`));
+          } finally {
+            currentTurn = null;
+          }
+          if (!meta.title) meta.title = await nameSession(provider, history);
+          saveSession(meta, history);
           continue;
         }
         const near = nearest(name, [...byName.keys()]);
