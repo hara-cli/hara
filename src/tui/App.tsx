@@ -107,19 +107,19 @@ function Block({ item, open }: { item: Item; open?: boolean }) {
     case "assistant":
       return <Text>{renderMarkdown(item.text)}</Text>; // headers/bold/inline-code/bullets + verbatim fences
     case "reasoning": {
-      // Print the FULL reasoning up to MAX lines (Codex-style); collapse only when longer — keep the live
-      // tail visible with a clear toggle. ctrl-r expands/collapses the full text.
-      const MAX = 14;
+      // Codex-style: stream the reasoning dim + italic with a leading "• " bullet; show the full text up to
+      // MAX lines, fold longer to the live tail with a "… +N lines" summary. ctrl-r expands/collapses.
+      const MAX = 10;
       const lines = item.text.replace(/\n+$/, "").split("\n");
       const long = lines.length > MAX;
       const shown = open || !long ? lines : lines.slice(-MAX); // short or expanded → all; long & collapsed → live tail
-      const hidden = long && !open ? lines.length - MAX : 0;
-      const hint = long ? (open ? " · ctrl-r collapse" : ` · +${hidden} earlier · ctrl-r expand`) : "";
+      const omitted = long && !open ? lines.length - MAX : 0;
+      const hint = long ? (open ? " · ctrl-r collapse" : ` · … +${omitted} lines · ctrl-r expand`) : "";
       return (
         <Box flexDirection="column">
           <Text color={accent()} dimColor>{`✻ thinking … ${lines.length} line${lines.length === 1 ? "" : "s"}${hint}`}</Text>
           {shown.map((l, i) => (
-            <Text key={i} dimColor>{`│ ${l}`}</Text>
+            <Text key={i} dimColor italic>{`${i === 0 ? "• " : "  "}${l}`}</Text>
           ))}
         </Box>
       );
