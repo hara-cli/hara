@@ -5,7 +5,7 @@ import type { SandboxMode } from "./sandbox.js";
 import type { HooksConfig } from "./hooks.js";
 import type { NotifyMode } from "./notify.js";
 
-export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai" | "hara-gateway";
+export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai" | "glm" | "deepseek" | "openrouter" | "hara-gateway";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
 
 export interface McpServerConfig {
@@ -87,6 +87,24 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   },
   "qwen-oauth": { model: "coder-model", envKey: "QWEN_OAUTH_TOKEN" },
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
+  // GLM / DeepSeek / OpenRouter are OpenAI-compatible: buildProvider routes them through the
+  // openai path (createOpenAIProvider) using the preset baseURL below. The preset baseURL is
+  // applied by loadConfig (merged.baseURL ?? d.baseURL), so the setup wizard never asks for a URL.
+  glm: {
+    model: "glm-4.6",
+    baseURL: "https://open.bigmodel.cn/api/paas/v4",
+    envKey: "GLM_API_KEY",
+  },
+  deepseek: {
+    model: "deepseek-chat",
+    baseURL: "https://api.deepseek.com",
+    envKey: "DEEPSEEK_API_KEY",
+  },
+  openrouter: {
+    model: "openai/gpt-4o-mini",
+    baseURL: "https://openrouter.ai/api/v1",
+    envKey: "OPENROUTER_API_KEY",
+  },
   "hara-gateway": { model: "", envKey: "HARA_GATEWAY_TOKEN" }, // B-end: enrolled device → token in ~/.hara/org.json, routed by the gateway
 };
 
@@ -228,4 +246,10 @@ export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
 
 export function providerEnvKey(provider: ProviderId): string {
   return (PROVIDER_DEFAULTS[provider] ?? PROVIDER_DEFAULTS.anthropic).envKey;
+}
+
+/** Preset base URL for a provider (undefined for anthropic/openai which use their SDK defaults).
+ *  Used by `hara setup` to write a self-contained baseURL for GLM/DeepSeek/OpenRouter. */
+export function providerDefaultBaseURL(provider: ProviderId): string | undefined {
+  return PROVIDER_DEFAULTS[provider]?.baseURL;
 }

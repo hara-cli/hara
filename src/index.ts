@@ -21,6 +21,7 @@ import {
   writeConfigValue,
   setModelVisionOverride,
   providerEnvKey,
+  providerDefaultBaseURL,
   CONFIG_KEYS,
   APPROVAL_MODES,
   SANDBOX_MODES,
@@ -161,7 +162,10 @@ async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
   // override (so `--profile`/`HARA_PROFILE`-overridden values flow + sidecar provider builds work).
   const provider: ProviderId = (cfg.provider && cfg.provider !== "hara-gateway" ? cfg.provider : ap.provider) || "anthropic";
   const apiKey = cfg.apiKey ?? ap.apiKey;
-  const baseURL = cfg.baseURL ?? ap.baseURL;
+  // Resolve base URL: explicit (cfg → profile) wins; otherwise fall back to the provider's preset
+  // (GLM/DeepSeek/OpenRouter). This keeps `profile add --byok --provider glm` working even when the
+  // user didn't pass --base-url (anthropic/openai stay undefined → their SDK defaults).
+  const baseURL = cfg.baseURL ?? ap.baseURL ?? providerDefaultBaseURL(provider);
   const model = cfg.model || effectiveModel(ap);
 
   if (provider === "qwen-oauth") {
@@ -193,9 +197,118 @@ function authHint(cfg: HaraConfig): string {
   return `Set ${c.bold(providerEnvKey(provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara setup")}.`;
 }
 
-const SETUP_DEFAULT_MODEL: Record<string, string> = { anthropic: "claude-opus-4-8", qwen: "qwen-plus", openai: "gpt-4o-mini", "qwen-oauth": "coder-model" };
+const SETUP_DEFAULT_MODEL: Record<string, string> = { anthropic: "claude-opus-4-8", qwen: "qwen-plus", openai: "gpt-4o-mini", glm: "glm-4.6", deepseek: "deepseek-chat", openrouter: "openai/gpt-4o-mini", "qwen-oauth": "coder-model" };
 
-/** Interactive first-run setup: pick a provider, (optional) base URL, API key, and model → ~/.hara/config.json. */
+/** Numbered provider menu for `hara setup`. Order is the displayed order; `id` maps to a ProviderId
+ *  (or the special "custom"/"qwen-oauth" routes). GLM/DeepSeek carry a preset base URL so the user
+ *  never types one; "custom" prompts for an OpenAI-compatible base URL. */
+const SETUP_MENU: { label: string; id: ProviderId | "custom" }[] = [
+  { label: "Anthropic", id: "anthropic" },
+  { label: "OpenAI", id: "openai" },
+  { label: "GLM (Zhipu)", id: "glm" },
+  { label: "DeepSeek", id: "deepseek" },
+  { label: "Qwen (DashScope key)", id: "qwen" },
+  { label: "OpenAI-compatible (custom base URL)", id: "custom" },
+  { label: "Qwen — free, no key (browser sign-in)", id: "qwen-oauth" },
+];
+
+/** Read a secret from the TTY without echoing it (shows `*` per char). Falls back to a plain
+ *  readline question when stdin isn't a raw-capable TTY (piped input / odd terminals) so scripted
+ *  `printf 'key\n' | hara setup` still works. Handles backspace, Enter, and Ctrl-C/Ctrl-D. */
+function readSecret(prompt: string, rl: ReturnType<typeof createInterface>): Promise<string> {
+  const input = stdin;
+  if (!input.isTTY || typeof (input as any).setRawMode !== "function") {
+    // Non-TTY (piped/scripted): can't suppress echo at the terminal level; read it plainly.
+    return rl.question(prompt);
+  }
+  return new Promise<string>((resolve, reject) => {
+    stdout.write(prompt);
+    let buf = "";
+    const prevRaw = (input as any).isRaw ?? false;
+    // Pause the readline interface so it doesn't also consume keystrokes / echo while we read raw.
+    // We restore it in cleanup() before the next rl.question() runs.
+    rl.pause();
+    (input as any).setRawMode(true);
+    input.resume();
+    const onData = (chunk: Buffer): void => {
+      const s = chunk.toString("utf8");
+      for (const ch of s) {
+        const code = ch.charCodeAt(0);
+        if (ch === "\r" || ch === "\n") {
+          cleanup();
+          stdout.write("\n");
+          resolve(buf);
+          return;
+        } else if (code === 3) {
+          // Ctrl-C → abort the wizard (mirror readline's SIGINT behavior).
+          cleanup();
+          stdout.write("\n");
+          reject(new Error("cancelled"));
+          return;
+        } else if (code === 4) {
+          // Ctrl-D → end of input; resolve with whatever we have.
+          cleanup();
+          stdout.write("\n");
+          resolve(buf);
+          return;
+        } else if (code === 127 || code === 8) {
+          // Backspace/Delete.
+          if (buf.length) {
+            buf = buf.slice(0, -1);
+            stdout.write("\b \b");
+          }
+        } else if (code >= 32) {
+          buf += ch;
+          stdout.write("*");
+        }
+      }
+    };
+    const cleanup = (): void => {
+      input.removeListener("data", onData);
+      try {
+        (input as any).setRawMode(prevRaw);
+      } catch {
+        /* best-effort */
+      }
+      // Hand control back to readline for the next prompt (model question).
+      rl.resume();
+    };
+    input.on("data", onData);
+  });
+}
+
+/** One-shot validation ping: build the provider exactly as the runtime would (anthropic vs the
+ *  OpenAI-compatible path with the resolved base URL) and send a tiny prompt with a short timeout.
+ *  Never throws — returns true on a clean turn, false on any error/timeout. Used only to print a
+ *  friendly "connected" hint; the wizard saves config regardless. */
+async function pingProvider(args: { provider: ProviderId; apiKey: string; model: string; baseURL?: string }): Promise<boolean> {
+  const { provider, apiKey, model, baseURL } = args;
+  if (!apiKey || !model) return false;
+  const prov =
+    provider === "anthropic"
+      ? createAnthropicProvider({ apiKey, model, baseURL })
+      : createOpenAIProvider({ apiKey, model, baseURL, label: provider });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12_000);
+  try {
+    const r = await prov.turn({
+      system: "Reply with the single word: ok",
+      history: [{ role: "user", content: "ping" }],
+      tools: [],
+      onText: () => {},
+      signal: ctrl.signal,
+    });
+    return r.stop !== "error";
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Interactive first-run setup: pick a provider (numbered menu), API key (masked), and model →
+ *  ~/.hara/config.json. GLM/DeepSeek/OpenRouter and "custom" route through the OpenAI-compatible
+ *  path; "Qwen free" routes to the device-login flow. Storage model is unchanged (config.json 0600). */
 async function runSetup(): Promise<void> {
   if (!stdin.isTTY) {
     out(c.yellow("`hara setup` is interactive — run it in a terminal, or use `hara config set <key> <value>` in scripts.\n"));
@@ -204,19 +317,60 @@ async function runSetup(): Promise<void> {
   const rl = createInterface({ input: stdin, output: stdout });
   try {
     out(c.bold("hara setup") + c.dim(" — configure a provider, key, and model (Ctrl-C to cancel)\n\n"));
-    const provider = ((await rl.question(`Provider ${c.dim("anthropic / qwen / openai")} [anthropic]: `)).trim() || "anthropic").toLowerCase();
-    let baseURL = "";
-    if (provider === "qwen" || provider === "openai") {
-      baseURL = (await rl.question(`Base URL ${c.dim("(blank = default; set for an OpenAI-compatible endpoint, e.g. GLM/Kimi/DashScope)")}: `)).trim();
+    SETUP_MENU.forEach((m, i) => out(`  ${c.bold(String(i + 1))}) ${m.label}\n`));
+    out("\n");
+    const pick = (await rl.question(`Provider [1]: `)).trim() || "1";
+    const idx = Number.parseInt(pick, 10);
+    const choice = Number.isInteger(idx) && idx >= 1 && idx <= SETUP_MENU.length ? SETUP_MENU[idx - 1] : SETUP_MENU[0];
+
+    // Route 7: Qwen free device login — no key, no model prompt. Reuse the existing flow + config writes.
+    if (choice.id === "qwen-oauth") {
+      try {
+        await qwenDeviceLogin((m) => out(m + "\n"));
+        writeConfigValue("provider", "qwen-oauth");
+        writeConfigValue("model", "coder-model");
+        out(c.green("\n✓ Qwen OAuth complete — provider set to qwen-oauth (model coder-model).\n") + c.dim(`Check it with ${c.bold("hara doctor")}, then just run ${c.bold("hara")}.\n`));
+      } catch (e: any) {
+        out(c.red(`\nQwen OAuth failed: ${e?.message ?? e}\n`));
+      }
+      return;
     }
-    const envKey = providerEnvKey(provider as ProviderId);
-    const apiKey = (await rl.question(`API key ${c.dim(`(blank = use the ${envKey} env var)`)}: `)).trim();
-    const model = (await rl.question(`Model [${SETUP_DEFAULT_MODEL[provider] ?? "?"}]: `)).trim() || SETUP_DEFAULT_MODEL[provider] || "";
+
+    // Resolve the concrete provider id + base URL. "custom" = OpenAI-compatible: ask for the base
+    // URL and store the chosen provider as "openai" (the generic OpenAI-compatible dispatch).
+    let provider: ProviderId;
+    let baseURL = "";
+    if (choice.id === "custom") {
+      provider = "openai";
+      baseURL = (await rl.question(`Base URL ${c.dim("(OpenAI-compatible endpoint, e.g. https://your-host/v1)")}: `)).trim();
+    } else {
+      provider = choice.id;
+      // GLM/DeepSeek/OpenRouter carry a preset base URL (PROVIDER_DEFAULTS) — written explicitly so
+      // the personal profile is self-contained. anthropic/openai use their built-in defaults.
+      baseURL = providerDefaultBaseURL(provider) ?? "";
+    }
+
+    const envKey = providerEnvKey(provider);
+    const apiKey = (await readSecret(`API key ${c.dim(`(masked; blank = use the ${envKey} env var)`)}: `, rl)).trim();
+    const defaultModel = SETUP_DEFAULT_MODEL[choice.id === "custom" ? "openai" : provider] ?? "";
+    const model = (await rl.question(`Model [${defaultModel || "?"}]: `)).trim() || defaultModel;
+
     writeConfigValue("provider", provider);
     if (baseURL) writeConfigValue("baseURL", baseURL);
     if (apiKey) writeConfigValue("apiKey", apiKey);
     if (model) writeConfigValue("model", model);
+
+    // One-shot validation ping (best-effort; never blocks saving). Only when we have a key + model.
+    if (apiKey && model) {
+      out(c.dim("\nChecking connection… "));
+      const ok = await pingProvider({ provider, apiKey, model, baseURL: baseURL || undefined });
+      out(ok ? c.green("✓ connected\n") : c.yellow(`⚠ couldn't reach ${provider} (saved anyway)\n`));
+    }
+
     out(c.green(`\n✓ saved to ${configPath()}\n`) + c.dim(`Check it with ${c.bold("hara doctor")}, then just run ${c.bold("hara")}.\n`));
+  } catch (e: any) {
+    if (e?.message === "cancelled") out(c.dim("\n(cancelled)\n"));
+    else throw e;
   } finally {
     rl.close();
   }
@@ -1126,7 +1280,7 @@ profileCmd
   .option("--code <code>", "(gateway) enrollment code from your admin")
   .option("--label <label>", "human-friendly label for the profile")
   .option("--byok", "(byok) BYOK profile — bring your own provider key")
-  .option("--provider <id>", "(byok) anthropic | qwen | openai | qwen-oauth")
+  .option("--provider <id>", "(byok) anthropic | openai | glm | deepseek | openrouter | qwen | qwen-oauth")
   .option("--key <key>", "(byok) API key (else read from the provider's env var at use-time)")
   .option("--base-url <url>", "(byok) override the provider base URL (OpenAI-compatible endpoints)")
   .option("--model <model>", "(byok) default model for this profile")
@@ -1181,7 +1335,7 @@ profileCmd
       out(c.dim(`Switch to it with \`hara profile use ${id}\`.\n`));
       return;
     }
-    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|qwen|openai|qwen-oauth [--key … --base-url … --model …]\n"));
+    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|openai|glm|deepseek|openrouter|qwen|qwen-oauth [--key … --base-url … --model …]\n"));
     process.exit(1);
   });
 
