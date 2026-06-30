@@ -29,6 +29,9 @@ export interface Helpers {
   sink: Sink;
   confirm: (q: string) => Promise<boolean | "always">;
   select: (title: string, options: { label: string; value: string }[]) => Promise<string>;
+  /** ask_user: pose a question (optionally with likely answers) and resolve to the user's answer (chosen
+   *  option or free text). Routes through the same prompt/input channel as confirm/select. */
+  ask: (question: string, options?: string[]) => Promise<string>;
   setApproval: (m: Approval) => void;
   signal: AbortSignal;
   exit: () => void;
@@ -383,6 +386,9 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [status, setStatus] = useState<Status>({ ...initialStatus, agents: 0 });
   const [prompt, setPrompt] = useState<{ title: string; options: { label: string; value: unknown; key?: string }[]; resolve: (v: unknown) => void } | null>(null);
   const [promptSel, setPromptSel] = useState(0);
+  // Free-text question prompt (ask_user with no/declined options): re-enables the InputBox to capture one
+  // line, then resolves the awaiting tool with that text. Separate from `prompt` (the select-only path).
+  const [askText, setAskText] = useState<{ title: string; resolve: (v: string) => void } | null>(null);
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false); // Ctrl+T full-transcript overlay
   // Live checklist mirror: TodoPanel reads this, and `Working` derives its spinner verb from the
@@ -457,6 +463,14 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const handleSubmit = useCallback(
     async (line: string, images?: ImageAttachment[]): Promise<void> => {
       const t = line.trim();
+      // A free-text question (ask_user) is awaiting an answer: this submission IS the answer, not a new turn.
+      if (askText) {
+        const r = askText.resolve;
+        setAskText(null);
+        setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]);
+        r(t);
+        return;
+      }
       if ((!t && !images?.length) || prompt) return; // nothing to send, or a choice is pending
       if (working) {
         // type-ahead: hold the message in the pool; all pooled messages are sent together when the turn ends
@@ -491,9 +505,25 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           { label: "No  (esc)", value: false, key: "n" },
         ]);
       const selectFn = (title: string, options: { label: string; value: string }[]): Promise<string> => openPrompt(title, options);
+      // Free-text question: re-enable the InputBox to read one line (resolves via handleSubmit's askText branch).
+      const askTextFn = (title: string): Promise<string> =>
+        new Promise((resolve) => setAskText({ title, resolve }));
+      // ask_user: when options are given, offer them as a select + a "type my own" escape hatch; otherwise (or
+      // when the user chooses to type their own) capture a free-text line. Returns the chosen/typed answer.
+      const OTHER = " __ask_other__"; // sentinel value for the "type my own" option
+      const askFn = async (question: string, options?: string[]): Promise<string> => {
+        if (options && options.length) {
+          const choice = await openPrompt<string>(question, [
+            ...options.map((o) => ({ label: o, value: o })),
+            { label: "✎ Type my own answer", value: OTHER },
+          ]);
+          if (choice !== OTHER) return choice;
+        }
+        return askTextFn(question);
+      };
       const setApprovalFn = (m: Approval): void => setStatus((s) => ({ ...s, approval: m }));
       try {
-        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval, drainQueue }, images);
+        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, ask: askFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval, drainQueue }, images);
       } catch (e: unknown) {
         pushCurrent("notice", `error: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -524,13 +554,13 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         }, 30_000);
       }
     },
-    [working, prompt, onSubmit, pushCurrent, model, exit, drainQueue, noteVisionIfNeeded],
+    [working, prompt, askText, onSubmit, pushCurrent, model, exit, drainQueue, noteVisionIfNeeded],
   );
 
   // Drain the type-ahead pool: when the turn finishes (working → false) and nothing awaits a choice, COALESCE
   // every pooled message into ONE turn and send it — additions/clarifications go to the agent together, in order.
   useEffect(() => {
-    if (working || prompt || drainingRef.current || !queueRef.current.length) return;
+    if (working || prompt || askText || drainingRef.current || !queueRef.current.length) return;
     drainingRef.current = true;
     const batch = queueRef.current;
     queueRef.current = [];
@@ -540,11 +570,20 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     void Promise.resolve(handleSubmit(line, images.length ? images : undefined)).finally(() => {
       drainingRef.current = false;
     });
-  }, [working, prompt, handleSubmit]);
+  }, [working, prompt, askText, handleSubmit]);
 
   useInput((input, key) => {
     if (key.ctrl && input === "t") return setShowTranscript((x) => !x); // open/close the full-transcript overlay
     if (showTranscript) return; // while open, the overlay's own useInput owns every key (scroll / esc)
+    // Free-text question awaiting an answer: Esc cancels (empty answer); all other keys belong to the InputBox.
+    if (askText) {
+      if (key.escape) {
+        const r = askText.resolve;
+        setAskText(null);
+        r("");
+      }
+      return;
+    }
     if (prompt) {
       const opts = prompt.options;
       if (key.upArrow) setPromptSel((s) => (s - 1 + opts.length) % opts.length);
@@ -602,14 +641,20 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           <Text dimColor>{`   ↑↓ or 1–${prompt.options.length} to choose · Enter · Esc cancels`}</Text>
         </Box>
       )}
-      {pool.length > 0 && !prompt && (
+      {askText && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color="yellow">{`  ? ${stripAnsi(askText.title)}`}</Text>
+          <Text dimColor>{"   type your answer below · Enter to send · Esc cancels"}</Text>
+        </Box>
+      )}
+      {pool.length > 0 && !prompt && !askText && (
         <Box flexDirection="column">
           {pool.map((l, i) => (
             <Text key={i} color={accent()}>{`  › ${l.length > 72 ? l.slice(0, 72) + "…" : l}`}</Text>
           ))}
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} isActive={!prompt} working={working} queued={pool.length} vim={vim} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
+      <InputBox status={status} cwd={cwd} isActive={!prompt} working={working && !askText} queued={pool.length} vim={vim} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );
 }

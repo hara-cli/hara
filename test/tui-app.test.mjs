@@ -249,6 +249,51 @@ test("App select: numbered options — typing a number picks it directly", async
   unmount();
 });
 
+test("App ask_user (h.ask) with options: shows numbered menu + a 'type my own' escape, returns picked option", async () => {
+  let answer = null;
+  const onSubmit = async (line, h) => {
+    answer = await h.ask("Which database?", ["SQLite", "Postgres"]);
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  const f = strip(lastFrame());
+  assert.ok(f.includes("Which database?"), "question shown");
+  assert.ok(f.includes("1. SQLite") && f.includes("2. Postgres"), "options numbered");
+  assert.ok(f.includes("Type my own answer"), "free-text escape hatch offered");
+  stdin.write("2"); // pick Postgres directly
+  await tick(80);
+  assert.equal(answer, "Postgres", "returns the chosen option text");
+  unmount();
+});
+
+test("App ask_user (h.ask) free-text: no options → input box captures the typed answer", async () => {
+  let answer = null;
+  const onSubmit = async (line, h) => {
+    answer = await h.ask("Where should migrations live?");
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("Where should migrations live?"), "free-text question shown");
+  stdin.write("db/migrations");
+  await tick();
+  stdin.write("\r");
+  await tick(80);
+  assert.equal(answer, "db/migrations", "the typed answer is returned as the tool's result");
+  unmount();
+});
+
 test("App renders assistant markdown (bold/inline-code styled, not raw)", async () => {
   const onSubmit = async (line, h) => {
     h.sink.assistantDelta("Use **bold** and `code` now.");

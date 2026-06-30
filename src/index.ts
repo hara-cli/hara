@@ -120,6 +120,7 @@ import "./tools/codebase.js"; // register codebase_search (repo as a knowledge b
 import "./tools/todo.js"; // register todo_write (inline task checklist)
 import "./tools/send.js"; // register send_file (self-gates on HARA_GATEWAY — pushes a file to the chat)
 import "./tools/external_agent.js"; // register external_agent (delegate to claude-code / codex headless)
+import "./tools/ask_user.js"; // register ask_user (pause mid-turn to ask the user a structured question)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -2217,6 +2218,21 @@ program.action(async (opts) => {
     },
   });
   const confirm = async (q: string) => (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
+  // ask_user (classic REPL): print the question + a numbered menu (matching the setup menu look) and read the
+  // answer through the SAME rl.question channel confirm uses. A bare option number selects it; any other text
+  // is taken as a free-text answer — so the user can always type their own response.
+  const askUser = async (q: string, options?: string[]): Promise<string> => {
+    out(c.bold("\n? ") + q + "\n");
+    const opts = (options ?? []).map((o) => o.trim()).filter(Boolean);
+    opts.forEach((o, i) => out(`  ${c.bold(String(i + 1))}) ${o}\n`));
+    const hint = opts.length ? c.dim(`(1-${opts.length} to pick, or type your own answer) `) : c.dim("(type your answer) ");
+    const raw = (await rl.question(`${c.cyan("›")} ${hint}`)).trim();
+    if (opts.length) {
+      const n = Number.parseInt(raw, 10);
+      if (Number.isInteger(n) && n >= 1 && n <= opts.length) return opts[n - 1];
+    }
+    return raw;
+  };
   // shift+tab cycles the approval mode (classic REPL only; the TUI handles its own keys).
   // Bare /approval is the reliable fallback everywhere.
   if (stdin.isTTY && !useTui) {
@@ -2939,7 +2955,7 @@ program.action(async (opts) => {
               // fall back to "suggest" so we keep the user's confirm gate without crashing the type check.
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               try {
-                await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: h.signal, fallback: fbOpt });
+                await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: h.signal, fallback: fbOpt });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -2982,7 +2998,7 @@ program.action(async (opts) => {
           const pout = stats.output;
           await runAgent(history, {
             provider,
-            ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot, locate: locateScreenshot },
+            ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
             approval: "suggest",
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n),
@@ -3011,7 +3027,7 @@ program.action(async (opts) => {
             const xout = stats.output;
             await runAgent(history, {
               provider,
-              ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot, locate: locateScreenshot },
+              ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
               approval: choice as ApprovalMode,
               memory: buildMemory(),
               confirm: h.confirm,
@@ -3037,7 +3053,7 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         await runAgent(history, {
           provider,
-          ctx: { cwd, sandbox, spawn, ui, describeImage: describeScreenshot, locate: locateScreenshot },
+          ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
           approval: appr,
           memory: buildMemory(),
           confirm: h.confirm,
@@ -3099,7 +3115,7 @@ program.action(async (opts) => {
           });
           currentTurn = new AbortController();
           try {
-            await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt });
+            await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           } finally {
@@ -3125,7 +3141,7 @@ program.action(async (opts) => {
     currentTurn = new AbortController();
     const t0 = Date.now();
     try {
-      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt });
+      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     } finally {

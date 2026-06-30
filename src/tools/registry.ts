@@ -18,6 +18,13 @@ export interface ToolContext {
   spawn?: (task: string, role?: string) => Promise<string>;
   /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */
   ui?: UiSink;
+  /** Ask the user a structured question mid-turn and await their answer (drives the `ask_user` tool).
+   *  Set only on INTERACTIVE run paths (classic REPL + TUI), routed through the SAME input channel as the
+   *  approval `confirm` prompt. Absent in headless / non-TTY / `-p` / gateway / sub-agent runs — so the tool
+   *  must treat `ask === undefined` as "no interactive user available" and not block. When `options` are
+   *  given they are offered as a numbered list; the user may also type a free-text answer. Returns the chosen
+   *  option text or the free text. */
+  ask?: (question: string, options?: string[]) => Promise<string>;
   /** describe an image file via the vision sidecar (lets the computer tool return a screenshot as text);
    *  `hint` focuses the description on a goal (e.g. "the Login button") for actionable RPA output */
   describeImage?: (path: string, hint?: string) => Promise<string>;
