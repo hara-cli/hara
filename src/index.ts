@@ -2740,6 +2740,7 @@ program.action(async (opts) => {
         orgId: __activeP.kind === "gateway" ? __activeP.deviceId || __activeP.id : undefined,
         routeHost: __routeForHeader?.host,
         modelSource: __modelSource,
+        visionModel: cfg.visionModel,
       },
       visionNotice: __visionNotice,
       cycleApproval: (m) => cycleMode(m),

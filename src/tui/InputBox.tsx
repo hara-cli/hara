@@ -53,7 +53,9 @@ const TopBorder = memo(function TopBorder({ name, width }: { name: string; width
 
 // Bottom border carries token usage + concurrency at the right corner (modes moved to ModeBar below).
 const BottomBorder = memo(function BottomBorder({ s, width }: { s: Status; width: number }) {
-  const usage = `↑${tok(s.input)} ↓${tok(s.output)}${s.ctxPct > 0 ? ` · ctx ${s.ctxPct}%` : ""}`;
+  // Always render `ctx N%` (from 0 on) so the field is present from the first frame — otherwise it
+  // pops in mid-session the moment ctx first exceeds 0, shifting the whole bottom-border layout.
+  const usage = `↑${tok(s.input)} ↓${tok(s.output)} · ctx ${s.ctxPct}%`;
   const label = s.agents > 0 ? `${usage} · ⛁${s.agents}` : `${usage} · ⛁ idle`;
   const left = Math.max(2, width - label.length - 3);
   return (

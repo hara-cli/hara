@@ -69,6 +69,10 @@ export interface HeaderInfo {
   /** When `kind === 'org'`: source of the current model — "org default" / "user override"
    *  / "/model override". Drives the suffix of the model line. */
   modelSource?: string;
+  /** The vision sidecar (describer) model, i.e. `cfg.visionModel` — the model that reads pasted
+   *  images when the main model is text-only. When set, the model line gets a dim `· vision <model>`
+   *  clause. When undefined we render nothing (native-vision main models stay silent — 顾雅 spec). */
+  visionModel?: string;
 }
 
 export interface AppProps {
@@ -266,6 +270,15 @@ export function shortenSession(uuid: string | undefined | null): string {
 const FIELD_PAD = 10;
 const padField = (name: string): string => name.padEnd(FIELD_PAD, " ");
 
+/** Dim trailing clause for the model line: the vision sidecar (only when configured) then a subtle
+ *  codex-style `/model` hint. Pure so the composition (spacing, ordering, silence-when-unset) can be
+ *  pinned in a unit test without rendering React. Returns "" when there is nothing to show beyond
+ *  the hint — the hint itself is always present (it's the discoverability affordance). */
+export function modelLineSuffix(visionModel?: string): string {
+  const vision = visionModel ? `  ·  vision ${visionModel}` : "";
+  return `${vision}  ·  /model to change`;
+}
+
 function HeaderCard(props: HeaderInfo) {
   const { version, modelLabel, cwd, agentsMdLoaded, session, kind } = props;
   const home = process.env.HOME ?? "";
@@ -295,6 +308,7 @@ function HeaderCard(props: HeaderInfo) {
           <Text dimColor>{props.routeHost}</Text>
         </Text>
       ) : null}
+      <Text dimColor>{modelLineSuffix(props.visionModel)}</Text>
     </Text>
   );
   return (
@@ -311,6 +325,7 @@ function HeaderCard(props: HeaderInfo) {
           <Text dimColor>{`  ${padField("model")}`}</Text>
           <Text>{modelLabel}</Text>
           {props.modelSource ? <Text dimColor>{`  ·  from ${props.modelSource}`}</Text> : null}
+          <Text dimColor>{modelLineSuffix(props.visionModel)}</Text>
         </Text>
       ) : null}
       <Text>
@@ -325,7 +340,7 @@ function HeaderCard(props: HeaderInfo) {
         </Text>
       ) : null}
       <Text>{" "}</Text>
-      <Text dimColor>{"  /help · @file · shift+tab · esc"}</Text>
+      <Text dimColor>{"  /help · @file · shift+tab · esc · ctrl+t transcript · ctrl+r reasoning"}</Text>
     </Box>
   );
 }

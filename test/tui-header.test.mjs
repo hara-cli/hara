@@ -2,7 +2,7 @@
 // rendering without React, so they can be pinned exactly — no escape codes, no layout drift.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractHost, shortenHome, shortenSession } from "../dist/tui/App.js";
+import { extractHost, shortenHome, shortenSession, modelLineSuffix } from "../dist/tui/App.js";
 import { routeHost } from "../dist/profile/profile.js";
 
 test("extractHost: returns host-only for canonical URLs (no scheme, no path, no query)", () => {
@@ -48,6 +48,19 @@ test("shortenSession: 8-char prefix, never the whole id; safe on missing input",
   assert.equal(shortenSession(""), "");
   assert.equal(shortenSession(undefined), "");
   assert.equal(shortenSession(null), "");
+});
+
+test("modelLineSuffix: appends '· vision <model>' only when a visionModel is set, always the /model hint", () => {
+  // With a describer configured → vision clause + the /model discoverability hint.
+  const withVision = modelLineSuffix("qwen3.7-plus");
+  assert.ok(withVision.includes("vision qwen3.7-plus"), "vision sidecar shown when set");
+  assert.ok(withVision.includes("/model to change"), "codex-style /model hint present");
+  assert.ok(withVision.indexOf("vision") < withVision.indexOf("/model"), "vision clause precedes the /model hint");
+  // No describer → NO vision clause (silence beats a fabricated describer), hint still present.
+  const noVision = modelLineSuffix(undefined);
+  assert.ok(!noVision.includes("vision"), "no vision clause when unset");
+  assert.ok(noVision.includes("/model to change"), "/model hint still present without a describer");
+  assert.equal(modelLineSuffix(""), noVision, "empty string is treated as unset (falsy)");
 });
 
 test("routeHost (profile.ts): personal on official endpoint → null (don't display)", () => {

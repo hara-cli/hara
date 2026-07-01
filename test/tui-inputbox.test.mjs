@@ -22,6 +22,8 @@ test("InputBox: session in top border, modes in the ModeBar, usage in the bottom
   assert.ok(frame.includes("confirms edits"), "active-mode description shown");
   assert.ok(frame.includes("⛁ idle"), "idle concurrency in bottom border");
   assert.ok(frame.includes("›"), "prompt arrow");
+  // ctx field is present from the very first frame (ctxPct 0) — no mid-session layout pop.
+  assert.ok(frame.includes("ctx 0%"), "ctx field renders from 0% (always present, no layout shift)");
   unmount();
 });
 

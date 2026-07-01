@@ -66,10 +66,58 @@ test("App header (personal): single-line logo + collapsed identity row, no banne
   assert.ok(!frame.includes("7bf3ee14-aaaa"), "no full uuid leak");
   // The always-on vision line is gone (顾雅 spec — lazy on first image).
   assert.ok(!frame.includes("👁"), "no always-on vision indicator in header");
+  // No visionModel configured → NO "vision <model>" clause on the identity line (stay silent).
+  assert.ok(!/vision\s+\S/.test(frame), "no 'vision <model>' clause when visionModel is unset");
+  // /model discoverability hint is always present (codex-style).
+  assert.ok(frame.includes("/model to change"), "/model discoverability hint on the model line");
+  // Footer key hints surface the transcript + reasoning shortcuts.
+  assert.ok(frame.includes("ctrl+t transcript"), "footer advertises Ctrl+T transcript overlay");
+  assert.ok(frame.includes("ctrl+r reasoning"), "footer advertises Ctrl+R reasoning expand");
   // Tip is the trimmed slash menu.
   assert.ok(frame.includes("/help"), "tip line shows /help");
   assert.ok(!frame.includes("attaches"), "tip no longer says 'attaches' (verb)");
   assert.ok(!frame.includes("cycles modes"), "tip no longer says 'cycles modes'");
+  unmount();
+});
+
+test("App header (personal w/ visionModel): identity row appends a dim '· vision <model>' clause", async () => {
+  const header = {
+    version: "9.9.9",
+    modelLabel: "qwen:glm-5",
+    cwd: "/Users/jeff/work/x",
+    kind: "personal",
+    visionModel: "qwen3.7-plus",
+  };
+  const { lastFrame, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), header, onSubmit: async () => {} }),
+  );
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(/personal\s+qwen:glm-5/.test(frame), "personal identity row still carries provider:model");
+  assert.ok(frame.includes("vision qwen3.7-plus"), "vision sidecar model surfaced on the model line");
+  assert.ok(frame.includes("/model to change"), "/model hint still present alongside the vision clause");
+  unmount();
+});
+
+test("App header (org w/ visionModel): dedicated model row appends the '· vision <model>' clause", async () => {
+  const header = {
+    version: "1.2.3",
+    modelLabel: "qwen:glm-5",
+    cwd: "/x/y",
+    kind: "org",
+    orgLabel: "Acme Inc",
+    orgId: "acme-jeff",
+    modelSource: "org default",
+    visionModel: "qwen3.7-plus",
+  };
+  const { lastFrame, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), header, onSubmit: async () => {} }),
+  );
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(/model\s+qwen:glm-5/.test(frame), "org model row present");
+  assert.ok(frame.includes("from org default"), "model source annotation retained");
+  assert.ok(frame.includes("vision qwen3.7-plus"), "vision sidecar model surfaced on the org model row");
   unmount();
 });
 
