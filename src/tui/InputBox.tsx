@@ -50,8 +50,9 @@ export function footerCwd(abs: string, home: string = process.env.HOME ?? "", ma
 
 /** Compose the single dim footer line rendered below the box. Pure so the ordering/spacing (and the
  *  optional route segment) can be pinned without rendering React. Shape (codex-style status line):
- *  `<model> · <approval>[ · <route>] · <cwd> · ↑<in> ↓<out> · ctx <pct>%`. `ctx N%` is always present
- *  (from 0 on) so the field never pops in mid-session and shifts the layout. */
+ *  `<model> · <approval>[ · <route>] · <cwd> · ↑<in> ↓<out> · ctx <pct>%`. The session name is NOT here —
+ *  it rides the input box's top-right border (see TopBorder). `ctx N%` is always present (from 0 on) so
+ *  the field never pops in mid-session and shifts the layout. */
 export function footerLine(model: string, s: Status, cwdShort: string, route?: string): string {
   const routeSeg = route ? ` · ${route}` : "";
   return `  ${model} · ${s.approval}${routeSeg} · ${cwdShort} · ↑${tok(s.input)} ↓${tok(s.output)} · ctx ${s.ctxPct}%`;
@@ -61,6 +62,24 @@ export function footerLine(model: string, s: Status, cwdShort: string, route?: s
 // route · cwd · usage · ctx. Memoized so a prompt keystroke doesn't reconcile it.
 const Footer = memo(function Footer({ model, s, cwdShort, route }: { model: string; s: Status; cwdShort: string; route?: string }) {
   return <Text dimColor>{footerLine(model, s, cwdShort, route)}</Text>;
+});
+
+// The rounded TOP edge of the input box, carrying the session name in the right corner (it "rides"
+// the border — codex-style titled panel, and where hara has always shown it). Drawn by hand because
+// ink's <Box borderStyle> has no title slot; the box below it renders with `borderTop={false}` and a
+// fixed `width`, so this line supplies the top with its two corners and everything lines up exactly.
+// Layout (total = width): `╭` + left dashes + ` ● <name> ` + `─╮`. `●` (U+25CF) is a hard 1-cell glyph
+// (unlike the emoji-presentation `⏺`, which some terminals render 2 cells wide and would skew the corner).
+const TopBorder = memo(function TopBorder({ name, width }: { name: string; width: number }) {
+  const left = Math.max(2, width - name.length - 7); // ╭(1)+ " "(1)+●(1)+" name "(len+2)+"─╮"(2)
+  return (
+    <Box>
+      <Text dimColor>{"╭" + "─".repeat(left) + " "}</Text>
+      <Text color="cyan">●</Text>
+      <Text bold>{` ${name} `}</Text>
+      <Text dimColor>{"─╮"}</Text>
+    </Box>
+  );
 });
 
 const MODE_DESC: Record<Approval, string> = {
@@ -490,13 +509,16 @@ export function InputBox({
   const gutter = vim && mode === "normal" ? "◆ " : "› ";
   const gutterColor = vim ? (mode === "normal" ? "yellow" : "green") : "cyan";
 
-  // The prompt box borders subtract 2 cells (1 each side) from the usable text width; InputLine's
-  // deterministic wrap needs the INNER width so the cursor/continuation gutter stay exact.
-  const innerW = Math.max(1, w - 2);
+  // The box borders (1 each side) + paddingX (1 each side) subtract 4 cells; InputLine's deterministic
+  // wrap needs the INNER width so the cursor/continuation gutter stay exact. The box is a fixed `width={w}`
+  // with `borderTop={false}` so the hand-drawn TopBorder (with the session title) supplies the top edge
+  // + corners and everything aligns column-for-column.
+  const innerW = Math.max(1, w - 4);
   const cwdShort = footerCwd(cwd);
   return (
     <Box flexDirection="column">
-      <Box borderStyle="round" borderColor="gray" borderDimColor paddingX={1}>
+      <TopBorder name={status.sessionName || "session"} width={w} />
+      <Box borderStyle="round" borderTop={false} borderColor="gray" borderDimColor paddingX={1} width={w}>
         <InputLine value={value} cursor={cursor} width={innerW} gutter={gutter} gutterColor={gutterColor} placeholder={placeholder} />
       </Box>
       {vim ? <Text dimColor>{mode === "normal" ? "  -- NORMAL --  i/a insert · h l 0 $ w b e move · x dd D cw p edit" : "  -- INSERT --  Esc → normal"}</Text> : null}
