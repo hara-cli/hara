@@ -100,6 +100,23 @@ interface Item {
 let _id = 0;
 const nid = (): number => ++_id;
 const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+/** Prepare a finalized turn item for the append-only `<Static>` scrollback. A completed reasoning
+ *  block collapses to a single-line "✻ thought · N lines" notice (its full text preserved in `full`
+ *  for the Ctrl+T overlay) — mirroring codex writing finalized rows to scrollback ONCE. Every other
+ *  kind passes through unchanged. Used both mid-turn (as blocks finalize) and at turn end so a given
+ *  turn's reasoning is emitted to Static exactly once and never re-rendered/re-emitted. */
+function foldForHistory(it: Item): Item {
+  if (it.kind !== "reasoning") return it;
+  const lines = it.text.split("\n").filter((l) => l.trim()).length;
+  return { ...it, kind: "notice", text: `✻ thought · ${lines} lines`, full: it.text };
+}
+
+/** Redraw throttle for the LIVE region (~30fps). A fast token stream or a slow/remote terminal can
+ *  push deltas far faster than a human perceives; without a cap ink re-diffs the growing dynamic
+ *  block on every token, which over a laggy link leaves stale duplicate lines + jitter. 33ms clamps
+ *  the live re-render rate while state itself stays exact (nothing is dropped, only coalesced). */
+const LIVE_FRAME_MS = 33;
 function Block({ item, open }: { item: Item; open?: boolean }) {
   switch (item.kind) {
     case "user":
@@ -402,15 +419,25 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const queueRef = useRef<{ line: string; images?: ImageAttachment[] }[]>([]); // type-ahead: FIFO of messages entered while working
   const [pool, setPool] = useState<string[]>([]); // type-ahead pool: queued message lines, shown above the input
   const drainingRef = useRef(false); // idempotency guard so the drain effect can't double-send one item
-  const currentRef = useRef<Item[]>([]);
-  currentRef.current = current;
   const statusRef = useRef(status);
   statusRef.current = status;
+  // Live-region write path (codex-style): deltas mutate `liveRef` synchronously (exact, never dropped),
+  // and a throttled flush (~30fps) reconciles it into the `current` React state that actually renders.
+  // As each block finalizes (a new block kind begins) its predecessors are appended to `history`
+  // (`<Static>`, rendered once) and dropped from the live buffer — so only the tail block stays dynamic.
+  const liveRef = useRef<Item[]>([]);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toStaticRef = useRef<Item[]>([]); // finalized blocks awaiting append to <Static> on the next flush
 
   useEffect(() => {
     const fn = (): void => setStatus((s) => ({ ...s, agents: activity.running }));
     activity.onChange(fn);
     return () => activity.onChange(null);
+  }, []);
+
+  // Cancel any pending live-region flush on unmount so a timer can't fire after teardown.
+  useEffect(() => () => {
+    if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
   }, []);
 
   // Subscribe to todo_write updates so the panel re-renders when the agent edits the checklist.
@@ -429,13 +456,47 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     };
   }, []);
 
-  const pushCurrent = useCallback((kind: Kind, text: string, merge = false): void => {
-    setCurrent((cur) => {
-      const last = cur[cur.length - 1];
-      if (merge && last && last.kind === kind) return [...cur.slice(0, -1), { ...last, text: last.text + text }];
-      return [...cur, { id: nid(), kind, text }];
-    });
+  // Reconcile the synchronously-mutated live buffer into React state, at most once per ~33ms. First
+  // append any finalized blocks to <Static> (once, in order), then publish the remaining live tail.
+  // The array identities are fresh each flush so React/ink re-render exactly the minimal live region.
+  const flushLive = useCallback((): void => {
+    flushTimerRef.current = null;
+    if (toStaticRef.current.length) {
+      const graduated = toStaticRef.current;
+      toStaticRef.current = [];
+      setHistory((h) => [...h, ...graduated]);
+    }
+    setCurrent(liveRef.current.slice());
   }, []);
+
+  // Schedule a throttled flush. Coalesces a burst of deltas into one re-render per LIVE_FRAME_MS —
+  // the leading edge is immediate (snappy first paint) and subsequent deltas ride the timer.
+  const scheduleFlush = useCallback((): void => {
+    if (flushTimerRef.current) return;
+    flushTimerRef.current = setTimeout(flushLive, LIVE_FRAME_MS);
+  }, [flushLive]);
+
+  const pushCurrent = useCallback(
+    (kind: Kind, text: string, merge = false): void => {
+      const live = liveRef.current;
+      const last = live[live.length - 1];
+      if (merge && last && last.kind === kind) {
+        // Same streaming block continues — grow it in place in the live buffer (no new React item).
+        live[live.length - 1] = { ...last, text: last.text + text };
+      } else {
+        // A new block begins. Everything before it in the live buffer is now finalized: graduate it
+        // to <Static> (folding reasoning) so it's written to scrollback ONCE and never re-rendered.
+        if (live.length) {
+          for (const it of live) toStaticRef.current.push(foldForHistory(it));
+          liveRef.current = [{ id: nid(), kind, text }];
+        } else {
+          live.push({ id: nid(), kind, text });
+        }
+      }
+      scheduleFlush();
+    },
+    [scheduleFlush],
+  );
 
   // Lazy vision notice: 顾雅 spec — the header no longer carries an always-on "👁 …" line.
   // Instead, the first time an image attachment shows up in this session, we print the
@@ -527,18 +588,19 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       } catch (e: unknown) {
         pushCurrent("notice", `error: ${e instanceof Error ? e.message : String(e)}`);
       }
-      // Commit this turn's items to scrollback. Read the LIVE current via the updater — currentRef only
-      // syncs on render (line ~225), so a fast slash-only turn (/design, /help, /skills…) that pushes a
-      // notice and returns before any re-render would otherwise commit nothing and lose the notice.
-      setCurrent((cur) => {
-        const committed = cur.map((it) =>
-          it.kind === "reasoning"
-            ? { ...it, kind: "notice" as const, text: `✻ thought · ${it.text.split("\n").filter((l) => l.trim()).length} lines`, full: it.text }
-            : it,
-        );
-        if (committed.length) setHistory((h) => [...h, ...committed]);
-        return [];
-      });
+      // Commit this turn's items to scrollback. The authoritative source is the synchronous live
+      // buffer (liveRef + any blocks already graduated to toStaticRef), NOT the throttled `current`
+      // React state — so a fast slash-only turn (/design, /help, /skills…) that pushes a notice and
+      // returns before a flush fires still commits it, and a pending throttle timer can't double-emit.
+      if (flushTimerRef.current) {
+        clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+      const committed = [...toStaticRef.current, ...liveRef.current.map(foldForHistory)];
+      toStaticRef.current = [];
+      liveRef.current = [];
+      if (committed.length) setHistory((h) => [...h, ...committed]);
+      setCurrent([]);
       setWorking(false);
       ctrlRef.current = null;
       // Schedule a panel collapse: if there was a checklist this turn, fold it to a one-line summary

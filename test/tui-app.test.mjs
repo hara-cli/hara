@@ -421,6 +421,42 @@ test("Ctrl+T transcript overlay: reasoning folds inline but shows FULL in the ov
   unmount();
 });
 
+test("App live region: finalized reasoning graduates to <Static> ONCE — no stacked/duplicate thinking lines", async () => {
+  // Regression for the remote/slow-terminal duplication bug: a completed reasoning block must be
+  // emitted to scrollback exactly once (folded), and must NOT keep re-appearing as the assistant
+  // streams. We stream reasoning, then a multi-delta assistant reply, and assert the folded
+  // "thought" summary shows up exactly once and the live assistant text renders without the
+  // expanded reasoning still glued above it.
+  const onSubmit = async (line, h) => {
+    h.sink.reasoningDelta("weighing options\nline two\nline three");
+    // Fast token stream after reasoning finalizes — over a slow link this used to thrash + stack.
+    for (const w of ["The ", "answer ", "is ", "42."]) {
+      h.sink.assistantDelta(w);
+      await tick(5);
+    }
+    await tick(120); // keep the live region visible to sample
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick(90); // sample mid-turn: reasoning has finalized, assistant is streaming
+  const mid = strip(lastFrame());
+  assert.ok(mid.includes("The answer is 42."), "assistant text streams in the live region");
+  // Reasoning finalized the moment assistant text began → folded, shown at most once, never expanded live.
+  const thoughtCount = (mid.match(/thought · \d+ lines/g) || []).length;
+  assert.ok(thoughtCount <= 1, `folded reasoning appears at most once mid-turn (saw ${thoughtCount})`);
+  assert.ok(!mid.includes("weighing options"), "expanded reasoning is NOT re-rendered above the live reply");
+  await tick(200); // finish + commit
+  const done = strip(lastFrame());
+  const finalCount = (done.match(/thought · \d+ lines/g) || []).length;
+  assert.equal(finalCount, 1, "after the turn, the folded reasoning summary appears exactly once (not stacked)");
+  unmount();
+});
+
 test("App type-ahead: Esc while working clears the queue (stop means stop)", async () => {
   const seen = [];
   let release;
