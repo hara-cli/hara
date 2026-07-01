@@ -3091,7 +3091,11 @@ program.action(async (opts) => {
         await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => h.sink.notice(m));
       },
     });
-    out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
+    // Only claim "saved · resume" if a turn actually persisted the session. A zero-turn session (opened,
+    // then exited without submitting anything) is never written by saveSession — so printing the resume
+    // hint would mislead and `hara resume <id>` would fail with "no session matching".
+    if (loadSession(meta.id))
+      out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
     await closeMcp();
     process.exit(0); // TUI done — exit cleanly (ink can leave stdin referenced)
   }
