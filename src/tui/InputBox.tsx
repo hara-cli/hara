@@ -1,12 +1,11 @@
-// The framed input box (ink): a top border carrying the session name in the right corner, the
-// prompt line in the middle, and a bottom border carrying the approval modes + token usage +
-// concurrency. Composed from <Text> rows (no ink border fork needed) so the title sits exactly
-// where we want it. Pure-ish: pass `width` to make rendering deterministic in tests.
+// The framed input box (ink): a rounded, dim-bordered box (codex polish) wrapping the prompt line,
+// with a single dim footer line rendered BELOW the box (model · approval · route · cwd · usage · ctx)
+// and the ModeBar under that. Pure-ish: pass `width` to make rendering deterministic in tests.
 //
 // Render-stability principles (codex-style, for slow/remote terminals): ink erases and rewrites the
 // ENTIRE dynamic region on every frame, so the box's cost scales with (a) how many lines it occupies
 // and (b) how often any of them change. Two levers here:
-//   1. The static chrome (borders, mode bar, mention popup) is memoized so a keystroke that only
+//   1. The static chrome (footer, mode bar, mention popup) is memoized so a keystroke that only
 //      changes the prompt text doesn't force React to reconcile the unchanged rows.
 //   2. Line-wrapping + cursor are computed deterministically from (value, cursor, width) in one memo,
 //      so long input wraps under a stable continuation indent and the cursor never drifts — instead
@@ -38,31 +37,30 @@ const tok = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `$
 // amount so the text column is stable across visual rows.
 const GUTTER = 2;
 
-const TopBorder = memo(function TopBorder({ name, width }: { name: string; width: number }) {
-  const labelLen = name.length + 2; // "⏺ " + name
-  const left = Math.max(2, width - labelLen - 3);
-  return (
-    <Box>
-      <Text dimColor>{"─".repeat(left)} </Text>
-      <Text color="cyan">⏺</Text>
-      <Text bold> {name}</Text>
-      <Text dimColor> ─</Text>
-    </Box>
-  );
-});
+// Tilde-collapse HOME and keep the project tail — a compact cwd for the one-line footer. Local (tiny)
+// copy so InputBox doesn't reach back into App.tsx (App imports InputBox — avoid the cycle).
+export function footerCwd(abs: string, home: string = process.env.HOME ?? "", maxLen = 28): string {
+  let p = abs;
+  if (home && (p === home || p.startsWith(home + "/"))) p = "~" + p.slice(home.length);
+  if (p.length <= maxLen) return p;
+  const tail = p.slice(-(maxLen - 1));
+  const slash = tail.indexOf("/");
+  return "…" + (slash > 0 ? tail.slice(slash) : tail);
+}
 
-// Bottom border carries token usage + concurrency at the right corner (modes moved to ModeBar below).
-const BottomBorder = memo(function BottomBorder({ s, width }: { s: Status; width: number }) {
-  // Always render `ctx N%` (from 0 on) so the field is present from the first frame — otherwise it
-  // pops in mid-session the moment ctx first exceeds 0, shifting the whole bottom-border layout.
-  const usage = `↑${tok(s.input)} ↓${tok(s.output)} · ctx ${s.ctxPct}%`;
-  const label = s.agents > 0 ? `${usage} · ⛁${s.agents}` : `${usage} · ⛁ idle`;
-  const left = Math.max(2, width - label.length - 3);
-  return (
-    <Box>
-      <Text dimColor>{`${"─".repeat(left)} ${label} ─`}</Text>
-    </Box>
-  );
+/** Compose the single dim footer line rendered below the box. Pure so the ordering/spacing (and the
+ *  optional route segment) can be pinned without rendering React. Shape (codex-style status line):
+ *  `<model> · <approval>[ · <route>] · <cwd> · ↑<in> ↓<out> · ctx <pct>%`. `ctx N%` is always present
+ *  (from 0 on) so the field never pops in mid-session and shifts the layout. */
+export function footerLine(model: string, s: Status, cwdShort: string, route?: string): string {
+  const routeSeg = route ? ` · ${route}` : "";
+  return `  ${model} · ${s.approval}${routeSeg} · ${cwdShort} · ↑${tok(s.input)} ↓${tok(s.output)} · ctx ${s.ctxPct}%`;
+}
+
+// The merged status footer (was split across the old top/bottom dash-rules): model · approval ·
+// route · cwd · usage · ctx. Memoized so a prompt keystroke doesn't reconcile it.
+const Footer = memo(function Footer({ model, s, cwdShort, route }: { model: string; s: Status; cwdShort: string; route?: string }) {
+  return <Text dimColor>{footerLine(model, s, cwdShort, route)}</Text>;
 });
 
 const MODE_DESC: Record<Approval, string> = {
@@ -298,10 +296,13 @@ const InputLine = memo(function InputLine({
   );
 });
 
-/** Top border (session) + prompt line + bottom border (usage) + ModeBar, with an @path popup. */
+/** Bordered prompt box + one dim status footer (model · approval · route · cwd · usage · ctx) +
+ *  ModeBar, with an @path popup. */
 export function InputBox({
   status,
   cwd,
+  model,
+  route,
   width,
   onSubmit,
   onClipboardImage,
@@ -313,6 +314,10 @@ export function InputBox({
 }: {
   status: Status;
   cwd: string;
+  /** `<provider>:<model>` (or bare model) — the leading segment of the status footer. */
+  model: string;
+  /** Route host (gateway / custom baseURL). Omitted → the footer drops the route segment. */
+  route?: string;
   width?: number;
   onSubmit?: (v: string, images?: ImageAttachment[]) => void;
   /** Read an image off the OS clipboard (Ctrl+V). Injected so the view stays side-effect-free in tests. */
@@ -485,12 +490,17 @@ export function InputBox({
   const gutter = vim && mode === "normal" ? "◆ " : "› ";
   const gutterColor = vim ? (mode === "normal" ? "yellow" : "green") : "cyan";
 
+  // The prompt box borders subtract 2 cells (1 each side) from the usable text width; InputLine's
+  // deterministic wrap needs the INNER width so the cursor/continuation gutter stay exact.
+  const innerW = Math.max(1, w - 2);
+  const cwdShort = footerCwd(cwd);
   return (
     <Box flexDirection="column">
-      <TopBorder name={status.sessionName || "session"} width={w} />
-      <InputLine value={value} cursor={cursor} width={w} gutter={gutter} gutterColor={gutterColor} placeholder={placeholder} />
+      <Box borderStyle="round" borderColor="gray" borderDimColor paddingX={1}>
+        <InputLine value={value} cursor={cursor} width={innerW} gutter={gutter} gutterColor={gutterColor} placeholder={placeholder} />
+      </Box>
       {vim ? <Text dimColor>{mode === "normal" ? "  -- NORMAL --  i/a insert · h l 0 $ w b e move · x dd D cw p edit" : "  -- INSERT --  Esc → normal"}</Text> : null}
-      <BottomBorder s={status} width={w} />
+      <Footer model={model} s={status} cwdShort={cwdShort} route={route} />
       {working ? <Text dimColor>{`  ⌨ working — Enter queues your message${queued ? ` · ${queued} queued` : ""} · Esc interrupts`}</Text> : null}
       {popupOpen ? <MentionPopup items={candidates} selected={selIdx} query={mention!.query} /> : null}
       <ModeBar approval={status.approval} />

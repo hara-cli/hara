@@ -7,7 +7,7 @@
 // The agent machinery is injected via `onSubmit` (a turn runner) so this view is testable with
 // ink-testing-library against a fake runner — no provider/network needed.
 import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { InputBox, type Status, type Approval } from "./InputBox.js";
 import type { ImageAttachment } from "../providers/types.js";
 import { activity } from "../activity.js";
@@ -264,83 +264,92 @@ export function shortenSession(uuid: string | undefined | null): string {
   return uuid.slice(0, 8);
 }
 
-/** Layout constants for the field grid. Field names live in a 10-char column;
- *  values start at column 12 (after 2 spaces). The view uses `padField` to
- *  pad a label so the values align vertically across rows. */
-const FIELD_PAD = 10;
-const padField = (name: string): string => name.padEnd(FIELD_PAD, " ");
-
-/** Dim trailing clause for the model line: the vision sidecar (only when configured) then a subtle
- *  codex-style `/model` hint. Pure so the composition (spacing, ordering, silence-when-unset) can be
- *  pinned in a unit test without rendering React. Returns "" when there is nothing to show beyond
- *  the hint — the hint itself is always present (it's the discoverability affordance). */
-export function modelLineSuffix(visionModel?: string): string {
-  const vision = visionModel ? `  ·  vision ${visionModel}` : "";
-  return `${vision}  ·  /model to change`;
+/** Data-driven label column (mirrors codex's `FieldFormatter::from_labels`): pad every label to the
+ *  width of the WIDEST label actually shown this render, so values line up without a hard-coded column.
+ *  Returns a `(label) => padded` closure. A 3-space gap after the padded label separates label↔value. */
+export function fieldFormatter(labels: string[]): (label: string) => string {
+  const width = labels.reduce((w, l) => Math.max(w, l.length), 0);
+  return (label: string): string => label.padEnd(width, " ");
 }
 
+/** Dim trailing clause for the model line: the vision sidecar (only when configured). Pure so the
+ *  composition (spacing, silence-when-unset) can be pinned in a unit test without rendering React.
+ *  Returns "" when no describer is configured (native-vision main models stay silent — 顾雅 spec).
+ *  The actionable `/model ↹` hint is rendered separately (in green) by the view. */
+export function modelLineSuffix(visionModel?: string): string {
+  return visionModel ? ` · vision ${visionModel}` : "";
+}
+
+// The header is emitted ONCE into <Static> (App's id:-1 sentinel). A rounded, dim-bordered card
+// (codex polish) that HUGS its content via alignSelf="flex-start" — so it neither spans the full
+// width nor blows out on resize. Keeps hara's identity: seal-red ◆ glyph + title, the org/profile
+// grid, and the vision sidecar clause. One accent (◆ + title); one green affordance (/model ↹).
 function HeaderCard(props: HeaderInfo) {
   const { version, modelLabel, cwd, agentsMdLoaded, session, kind } = props;
   const home = process.env.HOME ?? "";
   const cwdShort = shortenHome(cwd, home);
   const sessionShort = shortenSession(session);
-  // Identity line — branches on kind. Personal collapses kind+model into one line;
-  // org splits identity (org/label/id/route) from model (with its source).
-  const identity = kind === "org" ? (
+  const isOrg = kind === "org";
+  // Data-driven label column: the first grid row is `org`/`profile`, then `model`, `cwd`, and
+  // `session` (only when present). Pad to the widest of exactly the labels we render this pass.
+  const labels = [isOrg ? "org" : "profile", "model", "cwd", ...(sessionShort ? ["session"] : [])];
+  const pad = fieldFormatter(labels);
+  const GAP = "   "; // 3-space label↔value gap (codex spacing)
+  // No leading indent here: paddingX={1} on the card already insets content 1 cell, and the title
+  // glyph starts at that same column — so labels stay flush-left with `◆ hara` (codex alignment).
+  const row = (label: string, body: ReactNode): ReactNode => (
     <Text>
-      <Text dimColor>{`  ${padField("org")}`}</Text>
-      <Text>{props.orgLabel ?? props.orgId ?? "(unnamed)"}</Text>
-      {props.orgId && props.orgLabel ? <Text dimColor>{`  ·  ${props.orgId}`}</Text> : null}
-      {props.routeHost ? (
-        <Text>
-          <Text dimColor>{"  →  "}</Text>
-          <Text dimColor>{props.routeHost}</Text>
-        </Text>
-      ) : null}
-    </Text>
-  ) : (
-    <Text>
-      <Text dimColor>{`  ${padField(props.profileId ? `personal:${props.profileId}` : "personal")}`}</Text>
-      <Text>{modelLabel}</Text>
-      {props.routeHost ? (
-        <Text>
-          <Text dimColor>{"  →  "}</Text>
-          <Text dimColor>{props.routeHost}</Text>
-        </Text>
-      ) : null}
-      <Text dimColor>{modelLineSuffix(props.visionModel)}</Text>
+      <Text dimColor>{`${pad(label)}${GAP}`}</Text>
+      {body}
     </Text>
   );
+  // First grid row: personal → `profile  personal[:<id>]`; org → `org  <label> · <id> → <host>`.
+  const identityRow = isOrg
+    ? row("org", (
+        <Text>
+          <Text>{props.orgLabel ?? props.orgId ?? "(unnamed)"}</Text>
+          {props.orgId && props.orgLabel ? <Text dimColor>{` · ${props.orgId}`}</Text> : null}
+          {props.routeHost ? <Text dimColor>{` → ${props.routeHost}`}</Text> : null}
+        </Text>
+      ))
+    : row("profile", <Text>{props.profileId ? `personal:${props.profileId}` : "personal"}</Text>);
   return (
-    <Box flexDirection="column" marginBottom={1}>
-      <Text>
-        <Text color={accent()}>{"> "}</Text>
-        <Text color={accent()} bold>{`hara`}</Text>
-        <Text dimColor>{` · v${version} — the coding agent that runs like an org`}</Text>
-      </Text>
-      <Text>{" "}</Text>
-      {identity}
-      {kind === "org" ? (
+    <Box flexDirection="column">
+      <Box
+        flexDirection="column"
+        borderStyle="round"
+        borderColor="gray"
+        borderDimColor
+        paddingX={1}
+        alignSelf="flex-start"
+        marginBottom={1}
+      >
         <Text>
-          <Text dimColor>{`  ${padField("model")}`}</Text>
-          <Text>{modelLabel}</Text>
-          {props.modelSource ? <Text dimColor>{`  ·  from ${props.modelSource}`}</Text> : null}
-          <Text dimColor>{modelLineSuffix(props.visionModel)}</Text>
+          <Text color={accent()} bold>{"◆ hara"}</Text>
+          <Text dimColor>{`   v${version} · the agent that runs like an org`}</Text>
         </Text>
-      ) : null}
-      <Text>
-        <Text dimColor>{`  ${padField("cwd")}`}</Text>
-        <Text dimColor>{cwdShort}</Text>
-        {agentsMdLoaded ? <Text dimColor>{"  ·  AGENTS.md"}</Text> : null}
-      </Text>
-      {sessionShort ? (
-        <Text>
-          <Text dimColor>{`  ${padField("session")}`}</Text>
-          <Text dimColor>{sessionShort}</Text>
-        </Text>
-      ) : null}
-      <Text>{" "}</Text>
-      <Text dimColor>{"  /help · @file · shift+tab · esc · ctrl+t transcript · ctrl+r reasoning"}</Text>
+        <Text>{" "}</Text>
+        {identityRow}
+        {row("model", (
+          <Text>
+            <Text>{modelLabel}</Text>
+            {isOrg
+              ? props.modelSource ? <Text dimColor>{` · from ${props.modelSource}`}</Text> : null
+              : props.visionModel ? <Text dimColor>{modelLineSuffix(props.visionModel)}</Text> : null}
+            <Text>{"   "}</Text>
+            <Text color="green">{"/model ↹"}</Text>
+          </Text>
+        ))}
+        {row("cwd", (
+          <Text>
+            <Text>{cwdShort}</Text>
+            {agentsMdLoaded ? <Text dimColor>{" · AGENTS.md"}</Text> : null}
+          </Text>
+        ))}
+        {sessionShort ? row("session", <Text>{sessionShort}</Text>) : null}
+      </Box>
+      {/* Tip block — moved OUT of the card (顾雅 spec). Dim discoverability line below the card. */}
+      <Text dimColor>{"  Tip: @ attach file · ctrl+t transcript · ctrl+r reasoning · shift+tab approval · esc interrupt"}</Text>
     </Box>
   );
 }
@@ -746,7 +755,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           ))}
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} isActive={!prompt} working={working && !askText} queued={pool.length} vim={vim} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
+      <InputBox status={status} cwd={cwd} model={model} route={header?.routeHost} isActive={!prompt} working={working && !askText} queued={pool.length} vim={vim} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );
 }

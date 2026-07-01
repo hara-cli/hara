@@ -2,7 +2,7 @@
 // rendering without React, so they can be pinned exactly — no escape codes, no layout drift.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractHost, shortenHome, shortenSession, modelLineSuffix } from "../dist/tui/App.js";
+import { extractHost, shortenHome, shortenSession, modelLineSuffix, fieldFormatter } from "../dist/tui/App.js";
 import { routeHost } from "../dist/profile/profile.js";
 
 test("extractHost: returns host-only for canonical URLs (no scheme, no path, no query)", () => {
@@ -50,17 +50,27 @@ test("shortenSession: 8-char prefix, never the whole id; safe on missing input",
   assert.equal(shortenSession(null), "");
 });
 
-test("modelLineSuffix: appends '· vision <model>' only when a visionModel is set, always the /model hint", () => {
-  // With a describer configured → vision clause + the /model discoverability hint.
+test("modelLineSuffix: the dim vision clause '· vision <model>' ONLY when a visionModel is set (no /model hint here)", () => {
+  // With a describer configured → just the vision clause. The actionable `/model ↹` hint now lives in
+  // the view (rendered green), NOT in this dim suffix.
   const withVision = modelLineSuffix("qwen3.7-plus");
   assert.ok(withVision.includes("vision qwen3.7-plus"), "vision sidecar shown when set");
-  assert.ok(withVision.includes("/model to change"), "codex-style /model hint present");
-  assert.ok(withVision.indexOf("vision") < withVision.indexOf("/model"), "vision clause precedes the /model hint");
-  // No describer → NO vision clause (silence beats a fabricated describer), hint still present.
-  const noVision = modelLineSuffix(undefined);
-  assert.ok(!noVision.includes("vision"), "no vision clause when unset");
-  assert.ok(noVision.includes("/model to change"), "/model hint still present without a describer");
-  assert.equal(modelLineSuffix(""), noVision, "empty string is treated as unset (falsy)");
+  assert.ok(!withVision.includes("/model"), "the /model affordance is rendered by the view, not baked into the suffix");
+  // No describer → empty (silence beats a fabricated describer; native-vision models say nothing).
+  assert.equal(modelLineSuffix(undefined), "", "empty suffix when no describer configured");
+  assert.equal(modelLineSuffix(""), "", "empty string is treated as unset (falsy)");
+});
+
+test("fieldFormatter: pads every label to the WIDEST label actually shown (data-driven grid, codex FieldFormatter::from_labels)", () => {
+  // Personal grid labels: profile / model / cwd / session → widest is "session" (7).
+  const pad = fieldFormatter(["profile", "model", "cwd", "session"]);
+  assert.equal(pad("profile").length, 7, "each label padded to the max width (7)");
+  assert.equal(pad("model"), "model  ", "shorter labels right-padded with spaces");
+  assert.equal(pad("session"), "session", "the widest label is unpadded");
+  // Org grid (no session): org / model / cwd → widest is "model"/"cwd"? "model"=5, "org"=3, "cwd"=3 → 5.
+  const padOrg = fieldFormatter(["org", "model", "cwd"]);
+  assert.equal(padOrg("org").length, 5, "width adapts to the labels present (org grid → 5)");
+  assert.equal(padOrg("model"), "model", "widest label unpadded in the org grid");
 });
 
 test("routeHost (profile.ts): personal on official endpoint → null (don't display)", () => {

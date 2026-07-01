@@ -25,14 +25,14 @@ test("App runs a turn: user line in, streamed assistant reply out, status bar pi
   await tick(80); // sample mid-turn (within onSubmit's 200ms window)
   const mid = strip(lastFrame());
   assert.ok(mid.includes("Hello, world."), "streamed assistant text visible during the turn");
-  assert.ok(mid.includes("⏺ demo"), "status bar stays pinned below the live output");
+  assert.ok(mid.includes("glm-5 · suggest"), "status footer stays pinned below the live output");
   await tick(200); // let the turn finish and commit
   unmount();
 });
 
-test("App header (personal): single-line logo + collapsed identity row, no banner/no vision line", async () => {
-  // Personal on the provider's official endpoint — identity is one line ("personal  <provider>:<model>"),
-  // no "→ host" suffix (routeHost undefined), no vision row (lazy now), no banner block.
+test("App header (personal): bordered card, ◆ glyph + title, profile grid, /model ↹ affordance", async () => {
+  // Personal on the provider's official endpoint — grid row is `profile  personal`, the model row
+  // carries the model + green /model ↹ affordance, no "→ host" (routeHost undefined), no banner.
   const header = {
     version: "9.9.9",
     modelLabel: "qwen:glm-5",
@@ -46,17 +46,18 @@ test("App header (personal): single-line logo + collapsed identity row, no banne
   );
   await tick();
   const frame = strip(lastFrame());
-  // ASCII banner is gone — no more ███/╗/╝ characters in the header.
-  assert.ok(!/[█╔╗╚╝╠╣║]/.test(frame), "old ASCII banner block is no longer rendered");
-  // New single-line logo + tagline.
-  assert.ok(frame.includes("hara"), "single-line logo present");
-  assert.ok(frame.includes("v9.9.9"), "version on the logo line");
-  assert.ok(frame.includes("the coding agent that runs like an org"), "tagline on the logo line");
-  // Identity row collapses model into one line for personal; no "→ host" (no custom baseURL).
-  assert.ok(/personal\s+qwen:glm-5/.test(frame), "personal identity row carries the provider:model directly");
+  // ASCII banner is gone — no more ███ characters in the header.
+  assert.ok(!/[█]/.test(frame), "old ASCII banner block is no longer rendered");
+  // Rounded card chrome (codex polish).
+  assert.ok(frame.includes("╭") && frame.includes("╰"), "header rendered inside a rounded card");
+  // Seal-red ◆ glyph + title + dim version/tagline.
+  assert.ok(frame.includes("◆ hara"), "◆ glyph + title present (replaces the old > prompt)");
+  assert.ok(frame.includes("v9.9.9"), "version on the title line");
+  assert.ok(frame.includes("the agent that runs like an org"), "tagline on the title line");
+  // Grid: `profile  personal` (identity row), plus a `model` row (personal now has one too).
+  assert.ok(/profile\s+personal/.test(frame), "profile grid row shows 'personal'");
+  assert.ok(/model\s+qwen:glm-5/.test(frame), "model row carries the provider:model");
   assert.ok(!frame.includes("→"), "no '→ host' suffix on official-endpoint personal");
-  // No separate "model" row for personal.
-  assert.ok(!/^\s*model\s/m.test(frame), "personal layout omits the dedicated 'model' line");
   // cwd line gets a "· AGENTS.md" suffix when loaded; never a negative line.
   assert.ok(frame.includes("cwd"), "cwd label present");
   assert.ok(frame.includes("AGENTS.md"), "AGENTS.md flag rendered as a cwd suffix");
@@ -64,19 +65,15 @@ test("App header (personal): single-line logo + collapsed identity row, no banne
   // session is the first 8 chars, never the full uuid.
   assert.ok(frame.includes("7bf3ee14"), "session shows the short id");
   assert.ok(!frame.includes("7bf3ee14-aaaa"), "no full uuid leak");
-  // The always-on vision line is gone (顾雅 spec — lazy on first image).
-  assert.ok(!frame.includes("👁"), "no always-on vision indicator in header");
-  // No visionModel configured → NO "vision <model>" clause on the identity line (stay silent).
+  // No visionModel configured → NO "vision <model>" clause on the model row (stay silent).
   assert.ok(!/vision\s+\S/.test(frame), "no 'vision <model>' clause when visionModel is unset");
-  // /model discoverability hint is always present (codex-style).
-  assert.ok(frame.includes("/model to change"), "/model discoverability hint on the model line");
-  // Footer key hints surface the transcript + reasoning shortcuts.
-  assert.ok(frame.includes("ctrl+t transcript"), "footer advertises Ctrl+T transcript overlay");
-  assert.ok(frame.includes("ctrl+r reasoning"), "footer advertises Ctrl+R reasoning expand");
-  // Tip is the trimmed slash menu.
-  assert.ok(frame.includes("/help"), "tip line shows /help");
-  assert.ok(!frame.includes("attaches"), "tip no longer says 'attaches' (verb)");
-  assert.ok(!frame.includes("cycles modes"), "tip no longer says 'cycles modes'");
+  // The actionable /model ↹ affordance is present (green in a real TTY).
+  assert.ok(frame.includes("/model ↹"), "/model ↹ affordance on the model row");
+  // Tip block (below the card) advertises the transcript + reasoning shortcuts.
+  assert.ok(frame.includes("ctrl+t transcript"), "tip advertises Ctrl+T transcript overlay");
+  assert.ok(frame.includes("ctrl+r reasoning"), "tip advertises Ctrl+R reasoning expand");
+  assert.ok(frame.includes("Tip:"), "tip line present below the card");
+  assert.ok(frame.includes("@ attach file"), "tip mentions @ file attach");
   unmount();
 });
 
@@ -93,13 +90,16 @@ test("App header (personal w/ visionModel): identity row appends a dim '· visio
   );
   await tick();
   const frame = strip(lastFrame());
-  assert.ok(/personal\s+qwen:glm-5/.test(frame), "personal identity row still carries provider:model");
-  assert.ok(frame.includes("vision qwen3.7-plus"), "vision sidecar model surfaced on the model line");
-  assert.ok(frame.includes("/model to change"), "/model hint still present alongside the vision clause");
+  assert.ok(/profile\s+personal/.test(frame), "profile grid row shows 'personal'");
+  assert.ok(/model\s+qwen:glm-5/.test(frame), "model row carries provider:model");
+  assert.ok(frame.includes("vision qwen3.7-plus"), "vision sidecar model surfaced on the model row (dim)");
+  assert.ok(frame.includes("/model ↹"), "/model ↹ affordance present alongside the vision clause");
   unmount();
 });
 
-test("App header (org w/ visionModel): dedicated model row appends the '· vision <model>' clause", async () => {
+test("App header (org, routed): model row shows provenance '· from <source>' INSTEAD of the vision clause", async () => {
+  // When routed via an org, the model row surfaces WHERE the model came from (provenance) rather than
+  // the vision sidecar — the vision describer is a personal-config detail, not org-relevant chrome.
   const header = {
     version: "1.2.3",
     modelLabel: "qwen:glm-5",
@@ -116,12 +116,15 @@ test("App header (org w/ visionModel): dedicated model row appends the '· visio
   await tick();
   const frame = strip(lastFrame());
   assert.ok(/model\s+qwen:glm-5/.test(frame), "org model row present");
-  assert.ok(frame.includes("from org default"), "model source annotation retained");
-  assert.ok(frame.includes("vision qwen3.7-plus"), "vision sidecar model surfaced on the org model row");
+  assert.ok(frame.includes("from org default"), "provenance ('from <source>') shown on the org model row");
+  assert.ok(!frame.includes("vision qwen3.7-plus"), "vision clause suppressed on org (provenance takes its place)");
+  assert.ok(frame.includes("/model ↹"), "/model ↹ affordance still present on the org model row");
   unmount();
 });
 
-test("App header (personal w/ custom baseURL): identity row ends with '→ <host>' (host only, no scheme/path)", async () => {
+test("App header (personal w/ custom baseURL): the route host surfaces in the status footer (host only, no scheme)", async () => {
+  // Personal grid stays clean (`profile  personal`); the custom-baseURL route host is carried by the
+  // status footer below the input box (App passes header.routeHost → InputBox route).
   const header = {
     version: "1.0.0",
     modelLabel: "qwen:glm-5",
@@ -136,7 +139,7 @@ test("App header (personal w/ custom baseURL): identity row ends with '→ <host
   );
   await tick();
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("→  dashscope.aliyuncs.com"), "custom baseURL surfaces as '→ <host>' (host only)");
+  assert.ok(frame.includes("dashscope.aliyuncs.com"), "custom baseURL host surfaces (in the footer)");
   assert.ok(!frame.includes("https://"), "no scheme in the rendered route");
   assert.ok(!/no AGENTS\.md/.test(frame), "still no 'no AGENTS.md' negative line");
   unmount();
@@ -160,10 +163,10 @@ test("App header (org/gateway): split identity + model + source rows; route host
   );
   await tick();
   const frame = strip(lastFrame());
-  // identity row: org   <label>  ·  <id>  →  <host>
+  // identity row: org   <label> · <id> → <host>
   assert.ok(/org\s+Acme Inc/.test(frame), "org label rendered");
   assert.ok(frame.includes("acme-jeff"), "org/device id rendered");
-  assert.ok(frame.includes("→  gw.nanhara.tech"), "gateway host rendered as '→ <host>'");
+  assert.ok(frame.includes("→ gw.nanhara.tech"), "gateway host rendered as '→ <host>' in the org row");
   // model row exists with source annotation
   assert.ok(/model\s+qwen:glm-5/.test(frame), "dedicated model row for org");
   assert.ok(frame.includes("from org default"), "model source annotation present");

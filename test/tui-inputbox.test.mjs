@@ -12,35 +12,36 @@ const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 const cwd = process.cwd();
 const S = { sessionName: "s", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
 
-test("InputBox: session in top border, modes in the ModeBar, usage in the bottom border", () => {
+test("InputBox: bordered prompt box, modes in the ModeBar, status in the footer line", () => {
   const status = { sessionName: "refactor-auth", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
-  const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, width: 64 }));
+  const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", width: 64 }));
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("⏺ refactor-auth"), "session name in top border");
+  // Rounded box chrome (replaces the old ⏺/dash top & bottom rules).
+  assert.ok(frame.includes("╭") && frame.includes("╰"), "rounded box borders around the prompt");
+  assert.ok(frame.includes("glm-5 · suggest"), "model · approval lead the footer line");
   assert.ok(frame.includes("◆ suggest"), "active mode marked in the ModeBar");
   assert.ok(frame.includes("auto-edit") && frame.includes("full-auto"), "other modes listed");
   assert.ok(frame.includes("confirms edits"), "active-mode description shown");
-  assert.ok(frame.includes("⛁ idle"), "idle concurrency in bottom border");
   assert.ok(frame.includes("›"), "prompt arrow");
   // ctx field is present from the very first frame (ctxPct 0) — no mid-session layout pop.
   assert.ok(frame.includes("ctx 0%"), "ctx field renders from 0% (always present, no layout shift)");
   unmount();
 });
 
-test("InputBox highlights the active mode (auto-edit) + formats usage", () => {
+test("InputBox highlights the active mode (auto-edit) + formats usage in the footer", () => {
   const status = { sessionName: "s", approval: "auto-edit", input: 1200, output: 340, ctxPct: 12, agents: 2 };
-  const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, width: 72 }));
+  const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", route: "gw.nanhara.tech", width: 72 }));
   const frame = strip(lastFrame());
   assert.ok(frame.includes("◆ auto-edit"), "auto-edit marked active");
   assert.ok(frame.includes("↑1.2k ↓340"), "token usage formatted");
   assert.ok(frame.includes("ctx 12%"), "context percent shown");
-  assert.ok(frame.includes("⛁2"), "concurrent agents");
+  assert.ok(frame.includes("gw.nanhara.tech"), "route host in the footer when set");
   unmount();
 });
 
 test("InputBox accepts typed text and submits on Enter", async () => {
   let submitted = null;
-  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, onSubmit: (v) => (submitted = v) }));
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
   stdin.write("fix the null check");
   await tick();
   assert.ok(strip(lastFrame()).includes("fix the null check"), "typed text shows");
@@ -51,7 +52,7 @@ test("InputBox accepts typed text and submits on Enter", async () => {
 });
 
 test("InputBox backspace deletes before the cursor", async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd }));
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5" }));
   stdin.write("abcd");
   await tick();
   stdin.write(""); // DEL / backspace
@@ -62,7 +63,7 @@ test("InputBox backspace deletes before the cursor", async () => {
 });
 
 test("InputBox shows an @path popup with file matches", async () => {
-  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd }));
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5" }));
   stdin.write("@src");
   await tick(120);
   const frame = strip(lastFrame());
@@ -78,6 +79,7 @@ test("InputBox: Ctrl+V inserts a highlighted [Image #N] token inline + tracks th
     React.createElement(InputBox, {
       status: S,
       cwd,
+      model: "glm-5",
       onClipboardImage: () => fakeImg,
       onSubmit: (v, images) => (submitted = { v, images }),
     }),
@@ -101,7 +103,7 @@ test("InputBox: pasting an image file path inserts an inline token, not the raw 
   writeFileSync(png, Buffer.from([1, 2, 3]));
   let submitted = null;
   const { lastFrame, stdin, unmount } = render(
-    React.createElement(InputBox, { status: S, cwd, onSubmit: (v, images) => (submitted = { v, images }) }),
+    React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v, images) => (submitted = { v, images }) }),
   );
   stdin.write(png); // a dragged-in terminal emits the bare path
   await tick();
@@ -174,7 +176,7 @@ test("wrapRows: an [Image #N] token is never split across rows", () => {
 
 test("InputBox: long input wraps to multiple visual rows (doesn't render on a single overflowing line)", async () => {
   const long = "this is a fairly long prompt that should wrap across more than one visual row in a narrow box";
-  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, width: 40 }));
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", width: 40 }));
   stdin.write(long);
   await tick(80);
   const frame = strip(lastFrame());
@@ -190,7 +192,7 @@ test("InputBox: backspace over an [Image #N] token removes the token and its att
   const fakeImg = { path: "/tmp/a.png", mediaType: "image/png" };
   let submitted = null;
   const { lastFrame, stdin, unmount } = render(
-    React.createElement(InputBox, { status: S, cwd, onClipboardImage: () => fakeImg, onSubmit: (v, images) => (submitted = { v, images }) }),
+    React.createElement(InputBox, { status: S, cwd, model: "glm-5", onClipboardImage: () => fakeImg, onSubmit: (v, images) => (submitted = { v, images }) }),
   );
   stdin.write("\x16"); // attach → value is "[Image #1] "
   await tick();
