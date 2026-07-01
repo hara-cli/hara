@@ -190,6 +190,19 @@ async function withRouting(primary: Provider | null, cfg: HaraConfig): Promise<P
   return alt ? routingProvider(primary, alt) : primary;
 }
 
+/** Guardian veto model: the CHEAP tier if `routeModel` is configured (a small classifier call, not real
+ *  work), else the primary provider. Never blocks startup — any build failure just yields the fallback (and
+ *  the guardian fails open when even that is absent). Returns the `{ provider, enabled }` shape runAgent wants,
+ *  or undefined when guardian is off in config/env. */
+async function buildGuardian(cfg: HaraConfig, primary: Provider | null): Promise<{ provider: Provider | null; enabled: boolean } | undefined> {
+  if (cfg.guardian === "off") return undefined;
+  let gp: Provider | null = primary;
+  if (cfg.routeModel && cfg.routeModel !== cfg.model) {
+    gp = (await buildProvider({ ...cfg, model: cfg.routeModel, baseURL: cfg.routeBaseURL ?? cfg.baseURL, apiKey: cfg.routeApiKey ?? cfg.apiKey })) ?? primary;
+  }
+  return { provider: gp, enabled: true };
+}
+
 function authHint(cfg: HaraConfig): string {
   const ap = loadActiveProfile();
   if (ap.kind === "gateway") return `Active profile '${ap.id}' is a gateway profile but is missing deviceToken — re-enroll with \`hara profile add ${ap.id} --gateway <url> --code <code>\`.`;
@@ -2055,6 +2068,7 @@ program.action(async (opts) => {
   const provider0 = await withRouting(await buildProvider(cfg), cfg);
   const fallbackProvider = provider0 && cfg.fallbackModel && cfg.fallbackModel !== cfg.model ? await buildProvider({ ...cfg, model: cfg.fallbackModel, baseURL: cfg.fallbackBaseURL ?? cfg.baseURL, apiKey: cfg.fallbackApiKey ?? cfg.apiKey }) : null;
   const fbOpt = fallbackProvider ? { provider: fallbackProvider } : undefined; // app-failover for the main chat turns
+  const guardianOpt = await buildGuardian(cfg, provider0); // internal safety layer (high-risk actions only)
   if (!provider0) {
     // First-run friendliness: offer the setup wizard instead of just erroring (interactive TTY only).
     if (stdin.isTTY && !opts.print) {
@@ -2190,6 +2204,7 @@ program.action(async (opts) => {
       projectContext,
       memory: memoryDigest(cwd),
       stats,
+      guardian: guardianOpt, // safety layer stays on in headless -p (fail-open; breaker aborts, never hangs)
     });
     if (meta) {
       // Long-session safety: auto-compact before saving so a long chat/cron thread never overflows context.
@@ -2955,7 +2970,7 @@ program.action(async (opts) => {
               // fall back to "suggest" so we keep the user's confirm gate without crashing the type check.
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               try {
-                await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: h.signal, fallback: fbOpt });
+                await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -3036,6 +3051,7 @@ program.action(async (opts) => {
               stats,
               signal: h.signal,
               pendingInput,
+              guardian: guardianOpt,
             });
             h.sink.usage(stats.input - xin, stats.output - xout);
             saveSession(meta, history);
@@ -3063,6 +3079,7 @@ program.action(async (opts) => {
           signal: h.signal,
           pendingInput,
           fallback: fbOpt,
+          guardian: guardianOpt,
         });
         if (!meta.title) {
           meta.title = await nameSession(provider, history);
@@ -3115,7 +3132,7 @@ program.action(async (opts) => {
           });
           currentTurn = new AbortController();
           try {
-            await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt });
+            await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt, guardian: guardianOpt });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           } finally {
@@ -3141,7 +3158,7 @@ program.action(async (opts) => {
     currentTurn = new AbortController();
     const t0 = Date.now();
     try {
-      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt });
+      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt, guardian: guardianOpt });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     } finally {

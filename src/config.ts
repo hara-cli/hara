@@ -70,6 +70,11 @@ export interface HaraConfig {
   reasoningEffort: "off" | "low" | "medium" | "high" | undefined;
   /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
   hooks: HooksConfig;
+  /** Guardian safety layer: an internal HIGH-RISK classifier + a conservative cheap-model veto + a hard
+   *  circuit-breaker, layered on top of permission rules / hooks / the approval gate. "on" (default) engages
+   *  ONLY on genuinely dangerous actions (rm -rf, dd, curl|sh, sudo, force-push, out-of-project writes, …)
+   *  so normal work is untouched (zero added latency). "off" disables it. Also switchable via HARA_GUARDIAN. */
+  guardian: "on" | "off";
   /** ping when a (non-trivial) turn finishes: off | bell (terminal BEL) | system (OS notification + bell) */
   notify: NotifyMode;
   /** modal (vim) keybindings in the TUI input box (opt-in) */
@@ -108,7 +113,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   "hara-gateway": { model: "", envKey: "HARA_GATEWAY_TOKEN" }, // B-end: enrolled device → token in ~/.hara/org.json, routed by the gateway
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "notify", "vimMode", "autoCompact", "fileCheckpoints", "fallbackModel", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "vimMode", "autoCompact", "fileCheckpoints", "fallbackModel", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = ["off", "low", "medium", "high"];
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
@@ -229,6 +234,9 @@ export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
     ...(overlay.mcpServers ?? {}),
   };
   const hooks = (merged.hooks && typeof merged.hooks === "object" ? merged.hooks : {}) as HooksConfig;
+  // Guardian: default ON; env HARA_GUARDIAN=0/off/false or config guardian:"off" disables it.
+  const guardianRaw = process.env.HARA_GUARDIAN ?? merged.guardian;
+  const guardian: "on" | "off" = guardianRaw === "0" || guardianRaw === "off" || guardianRaw === "false" ? "off" : "on";
   const notify = (process.env.HARA_NOTIFY ?? merged.notify ?? "off") as NotifyMode;
   const vimMode = process.env.HARA_VIM === "1" || merged.vimMode === true || merged.vimMode === "true";
   const autoCompact = !(process.env.HARA_AUTO_COMPACT === "0" || merged.autoCompact === false || merged.autoCompact === "false"); // default ON
@@ -241,7 +249,7 @@ export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
     ? (reasoningRaw as "off" | "low" | "medium" | "high")
     : undefined;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, hooks, notify, vimMode, autoCompact, fileCheckpoints, fallbackModel, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, vimMode, autoCompact, fileCheckpoints, fallbackModel, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: process.cwd() };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

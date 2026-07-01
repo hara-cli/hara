@@ -9,6 +9,7 @@ import { runHooks } from "../hooks.js";
 import { mapLimit, maxParallel } from "../concurrency.js";
 import type { ApprovalMode } from "../config.js";
 import { decideCommand, loadPermissionRules } from "../security/permissions.js";
+import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
 import { currentTodos, type Todo } from "../tools/todo.js";
@@ -101,6 +102,11 @@ export interface RunOpts {
   /** App-level failover (wired only at the main chat entry): retry an errored, recoverable turn once on a
    *  fallback-model `provider` (overload / rate-limit / timeout / context-overflow → a different model). */
   fallback?: { provider?: Provider };
+  /** Guardian (internal safety layer): a deterministic HIGH-RISK classifier + a conservative cheap-model
+   *  veto + a hard circuit-breaker, layered on top of permission rules / PreToolUse hooks / approval gate.
+   *  `provider` is the cheap model used for the veto (fail-open if absent/glitchy). Normal (low-risk) tools
+   *  never touch it — zero added latency. Absent → guardian off. */
+  guardian?: { provider?: Provider | null; enabled?: boolean };
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
@@ -117,6 +123,12 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   const toolCounts = new Map<string, number>();
   let blindShots = 0;
   let nudged = false;
+
+  // Guardian: engaged only on HIGH-RISK actions (see classifyRisk). `on` gates the whole layer so normal
+  // work never pays for it; the breaker is per-run (a hard stop after repeated blocks).
+  const guardianOn = !!opts.guardian && (opts.guardian.enabled ?? true) && guardianEnabled();
+  const breaker: BreakerState = newBreaker();
+  let breakerHalt = false; // set when a tripped breaker aborts this run
 
   for (;;) {
     // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
@@ -242,6 +254,12 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     }
     const plans: Plan[] = [];
     for (const tu of r.toolUses) {
+      if (breakerHalt) {
+        // Circuit-breaker halted the run: refuse every remaining call in this round with a clear message
+        // (no hang, no further tools) so the model + user get a definitive stop.
+        plans.push({ tu, tool: getTool(tu.name), denied: "Guardian circuit-breaker halted this run (too many high-risk actions blocked). Ask the user to review and re-run." });
+        continue;
+      }
       const tool = getTool(tu.name);
       if (!tool) {
         plans.push({ tu, tool: undefined, denied: `Unknown tool: ${tu.name}` });
@@ -259,6 +277,52 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       if (cmdDecision === "deny") {
         plans.push({ tu, tool, denied: "Denied by a permission rule (~/.hara/permissions.json). Loosen the rule or run it yourself." });
         continue;
+      }
+      // Guardian layer — runs AFTER permission rules, alongside/just before the confirm gate. The
+      // deterministic classifier short-circuits FIRST: read tools, in-project edits, and ordinary shell
+      // commands classify `low` (pure Node, no LLM) and skip everything below — zero added latency. Only a
+      // genuinely HIGH-RISK action pays for a cheap-model veto, and that veto fails OPEN on any glitch.
+      if (guardianOn && !breakerHalt) {
+        const risk = classifyRisk(tu.name, tool.kind, input, ctx.cwd);
+        if (risk.level === "high") {
+          const detail = String(input.command ?? input.path ?? "").replace(/\s+/g, " ").trim().slice(0, 400);
+          const verdict = await guardianVeto(
+            opts.guardian!.provider,
+            { tool: tu.name, detail, classifierReason: risk.reason },
+            history,
+            { signal: opts.signal },
+          );
+          if (verdict.decision === "block") {
+            const tripped = recordBlock(breaker); // deterministic circuit-breaker: N blocks → hard stop
+            plans.push({
+              tu,
+              tool,
+              denied: `Guardian blocked this high-risk action: ${verdict.reason || risk.reason}. Reconsider — take a safer, in-scope step, or ask the user before doing this.`,
+            });
+            if (!opts.quiet) {
+              const note = `⛔ guardian blocked ${tu.name} — ${verdict.reason || risk.reason}`;
+              if (sink) sink.notice(note);
+              else out(c.yellow(`  ${note}\n`));
+            }
+            if (tripped) {
+              // Circuit-breaker tripped — a HARDER stop than the soft stuck-guard. On an INTERACTIVE run
+              // (an `ask` channel exists), require an explicit human OK to continue. In headless/no-UI
+              // (gateway/cron/-p, where `confirm` is auto-yes and there's no real user), abort SAFELY —
+              // never auto-continue past the breaker, and never hang.
+              const interactive = !!ctx.ask;
+              const cont = interactive
+                ? await opts.confirm(`${c.red("⛔ guardian circuit-breaker")} — ${breaker.blocks} high-risk actions blocked this turn. Continue anyway?`)
+                : false;
+              if (cont === false) {
+                breakerHalt = true;
+              } else {
+                breaker.tripped = false;
+                breaker.blocks = 0; // user vouched → reset the counter, keep classifying
+              }
+            }
+            continue;
+          }
+        }
       }
       if (cmdDecision !== "allow" && needsConfirm(tool.kind, opts.approval) && (alwaysGate || !opts.autoApprove?.has(tu.name))) {
         const reply = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
@@ -318,6 +382,17 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     }
     await flush();
     history.push({ role: "tool", results });
+
+    if (breakerHalt) {
+      // A tripped-and-declined circuit-breaker is a hard stop: end the run cleanly (the denial messages are
+      // already in `results` so the model/user see why). Never spin further.
+      if (!opts.quiet) {
+        const note = "⛔ guardian circuit-breaker: run halted (too many high-risk actions blocked). Review and re-run.";
+        if (sink) sink.notice(note);
+        else out(c.red(`${note}\n`));
+      }
+      return;
+    }
 
     if (guard && !nudged) {
       for (const p of plans) if (p.tool && p.tool.kind !== "read") toolCounts.set(p.tu.name, (toolCounts.get(p.tu.name) ?? 0) + 1);
