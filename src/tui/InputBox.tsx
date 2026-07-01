@@ -2,8 +2,18 @@
 // prompt line in the middle, and a bottom border carrying the approval modes + token usage +
 // concurrency. Composed from <Text> rows (no ink border fork needed) so the title sits exactly
 // where we want it. Pure-ish: pass `width` to make rendering deterministic in tests.
+//
+// Render-stability principles (codex-style, for slow/remote terminals): ink erases and rewrites the
+// ENTIRE dynamic region on every frame, so the box's cost scales with (a) how many lines it occupies
+// and (b) how often any of them change. Two levers here:
+//   1. The static chrome (borders, mode bar, mention popup) is memoized so a keystroke that only
+//      changes the prompt text doesn't force React to reconcile the unchanged rows.
+//   2. Line-wrapping + cursor are computed deterministically from (value, cursor, width) in one memo,
+//      so long input wraps under a stable continuation indent and the cursor never drifts — instead
+//      of leaning on ink's soft-wrap of a single <Text>, which mis-aligns wrapped rows against the
+//      "› " prompt gutter and reflows unpredictably as you type.
 import { Box, Text, useInput, useStdout } from "ink";
-import { useMemo, useState, type ReactNode } from "react";
+import { memo, useMemo, useState, type ReactNode } from "react";
 import { fileCandidates } from "../context/mentions.js";
 import { imagePathFromPaste } from "../images.js";
 import { vimNormal, type VimMode } from "./vim.js";
@@ -24,7 +34,11 @@ export interface Status {
 
 const tok = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
 
-function TopBorder({ name, width }: { name: string; width: number }) {
+// The prompt gutter ("› " / "◆ ") is 2 cells wide; wrapped continuation lines indent by the same
+// amount so the text column is stable across visual rows.
+const GUTTER = 2;
+
+const TopBorder = memo(function TopBorder({ name, width }: { name: string; width: number }) {
   const labelLen = name.length + 2; // "⏺ " + name
   const left = Math.max(2, width - labelLen - 3);
   return (
@@ -35,10 +49,10 @@ function TopBorder({ name, width }: { name: string; width: number }) {
       <Text dimColor> ─</Text>
     </Box>
   );
-}
+});
 
 // Bottom border carries token usage + concurrency at the right corner (modes moved to ModeBar below).
-function BottomBorder({ s, width }: { s: Status; width: number }) {
+const BottomBorder = memo(function BottomBorder({ s, width }: { s: Status; width: number }) {
   const usage = `↑${tok(s.input)} ↓${tok(s.output)}${s.ctxPct > 0 ? ` · ctx ${s.ctxPct}%` : ""}`;
   const label = s.agents > 0 ? `${usage} · ⛁${s.agents}` : `${usage} · ⛁ idle`;
   const left = Math.max(2, width - label.length - 3);
@@ -47,7 +61,7 @@ function BottomBorder({ s, width }: { s: Status; width: number }) {
       <Text dimColor>{`${"─".repeat(left)} ${label} ─`}</Text>
     </Box>
   );
-}
+});
 
 const MODE_DESC: Record<Approval, string> = {
   suggest: "confirms edits & commands",
@@ -58,7 +72,7 @@ const MODE_DESC: Record<Approval, string> = {
 
 // Prominent approval-mode selector below the box: all three listed, the active one highlighted (red
 // for the dangerous full-auto) with a one-line description and the shift+tab hint.
-function ModeBar({ approval }: { approval: Approval }) {
+const ModeBar = memo(function ModeBar({ approval }: { approval: Approval }) {
   const warn = approval === "full-auto";
   return (
     <Box flexDirection="column">
@@ -73,7 +87,7 @@ function ModeBar({ approval }: { approval: Approval }) {
       <Text dimColor>{`    ${MODE_DESC[approval]} · shift+tab ⇄`}</Text>
     </Box>
   );
-}
+});
 
 /** The active `@mention` token immediately left of the cursor (for the file popup), or null. */
 function activeMention(value: string, cursor: number): { query: string; start: number } | null {
@@ -82,7 +96,7 @@ function activeMention(value: string, cursor: number): { query: string; start: n
 }
 
 // Dropdown of fuzzy @path matches, shown above the input as you type `@…` (codex / Claude-Code style).
-function MentionPopup({ items, selected, query }: { items: string[]; selected: number; query: string }) {
+const MentionPopup = memo(function MentionPopup({ items, selected, query }: { items: string[]; selected: number; query: string }) {
   return (
     <Box flexDirection="column">
       <Text dimColor>{`  @${query}  ·  ${items.length} match${items.length === 1 ? "" : "es"} — ↑↓ select · Tab/Enter insert · Esc dismiss`}</Text>
@@ -96,13 +110,12 @@ function MentionPopup({ items, selected, query }: { items: string[]; selected: n
       ))}
     </Box>
   );
-}
+});
 
 const TOKEN_RE = /\[Image #\d+\]/g;
 
-/** Render the prompt line: plain text + the cursor, with any `[Image #N]` attachment tokens highlighted
- *  (codex / Claude-Code style — the image lives inline in the text, visibly distinct from what you typed). */
-function InputLine({ value, cursor }: { value: string; cursor: number }) {
+/** Split the value into text/image-token segments (image tokens render highlighted, codex-style). */
+function segmentize(value: string): { text: string; token: boolean }[] {
   const parts: { text: string; token: boolean }[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
@@ -113,7 +126,88 @@ function InputLine({ value, cursor }: { value: string; cursor: number }) {
     last = m.index + m[0].length;
   }
   if (last < value.length) parts.push({ text: value.slice(last), token: false });
-  const seg = (token: boolean, text: string, k: string) =>
+  return parts;
+}
+
+/** One wrapped visual row: the character range [start,end) of `value` it covers. Precomputed so the
+ *  cursor lands on the right row/column and image tokens stay whole (never split across a wrap). */
+export interface Row {
+  start: number;
+  end: number;
+}
+
+/** Wrap `value` into rows that each fit within `cols` cells, breaking on spaces where possible but
+ *  never inside an `[Image #N]` token. Deterministic (no reliance on ink's soft-wrap) so wrapped rows
+ *  align under a stable gutter and the cursor position is exact. Always returns at least one row. */
+export function wrapRows(value: string, cols: number): Row[] {
+  const width = Math.max(1, cols);
+  const rows: Row[] = [];
+  const parts = segmentize(value);
+  // Flatten to atomic units: a run of text is breakable per-char/word; an image token is atomic.
+  const atoms: { text: string; start: number; atomic: boolean }[] = [];
+  let pos = 0;
+  for (const p of parts) {
+    if (p.token) {
+      atoms.push({ text: p.text, start: pos, atomic: true });
+      pos += p.text.length;
+    } else {
+      // Break the text run into word chunks (keep trailing space with the word) so wraps land on spaces.
+      const re = /\S+\s*|\s+/g;
+      let m: RegExpExecArray | null;
+      let base = pos;
+      while ((m = re.exec(p.text))) {
+        atoms.push({ text: m[0], start: base + m.index, atomic: false });
+      }
+      pos += p.text.length;
+    }
+  }
+  if (atoms.length === 0) return [{ start: 0, end: value.length }];
+
+  let rowStart = 0;
+  let col = 0;
+  const flush = (end: number): void => {
+    rows.push({ start: rowStart, end });
+    rowStart = end;
+    col = 0;
+  };
+  for (const a of atoms) {
+    const aEnd = a.start + a.text.length;
+    if (a.atomic || a.text.length <= width) {
+      // A whole unit (image token OR a word chunk that fits within a full row): if it doesn't fit in
+      // the remaining room and the row already has content, wrap to a fresh row FIRST — never split it.
+      if (a.text.length > width - col && col > 0) flush(a.start);
+      col += a.text.length; // an oversized atomic token may exceed width — acceptable (rare, kept whole)
+      if (col >= width) flush(aEnd);
+    } else {
+      // A single word longer than the whole width: hard-break it across rows.
+      let s = a.start;
+      if (col > 0) flush(s); // start the long word on a fresh row
+      while (s < aEnd) {
+        const room = width - col;
+        const take = Math.min(room, aEnd - s);
+        col += take;
+        s += take;
+        if (col >= width) flush(s);
+      }
+    }
+  }
+  // Flush the tail. If content exactly filled the last flushed row (rowStart === value.length), we add
+  // an EMPTY trailing row so an end-of-line cursor doesn't overflow the full row (would wrap oddly).
+  if (rowStart < value.length) {
+    rows.push({ start: rowStart, end: value.length });
+  } else if (rows.length === 0) {
+    rows.push({ start: 0, end: value.length }); // whole value fit on one (un-flushed) row
+  } else if (rowStart === value.length && col === 0) {
+    rows.push({ start: value.length, end: value.length }); // exactly-full last row → empty tail for the cursor
+  }
+  return rows;
+}
+
+/** Render a single visual row of the prompt: text + highlighted image tokens, drawing the block
+ *  cursor (inverse cell) when it falls on this row. Splitting happens on precomputed rows so the
+ *  whole prompt never reflows as a single <Text> — stable under wrapping and quick to diff. */
+function renderRow(value: string, row: Row, cursor: number, showCursor: boolean, isLastRow: boolean, keyPrefix: string): ReactNode {
+  const seg = (token: boolean, text: string, k: string): ReactNode =>
     token ? (
       <Text key={k} backgroundColor="magenta" color="white">
         {text}
@@ -121,34 +215,86 @@ function InputLine({ value, cursor }: { value: string; cursor: number }) {
     ) : (
       <Text key={k}>{text}</Text>
     );
+  // Segments intersected with this row's [start,end) range.
+  const parts = segmentize(value);
   const nodes: ReactNode[] = [];
-  let pos = 0;
   let ki = 0;
+  let pos = 0;
+  const cursorOnRow = showCursor && cursor >= row.start && cursor < row.end;
   for (const p of parts) {
-    const start = pos;
-    const end = pos + p.text.length;
-    if (cursor >= start && cursor < end) {
-      const rel = cursor - start;
-      if (rel > 0) nodes.push(seg(p.token, p.text.slice(0, rel), `s${ki++}`));
+    const pStart = pos;
+    const pEnd = pos + p.text.length;
+    pos = pEnd;
+    const from = Math.max(pStart, row.start);
+    const to = Math.min(pEnd, row.end);
+    if (from >= to) continue; // segment not on this row
+    const slice = p.text.slice(from - pStart, to - pStart);
+    if (cursorOnRow && cursor >= from && cursor < to) {
+      const rel = cursor - from;
+      if (rel > 0) nodes.push(seg(p.token, slice.slice(0, rel), `${keyPrefix}s${ki++}`));
       nodes.push(
-        <Text key={`c${ki++}`} inverse>
-          {p.text[rel]}
+        <Text key={`${keyPrefix}c${ki++}`} inverse>
+          {slice[rel]}
         </Text>,
       );
-      if (rel + 1 < p.text.length) nodes.push(seg(p.token, p.text.slice(rel + 1), `e${ki++}`));
+      if (rel + 1 < slice.length) nodes.push(seg(p.token, slice.slice(rel + 1), `${keyPrefix}e${ki++}`));
     } else {
-      nodes.push(seg(p.token, p.text, `p${ki++}`));
+      nodes.push(seg(p.token, slice, `${keyPrefix}p${ki++}`));
     }
-    pos = end;
   }
-  if (cursor >= value.length)
+  // End-of-value cursor: a trailing inverse space, only ever on the LAST row (so it's drawn once).
+  if (showCursor && isLastRow && cursor >= value.length && cursor >= row.start) {
     nodes.push(
-      <Text key="end" inverse>
+      <Text key={`${keyPrefix}end`} inverse>
         {" "}
       </Text>,
     );
-  return <Text>{nodes}</Text>;
+  }
+  return nodes;
 }
+
+/** The prompt: gutter + wrapped input rows (or a placeholder when empty). Each wrapped continuation
+ *  row is indented under the gutter so the text column is stable. Memoized so it only re-renders when
+ *  the value/cursor/width/gutter actually change (not when unrelated status ticks over). */
+const InputLine = memo(function InputLine({
+  value,
+  cursor,
+  width,
+  gutter,
+  gutterColor,
+  placeholder,
+}: {
+  value: string;
+  cursor: number;
+  width: number;
+  gutter: string;
+  gutterColor: string;
+  placeholder: string;
+}) {
+  const cols = Math.max(1, width - GUTTER); // text column width (after the 2-cell gutter)
+  const rows = useMemo(() => (value.length ? wrapRows(value, cols) : [{ start: 0, end: 0 }]), [value, cols]);
+  if (value.length === 0) {
+    return (
+      <Box>
+        <Text color={gutterColor}>{gutter}</Text>
+        <Text>
+          <Text inverse> </Text>
+          <Text dimColor>{placeholder}</Text>
+        </Text>
+      </Box>
+    );
+  }
+  return (
+    <Box flexDirection="column">
+      {rows.map((row, i) => (
+        <Box key={i}>
+          <Text color={gutterColor}>{i === 0 ? gutter : "  "}</Text>
+          <Text>{renderRow(value, row, cursor, true, i === rows.length - 1, `r${i}_`)}</Text>
+        </Box>
+      ))}
+    </Box>
+  );
+});
 
 /** Top border (session) + prompt line + bottom border (usage) + ModeBar, with an @path popup. */
 export function InputBox({
@@ -219,9 +365,12 @@ export function InputBox({
   };
 
   const mention = activeMention(value, cursor);
+  // FS scan only when the mention QUERY changes — not on every cursor move / unrelated keystroke.
+  // (`mention.start` moves whenever the cursor does; keying off it re-scanned the disk needlessly.)
+  const mentionQuery = isActive && mention && !dismissed ? mention.query : null;
   const candidates = useMemo(
-    () => (isActive && mention && !dismissed ? fileCandidates(cwd, mention.query, 8) : []),
-    [cwd, isActive, dismissed, mention?.query, mention?.start],
+    () => (mentionQuery !== null ? fileCandidates(cwd, mentionQuery, 8) : []),
+    [cwd, mentionQuery],
   );
   const popupOpen = candidates.length > 0;
   const selIdx = popupOpen ? Math.min(sel, candidates.length - 1) : 0;
@@ -331,20 +480,13 @@ export function InputBox({
     { isActive },
   );
 
+  const gutter = vim && mode === "normal" ? "◆ " : "› ";
+  const gutterColor = vim ? (mode === "normal" ? "yellow" : "green") : "cyan";
+
   return (
     <Box flexDirection="column">
       <TopBorder name={status.sessionName || "session"} width={w} />
-      <Box>
-        <Text color={vim ? (mode === "normal" ? "yellow" : "green") : "cyan"}>{vim && mode === "normal" ? "◆ " : "› "}</Text>
-        {value.length === 0 ? (
-          <Text>
-            <Text inverse> </Text>
-            <Text dimColor>{placeholder}</Text>
-          </Text>
-        ) : (
-          <InputLine value={value} cursor={cursor} />
-        )}
-      </Box>
+      <InputLine value={value} cursor={cursor} width={w} gutter={gutter} gutterColor={gutterColor} placeholder={placeholder} />
       {vim ? <Text dimColor>{mode === "normal" ? "  -- NORMAL --  i/a insert · h l 0 $ w b e move · x dd D cw p edit" : "  -- INSERT --  Esc → normal"}</Text> : null}
       <BottomBorder s={status} width={w} />
       {working ? <Text dimColor>{`  ⌨ working — Enter queues your message${queued ? ` · ${queued} queued` : ""} · Esc interrupts`}</Text> : null}

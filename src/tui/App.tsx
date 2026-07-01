@@ -7,7 +7,7 @@
 // The agent machinery is injected via `onSubmit` (a turn runner) so this view is testable with
 // ink-testing-library against a fake runner — no provider/network needed.
 import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { InputBox, type Status, type Approval } from "./InputBox.js";
 import type { ImageAttachment } from "../providers/types.js";
 import { activity } from "../activity.js";
@@ -117,7 +117,10 @@ function foldForHistory(it: Item): Item {
  *  block on every token, which over a laggy link leaves stale duplicate lines + jitter. 33ms clamps
  *  the live re-render rate while state itself stays exact (nothing is dropped, only coalesced). */
 const LIVE_FRAME_MS = 33;
-function Block({ item, open }: { item: Item; open?: boolean }) {
+// Memoized: a live block only re-renders when its own `item` (a fresh object when its text grows) or
+// `open` changes. So a spinner tick or an unrelated flush doesn't re-run `renderMarkdown` for every
+// live block, and non-tail live blocks stay put while only the streaming tail grows.
+const Block = memo(function Block({ item, open }: { item: Item; open?: boolean }) {
   switch (item.kind) {
     case "user":
       return (
@@ -153,7 +156,7 @@ function Block({ item, open }: { item: Item; open?: boolean }) {
     case "notice":
       return <Text dimColor>{item.text}</Text>;
   }
-}
+});
 
 // ── Ctrl+T transcript overlay (Codex-style): the whole conversation with NOTHING folded — full reasoning,
 // full tool output, full text — scrollable. The folded live view stays the default; this is the "see everything"
@@ -339,17 +342,27 @@ export function spinnerVerb(list: Todo[], elapsedSec: number): string {
   return `working ${elapsedSec}s · esc to interrupt`;
 }
 
+// The spinner is the only element that animates continuously while a turn runs — and because ink
+// redraws the WHOLE dynamic region (input box + mode bar included) on any change, its tick rate sets
+// a floor on full-frame redraws over the life of a turn. At ~8fps (125ms) the braille glyph still
+// reads as smooth motion but cuts those forced redraws ~20% vs 100ms — meaningfully calmer over a
+// slow/remote link. Elapsed seconds come from a wall-clock start, so the "Ns" text stays exact and
+// stable (it only changes once per second, not coupled to the glyph frame).
+const SPINNER_FRAME_MS = 125;
 function Working({ todos }: { todos: Todo[] }) {
-  const [n, setN] = useState(0);
+  const [frame, setFrame] = useState(0);
+  const startRef = useRef(Date.now());
   useEffect(() => {
-    const id = setInterval(() => setN((x) => x + 1), 100);
+    startRef.current = Date.now();
+    const id = setInterval(() => setFrame((x) => x + 1), SPINNER_FRAME_MS);
     return () => clearInterval(id);
   }, []);
   const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+  const elapsedSec = Math.floor((Date.now() - startRef.current) / 1000);
   return (
     <Box marginTop={1}>
-      <Text color="yellow">{frames[n % frames.length]}</Text>
-      <Text dimColor>{` ${spinnerVerb(todos, Math.floor(n / 10))}`}</Text>
+      <Text color="yellow">{frames[frame % frames.length]}</Text>
+      <Text dimColor>{` ${spinnerVerb(todos, elapsedSec)}`}</Text>
     </Box>
   );
 }
@@ -359,7 +372,9 @@ function Working({ todos }: { todos: Todo[] }) {
 // `… +N pending/done`. Hidden when the list is empty.
 const PANEL_MAX_ROWS = 8;
 const TODO_MARK: Record<Todo["status"], string> = { pending: "☐", in_progress: "▶", done: "☑" };
-function TodoPanel({ todos }: { todos: Todo[] }) {
+// Memoized on the `todos` array reference (stable between todo_write updates), so spinner ticks and
+// streaming flushes don't re-run the sort/slice every frame.
+const TodoPanel = memo(function TodoPanel({ todos }: { todos: Todo[] }) {
   if (!todos.length) return null;
   const doneCount = todos.filter((t) => t.status === "done").length;
   // Prioritize visible rows: in_progress first, then pending, then done — show the most informative
@@ -393,7 +408,7 @@ function TodoPanel({ todos }: { todos: Todo[] }) {
       {hiddenSummary ? <Text dimColor>{hiddenSummary}</Text> : null}
     </Box>
   );
-}
+});
 
 export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval, onClipboardImage, vim, visionNotice }: AppProps) {
   const { exit } = useApp();

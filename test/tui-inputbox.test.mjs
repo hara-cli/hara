@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
-import { InputBox } from "../dist/tui/InputBox.js";
+import { InputBox, wrapRows } from "../dist/tui/InputBox.js";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -109,6 +109,78 @@ test("InputBox: pasting an image file path inserts an inline token, not the raw 
   stdin.write("\r");
   await tick();
   assert.deepEqual(submitted.images, [{ path: png, mediaType: "image/png" }], "attachment passed on submit");
+  unmount();
+});
+
+// ── wrapRows: deterministic line-wrapping (drives the multi-line prompt + cursor placement) ──
+// Rows must (a) cover the whole value with no gaps/overlap, (b) each fit within `cols`, (c) prefer
+// breaking on spaces, (d) keep [Image #N] tokens whole, (e) leave a place for an end-of-line cursor.
+
+const coversExactly = (rows, value, cols) => {
+  assert.equal(rows[0].start, 0, "first row starts at 0");
+  assert.equal(rows[rows.length - 1].end, value.length, "last row ends at value.length");
+  for (let i = 1; i < rows.length; i++) assert.equal(rows[i].start, rows[i - 1].end, "rows are contiguous");
+  for (const r of rows) assert.ok(r.end - r.start <= cols || /\[Image #\d+\]/.test(value.slice(r.start, r.end)), `row within ${cols} cols (or an atomic token)`);
+};
+
+test("wrapRows: short value stays on one row", () => {
+  const rows = wrapRows("hello", 20);
+  assert.equal(rows.length, 1);
+  coversExactly(rows, "hello", 20);
+});
+
+test("wrapRows: wraps on a space boundary, not mid-word", () => {
+  const v = "alpha beta gamma delta"; // 22 chars
+  const rows = wrapRows(v, 12);
+  coversExactly(rows, v, 12);
+  assert.ok(rows.length >= 2, "wraps to multiple rows");
+  // each row (except possibly the last) should not end mid-word — it ends on/after a space
+  for (let i = 0; i < rows.length - 1; i++) {
+    const rowText = v.slice(rows[i].start, rows[i].end);
+    assert.ok(/\s$/.test(rowText) || rows[i].end === v.length, `row ${i} breaks on whitespace: ${JSON.stringify(rowText)}`);
+  }
+});
+
+test("wrapRows: a word longer than the width hard-breaks (no infinite loop)", () => {
+  const v = "x".repeat(25);
+  const rows = wrapRows(v, 10);
+  coversExactly(rows, v, 10);
+  assert.equal(rows.length, 3, "25 chars over width 10 → 3 rows (10+10+5)");
+});
+
+test("wrapRows: exactly-full content gets an empty trailing row (so the end cursor has a home)", () => {
+  const v = "0123456789"; // exactly width 10
+  const rows = wrapRows(v, 10);
+  coversExactly(rows, v, 10);
+  const last = rows[rows.length - 1];
+  assert.equal(last.start, v.length, "trailing empty row starts at end");
+  assert.equal(last.end, v.length, "trailing empty row is zero-length");
+});
+
+test("wrapRows: an [Image #N] token is never split across rows", () => {
+  const v = "look at [Image #1] closely";
+  const rows = wrapRows(v, 12);
+  coversExactly(rows, v, 12);
+  const tokenStart = v.indexOf("[Image #1]");
+  const tokenEnd = tokenStart + "[Image #1]".length;
+  // no row boundary falls strictly inside the token
+  for (const r of rows) {
+    assert.ok(!(r.end > tokenStart && r.end < tokenEnd), "no row ends inside the token");
+    assert.ok(!(r.start > tokenStart && r.start < tokenEnd), "no row starts inside the token");
+  }
+});
+
+test("InputBox: long input wraps to multiple visual rows (doesn't render on a single overflowing line)", async () => {
+  const long = "this is a fairly long prompt that should wrap across more than one visual row in a narrow box";
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, width: 40 }));
+  stdin.write(long);
+  await tick(80);
+  const frame = strip(lastFrame());
+  // all words present
+  assert.ok(frame.includes("fairly long prompt") && frame.includes("visual row"), "full text rendered");
+  // the prompt region spans multiple lines — count lines that carry input words
+  const inputLines = frame.split("\n").filter((l) => /this|prompt|wrap|visual|narrow/.test(l));
+  assert.ok(inputLines.length >= 2, `long input occupies multiple rows (saw ${inputLines.length})`);
   unmount();
 });
 
