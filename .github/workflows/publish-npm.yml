@@ -1,0 +1,41 @@
+# Publish @nanhara/hara to npm. Fires on a version tag push (v*) — so "release to GitHub" (push a tag, or cut a
+# GitHub Release, which creates the tag) also ships to npm — plus a manual "Run workflow" button. Auth uses the
+# repo's .npmrc (`//registry.npmjs.org/:_authToken=${NPM_TOKEN}`) resolved from the NPM_TOKEN repo secret — which
+# must be an npm granular token with publish rights to @nanhara AND 2FA bypass (CI can't answer an OTP prompt).
+#
+# Idempotent: if package.json's version is already on npm, the run exits green ("nothing to publish") instead of
+# failing — so re-runs and dispatch-tests are safe, and a green run still proves the token authenticated.
+name: publish-npm
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org/
+      - run: npm ci
+      - run: npm test
+      - name: Publish to npm (idempotent)
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set +e
+          out=$(npm publish --registry https://registry.npmjs.org/ 2>&1); code=$?
+          echo "$out"
+          if [ $code -eq 0 ]; then echo "✓ published"; exit 0; fi
+          if echo "$out" | grep -qiE "cannot publish over|previously published|EPUBLISHCONFLICT|409 Conflict"; then
+            echo "✓ auth OK — this version is already on npm; nothing to publish"; exit 0
+          fi
+          echo "✗ publish failed (auth or other error above)"; exit 1
