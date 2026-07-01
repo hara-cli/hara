@@ -121,6 +121,10 @@ function foldForHistory(it: Item): Item {
  *  block on every token, which over a laggy link leaves stale duplicate lines + jitter. 33ms clamps
  *  the live re-render rate while state itself stays exact (nothing is dropped, only coalesced). */
 const LIVE_FRAME_MS = 33;
+// How long the transient approval-mode selector stays up after a shift+tab before it auto-hides. Long
+// enough to read the descriptions + tap shift+tab again to keep cycling; short enough that it isn't
+// always-on chrome (codex/Claude-Code keep the mode compact in the status line, not a permanent bar).
+const MODE_SELECTOR_MS = 2500;
 // Memoized: a live block only re-renders when its own `item` (a fresh object when its text grows) or
 // `open` changes. So a spinner tick or an unrelated flush doesn't re-run `renderMarkdown` for every
 // live block, and non-tail live blocks stay put while only the streaming tail grows.
@@ -136,20 +140,23 @@ const Block = memo(function Block({ item, open }: { item: Item; open?: boolean }
     case "assistant":
       return <Text>{renderMarkdown(item.text)}</Text>; // headers/bold/inline-code/bullets + verbatim fences
     case "reasoning": {
-      // Codex-style: stream the reasoning dim + italic with a leading "• " bullet; show the full text up to
-      // MAX lines, fold longer to the live tail with a "… +N lines" summary. ctrl-r expands/collapses.
-      const MAX = 10;
+      // A streaming reasoning block lives in the dynamic region ABOVE the input box, and the instant the
+      // model stops thinking it FOLDS to a single "✻ thought · N lines" notice in scrollback. If we streamed
+      // the body live (up to ~11 rows) and then folded to 1, the input box would jump UP by that many rows
+      // every time — the "bobbing" you saw. So by default we show only the compact 1-line header (same height
+      // as the folded form → the box holds still). ctrl+r opts into the full streaming body (its own taller
+      // view), and the FULL text is always in the ctrl+t transcript regardless — nothing is lost.
       const lines = item.text.replace(/\n+$/, "").split("\n");
-      const long = lines.length > MAX;
-      const shown = open || !long ? lines : lines.slice(-MAX); // short or expanded → all; long & collapsed → live tail
-      const omitted = long && !open ? lines.length - MAX : 0;
-      const hint = long ? (open ? " · ctrl-r collapse" : ` · … +${omitted} lines · ctrl-r expand`) : "";
+      const n = lines.length;
+      const hint = open ? " · ctrl-r collapse" : " · ctrl-r expand";
       return (
         <Box flexDirection="column">
-          <Text color={accent()} dimColor>{`✻ thinking … ${lines.length} line${lines.length === 1 ? "" : "s"}${hint}`}</Text>
-          {shown.map((l, i) => (
-            <Text key={i} dimColor italic>{`${i === 0 ? "• " : "  "}${l}`}</Text>
-          ))}
+          <Text color={accent()} dimColor>{`✻ thinking … ${n} line${n === 1 ? "" : "s"}${hint}`}</Text>
+          {open
+            ? lines.map((l, i) => (
+                <Text key={i} dimColor italic>{`${i === 0 ? "• " : "  "}${l}`}</Text>
+              ))
+            : null}
         </Box>
       );
     }
@@ -447,6 +454,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [askText, setAskText] = useState<{ title: string; resolve: (v: string) => void } | null>(null);
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false); // Ctrl+T full-transcript overlay
+  const [modeSelector, setModeSelector] = useState(false); // transient approval selector: shift+tab pops it, auto-hides
+  const modeSelectorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Live checklist mirror: TodoPanel reads this, and `Working` derives its spinner verb from the
   // in_progress item. The tool emits on every todo_write — keeps the UI in lockstep with the agent.
   const [todos, setTodos] = useState<Todo[]>(() => currentTodos());
@@ -474,9 +483,10 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     return () => activity.onChange(null);
   }, []);
 
-  // Cancel any pending live-region flush on unmount so a timer can't fire after teardown.
+  // Cancel any pending timers on unmount so they can't fire after teardown.
   useEffect(() => () => {
     if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+    if (modeSelectorTimerRef.current) clearTimeout(modeSelectorTimerRef.current);
   }, []);
 
   // Subscribe to todo_write updates so the panel re-renders when the agent edits the checklist.
@@ -716,7 +726,17 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       }
       ctrlRef.current?.abort();
     }
-    else if (key.tab && key.shift && cycleApproval) setStatus((s) => ({ ...s, approval: cycleApproval(s.approval) }));
+    else if (key.tab && key.shift && cycleApproval) {
+      setStatus((s) => ({ ...s, approval: cycleApproval(s.approval) }));
+      // Pop the approval selector transiently (codex-style) and (re)arm the auto-hide — tapping shift+tab
+      // again keeps it up while cycling; it folds away on its own so it isn't permanent chrome.
+      setModeSelector(true);
+      if (modeSelectorTimerRef.current) clearTimeout(modeSelectorTimerRef.current);
+      modeSelectorTimerRef.current = setTimeout(() => {
+        setModeSelector(false);
+        modeSelectorTimerRef.current = null;
+      }, MODE_SELECTOR_MS);
+    }
   });
 
   if (showTranscript) return <Transcript items={[...history, ...current]} onClose={() => setShowTranscript(false)} />;
@@ -755,7 +775,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           ))}
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} model={model} route={header?.routeHost} isActive={!prompt} working={working && !askText} queued={pool.length} vim={vim} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
+      <InputBox status={status} cwd={cwd} model={model} route={header?.routeHost} isActive={!prompt} working={working && !askText} queued={pool.length} vim={vim} showModeSelector={modeSelector} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );
 }

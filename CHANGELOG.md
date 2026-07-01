@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.99.2 — TUI: steadier input box + transient approval selector
+
+- **Approval-mode selector is now transient, not always-on chrome.** The persistent two-row ModeBar under every
+  frame is gone; the current mode reads inline in the status footer (colored: red=full-auto, cyan=plan,
+  green=edit), and **shift+tab** pops the full picker + descriptions, which auto-hides after ~2.5s. Reclaims two
+  rows and cuts per-frame redraw during streaming — matching codex (transient approval overlay + compact status
+  line) and Claude Code.
+  - `tui/InputBox.tsx`: `footerParts`/`approvalColor` (colored mode in the footer); `ModeBar` gated on a new
+    `showModeSelector` prop. `tui/App.tsx`: shift+tab arms a 2.5s auto-hide timer.
+- **Input box no longer bobs up/down while the model thinks.** A streaming reasoning block used to render up to
+  ~11 live rows above the input, then fold to a single "✻ thought · N lines" line on finalize — that N→1
+  collapse yanked the box up every time. Reasoning now shows a **compact 1-line header by default** (same height
+  as the folded form → zero jump); **ctrl+r** expands the full streaming body, and **ctrl+t** always has the full
+  text. (ink can't bottom-pin the composer the way codex's ratatui viewport does, so this removes the dominant
+  jump; minor spinner/panel shifts at turn boundaries remain.)
+  - `tui/App.tsx`: the reasoning `Block` renders header-only unless `open` (ctrl+r).
+
 ## 0.94.1 — unreleased (gateway: relay is on-inbound, not a noisy push)
 
 - **Fix the bind output relay to be quiet + platform-correct.** 0.94.0's continuous 3s timer-push flooded chat

@@ -472,6 +472,31 @@ test("Ctrl+T transcript overlay: reasoning folds inline but shows FULL in the ov
   unmount();
 });
 
+test("App: streaming reasoning shows only the compact header by default (steady input box); ctrl+r reveals the body", async () => {
+  // Anti-bob: while reasoning is the live tail it must NOT stream its multi-line body above the input box
+  // (that body would fold to 1 line on finalize and yank the box up). Default = 1-line header; ctrl+r expands.
+  const onSubmit = async (line, h) => {
+    h.sink.reasoningDelta("alpha thought\nbeta thought\ngamma thought");
+    await tick(300); // hold as the live tail (no assistant delta yet) so both samples land pre-fold
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("think");
+  await tick();
+  stdin.write("\r");
+  await tick(70); // mid-turn: reasoning is the live tail, collapsed by default
+  const collapsed = strip(lastFrame());
+  assert.ok(collapsed.includes("thinking … 3 lines"), "compact header with the line count is shown");
+  assert.ok(!collapsed.includes("alpha thought"), "reasoning body hidden by default — the input box holds steady");
+  stdin.write("\x12"); // Ctrl+R → expand
+  await tick(70);
+  const expanded = strip(lastFrame());
+  assert.ok(expanded.includes("alpha thought") && expanded.includes("gamma thought"), "ctrl+r reveals the full reasoning body");
+  unmount();
+});
+
 test("App live region: finalized reasoning graduates to <Static> ONCE — no stacked/duplicate thinking lines", async () => {
   // Regression for the remote/slow-terminal duplication bug: a completed reasoning block must be
   // emitted to scrollback exactly once (folded), and must NOT keep re-appearing as the assistant

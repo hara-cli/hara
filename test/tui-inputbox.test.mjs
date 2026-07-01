@@ -12,30 +12,43 @@ const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
 const cwd = process.cwd();
 const S = { sessionName: "s", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
 
-test("InputBox: bordered prompt box, modes in the ModeBar, status in the footer line", () => {
+test("InputBox: bordered prompt box, current mode colored in the footer, no always-on ModeBar", () => {
   const status = { sessionName: "refactor-auth", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
   const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", width: 64 }));
   const frame = strip(lastFrame());
   // Rounded box chrome (replaces the old ⏺/dash top & bottom rules).
   assert.ok(frame.includes("╭") && frame.includes("╰"), "rounded box borders around the prompt");
-  assert.ok(frame.includes("glm-5 · suggest"), "model · approval lead the footer line");
-  assert.ok(frame.includes("◆ suggest"), "active mode marked in the ModeBar");
-  assert.ok(frame.includes("auto-edit") && frame.includes("full-auto"), "other modes listed");
-  assert.ok(frame.includes("confirms edits"), "active-mode description shown");
+  assert.ok(frame.includes("glm-5 · suggest"), "model · approval lead the footer line (the mode lives here now)");
+  // The persistent ModeBar is gone (shift+tab pops it transiently instead) — by default: no ◆ picker,
+  // no other-modes list, no description eating two rows under every frame.
+  assert.ok(!frame.includes("◆ suggest"), "no always-on ModeBar picker by default");
+  assert.ok(!frame.includes("full-auto"), "other modes not listed persistently");
+  assert.ok(!frame.includes("confirms edits"), "no persistent mode description");
   assert.ok(frame.includes("›"), "prompt arrow");
   // ctx field is present from the very first frame (ctxPct 0) — no mid-session layout pop.
   assert.ok(frame.includes("ctx 0%"), "ctx field renders from 0% (always present, no layout shift)");
   unmount();
 });
 
-test("InputBox highlights the active mode (auto-edit) + formats usage in the footer", () => {
+test("InputBox: active mode reads from the footer + usage is formatted", () => {
   const status = { sessionName: "s", approval: "auto-edit", input: 1200, output: 340, ctxPct: 12, agents: 2 };
   const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", route: "gw.nanhara.tech", width: 72 }));
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("◆ auto-edit"), "auto-edit marked active");
+  assert.ok(frame.includes("glm-5 · auto-edit"), "active mode shown inline in the footer");
   assert.ok(frame.includes("↑1.2k ↓340"), "token usage formatted");
   assert.ok(frame.includes("ctx 12%"), "context percent shown");
   assert.ok(frame.includes("gw.nanhara.tech"), "route host in the footer when set");
+  unmount();
+});
+
+test("InputBox: showModeSelector pops the transient picker (all modes + active description)", () => {
+  const status = { sessionName: "s", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
+  const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", width: 72, showModeSelector: true }));
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("◆ suggest"), "active mode marked in the transient selector");
+  assert.ok(frame.includes("auto-edit") && frame.includes("full-auto"), "other modes listed while the picker is up");
+  assert.ok(frame.includes("confirms edits"), "active-mode description shown");
+  assert.ok(frame.includes("shift+tab"), "shift+tab hint shown in the picker");
   unmount();
 });
 

@@ -48,20 +48,48 @@ export function footerCwd(abs: string, home: string = process.env.HOME ?? "", ma
   return "…" + (slash > 0 ? tail.slice(slash) : tail);
 }
 
-/** Compose the single dim footer line rendered below the box. Pure so the ordering/spacing (and the
- *  optional route segment) can be pinned without rendering React. Shape (codex-style status line):
+/** Approval-mode accent color, shared by the footer indicator + the transient ModeBar. full-auto is
+ *  the dangerous one (red), plan is read-only (cyan), the edit modes are green. */
+export function approvalColor(a: Approval): string {
+  return a === "full-auto" ? "red" : a === "plan" ? "cyan" : "green";
+}
+
+/** The footer split into three parts so the ACTIVE approval mode can be colored inline. The always-on
+ *  ModeBar was removed — the mode now lives, glanceable and colored, right here in the footer, and
+ *  shift+tab pops a transient selector. `prefix`+`mode`+`suffix` concatenates to exactly the old
+ *  `footerLine` (same text, same spacing) — only the color of the `mode` token differs. Pure so the
+ *  ordering/spacing can be pinned without rendering React. Shape (codex-style status line):
  *  `<model> · <approval>[ · <route>] · <cwd> · ↑<in> ↓<out> · ctx <pct>%`. The session name is NOT here —
  *  it rides the input box's top-right border (see TopBorder). `ctx N%` is always present (from 0 on) so
  *  the field never pops in mid-session and shifts the layout. */
-export function footerLine(model: string, s: Status, cwdShort: string, route?: string): string {
+export function footerParts(model: string, s: Status, cwdShort: string, route?: string): { prefix: string; mode: string; suffix: string } {
   const routeSeg = route ? ` · ${route}` : "";
-  return `  ${model} · ${s.approval}${routeSeg} · ${cwdShort} · ↑${tok(s.input)} ↓${tok(s.output)} · ctx ${s.ctxPct}%`;
+  return {
+    prefix: `  ${model} · `,
+    mode: s.approval,
+    suffix: `${routeSeg} · ${cwdShort} · ↑${tok(s.input)} ↓${tok(s.output)} · ctx ${s.ctxPct}%`,
+  };
 }
 
-// The merged status footer (was split across the old top/bottom dash-rules): model · approval ·
-// route · cwd · usage · ctx. Memoized so a prompt keystroke doesn't reconcile it.
+/** Back-compat: the full footer as one string (prefix+mode+suffix). Kept for any pure consumer/test. */
+export function footerLine(model: string, s: Status, cwdShort: string, route?: string): string {
+  const p = footerParts(model, s, cwdShort, route);
+  return p.prefix + p.mode + p.suffix;
+}
+
+// The merged status footer: model · approval · route · cwd · usage · ctx. The active approval mode is
+// colored inline (the always-on ModeBar is gone — shift+tab now pops a transient selector instead), so
+// the outer <Text> is NOT dim: only the prefix/suffix are dimmed and the mode token stays bright.
+// Memoized so a prompt keystroke doesn't reconcile it.
 const Footer = memo(function Footer({ model, s, cwdShort, route }: { model: string; s: Status; cwdShort: string; route?: string }) {
-  return <Text dimColor>{footerLine(model, s, cwdShort, route)}</Text>;
+  const { prefix, mode, suffix } = footerParts(model, s, cwdShort, route);
+  return (
+    <Text>
+      <Text dimColor>{prefix}</Text>
+      <Text color={approvalColor(s.approval)} bold>{mode}</Text>
+      <Text dimColor>{suffix}</Text>
+    </Text>
+  );
 });
 
 // The rounded TOP edge of the input box, carrying the session name in the right corner (it "rides"
@@ -89,8 +117,10 @@ const MODE_DESC: Record<Approval, string> = {
   plan: "investigate read-only, then propose a plan to approve",
 };
 
-// Prominent approval-mode selector below the box: all three listed, the active one highlighted (red
-// for the dangerous full-auto) with a one-line description and the shift+tab hint.
+// Transient approval-mode selector: popped by shift+tab and auto-hidden after a beat (App owns the
+// timer) so it isn't always-on chrome. All modes listed, the active one highlighted (red for the
+// dangerous full-auto) with a one-line description and the shift+tab hint. When hidden, the current
+// mode still reads (colored) from the footer line — this just adds the full picker + descriptions.
 const ModeBar = memo(function ModeBar({ approval }: { approval: Approval }) {
   const warn = approval === "full-auto";
   return (
@@ -329,6 +359,7 @@ export function InputBox({
   working = false,
   queued = 0,
   vim = false,
+  showModeSelector = false,
   placeholder = "Type a task · /help · @file · Ctrl+V paste image · shift+tab mode · Esc interrupts",
 }: {
   status: Status;
@@ -348,6 +379,9 @@ export function InputBox({
   queued?: number;
   /** modal (vim) keybindings: Esc → normal mode (commands), i/a → insert */
   vim?: boolean;
+  /** show the transient approval-mode selector (App pops it on shift+tab, auto-hides it). When false the
+   *  mode still reads from the colored footer segment — this just adds the full picker + descriptions. */
+  showModeSelector?: boolean;
   placeholder?: string;
 }) {
   const { stdout } = useStdout();
@@ -525,7 +559,7 @@ export function InputBox({
       <Footer model={model} s={status} cwdShort={cwdShort} route={route} />
       {working ? <Text dimColor>{`  ⌨ working — Enter queues your message${queued ? ` · ${queued} queued` : ""} · Esc interrupts`}</Text> : null}
       {popupOpen ? <MentionPopup items={candidates} selected={selIdx} query={mention!.query} /> : null}
-      <ModeBar approval={status.approval} />
+      {showModeSelector ? <ModeBar approval={status.approval} /> : null}
     </Box>
   );
 }
