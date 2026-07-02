@@ -13,7 +13,7 @@ import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, t
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
-import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS } from "./reminders.js";
+import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
 import { setTurnPhase } from "./phase.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
@@ -462,6 +462,14 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     }
     await flush();
     history.push({ role: "tool", results });
+
+    // Synthesis nudge (CC's KN5, hara-shaped): a round that fanned out to several parallel agents just
+    // produced N independent reports — remind the model to merge/reconcile them before acting, instead
+    // of anchoring on whichever report happens to sit last in context.
+    if (!opts.quiet) {
+      const fanout = r.toolUses.filter((tu) => tu.name === "agent").length;
+      if (fanout >= SYNTHESIS_MIN_AGENTS) pushReminder(synthesisReminder(fanout));
+    }
 
     // Todo attention-refresh: a round that touched the checklist resets the clock; rounds that leave
     // unfinished items untouched accumulate, and at TODO_STALE_ROUNDS the model gets a system-reminder

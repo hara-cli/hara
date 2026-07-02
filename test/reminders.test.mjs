@@ -121,3 +121,50 @@ test("COMPACT_SYSTEM: 8 sections incl. verbatim user messages + key technical co
   assert.ok(/verbatim and in order/.test(COMPACT_SYSTEM), "user messages preserved verbatim (anti-drift)");
   assert.ok(/8\./.test(COMPACT_SYSTEM), "numbered through 8");
 });
+
+test("synthesis nudge: a ≥3-agent fan-out round injects the merge reminder before the next call", async () => {
+  drainReminders();
+  clearTodos();
+  const fakeAgent = {
+    name: "agent",
+    description: "spawn",
+    input_schema: { type: "object", properties: { task: { type: "string" } } },
+    kind: "read",
+    run: async () => "report",
+  };
+  let round = 0;
+  const provider = {
+    id: "f",
+    model: "f",
+    async turn() {
+      round++;
+      if (round === 1)
+        return { text: "", toolUses: [1, 2, 3].map((i) => ({ id: `a${i}`, name: "agent", input: { task: `q${i}` } })), stop: "tool_use" };
+      return { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "investigate three things" }];
+  await runAgent(history, { provider, ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice() {} } }, approval: "full-auto", confirm: async () => true, extraTools: [fakeAgent] });
+  const nudge = history.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("3 parallel agent reports"));
+  assert.ok(nudge, "synthesis reminder injected after the fan-out round");
+  assert.ok(nudge.content.includes("SYNTHESIZE"), "asks for an explicit merge");
+});
+
+test("synthesis nudge: 1-2 agent calls do NOT trigger it (only real fan-outs)", async () => {
+  drainReminders();
+  clearTodos();
+  const fakeAgent = { name: "agent", description: "spawn", input_schema: { type: "object", properties: {} }, kind: "read", run: async () => "r" };
+  let round = 0;
+  const provider = {
+    id: "f",
+    model: "f",
+    async turn() {
+      round++;
+      if (round === 1) return { text: "", toolUses: [{ id: "a1", name: "agent", input: {} }, { id: "a2", name: "agent", input: {} }], stop: "tool_use" };
+      return { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "two lookups" }];
+  await runAgent(history, { provider, ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice() {} } }, approval: "full-auto", confirm: async () => true, extraTools: [fakeAgent] });
+  assert.ok(!history.some((m) => typeof m.content === "string" && m.content.includes("parallel agent reports")), "no nudge below the threshold");
+});

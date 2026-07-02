@@ -36,6 +36,19 @@ export function wrapReminders(items: string[]): string {
  *  attention refresh. Reset on every todo_write; re-arms after firing so it nags at most once per N. */
 export const TODO_STALE_ROUNDS = 5;
 
+/** Parallel fan-outs at/above this size get a synthesis nudge (CC's KN5 synthesizer, hara-shaped:
+ *  instead of a dedicated merger agent, the MAIN model is reminded to merge before acting). */
+export const SYNTHESIS_MIN_AGENTS = 3;
+
+/** The synthesis nudge: N independent reports just landed — reconcile before acting. */
+export function synthesisReminder(n: number): string {
+  return (
+    `You just received ${n} parallel agent reports. Before acting, SYNTHESIZE them into one coherent ` +
+    "picture: reconcile overlaps and conflicts explicitly (say which report wins and why), note anything " +
+    "only one report saw, and state the merged conclusion. Don't act on a single report in isolation."
+  );
+}
+
 /** The staleness nudge: re-show the authoritative list + ask for a status pass. */
 export function todoStaleReminder(renderedTodos: string): string {
   return (

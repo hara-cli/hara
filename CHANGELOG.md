@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.105.0 — fan-outs synthesize before acting
+
+- **Synthesis nudge** (the last adopted item from the Claude Code internals study — their KN5
+  synthesizer, hara-shaped): when a round returns **3+ parallel agent reports**, a silent
+  system-reminder tells the model to merge them first — reconcile overlaps and conflicts explicitly,
+  note what only one report saw, state the merged conclusion — instead of anchoring on whichever
+  report happens to sit last in context. Rides the 0.100.0 reminder layer; no new machinery.
+
 ## 0.104.0 — compaction keeps your working files + honest context accounting
 
 Closes the last two adopted items from the Claude Code internals study, and un-breaks the release
