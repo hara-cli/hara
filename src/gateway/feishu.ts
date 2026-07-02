@@ -3,7 +3,11 @@
 // outbound. Creds from HARA_FEISHU_APP_ID / HARA_FEISHU_APP_SECRET (+ HARA_FEISHU_DOMAIN=lark for larksuite.com).
 // Same ChatAdapter shape as the others, so all cross-platform gateway logic (send_file, system context,
 // stuck-guard, image attach/describe) works unchanged. v1 = p2p (DM) only; group support is a fast-follow.
-import lark from "@larksuiteoapi/node-sdk";
+// Namespace import + default fallback: node resolves this SDK as CJS (default = module object), but
+// bun's bundler resolves its ESM build (named exports only, NO default) — `import lark from` made
+// every binaries release fail. This form works under both resolutions.
+import * as larkNs from "@larksuiteoapi/node-sdk";
+const lark = ((larkNs as { default?: unknown }).default ?? larkNs) as typeof import("@larksuiteoapi/node-sdk");
 import { createReadStream, createWriteStream, mkdirSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { join, basename } from "node:path";

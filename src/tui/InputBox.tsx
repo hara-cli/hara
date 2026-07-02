@@ -63,19 +63,23 @@ export function approvalColor(a: Approval): string {
  *  `<model> · <approval>[ · <route>] · <cwd> · ↑<in> ↓<out> · ctx <pct>%`. The session name is NOT here —
  *  it rides the input box's top-right border (see TopBorder). `ctx N%` is always present (from 0 on) so
  *  the field never pops in mid-session and shifts the layout. */
-export function footerParts(model: string, s: Status, cwdShort: string, route?: string): { prefix: string; mode: string; suffix: string } {
+export function footerParts(model: string, s: Status, cwdShort: string, route?: string): { prefix: string; mode: string; suffix: string; ctx: string; ctxLevel: "ok" | "warn" | "high" } {
   const routeSeg = route ? ` · ${route}` : "";
   return {
     prefix: `  ${model} · `,
     mode: s.approval,
-    suffix: `${routeSeg} · ${cwdShort} · ↑${tok(s.input)} ↓${tok(s.output)} · ctx ${s.ctxPct}%`,
+    suffix: `${routeSeg} · ${cwdShort} · ↑${tok(s.input)} ↓${tok(s.output)} · `,
+    ctx: `ctx ${s.ctxPct}%`,
+    // Claude Code's threshold ladder (60 warn / 80 error / 92 compact): hara auto-compacts at 85, so
+    // the footer escalates BEFORE that — yellow at 60, red at 80 — and the user sees compaction coming.
+    ctxLevel: s.ctxPct >= 80 ? "high" : s.ctxPct >= 60 ? "warn" : "ok",
   };
 }
 
-/** Back-compat: the full footer as one string (prefix+mode+suffix). Kept for any pure consumer/test. */
+/** Back-compat: the full footer as one string. Kept for any pure consumer/test. */
 export function footerLine(model: string, s: Status, cwdShort: string, route?: string): string {
   const p = footerParts(model, s, cwdShort, route);
-  return p.prefix + p.mode + p.suffix;
+  return p.prefix + p.mode + p.suffix + p.ctx;
 }
 
 // The merged status footer: model · approval · route · cwd · usage · ctx. The active approval mode is
@@ -83,12 +87,13 @@ export function footerLine(model: string, s: Status, cwdShort: string, route?: s
 // the outer <Text> is NOT dim: only the prefix/suffix are dimmed and the mode token stays bright.
 // Memoized so a prompt keystroke doesn't reconcile it.
 const Footer = memo(function Footer({ model, s, cwdShort, route }: { model: string; s: Status; cwdShort: string; route?: string }) {
-  const { prefix, mode, suffix } = footerParts(model, s, cwdShort, route);
+  const { prefix, mode, suffix, ctx, ctxLevel } = footerParts(model, s, cwdShort, route);
   return (
     <Text>
       <Text dimColor>{prefix}</Text>
       <Text color={approvalColor(s.approval)} bold>{mode}</Text>
       <Text dimColor>{suffix}</Text>
+      {ctxLevel === "ok" ? <Text dimColor>{ctx}</Text> : <Text color={ctxLevel === "high" ? "red" : "yellow"} bold>{ctx}</Text>}
     </Text>
   );
 });

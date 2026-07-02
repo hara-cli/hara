@@ -15,6 +15,11 @@ import { classifyError, failoverAction, errorHint } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
 import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS } from "./reminders.js";
 import { setTurnPhase } from "./phase.js";
+import { recordTouch } from "./touched.js";
+import { resolve as resolvePath } from "node:path";
+
+/** File tools whose `path` input marks the file as "recently worked with" (post-compaction restore). */
+const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
 
 /** Stall watchdog ceiling: a model attempt that streams NOTHING for this long is treated as a dead /
  *  stalled connection and aborted into the normal error→failover path — instead of hanging on
@@ -423,6 +428,11 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         if (pre.block) {
           results[idx] = { id: p.tu.id, name: p.tu.name, content: pre.message, isError: true };
           return;
+        }
+        // Track the MAIN conversation's working files for post-compaction restore (quiet fan-out
+        // sub-agents read broadly — their files aren't "what the user was working on").
+        if (!opts.quiet && FILE_TOUCH_TOOLS.has(p.tu.name) && typeof (p.tu.input as { path?: unknown })?.path === "string") {
+          recordTouch(resolvePath(ctx.cwd, String((p.tu.input as { path: string }).path)));
         }
         const res = await p.tool!.run(p.tu.input, ctx);
         // append any not-yet-seen subdirectory AGENTS.md/CLAUDE.md this call touched (monorepo-local conventions)

@@ -113,7 +113,11 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
         .filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use")
         .map((b) => ({ id: b.id, name: b.name, input: b.input }));
       const stop = msg.stop_reason === "tool_use" ? "tool_use" : "end";
-      const usage = { input: msg.usage?.input_tokens ?? 0, output: msg.usage?.output_tokens ?? 0 };
+      // Cache-aware input accounting: Anthropic's input_tokens EXCLUDES cache reads/writes, so a
+      // cached session under-reported context fullness badly (ctx% stayed tiny → auto-compact never
+      // fired → overflow). Total context = fresh + cache_creation + cache_read (CC's zY5 equivalent).
+      const u = msg.usage as { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined;
+      const usage = { input: (u?.input_tokens ?? 0) + (u?.cache_creation_input_tokens ?? 0) + (u?.cache_read_input_tokens ?? 0), output: u?.output_tokens ?? 0 };
       return { text, toolUses, stop, usage };
     },
   };

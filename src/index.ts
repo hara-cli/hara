@@ -62,7 +62,8 @@ import {
 } from "./profile/profile.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
-import { shouldAutoCompact, COMPACT_SYSTEM } from "./agent/compact.js";
+import { shouldAutoCompact, COMPACT_SYSTEM, buildFileRestore } from "./agent/compact.js";
+import { recentTouched } from "./agent/touched.js";
 import { checkForUpdate } from "./update-check.js";
 import { formatContextReport } from "./agent/context-report.js";
 import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
@@ -798,6 +799,16 @@ async function compactConversation(provider: Provider, history: NeutralMsg[], me
   meta.workingSet = workingSetFromSummary(summary); // survives the history wipe + injects into the next turns
   history.length = 0;
   history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
+  // TW5-style file restore: the summary alone loses the working set's ACTUAL content — re-attach the
+  // most recently touched files (current on-disk state, byte-capped) so work continues without re-reads.
+  const restore = buildFileRestore(recentTouched(5), (p) => {
+    try {
+      return readFileSync(p, "utf8");
+    } catch {
+      return null;
+    }
+  });
+  if (restore) history.push({ role: "user", content: restore });
   stats.input += r.usage?.input ?? 0;
   stats.output += r.usage?.output ?? 0;
   stats.lastInput = r.usage?.input ?? 0; // ctx% now reflects the (small) summary, not the old full turn

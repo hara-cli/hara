@@ -12,7 +12,9 @@
 FROM node:22-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci
+# --ignore-scripts: "prepare": "tsc" would fire here, BEFORE src/tsconfig are copied, and fail the
+# build (this broke the release image job on every tag). The explicit `npm run build` below compiles.
+RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build

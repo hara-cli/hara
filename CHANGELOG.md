@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.104.0 — compaction keeps your working files + honest context accounting
+
+Closes the last two adopted items from the Claude Code internals study, and un-breaks the release
+pipeline.
+
+- **Post-compaction file restore** (CC's TW5): compaction now re-attaches the CURRENT on-disk content
+  of the files the conversation was most recently working with (top 5, byte-capped) — the summary is
+  no longer the model's only anchor, so it doesn't re-read its own working set or act on a stale
+  memory of an edited file.
+- **Context threshold ladder + cache-aware accounting**: the footer's `ctx N%` turns yellow at 60%
+  and red at 80% (auto-compact fires at 85), so compaction never surprises you. And on Anthropic
+  endpoints, input accounting now includes cache reads/writes — cached sessions used to under-report
+  context fullness so badly that auto-compact could never fire before overflow.
+- **Release pipeline fixed** (every `v*` tag's release workflow had been failing silently):
+  the Docker image's `npm ci` ran the `prepare → tsc` hook before src was copied; and the standalone
+  binaries died on the Feishu SDK's default import under bun's ESM resolution. Both corrected —
+  binaries + ghcr image ship again from this tag.
+
 ## 0.103.0 — the project-analysis SOP (why hara felt slow on "analyze this repo")
 
 The execution layer could always parallelize reads and fan out read-only sub-agents — but nothing

@@ -24,6 +24,30 @@ export const COMPACT_SYSTEM =
   "8. Next step — the immediate next action, INCLUDING a direct verbatim quote of the user's most recent request so there is no drift.\n" +
   "Be specific and concrete. Drop the <analysis>; output only the headed summary.";
 
+/** Post-compaction file restore (Claude Code's TW5): re-attach the CURRENT content of the files the
+ *  conversation was just working with, so the summary isn't the model's only anchor — it doesn't have
+ *  to re-read its own working set next turn (and can't act on a stale memory of an edited file).
+ *  `readFn` is injected (returns null for unreadable/gone files); byte caps bound the token cost. */
+export function buildFileRestore(
+  paths: string[],
+  readFn: (p: string) => string | null,
+  opts?: { perFileBytes?: number; totalBytes?: number },
+): string | null {
+  const per = opts?.perFileBytes ?? 8_192;
+  let budget = opts?.totalBytes ?? 24_576;
+  const parts: string[] = [];
+  for (const p of paths) {
+    if (budget <= 0) break;
+    const raw = readFn(p);
+    if (raw == null) continue;
+    const clipped = raw.slice(0, Math.min(per, budget));
+    budget -= clipped.length;
+    parts.push(`--- ${p}${clipped.length < raw.length ? " (truncated)" : ""} ---\n${clipped}`);
+  }
+  if (!parts.length) return null;
+  return `Files you were recently working with (CURRENT on-disk content, restored after compaction):\n\n${parts.join("\n\n")}`;
+}
+
 /** Whether to auto-compact now: enabled, the history is substantial enough to be worth summarizing, and the
  *  last turn filled the context past the threshold (so the NEXT turn would risk overflow). */
 export function shouldAutoCompact(ctxPct: number, historyLen: number, autoCompact: boolean, threshold = AUTO_COMPACT_PCT): boolean {
