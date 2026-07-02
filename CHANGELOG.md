@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.101.0 — startup update check
+
+- **`hara` tells you when it's out of date.** On launch (interactive TTY only), a one-line notice —
+  `⬆ Update available 0.100.0 → 0.101.0 · npm i -g @nanhara/hara` — driven by a daily background
+  probe with a 3s timeout that NEVER delays startup (the notice always comes from the previous
+  probe's cache, npm update-notifier style). npmjs first, npmmirror fallback for CN networks;
+  offline machines fail silent and back off to daily retries. Disable with
+  `hara config set updateCheck false` or `HARA_UPDATE_CHECK=0`.
+
 ## 0.100.0 — the agent keeps its own attention: system-reminders + anti-drift compaction
 
 Distilled from a source-level study of Claude Code v1.0.33's agent internals (the Ie1/WD5 reminder

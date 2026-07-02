@@ -63,6 +63,7 @@ import {
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
 import { shouldAutoCompact, COMPACT_SYSTEM } from "./agent/compact.js";
+import { checkForUpdate } from "./update-check.js";
 import { formatContextReport } from "./agent/context-report.js";
 import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
 import { checkpoint, listCheckpoints, restoreCheckpoint } from "./checkpoints.js";
@@ -2226,6 +2227,12 @@ program.action(async (opts) => {
   // interactive REPL — ink TUI by default on a real terminal; HARA_TUI=0 forces the classic readline path
   const useTui = stdin.isTTY && stdout.isTTY && process.env.HARA_TUI !== "0";
   out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}${sandbox !== "off" ? `  ·  sandbox:${sandbox}` : ""}  ·  ${cwd}\n`));
+  // Startup update notice — cache-driven (a previous session's background probe), so it costs zero
+  // latency; today's probe (if due) fires in the background for the NEXT launch. TTY sessions only.
+  if (cfg.updateCheck && stdout.isTTY) {
+    const upd = checkForUpdate(pkg.version);
+    if (upd) out(c.yellow(`⬆ ${upd}`) + "\n");
+  }
   const rl = createInterface({
     input: stdin,
     output: stdout,
