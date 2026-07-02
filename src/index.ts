@@ -74,6 +74,7 @@ import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath
 import { runTick, runJobOnce, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools, type Tool } from "./tools/registry.js";
+import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
@@ -829,6 +830,9 @@ async function runSubagent(
 ): Promise<string> {
   const roles = loadRoles(cwd);
   const role = roleId ? roles.find((r) => r.id === roleId) : undefined;
+  // Built-in explore persona: `agent(role:"explore")` works with ZERO user setup (a user-defined
+  // explore role still wins — it was found above and carries its own system).
+  const builtinSystem = !role && roleId === "explore" ? EXPLORE_SYSTEM : undefined;
   const __subModel = effectiveRoleModel(role?.model, cfg.model);
   const provider = __subModel ? ((await buildProvider({ ...cfg, model: __subModel })) ?? baseProvider) : baseProvider;
   // A sub-agent runs full-auto + UNCONFIRMED + parallel, so it is ALWAYS read-only — a role may narrow
@@ -844,7 +848,7 @@ async function runSubagent(
     projectContext,
     memory: memoryDigest(cwd),
     stats,
-    systemOverride: role?.system,
+    systemOverride: role?.system ?? builtinSystem,
     toolFilter,
     quiet: true,
   });

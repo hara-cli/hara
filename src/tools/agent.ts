@@ -3,12 +3,27 @@
 // read-only by default (safe to parallelize); the actual spawn is provided via ctx.spawn.
 import { registerTool } from "./registry.js";
 
+/** Built-in persona for `role: "explore"` (no setup needed — index.ts falls back to this when the
+ *  user hasn't defined an explore role). Claude-Code's Explore-agent playbook: read-only, parallel,
+ *  excerpts-not-files, conclusions-not-dumps. */
+export const EXPLORE_SYSTEM =
+  "You are a fast, READ-ONLY codebase explorer. Navigate with grep/glob/ls/read_file and be quick: " +
+  "issue your searches and file reads as MULTIPLE PARALLEL tool calls in one round whenever they are " +
+  "independent — never one-per-turn. Read targeted excerpts, not whole files. You cannot modify anything. " +
+  "Answer with CONCLUSIONS: the finding, the relevant paths with line references, and what they mean for " +
+  "the question — never dump raw file contents. Match your depth to the task: a quick lookup stays quick; " +
+  "an architecture question deserves a thorough sweep across naming conventions and directories.";
+
 registerTool({
   name: "agent",
   description:
-    "Delegate an independent sub-task to a fresh sub-agent and get its result. Spawn SEVERAL in one " +
-    "turn to run them in parallel (e.g. analyze/search/review N things at once). Sub-agents are " +
-    "read-only by default; pass a `role` id to use that role's persona + tools. Not for edits.",
+    "Delegate an independent sub-task to a fresh READ-ONLY sub-agent and get its conclusions. " +
+    "WHEN TO USE: open-ended exploration ('how does X work across the codebase', 'find everything that touches Y') " +
+    "that would take more than ~3 searches — pass role \"explore\" for a fast search specialist; and spawning " +
+    "SEVERAL agents in ONE response for independent questions (they run in parallel). " +
+    "WHEN NOT TO USE: reading a specific known file (read_file), finding one symbol (grep), or searching " +
+    "within 2-3 known files — direct tools are faster. Never for edits. " +
+    "Pass a `role` id to use that role's persona + tools.",
   input_schema: {
     type: "object",
     properties: {

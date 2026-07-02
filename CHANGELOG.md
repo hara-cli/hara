@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.103.0 — the project-analysis SOP (why hara felt slow on "analyze this repo")
+
+The execution layer could always parallelize reads and fan out read-only sub-agents — but nothing
+TAUGHT the model, so it explored one call per turn. Distilled from codex's prompt discipline and
+Claude Code's Explore-agent pattern:
+
+- **System prompt playbook**: batch independent tool calls in one response (reads execute in
+  parallel); analyzing a project starts with a ONE-batch wide sweep (manifest + README + build/CI
+  config) then narrow grep/glob; more than ~3 searches → fan out `agent` sub-agents, several in one
+  response.
+- **`agent` tool grows WHEN-TO-USE / WHEN-NOT-TO-USE guidance** (CC's heuristic): narrow lookups go
+  to direct tools; open-ended "how does X work across the codebase" goes to sub-agents.
+- **Built-in `explore` persona** — `agent(role:"explore")` works with zero setup: read-only, parallel
+  searches, excerpts not whole files, returns conclusions with path:line refs, never dumps. A
+  user-defined explore role still wins.
+
 ## 0.102.0 — a slow network never feels dead
 
 Jeff + a designer colleague both hit the same thing: press Enter on a slow connection and hara
