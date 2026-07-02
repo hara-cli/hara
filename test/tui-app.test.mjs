@@ -636,3 +636,30 @@ test("App todo fold-on-submit: previous checklist folds to a one-line summary wh
   assert.equal(currentTodos().length, 0, "tool-side list cleared with the fold");
   unmount();
 });
+
+test("App live overflow guard: a long streaming answer shows only a tail window; FULL text commits on finalize", async () => {
+  // The dynamic region must never outgrow the terminal (ink's repaint breaks and the input box "runs
+  // to the top"). A 60-line streaming answer should render as a bounded tail mid-turn, then land whole.
+  const long = Array.from({ length: 60 }, (_, i) => `line-${i + 1}`).join("\n");
+  const onSubmit = async (line, h) => {
+    h.sink.assistantDelta(long);
+    await tick(250); // hold the live region so we can sample mid-turn
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick(100); // mid-turn
+  const mid = strip(lastFrame());
+  assert.ok(mid.includes("line-60"), "tail of the stream is visible live");
+  assert.ok(!mid.includes("line-1\n") && !mid.includes("line-2\n"), "early lines are elided from the live view");
+  assert.ok(/\+\d+ earlier lines/.test(mid), "elision counter shown");
+  await tick(300); // finalize → full block graduates to <Static>
+  const done = strip(lastFrame());
+  assert.ok(done.includes("line-1") && done.includes("line-30") && done.includes("line-60"), "full text landed in scrollback after finalize");
+  assert.ok(!/\+\d+ earlier lines/.test(done.split("line-60").pop() ?? ""), "no elision header on the committed block");
+  unmount();
+});

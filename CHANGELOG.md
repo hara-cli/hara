@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.101.1 — the input box stops running to the top
+
+- **Live-region overflow guard.** A long streaming answer (or a big diff) used to grow the live region
+  past the terminal height — at which point ink's in-place repaint breaks and the input box "runs to
+  the top of the screen". Live blocks now render a bounded tail window (sized to your terminal, elided
+  lines counted in a dim header); the FULL text lands in scrollback the moment the block finalizes,
+  and ctrl+t shows it live. Same treatment reasoning got in 0.99.2, now for answers and diffs — the
+  dynamic region can no longer outgrow the viewport, which is the invariant that kept codex stable
+  (line-level commits) and pushed Claude Code to a fullscreen ScrollBox.
+
 ## 0.101.0 — startup update check
 
 - **`hara` tells you when it's out of date.** On launch (interactive TTY only), a one-line notice —

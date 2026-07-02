@@ -130,7 +130,32 @@ const MODE_SELECTOR_MS = 2500;
 // Memoized: a live block only re-renders when its own `item` (a fresh object when its text grows) or
 // `open` changes. So a spinner tick or an unrelated flush doesn't re-run `renderMarkdown` for every
 // live block, and non-tail live blocks stay put while only the streaming tail grows.
-const Block = memo(function Block({ item, open }: { item: Item; open?: boolean }) {
+/** Tail-window a LIVE block's rendered lines so the dynamic region can never outgrow the terminal.
+ *  ink repaints the whole dynamic region in place; once it's taller than the viewport the erase math
+ *  breaks and the input box "runs to the top of the screen". Bounding the live view fixes the class:
+ *  earlier lines are elided with a dim counter, and the FULL text lands in scrollback the moment the
+ *  block finalizes (nothing is lost — ctrl+t shows it live too). `maxRows` comes from the terminal. */
+function tailWindow(rendered: string, maxRows: number): { header: string | null; body: string } {
+  const lines = rendered.replace(/\n+$/, "").split("\n");
+  if (lines.length <= maxRows) return { header: null, body: rendered };
+  return {
+    header: `… +${lines.length - maxRows} earlier lines — full text lands above when this block finishes · ctrl+t to view now`,
+    body: lines.slice(-maxRows).join("\n"),
+  };
+}
+
+const Block = memo(function Block({ item, open, liveRows }: { item: Item; open?: boolean; liveRows?: number }) {
+  // Live streaming blocks get a bounded tail view (liveRows set); committed <Static> blocks render full.
+  const windowed = (rendered: string): ReactNode => {
+    if (!liveRows) return <Text>{rendered}</Text>;
+    const w = tailWindow(rendered, liveRows);
+    return (
+      <Box flexDirection="column">
+        {w.header ? <Text dimColor>{w.header}</Text> : null}
+        <Text>{w.body}</Text>
+      </Box>
+    );
+  };
   switch (item.kind) {
     case "user":
       return (
@@ -140,7 +165,7 @@ const Block = memo(function Block({ item, open }: { item: Item; open?: boolean }
         </Box>
       );
     case "assistant":
-      return <Text>{renderMarkdown(item.text)}</Text>; // headers/bold/inline-code/bullets + verbatim fences
+      return windowed(renderMarkdown(item.text)); // headers/bold/inline-code/bullets + verbatim fences
     case "reasoning": {
       // A streaming reasoning block lives in the dynamic region ABOVE the input box, and the instant the
       // model stops thinking it FOLDS to a single "✻ thought · N lines" notice in scrollback. If we streamed
@@ -165,7 +190,7 @@ const Block = memo(function Block({ item, open }: { item: Item; open?: boolean }
     case "tool":
       return <Text dimColor>{"  " + item.text}</Text>;
     case "diff":
-      return <Text>{item.text}</Text>;
+      return windowed(item.text); // a big diff must not blow the live region either
     case "notice":
       return <Text dimColor>{item.text}</Text>;
   }
@@ -486,6 +511,11 @@ const TodoPanel = memo(function TodoPanel({ todos }: { todos: Todo[] }) {
 
 export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval, onClipboardImage, vim, visionNotice }: AppProps) {
   const { exit } = useApp();
+  const { stdout: termOut } = useStdout();
+  // Live tail budget: terminal rows minus the rest of the dynamic chrome (todo panel ≤10, status slot,
+  // input box + footer, margins). Keeps the WHOLE dynamic region under the viewport — the invariant that
+  // stops ink's repaint from "running to the top" when a long answer/diff streams. Floor 8 for tiny panes.
+  const liveRows = Math.max(8, (termOut?.rows ?? 30) - 20);
   const [history, setHistory] = useState<Item[]>([]);
   const [current, setCurrent] = useState<Item[]>([]);
   const [working, setWorking] = useState(false);
@@ -775,7 +805,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         {(item) => (item.id === -1 ? <HeaderCard key="hdr" {...header!} /> : <Block key={item.id} item={item} />)}
       </Static>
       {current.map((item) => (
-        <Block key={item.id} item={item} open={reasoningOpen} />
+        <Block key={item.id} item={item} open={reasoningOpen} liveRows={liveRows} />
       ))}
       <TodoPanel todos={todos} />
       {prompt && (
