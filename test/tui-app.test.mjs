@@ -560,3 +560,79 @@ test("App type-ahead: Esc while working clears the queue (stop means stop)", asy
   assert.ok(!seen.includes("queued one"), "queued message dropped after Esc — stop means stop");
   unmount();
 });
+
+// ── Constant-height status slot (anti-bob): StatusRow ⇄ ModeLine, always exactly one row + margin ──
+
+test("App status slot: idle shows key hints; working swaps in the spinner (no ⌨ working row, no height pop)", async () => {
+  const onSubmit = async (line, h) => {
+    h.sink.assistantDelta("hi");
+    await tick(200); // hold the turn open so we can sample the working state
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  const idle = strip(lastFrame());
+  assert.ok(idle.includes("⏎ send") && idle.includes("shift+tab mode"), "idle → key-hints row present (slot occupied)");
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick(90); // mid-turn
+  const mid = strip(lastFrame());
+  assert.ok(/working \d+s/.test(mid) || mid.includes("⏎ queues"), "working → spinner row in the same slot");
+  assert.ok(!mid.includes("⏎ send · @ file"), "hints swapped OUT while working (one row at a time)");
+  assert.ok(!mid.includes("⌨ working"), "the old extra working-hint row is gone");
+  await tick(250); // turn ends
+  const done = strip(lastFrame());
+  assert.ok(done.includes("⏎ send"), "idle hints return after the turn — slot never empties");
+  unmount();
+});
+
+test("App shift+tab: ModeLine swaps into the status slot (equal height), cycles the mode, then auto-hides", async () => {
+  const nextMode = (m) => ({ suggest: "auto-edit", "auto-edit": "full-auto", "full-auto": "plan", plan: "suggest" })[m];
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit: async () => {}, cycleApproval: nextMode }),
+  );
+  await tick();
+  stdin.write("\x1b[Z"); // shift+tab (backtab)
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("◆ auto-edit"), "cycled suggest → auto-edit, marked active in the ModeLine");
+  assert.ok(frame.includes("suggest") && frame.includes("full-auto") && frame.includes("plan"), "all modes listed");
+  assert.ok(frame.includes("⇄ shift+tab"), "cycle hint inline");
+  assert.ok(!frame.includes("⏎ send · @ file"), "StatusRow swapped OUT — the slot holds ONE row at a time");
+  assert.ok(frame.includes("glm-5 · auto-edit"), "footer reflects the new mode too");
+  unmount();
+});
+
+test("App todo fold-on-submit: previous checklist folds to a one-line summary when the NEXT turn starts", async () => {
+  await import("../dist/tools/todo.js"); // ensure the tool is registered
+  const { getTool } = await import("../dist/tools/registry.js");
+  const { currentTodos } = await import("../dist/tools/todo.js");
+  const todoTool = getTool("todo_write");
+  const onSubmit = async (line, h) => {
+    if (line === "task one") {
+      await todoTool.run({ todos: [{ text: "step A", status: "done" }, { text: "step B", status: "done" }] }, { cwd: process.cwd() });
+    }
+    h.sink.assistantDelta("ok");
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("task one");
+  await tick();
+  stdin.write("\r");
+  await tick(150); // turn 1 done — panel visible, NOT folded by any timer
+  const after1 = strip(lastFrame());
+  assert.ok(after1.includes("step A"), "panel stays visible after the turn (no 30s yank)");
+  assert.ok(!after1.includes("✓ Todos:"), "not folded yet");
+  stdin.write("task two");
+  await tick();
+  stdin.write("\r");
+  await tick(150); // turn 2 — fold happened at submit
+  const after2 = strip(lastFrame());
+  assert.ok(after2.includes("✓ Todos: 2/2 done"), "checklist folded to a summary at the next submit");
+  assert.equal(currentTodos().length, 0, "tool-side list cleared with the fold");
+  unmount();
+});

@@ -1,6 +1,7 @@
 // The framed input box (ink): a rounded, dim-bordered box (codex polish) wrapping the prompt line,
-// with a single dim footer line rendered BELOW the box (model · approval · route · cwd · usage · ctx)
-// and the ModeBar under that. Pure-ish: pass `width` to make rendering deterministic in tests.
+// with a single dim footer line rendered BELOW the box (model · approval · route · cwd · usage · ctx).
+// The approval-mode picker and working/queue status live OUTSIDE this component (App's constant-height
+// StatusRow/ModeLine slot above the box). Pure-ish: pass `width` for deterministic tests.
 //
 // Render-stability principles (codex-style, for slow/remote terminals): ink erases and rewrites the
 // ENTIRE dynamic region on every frame, so the box's cost scales with (a) how many lines it occupies
@@ -48,7 +49,7 @@ export function footerCwd(abs: string, home: string = process.env.HOME ?? "", ma
   return "…" + (slash > 0 ? tail.slice(slash) : tail);
 }
 
-/** Approval-mode accent color, shared by the footer indicator + the transient ModeBar. full-auto is
+/** Approval-mode accent color, shared by the footer indicator + App's transient ModeLine. full-auto is
  *  the dangerous one (red), plan is read-only (cyan), the edit modes are green. */
 export function approvalColor(a: Approval): string {
   return a === "full-auto" ? "red" : a === "plan" ? "cyan" : "green";
@@ -106,34 +107,6 @@ const TopBorder = memo(function TopBorder({ name, width }: { name: string; width
       <Text color="cyan">●</Text>
       <Text bold>{` ${name} `}</Text>
       <Text dimColor>{"─╮"}</Text>
-    </Box>
-  );
-});
-
-const MODE_DESC: Record<Approval, string> = {
-  suggest: "confirms edits & commands",
-  "auto-edit": "auto-applies edits · asks before commands",
-  "full-auto": "runs everything — no prompts  ⚠",
-  plan: "investigate read-only, then propose a plan to approve",
-};
-
-// Transient approval-mode selector: popped by shift+tab and auto-hidden after a beat (App owns the
-// timer) so it isn't always-on chrome. All modes listed, the active one highlighted (red for the
-// dangerous full-auto) with a one-line description and the shift+tab hint. When hidden, the current
-// mode still reads (colored) from the footer line — this just adds the full picker + descriptions.
-const ModeBar = memo(function ModeBar({ approval }: { approval: Approval }) {
-  const warn = approval === "full-auto";
-  return (
-    <Box flexDirection="column">
-      <Box>
-        {MODES.map((m, i) => (
-          <Text key={m}>
-            {i > 0 ? "   " : "  "}
-            {m === approval ? <Text color={warn ? "red" : m === "plan" ? "cyan" : "green"} bold>{`◆ ${m}`}</Text> : <Text dimColor>{m}</Text>}
-          </Text>
-        ))}
-      </Box>
-      <Text dimColor>{`    ${MODE_DESC[approval]} · shift+tab ⇄`}</Text>
     </Box>
   );
 });
@@ -345,8 +318,8 @@ const InputLine = memo(function InputLine({
   );
 });
 
-/** Bordered prompt box + one dim status footer (model · approval · route · cwd · usage · ctx) +
- *  ModeBar, with an @path popup. */
+/** Bordered prompt box + one dim status footer (model · approval · route · cwd · usage · ctx),
+ *  with an @path popup. */
 export function InputBox({
   status,
   cwd,
@@ -356,10 +329,7 @@ export function InputBox({
   onSubmit,
   onClipboardImage,
   isActive = true,
-  working = false,
-  queued = 0,
   vim = false,
-  showModeSelector = false,
   placeholder = "Type a task · /help · @file · Ctrl+V paste image · shift+tab mode · Esc interrupts",
 }: {
   status: Status;
@@ -373,15 +343,8 @@ export function InputBox({
   /** Read an image off the OS clipboard (Ctrl+V). Injected so the view stays side-effect-free in tests. */
   onClipboardImage?: () => ImageAttachment | null;
   isActive?: boolean;
-  /** the agent is mid-turn — typing here is type-ahead (queued, sent when the turn finishes) */
-  working?: boolean;
-  /** how many messages are already queued (for the hint) */
-  queued?: number;
   /** modal (vim) keybindings: Esc → normal mode (commands), i/a → insert */
   vim?: boolean;
-  /** show the transient approval-mode selector (App pops it on shift+tab, auto-hides it). When false the
-   *  mode still reads from the colored footer segment — this just adds the full picker + descriptions. */
-  showModeSelector?: boolean;
   placeholder?: string;
 }) {
   const { stdout } = useStdout();
@@ -557,9 +520,7 @@ export function InputBox({
       </Box>
       {vim ? <Text dimColor>{mode === "normal" ? "  -- NORMAL --  i/a insert · h l 0 $ w b e move · x dd D cw p edit" : "  -- INSERT --  Esc → normal"}</Text> : null}
       <Footer model={model} s={status} cwdShort={cwdShort} route={route} />
-      {working ? <Text dimColor>{`  ⌨ working — Enter queues your message${queued ? ` · ${queued} queued` : ""} · Esc interrupts`}</Text> : null}
       {popupOpen ? <MentionPopup items={candidates} selected={selIdx} query={mention!.query} /> : null}
-      {showModeSelector ? <ModeBar approval={status.approval} /> : null}
     </Box>
   );
 }

@@ -1,5 +1,5 @@
 import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
-import { getTool, toolSpecs, type ToolContext } from "../tools/registry.js";
+import { getTool, toolSpecs, type Tool, type ToolContext } from "../tools/registry.js";
 import { stdout } from "node:process";
 import { c, out } from "../ui.js";
 import { activity } from "../activity.js";
@@ -91,6 +91,10 @@ export interface RunOpts {
   systemOverride?: string;
   /** restrict which tools this run may use (by name) */
   toolFilter?: (name: string) => boolean;
+  /** Ad-hoc tools for THIS run only (e.g. plan mode's `exit_plan`) — appended AFTER toolFilter (so a
+   *  filter can't accidentally drop them) and resolved BEFORE the registry on dispatch. Never
+   *  registered globally, so other runs/modes can't see or call them. */
+  extraTools?: Tool[];
   /** abort the in-flight LLM request (user interrupt) */
   signal?: AbortSignal;
   /** suppress streaming/tool output (sub-agents running in parallel) */
@@ -136,7 +140,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     if (opts.pendingInput) {
       for (const m of await opts.pendingInput()) history.push(m);
     }
-    const specs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
+    const baseSpecs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
+    const specs = opts.extraTools?.length
+      ? [...baseSpecs, ...opts.extraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
+      : baseSpecs;
     const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
     const tty = stdout.isTTY && !opts.quiet && !sink;
     const md = tty && process.env.HARA_MD !== "0" ? makeRenderer(out) : null;
@@ -253,14 +260,16 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       denied?: string;
     }
     const plans: Plan[] = [];
+    // Extra (per-run) tools win over the registry so a run-scoped tool can't be shadowed by a global one.
+    const resolveTool = (name: string): Tool | undefined => opts.extraTools?.find((t) => t.name === name) ?? getTool(name);
     for (const tu of r.toolUses) {
       if (breakerHalt) {
         // Circuit-breaker halted the run: refuse every remaining call in this round with a clear message
         // (no hang, no further tools) so the model + user get a definitive stop.
-        plans.push({ tu, tool: getTool(tu.name), denied: "Guardian circuit-breaker halted this run (too many high-risk actions blocked). Ask the user to review and re-run." });
+        plans.push({ tu, tool: resolveTool(tu.name), denied: "Guardian circuit-breaker halted this run (too many high-risk actions blocked). Ask the user to review and re-run." });
         continue;
       }
-      const tool = getTool(tu.name);
+      const tool = resolveTool(tu.name);
       if (!tool) {
         plans.push({ tu, tool: undefined, denied: `Unknown tool: ${tu.name}` });
         continue;

@@ -72,7 +72,7 @@ import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
 import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
 import { runTick, runJobOnce, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
-import { getTools } from "./tools/registry.js";
+import { getTools, type Tool } from "./tools/registry.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
@@ -742,10 +742,26 @@ async function nameSession(provider: Provider, history: NeutralMsg[]): Promise<s
     return titleFrom(history);
   }
 }
+/** Render a proposed plan as a bordered block for the transcript (codex ProposedPlanCell-style).
+ *  Left-border-only frame — right-edge alignment against variable-width content is brittle, and the
+ *  open right side lets long lines wrap naturally. Emitted via the diff sink channel (renders verbatim,
+ *  not dimmed like notice). */
+const renderPlanBlock = (plan: string): string => {
+  const lines = plan.replace(/\n+$/, "").split("\n");
+  const top = c.cyan("╭─ ") + c.bold(c.cyan("Plan")) + c.cyan(" " + "─".repeat(42));
+  const body = lines.map((l) => c.cyan("│ ") + l).join("\n");
+  return `${top}\n${body}\n${c.cyan("╰" + "─".repeat(48))}`;
+};
+
+// Plan mode's contract (Claude-Code style handshake): the MODEL decides when the plan is ready by
+// calling `exit_plan` — we never nag with a proceed-prompt after turns that were just investigation
+// or Q&A. codex's equivalent is the plan streaming to a dedicated cell + Enter-to-implement.
 const PLAN_SYSTEM =
-  "You are in PLAN MODE. Investigate read-only (read_file / grep / glob / ls / web_fetch) and think, " +
-  "then propose a concise step-by-step plan for the task. Do NOT edit files or run commands yet — only plan. " +
-  "End your message with the plan as a short numbered list.";
+  "You are in PLAN MODE — a read-only investigation phase. Explore with read_file / grep / glob / ls / " +
+  "web tools and think. Do NOT edit files or run mutating commands — only investigate and plan. " +
+  "When (and only when) you have a complete, actionable plan, call the `exit_plan` tool with the full plan " +
+  "(concise markdown, short numbered steps), then stop and wait for the user's decision. " +
+  "If the user is asking a question, or the plan isn't ready yet, just answer normally WITHOUT calling exit_plan.";
 const DISTILL_SYSTEM =
   "The session is ending. Reflect and persist only durable, reusable learnings: memory_write for facts / " +
   "conventions / the user's preferences, skill_create for reusable how-tos. Be selective — skip the trivial. Then reply DONE.";
@@ -3005,19 +3021,38 @@ program.action(async (opts) => {
         };
         const turnStart = Date.now(); // for the task-done notification (gated on elapsed)
         if (appr === "plan") {
-          // PLAN MODE: read-only investigate → propose a plan → selectable proceed → execute.
+          // PLAN MODE: read-only investigate; the MODEL signals plan-readiness by calling `exit_plan`
+          // (Claude-Code style handshake) — only then do we pop the proceed prompt. Turns that were just
+          // investigation / Q&A end back at the input, still in plan mode, with no nagging.
           const planImg = await resolveImages(images, h);
           if (planImg.skip) return;
           history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + (planImg.extraText ?? ""), ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
           recalledContext = "";
           const pin = stats.input;
           const pout = stats.output;
+          // Run-scoped tool (never in the registry, so no other mode can see it): captures the proposed
+          // plan and renders it as a bordered block (codex's ProposedPlanCell equivalent) via the sink.
+          let proposedPlan: string | null = null;
+          const exitPlanTool: Tool = {
+            name: "exit_plan",
+            description:
+              "Call when your plan is complete and ready for the user to approve. Pass the FULL plan as concise " +
+              "markdown (short numbered steps). This ends the planning phase — after calling it, stop and wait.",
+            input_schema: { type: "object", properties: { plan: { type: "string", description: "the complete plan (markdown, short numbered steps)" } }, required: ["plan"] },
+            kind: "read", // never prompts — submitting a plan is not a mutation
+            run: async (input, tctx) => {
+              proposedPlan = String((input as { plan?: unknown })?.plan ?? "").trim();
+              if (proposedPlan) tctx.ui?.diff(renderPlanBlock(proposedPlan));
+              return "Plan submitted to the user for approval. Stop now and wait for their decision — do not keep working.";
+            },
+          };
           await runAgent(history, {
             provider,
             ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
             approval: "suggest",
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n),
+            extraTools: [exitPlanTool],
             systemOverride: PLAN_SYSTEM,
             memory: buildMemory(),
             projectContext,
@@ -3031,6 +3066,11 @@ program.action(async (opts) => {
           }
           h.sink.usage(stats.input - pin, stats.output - pout);
           saveSession(meta, history);
+          if (!proposedPlan) {
+            // No exit_plan this turn — the model was investigating or answering. Stay in plan mode quietly.
+            notifyDone(cfg.notify, { message: meta.title || "plan turn complete", elapsedMs: Date.now() - turnStart });
+            return;
+          }
           const choice = await h.select("hara has a plan — proceed?", [
             { label: "Yes, and auto-apply edits", value: "auto-edit" },
             { label: "Yes, approve each edit", value: "suggest" },

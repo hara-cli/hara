@@ -5,6 +5,28 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.99.3 — TUI: rock-steady input box (constant-height chrome) + plan mode grows a real handshake
+
+Built from a source-level study of codex-rs (bottom-anchored viewport, plan cells) and Claude Code
+(flexShrink-pinned bottom region, ExitPlanMode handshake).
+
+- **The input box no longer jumps at turn boundaries.** The bottom chrome is now a CONSTANT-height
+  stack: a permanent one-row status slot above the box swaps its content — spinner + verb + queue count
+  while working ⇄ dim key hints when idle — instead of appearing/disappearing (the old `Working` block +
+  `⌨ working` hint row cost ±3 rows at every turn start/end). The shift+tab picker (`ModeLine`, now ONE
+  row with short inline descriptions) swaps into the SAME slot, so popping/auto-hiding it moves nothing.
+  The todo panel no longer folds on a 30s timer (which yanked the box up while you read) — it folds to
+  its one-line summary when the NEXT turn starts, coinciding with your own submit.
+  - `tui/App.tsx`: `StatusRow`/`ModeLine` + the constant slot; fold-on-submit; `tui/InputBox.tsx`: the
+    working-hint row and two-row ModeBar are gone (mode still reads colored in the footer).
+- **Plan mode: the MODEL now decides when the plan is ready** (Claude-Code style), instead of hara
+  nagging "proceed?" after every read-only turn. A run-scoped `exit_plan` tool (new `extraTools` option
+  on `runAgent` — per-run tools, never registered globally) is offered only in plan mode; when the model
+  calls it, the plan renders as a bordered `╭─ Plan` block (codex ProposedPlanCell-style) and THEN the
+  proceed picker appears. Investigation/Q&A turns end quietly, still in plan mode.
+  - `agent/loop.ts`: `opts.extraTools` (advertised post-filter, resolved before the registry);
+    `index.ts`: plan branch rewired + `PLAN_SYSTEM` teaches the exit_plan contract.
+
 ## 0.99.2 — TUI: steadier input box + transient approval selector
 
 - **Approval-mode selector is now transient, not always-on chrome.** The persistent two-row ModeBar under every

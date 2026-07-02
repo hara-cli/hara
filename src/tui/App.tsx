@@ -1,20 +1,22 @@
 // The hara TUI (ink). Layout, top to bottom:
-//   <Static>   committed transcript — rendered once each, scrolls into native scrollback
-//   current    the in-progress turn's blocks (assistant text / reasoning / tool / diff), live
-//   <Working>  spinner while a turn runs (Esc interrupts)
-//   <InputBox> the pinned, bordered prompt (or a confirm prompt when a tool needs approval)
+//   <Static>    committed transcript — rendered once each, scrolls into native scrollback
+//   current     the in-progress turn's blocks (assistant text / reasoning / tool / diff), live
+//   <TodoPanel> live checklist (when the agent keeps one)
+//   status slot ALWAYS one row: StatusRow (spinner while working / key hints idle) ⇄ ModeLine
+//               (shift+tab picker) — constant height so the input box never bobs at turn boundaries
+//   <InputBox>  the bordered prompt (or a confirm prompt when a tool needs approval)
 //
 // The agent machinery is injected via `onSubmit` (a turn runner) so this view is testable with
 // ink-testing-library against a fake runner — no provider/network needed.
 import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
 import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { InputBox, type Status, type Approval } from "./InputBox.js";
+import { InputBox, MODES, approvalColor, type Status, type Approval } from "./InputBox.js";
 import type { ImageAttachment } from "../providers/types.js";
 import { activity } from "../activity.js";
 import { ctxPctFor } from "../statusbar.js";
 import { accent } from "./theme.js";
 import { renderMarkdown } from "../md.js";
-import { currentTodos, onTodosChange, type Todo } from "../tools/todo.js";
+import { clearTodos, currentTodos, onTodosChange, type Todo } from "../tools/todo.js";
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -373,30 +375,71 @@ export function spinnerVerb(list: Todo[], elapsedSec: number): string {
   return `working ${elapsedSec}s · esc to interrupt`;
 }
 
+// The status row — ALWAYS rendered, exactly one content row (codex-style: the bottom pane keeps a
+// constant-height status slot and swaps its CONTENT). This is the anti-bob keystone: the old
+// `Working` block appeared at turn start and vanished at turn end (±2 rows), so the input box
+// jumped up 3 rows at every turn boundary (together with the ⌨-hint line, now folded in here).
+// Working → spinner + verb + queue count; idle → dim key hints. Same height either way → zero shift.
+//
 // The spinner is the only element that animates continuously while a turn runs — and because ink
-// redraws the WHOLE dynamic region (input box + mode bar included) on any change, its tick rate sets
-// a floor on full-frame redraws over the life of a turn. At ~8fps (125ms) the braille glyph still
-// reads as smooth motion but cuts those forced redraws ~20% vs 100ms — meaningfully calmer over a
-// slow/remote link. Elapsed seconds come from a wall-clock start, so the "Ns" text stays exact and
-// stable (it only changes once per second, not coupled to the glyph frame).
+// redraws the WHOLE dynamic region (input box included) on any change, its tick rate sets a floor on
+// full-frame redraws over the life of a turn. At ~8fps (125ms) the braille glyph still reads as
+// smooth motion — meaningfully calmer over a slow/remote link. Elapsed seconds come from a
+// wall-clock start, so the "Ns" text stays exact and stable.
 const SPINNER_FRAME_MS = 125;
-function Working({ todos }: { todos: Todo[] }) {
+const IDLE_HINTS = "⏎ send · @ file · ctrl+v image · ctrl+t transcript · shift+tab mode";
+function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]; queued: number }) {
   const [frame, setFrame] = useState(0);
   const startRef = useRef(Date.now());
   useEffect(() => {
+    if (!working) return;
     startRef.current = Date.now();
     const id = setInterval(() => setFrame((x) => x + 1), SPINNER_FRAME_MS);
     return () => clearInterval(id);
-  }, []);
+  }, [working]);
+  if (!working) {
+    return (
+      <Box marginTop={1}>
+        <Text dimColor>{`  ${IDLE_HINTS}`}</Text>
+      </Box>
+    );
+  }
   const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
   const elapsedSec = Math.floor((Date.now() - startRef.current) / 1000);
   return (
     <Box marginTop={1}>
       <Text color="yellow">{frames[frame % frames.length]}</Text>
-      <Text dimColor>{` ${spinnerVerb(todos, elapsedSec)}`}</Text>
+      <Text dimColor>{` ${spinnerVerb(todos, elapsedSec)} · ⏎ queues${queued ? ` (${queued})` : ""}`}</Text>
     </Box>
   );
 }
+
+// Short per-mode descriptions for the ONE-ROW mode line (the old two-row ModeBar's long sentences
+// don't fit inline). Full behavior is documented in /help; this line is a switching aid, not a manual.
+const MODE_HINT: Record<Approval, string> = {
+  suggest: "confirms edits+cmds",
+  "auto-edit": "auto edits · asks cmds",
+  "full-auto": "no prompts ⚠",
+  plan: "read-only → plan",
+};
+// Transient approval-mode line: popped by shift+tab in PLACE of the StatusRow (equal-height swap —
+// one row for one row, so the picker appearing/auto-hiding never moves the input box). All modes
+// listed, the active one colored, with the active mode's short description inline.
+const ModeLine = memo(function ModeLine({ approval }: { approval: Approval }) {
+  return (
+    <Box marginTop={1}>
+      <Text>
+        {MODES.map((m, i) => (
+          <Text key={m}>
+            {i > 0 ? "  " : "  "}
+            {m === approval ? <Text color={approvalColor(m)} bold>{`◆ ${m}`}</Text> : <Text dimColor>{m}</Text>}
+          </Text>
+        ))}
+        <Text dimColor>{` · ${MODE_HINT[approval]} · ⇄ shift+tab`}</Text>
+      </Text>
+    </Box>
+  );
+});
 
 // Live task panel: renders the current todo_write checklist between the in-progress turn output
 // and the input box. Highlights the in_progress item; caps at 8 rows and folds the rest into
@@ -459,10 +502,6 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   // Live checklist mirror: TodoPanel reads this, and `Working` derives its spinner verb from the
   // in_progress item. The tool emits on every todo_write — keeps the UI in lockstep with the agent.
   const [todos, setTodos] = useState<Todo[]>(() => currentTodos());
-  // Collapse-after-turn: once a turn ends, leave the panel visible briefly (so the user sees the
-  // final state) then fold it into a single-line "Todos: N/M done" notice in history. Cleared if
-  // a new turn starts before the timer fires.
-  const collapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ctrlRef = useRef<AbortController | null>(null);
   const queueRef = useRef<{ line: string; images?: ImageAttachment[] }[]>([]); // type-ahead: FIFO of messages entered while working
   const [pool, setPool] = useState<string[]>([]); // type-ahead pool: queued message lines, shown above the input
@@ -493,16 +532,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   useEffect(() => {
     const unsub = onTodosChange((list) => {
       setTodos([...list]); // copy so React sees a new array (the tool reuses one)
-      // A change mid-turn cancels any pending collapse — the user is still working with this list.
-      if (collapseTimerRef.current) {
-        clearTimeout(collapseTimerRef.current);
-        collapseTimerRef.current = null;
-      }
     });
-    return () => {
-      unsub();
-      if (collapseTimerRef.current) clearTimeout(collapseTimerRef.current);
-    };
+    return unsub;
   }, []);
 
   // Reconcile the synchronously-mutated live buffer into React state, at most once per ~33ms. First
@@ -588,6 +619,15 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         setPool(queueRef.current.map((q) => q.line.trim() || "🖼 (image)"));
         return;
       }
+      // Fold the previous turn's checklist NOW, at the natural boundary (a new task begins). The old
+      // 30s-idle timer yanked the input box UP by the panel's height while the user was reading/typing
+      // (anti-bob); folding on submit means the shrink coincides with the user's own action.
+      if (currentTodos().length) {
+        const list = currentTodos();
+        const done = list.filter((td) => td.status === "done").length;
+        setHistory((h) => [...h, { id: nid(), kind: "notice", text: `  ✓ Todos: ${done}/${list.length} done` }]);
+        clearTodos(); // emits → the panel unmounts via onTodosChange
+      }
       if (images?.length) noteVisionIfNeeded(); // one-shot inline notice on first image of the session
       setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]); // t already carries any [Image #N] tokens
       const ctrl = new AbortController();
@@ -652,18 +692,6 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       setCurrent([]);
       setWorking(false);
       ctrlRef.current = null;
-      // Schedule a panel collapse: if there was a checklist this turn, fold it to a one-line summary
-      // in scrollback after ~30s of quiet (i.e. no new todo_write or new turn).
-      if (collapseTimerRef.current) clearTimeout(collapseTimerRef.current);
-      if (currentTodos().length) {
-        collapseTimerRef.current = setTimeout(() => {
-          const list = currentTodos();
-          if (!list.length) return;
-          const done = list.filter((t) => t.status === "done").length;
-          setHistory((h) => [...h, { id: nid(), kind: "notice" as const, text: `  ✓ Todos: ${done}/${list.length} done` }]);
-          collapseTimerRef.current = null;
-        }, 30_000);
-      }
     },
     [working, prompt, askText, onSubmit, pushCurrent, model, exit, drainQueue, noteVisionIfNeeded],
   );
@@ -749,8 +777,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       {current.map((item) => (
         <Block key={item.id} item={item} open={reasoningOpen} />
       ))}
-      {!prompt && <TodoPanel todos={todos} />}
-      {working && !prompt && <Working todos={todos} />}
+      <TodoPanel todos={todos} />
       {prompt && (
         <Box flexDirection="column" marginTop={1}>
           <Text color="yellow">{`  ${stripAnsi(prompt.title)}`}</Text>
@@ -775,7 +802,11 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           ))}
         </Box>
       )}
-      <InputBox status={status} cwd={cwd} model={model} route={header?.routeHost} isActive={!prompt} working={working && !askText} queued={pool.length} vim={vim} showModeSelector={modeSelector} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
+      {/* Constant-height status slot (the anti-bob keystone): ModeLine and StatusRow are both exactly
+          one row + one margin row, and ONE of them is always rendered — so shift+tab, turn start, and
+          turn end never change the chrome height under the transcript. */}
+      {modeSelector ? <ModeLine approval={status.approval} /> : <StatusRow working={working} todos={todos} queued={pool.length} />}
+      <InputBox status={status} cwd={cwd} model={model} route={header?.routeHost} isActive={!prompt} vim={vim} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );
 }

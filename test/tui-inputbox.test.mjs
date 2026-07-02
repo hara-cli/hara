@@ -41,14 +41,12 @@ test("InputBox: active mode reads from the footer + usage is formatted", () => {
   unmount();
 });
 
-test("InputBox: showModeSelector pops the transient picker (all modes + active description)", () => {
+test("InputBox: carries no working/mode chrome of its own (lives in App's constant status slot)", () => {
   const status = { sessionName: "s", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
-  const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", width: 72, showModeSelector: true }));
+  const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", width: 72 }));
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("◆ suggest"), "active mode marked in the transient selector");
-  assert.ok(frame.includes("auto-edit") && frame.includes("full-auto"), "other modes listed while the picker is up");
-  assert.ok(frame.includes("confirms edits"), "active-mode description shown");
-  assert.ok(frame.includes("shift+tab"), "shift+tab hint shown in the picker");
+  assert.ok(!frame.includes("⌨ working"), "no working-hint row inside the box chrome");
+  assert.ok(!frame.includes("◆ suggest"), "no mode picker inside the box chrome");
   unmount();
 });
 
