@@ -258,6 +258,10 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       }
     }
     const ctx = chatContext(adapter.name, m.chatId, cwd); // this chat's current { cwd, sessionId }
+    if (ctx.rotatedFrom) {
+      // Idle auto-rotation just happened (session hygiene): tell the user ONCE, with the escape hatch.
+      await adapter.send(m.chatId, `🧵 fresh thread (chat was idle) — /resume ${ctx.rotatedFrom.slice(-18)} continues the previous one`);
+    }
     const cmd = parseCommand(m.text);
     if (cmd) {
       if (cmd.cmd === "help")

@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.106.0 — gateway session hygiene
+
+- **Idle chats auto-rotate to a fresh thread.** A WeChat/Feishu chat is one endless surface — days-old
+  context used to pile onto every new ask and the agent answered from stale state. Now a chat idle
+  past **8 hours** (HARA_GATEWAY_IDLE_HOURS to tune; 0 disables) starts the next message on a fresh
+  session, with a one-time notice carrying `/resume <id>` — the old thread persists, nothing is lost.
+  Same-afternoon follow-ups continue as before.
+
 ## 0.105.0 — fan-outs synthesize before acting
 
 - **Synthesis nudge** (the last adopted item from the Claude Code internals study — their KN5

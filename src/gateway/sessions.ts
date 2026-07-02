@@ -14,6 +14,17 @@ interface ChatEntry {
   sessionId: string;
   fork: number;
   voice?: boolean; // /voice toggle — speak replies as TTS audio
+  lastUsed?: number; // last inbound message ts — drives idle auto-rotation (session hygiene)
+}
+
+/** Idle window before a chat auto-rotates to a FRESH session (hours). A WeChat/Feishu chat is one
+ *  endless surface — without this, days-old context piles onto every new ask and the agent answers
+ *  from stale state (the "gateway answers with old context" report). Default 8h: overnight gaps start
+ *  clean, a same-afternoon follow-up continues. HARA_GATEWAY_IDLE_HOURS tunes it; 0 disables. */
+export function idleRotationMs(): number {
+  const raw = Number(process.env.HARA_GATEWAY_IDLE_HOURS ?? 8);
+  if (!Number.isFinite(raw) || raw <= 0) return 0; // 0/garbage → disabled
+  return raw * 3_600_000;
 }
 interface ChatMap {
   [key: string]: ChatEntry;
@@ -46,21 +57,34 @@ function deriveId(platform: string, chatId: number | string, cwd: string, fork: 
 
 /** Get (or initialize) the chat's context: current working dir + the session id it drives. `defaultCwd` (the
  *  gateway's launch dir) is used only on first contact; a pre-cwd entry is migrated in place (keeps its id). */
-export function chatContext(platform: string, chatId: number | string, defaultCwd: string): { cwd: string; sessionId: string; voice: boolean } {
+export function chatContext(
+  platform: string,
+  chatId: number | string,
+  defaultCwd: string,
+): { cwd: string; sessionId: string; voice: boolean; rotatedFrom?: string } {
   const m = load();
   const k = mapKey(platform, chatId);
   const e = m[k];
+  const now = Date.now();
   if (!e) {
-    const fresh: ChatEntry = { cwd: defaultCwd, sessionId: deriveId(platform, chatId, defaultCwd, 0), fork: 0 };
+    const fresh: ChatEntry = { cwd: defaultCwd, sessionId: deriveId(platform, chatId, defaultCwd, 0), fork: 0, lastUsed: now };
     m[k] = fresh;
     save(m);
     return { cwd: fresh.cwd, sessionId: fresh.sessionId, voice: false };
   }
-  if (!e.cwd) {
-    e.cwd = defaultCwd; // migrate an old (pre-cwd) entry, preserving its existing sessionId
-    save(m);
+  if (!e.cwd) e.cwd = defaultCwd; // migrate an old (pre-cwd) entry, preserving its existing sessionId
+  // Session hygiene: a chat idle past the window rotates to a fresh thread (same mechanics as /new).
+  // The OLD id is returned so the gateway can offer "/resume <id>" — nothing is lost, sessions persist.
+  const idleMs = idleRotationMs();
+  let rotatedFrom: string | undefined;
+  if (idleMs > 0 && typeof e.lastUsed === "number" && now - e.lastUsed > idleMs && e.sessionId) {
+    rotatedFrom = e.sessionId;
+    e.fork = (e.fork ?? 0) + 1;
+    e.sessionId = deriveId(platform, chatId, e.cwd, e.fork);
   }
-  return { cwd: e.cwd, sessionId: e.sessionId, voice: !!e.voice };
+  e.lastUsed = now;
+  save(m);
+  return { cwd: e.cwd, sessionId: e.sessionId, voice: !!e.voice, ...(rotatedFrom ? { rotatedFrom } : {}) };
 }
 
 /** `/voice` — toggle whether this chat's replies are spoken (TTS audio); returns the new state. */
