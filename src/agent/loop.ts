@@ -12,7 +12,8 @@ import { decideCommand, loadPermissionRules } from "../security/permissions.js";
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
-import { currentTodos, type Todo } from "../tools/todo.js";
+import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
+import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS } from "./reminders.js";
 
 /** Spinner verb (terminal mode + reused by TUI tests): when the agent has an in_progress todo,
  *  surface its activeForm/text so the bottom-of-screen line reads concretely ("▶ updating tests… 3s")
@@ -134,11 +135,21 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   const breaker: BreakerState = newBreaker();
   let breakerHalt = false; // set when a tripped breaker aborts this run
 
+  // Todo attention-refresh (à la Claude Code): tool rounds since the checklist was last touched while
+  // unfinished items exist. Main loop only — quiet (sub-agent) runs share the global list and must not nag.
+  let todoIdleRounds = 0;
   for (;;) {
     // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
     // reaches the model on this next call (drained after the last tool round; empty on the 1st pass).
     if (opts.pendingInput) {
       for (const m of await opts.pendingInput()) history.push(m);
+    }
+    // system-reminder injection: event-driven context queued since the last call (todo staleness today)
+    // lands as ONE wrapped user message the UI never renders. Quiet runs don't drain — a parallel
+    // sub-agent must not steal the main conversation's reminders.
+    if (!opts.quiet) {
+      const reminders = drainReminders();
+      if (reminders.length) history.push({ role: "user", content: wrapReminders(reminders) });
     }
     const baseSpecs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
     const specs = opts.extraTools?.length
@@ -391,6 +402,21 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     }
     await flush();
     history.push({ role: "tool", results });
+
+    // Todo attention-refresh: a round that touched the checklist resets the clock; rounds that leave
+    // unfinished items untouched accumulate, and at TODO_STALE_ROUNDS the model gets a system-reminder
+    // re-showing the authoritative list (then the counter re-arms — at most one nag per N rounds).
+    if (!opts.quiet) {
+      if (r.toolUses.some((tu) => tu.name === "todo_write")) {
+        todoIdleRounds = 0;
+      } else if (currentTodos().some((t) => t.status !== "done")) {
+        todoIdleRounds++;
+        if (todoIdleRounds >= TODO_STALE_ROUNDS) {
+          pushReminder(todoStaleReminder(renderTodos(currentTodos())));
+          todoIdleRounds = 0;
+        }
+      }
+    }
 
     if (breakerHalt) {
       // A tripped-and-declined circuit-breaker is a hard stop: end the run cleanly (the denial messages are

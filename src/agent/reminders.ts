@@ -1,0 +1,46 @@
+// system-reminder injection (à la Claude Code's Ie1/WD5 event layer): event-driven context the model
+// should see on its NEXT call, injected as ONE `<system-reminder>`-wrapped user message. It rides the
+// provider history only — the UI transcript never renders it, so the user isn't bothered while the
+// model stays synchronized with system state (todo staleness today; file-change/diagnostic events can
+// plug in later via pushReminder).
+//
+// Claude Code's disclaimer is preserved: the model is told the context may be irrelevant, so an
+// injected nudge never derails an unrelated task.
+
+const queue: string[] = [];
+
+/** Queue a reminder for injection before the next model call (main loop only — quiet/sub-agent runs
+ *  neither push nor drain, so a parallel fan-out can't steal the main conversation's reminders). */
+export function pushReminder(text: string): void {
+  const t = text.trim();
+  if (t) queue.push(t);
+}
+
+/** Take everything queued (FIFO), clearing the queue. */
+export function drainReminders(): string[] {
+  if (!queue.length) return [];
+  return queue.splice(0, queue.length);
+}
+
+/** Merge queued reminders into the single injected message. */
+export function wrapReminders(items: string[]): string {
+  return (
+    "<system-reminder>\n" +
+    items.join("\n\n") +
+    "\n\nThis context may or may not be relevant to your task — do not respond to it directly; ignore it unless it is relevant.\n" +
+    "</system-reminder>"
+  );
+}
+
+/** How many tool rounds a checklist may sit untouched (with unfinished items) before the model gets an
+ *  attention refresh. Reset on every todo_write; re-arms after firing so it nags at most once per N. */
+export const TODO_STALE_ROUNDS = 5;
+
+/** The staleness nudge: re-show the authoritative list + ask for a status pass. */
+export function todoStaleReminder(renderedTodos: string): string {
+  return (
+    `Your todo list has not been updated in a while. Current state:\n\n${renderedTodos}\n\n` +
+    "If you have completed or started items, update them with todo_write now (statuses drive the user's progress view). " +
+    "If the list no longer matches the work, rewrite it."
+  );
+}

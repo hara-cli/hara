@@ -6,6 +6,10 @@ import { join } from "node:path";
 import { loadRoles, scaffoldRoles, subagentToolFilter } from "../dist/org/roles.js";
 import { routeByKeywords, parseRoleId, buildDispatchPrompt } from "../dist/org/router.js";
 
+// Hermetic HOME: loadRoles merges ~/.hara/roles + ~/.hara/org-roles (os.homedir() honors $HOME), so a
+// developer's real global roles (e.g. the converted Claude-Code pack) must not leak into these tests.
+process.env.HOME = mkdtempSync(join(tmpdir(), "hara-test-home-"));
+
 test("subagentToolFilter: a write-granting role can NOT give a fan-out sub-agent edit/exec (no gate bypass)", () => {
   const ro = (n) => n === "read_file" || n === "grep" || n === "ls"; // the read-kind predicate
   const writeRole = subagentToolFilter({ allowTools: ["edit_file", "bash", "read_file"] }, ro);

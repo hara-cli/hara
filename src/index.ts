@@ -62,7 +62,7 @@ import {
 } from "./profile/profile.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
-import { shouldAutoCompact } from "./agent/compact.js";
+import { shouldAutoCompact, COMPACT_SYSTEM } from "./agent/compact.js";
 import { formatContextReport } from "./agent/context-report.js";
 import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
 import { checkpoint, listCheckpoints, restoreCheckpoint } from "./checkpoints.js";
@@ -771,17 +771,7 @@ const MEMORY_DISTILL_SYSTEM =
   "conventions / user preferences from the logs that are NOT already captured, and persist each with " +
   "memory_write (target=memory, or target=user for preferences; pick the right scope=project|global). " +
   "Skip the ephemeral, the one-off, and anything already known. Be terse and de-duplicated. Then reply DONE.";
-const COMPACT_SYSTEM =
-  "Summarize the conversation so far into a structured, complete brief so the assistant can continue with NO " +
-  "loss of context. First think privately in a brief <analysis> scratchpad (what matters, what's in flight), " +
-  "then output ONLY the summary under these exact headings:\n" +
-  "1. Goal — the user's overall intent, in their own framing.\n" +
-  "2. Key decisions — choices made and why (so they aren't relitigated).\n" +
-  "3. Files & code — files created/changed and the important snippets, with why each matters.\n" +
-  "4. Errors & fixes — failures hit, how they were resolved, and any correction the user gave (quote pointed feedback verbatim).\n" +
-  "5. Current state — what works now / what is verified.\n" +
-  "6. Next step — the immediate next action, INCLUDING a direct verbatim quote of the user's most recent request so there is no drift.\n" +
-  "Be specific and concrete. Drop the <analysis>; output only the headed summary.";
+// COMPACT_SYSTEM (the 8-section brief) lives in agent/compact.ts so tests can pin its structure.
 const workingSetFromSummary = (s: string): string[] =>
   s
     .split("\n")

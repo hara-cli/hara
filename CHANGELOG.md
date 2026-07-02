@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.100.0 — the agent keeps its own attention: system-reminders + anti-drift compaction
+
+Distilled from a source-level study of Claude Code v1.0.33's agent internals (the Ie1/WD5 reminder
+layer and the AU2 compaction template).
+
+- **system-reminder injection layer.** An event queue (`agent/reminders.ts`) that lands queued context
+  as ONE `<system-reminder>`-wrapped message before the next model call — visible to the model, never
+  rendered in the transcript, and always carrying the "ignore unless relevant" disclaimer so a nudge
+  can't derail unrelated work. Quiet (sub-agent) runs neither drain nor push, so parallel fan-outs
+  can't steal the main conversation's reminders. First wired event:
+- **Todo attention-refresh.** When a checklist has unfinished items and goes 5 tool-rounds untouched,
+  the model gets a reminder re-showing the authoritative list and asking for a status pass — so long
+  tasks stop silently abandoning their own plan. Any `todo_write` resets the clock; after firing it
+  re-arms (at most one nag per 5 rounds).
+- **Compaction brief: 6 → 8 sections (anti-drift).** `/compact` and auto-compaction now also preserve
+  **All user messages** — your own words survive verbatim, in order, however hard the history is
+  squeezed — and **Key technical concepts**, so the next turn doesn't re-derive the stack.
+  (`COMPACT_SYSTEM` moved to `agent/compact.ts` where tests pin the structure.)
+
 ## 0.99.3 — TUI: rock-steady input box (constant-height chrome) + plan mode grows a real handshake
 
 Built from a source-level study of codex-rs (bottom-anchored viewport, plan cells) and Claude Code
