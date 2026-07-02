@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.102.0 — a slow network never feels dead
+
+Jeff + a designer colleague both hit the same thing: press Enter on a slow connection and hara
+"looks stuck — thought it failed". Studied codex's handling (15s connect timeout, 2–9s stream-idle
+timeout, Working[Xs·Esc] status machine) and closed the gaps:
+
+- **Stall watchdog.** A model attempt that streams NOTHING for 120s (HARA_STALL_TIMEOUT to tune) is
+  aborted and routed through the normal error→failover path — `fallbackModel` picks it up
+  automatically, or you get a clear "model stream timeout — no output for 120s" instead of an
+  infinite spinner. A real Esc stays an interrupt (never rewritten).
+- **"waiting for the model… Ns".** The status row now distinguishes the pre-first-token stretch from
+  actual work (a new turn-phase channel published by the loop) — on a slow route you can SEE the
+  request is out, ticking, interruptible.
+- **Big pastes fold to a token.** Pasting a long/multi-line text used to flood the box AND could
+  auto-submit at the first newline mid-paste. Now ≥3 lines or ≥600 chars folds to a highlighted
+  `[Paste #1 +N lines]` token (Claude-Code style): the box stays small, typing stays smooth,
+  backspace deletes it whole, and the FULL text expands into the message on submit.
+
 ## 0.101.1 — the input box stops running to the top
 
 - **Live-region overflow guard.** A long streaming answer (or a big diff) used to grow the live region

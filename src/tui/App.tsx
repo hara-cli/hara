@@ -17,6 +17,7 @@ import { ctxPctFor } from "../statusbar.js";
 import { accent } from "./theme.js";
 import { renderMarkdown } from "../md.js";
 import { clearTodos, currentTodos, onTodosChange, type Todo } from "../tools/todo.js";
+import { onTurnPhase, turnPhase, type TurnPhase } from "../agent/phase.js";
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -415,7 +416,9 @@ const SPINNER_FRAME_MS = 125;
 const IDLE_HINTS = "⏎ send · @ file · ctrl+v image · ctrl+t transcript · shift+tab mode";
 function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]; queued: number }) {
   const [frame, setFrame] = useState(0);
+  const [phase, setPhase] = useState<TurnPhase>(() => turnPhase());
   const startRef = useRef(Date.now());
+  useEffect(() => onTurnPhase(setPhase), []); // waiting → streaming, published by the agent loop
   useEffect(() => {
     if (!working) return;
     startRef.current = Date.now();
@@ -431,10 +434,13 @@ function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]
   }
   const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
   const elapsedSec = Math.floor((Date.now() - startRef.current) / 1000);
+  // Pre-first-token honesty (codex-parity): "waiting for the model" reads very differently from a
+  // generic "working" when the network is slow — the user knows the request is out, not dead.
+  const verb = phase === "waiting" ? `waiting for the model… ${elapsedSec}s · esc to interrupt` : spinnerVerb(todos, elapsedSec);
   return (
     <Box marginTop={1}>
       <Text color="yellow">{frames[frame % frames.length]}</Text>
-      <Text dimColor>{` ${spinnerVerb(todos, elapsedSec)} · ⏎ queues${queued ? ` (${queued})` : ""}`}</Text>
+      <Text dimColor>{` ${verb} · ⏎ queues${queued ? ` (${queued})` : ""}`}</Text>
     </Box>
   );
 }

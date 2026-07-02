@@ -218,3 +218,42 @@ test("InputBox: backspace over an [Image #N] token removes the token and its att
   assert.equal(submitted.images, undefined, "attachment removed with the token");
   unmount();
 });
+
+// ── Long-paste folding: big pastes become [Paste #N +L lines] tokens (never flood or auto-submit) ──
+
+test("InputBox: a multi-line paste folds to a token instead of submitting at the first newline", async () => {
+  let submitted = null;
+  const big = Array.from({ length: 12 }, (_, i) => `paste line ${i + 1}`).join("\n");
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
+  stdin.write(big); // one chunk, 12 lines — the old path would have submitted "paste line 1"
+  await tick();
+  const frame = strip(lastFrame());
+  assert.ok(frame.includes("[Paste #1 +12 lines]"), "folded into a token");
+  assert.ok(!frame.includes("paste line 5"), "body not flooded into the box");
+  assert.equal(submitted, null, "nothing auto-submitted");
+  stdin.write(" please summarize");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.ok(submitted.includes("paste line 1") && submitted.includes("paste line 12"), "token expanded to the FULL text on submit");
+  assert.ok(submitted.includes("please summarize"), "typed text preserved around the expansion");
+  unmount();
+});
+
+test("InputBox: backspace over a paste token removes it whole (and its stored text)", async () => {
+  let submitted = null;
+  const big = Array.from({ length: 8 }, (_, i) => `x${i}`).join("\n");
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
+  stdin.write(big);
+  await tick();
+  assert.ok(strip(lastFrame()).includes("[Paste #1 +8 lines]"), "token present");
+  stdin.write("\x7f"); // backspace → whole token gone
+  await tick();
+  assert.ok(!strip(lastFrame()).includes("[Paste #1"), "token removed whole");
+  stdin.write("hi");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.equal(submitted, "hi", "no stale paste text leaked into the submission");
+  unmount();
+});

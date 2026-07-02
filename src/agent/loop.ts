@@ -14,6 +14,17 @@ import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
 import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS } from "./reminders.js";
+import { setTurnPhase } from "./phase.js";
+
+/** Stall watchdog ceiling: a model attempt that streams NOTHING for this long is treated as a dead /
+ *  stalled connection and aborted into the normal error→failover path — instead of hanging on
+ *  "working Ns" forever (the "pressed Enter, thought it failed" report). Generous default because
+ *  hidden-reasoning models can legitimately go quiet for a while; HARA_STALL_TIMEOUT (ms) tunes it,
+ *  floor 1s (tests). codex's equivalent is its 2–9s stream-idle timeout. */
+export function stallMs(): number {
+  const raw = Number(process.env.HARA_STALL_TIMEOUT ?? 120_000);
+  return Math.max(1_000, Number.isFinite(raw) && raw > 0 ? raw : 120_000);
+}
 
 /** Spinner verb (terminal mode + reused by TUI tests): when the agent has an in_progress todo,
  *  surface its activeForm/text so the bottom-of-screen line reads concretely ("▶ updating tests… 3s")
@@ -187,11 +198,34 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         out(`\r\x1b[K${c.dim(`${frames[fi++ % frames.length]} ${verb}`)}`);
       }, 100);
     }
-    const r = await activeProvider.turn({
+    // Stall watchdog: any stream event resets the clock; STALL_MS of silence aborts THIS attempt via
+    // its own controller (the user's opts.signal chains into it, so Esc still interrupts). The abort
+    // is then rewritten from "interrupted" to a timeout-class error so failover can take over.
+    const STALL_MS = stallMs();
+    const attempt = new AbortController();
+    const onUserAbort = (): void => attempt.abort();
+    opts.signal?.addEventListener("abort", onUserAbort, { once: true });
+    let lastEvent = Date.now();
+    let stalled = false;
+    const stallTimer = setInterval(() => {
+      if (Date.now() - lastEvent > STALL_MS) {
+        stalled = true;
+        attempt.abort();
+      }
+    }, Math.min(2_000, Math.max(250, STALL_MS / 4)));
+    const alive = (): void => {
+      lastEvent = Date.now();
+      if (!opts.quiet) setTurnPhase("streaming");
+    };
+    if (!opts.quiet) setTurnPhase("waiting"); // request sent, nothing streamed yet — the status row shows it
+    let r!: Awaited<ReturnType<Provider["turn"]>>;
+    try {
+      r = await activeProvider.turn({
       system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
       history,
       tools: specs,
       onText: (d) => {
+        alive();
         if (opts.quiet) return;
         if (sink) {
           sink.text(d);
@@ -205,6 +239,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       onReasoning:
         sink || tty
           ? (d) => {
+              alive();
               if (opts.quiet) return;
               if (sink) {
                 sink.reasoning(d);
@@ -228,9 +263,18 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
                 }
               }
             }
-          : undefined,
-      signal: opts.signal,
+          : (d) => alive(), // quiet runs still feed the watchdog (reasoning-only stretches are progress)
+      signal: attempt.signal,
     });
+    } finally {
+      clearInterval(stallTimer);
+      opts.signal?.removeEventListener("abort", onUserAbort);
+    }
+    // A watchdog abort surfaces from the provider as "interrupted" — rewrite it to a timeout-class
+    // error (unless the USER really did interrupt) so classifyError → failover/fallback handles it.
+    if (stalled && r.stop === "error" && !opts.signal?.aborted) {
+      r = { ...r, errorMsg: `model stream timeout — no output for ${Math.round(STALL_MS / 1000)}s (stalled connection?)` };
+    }
     stopSpin();
     flushReasoningTail();
     md?.end();

@@ -134,7 +134,7 @@ const MentionPopup = memo(function MentionPopup({ items, selected, query }: { it
   );
 });
 
-const TOKEN_RE = /\[Image #\d+\]/g;
+const TOKEN_RE = /\[Image #\d+\]|\[Paste #\d+ \+\d+ lines\]/g;
 
 /** Split the value into text/image-token segments (image tokens render highlighted, codex-style). */
 function segmentize(value: string): { text: string; token: boolean }[] {
@@ -354,6 +354,7 @@ export function InputBox({
   const [sel, setSel] = useState(0);
   const [dismissed, setDismissed] = useState(false);
   const [images, setImages] = useState<ImageAttachment[]>([]);
+  const [pastes, setPastes] = useState<string[]>([]); // full text behind each [Paste #N] token
   const [mode, setMode] = useState<VimMode>("insert"); // vim only
   const [pending, setPending] = useState(""); // vim operator-pending (d/c/g)
   const [register, setRegister] = useState(""); // vim yank/delete register
@@ -378,11 +379,29 @@ export function InputBox({
     setDismissed(false);
   };
 
+  // A big paste folds into a [Paste #N +L lines] token (Claude-Code/codex style) instead of flooding
+  // the box: typing stays smooth (the VALUE stays short), the box stays small, and a multi-line paste
+  // can no longer fire the newline-submit path mid-paste. Expanded back to the full text on submit.
+  const addPaste = (text: string): void => {
+    const lines = text.split("\n").length;
+    const tok = `[Paste #${pastes.length + 1} +${lines} lines]`;
+    const before = value.slice(0, cursor);
+    const ins = (before && !/\s$/.test(before) ? " " : "") + tok + " ";
+    setValue(before + ins + value.slice(cursor));
+    setCursor((before + ins).length);
+    setPastes((xs) => [...xs, text]);
+    setSel(0);
+    setDismissed(false);
+  };
+  const expandPastes = (text: string): string =>
+    text.replace(/\[Paste #(\d+) \+\d+ lines\]/g, (m, d) => pastes[Number(d) - 1] ?? m);
+
   const submit = (text: string): void => {
     if (!text.trim() && images.length === 0) return; // nothing to send
-    onSubmit?.(text, images.length ? images : undefined);
+    onSubmit?.(expandPastes(text), images.length ? images : undefined);
     set("", 0);
     setImages([]);
+    setPastes([]);
     setMode("insert"); // a fresh prompt starts in insert
     setPending("");
   };
@@ -467,6 +486,18 @@ export function InputBox({
       if (key.backspace || key.delete) {
         if (cursor > 0) {
           const head = value.slice(0, cursor);
+          const pm = /\[Paste #(\d+) \+\d+ lines\]\s?$/.exec(head); // paste token deletes whole + renumbers
+          if (pm) {
+            const n = Number(pm[1]);
+            const kept = head.slice(0, pm.index) + value.slice(cursor);
+            const renumbered = kept.replace(/\[Paste #(\d+)( \+\d+ lines\])/g, (m2, d, tail) => (Number(d) > n ? `[Paste #${Number(d) - 1}${tail}` : m2));
+            setPastes((xs) => xs.filter((_, i) => i !== n - 1));
+            setValue(renumbered);
+            setCursor(pm.index);
+            setSel(0);
+            setDismissed(false);
+            return;
+          }
           const tm = /\[Image #(\d+)\]\s?$/.exec(head); // backspacing over an attachment token removes it whole
           if (tm) {
             const n = Number(tm[1]);
@@ -484,6 +515,12 @@ export function InputBox({
         return;
       }
       if (input && !key.ctrl && !key.meta) {
+        // A LARGE paste (many lines or lots of text in one chunk) folds to a token — never submits,
+        // never floods the box. Small chunks keep the existing paste-to-run newline behavior.
+        if (input.length >= 600 || (input.match(/\n/g)?.length ?? 0) >= 3) {
+          addPaste(input);
+          return;
+        }
         const nl = input.search(/[\r\n]/); // a chunk carrying a newline (paste / fed input) submits
         if (nl >= 0) {
           submit(value.slice(0, cursor) + input.slice(0, nl) + value.slice(cursor));
