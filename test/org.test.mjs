@@ -68,3 +68,36 @@ test("org: parseRoleId + dispatch prompt", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── Claude-Code `.claude/agents` interop: tool-name translation + model-alias sanitizing ──
+
+test("claudeTools: CC names map to hara names; 'All tools' means unrestricted", async () => {
+  const { claudeTools } = await import("../dist/org/roles.js");
+  assert.deepEqual(
+    claudeTools("Read, Edit, Write, Bash, Grep, Glob"),
+    ["read_file", "edit_file", "write_file", "bash", "grep", "glob"],
+    "comma-string CC tools translate to hara tool names",
+  );
+  assert.deepEqual(claudeTools(["WebFetch", "read_file"]), ["web_fetch", "read_file"], "arrays + already-hara names pass through");
+  assert.equal(claudeTools("All tools"), undefined, "'All tools' → unrestricted (no allowTools)");
+  assert.equal(claudeTools("*"), undefined, "'*' → unrestricted");
+  assert.equal(claudeTools(""), undefined, "empty → undefined");
+});
+
+test("loadRoles: a Claude-Code agent file yields usable hara allowTools + drops CC model aliases", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-cc-"));
+  const ccDir = join(dir, ".claude", "agents");
+  mkdirSync(ccDir, { recursive: true });
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(
+    join(ccDir, "cfo.md"),
+    `---\nname: cfo\ndescription: finance data steward\ntools: Read, Edit, Write, Bash, Grep, Glob\nmodel: sonnet\n---\nYou are the CFO.`,
+  );
+  const roles = loadRoles(dir);
+  const cfo = roles.find((r) => r.id === "cfo");
+  assert.ok(cfo, "CC agent picked up from .claude/agents");
+  assert.deepEqual(cfo.allowTools, ["read_file", "edit_file", "write_file", "bash", "grep", "glob"], "tools translated to hara names (the zero-toolbox bug)");
+  assert.equal(cfo.model, undefined, "CC 'sonnet' alias dropped → inherit the session model");
+  assert.equal(cfo.system, "You are the CFO.", "body becomes the persona");
+  rmSync(dir, { recursive: true, force: true });
+});

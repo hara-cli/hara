@@ -34,11 +34,35 @@ export function orgRolesDir(): string {
 export function claudeAgentsDir(cwd: string): string {
   return join(findProjectRoot(cwd), ".claude", "agents");
 }
-/** Accept Claude-Code `tools:` (comma string or list) as an alias for hara's allowTools. */
-function claudeTools(v: unknown): string[] | undefined {
-  if (Array.isArray(v)) return v as string[];
-  if (typeof v === "string" && v.trim()) return v.split(",").map((s) => s.trim()).filter(Boolean);
-  return undefined;
+/** Claude-Code tool names → hara tool names, for `.claude/agents` interop. Without this, a CC agent
+ *  with `tools: Read, Edit, Bash` produced allowTools that matched ZERO hara tools — the role spawned
+ *  with an empty toolbox. Unknown names pass through verbatim (they may be hara names already). */
+const CLAUDE_TOOL_MAP: Record<string, string> = {
+  read: "read_file",
+  edit: "edit_file",
+  write: "write_file",
+  bash: "bash",
+  grep: "grep",
+  glob: "glob",
+  ls: "ls",
+  webfetch: "web_fetch",
+  websearch: "web_search",
+  agent: "agent",
+  task: "agent",
+  todowrite: "todo_write",
+  notebookedit: "edit_file",
+};
+/** Accept Claude-Code `tools:` (comma string or list) as an alias for hara's allowTools —
+ *  translating CC tool names to hara's. "All tools" / "*" means unrestricted → undefined. */
+export function claudeTools(v: unknown): string[] | undefined {
+  const raw = Array.isArray(v)
+    ? (v as string[])
+    : typeof v === "string" && v.trim()
+      ? v.split(",").map((s) => s.trim()).filter(Boolean)
+      : null;
+  if (!raw || !raw.length) return undefined;
+  if (raw.some((t) => /^(\*|all tools?)$/i.test(t))) return undefined; // unrestricted
+  return raw.map((t) => CLAUDE_TOOL_MAP[t.toLowerCase().replace(/[^a-z]/g, "")] ?? t);
 }
 
 function parseFrontmatter(text: string): { fm: Record<string, any>; body: string } {
@@ -91,7 +115,9 @@ export function loadRoles(cwd: string): Role[] {
           description: (fm.description as string) || "",
           owns: Array.isArray(fm.owns) ? fm.owns : [],
           rejects: Array.isArray(fm.rejects) ? fm.rejects : [],
-          model: fm.model || undefined,
+          // Claude-Code model ALIASES (sonnet/opus/haiku/inherit) aren't hara model ids — treat as
+          // "inherit the session model" rather than passing a string no provider resolves.
+          model: fm.model && !/^(sonnet|opus|haiku|inherit)$/i.test(String(fm.model)) ? fm.model : undefined,
           allowTools: Array.isArray(fm.allowTools) ? fm.allowTools : claudeTools(fm.tools),
           denyTools: Array.isArray(fm.denyTools) ? fm.denyTools : undefined,
           system: body,
