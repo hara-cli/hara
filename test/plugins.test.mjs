@@ -68,7 +68,7 @@ test(".claude/agents subagents load as roles (Claude-Code interop, tools→allow
   try {
     const r = loadRoles(proj).find((x) => x.id === "explorer");
     assert.ok(r, "claude subagent loaded as a role");
-    assert.deepEqual(r.allowTools, ["Read", "Grep"], "Claude `tools:` mapped to allowTools");
+    assert.deepEqual(r.allowTools, ["read_file", "grep"], "Claude `tools:` TRANSLATED to hara tool names (not passed verbatim)");
   } finally {
     rmSync(proj, { recursive: true, force: true });
   }
