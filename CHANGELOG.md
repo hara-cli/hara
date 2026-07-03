@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.107.0 — interjection triage: the model is the scheduler, the todo list is the queue
+
+- **Mid-task messages get triaged, not blindly folded in.** Typing while hara works always reached
+  the model between tool calls (type-ahead steering) — but nothing told it HOW to handle the
+  interjection. Now every mid-task message carries a triage contract, backed by a standing policy in
+  the system prompt: a **refinement** folds into the current task immediately; a **new independent
+  task** goes onto the todo queue (`todo_write`, one-line acknowledgment, current work continues);
+  something **urgent** — a bug, "stop", "this first" — finishes the current step safely (no half-done
+  edits), re-plans the queue, and switches immediately. Same architecture codex and Claude Code
+  landed on: no engine-level priority scheduler — classification is exactly what the model is best
+  at, and the todo list (with its live panel + attention refresh) is the task queue.
+
 ## 0.106.0 — gateway session hygiene
 
 - **Idle chats auto-rotate to a fresh thread.** A WeChat/Feishu chat is one endless surface — days-old

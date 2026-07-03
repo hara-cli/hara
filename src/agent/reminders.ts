@@ -36,6 +36,17 @@ export function wrapReminders(items: string[]): string {
  *  attention refresh. Reset on every todo_write; re-arms after firing so it nags at most once per N. */
 export const TODO_STALE_ROUNDS = 5;
 
+/** Prefix for a message the user sent MID-TASK (type-ahead steering). Carries the triage contract
+ *  inline (self-contained even for role-overridden runs): the model — not the engine — is the
+ *  scheduler, and the todo list is the task queue (codex/Claude-Code's model too: neither ships an
+ *  engine-level priority scheduler; classification is exactly what the LLM is best at). */
+export const INTERJECT_PREFIX =
+  "[Sent while you were working on the above — TRIAGE before continuing: " +
+  "a refinement/correction of the current task → fold it in now; " +
+  "a NEW independent task → todo_write it onto the queue, acknowledge in one line, continue the current task; " +
+  "URGENT (a bug, \"stop\", \"this first\") → finish the current step safely (no half-done edits), " +
+  "todo_write the re-plan (current task → pending, this → in_progress), and switch to it immediately.]";
+
 /** Parallel fan-outs at/above this size get a synthesis nudge (CC's KN5 synthesizer, hara-shaped:
  *  instead of a dedicated merger agent, the MAIN model is reminded to merge before acting). */
 export const SYNTHESIS_MIN_AGENTS = 3;

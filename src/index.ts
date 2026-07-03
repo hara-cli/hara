@@ -64,6 +64,7 @@ import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projec
 import { routingProvider } from "./agent/route.js";
 import { shouldAutoCompact, COMPACT_SYSTEM, buildFileRestore } from "./agent/compact.js";
 import { recentTouched } from "./agent/touched.js";
+import { INTERJECT_PREFIX } from "./agent/reminders.js";
 import { checkForUpdate } from "./update-check.js";
 import { formatContextReport } from "./agent/context-report.js";
 import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
@@ -3027,7 +3028,7 @@ program.action(async (opts) => {
             const body = expandMentions(it.line, cwd) + (r2.skip ? "" : (r2.extraText ?? ""));
             const attach = !r2.skip && r2.attach?.length ? r2.attach : undefined;
             if (!body.trim() && !attach) continue; // image-only message whose image was skipped → nothing to add
-            out.push({ role: "user", content: `[I sent this while you were working on the above]\n\n${body}`, ...(attach ? { images: attach } : {}) });
+            out.push({ role: "user", content: `${INTERJECT_PREFIX}\n\n${body}`, ...(attach ? { images: attach } : {}) });
           }
           return out;
         };

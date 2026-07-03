@@ -45,3 +45,17 @@ test("built-in explore persona: read-only, parallel, excerpts, conclusions — n
   assert.ok(/excerpts, not whole files/.test(EXPLORE_SYSTEM), "excerpt discipline");
   assert.ok(/CONCLUSIONS/.test(EXPLORE_SYSTEM) && /never dump/.test(EXPLORE_SYSTEM), "returns conclusions, not dumps");
 });
+
+test("interjection triage: mid-task messages carry the fold-in / queue / urgent-switch contract", async () => {
+  const { INTERJECT_PREFIX } = await import("../dist/agent/reminders.js");
+  assert.ok(/TRIAGE/.test(INTERJECT_PREFIX), "triage instruction present");
+  assert.ok(/fold it in now/.test(INTERJECT_PREFIX), "refinement path");
+  assert.ok(/todo_write it onto the queue/.test(INTERJECT_PREFIX), "new-task path uses the todo queue");
+  assert.ok(/URGENT/.test(INTERJECT_PREFIX) && /switch to it immediately/.test(INTERJECT_PREFIX), "urgent preemption path");
+  assert.ok(/finish the current step safely/.test(INTERJECT_PREFIX), "no half-done edits before switching");
+  // The standing policy also rides the system prompt (not only the per-message marker):
+  let system = "";
+  const provider = { id: "f", model: "f", async turn(a) { system = a.system; return { text: "ok", toolUses: [], stop: "end" }; } };
+  await runAgent([{ role: "user", content: "hi" }], { provider, ctx: { cwd: process.cwd() }, approval: "full-auto", confirm: async () => true, quiet: true });
+  assert.ok(/triage them/.test(system) && /todo list is your task queue/.test(system), "system prompt carries the scheduling policy");
+});
