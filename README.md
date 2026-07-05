@@ -8,7 +8,7 @@
 > with routing boundaries, a dispatcher, a single source-of-truth data layer, human-in-the-loop
 > approvals, and cron autonomy.
 
-🚧 **v0.89** · TypeScript · local-first · Apache-2.0
+[![npm](https://img.shields.io/npm/v/%40nanhara%2Fhara?label=npm&color=cb3837)](https://www.npmjs.com/package/@nanhara/hara) · TypeScript · local-first · Apache-2.0
 
 **Highlights**
 - **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**), and `hara plan --parallel` runs independent atoms concurrently.
@@ -17,6 +17,9 @@
 - **Persistent memory + self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting, **proactively saves** durable facts, and grows its own playbooks (a lexical guard screens what it writes). Inspect/consolidate it with **`hara memory show`** and **`hara memory distill`** (promote recent daily logs → durable memory). Lexical-first by design — semantic search is opt-in, never required.
 - **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
 - **Delegate to other agents** — the **`external_agent`** tool hands a self-contained task to **Claude Code** or **Codex** running headless, and returns the result — so you pick the best engine per task. Gated by approval, trust-tiered, and never exposed to read-only sub-agents.
+- **Honest under a slow network** — a live "waiting for the model… Ns" status, a stall watchdog that
+  auto-fails-over instead of hanging, big pastes folding to a token, and a startup update notice — the
+  terminal never feels dead.
 - **Solid coding core** — `edit_file` / `apply_patch` (atomic multi-file) with colored diffs · `grep`/`glob`/`ls`/`codebase_search` (lexical + optional semantic search over the repo) /`web_fetch` · fuzzy `@file` · `/undo` · `/compact` · **Esc-to-interrupt** · parallel sub-agents · MCP client · macOS sandbox.
 
 Track it: https://github.com/hara-cli/hara · https://hara.run
