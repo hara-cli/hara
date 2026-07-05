@@ -71,7 +71,8 @@ import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
 import { checkpoint, listCheckpoints, restoreCheckpoint } from "./checkpoints.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
 import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
-import { parseSchedule, describeSchedule, nextRun } from "./cron/schedule.js";
+import { parseSchedule, describeSchedule, nextRun, validTz } from "./cron/schedule.js";
+import { parseDeliver } from "./cron/deliver.js";
 import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
 import { runTick, runJobOnce, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
@@ -125,6 +126,7 @@ import "./tools/todo.js"; // register todo_write (inline task checklist)
 import "./tools/send.js"; // register send_file (self-gates on HARA_GATEWAY — pushes a file to the chat)
 import "./tools/external_agent.js"; // register external_agent (delegate to claude-code / codex headless)
 import "./tools/ask_user.js"; // register ask_user (pause mid-turn to ask the user a structured question)
+import "./tools/cron.js"; // register cronjob (model-facing scheduler — "remind me every morning" just works)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1789,12 +1791,32 @@ cronCmd
   .description('schedule a task — schedule = cron expr ("0 9 * * *"), "every 30m", "in 2h", or an ISO timestamp')
   .option("--name <name>", "a label for the job")
   .option("--org", "run via `hara org` (role routing + review) instead of a plain `hara -p` prompt")
-  .action((schedule: string, taskParts: string[], opts: { name?: string; org?: boolean }) => {
+  .option("--command", "run the task as a plain SHELL COMMAND — deterministic, no agent, no tokens")
+  .option("--tz <zone>", 'IANA timezone for cron exprs (e.g. "Asia/Shanghai"); default = local time')
+  .option("--deliver <spec>", "push each run's result: telegram:<chatId> | feishu:<chatId> | webhook:<url>")
+  .action((schedule: string, taskParts: string[], opts: { name?: string; org?: boolean; command?: boolean; tz?: string; deliver?: string }) => {
     const task = taskParts.join(" ");
+    if (opts.org && opts.command) return void out(c.red("--org and --command are mutually exclusive\n"));
     const sched = parseSchedule(schedule, Date.now());
     if ("error" in sched) return void out(c.red(sched.error + "\n"));
-    const job = addJob({ name: opts.name || task.slice(0, 48), schedule: sched, task, mode: opts.org ? "org" : "print", cwd: process.cwd(), createdAt: Date.now() });
-    out(c.green(`✓ scheduled ${job.id}`) + c.dim(` · ${describeSchedule(sched)} · ${job.mode} · cwd ${job.cwd}\n`));
+    if (opts.tz && !validTz(opts.tz)) return void out(c.red(`invalid timezone "${opts.tz}" (IANA name, e.g. Asia/Shanghai)\n`));
+    if (opts.tz && sched.kind !== "cron") return void out(c.red("--tz only applies to cron expressions\n"));
+    if (opts.deliver) {
+      const d = parseDeliver(opts.deliver);
+      if ("error" in d) return void out(c.red(d.error + "\n"));
+    }
+    const mode = opts.command ? ("command" as const) : opts.org ? ("org" as const) : ("print" as const);
+    const job = addJob({
+      name: opts.name || task.slice(0, 48),
+      schedule: sched,
+      task,
+      mode,
+      cwd: process.cwd(),
+      ...(opts.tz ? { tz: opts.tz } : {}),
+      ...(opts.deliver ? { deliver: opts.deliver } : {}),
+      createdAt: Date.now(),
+    });
+    out(c.green(`✓ scheduled ${job.id}`) + c.dim(` · ${describeSchedule(sched)}${opts.tz ? ` @ ${opts.tz}` : ""} · ${job.mode}${opts.deliver ? ` · → ${opts.deliver}` : ""} · cwd ${job.cwd}\n`));
     if (!isInstalled()) out(c.yellow("⚠ scheduler not installed yet — run `hara cron install` so jobs actually fire.\n"));
   });
 // Resolve an id/prefix to one job, printing a clear error for none / ambiguous (never act on a guess).

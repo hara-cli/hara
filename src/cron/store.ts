@@ -10,14 +10,26 @@ export interface CronJob {
   id: string;
   name: string;
   schedule: Schedule;
-  task: string; // the prompt / task to run
-  mode: "print" | "org"; // `hara -p <task>` vs `hara org <task>`
+  task: string; // the prompt / task / shell command to run (per `mode`)
+  /** `print` = `hara -p <task>` · `org` = `hara org <task>` · `command` = run <task> as a SHELL
+   *  COMMAND, deterministically — no agent, no tokens (hermes-style script lane). */
+  mode: "print" | "org" | "command";
   cwd: string; // working directory the job runs in
+  /** IANA timezone for cron-expr matching (e.g. "Asia/Shanghai"). Absent = local time. */
+  tz?: string;
+  /** Push each run's outcome to a channel: telegram:<chatId> | feishu:<chatId> | webhook:<url>. */
+  deliver?: string;
+  /** Consecutive failures before a 🚨 alert fires on the deliver channel (default 3). */
+  alertAfter?: number;
   enabled: boolean;
   createdAt: number;
   lastRunAt?: number;
   lastStatus?: "ok" | "error";
   lastError?: string;
+  /** Consecutive error count (reset on success) — drives the failure alert. */
+  consecutiveErrors?: number;
+  /** Last 🚨 alert timestamp — cooldown gate so a flapping job doesn't spam. */
+  lastAlertAt?: number;
 }
 
 export function cronDir(): string {
@@ -101,5 +113,15 @@ export function recordRun(id: string, at: number, status: "ok" | "error", error?
   job.lastRunAt = at;
   job.lastStatus = status;
   job.lastError = error;
+  job.consecutiveErrors = status === "error" ? (job.consecutiveErrors ?? 0) + 1 : 0;
+  saveJobs(jobs);
+}
+
+/** Stamp the failure-alert time (cooldown gate). */
+export function recordAlert(id: string, at: number): void {
+  const jobs = loadJobs();
+  const job = jobs.find((x) => x.id === id);
+  if (!job) return;
+  job.lastAlertAt = at;
   saveJobs(jobs);
 }

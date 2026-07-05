@@ -5,6 +5,26 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.108.0 — cron grows up: chat-native scheduling, delivery, a deterministic lane
+
+Distilled from a three-way study of openclaw (the production-grade scheduler running our company),
+hermes (the best creation UX), and hara's own minimal cron:
+
+- **`cronjob` model tool** (hermes parity): "every morning at 9, check X and send me a summary" in
+  chat just works — one action-style tool (add/list/remove/enable/disable/run), approval-gated like
+  any exec. **Recursion guard**: sessions spawned BY a cron job can't schedule more jobs.
+- **`--command` deterministic lane**: run the task as a plain shell command — no agent, no tokens,
+  exact exit codes. Fixed scripts stop burning an LLM round just to type `python script.py`.
+- **Result delivery** (openclaw/hermes parity): `--deliver telegram:<chatId> | feishu:<chatId> |
+  webhook:<url>` pushes each run's outcome (+ output tail) to a channel — no gateway process needed,
+  adapters fire one-shot from the same env vars.
+- **Failure alerts**: 3 consecutive failures (per-job `alertAfter`) → one 🚨 on the deliver channel,
+  6h cooldown, streak resets on success.
+- **Per-job timezone**: `--tz Asia/Shanghai` pins cron expressions to a wall clock (IANA, validated
+  at add time) instead of whatever the machine happens to be set to.
+
+Still the lightest of the three: no daemon — the OS (launchd/crontab) ticks `hara cron`.
+
 ## 0.107.0 — interjection triage: the model is the scheduler, the todo list is the queue
 
 - **Mid-task messages get triaged, not blindly folded in.** Typing while hara works always reached

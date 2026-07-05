@@ -2,9 +2,10 @@
 // session IS the agent — same model as openclaw/hermes). Meant to be invoked every minute by the OS
 // scheduler (see install.ts). A lock file prevents overlapping ticks from double-firing a slow job.
 import { spawn } from "node:child_process";
+import { deliverResult } from "./deliver.js";
 import { existsSync, mkdirSync, writeFileSync, rmSync, statSync, appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadJobs, recordRun, cronDir, logPath, type CronJob } from "./store.js";
+import { loadJobs, recordRun, recordAlert, findJob, cronDir, logPath, type CronJob } from "./store.js";
 import { isDue } from "./schedule.js";
 
 /** Jobs that are enabled AND due at `nowMs` (pure — for the tick and for testing). */
@@ -40,10 +41,9 @@ function capLog(log: string): void {
 
 /** Run one job's task in a fresh hara process (full-auto, no prompts), appending output to its log.
  *  Exported so `hara cron run <id>` can fire a job on demand, ignoring its schedule. */
-export function runJobOnce(job: CronJob): Promise<{ ok: boolean; error?: string }> {
+export function runJobOnce(job: CronJob): Promise<{ ok: boolean; error?: string; output?: string }> {
   return new Promise((resolve) => {
     mkdirSync(join(cronDir(), "logs"), { recursive: true });
-    const args = job.mode === "org" ? ["org", job.task] : ["-p", job.task, "--approval", "full-auto"];
     const log = logPath(job.id);
     capLog(log);
     try {
@@ -51,9 +51,18 @@ export function runJobOnce(job: CronJob): Promise<{ ok: boolean; error?: string 
     } catch {
       /* logging is best-effort */
     }
+    // mode "command" = the deterministic lane (hermes-style): run the task as a plain shell command —
+    // no agent, no tokens, exact. The other modes spawn a fresh hara session. Either way HARA_CRON=1
+    // marks the child so cron-run sessions can't create more cron jobs (recursion guard).
     const self = selfArgv();
-    const child = spawn(self[0], [...self.slice(1), ...args], { cwd: job.cwd, env: process.env });
+    const [cmd, argv] =
+      job.mode === "command"
+        ? ["bash", ["-lc", job.task]]
+        : [self[0], [...self.slice(1), ...(job.mode === "org" ? ["org", job.task] : ["-p", job.task, "--approval", "full-auto"])]];
+    const child = spawn(cmd, argv as string[], { cwd: job.cwd, env: { ...process.env, HARA_CRON: "1" } });
+    let tail = ""; // last few KB, for chat delivery (the full stream goes to the log file)
     const append = (d: Buffer): void => {
+      tail = (tail + d.toString()).slice(-4_000);
       try {
         appendFileSync(log, d);
       } catch {
@@ -62,9 +71,41 @@ export function runJobOnce(job: CronJob): Promise<{ ok: boolean; error?: string 
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);
-    child.on("error", (e) => resolve({ ok: false, error: String(e?.message ?? e) }));
-    child.on("close", (code) => resolve(code === 0 ? { ok: true } : { ok: false, error: `exited ${code}` }));
+    child.on("error", (e) => resolve({ ok: false, error: String(e?.message ?? e), output: tail }));
+    child.on("close", (code) => resolve(code === 0 ? { ok: true, output: tail } : { ok: false, error: `exited ${code}`, output: tail }));
   });
+}
+
+/** After a run: push the outcome to the job's deliver channel, and — on repeated failures — a 🚨 alert
+ *  (threshold `alertAfter` (default 3), 6h cooldown). Best-effort: a delivery error only hits the log.
+ *  `deliver` + `nowMs` injectable for tests. */
+export async function deliverOutcome(
+  job: CronJob,
+  r: { ok: boolean; error?: string; output?: string },
+  deliver: (spec: string, text: string) => Promise<string | null> = deliverResult,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  if (!job.deliver) return;
+  const snippet = (r.output ?? "").trim().slice(-1_500);
+  const head = r.ok ? `⏰ ${job.name} ✓` : `⏰ ${job.name} ✗ ${r.error ?? "failed"}`;
+  const err = await deliver(job.deliver, snippet ? `${head}\n${snippet}` : head);
+  if (err) {
+    try {
+      appendFileSync(logPath(job.id), `\n[deliver] ${err}\n`);
+    } catch {
+      /* best-effort */
+    }
+  }
+  if (!r.ok) {
+    const fresh = findJob(job.id); // recordRun already bumped consecutiveErrors
+    const count = fresh?.consecutiveErrors ?? 0;
+    const threshold = job.alertAfter ?? 3;
+    const cooled = !fresh?.lastAlertAt || nowMs - fresh.lastAlertAt > 6 * 3_600_000;
+    if (count >= threshold && cooled) {
+      await deliver(job.deliver, `🚨 ${job.name} has failed ${count}× in a row — latest: ${r.error ?? "unknown"}. Log: ${logPath(job.id)}`);
+      recordAlert(job.id, nowMs);
+    }
+  }
 }
 
 /** One scheduler tick: run every due job (sequentially), recording each outcome. Lock-guarded so an
@@ -97,6 +138,7 @@ export async function runTick(nowMs: number, run: (job: CronJob) => Promise<{ ok
     for (const job of due) {
       const r = await run(job);
       recordRun(job.id, nowMs, r.ok ? "ok" : "error", r.error);
+      await deliverOutcome(job, r);
       ran.push(job.id);
     }
     return { ran };

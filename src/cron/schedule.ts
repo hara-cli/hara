@@ -74,13 +74,52 @@ export function parseCron(expr: string): CronFields | null {
   return { m, h, dom, mon, dow, domStar: f[2] === "*", dowStar: f[4] === "*" };
 }
 
-/** Does `expr` fire at the given local minute? Uses the Vixie day-of-month/day-of-week OR rule. */
-export function cronMatches(expr: string, d: Date): boolean {
+/** Offset (ms) of IANA zone `tz` from UTC at instant `atMs`. Cached per (tz, hour) — offsets only move
+ *  at DST transitions, so hour-bucket caching keeps nextRun's minute-by-minute scan fast. */
+const offsetCache = new Map<string, number>();
+export function zoneOffsetMs(tz: string, atMs: number): number {
+  const key = `${tz}:${Math.floor(atMs / 3_600_000)}`;
+  const hit = offsetCache.get(key);
+  if (hit !== undefined) return hit;
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+  const p: Record<string, string> = {};
+  for (const part of fmt.formatToParts(new Date(atMs))) p[part.type] = part.value;
+  const asUtc = Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour) % 24, Number(p.minute), Number(p.second));
+  const off = asUtc - Math.floor(atMs / 1000) * 1000;
+  if (offsetCache.size > 10_000) offsetCache.clear();
+  offsetCache.set(key, off);
+  return off;
+}
+
+/** Is `tz` a valid IANA timezone? (validated at job-add time so a typo fails loudly, not silently-local) */
+export function validTz(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Wall-clock parts of the instant — in `tz` when given (offset-shifted UTC getters), else local. */
+function wallParts(d: Date, tz?: string): { min: number; hour: number; dom: number; mon: number; dow: number } {
+  if (!tz) return { min: d.getMinutes(), hour: d.getHours(), dom: d.getDate(), mon: d.getMonth() + 1, dow: d.getDay() };
+  const z = new Date(d.getTime() + zoneOffsetMs(tz, d.getTime()));
+  return { min: z.getUTCMinutes(), hour: z.getUTCHours(), dom: z.getUTCDate(), mon: z.getUTCMonth() + 1, dow: z.getUTCDay() };
+}
+
+/** Does `expr` fire at the given minute (in `tz` when set, else local)? Vixie dom/dow OR rule. */
+export function cronMatches(expr: string, d: Date, tz?: string): boolean {
   const p = parseCron(expr);
   if (!p) return false;
-  if (!p.m.has(d.getMinutes()) || !p.h.has(d.getHours()) || !p.mon.has(d.getMonth() + 1)) return false;
-  const domOk = p.dom.has(d.getDate());
-  const dowOk = p.dow.has(d.getDay());
+  const w = wallParts(d, tz);
+  if (!p.m.has(w.min) || !p.h.has(w.hour) || !p.mon.has(w.mon)) return false;
+  const domOk = p.dom.has(w.dom);
+  const dowOk = p.dow.has(w.dow);
   if (p.domStar && p.dowStar) return true; // both unrestricted → any day
   if (!p.domStar && !p.dowStar) return domOk || dowOk; // both restricted → OR
   return p.domStar ? dowOk : domOk; // one restricted → that one
@@ -118,6 +157,7 @@ interface JobTiming {
   schedule: Schedule;
   createdAt: number;
   lastRunAt?: number;
+  tz?: string;
 }
 
 /** Is this job due to run at `nowMs`? Cron jobs fire once per matching minute (deduped via lastRunAt);
@@ -125,7 +165,7 @@ interface JobTiming {
 export function isDue(job: JobTiming, nowMs: number): boolean {
   const s = job.schedule;
   if (s.kind === "cron") {
-    if (!cronMatches(s.expr, new Date(nowMs))) return false;
+    if (!cronMatches(s.expr, new Date(nowMs), job.tz)) return false;
     return job.lastRunAt === undefined || Math.floor(job.lastRunAt / 60_000) < Math.floor(nowMs / 60_000);
   }
   // interval: fire once per grid slot of width everyMs — a tick landing slightly early still counts the
@@ -144,7 +184,7 @@ export function nextRun(job: JobTiming, fromMs: number): number | null {
   if (!p) return null;
   const start = Math.floor(fromMs / 60_000) * 60_000 + 60_000; // next minute boundary
   for (let t = start, i = 0; i < 366 * 24 * 60; t += 60_000, i++) {
-    if (cronMatches(s.expr, new Date(t))) return t;
+    if (cronMatches(s.expr, new Date(t), job.tz)) return t;
   }
   return null;
 }
