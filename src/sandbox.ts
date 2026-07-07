@@ -5,12 +5,36 @@
 // project, NOT a determined exfiltration. Other platforms run UNSANDBOXED (a one-time warning is
 // emitted from runShell so every entry point — REPL, -p, org, cron — surfaces it). Only the `bash`
 // shell is sandboxed; hara's own file tools are in-process, explicit, and gated by the approval flow.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir, platform } from "node:os";
 import { join } from "node:path";
 
 export type SandboxMode = "off" | "workspace-write" | "read-only";
+
+// Windows shell resolution. hara (and the model) speak POSIX shell — the agent writes `ls`, `grep`,
+// `cat`, pipes, `&&`. So on Windows we PREFER a real bash (Git Bash or WSL, which most Windows devs
+// have) and only fall back to cmd.exe when none is found. Memoized: the PATH probe runs at most once.
+let _winBash: string | null | undefined;
+function findWindowsBash(): string | null {
+  if (_winBash !== undefined) return _winBash;
+  // `where bash` finds Git Bash / WSL bash on PATH; also probe the default Git-for-Windows location.
+  const onPath = spawnSync("where", ["bash"], { encoding: "utf8" });
+  const hit = onPath.status === 0 ? String(onPath.stdout).split(/\r?\n/).find((l) => l.trim()) : "";
+  _winBash = (hit && hit.trim()) || null;
+  return _winBash;
+}
+
+/** Pure shell-argv resolution — split out so the platform branching is unit-testable without spawning.
+ *  `plat` and `bash` are injected; production passes the real platform() + findWindowsBash(). */
+export function resolveShellArgv(command: string, plat: string, bash: string | null): { cmd: string; args: string[] } {
+  if (plat === "win32") {
+    // A real bash keeps POSIX commands working; cmd.exe is the last resort (most `ls/grep` will fail
+    // there — the model should be told, see maybeWarnWindowsShell).
+    return bash ? { cmd: bash, args: ["-c", command] } : { cmd: "cmd.exe", args: ["/d", "/s", "/c", command] };
+  }
+  return { cmd: "/bin/sh", args: ["-c", command] };
+}
 
 const sbQuote = (s: string) => '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
 
@@ -56,7 +80,21 @@ export function shellCommand(command: string, cwd: string, mode: SandboxMode): {
     return { cmd: "sandbox-exec", args: ["-f", profileFile, "/bin/bash", "-lc", command] };
   }
   maybeWarnUnsandboxed(mode);
-  return { cmd: "/bin/sh", args: ["-c", command] };
+  const plat = platform();
+  if (plat === "win32") maybeWarnWindowsShell();
+  return resolveShellArgv(command, plat, plat === "win32" ? findWindowsBash() : null);
+}
+
+/** One-time notice on Windows when no bash is found — the POSIX commands the model writes won't run
+ *  under cmd.exe. Points the user at the fix (install Git for Windows or run under WSL). */
+let warnedWinShell = false;
+function maybeWarnWindowsShell(): void {
+  if (warnedWinShell || findWindowsBash()) return;
+  warnedWinShell = true;
+  process.stderr.write(
+    "hara: no bash found on PATH — shell commands run under cmd.exe, where most Unix commands (ls, grep, cat) fail.\n" +
+      "      Install Git for Windows (bundles bash) or run hara inside WSL for full command support.\n",
+  );
 }
 
 /** One-time-per-process notice that --sandbox is a no-op off macOS (covers every entry point). */

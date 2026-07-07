@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.109.0 — real multi-line input + Windows shell
+
+- **Pasted multi-line text is now real, editable text in the box** — not a `[Paste]` token, not an
+  auto-submit. The input box renders `\n` as actual line breaks (deterministic wrap now treats a
+  newline as a hard row break), so a pasted paragraph / code / stack trace shows in full, you edit it,
+  and only a real **Enter** sends it. (0.108.1 over-corrected by folding every paste to a token; this
+  is codex's behavior — the composer is a multi-line textarea, a pasted newline is content.) A truly
+  enormous dump (>8000 chars) still folds to a token so it can't wall off the screen.
+- **Windows: the shell no longer hard-fails.** The bash tool hardcoded `/bin/sh`, which doesn't exist
+  on Windows — so every command errored. Now on Windows hara prefers a real **bash** (Git Bash / WSL,
+  which it probes on PATH) so the POSIX commands the model writes keep working, and falls back to
+  `cmd.exe` with a one-time notice pointing at the fix. (Still no auto-`cron install` or sandbox on
+  Windows — those stay Unix-only, as before.)
+
 ## 0.108.1 — pasting no longer sends the message
 
 - **A pasted newline is content, not "send".** Pasting multi-line text used to fire the message at

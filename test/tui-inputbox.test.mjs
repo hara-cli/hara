@@ -221,32 +221,32 @@ test("InputBox: backspace over an [Image #N] token removes the token and its att
 
 // ── Long-paste folding: big pastes become [Paste #N +L lines] tokens (never flood or auto-submit) ──
 
-test("InputBox: a multi-line paste folds to a token instead of submitting at the first newline", async () => {
+test("InputBox: a multi-line paste inserts as real multi-line text (visible, editable) — never auto-submits", async () => {
   let submitted = null;
   const big = Array.from({ length: 12 }, (_, i) => `paste line ${i + 1}`).join("\n");
   const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
-  stdin.write(big); // one chunk, 12 lines — the old path would have submitted "paste line 1"
+  stdin.write(big); // one chunk, 12 lines — the old path submitted "paste line 1"; now it inserts as text
   await tick();
   const frame = strip(lastFrame());
-  assert.ok(frame.includes("[Paste #1 +12 lines]"), "folded into a token");
-  assert.ok(!frame.includes("paste line 5"), "body not flooded into the box");
+  assert.equal(submitted, null, "nothing auto-submitted on a pasted newline");
+  assert.ok(frame.includes("paste line 1") && frame.includes("paste line 12"), "shown as real multi-line text, not a token");
   assert.equal(submitted, null, "nothing auto-submitted");
   stdin.write(" please summarize");
   await tick();
   stdin.write("\r");
   await tick();
-  assert.ok(submitted.includes("paste line 1") && submitted.includes("paste line 12"), "token expanded to the FULL text on submit");
-  assert.ok(submitted.includes("please summarize"), "typed text preserved around the expansion");
+  assert.ok(submitted.includes("paste line 1") && submitted.includes("paste line 12"), "full multi-line text sent on Enter");
+  assert.ok(submitted.includes("please summarize"), "typed text preserved after the paste");
   unmount();
 });
 
-test("InputBox: backspace over a paste token removes it whole (and its stored text)", async () => {
+test("InputBox: an ENORMOUS paste (>8000 chars) folds to a token; backspace removes it whole", async () => {
   let submitted = null;
-  const big = Array.from({ length: 8 }, (_, i) => `x${i}`).join("\n");
+  const huge = Array.from({ length: 300 }, (_, i) => `line ${i} ${"y".repeat(30)}`).join("\n"); // ~10k chars
   const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
-  stdin.write(big);
+  stdin.write(huge);
   await tick();
-  assert.ok(strip(lastFrame()).includes("[Paste #1 +8 lines]"), "token present");
+  assert.ok(strip(lastFrame()).includes("[Paste #1 "), "an enormous dump folds to a token (safety valve)");
   stdin.write("\x7f"); // backspace → whole token gone
   await tick();
   assert.ok(!strip(lastFrame()).includes("[Paste #1"), "token removed whole");
@@ -265,7 +265,9 @@ test("InputBox: a SHORT multi-line paste (1-2 newlines, <600 chars) folds — do
   stdin.write(short);
   await tick();
   assert.equal(submitted, null, "a pasted newline no longer sends the message");
-  assert.ok(strip(lastFrame()).includes("[Paste #1 +2 lines]"), "folded to a token instead");
+  const f = strip(lastFrame());
+  assert.ok(f.includes("第一行") && f.includes("第二行"), "shown as real multi-line text (not a token)");
+  assert.ok(!f.includes("[Paste"), "no fold token for a normal multi-line paste");
   stdin.write("\r"); // NOW a real Enter sends
   await tick();
   assert.ok(submitted && submitted.includes("第一行") && submitted.includes("第二行"), "Enter sends the full expanded text");

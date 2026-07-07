@@ -171,19 +171,20 @@ export function wrapRows(value: string, cols: number): Row[] {
   const rows: Row[] = [];
   const parts = segmentize(value);
   // Flatten to atomic units: a run of text is breakable per-char/word; an image token is atomic.
-  const atoms: { text: string; start: number; atomic: boolean }[] = [];
+  const atoms: { text: string; start: number; atomic: boolean; br?: boolean }[] = [];
   let pos = 0;
   for (const p of parts) {
     if (p.token) {
       atoms.push({ text: p.text, start: pos, atomic: true });
       pos += p.text.length;
     } else {
-      // Break the text run into word chunks (keep trailing space with the word) so wraps land on spaces.
-      const re = /\S+\s*|\s+/g;
+      // Break the text run into: a hard newline (its own atom → forces a row break, so a pasted/typed
+      // `\n` renders as an actual line), a word + trailing NON-newline whitespace, or a run of spaces.
+      const re = /\n|\S+[^\S\n]*|[^\S\n]+/g;
       let m: RegExpExecArray | null;
-      let base = pos;
+      const base = pos;
       while ((m = re.exec(p.text))) {
-        atoms.push({ text: m[0], start: base + m.index, atomic: false });
+        atoms.push({ text: m[0], start: base + m.index, atomic: false, br: m[0] === "\n" });
       }
       pos += p.text.length;
     }
@@ -199,6 +200,12 @@ export function wrapRows(value: string, cols: number): Row[] {
   };
   for (const a of atoms) {
     const aEnd = a.start + a.text.length;
+    if (a.br) {
+      // A newline ends the current row: the `\n` sits at the row's end (renderRow strips it from the
+      // displayed text). The next row starts right after it — rows stay contiguous over the value.
+      flush(aEnd);
+      continue;
+    }
     if (a.atomic || a.text.length <= width) {
       // A whole unit (image token OR a word chunk that fits within a full row): if it doesn't fit in
       // the remaining room and the row already has content, wrap to a fresh row FIRST — never split it.
@@ -234,13 +241,15 @@ export function wrapRows(value: string, cols: number): Row[] {
  *  cursor (inverse cell) when it falls on this row. Splitting happens on precomputed rows so the
  *  whole prompt never reflows as a single <Text> — stable under wrapping and quick to diff. */
 function renderRow(value: string, row: Row, cursor: number, showCursor: boolean, isLastRow: boolean, keyPrefix: string): ReactNode {
+  // `\n` chars are row SEPARATORS (wrapRows already broke the row on them) — never render them, or ink
+  // would insert a second line break and desync the deterministic layout.
   const seg = (token: boolean, text: string, k: string): ReactNode =>
     token ? (
       <Text key={k} backgroundColor="magenta" color="white">
-        {text}
+        {text.replace(/\n/g, "")}
       </Text>
     ) : (
-      <Text key={k}>{text}</Text>
+      <Text key={k}>{text.replace(/\n/g, "")}</Text>
     );
   // Segments intersected with this row's [start,end) range.
   const parts = segmentize(value);
@@ -261,7 +270,7 @@ function renderRow(value: string, row: Row, cursor: number, showCursor: boolean,
       if (rel > 0) nodes.push(seg(p.token, slice.slice(0, rel), `${keyPrefix}s${ki++}`));
       nodes.push(
         <Text key={`${keyPrefix}c${ki++}`} inverse>
-          {slice[rel]}
+          {slice[rel] === "\n" ? " " : slice[rel]}
         </Text>,
       );
       if (rel + 1 < slice.length) nodes.push(seg(p.token, slice.slice(rel + 1), `${keyPrefix}e${ki++}`));
@@ -526,13 +535,18 @@ export function InputBox({
           submit(value);
           return;
         }
-        // A PASTE — any multi-char chunk that CONTAINS a newline, or a large single chunk — folds to a
-        // `[Paste #N +L lines]` token and NEVER submits. A pasted newline is content, not "send" (codex's
-        // paste-burst rule: Enter inside a paste is a newline, not submit). This fixes "paste is sent
-        // immediately": the old code submitted at the first newline in a pasted chunk, so any 1–2 line
-        // paste under 600 chars fired the message. Now only a real Enter (above / key.return) sends.
-        if (/[\r\n]/.test(input) || input.length >= 600) {
-          addPaste(input);
+        // A PASTE containing newlines inserts as REAL MULTI-LINE TEXT (normalize CRLF/CR → LF) — the
+        // user sees and can edit it, and a pasted newline is content, NOT "send" (only a real Enter,
+        // above / key.return, submits). Only a truly ENORMOUS dump folds to a `[Paste #N]` token, so a
+        // 500-line paste doesn't turn the box into a wall — normal multi-line pastes stay visible.
+        const hasNL = /[\r\n]/.test(input);
+        if (input.length >= 8000) {
+          addPaste(input.replace(/\r\n?/g, "\n"));
+          return;
+        }
+        if (hasNL) {
+          const text = input.replace(/\r\n?/g, "\n");
+          set(value.slice(0, cursor) + text + value.slice(cursor), cursor + text.length);
           return;
         }
         // a dragged-in / pasted image file path attaches instead of inserting literal text
