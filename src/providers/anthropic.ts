@@ -49,6 +49,38 @@ export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
   return msgs;
 }
 
+const CACHE = { type: "ephemeral" as const };
+
+/** Attach Anthropic prompt-cache breakpoints so each turn re-reads the static prefix and the
+ *  conversation prefix FROM CACHE instead of re-billing + re-processing the whole prompt — the single
+ *  biggest latency + cost win as history grows (uncached, a long session pays full input every turn).
+ *
+ *  Anthropic caps breakpoints at 4 and orders the cache prefix `tools → system → messages`, so a mark
+ *  on `system` already caches tools+system (the big static block) in one shot. We then spend up to two
+ *  rolling marks near the message tail: the last message (so THIS turn's full prefix is written) and one
+ *  ~2 back (so the NEXT turn — which appends new messages — still finds a long cached prefix to read).
+ *  Mutates `messages` in place (toAnthropic hands us a fresh array each turn); returns the request-shaped
+ *  system. Exported pure for tests. */
+export function applyCacheControl(
+  system: string,
+  messages: Anthropic.MessageParam[],
+): { system: string | Anthropic.TextBlockParam[]; messages: Anthropic.MessageParam[] } {
+  const mark = (m: Anthropic.MessageParam): void => {
+    if (typeof m.content === "string") {
+      if (m.content.length) m.content = [{ type: "text", text: m.content, cache_control: CACHE }];
+    } else if (m.content.length) {
+      (m.content[m.content.length - 1] as { cache_control?: typeof CACHE }).cache_control = CACHE;
+    }
+  };
+  const idxs = new Set<number>();
+  if (messages.length) idxs.add(messages.length - 1);
+  if (messages.length >= 3) idxs.add(messages.length - 3);
+  for (const i of idxs) mark(messages[i]);
+  // Only cache system when it's substantial enough to matter (an empty text block would 400).
+  const cachedSystem: string | Anthropic.TextBlockParam[] = system ? [{ type: "text", text: system, cache_control: CACHE }] : system;
+  return { system: cachedSystem, messages };
+}
+
 /** Anthropic models whose only valid `thinking` setting is `{type: "adaptive"}` — they reject any
  *  explicit `budget_tokens`. We detect them by id family so "off"/low/high still degrade gracefully
  *  (we just omit the field or stay on adaptive instead of sending a 400-triggering body). */
@@ -82,14 +114,15 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
     model: opts.model,
     async turn({ system, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
       const thinking = buildThinkingParam(opts.model, opts.reasoningEffort);
+      const { system: cachedSystem, messages } = applyCacheControl(system, toAnthropic(history));
       const stream = client.messages.stream(
         {
           model: opts.model,
           max_tokens: 32000,
           ...(thinking ? { thinking } : {}),
-          system,
+          system: cachedSystem,
           tools: tools as Anthropic.Tool[],
-          messages: toAnthropic(history),
+          messages,
         },
         { signal },
       );

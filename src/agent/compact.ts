@@ -5,6 +5,12 @@
 /** Auto-compact once the last turn used ≥ this % of the model's context window. */
 export const AUTO_COMPACT_PCT = 85;
 
+/** Dynamic absolute ceiling. On a 1M-window model, 85% == 850k tokens — a size a session drags for a
+ *  long, sluggish while before ever reaching, so the %-trigger effectively never fires and every turn
+ *  re-sends a bloated prompt. This cap makes auto-compaction actually engage at a snappy working size
+ *  regardless of how large the window is. Overridable via `HARA_AUTO_COMPACT_TOKENS`. */
+export const AUTO_COMPACT_TOKEN_CAP = 200_000;
+
 /** The compaction brief (shared by /compact and auto-compaction). Eight sections, mirroring Claude
  *  Code's AU2 template — the two that matter most beyond the obvious: **All user messages** (the
  *  user's own words survive verbatim, so however hard the history is squeezed, intent never drifts)
@@ -52,4 +58,11 @@ export function buildFileRestore(
  *  last turn filled the context past the threshold (so the NEXT turn would risk overflow). */
 export function shouldAutoCompact(ctxPct: number, historyLen: number, autoCompact: boolean, threshold = AUTO_COMPACT_PCT): boolean {
   return autoCompact && historyLen >= 4 && ctxPct >= threshold;
+}
+
+/** Absolute-size companion to shouldAutoCompact: fire once the last turn's real token count crosses the
+ *  cap. This is what makes auto-compaction engage on huge-window models, where the %-trigger sits at an
+ *  unreachable 850k. Either trigger (this OR the %-of-window one) compacts. */
+export function shouldAutoCompactTokens(lastInputTokens: number, historyLen: number, autoCompact: boolean, cap = AUTO_COMPACT_TOKEN_CAP): boolean {
+  return autoCompact && historyLen >= 4 && lastInputTokens >= cap;
 }

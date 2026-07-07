@@ -62,7 +62,7 @@ import {
 } from "./profile/profile.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
-import { shouldAutoCompact, COMPACT_SYSTEM, buildFileRestore } from "./agent/compact.js";
+import { shouldAutoCompact, shouldAutoCompactTokens, AUTO_COMPACT_TOKEN_CAP, COMPACT_SYSTEM, buildFileRestore } from "./agent/compact.js";
 import { recentTouched } from "./agent/touched.js";
 import { INTERJECT_PREFIX } from "./agent/reminders.js";
 import { checkForUpdate } from "./update-check.js";
@@ -823,9 +823,15 @@ async function compactConversation(provider: Provider, history: NeutralMsg[], me
  *  doesn't overflow. Opt-out via `autoCompact: false` / `HARA_AUTO_COMPACT=0`. Best-effort; `notify` surfaces
  *  a one-line status. Returns true if it compacted. */
 async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, cfg: HaraConfig, notify: (m: string) => void): Promise<boolean> {
-  const pct = bar.ctxPctFor(cfg.model, stats.lastInput ?? 0);
-  if (!shouldAutoCompact(pct, history.length, cfg.autoCompact)) return false;
-  notify(`✻ Auto-compacting conversation (context ${pct}% full)…`);
+  const lastInput = stats.lastInput ?? 0;
+  const pct = bar.ctxPctFor(cfg.model, lastInput);
+  // Two triggers, whichever hits first: % of window (small-window models) OR an absolute token cap
+  // (huge-window models, where 85% is an unreachable 850k). Cap is overridable via env.
+  const cap = Number(process.env.HARA_AUTO_COMPACT_TOKENS) || AUTO_COMPACT_TOKEN_CAP;
+  const overPct = shouldAutoCompact(pct, history.length, cfg.autoCompact);
+  const overCap = shouldAutoCompactTokens(lastInput, history.length, cfg.autoCompact, cap);
+  if (!overPct && !overCap) return false;
+  notify(`✻ Auto-compacting conversation (context ${pct}% full, ~${Math.round(lastInput / 1000)}k tok)…`);
   const summary = await compactConversation(provider, history, meta, stats);
   notify(summary ? `(auto-compacted — context replaced with a summary; ${meta.workingSet?.length ?? 0} notes kept)` : "(auto-compact failed — use /compact or /clear)");
   return !!summary;

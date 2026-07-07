@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.109.1 — prompt caching + dynamic compaction (the "why is it slow" fix)
+
+- **Prompt caching, finally on.** Every turn used to re-send *and re-process* the whole prompt —
+  system + all tool definitions + the entire growing history — with **no cache breakpoints**, so the
+  model re-billed and re-crunched everything from scratch each turn. The longer the session, the
+  slower and pricier each reply. hara now sets Anthropic `cache_control` breakpoints on the static
+  prefix (system, which covers tools+system in cache order) and two rolling points at the message tail,
+  so each turn reads the unchanged prefix **from cache** (~10% the cost, and far lower time-to-first-
+  token). This is the single biggest latency win as history grows. (Cache engages once the prefix
+  passes Anthropic's ~1024-token minimum — i.e. any real coding session.)
+- **Auto-compaction now actually fires on big-window models.** It triggered at 85% of the context
+  window — but on a 1M-token model that's **850k tokens**, a size a session drags sluggishly toward and
+  realistically never hits, so it never compacted and the prompt just kept bloating. Added a **dynamic
+  absolute cap**: compact once the live context passes ~200k tokens *regardless* of window size (either
+  trigger — % of window OR the cap — fires). Override with `HARA_AUTO_COMPACT_TOKENS`; opt out as before
+  with `autoCompact: false` / `HARA_AUTO_COMPACT=0`.
+- Studied codex (Rust `prompt_cache_key` + a 1000-char paste-fold threshold) and cc-haha (Claude Code's
+  session-stable cache TTL) to land the breakpoint layout and keep the TTL steady within a session.
+
 ## 0.109.0 — real multi-line input + Windows shell
 
 - **Pasted multi-line text is now real, editable text in the box** — not a `[Paste]` token, not an
