@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.108.1 — pasting no longer sends the message
+
+- **A pasted newline is content, not "send".** Pasting multi-line text used to fire the message at
+  the first newline (any 1–2 line paste under 600 chars auto-submitted) — the classic "I pasted and
+  it sent before I could edit" bug. Now ANY paste containing a newline folds to a `[Paste #N +L lines]`
+  token and waits; only a real **Enter** sends it (the token expands to the full text on submit). This
+  is codex's paste-burst rule — Enter inside a paste is a newline, not a submit. A lone newline typed
+  at the prompt still sends, as before.
+- (Slow paste *recognition* over a remote/SSH terminal is chunk-delivery latency — network-bound, not
+  something the client amplifies; local pastes arrive as one chunk and are instant.)
+
 ## 0.108.0 — cron grows up: chat-native scheduling, delivery, a deterministic lane
 
 Distilled from a three-way study of openclaw (the production-grade scheduler running our company),

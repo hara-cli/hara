@@ -257,3 +257,28 @@ test("InputBox: backspace over a paste token removes it whole (and its stored te
   assert.equal(submitted, "hi", "no stale paste text leaked into the submission");
   unmount();
 });
+
+test("InputBox: a SHORT multi-line paste (1-2 newlines, <600 chars) folds — does NOT auto-submit (the bug)", async () => {
+  let submitted = null;
+  const short = "第一行\n第二行"; // 1 newline, well under 600 chars — the old path submitted "第一行" here
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
+  stdin.write(short);
+  await tick();
+  assert.equal(submitted, null, "a pasted newline no longer sends the message");
+  assert.ok(strip(lastFrame()).includes("[Paste #1 +2 lines]"), "folded to a token instead");
+  stdin.write("\r"); // NOW a real Enter sends
+  await tick();
+  assert.ok(submitted && submitted.includes("第一行") && submitted.includes("第二行"), "Enter sends the full expanded text");
+  unmount();
+});
+
+test("InputBox: a lone newline in the input stream = Enter (submits the current value)", async () => {
+  let submitted = null;
+  const { stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
+  stdin.write("hello");
+  await tick();
+  stdin.write("\r"); // some terminals deliver Enter via the input string, not key.return
+  await tick();
+  assert.equal(submitted, "hello", "lone newline still submits");
+  unmount();
+});

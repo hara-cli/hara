@@ -520,15 +520,19 @@ export function InputBox({
         return;
       }
       if (input && !key.ctrl && !key.meta) {
-        // A LARGE paste (many lines or lots of text in one chunk) folds to a token — never submits,
-        // never floods the box. Small chunks keep the existing paste-to-run newline behavior.
-        if (input.length >= 600 || (input.match(/\n/g)?.length ?? 0) >= 3) {
-          addPaste(input);
+        // A lone newline delivered through `input` (some terminals send Enter this way instead of
+        // setting key.return) = the user pressed Enter → submit.
+        if (/^[\r\n]+$/.test(input)) {
+          submit(value);
           return;
         }
-        const nl = input.search(/[\r\n]/); // a chunk carrying a newline (paste / fed input) submits
-        if (nl >= 0) {
-          submit(value.slice(0, cursor) + input.slice(0, nl) + value.slice(cursor));
+        // A PASTE — any multi-char chunk that CONTAINS a newline, or a large single chunk — folds to a
+        // `[Paste #N +L lines]` token and NEVER submits. A pasted newline is content, not "send" (codex's
+        // paste-burst rule: Enter inside a paste is a newline, not submit). This fixes "paste is sent
+        // immediately": the old code submitted at the first newline in a pasted chunk, so any 1–2 line
+        // paste under 600 chars fired the message. Now only a real Enter (above / key.return) sends.
+        if (/[\r\n]/.test(input) || input.length >= 600) {
+          addPaste(input);
           return;
         }
         // a dragged-in / pasted image file path attaches instead of inserting literal text
