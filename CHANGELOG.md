@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.109.2 — long paste no longer freezes the input box
+
+- **The input box now draws a bottom-anchored viewport, not every wrapped row.** A long multi-line
+  paste (a spec, a stack trace, a design brief) wraps to hundreds of rows; rendering *all* of them on
+  every keystroke floods ink's layout+diff and the box appears frozen ("卡着" — you type and nothing
+  moves). It now renders at most ~14 rows around the cursor with `⋯ N more lines above/below` markers,
+  so a huge paste stays smooth and the box stays a sane height. (This closes the freeze that 0.109.0's
+  "paste inserts as real multi-line text" could reach — the two ship as a pair.) A tip if a paste was
+  meant to *launch* a skill: a plain long message relies on the model to pick the skill; prefixing the
+  explicit command (e.g. `/design <brief>`) enters that mode deterministically and immediately.
+
 ## 0.109.1 — prompt caching + dynamic compaction (the "why is it slow" fix)
 
 - **Prompt caching, finally on.** Every turn used to re-send *and re-process* the whole prompt —

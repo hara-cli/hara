@@ -289,6 +289,26 @@ function renderRow(value: string, row: Row, cursor: number, showCursor: boolean,
   return nodes;
 }
 
+/** Max input rows drawn at once. A long multi-line paste (a spec, a stack trace, a design brief) wraps
+ *  to hundreds/thousands of rows; rendering them ALL every keystroke floods ink's layout+diff and the
+ *  box appears frozen ("卡着"). So we draw a bottom-anchored viewport (codex-style) around the cursor. */
+export const MAX_INPUT_ROWS = 14;
+
+/** The [first, last) slice of rows to render so the cursor stays visible without drawing the whole
+ *  input. Bottom-anchored: when the cursor is at the end (typing), you see the last MAX rows; when
+ *  editing mid-text, the cursor's row + a little context below stays on screen. Exported pure for tests. */
+export function windowRows(rowCount: number, cursorRow: number, max = MAX_INPUT_ROWS): { first: number; last: number } {
+  if (rowCount <= max) return { first: 0, last: rowCount };
+  const last = Math.min(rowCount, Math.max(cursorRow + 2, max));
+  return { first: Math.max(0, last - max), last };
+}
+
+/** Index of the wrapped row that holds the cursor (last row if past the end). */
+export function cursorRowIndex(rows: Row[], cursor: number): number {
+  for (let i = 0; i < rows.length; i++) if (cursor >= rows[i].start && cursor <= rows[i].end) return i;
+  return Math.max(0, rows.length - 1);
+}
+
 /** The prompt: gutter + wrapped input rows (or a placeholder when empty). Each wrapped continuation
  *  row is indented under the gutter so the text column is stable. Memoized so it only re-renders when
  *  the value/cursor/width/gutter actually change (not when unrelated status ticks over). */
@@ -320,14 +340,20 @@ const InputLine = memo(function InputLine({
       </Box>
     );
   }
+  const { first, last } = windowRows(rows.length, cursorRowIndex(rows, cursor));
   return (
     <Box flexDirection="column">
-      {rows.map((row, i) => (
-        <Box key={i}>
-          <Text color={gutterColor}>{i === 0 ? gutter : "  "}</Text>
-          <Text>{renderRow(value, row, cursor, true, i === rows.length - 1, `r${i}_`)}</Text>
-        </Box>
-      ))}
+      {first > 0 && <Text dimColor>{`  ⋯ ${first} more line${first > 1 ? "s" : ""} above`}</Text>}
+      {rows.slice(first, last).map((row, k) => {
+        const i = first + k;
+        return (
+          <Box key={i}>
+            <Text color={gutterColor}>{i === 0 ? gutter : "  "}</Text>
+            <Text>{renderRow(value, row, cursor, true, i === rows.length - 1, `r${i}_`)}</Text>
+          </Box>
+        );
+      })}
+      {last < rows.length && <Text dimColor>{`  ⋯ ${rows.length - last} more line${rows.length - last > 1 ? "s" : ""} below`}</Text>}
     </Box>
   );
 });

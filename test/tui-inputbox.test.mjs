@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
-import { InputBox, wrapRows } from "../dist/tui/InputBox.js";
+import { InputBox, wrapRows, windowRows, cursorRowIndex, MAX_INPUT_ROWS } from "../dist/tui/InputBox.js";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -170,6 +170,41 @@ test("wrapRows: exactly-full content gets an empty trailing row (so the end curs
   const last = rows[rows.length - 1];
   assert.equal(last.start, v.length, "trailing empty row starts at end");
   assert.equal(last.end, v.length, "trailing empty row is zero-length");
+});
+
+// ── windowRows: the bottom-anchored viewport that stops a long paste from freezing the box ──
+test("windowRows: short input renders every row (no windowing)", () => {
+  assert.deepEqual(windowRows(5, 4), { first: 0, last: 5 });
+  assert.deepEqual(windowRows(MAX_INPUT_ROWS, 0), { first: 0, last: MAX_INPUT_ROWS });
+});
+
+test("windowRows: long input with cursor at the end shows the LAST window (bottom-anchored)", () => {
+  const { first, last } = windowRows(500, 499); // 500 rows, cursor on the last
+  assert.equal(last, 500, "window ends at the bottom");
+  assert.equal(last - first, MAX_INPUT_ROWS, "exactly MAX rows drawn (not all 500)");
+  assert.equal(first, 500 - MAX_INPUT_ROWS);
+});
+
+test("windowRows: cursor mid-text stays visible with a little context below", () => {
+  const { first, last } = windowRows(500, 200);
+  assert.ok(200 >= first && 200 < last, "cursor row 200 is within the drawn window");
+  assert.equal(last - first, MAX_INPUT_ROWS, "still only MAX rows drawn");
+  assert.equal(last, 202, "cursor + 2 rows of look-ahead");
+});
+
+test("windowRows: never draws more than MAX regardless of size", () => {
+  for (const [n, cur] of [[1000, 0], [1000, 500], [1000, 999], [15, 7]]) {
+    const { first, last } = windowRows(n, cur);
+    assert.ok(last - first <= MAX_INPUT_ROWS, `≤MAX for n=${n} cur=${cur}`);
+    assert.ok(cur >= first && cur < last || n <= MAX_INPUT_ROWS, "cursor stays in view");
+  }
+});
+
+test("cursorRowIndex: finds the row holding the cursor; clamps past the end", () => {
+  const rows = wrapRows("x".repeat(25), 10); // 3 rows: [0,10)[10,20)[20,25]
+  assert.equal(cursorRowIndex(rows, 0), 0);
+  assert.equal(cursorRowIndex(rows, 15), 1);
+  assert.equal(cursorRowIndex(rows, 25), 2, "end-of-text cursor lands on the last row");
 });
 
 test("wrapRows: an [Image #N] token is never split across rows", () => {
