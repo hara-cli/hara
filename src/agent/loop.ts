@@ -144,6 +144,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
   let triedFallback = false;
+  let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
 
   // Stuck/loop guard — only in headless chat (`hara gateway`), where a wrong approach can grind forever with
   // nobody to hit Esc (e.g. screenshots it can't read). Once per run, when the agent keeps repeating one
@@ -319,7 +320,34 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       }
       return;
     }
-    if (r.stop !== "tool_use") return;
+
+    // Empty-turn guard. The model returned nothing actionable — no text AND no tool calls (a blank
+    // completion, or a "tool_use" stop with an empty tool list). Silently returning here leaves the
+    // user at a dead prompt with ZERO feedback: it reads as a 15-hour hang when really the turn just
+    // vanished. Retry ONCE with a nudge (usually a transient hiccup), then, if still empty, say so
+    // plainly and end — never loop forever, never disappear. (Claude Code / codex both guard this.)
+    if (!r.text.trim() && r.toolUses.length === 0) {
+      if (!emptyRetried) {
+        emptyRetried = true;
+        history.pop(); // drop the empty assistant turn before re-asking
+        history.push({ role: "user", content: "(Your previous response was empty. Continue the task now — take the next concrete step with a tool, or reply with text. Do not return an empty response.)" });
+        if (!opts.quiet) {
+          const note = "✻ empty response — retrying once…";
+          if (sink) sink.notice(note);
+          else out(c.dim(`${note}\n`));
+        }
+        continue;
+      }
+      const note = "✻ the model returned an empty response — nothing to do. Rephrase your request, or press Enter to try again.";
+      if (!opts.quiet) {
+        if (sink) sink.notice(note);
+        else out(c.dim(`${note}\n`));
+      }
+      return;
+    }
+    // A "tool_use" stop with text but no tools (rare) has nothing to execute — end after showing the text
+    // rather than pushing an empty tool round and re-requesting in a loop.
+    if (r.stop !== "tool_use" || r.toolUses.length === 0) return;
 
     // Resolve + gate each call first (confirmations must be sequential — can't prompt in parallel).
     interface Plan {

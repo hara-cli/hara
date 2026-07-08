@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.109.3 — an empty model response no longer looks like a hang
+
+- **A turn that comes back with no text and no tool calls is no longer silently dropped.** The agent
+  loop treated an empty completion as "done" and returned with zero feedback — so after e.g. a "继续"
+  the box just sat there, idle, looking frozen for hours (CPU 0%, waiting at the prompt) when really
+  the turn had vanished. It now **retries once** with a nudge (an empty response is usually a transient
+  hiccup), and if it's still empty says so plainly (`✻ empty response — nothing to do. Rephrase…`)
+  instead of disappearing. Matches how Claude Code / codex refuse to end on a blank turn.
+- **Closed a matching spin:** a `tool_use` stop reason carrying an *empty* tool list used to push an
+  empty tool round and re-request in a loop; it's now bounded by the same single-retry guard. (The
+  120s stall-watchdog already covered a genuinely dead/silent socket — this covers the case where the
+  request *succeeds* but returns nothing.)
+
 ## 0.109.2 — long paste no longer freezes the input box
 
 - **The input box now draws a bottom-anchored viewport, not every wrapped row.** A long multi-line
