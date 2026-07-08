@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.112.0 — /jobs: see (and manage) what's running in the background
+
+- **`/jobs` — a user-facing view of the agent's background shell jobs** (dev servers, watchers, long
+  builds started via `bash {background:true}`). hara already tracked these for the *agent* (the `job`
+  tool), but the *user* had no way to glance and see "what's running back there" — the way codex and
+  Claude Code surface it. Now: `/jobs` lists them (id · status · age · command), `/jobs tail <id>`
+  shows recent output, `/jobs kill <id>` stops one. Works in the TUI and the readline REPL.
+- **Status row shows a `⚙ N bg` indicator** when background jobs are running, so a preview server /
+  watcher humming along is visible at a glance (live while working; `/jobs` is the on-demand truth).
+
 ## 0.111.0 — an interactive /model picker: ↑↓ a model, ←→ its thinking
 
 - **`/model` (no argument) now opens an interactive picker** built on the provider registry — the

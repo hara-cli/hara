@@ -18,6 +18,7 @@ import { accent } from "./theme.js";
 import { renderMarkdown } from "../md.js";
 import { clearTodos, currentTodos, onTodosChange, type Todo } from "../tools/todo.js";
 import { onTurnPhase, turnPhase, type TurnPhase } from "../agent/phase.js";
+import { listJobs } from "../exec/jobs.js";
 import { ModelPicker } from "./model-picker.js";
 import type { ReasoningStyle, Effort } from "../providers/reasoning.js";
 
@@ -429,10 +430,15 @@ function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]
     const id = setInterval(() => setFrame((x) => x + 1), SPINNER_FRAME_MS);
     return () => clearInterval(id);
   }, [working]);
+  // Background-job indicator — so the user can SEE what's running in the background (a preview server, a
+  // watcher) without asking. Live while working (spinner ticks re-render); best-effort at idle (/jobs is
+  // the authoritative on-demand view). Re-read each render.
+  const bg = listJobs().filter((j) => j.status === "running").length;
+  const bgTag = bg ? ` · ⚙ ${bg} bg (/jobs)` : "";
   if (!working) {
     return (
       <Box marginTop={1}>
-        <Text dimColor>{`  ${IDLE_HINTS}`}</Text>
+        <Text dimColor>{`  ${IDLE_HINTS}${bgTag}`}</Text>
       </Box>
     );
   }
@@ -440,7 +446,7 @@ function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]
   const elapsedSec = Math.floor((Date.now() - startRef.current) / 1000);
   // Pre-first-token honesty (codex-parity): "waiting for the model" reads very differently from a
   // generic "working" when the network is slow — the user knows the request is out, not dead.
-  const verb = phase === "waiting" ? `waiting for the model… ${elapsedSec}s · esc to interrupt` : spinnerVerb(todos, elapsedSec);
+  const verb = (phase === "waiting" ? `waiting for the model… ${elapsedSec}s · esc to interrupt` : spinnerVerb(todos, elapsedSec)) + bgTag;
   return (
     <Box marginTop={1}>
       <Text color="yellow">{frames[frame % frames.length]}</Text>

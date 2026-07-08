@@ -82,6 +82,21 @@ import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
 import { resolvePlatform } from "./providers/registry.js";
 import { listModels } from "./providers/models.js";
+import { listJobs, tailJob, killJob } from "./exec/jobs.js";
+
+/** Render the background-job list for /jobs (user-facing view of what the agent has running in the
+ *  background — dev servers, watchers, long tasks). Mirrors codex/Claude-Code process visibility. */
+function renderBgJobs(): string {
+  const js = listJobs();
+  if (!js.length) return "(no background jobs — the agent starts them with bash {background:true})";
+  const age = (ms: number) => (ms < 60_000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60_000)}m`);
+  const rows = js.map((j) => {
+    const st = j.status === "running" ? "▶ running" : j.status === "killed" ? "✕ killed" : `● exited${j.code != null ? ` (${j.code})` : ""}`;
+    const cmd = j.command.length > 64 ? j.command.slice(0, 64) + "…" : j.command;
+    return `  ${j.id}  ${st}  ${age(j.ageMs).padStart(4)}  ${cmd}`;
+  });
+  return `Background jobs — /jobs tail <id> · /jobs kill <id>:\n${rows.join("\n")}`;
+}
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
 import { loadAgentsMd, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import { getEmbedder } from "./search/embed.js";
@@ -2530,6 +2545,12 @@ program.action(async (opts) => {
       },
     },
     { name: "usage", desc: "show token usage this session", run: () => void out(statusLine(cfg.model, stats.input, stats.output) + "\n") },
+    { name: "jobs", desc: "list/tail/kill background shell jobs (dev servers, watchers)", run: (a) => {
+      const [sub, jid] = (a || "").trim().split(/\s+/);
+      if (sub === "kill" && jid) return void out((killJob(jid) ? `✕ killed ${jid}` : `no running job ${jid}`) + "\n");
+      if (sub === "tail" && jid) return void out((tailJob(jid) ?? `no job ${jid}`) + "\n");
+      out(renderBgJobs() + "\n");
+    } },
     { name: "doctor", desc: "check your hara setup", run: () => void out(runDoctor(cfg) + "\n") },
     {
       name: "roles",
@@ -2969,6 +2990,12 @@ program.action(async (opts) => {
             );
           }
           if (nm === "usage") return void h.sink.notice(`tokens — ↑${stats.input} ↓${stats.output}`);
+          if (nm === "jobs") {
+            const [sub, jid] = (arg || "").trim().split(/\s+/);
+            if (sub === "kill" && jid) return void h.sink.notice(killJob(jid) ? `✕ killed ${jid}` : `no running job ${jid}`);
+            if (sub === "tail" && jid) return void h.sink.notice(tailJob(jid) ?? `no job ${jid}`);
+            return void h.sink.notice(renderBgJobs());
+          }
           if (nm === "doctor") return void h.sink.notice(runDoctor(cfg).replace(/\[[0-9;]*m/g, ""));
           if (nm === "vision") return void h.sink.notice(applyVision(arg));
           if (nm === "roles") {
