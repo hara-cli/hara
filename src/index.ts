@@ -81,6 +81,7 @@ import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
 import { resolvePlatform } from "./providers/registry.js";
+import { listModels } from "./providers/models.js";
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
 import { loadAgentsMd, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import { getEmbedder } from "./search/embed.js";
@@ -2865,23 +2866,26 @@ program.action(async (opts) => {
             const force = parts.some((p) => p === "--force" || p === "all" || p === "-f");
             const id = parts.find((p) => p !== "--force" && p !== "all" && p !== "-f");
             if (!id) {
-              const __force = isSessionForceModel();
-              const __lines = [`model: ${cfg.provider}:${cfg.model}`];
-              if (meta.model && meta.model !== cfg.model) {
-                __lines.push(`session pinned: ${meta.model} (cfg drift — /model ${meta.model} to re-pin)`);
-              } else {
-                __lines.push(`session pinned: ${meta.model || "(none)"}${__force ? " · forced (all roles use session model)" : ""}`);
+              // Bare /model → the interactive picker: the endpoint's live model list (↑↓) + its thinking
+              // level (←→, per the registry's reasoning style). Falls back to typing an id if the endpoint
+              // doesn't enumerate models.
+              const bURL = cfg.baseURL ?? providerDefaultBaseURL(cfg.provider);
+              const models = await listModels(bURL, cfg.apiKey ?? "");
+              const style = resolvePlatform(cfg.provider, bURL).reasoning;
+              const chosen = await h.pickModel({ models, style, current: cfg.model, effort: cfg.reasoningEffort });
+              if (!chosen) return; // esc — no change
+              if (chosen.model) {
+                cfg.model = chosen.model;
+                meta.model = chosen.model;
               }
-              const __roles = loadRoles(cwd);
-              if (__roles.length) {
-                __lines.push("roles:");
-                for (const r of __roles) {
-                  const eff = __force ? cfg.model : (r.model || cfg.model);
-                  const tag = __force && r.model && r.model !== cfg.model ? " (overridden by --force)" : r.model ? " (role pin)" : " (session)";
-                  __lines.push(`  ${r.id}: ${eff}${tag}`);
-                }
-              }
-              return void h.sink.notice(__lines.join("\n"));
+              cfg.reasoningEffort = chosen.effort;
+              visionProvider = undefined;
+              remindedVision = false;
+              const p2 = await buildProvider(cfg);
+              if (!p2) return void h.sink.notice("(could not rebuild provider)");
+              provider = p2;
+              saveSession(meta, history);
+              return void h.sink.notice(`(model → ${cfg.provider}:${cfg.model} · thinking ${chosen.effort ?? "default"})`);
             }
             cfg.model = id;
             meta.model = id;

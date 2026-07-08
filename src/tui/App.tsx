@@ -18,6 +18,8 @@ import { accent } from "./theme.js";
 import { renderMarkdown } from "../md.js";
 import { clearTodos, currentTodos, onTodosChange, type Todo } from "../tools/todo.js";
 import { onTurnPhase, turnPhase, type TurnPhase } from "../agent/phase.js";
+import { ModelPicker } from "./model-picker.js";
+import type { ReasoningStyle, Effort } from "../providers/reasoning.js";
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -35,6 +37,8 @@ export interface Helpers {
   /** ask_user: pose a question (optionally with likely answers) and resolve to the user's answer (chosen
    *  option or free text). Routes through the same prompt/input channel as confirm/select. */
   ask: (question: string, options?: string[]) => Promise<string>;
+  /** /model picker: ↑↓ a model + ←→ its thinking level; resolves to the chosen {model, effort}, or null on esc. */
+  pickModel: (o: { models: string[]; style: ReasoningStyle; current?: string; effort: Effort }) => Promise<{ model: string; effort: Effort } | null>;
   setApproval: (m: Approval) => void;
   signal: AbortSignal;
   exit: () => void;
@@ -533,6 +537,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [askText, setAskText] = useState<{ title: string; resolve: (v: string) => void } | null>(null);
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false); // Ctrl+T full-transcript overlay
+  const [picker, setPicker] = useState<{ models: string[]; style: ReasoningStyle; current?: string; effort: Effort; resolve: (v: { model: string; effort: Effort } | null) => void } | null>(null); // /model picker overlay
   const [modeSelector, setModeSelector] = useState(false); // transient approval selector: shift+tab pops it, auto-hides
   const modeSelectorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Live checklist mirror: TodoPanel reads this, and `Working` derives its spinner verb from the
@@ -708,13 +713,15 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         return askTextFn(question);
       };
       const setApprovalFn = (m: Approval): void => setStatus((s) => ({ ...s, approval: m }));
+      const pickModelFn = (o: { models: string[]; style: ReasoningStyle; current?: string; effort: Effort }): Promise<{ model: string; effort: Effort } | null> =>
+        new Promise((resolve) => setPicker({ ...o, resolve }));
       // Enter the conversation flow INSTANTLY: yield one macrotask so ink paints the committed message +
       // cleared input + spinner BEFORE the turn's synchronous prep runs (reading @-files, base64-encoding
       // images) and before the model's slow first token. Without this, that sync prep blocks ink's flush,
       // so pressing Enter leaves the message stuck in the input box for seconds ("回车一直不动"). One tick.
       await new Promise((resolve) => setTimeout(resolve, 0));
       try {
-        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, ask: askFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval, drainQueue }, images);
+        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, ask: askFn, pickModel: pickModelFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval, drainQueue }, images);
       } catch (e: unknown) {
         pushCurrent("notice", `error: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -755,6 +762,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   useInput((input, key) => {
     if (key.ctrl && input === "t") return setShowTranscript((x) => !x); // open/close the full-transcript overlay
     if (showTranscript) return; // while open, the overlay's own useInput owns every key (scroll / esc)
+    if (picker) return; // the /model picker overlay owns input (↑↓ model, ←→ thinking, ⏎, esc) while open
     // Free-text question awaiting an answer: Esc cancels (empty answer); all other keys belong to the InputBox.
     if (askText) {
       if (key.escape) {
@@ -819,6 +827,24 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         <Block key={item.id} item={item} open={reasoningOpen} liveRows={liveRows} />
       ))}
       <TodoPanel todos={todos} />
+      {picker && (
+        <ModelPicker
+          models={picker.models}
+          style={picker.style}
+          current={picker.current}
+          effort={picker.effort}
+          onSelect={(model, effort) => {
+            const r = picker.resolve;
+            setPicker(null);
+            r({ model, effort });
+          }}
+          onCancel={() => {
+            const r = picker.resolve;
+            setPicker(null);
+            r(null);
+          }}
+        />
+      )}
       {prompt && (
         <Box flexDirection="column" marginTop={1}>
           <Text color="yellow">{`  ${stripAnsi(prompt.title)}`}</Text>

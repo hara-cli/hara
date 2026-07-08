@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.111.0 — an interactive /model picker: ↑↓ a model, ←→ its thinking
+
+- **`/model` (no argument) now opens an interactive picker** built on the provider registry — the
+  "one key, many models" flow. It pulls the endpoint's **live model list** (`GET /models`; a coding-plan
+  key exposes ~10: Qwen / GLM / Kimi / MiniMax / …), and you drive it with the arrow keys:
+  - **↑↓** move through the models,
+  - **←→** set the **thinking level** for this endpoint — the levels come from the registry's reasoning
+    style, so a DashScope/Ollama endpoint shows `off / on` (the real speedup toggle) while an
+    OpenAI/Anthropic one shows `off / low / medium / high`,
+  - **⏎** applies (switches the model, sets the dial, rebuilds the provider, persists to the session),
+    **esc** cancels.
+  Endpoints that don't enumerate models still let you set the thinking level (and `/model <id>` still
+  switches directly, as before). TUI only; the readline REPL keeps the text form.
+
 ## 0.110.0 — a provider registry: one key, many platforms, the right wire + thinking control for each
 
 - **hara now speaks each platform its own way, chosen from a data-driven registry (a dictionary), not
