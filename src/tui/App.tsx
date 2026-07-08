@@ -708,6 +708,11 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         return askTextFn(question);
       };
       const setApprovalFn = (m: Approval): void => setStatus((s) => ({ ...s, approval: m }));
+      // Enter the conversation flow INSTANTLY: yield one macrotask so ink paints the committed message +
+      // cleared input + spinner BEFORE the turn's synchronous prep runs (reading @-files, base64-encoding
+      // images) and before the model's slow first token. Without this, that sync prep blocks ink's flush,
+      // so pressing Enter leaves the message stuck in the input box for seconds ("回车一直不动"). One tick.
+      await new Promise((resolve) => setTimeout(resolve, 0));
       try {
         await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, ask: askFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval, drainQueue }, images);
       } catch (e: unknown) {

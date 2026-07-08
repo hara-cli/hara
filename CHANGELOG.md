@@ -5,6 +5,30 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.109.5 — Enter enters the conversation instantly + reasoning off truly disables DashScope thinking
+
+- **Pressing Enter now enters the conversation flow instantly — the message no longer sits stuck in the
+  input box.** A turn's synchronous prep (reading an inlined `@file`, base64-encoding pasted images) used
+  to run *before* ink could paint, so with a heavy message (a big spec + two images) Enter looked dead
+  for seconds ("回车一直不动") until the work finished. The submit now yields one tick so the UI paints
+  the committed message + cleared input + spinner FIRST, then does the prep and the (often slow) model
+  call. Instant feedback regardless of how heavy the turn or how slow the first token.
+- **On DashScope, `reasoning off` now actually stops the thinking phase — not just hides it.** DashScope
+  models (Qwen, GLM, …) stream a "thinking" pass *before* the answer; that generation is the main latency
+  there (measured: **qwen3.7-plus ~14s with thinking → ~1.6s without**). hara previously assumed chat
+  models "can't be silenced server-side" and merely dropped the reasoning from the UI — so the model
+  still spent the time. It *can* be silenced: reasoning **off** now sends `enable_thinking: false` (fast),
+  low/medium/high sends `true`, and the dial **UNSET leaves the request untouched** (model default — zero
+  impact, the safe default). Detected by the **DashScope endpoint** (built-in `qwen`/`qwen-oauth`, or a
+  custom baseURL on `dashscope.aliyuncs.com`), not the model name — so a custom `qwen3.7-plus` profile is
+  covered. Set it with `HARA_REASONING_EFFORT=off` or `reasoningEffort: "off"` in `~/.hara/config.json`.
+  (A runtime `/reasoning` toggle — adjust it mid-session like Claude Code — is coming next.)
+- Note: `enable_thinking:false` is reliable on qwen3.x-plus; on some other DashScope models it only
+  suppresses the reasoning without the full speedup, which is why it's opt-in, not a forced default.
+- Context on prompt caching (from 0.109.1): that path only ever applied to the raw **Anthropic** provider.
+  DashScope/GLM/DeepSeek/gateway go through the OpenAI-compatible path, where caching is the provider's own
+  automatic prefix cache — and hara's system prompt is stable across turns, so it engages on its own.
+
 ## 0.109.4 — a dropped file path is read, not "Unknown command"
 
 - **Dragging/pasting a file into the prompt no longer errors.** A dropped file pastes as an absolute path
