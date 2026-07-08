@@ -25,6 +25,10 @@ function git(root: string, gitDir: string, args: string[]): string {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
     maxBuffer: 64 * 1024 * 1024,
+    // Bound it: the per-turn shadow `git add -A` over a large tree (or a hung git) must never freeze a
+    // turn. On timeout execFileSync throws → checkpoint()/ensureRepo() catch it → the snapshot is just
+    // skipped (best-effort), the turn proceeds.
+    timeout: 10000,
   }).toString();
 }
 

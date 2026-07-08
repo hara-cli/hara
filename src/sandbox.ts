@@ -19,7 +19,9 @@ let _winBash: string | null | undefined;
 function findWindowsBash(): string | null {
   if (_winBash !== undefined) return _winBash;
   // `where bash` finds Git Bash / WSL bash on PATH; also probe the default Git-for-Windows location.
-  const onPath = spawnSync("where", ["bash"], { encoding: "utf8" });
+  // `timeout` is CRITICAL: this is a SYNCHRONOUS probe on the main thread — without it a slow `where`
+  // (a huge PATH, a dead network drive on PATH) hangs hara at startup with nothing able to interrupt it.
+  const onPath = spawnSync("where", ["bash"], { encoding: "utf8", timeout: 3000 });
   const hit = onPath.status === 0 ? String(onPath.stdout).split(/\r?\n/).find((l) => l.trim()) : "";
   _winBash = (hit && hit.trim()) || null;
   return _winBash;

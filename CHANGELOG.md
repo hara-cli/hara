@@ -5,6 +5,32 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.110.0 — a provider registry: one key, many platforms, the right wire + thinking control for each
+
+- **hara now speaks each platform its own way, chosen from a data-driven registry (a dictionary), not
+  scattered if/else.** One row per platform declares its **wire protocol** (chat / Anthropic / Responses)
+  + how it expresses the **thinking dial** + how it **caches**. Point hara at a custom baseURL and it Just
+  Works:
+  - **Any vendor's `.../anthropic` endpoint** — DeepSeek, Kimi/Moonshot, Zhipu GLM, MiniMax, and Alibaba's
+    `…/apps/anthropic` — now routes through the **Anthropic wire** (so you get prompt caching + a native
+    thinking budget). Verified end-to-end against Alibaba's endpoint.
+  - **Local Ollama / LM Studio** (`localhost:11434` / `1234`) — `reasoning off` sends `think:false`, which
+    actually stops a local reasoning model's thinking phase (**measured: deepseek-r1:14b 17s → 0.6s**).
+  - **Alibaba DashScope** chat (coding plan / pay-as-you-go) — `reasoning off` → `enable_thinking:false`
+    (**qwen3.7-plus ~14s → ~1.6s**); works for a custom `qwen3.7-plus`/`glm-5` profile, keyed on the
+    endpoint, not the model name.
+  - OpenAI reasoning models keep `reasoning_effort`; Anthropic keeps its thinking budget. The dial **UNSET
+    leaves the request untouched** everywhere (model default, zero impact — the safe default).
+  - The Responses API (Alibaba Token Plan's newest models) is a distinct wire hara doesn't speak yet; a
+    Responses endpoint now returns a clear pointer to use the chat or `/apps/anthropic` endpoint instead
+    (rather than sending a body it would reject). Coming once there's a Token-Plan key to verify against.
+- **Windows: hara no longer hangs at startup / on the first command.** Three SYNCHRONOUS probes ran with
+  no timeout, so on Windows a slow/hung one froze the whole process (main-thread block — nothing could
+  interrupt it): the `where bash` shell probe (added in 0.109.0), `git ls-files` (the "which files exist"
+  scan), and the per-turn shadow `git add -A`. All three are now bounded (3s / 5s / 10s) and fall back
+  gracefully (cmd.exe / filesystem walk / skip the snapshot). This is the "stuck at shell/directory
+  probing, never got to the actual work" hang.
+
 ## 0.109.5 — Enter enters the conversation instantly + reasoning off truly disables DashScope thinking
 
 - **Pressing Enter now enters the conversation flow instantly — the message no longer sits stuck in the

@@ -80,6 +80,7 @@ import { getTools, type Tool } from "./tools/registry.js";
 import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
+import { resolvePlatform } from "./providers/registry.js";
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
 import { loadAgentsMd, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import { getEmbedder } from "./search/embed.js";
@@ -181,8 +182,24 @@ async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
     return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model, label: "qwen-oauth", reasoningEffort: cfg.reasoningEffort });
   }
   if (!apiKey) return null;
-  if (provider === "anthropic") {
+  // Transport is chosen from the provider REGISTRY (the dictionary) by wire protocol — so a custom
+  // baseURL Just Works: a vendor's `.../anthropic` endpoint (DeepSeek/Kimi/GLM/MiniMax/Aliyun) speaks the
+  // Anthropic wire (gets cache_control + thinking budget), DashScope/Ollama/OpenAI speak chat, etc.
+  const wire = resolvePlatform(provider, baseURL).wireApi;
+  if (wire === "anthropic") {
     return createAnthropicProvider({ apiKey, model, baseURL, reasoningEffort: cfg.reasoningEffort });
+  }
+  if (wire === "responses") {
+    // The OpenAI Responses API (e.g. Aliyun Token Plan's newest models) — a distinct wire hara doesn't
+    // speak yet. Fail with guidance instead of sending a chat body it will reject. (Tracked for when a
+    // Token-Plan key is available to build + verify against; the chat + anthropic endpoints work today.)
+    return {
+      id: provider,
+      model,
+      async turn() {
+        return { text: "", toolUses: [], stop: "error" as const, errorMsg: `This endpoint uses the OpenAI Responses API, which hara doesn't speak yet. Point hara at the plan's OpenAI-compatible chat endpoint (…/compatible-mode/v1 or …/v1) or its Anthropic-compatible endpoint (…/apps/anthropic) instead.` };
+      },
+    };
   }
   return createOpenAIProvider({ apiKey, model, baseURL, label: provider, reasoningEffort: cfg.reasoningEffort });
 }

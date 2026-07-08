@@ -1,32 +1,80 @@
-// DashScope thinking toggle: reasoning "off" must actually disable the thinking phase (enable_thinking:
-// false), the main DashScope latency — not just hide it (measured: qwen3.7-plus 14s → 1.6s). Detected by
-// the DashScope ENDPOINT (baseURL / qwen provider), NOT the model name, so a custom qwen3.7-plus/glm-5
-// profile is covered. UNSET leaves the request untouched (zero impact — the safe default).
+// Reasoning is now data-driven: the registry maps a platform → a reasoning STYLE, and the applier maps
+// the dial → wire params. Pins the DashScope speedup path (enable_thinking) end to end, plus the other
+// styles and the resolver that makes a custom DashScope profile Just Work.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { dashscopeThinking } from "../dist/providers/openai.js";
+import { reasoningParams } from "../dist/providers/reasoning.js";
+import { resolvePlatform } from "../dist/providers/registry.js";
 
 const DS = "https://coding.dashscope.aliyuncs.com/v1"; // the reporter's custom endpoint
 
-test("dashscopeThinking: DashScope baseURL + reasoning off → disable thinking (false)", () => {
-  assert.equal(dashscopeThinking("off", DS), false, "custom baseURL on dashscope (custom:qwen3.7-plus)");
-  assert.equal(dashscopeThinking("off", undefined, "qwen"), false, "built-in qwen provider");
-  assert.equal(dashscopeThinking("off", undefined, "qwen-oauth"), false, "qwen-oauth");
+test("reasoningParams enable_thinking: off → stop thinking (fast), levels → on, UNSET → untouched", () => {
+  assert.deepEqual(reasoningParams("enable_thinking", "off"), { enable_thinking: false });
+  assert.deepEqual(reasoningParams("enable_thinking", "low"), { enable_thinking: true });
+  assert.deepEqual(reasoningParams("enable_thinking", "high"), { enable_thinking: true });
+  assert.deepEqual(reasoningParams("enable_thinking", undefined), {}, "UNSET → {} (model default, zero impact)");
 });
 
-test("dashscopeThinking: DashScope + explicit low/medium/high → keep thinking on (true)", () => {
-  assert.equal(dashscopeThinking("low", DS), true);
-  assert.equal(dashscopeThinking("high", undefined, "qwen"), true);
+test("reasoningParams reasoning_effort: only OpenAI reasoning models; off → minimal", () => {
+  assert.deepEqual(reasoningParams("reasoning_effort", "high", "gpt-5"), { reasoning_effort: "high" });
+  assert.deepEqual(reasoningParams("reasoning_effort", "off", "o3"), { reasoning_effort: "minimal" });
+  assert.deepEqual(reasoningParams("reasoning_effort", "high", "qwen3.7-plus"), {}, "non-reasoning model → untouched");
 });
 
-test("dashscopeThinking: dial UNSET → undefined (leave untouched, model default, ZERO impact)", () => {
-  assert.equal(dashscopeThinking(undefined, DS), undefined, "unset on dashscope → untouched");
-  assert.equal(dashscopeThinking(undefined, undefined, "qwen"), undefined);
+test("reasoningParams reasoning_object (Responses API): reasoning:{effort} on reasoning models", () => {
+  assert.deepEqual(reasoningParams("reasoning_object", "medium", "gpt-5"), { reasoning: { effort: "medium" } });
+  assert.deepEqual(reasoningParams("reasoning_object", "medium", "qwen3.7-plus"), {});
 });
 
-test("dashscopeThinking: non-DashScope endpoints are never touched", () => {
-  assert.equal(dashscopeThinking("off", "https://api.openai.com/v1", "openai"), undefined);
-  assert.equal(dashscopeThinking("off", "https://open.bigmodel.cn/api/paas/v4", "glm"), undefined, "GLM's own endpoint uses a different param");
-  assert.equal(dashscopeThinking("off", "https://api.deepseek.com", "deepseek"), undefined);
-  assert.equal(dashscopeThinking("off", undefined, "hara-gateway"), undefined);
+test("reasoningParams none / thinking_budget: nothing merged on the chat/responses body", () => {
+  assert.deepEqual(reasoningParams("none", "off"), {});
+  assert.deepEqual(reasoningParams("thinking_budget", "high"), {}, "Anthropic thinking is applied in anthropic.ts");
+});
+
+test("reasoningParams ollama_think: off → think:false (measured 17s→0.6s), levels → true, UNSET → {}", () => {
+  assert.deepEqual(reasoningParams("ollama_think", "off"), { think: false });
+  assert.deepEqual(reasoningParams("ollama_think", "medium"), { think: true });
+  assert.deepEqual(reasoningParams("ollama_think", undefined), {});
+});
+
+test("resolvePlatform: local Ollama / LM Studio → chat + ollama_think, no cache", () => {
+  for (const url of ["http://localhost:11434/v1", "http://127.0.0.1:11434/v1", "http://localhost:1234/v1"]) {
+    const caps = resolvePlatform("ollama", url);
+    assert.equal(caps.reasoning, "ollama_think", url);
+    assert.equal(caps.cache, "none");
+  }
+});
+
+test("resolvePlatform: ANY vendor's /anthropic endpoint → anthropic wire + thinking budget + cache_control", () => {
+  for (const url of ["https://api.deepseek.com/anthropic", "https://api.moonshot.cn/anthropic", "https://open.bigmodel.cn/api/anthropic", "https://api.minimaxi.com/anthropic"]) {
+    const caps = resolvePlatform("custom", url);
+    assert.equal(caps.wireApi, "anthropic", url);
+    assert.equal(caps.reasoning, "thinking_budget");
+    assert.equal(caps.cache, "cache_control");
+  }
+});
+
+test("resolvePlatform: DeepSeek OpenAI-compat (chat) → no per-request thinking toggle", () => {
+  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com").reasoning, "none");
+  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/v1").wireApi, "chat");
+});
+
+test("resolvePlatform: a custom DashScope baseURL → chat + enable_thinking (custom:qwen3.7-plus)", () => {
+  const caps = resolvePlatform("custom", DS);
+  assert.equal(caps.wireApi, "chat");
+  assert.equal(caps.reasoning, "enable_thinking", "so reasoning off actually disables Qwen thinking");
+  assert.equal(caps.cache, "auto");
+});
+
+test("resolvePlatform: DashScope endpoint variants + built-in providers", () => {
+  assert.equal(resolvePlatform("qwen").reasoning, "enable_thinking", "built-in qwen provider");
+  assert.equal(resolvePlatform(undefined, "https://coding.dashscope.aliyuncs.com/apps/anthropic").wireApi, "anthropic");
+  assert.equal(resolvePlatform(undefined, "https://coding.dashscope.aliyuncs.com/apps/anthropic").cache, "cache_control");
+  assert.equal(resolvePlatform(undefined, "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1").wireApi, "responses");
+  assert.equal(resolvePlatform("anthropic").wireApi, "anthropic");
+  assert.equal(resolvePlatform("openai").reasoning, "reasoning_effort");
+});
+
+test("resolvePlatform: explicit wireApi override wins the transport", () => {
+  assert.equal(resolvePlatform("openai", undefined, "responses").wireApi, "responses");
 });

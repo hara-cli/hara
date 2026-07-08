@@ -52,6 +52,9 @@ export function listProjectFiles(root: string, cap = 8000): string[] {
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
+      // Bound it: a hung git (credential-helper GUI, a slow/network filesystem, a giant repo) must not
+      // freeze the "which files exist" probe — on timeout it throws → we fall through to the fs walk.
+      timeout: 5000,
     })
       .split("\n")
       .map((s) => s.trim())

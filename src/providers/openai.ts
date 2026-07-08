@@ -1,6 +1,11 @@
 import OpenAI from "openai";
 import type { Provider, NeutralMsg, ToolUse, TurnArgs, TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
+import { reasoningParams } from "./reasoning.js";
+import { resolvePlatform } from "./registry.js";
+
+// Re-exported for callers that still import it from here (the reasoning-family check now lives in reasoning.ts).
+export { isReasoningModel } from "./reasoning.js";
 
 /** Build OpenAI chat-completions messages from neutral history. */
 export function toOpenAI(system: string, history: NeutralMsg[]): any[] {
@@ -43,28 +48,6 @@ export function toOpenAI(system: string, history: NeutralMsg[]): any[] {
   return msgs;
 }
 
-/** Reasoning models on OpenAI (o-series + gpt-5) accept `reasoning_effort` on chat-completions.
- *  Non-reasoning models reject it. We only attach the param when the model id matches a known
- *  reasoning family — keeps DeepSeek/GLM/Qwen requests clean. Exported for tests. */
-export function isReasoningModel(model: string): boolean {
-  return /^(o1|o3|o4|gpt-5)/i.test(model);
-}
-
-/** DashScope (Alibaba — serves Qwen, GLM, …) runs a "thinking" phase that streams reasoning BEFORE the
- *  answer — the main latency there (measured: qwen3.7-plus ~14s thinking vs ~1.6s without). It can be
- *  silenced SERVER-SIDE with `enable_thinking:false` (actually stops generating the reasoning, not just
- *  hides it). So map hara's reasoning dial onto it: an explicit **off** → thinking off (fast);
- *  low/medium/high → on. Returns the flag to send, or `undefined` = leave the request UNTOUCHED — when
- *  the dial is UNSET (keep the model's own default; zero impact — the safe default the user asked for)
- *  or the endpoint isn't DashScope. Detected by the DashScope ENDPOINT (built-in qwen/qwen-oauth
- *  providers, OR a custom baseURL on dashscope — which is how the reporter's `custom:qwen3.7-plus`
- *  profile is set up), NOT the model name, so it covers custom Qwen/GLM profiles too. Exported for tests. */
-export function dashscopeThinking(effort?: string, baseURL?: string, label?: string): boolean | undefined {
-  const isDashscope = /dashscope\.aliyuncs\.com/i.test(baseURL ?? "") || label === "qwen" || label === "qwen-oauth";
-  if (!isDashscope || effort === undefined) return undefined;
-  return effort !== "off";
-}
-
 /** OpenAI-compatible provider (works with OpenAI, Qwen/DashScope, GLM, Kimi, …). */
 export function createOpenAIProvider(opts: {
   apiKey: string;
@@ -90,17 +73,12 @@ export function createOpenAIProvider(opts: {
         stream_options: { include_usage: true },
       };
       if (oaiTools.length) params.tools = oaiTools;
-      // reasoning_effort: only attach for OpenAI reasoning models, and only when the user picked a
-      // non-default level. "off" means "don't ask the model to reason" — for reasoning models we
-      // pass "minimal" (gpt-5 / o-series accept it); on chat-style models that put reasoning in
-      // the stream (DeepSeek/GLM) we can't silence it server-side, so the UI just won't render.
-      if (opts.reasoningEffort && opts.reasoningEffort !== undefined && isReasoningModel(opts.model)) {
-        params.reasoning_effort = opts.reasoningEffort === "off" ? "minimal" : opts.reasoningEffort;
-      }
-      // DashScope: reasoning "off" REALLY disables the thinking phase (big speedup), not just hides it.
-      // Only fires on the DashScope endpoint + when the dial is set — UNSET stays untouched (zero impact).
-      const dsThink = dashscopeThinking(opts.reasoningEffort, opts.baseURL, opts.label);
-      if (dsThink !== undefined) params.enable_thinking = dsThink;
+      // Reasoning: the registry says HOW this platform expresses the thinking dial (DashScope →
+      // enable_thinking, OpenAI reasoning models → reasoning_effort, …); the applier turns hara's dial
+      // into the params to merge. UNSET → {} (model default, zero impact). One data-driven line replaces
+      // the old per-platform if/else — a new platform is a registry row, not code here.
+      const caps = resolvePlatform(opts.label, opts.baseURL);
+      Object.assign(params, reasoningParams(caps.reasoning, opts.reasoningEffort, opts.model));
 
       // Stream: emit text deltas live; accumulate tool-call args by index; grab usage from the tail chunk.
       let text = "";
