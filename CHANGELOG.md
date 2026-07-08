@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.112.2 — moving/resizing the window no longer garbles the UI
+
+- **Terminal resize no longer stacks the status row + input box into a garble.** ink 6.8's resize
+  handler only clears the screen when the terminal gets *narrower*; on a *widen* (or a resize it doesn't
+  classify as narrowing) it just re-renders, so the old frame — reflowed at the new width — is never
+  erased, and the ~125ms spinner tick stacks a fresh copy each time (the "I moved the window and the UI
+  filled up with repeated `waiting for the model…` lines"). hara now hooks the resize event and, on ANY
+  resize, resets ink's tracked output (debounced across a drag's burst of events) so the next render
+  starts clean and subsequent ticks erase correctly. Not "just the terminal" — a real repaint fix.
+
 ## 0.112.1 — the background-job indicator is now LIVE (even at idle)
 
 - **`⚙ N bg running` updates in real time — including when hara is idle.** In 0.112.0 the indicator only

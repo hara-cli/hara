@@ -7,7 +7,32 @@ import { App, type AppProps } from "./App.js";
 
 export async function runTui(props: AppProps): Promise<void> {
   const instance = render(createElement(App, props));
-  await instance.waitUntilExit();
+  // Resize repaint fix. ink 6.8's own resize handler only clears the screen when the terminal gets
+  // NARROWER; on a WIDEN (or a resize it doesn't classify as narrowing) it just re-renders, so the old
+  // frame — reflowed at the new width — is never erased, and the ~125ms spinner tick stacks a fresh copy
+  // each time (the "moved the window and the UI stacked up" garble). We complement it: on ANY resize,
+  // clear ink's tracked output so the next render starts clean. Debounced by a microtask so a burst of
+  // resize events during a window drag collapses to one clear.
+  const out = process.stdout;
+  let pending = false;
+  const onResize = (): void => {
+    if (pending) return;
+    pending = true;
+    queueMicrotask(() => {
+      pending = false;
+      try {
+        instance.clear();
+      } catch {
+        /* best-effort — never let a repaint fix crash the session */
+      }
+    });
+  };
+  out.on("resize", onResize);
+  try {
+    await instance.waitUntilExit();
+  } finally {
+    out.off("resize", onResize);
+  }
 }
 
 // A tiny ink yes/no prompt for pre-TUI confirms (e.g. the first-run "create AGENTS.md?" offer).
