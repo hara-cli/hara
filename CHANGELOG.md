@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.112.1 — the background-job indicator is now LIVE (even at idle)
+
+- **`⚙ N bg running` updates in real time — including when hara is idle.** In 0.112.0 the indicator only
+  refreshed while a turn was running, so once the agent finished but a background task (a preview server,
+  a watcher, a long render) was still going, the idle prompt looked exactly like "nothing running" — and
+  the user reads that as *"why did it just stop?"*. Now `jobs.ts` emits on every start / self-exit / kill
+  and the status row subscribes, so the indicator appears the moment a task starts, updates as tasks
+  finish on their own, and clears when the last one ends — event-driven, no polling. (`/jobs` remains the
+  on-demand detailed view.)
+
 ## 0.112.0 — /jobs: see (and manage) what's running in the background
 
 - **`/jobs` — a user-facing view of the agent's background shell jobs** (dev servers, watchers, long

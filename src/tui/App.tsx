@@ -18,7 +18,7 @@ import { accent } from "./theme.js";
 import { renderMarkdown } from "../md.js";
 import { clearTodos, currentTodos, onTodosChange, type Todo } from "../tools/todo.js";
 import { onTurnPhase, turnPhase, type TurnPhase } from "../agent/phase.js";
-import { listJobs } from "../exec/jobs.js";
+import { listJobs, onJobsChange } from "../exec/jobs.js";
 import { ModelPicker } from "./model-picker.js";
 import type { ReasoningStyle, Effort } from "../providers/reasoning.js";
 
@@ -434,7 +434,7 @@ function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]
   // watcher) without asking. Live while working (spinner ticks re-render); best-effort at idle (/jobs is
   // the authoritative on-demand view). Re-read each render.
   const bg = listJobs().filter((j) => j.status === "running").length;
-  const bgTag = bg ? ` · ⚙ ${bg} bg (/jobs)` : "";
+  const bgTag = bg ? ` · ⚙ ${bg} bg running (/jobs)` : "";
   if (!working) {
     return (
       <Box marginTop={1}>
@@ -582,6 +582,13 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     });
     return unsub;
   }, []);
+
+  // Subscribe to background-job start/exit/kill so the `⚙ N bg` indicator is LIVE — crucially at idle.
+  // A job finishing on its own, or a preview server still running after a turn ends, now refreshes the
+  // status row; without it the idle prompt reads as "it stopped". Bumping a nonce forces the re-render;
+  // StatusRow re-reads listJobs().
+  const [, setJobsTick] = useState(0);
+  useEffect(() => onJobsChange(() => setJobsTick((n) => n + 1)), []);
 
   // Reconcile the synchronously-mutated live buffer into React state, at most once per ~33ms. First
   // append any finalized blocks to <Static> (once, in order), then publish the remaining live tail.
