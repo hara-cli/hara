@@ -85,7 +85,7 @@ import { loadAgentsMd, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./conte
 import { getEmbedder } from "./search/embed.js";
 import { collectRepoChunks, collectDirChunks, buildIndex, indexPath, indexExists, type Chunk } from "./search/semindex.js";
 import { searchHybrid } from "./search/hybrid.js";
-import { expandMentions, fileCandidates } from "./context/mentions.js";
+import { expandMentions, fileCandidates, isSlashCommand, inlineLeadingPath } from "./context/mentions.js";
 import {
   newSessionId,
   shortId,
@@ -2804,7 +2804,9 @@ program.action(async (opts) => {
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
       onSubmit: async (line, h, images) => {
-        if (line.startsWith("/")) {
+        // A dropped/pasted file path (`/Users/…/doc.md`, maybe trailing text/images) starts with '/' but
+        // is NOT a command — treat it as a file to read, not "Unknown command" (see isSlashCommand).
+        if (isSlashCommand(line)) {
           const [nm, ...rest] = line.slice(1).split(/\s+/);
           const arg = rest.join(" ").trim();
           if (nm === "exit" || nm === "quit") {
@@ -3044,6 +3046,9 @@ program.action(async (opts) => {
           const near = nearest(nm, [...byName.keys()]);
           return void h.sink.notice(`Unknown command /${nm}.${near.length ? " Did you mean " + near.map((n) => "/" + n).join(", ") + "?" : ""}`);
         }
+        // A message that begins with an absolute file path (the case skipped above) → inline it as an
+        // @-mention so its content is read into the turn (drag-a-file-in → interpret it).
+        line = inlineLeadingPath(line, existsSync);
         const ui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
         const appr = h.approval;
         // Type-ahead steering: fold messages typed mid-turn into the next model call (codex-style) so a
@@ -3203,7 +3208,8 @@ program.action(async (opts) => {
     }
     bar.renderBottom(); // bottom border + modes/usage
     if (!line) continue;
-    if (line.startsWith("/")) {
+    // A dropped/pasted file path starts with '/' but isn't a command — read it, don't error (see TUI path).
+    if (isSlashCommand(line)) {
       const [name, ...rest] = line.slice(1).split(/\s+/);
       const cmd = byName.get(name);
       if (!cmd) {
@@ -3237,6 +3243,7 @@ program.action(async (opts) => {
       if (res === "exit") break;
       continue;
     }
+    line = inlineLeadingPath(line, existsSync); // leading dropped file path → @-mention so it's read in
     const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd);
     recalledContext = "";
     history.push({ role: "user", content: userContent });

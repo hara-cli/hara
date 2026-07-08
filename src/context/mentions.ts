@@ -10,6 +10,24 @@ const MAX_FILE = 50_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
 const MENTION_RE = /(?:^|\s)@([^\s@]+)/g;
 
+/** A submitted line is a slash COMMAND only if it starts with '/' AND its first whitespace-delimited
+ *  token has no *embedded* '/'. A dropped/pasted absolute file path (`/Users/…/doc.md`, possibly followed
+ *  by text or `[Image #N]` tokens) has an embedded slash → it is NOT a command. Without this, dragging a
+ *  file into the prompt errored with "Unknown command /Users/…". Exported pure for tests. */
+export function isSlashCommand(line: string): boolean {
+  return line.startsWith("/") && !line.slice(1).split(/\s+/)[0].includes("/");
+}
+
+/** If a message BEGINS with an absolute file path (a dragged/pasted file), rewrite that leading path into
+ *  an `@`-mention so expandMentions inlines the file's content into the turn — the "read/interpret this
+ *  file" the user meant. Space-free leading paths only (a mention can't contain spaces); a non-existent or
+ *  spaced path is left untouched. `exists` is injected so this stays pure/testable. */
+export function inlineLeadingPath(line: string, exists: (p: string) => boolean): string {
+  if (!line.startsWith("/")) return line;
+  const first = line.split(/\s+/)[0];
+  return exists(first) ? "@" + line : line;
+}
+
 /** Expand `@path` references **in place** — the file/dir content lands where it's referenced, not
  *  dumped at the bottom (so "compare @a.ts with @b.ts" reads in context). A repeated mention keeps
  *  the bare `@path` the second time (no double-inlining), and a non-readable ref is left untouched. */

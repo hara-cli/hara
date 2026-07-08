@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.109.4 — a dropped file path is read, not "Unknown command"
+
+- **Dragging/pasting a file into the prompt no longer errors.** A dropped file pastes as an absolute path
+  (`/Users/…/spec.md`, often with trailing text or `[Image #N]` tokens). Because it starts with `/`, hara
+  treated it as a slash command and replied `Unknown command /Users/…`. Now the command parser only fires
+  when the first token has **no embedded slash** (real commands — `/help`, `/design` — never contain one),
+  so a path falls through to the normal turn. And when a message *begins* with an existing absolute path,
+  that path is rewritten to an `@`-mention so its content is **read into the turn** — i.e. "interpret this
+  file" just works. Fixed in both the TUI and the readline REPL.
+
 ## 0.109.3 — an empty model response no longer looks like a hang
 
 - **A turn that comes back with no text and no tool calls is no longer silently dropped.** The agent
