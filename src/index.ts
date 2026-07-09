@@ -109,6 +109,8 @@ import {
   resolveSessionId,
   saveSession,
   loadSession,
+  acquireSessionLock,
+  releaseSessionLock,
   listSessions,
   latestForCwd,
   titleFrom,
@@ -2416,6 +2418,18 @@ program.action(async (opts) => {
     createdAt: new Date().toISOString(),
     updatedAt: "",
   };
+  // Single-writer guard: two hara processes on the SAME session race writes to its append-only history and
+  // corrupt it. Lock it here (a brand-new session's id is unique, so this only ever blocks a DOUBLE-resume
+  // of a session already open elsewhere). Released on exit.
+  const lock = acquireSessionLock(meta.id);
+  if (!lock.ok) {
+    out(
+      c.red(`Session ${shortId(meta.id)} is already open in another hara process (pid ${lock.pid}).`) +
+        c.dim(` Resuming the same session twice races writes and can corrupt its history. Close that one, or run \`hara\` for a new session. (Override: rm ~/.hara/sessions/${meta.id}.lock)\n`),
+    );
+    process.exit(1);
+  }
+  process.on("exit", () => releaseSessionLock(meta.id));
   // Per-session model precedence on resume:
   //   1. --model flag (already applied to cfg.model up-top) → wins and is written back to meta.model.
   //   2. resumed meta.model → restored into cfg.model (the user's last /model choice).

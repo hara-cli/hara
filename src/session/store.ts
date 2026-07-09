@@ -1,7 +1,7 @@
 // Session persistence — conversations saved as JSON under ~/.hara/sessions, resumable.
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { NeutralMsg } from "../providers/types.js";
 
@@ -30,6 +30,52 @@ function sessionsDir(): string {
   return d;
 }
 const sessionFile = (id: string) => join(sessionsDir(), `${id}.json`);
+const lockFile = (id: string) => join(sessionsDir(), `${id}.lock`);
+
+/** Is a process with this pid alive? `process.kill(pid, 0)` sends no signal — it just probes: throws
+ *  ESRCH if dead, EPERM if alive-but-not-ours (still alive). Best-effort across platforms. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code === "EPERM";
+  }
+}
+
+/** Take an exclusive lock on a session so two hara processes can't resume the SAME session and corrupt
+ *  its append-only history by racing writes. Returns `{ ok: true }` if acquired (or the previous holder
+ *  is dead → we take over), or `{ ok: false, pid }` if a LIVE process already holds it. Best-effort: any
+ *  filesystem hiccup resolves to `ok:true` so a lock problem never blocks the user. Pair with
+ *  `releaseSessionLock` on exit. */
+export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
+  const f = lockFile(id);
+  try {
+    if (existsSync(f)) {
+      const held = JSON.parse(readFileSync(f, "utf8")) as { pid?: number };
+      if (typeof held.pid === "number" && held.pid !== process.pid && pidAlive(held.pid)) {
+        return { ok: false, pid: held.pid };
+      }
+      // stale (dead pid) or already ours → fall through and (re)claim it
+    }
+    writeFileSync(f, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+    return { ok: true };
+  } catch {
+    return { ok: true };
+  }
+}
+
+/** Release a session lock we hold (only removes it if the pid matches ours — never steals another's). */
+export function releaseSessionLock(id: string): void {
+  try {
+    const f = lockFile(id);
+    if (!existsSync(f)) return;
+    const held = JSON.parse(readFileSync(f, "utf8")) as { pid?: number };
+    if (held?.pid === process.pid) rmSync(f);
+  } catch {
+    /* best-effort */
+  }
+}
 
 /** A full UUID per session (the stable identity). */
 export const newSessionId = (): string => randomUUID();
