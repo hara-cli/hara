@@ -92,7 +92,7 @@ export function createOpenAIProvider(opts: {
   return {
     id: opts.label ?? "openai",
     model: opts.model,
-    async turn({ system, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
+    async turn({ system, history, tools, onText, onReasoning, onActivity, signal }: TurnArgs): Promise<TurnResult> {
       const oaiTools = tools.map((t) => ({
         type: "function" as const,
         function: { name: t.name, description: t.description, parameters: t.input_schema },
@@ -120,6 +120,7 @@ export function createOpenAIProvider(opts: {
       try {
         const stream = await client.chat.completions.create(params, { signal });
         for await (const chunk of stream as any) {
+          onActivity?.(); // ANY chunk (reasoning, tool-args, content, even a keep-alive) → the model is alive
           const choice = chunk.choices?.[0];
           const delta = choice?.delta;
           if (delta?.content) {

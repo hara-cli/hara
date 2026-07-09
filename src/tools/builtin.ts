@@ -82,7 +82,7 @@ registerTool({
     type: "object",
     properties: {
       command: { type: "string" },
-      timeout_ms: { type: "number", description: "default 120000" },
+      timeout_ms: { type: "number", description: "default 300000 (5 min); raise for a long build/transform, or use background:true for a server" },
       background: { type: "boolean", description: "run as a background job (dev server, watcher, long task); returns a job id immediately — tail/kill it with the `job` tool" },
     },
     required: ["command"],
@@ -108,7 +108,7 @@ registerTool({
         : undefined;
     try {
       const { stdout, stderr } = await runShell(input.command, ctx.cwd, ctx.sandbox ?? "off", {
-        timeout: input.timeout_ms ?? 120_000,
+        timeout: input.timeout_ms ?? 300_000, // was 120s — a long file transform/build legitimately runs longer
         maxBuffer: 10 * 1024 * 1024,
         onData: live,
       });

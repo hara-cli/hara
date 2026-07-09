@@ -9,13 +9,13 @@ const tick = (ms) => new Promise((r) => setTimeout(r, ms));
 
 test("stallMs: env-tunable with a sane default and a 1s floor", () => {
   delete process.env.HARA_STALL_TIMEOUT;
-  assert.equal(stallMs(), 120_000, "default 120s");
+  assert.equal(stallMs(), 240_000, "default 240s (generous — reasoning models go quiet before the first content token)");
   process.env.HARA_STALL_TIMEOUT = "5000";
   assert.equal(stallMs(), 5000);
   process.env.HARA_STALL_TIMEOUT = "10";
   assert.equal(stallMs(), 1000, "floor 1s");
   process.env.HARA_STALL_TIMEOUT = "garbage";
-  assert.equal(stallMs(), 120_000, "garbage → default");
+  assert.equal(stallMs(), 240_000, "garbage → default");
   delete process.env.HARA_STALL_TIMEOUT;
 });
 

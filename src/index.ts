@@ -2150,8 +2150,32 @@ program.action(async (opts) => {
   const cfg = loadConfig({ overlay: opts.overlay });
   if (opts.model) cfg.model = opts.model;
   const provider0 = await withRouting(await buildProvider(cfg), cfg);
-  const fallbackProvider = provider0 && cfg.fallbackModel && cfg.fallbackModel !== cfg.model ? await buildProvider({ ...cfg, model: cfg.fallbackModel, baseURL: cfg.fallbackBaseURL ?? cfg.baseURL, apiKey: cfg.fallbackApiKey ?? cfg.apiKey }) : null;
-  const fbOpt = fallbackProvider ? { provider: fallbackProvider } : undefined; // app-failover for the main chat turns
+  // Fallback provider, built correctly for CROSS-PROVIDER failover. The old `baseURL: fallbackBaseURL ??
+  // baseURL` sent the fallback model to the PRIMARY endpoint when no fallbackBaseURL was set — e.g.
+  // deepseek-v4-pro posted to coding.dashscope → 400. Now: `fallbackProvider` routes to that vendor's
+  // endpoint + its own key (fallbackBaseURL/fallbackApiKey still override); without it we stay on the
+  // primary endpoint (correct only for a same-endpoint fallback).
+  let fallbackProv: Provider | null = null;
+  if (provider0 && cfg.fallbackModel && cfg.fallbackModel !== cfg.model) {
+    const fp = cfg.fallbackProvider;
+    const cross = !!fp && fp !== cfg.provider;
+    const family = (m: string): string => m.toLowerCase().split(/[-.:/]/)[0];
+    if (cross && !cfg.fallbackApiKey && !cfg.apiKey) {
+      process.stderr.write(`hara: fallbackProvider '${fp}' needs its own key — set fallbackApiKey. Fallback disabled.\n`);
+    } else if (!fp && !cfg.fallbackBaseURL && family(cfg.fallbackModel) !== family(cfg.model)) {
+      // A different-looking vendor with no routing set would hit the primary endpoint and 400 on failover.
+      process.stderr.write(`hara: fallbackModel '${cfg.fallbackModel}' looks like a different vendor than '${cfg.model}', but no fallbackProvider/fallbackBaseURL is set — it would hit the PRIMARY endpoint (likely 400). Set fallbackProvider (+ fallbackApiKey). Fallback disabled.\n`);
+    } else {
+      fallbackProv = await buildProvider({
+        ...cfg,
+        provider: fp ?? cfg.provider,
+        model: cfg.fallbackModel,
+        baseURL: cfg.fallbackBaseURL ?? (fp ? providerDefaultBaseURL(fp) : cfg.baseURL),
+        apiKey: cfg.fallbackApiKey ?? (cross ? undefined : cfg.apiKey),
+      });
+    }
+  }
+  const fbOpt = fallbackProv ? { provider: fallbackProv } : undefined; // app-failover for the main chat turns
   const guardianOpt = await buildGuardian(cfg, provider0); // internal safety layer (high-risk actions only)
   if (!provider0) {
     // First-run friendliness: offer the setup wizard instead of just erroring (interactive TTY only).

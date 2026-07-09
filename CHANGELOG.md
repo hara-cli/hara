@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.112.4 — reasoning models don't false-timeout · cross-provider fallback routes correctly
+
+- **A reasoning model (qwen3.7-plus / GLM / DeepSeek) thinking on a long context no longer false-times-out.**
+  These models stream `reasoning_content` (the thought) for a while — often long — before the first real
+  `content` token. The stall watchdog was only fed by rendered output, so on a big context (e.g. 58
+  messages) the model could still be thinking when the 120s "no output" timer fired. Now **every stream
+  chunk — reasoning, tool-args, even suppressed reasoning — resets the watchdog** (new `onActivity`), and
+  the default stall timeout is **120s → 240s** (still `HARA_STALL_TIMEOUT`-tunable). Confirmed: simple
+  calls always worked; only the long-context interactive case timed out — a hara bug, not the API.
+- **`bash` default timeout 120s → 300s** — a long file transform/build legitimately runs past two minutes;
+  it was erroring out. (Set `timeout_ms`, or `background:true` for a server.)
+- **Cross-provider fallback now targets the right endpoint.** With `fallbackModel` set but no
+  `fallbackBaseURL`, the fallback reused the PRIMARY baseURL — so e.g. a `deepseek-v4-pro` fallback got
+  posted to `coding.dashscope` → 400. New **`fallbackProvider`** config routes the fallback to that
+  vendor's endpoint + its own key (`fallbackBaseURL`/`fallbackApiKey` still override); and a mismatched
+  fallback (a different-vendor model with no routing configured) is now refused with a clear warning
+  instead of silently 400-ing on failover.
+
 ## 0.112.3 — big file write no longer traps the model in a "params not passed" loop
 
 - **Fixed the loop where a model (glm-5 / qwen via DashScope) repeats `write_file` / `bash` with empty or

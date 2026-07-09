@@ -27,8 +27,8 @@ const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
  *  hidden-reasoning models can legitimately go quiet for a while; HARA_STALL_TIMEOUT (ms) tunes it,
  *  floor 1s (tests). codex's equivalent is its 2–9s stream-idle timeout. */
 export function stallMs(): number {
-  const raw = Number(process.env.HARA_STALL_TIMEOUT ?? 120_000);
-  return Math.max(1_000, Number.isFinite(raw) && raw > 0 ? raw : 120_000);
+  const raw = Number(process.env.HARA_STALL_TIMEOUT ?? 240_000);
+  return Math.max(1_000, Number.isFinite(raw) && raw > 0 ? raw : 240_000);
 }
 
 /** Spinner verb (terminal mode + reused by TUI tests): when the agent has an in_progress todo,
@@ -238,6 +238,11 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
       history,
       tools: specs,
+      // Any stream chunk keeps the connection considered alive — even suppressed reasoning_content, so a
+      // reasoning model thinking for a long while before its first `content` token can't be false-timed-out.
+      onActivity: () => {
+        lastEvent = Date.now();
+      },
       onText: (d) => {
         alive();
         if (opts.quiet) return;

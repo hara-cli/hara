@@ -32,6 +32,12 @@ export interface TurnArgs {
   onText: (delta: string) => void;
   /** stream reasoning/thinking deltas (shown dimmed); optional, provider-dependent */
   onReasoning?: (delta: string) => void;
+  /** ANY stream activity (a content/reasoning/tool-call chunk arrived) — resets the stall watchdog even
+   *  for chunks we don't render. Critical for reasoning models: they emit reasoning_content (possibly
+   *  suppressed) for a long time before the first `content` token, and without this the watchdog would
+   *  time out mid-thinking. Providers call it on every chunk; the loop keeps the connection considered
+   *  alive. */
+  onActivity?: () => void;
   /** abort the in-flight request (user interrupt) */
   signal?: AbortSignal;
 }
