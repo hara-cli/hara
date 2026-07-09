@@ -4,6 +4,38 @@ import { imageToBase64 } from "../images.js";
 import { reasoningParams } from "./reasoning.js";
 import { resolvePlatform } from "./registry.js";
 
+/** Assemble streamed tool-call fragments into tool uses. CRITICAL: non-empty arguments that don't parse
+ *  mean the model was cut off MID tool-call (almost always the output-length limit on a big write_file /
+ *  bash). Silently substituting `{}` makes the model loop forever — it calls write_file with no path, bash
+ *  with `command: undefined` (`/bin/sh: undefined: command not found`), sees the failure, and retries,
+ *  never realizing its OUTPUT was truncated. So we surface it as an actionable error instead. Exported for
+ *  tests. */
+export function assembleToolCalls(
+  entries: { id: string; name: string; args: string }[],
+  finish?: string,
+): { toolUses: ToolUse[]; error?: string } {
+  let truncated = false;
+  const toolUses: ToolUse[] = entries
+    .filter((t) => t.id && t.name)
+    .map((t) => {
+      let input: any = {};
+      const raw = (t.args || "").trim();
+      if (raw) {
+        try {
+          input = JSON.parse(raw);
+        } catch {
+          truncated = true;
+        }
+      }
+      return { id: t.id, name: t.name, input };
+    });
+  if (truncated) {
+    const why = finish === "length" ? "the model hit its output-length limit mid tool-call" : "the model emitted malformed tool-call arguments";
+    return { toolUses: [], error: `Tool call dropped — ${why}, so its arguments were incomplete. For a large file, write it in smaller parts (several write_file/edit calls) rather than one giant call.` };
+  }
+  return { toolUses };
+}
+
 // Re-exported for callers that still import it from here (the reasoning-family check now lives in reasoning.ts).
 export { isReasoningModel } from "./reasoning.js";
 
@@ -68,7 +100,7 @@ export function createOpenAIProvider(opts: {
       const params: any = {
         model: opts.model,
         messages: toOpenAI(system, history),
-        max_tokens: 8192,
+        max_tokens: 32000, // was 8192 — too small: a big write_file's args got truncated → unparseable → loop
         stream: true,
         stream_options: { include_usage: true },
       };
@@ -116,17 +148,8 @@ export function createOpenAIProvider(opts: {
         return { text: "", toolUses: [], stop: "error", errorMsg: `${e?.status ?? ""} ${e?.message ?? e}` };
       }
 
-      const toolUses: ToolUse[] = [...acc.values()]
-        .filter((t) => t.id && t.name)
-        .map((t) => {
-          let input: any = {};
-          try {
-            input = JSON.parse(t.args || "{}");
-          } catch {
-            input = {};
-          }
-          return { id: t.id, name: t.name, input };
-        });
+      const { toolUses, error: argsError } = assembleToolCalls([...acc.values()], finish);
+      if (argsError) return { text, toolUses: [], stop: "error", errorMsg: argsError, usage };
       const stop = finish === "tool_calls" || toolUses.length ? "tool_use" : "end";
       return { text, toolUses, stop, usage };
     },

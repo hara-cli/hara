@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.112.3 — big file write no longer traps the model in a "params not passed" loop
+
+- **Fixed the loop where a model (glm-5 / qwen via DashScope) repeats `write_file` / `bash` with empty or
+  `undefined` arguments.** Two problems compounded: the OpenAI-compatible path capped output at
+  `max_tokens: 8192`, so a large `write_file` (e.g. a 64-hexagram data file) ran PAST the limit and its
+  tool-call-arguments JSON was cut off — and hara then **silently swallowed the unparseable JSON into an
+  empty `{}`**. So the tool ran with no path/content (`bash` got `command: undefined` →
+  `/bin/sh: undefined: command not found`), the model saw the failure, "fixed" it by calling again, and
+  looped — never realizing its *output* had been truncated. Now: (1) `max_tokens` is raised to 32000
+  (glm-5/qwen accept it), and (2) **truncated/malformed tool arguments surface as an actionable error**
+  ("the model hit its output-length limit mid tool-call — write the file in smaller parts") instead of a
+  silent `{}`, so the loop breaks and the fix is obvious.
+
 ## 0.112.2 — moving/resizing the window no longer garbles the UI
 
 - **Terminal resize no longer stacks the status row + input box into a garble.** ink 6.8's resize
