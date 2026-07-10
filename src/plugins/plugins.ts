@@ -19,6 +19,18 @@ export interface PluginManifest {
   mcpServers?: Record<string, McpServerConfig>;
   hooks?: HooksConfig; // PreToolUse/PostToolUse shell commands
   bin?: Record<string, string>; // command name → executable path (relative to plugin root); linked into ~/.hara/bin on install
+  panels?: PanelSpec[]; // web UIs the desktop shell can embed (declared here, launched on demand)
+}
+
+/** A plugin-contributed panel: a local web UI the desktop shell can launch + embed (e.g. hara-design's
+ *  preview gallery). `command` is one of the plugin's `bin` entries (or anything on PATH); the desktop
+ *  runs it and reads the URL from stdout (or dials `port` directly when the server is already up). */
+export interface PanelSpec {
+  id: string;
+  title: string;
+  command: string;
+  args?: string[];
+  port?: number;
 }
 export interface Plugin {
   name: string;
