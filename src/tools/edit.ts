@@ -12,8 +12,9 @@ registerTool({
     "Edit an existing file by replacing exact strings. Provide a single `old_string`/`new_string`, " +
     "or `edits` (an array of {old_string,new_string,replace_all?}) applied in order. Each `old_string` " +
     "must match exactly and appear once (include surrounding context) unless `replace_all` is true. " +
-    "Quote variants (straight/curly) are matched leniently. Use write_file to create a new file, or " +
-    "apply_patch to change several files at once.",
+    "`old_string` is matched against the RAW file text — strip read_file's line-number prefix " +
+    "(the leading `   123\\t`) before matching. Quote variants (straight/curly) are matched leniently. " +
+    "Use write_file to create a new file, or apply_patch to change several files at once.",
   input_schema: {
     type: "object",
     properties: {

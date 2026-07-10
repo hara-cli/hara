@@ -10,6 +10,7 @@ import { mapLimit, maxParallel } from "../concurrency.js";
 import type { ApprovalMode } from "../config.js";
 import { decideCommand, loadPermissionRules } from "../security/permissions.js";
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
+import { recordCall } from "./repeat-guard.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
@@ -61,7 +62,14 @@ them whole. Batch INDEPENDENT tool calls in a single response — especially rea
 glob / ls run in PARALLEL when requested together); one-call-per-turn exploration is the slowest thing
 you can do. When analyzing a project, start wide in ONE batch — manifest (package.json / Cargo.toml /
 pyproject.toml / go.mod), README, build/CI config — then chase only what the task needs with narrow
-grep/glob; don't read whole large files when a targeted search answers the question. For broad,
+grep/glob; don't read whole large files when a targeted search answers the question. For a long file,
+grep to locate then read_file just that region with offset/limit — not the whole file. After a successful
+edit_file/write_file do NOT re-read the file to verify — the tool already applied and diffed the change;
+re-reading a big file after every edit is the slowest habit an agent can have.
+When an attempt FAILS, never repeat it unchanged — read the error, form a hypothesis about the cause, and
+change something (arguments / approach / tool) before trying again. After two failed variants of the same
+approach, stop: re-plan from what you learned, or ask the user, stating concisely what you tried and what
+the errors said. Repeating a failed action hoping for a different result is how sessions die. For broad,
 open-ended exploration (more than ~3 searches), spawn \`agent\` sub-agents — several in one response for
 independent questions (role "explore") — each returns conclusions, not dumps. Messages the user sends
 mid-task arrive marked as interjections — triage them (refine current / queue as todo / urgent-switch)
@@ -478,10 +486,12 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         }
         const res = await p.tool!.run(p.tu.input, ctx);
         // append any not-yet-seen subdirectory AGENTS.md/CLAUDE.md this call touched (monorepo-local conventions)
-        results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) };
+        // + the repeat-guard's anti-spinning note when this exact call keeps failing (repeat-guard.ts)
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) + recordCall(p.tu.name, p.tu.input, res) };
         runHooks("PostToolUse", p.tu.name, { input: p.tu.input, result: res }, ctx.cwd); // observe-only
       } catch (e: any) {
-        results[idx] = { id: p.tu.id, name: p.tu.name, content: `Error: ${e.message}`, isError: true };
+        const msg = `Error: ${e.message}`;
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + recordCall(p.tu.name, p.tu.input, msg, true), isError: true };
       } finally {
         activity.dec();
       }

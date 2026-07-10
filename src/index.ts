@@ -78,6 +78,7 @@ import { runTick, runJobOnce, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools, type Tool } from "./tools/registry.js";
 import { resetReachability } from "./tools/net-reachability.js";
+import { resetRepeatGuard } from "./agent/repeat-guard.js";
 import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
@@ -2916,6 +2917,7 @@ program.action(async (opts) => {
             history.length = 0;
             recalledContext = "";
             resetReachability(); // fresh start — drop any "host unreachable" marks (network may be fixed)
+            resetRepeatGuard(); // …and the repeated-failure streaks (the user may have fixed the cause)
             return void h.sink.notice("(context cleared)");
           }
           if (nm === "undo") {

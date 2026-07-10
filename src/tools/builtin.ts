@@ -56,20 +56,49 @@ export function capHeadTail(s: string, max = MAX): string {
   return s.slice(0, head) + `\n…[${s.length - max} chars truncated]…\n` + s.slice(s.length - (max - head));
 }
 
+const READ_LINES = 2000; // default lines per read_file call (a long file is read in slices, not dumped whole)
+const LINE_CAP = 2000; // chars per line before truncation (minified bundles / data lines)
+
+/** Render a line slice of a file, cat -n style. The old read_file dumped the WHOLE file (100K-char cap,
+ *  tail simply lost) — on long files that both flooded the context (~25k tokens per read, again on every
+ *  re-read) and made everything past the cap unreachable. Now: line numbers (anchor for edits and for
+ *  "read around line N"), a default window of READ_LINES, and a header that says how to continue. Pure —
+ *  exported for tests. */
+export function renderFileSlice(text: string, offset?: number, limit?: number): string {
+  const lines = text.split("\n");
+  // A trailing newline yields one phantom "" line at the end — don't count or show it.
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  const total = lines.length;
+  const start = Math.max(1, Math.floor(offset ?? 1));
+  const want = Math.max(1, Math.floor(limit ?? READ_LINES));
+  if (start > total) return `(file has ${total} lines — offset ${start} is past the end)`;
+  const end = Math.min(total, start + want - 1);
+  const body = lines
+    .slice(start - 1, end)
+    .map((l, i) => `${String(start + i).padStart(6)}\t${l.length > LINE_CAP ? l.slice(0, LINE_CAP) + `…[+${l.length - LINE_CAP} chars]` : l}`)
+    .join("\n");
+  const sliced = start > 1 || end < total;
+  const head = sliced ? `(lines ${start}–${end} of ${total}${end < total ? ` — continue with offset:${end + 1}` : ""})\n` : "";
+  return head + body;
+}
+
 registerTool({
   name: "read_file",
-  description: "Read a UTF-8 text file and return its contents.",
+  description:
+    "Read a UTF-8 text file; returns cat -n style numbered lines. Reads up to 2000 lines by default — for a longer file pass offset/limit to read the next slice (the output header tells you the total and where to continue). Prefer grep to locate, then read just that region.",
   input_schema: {
     type: "object",
     properties: {
       path: { type: "string", description: "File path, relative to cwd or absolute" },
+      offset: { type: "number", description: "1-based line number to start from (for long files)" },
+      limit: { type: "number", description: "max lines to return (default 2000)" },
     },
     required: ["path"],
   },
   kind: "read",
   async run(input, ctx) {
     try {
-      return cap(await readFile(abs(input.path, ctx.cwd), "utf8"));
+      return cap(renderFileSlice(await readFile(abs(input.path, ctx.cwd), "utf8"), input.offset, input.limit));
     } catch (e: any) {
       const near = nearestPaths(ctx.cwd, input.path);
       return `Error: cannot read ${input.path}: ${e.code ?? e.message}.` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");

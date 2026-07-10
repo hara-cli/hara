@@ -28,7 +28,7 @@ test("write_file → read_file round-trips in cwd", async () => {
     const w = await getTool("write_file").run({ path: "a.txt", content: "hello hara" }, ctx);
     assert.match(w, /Wrote 10 chars/);
     const r = await getTool("read_file").run({ path: "a.txt" }, ctx);
-    assert.equal(r, "hello hara");
+    assert.equal(r, "     1\thello hara"); // cat -n numbered since the long-file slicing change
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -40,7 +40,7 @@ test("write_file creates nested parent directories", async () => {
     const ctx = { cwd: dir };
     await getTool("write_file").run({ path: "deep/nested/b.txt", content: "x" }, ctx);
     const r = await getTool("read_file").run({ path: "deep/nested/b.txt" }, ctx);
-    assert.equal(r, "x");
+    assert.equal(r, "     1\tx"); // cat -n numbered
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
