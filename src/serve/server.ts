@@ -16,6 +16,8 @@ import type { ApprovalMode } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
 import { loadAgentsMd } from "../context/agents-md.js";
 import { memoryDigest } from "../memory/store.js";
+import { listInstalled, enabledPlugins, setPluginEnabled } from "../plugins/plugins.js";
+import { loadSkillIndex } from "../skills/skills.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 
@@ -212,6 +214,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const resolve = pendingApprovals.get(p.approvalId);
             if (resolve) resolve(p.always === true ? "always" : p.allow === true);
             return reply(rpcResult(id!, {})); // idempotent — a late/duplicate reply is a no-op
+          }
+          case "plugins.list": {
+            const on = new Set(enabledPlugins().map((pl) => pl.name));
+            return reply(rpcResult(id!, { plugins: listInstalled().map((pl) => ({ name: pl.name, version: pl.version, description: pl.manifest.description ?? "", enabled: on.has(pl.name), skills: (pl.manifest.skills ?? []).length, agents: (pl.manifest.agents ?? []).length, mcpServers: Object.keys(pl.manifest.mcpServers ?? {}).length })) }));
+          }
+          case "plugins.set": {
+            if (typeof p.name !== "string" || typeof p.enabled !== "boolean") return reply(rpcError(id, ERR.PARAMS, "name + enabled required"));
+            if (!listInstalled().some((pl) => pl.name === p.name)) return reply(rpcError(id, ERR.PARAMS, `no installed plugin "${p.name}"`));
+            setPluginEnabled(p.name, p.enabled);
+            return reply(rpcResult(id!, { name: p.name, enabled: p.enabled })); // takes effect on the next session/turn (loaders re-read)
+          }
+          case "skills.list": {
+            const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, { skills: loadSkillIndex(cwd).map((s) => ({ id: s.id, description: s.description, source: s.source })) }));
           }
           default:
             return reply(rpcError(id, ERR.METHOD, `unknown method ${req.method}`));

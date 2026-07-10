@@ -10,6 +10,9 @@
 //   session.send      {sessionId,text}           → (streams events, then) {reply,usage}
 //   session.interrupt {sessionId}                → {}
 //   approval.reply    {approvalId,allow,always?}  → {}
+//   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
+//   plugins.set       {name,enabled}              → {name,enabled}   (applies to future sessions/turns)
+//   skills.list       {cwd?}                      → {skills:[{id,description,source}]}
 // Server → client notifications (all carry sessionId):
 //   event.text / event.reasoning {delta} · event.tool {name,preview} · event.diff {text}
 //   event.notice {text} · event.turn_end {reply,usage,error?} · approval.request {approvalId,question}

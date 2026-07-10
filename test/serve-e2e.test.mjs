@@ -147,6 +147,14 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(nosess.error.code, -32003);
     const badParams = await c.call("session.send", { sessionId: sid });
     assert.equal(badParams.error.code, -32602);
+
+    // plugins/skills surface (P2): shape-only — contents depend on the machine's ~/.hara
+    const plugins = await c.call("plugins.list", {});
+    assert.ok(Array.isArray(plugins.result.plugins), "plugins.list returns an array");
+    const badSet = await c.call("plugins.set", { name: "definitely-not-installed-xyz", enabled: false });
+    assert.equal(badSet.error.code, -32602, "plugins.set on unknown plugin → params error (never writes config)");
+    const skills = await c.call("skills.list", {});
+    assert.ok(Array.isArray(skills.result.skills), "skills.list returns an array");
   } finally {
     c.close();
     await srv.close();
