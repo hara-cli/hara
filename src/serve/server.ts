@@ -15,6 +15,7 @@ import type { UiSink } from "../tools/registry.js";
 import type { ApprovalMode } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
 import { loadAgentsMd } from "../context/agents-md.js";
+import { expandMentions } from "../context/mentions.js";
 import { memoryDigest } from "../memory/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled } from "../plugins/plugins.js";
 import { loadSkillIndex } from "../skills/skills.js";
@@ -136,7 +137,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         broadcast("approval.request", { sessionId, approvalId, question: q });
       });
     try {
-      s.history.push({ role: "user", content: text });
+      // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works)
+      s.history.push({ role: "user", content: expandMentions(text, s.meta.cwd) });
       await runAgent(s.history, {
         provider: s.provider,
         ctx: {
