@@ -177,7 +177,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         if (req.method === "initialize") {
           if (typeof p.token !== "string" || !sameToken(p.token, token)) return reply(rpcError(id, ERR.UNAUTHORIZED, "bad token"));
           authed.add(ws);
-          return reply(rpcResult(id!, { name: "hara", version: deps.version, protocol: PROTOCOL_VERSION, cwd: opts.cwd, provider: deps.providerId, model: deps.model }));
+          // capability negotiation (codex app-server pattern): the server ADVERTISES its method set so
+          // clients feature-detect up front instead of probing for -32601 per call. `p.capabilities`
+          // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
+          const methods = [
+            "session.list", "session.create", "session.resume", "session.send", "session.interrupt", "session.set-model",
+            "approval.reply", "plugins.list", "plugins.set", "skills.list", "automation.list", "models.list",
+          ];
+          return reply(rpcResult(id!, { name: "hara", version: deps.version, protocol: PROTOCOL_VERSION, cwd: opts.cwd, provider: deps.providerId, model: deps.model, capabilities: { methods } }));
         }
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
 

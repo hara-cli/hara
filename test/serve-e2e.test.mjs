@@ -125,6 +125,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     const init = await c.call("initialize", { token: "tok" });
     assert.equal(init.result.protocol, 1);
     assert.equal(init.result.model, "fake-1");
+    assert.ok(init.result.capabilities.methods.includes("automation.list"), "capabilities advertised");
 
     const created = await c.call("session.create", {});
     const sid = created.result.sessionId;

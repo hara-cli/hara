@@ -3,7 +3,8 @@
 // Everything here is PURE (parse + frame builders + error codes) and unit-tested.
 //
 // Client → server requests:
-//   initialize        {token}                    → {name,version,protocol,cwd,provider,model}
+//   initialize        {token,capabilities?}      → {name,version,protocol,cwd,provider,model,
+//                                                   capabilities:{methods:[…]}}  (feature detection)
 //   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,updatedAt}]}
 //   session.create    {cwd?,approval?}           → {sessionId,model}
 //   session.resume    {sessionId}                → {sessionId,model,history:[{role,text}]}
