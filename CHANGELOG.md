@@ -5,6 +5,28 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.114.0 — long files read in slices · repeat-guard anti-spinning · `hara serve` (the desktop/IDE backbone)
+
+- **Long files no longer flood the context.** `read_file` now returns cat-n numbered lines with
+  `offset`/`limit` slicing (2000-line default window, per-line truncation, a header that says how to
+  continue). The old behavior dumped the whole file (100K-char cap) — ~25k tokens per read, tail
+  unreachable. Paired prompt rules: grep-then-slice on long files, and **no whole-file re-read after a
+  successful edit** (the slowest habit an agent can have). This is the "hara is slow on long files" fix.
+- **Repeat-guard — the anti-spinning tripwire.** When the EXACT same tool call (same tool, same
+  arguments) fails twice in a row, the result now carries an explicit "repeating this unchanged will
+  fail again — change something or ask the user" note. The guardian breaker covers DENIED actions;
+  this covers FAILED ones (observed: 4× the same `git pull` into a dead network). Successes reset the
+  streak; `/reset` clears it. Plus prompt rules: diagnose before retrying, two failed variants → step
+  back and re-plan.
+- **`hara serve` — a persistent local server (WebSocket JSON-RPC v1)** that desktop shells, ACP and
+  IDE clients drive: `initialize` (token auth) · `session.create/resume/list/send/interrupt` ·
+  streamed `event.text/reasoning/tool/diff/notice/turn_end` · **approval round-trips**
+  (`approval.request` ⇄ `approval.reply`, 5-min deny-timeout, deny-on-disconnect) · sessions are the
+  SAME `~/.hara/sessions` store the CLI uses (single-writer lock respected) · `~/.hara/serve.json`
+  discovery file. This is the backbone the new hara desktop app (Tauri) speaks to.
+- `tools/all.ts` — library entries (serve, embedders) now register the full built-in toolset; an
+  unregistered tool was silently unplannable.
+
 ## 0.113.0 — DeepSeek reasoning control (thinking + effort, incl. `max`) · host-unreachable memory
 
 - **DeepSeek reasoning is now a real dial.** DeepSeek's V4 models (`deepseek-v4-pro` / `deepseek-v4-flash`)
