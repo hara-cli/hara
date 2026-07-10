@@ -77,6 +77,7 @@ import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath
 import { runTick, runJobOnce, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools, type Tool } from "./tools/registry.js";
+import { resetReachability } from "./tools/net-reachability.js";
 import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
@@ -2914,6 +2915,7 @@ program.action(async (opts) => {
           if (nm === "reset" || nm === "clear") {
             history.length = 0;
             recalledContext = "";
+            resetReachability(); // fresh start — drop any "host unreachable" marks (network may be fixed)
             return void h.sink.notice("(context cleared)");
           }
           if (nm === "undo") {

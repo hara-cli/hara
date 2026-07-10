@@ -127,6 +127,14 @@ hara config set visionModel qwen-vl-max   # a vision model on the same plan/key
 If a model's capability is unknown, hara **asks once and remembers**. In the TUI, `/vision <model>` sets the
 describer and `/vision main yes|no|auto` corrects a model's detected capability.
 
+**Reasoning effort** — dial how hard a thinking model reasons: `off` · `low` · `medium` · `high` · `max`.
+```bash
+hara config set reasoningEffort high     # or off / low / medium / max
+```
+hara expresses it the way each endpoint wants (OpenAI `reasoning_effort`, Anthropic thinking budget,
+DashScope `enable_thinking`, **DeepSeek** V4 `thinking` + `reasoning_effort` where `max` genuinely raises the
+effort). In the TUI, bare `/model` opens a picker — ↑↓ pick a model, **←→ set the thinking level**.
+
 Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `HARA_MODEL`,
 `HARA_BASE_URL`, `HARA_API_KEY`, or the provider key (`ANTHROPIC_API_KEY` / `DASHSCOPE_API_KEY`).
 

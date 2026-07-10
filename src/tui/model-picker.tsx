@@ -11,6 +11,7 @@ import type { ReasoningStyle, Effort } from "../providers/reasoning.js";
 export function levelsFor(style: ReasoningStyle): Effort[] {
   if (style === "none") return [];
   if (style === "enable_thinking" || style === "ollama_think") return ["off", "high"]; // "high" renders as "on"
+  if (style === "deepseek") return ["off", "low", "medium", "high", "max"]; // DeepSeek V4 honors a real "max"
   return ["off", "low", "medium", "high"];
 }
 

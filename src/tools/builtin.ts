@@ -7,8 +7,38 @@ import { nearestPaths } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
 import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
+import {
+  hostsInCommand,
+  isNetworkGitOp,
+  hostFromConnectError,
+  isConnectFailure,
+  markHostUnreachable,
+  isHostUnreachable,
+  unreachableHostsSnapshot,
+} from "./net-reachability.js";
 
 const MAX = 100_000;
+
+/** Resolve the remote HOST a bare `git pull/fetch/push` targets (no URL in the command → host lives in the
+ *  repo's remote config). Local + fast (no network); best-effort — returns "" on any hiccup. Only ever
+ *  called after a host has already been marked unreachable, so it adds zero overhead on the happy path. */
+async function gitRemoteHost(command: string, cwd: string, sandbox: Parameters<typeof runShell>[2]): Promise<string> {
+  const m = command.match(/\bgit\b[^\n]*\b(?:fetch|pull|push)\b\s+(?!-)(\S+)/);
+  const remote = m && /^[\w./-]+$/.test(m[1]) ? m[1] : "origin";
+  try {
+    const { stdout } = await runShell(`git remote get-url ${remote}`, cwd, sandbox, { timeout: 5000, maxBuffer: 65536 });
+    return hostsInCommand(stdout.trim())[0] ?? "";
+  } catch {
+    return "";
+  }
+}
+
+/** git ignores the macOS system / Clash proxy unless told to — so a browser that reaches GitHub doesn't
+ *  mean the terminal does. Appended to connectivity-failure output so the agent diagnoses instead of retrying. */
+function proxyHint(host: string): string {
+  const h = host || "the remote host";
+  return `\n\n↯ hara: this is a CONNECTIVITY failure to ${h} (timeout/DNS), not an auth error — I will NOT retry network ops to ${h} for the rest of this session (a repeat just hangs ~75s again). git does NOT use the macOS system/Clash proxy unless configured; check \`git config --global http.proxy\` and \`echo $https_proxy $ALL_PROXY\`. If you've since started a VPN/proxy or fixed DNS, tell me and I'll clear the mark and retry.`;
+}
 
 function abs(p: string, cwd: string): string {
   return isAbsolute(p) ? p : resolve(cwd, p);
@@ -93,6 +123,21 @@ registerTool({
       const id = startJob(input.command, ctx.cwd, ctx.sandbox ?? "off");
       return `Started background job ${id}: \`${input.command}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all.`;
     }
+    // Network fault tolerance — short-circuit if this command targets a host already found unreachable this
+    // session, so a repeat doesn't burn another ~75s OS connect timeout. Only pays the git-remote lookup
+    // once something is actually marked (unreachableHostsSnapshot empty ⇒ zero overhead on the happy path).
+    if (unreachableHostsSnapshot().length) {
+      const explicit = hostsInCommand(input.command);
+      let blocked = explicit.find(isHostUnreachable) ?? "";
+      if (!blocked && !explicit.length && isNetworkGitOp(input.command)) {
+        const h = await gitRemoteHost(input.command, ctx.cwd, ctx.sandbox ?? "off");
+        if (h && isHostUnreachable(h)) blocked = h;
+      }
+      if (blocked) {
+        ctx.ui?.notice(`↯ skipping — ${blocked} was unreachable earlier this session`);
+        return `Skipped without running: host "${blocked}" already failed to connect earlier in THIS session — hara does not retry network operations to a host known unreachable this session (a retry just hangs ~75s again). Do not swap in a public mirror (won't serve private repos) or switch protocols; diagnose instead.${proxyHint(blocked)}`;
+      }
+    }
     let buf = ""; // TUI: line-buffer live output into the sink (one notice per line)
     const live = ctx.ui
       ? (s: string) => {
@@ -116,7 +161,19 @@ registerTool({
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
       return capHeadTail(combined.trim() || "(no output)");
     } catch (e: any) {
-      return capHeadTail(`Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`);
+      const base = `Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`;
+      // Network fault tolerance — if this was a genuine host-unreachability (connect timeout / DNS, NOT
+      // auth / 404 / connection-refused), remember the host so we fast-fail future ops to it this session.
+      if (isConnectFailure(base)) {
+        let host = hostFromConnectError(base) || hostsInCommand(input.command)[0] || "";
+        if (!host && isNetworkGitOp(input.command)) host = await gitRemoteHost(input.command, ctx.cwd, ctx.sandbox ?? "off");
+        if (host) {
+          markHostUnreachable(host);
+          ctx.ui?.notice(`↯ ${host} marked unreachable for this session — won't retry network ops to it`);
+          return capHeadTail(base + proxyHint(host));
+        }
+      }
+      return capHeadTail(base);
     }
   },
 });

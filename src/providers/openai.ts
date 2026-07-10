@@ -86,7 +86,7 @@ export function createOpenAIProvider(opts: {
   model: string;
   baseURL?: string;
   label?: string;
-  reasoningEffort?: "off" | "low" | "medium" | "high";
+  reasoningEffort?: "off" | "low" | "medium" | "high" | "max";
 }): Provider {
   const client = new OpenAI({ apiKey: opts.apiKey, maxRetries: 4, ...(opts.baseURL ? { baseURL: opts.baseURL } : {}) });
   return {

@@ -71,8 +71,15 @@ memory: use memory_search before answering about prior decisions,
 conventions, or the user's preferences, and memory_write to proactively save durable facts you learn.
 When a task matches one of the Skills listed below, call the \`skill\` tool to load its full instructions
 before acting; save a reusable how-to as a new skill with skill_create. If you discover a durable project
-convention, you may propose an edit to AGENTS.md via edit_file (the user reviews the diff). After completing
-a task, give a one-line summary.`;
+convention, you may propose an edit to AGENTS.md via edit_file (the user reviews the diff).
+Network resilience: before \`git clone\`, check the target dir isn't already present (ls / test -d) and
+reuse a local checkout instead of re-cloning. If a network command fails to CONNECT (timeout or DNS — not
+auth/404), treat that host as down for the session: don't retry it, don't swap in a public mirror (mirrors
+can't serve private repos), don't switch protocols — hara already fast-fails repeats to a dead host, so
+diagnose instead. git ignores the macOS system / Clash proxy unless configured (git config --global
+http.proxy), so a browser that reaches a site doesn't mean the terminal does — verify connectivity yourself
+rather than trusting "the network is fine". If a step's output artifact already exists and is newer than its
+inputs, skip re-running it. After completing a task, give a one-line summary.`;
 
 /** When running inside `hara gateway`, tell the agent it's in a chat — so it delivers files via send_file
  *  (the only channel that reaches the peer) and never reaches for the desktop client / computer tool. */

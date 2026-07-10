@@ -73,7 +73,7 @@ export interface HaraConfig {
    *   - "high"   → large budget (anthropic budget_tokens up, openai reasoning_effort:"high")
    *  GLM/DeepSeek-style models put reasoning in the stream and can't be silenced here — "off" just
    *  means we don't render it (handled at the UI layer). */
-  reasoningEffort: "off" | "low" | "medium" | "high" | undefined;
+  reasoningEffort: "off" | "low" | "medium" | "high" | "max" | undefined;
   /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
   hooks: HooksConfig;
   /** Guardian safety layer: an internal HIGH-RISK classifier + a conservative cheap-model veto + a hard
@@ -120,7 +120,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
 };
 
 export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
-export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = ["off", "low", "medium", "high"];
+export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = ["off", "low", "medium", "high", "max"];
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
@@ -253,8 +253,8 @@ export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
   const fallbackBaseURL = process.env.HARA_FALLBACK_BASE_URL ?? merged.fallbackBaseURL;
   const fallbackApiKey = process.env.HARA_FALLBACK_API_KEY ?? merged.fallbackApiKey;
   const reasoningRaw = process.env.HARA_REASONING_EFFORT ?? merged.reasoningEffort;
-  const reasoningEffort = reasoningRaw && (["off", "low", "medium", "high"] as const).includes(reasoningRaw as never)
-    ? (reasoningRaw as "off" | "low" | "medium" | "high")
+  const reasoningEffort = reasoningRaw && (["off", "low", "medium", "high", "max"] as const).includes(reasoningRaw as never)
+    ? (reasoningRaw as "off" | "low" | "medium" | "high" | "max")
     : undefined;
 
   return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, vimMode, autoCompact, fileCheckpoints, updateCheck, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: process.cwd() };

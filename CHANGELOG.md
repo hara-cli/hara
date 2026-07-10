@@ -5,6 +5,32 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.113.0 — DeepSeek reasoning control (thinking + effort, incl. `max`) · host-unreachable memory
+
+- **DeepSeek reasoning is now a real dial.** DeepSeek's V4 models (`deepseek-v4-pro` / `deepseek-v4-flash`)
+  added a per-request thinking switch on the OpenAI-compatible chat path — `thinking: {type}` plus
+  `reasoning_effort` (native `high`|`max`; `low`/`medium` map → high server-side). hara now sends both via a
+  new `deepseek` reasoning style: **`off` → `thinking:{type:"disabled"}`** (reasoning_effort has no "off"),
+  any level → `thinking:{type:"enabled"}` + the effort. The `/model` picker's ←→ thinking dial now lights up
+  for DeepSeek. Verified against the live API: `off` emits no `reasoning_content`, `high`/`max` stream it
+  (`max` thinks measurably harder than `high`), and tool-calls work with reasoning on.
+- **New `max` reasoning level.** `hara config set reasoningEffort max` (and the picker's ←→) now accept
+  **`max`**, the top of the dial. On DeepSeek it becomes `reasoning_effort:"max"`; on OpenAI reasoning models
+  it clamps to `high` (OpenAI has no `max`, so it never 400s); on Anthropic it takes the largest thinking
+  budget. Existing `off`/`low`/`medium`/`high` are unchanged.
+- **Host-unreachable memory — stop re-hanging on a dead host.** When a network command (git clone/pull/fetch,
+  curl, …) fails to CONNECT — a TCP connect timeout or DNS failure (macOS's ~75s SYN timeout), *not* an
+  auth/404/connection-refused — hara now remembers that host for the session and **fast-fails later network
+  ops to it instantly** instead of eating another ~75s per retry. The failure output also flags that git
+  ignores the macOS system / Clash proxy unless configured (`git config --global http.proxy`). Cleared by
+  `/reset`. Paired with a system-prompt rule: reuse a local checkout before cloning, don't swap in a public
+  mirror for a private repo, and verify connectivity yourself rather than trusting "the network is fine".
+
+## 0.112.5 — single-writer session lock
+
+- **A double-resume can no longer corrupt session history.** A single-writer lock serializes session writes
+  so two processes resuming the same session don't interleave and clobber the transcript.
+
 ## 0.112.4 — reasoning models don't false-timeout · cross-provider fallback routes correctly
 
 - **A reasoning model (qwen3.7-plus / GLM / DeepSeek) thinking on a long context no longer false-times-out.**

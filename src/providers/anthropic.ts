@@ -92,7 +92,7 @@ function isAdaptiveOnly(model: string): boolean {
 
 /** Map hara's reasoningEffort dial to Anthropic's `thinking` parameter (or omit it).
  *  Exported for unit testing. */
-export function buildThinkingParam(model: string, effort?: "off" | "low" | "medium" | "high"):
+export function buildThinkingParam(model: string, effort?: "off" | "low" | "medium" | "high" | "max"):
   | { type: "enabled"; budget_tokens: number }
   | { type: "adaptive" }
   | undefined {
@@ -103,11 +103,12 @@ export function buildThinkingParam(model: string, effort?: "off" | "low" | "medi
   if (adaptiveOnly) return { type: "adaptive" }; // can't honor budget on these — fall back to adaptive instead of 400'ing
   if (effort === "low") return { type: "enabled", budget_tokens: 4096 };
   if (effort === "medium") return { type: "adaptive" };
+  if (effort === "max") return { type: "enabled", budget_tokens: 32000 }; // top of the dial — biggest budget
   // high
   return { type: "enabled", budget_tokens: 24000 };
 }
 
-export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: "off" | "low" | "medium" | "high" }): Provider {
+export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: "off" | "low" | "medium" | "high" | "max" }): Provider {
   const client = new Anthropic({ apiKey: opts.apiKey, maxRetries: 4, ...(opts.baseURL ? { baseURL: opts.baseURL } : {}) });
   return {
     id: "anthropic",

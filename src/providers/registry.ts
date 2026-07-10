@@ -46,9 +46,9 @@ const BY_BASEURL: { test: RegExp; caps: PlatformCaps }[] = [
   // GLM, MiniMax, Aliyun apps/anthropic … all expose `.../anthropic` with thinking + explicit cache. One
   // row covers the whole ecosystem — talk to it with the anthropic transport.
   { test: /\/anthropic\/?($|\?)/i, caps: { wireApi: "anthropic", reasoning: "thinking_budget", cache: "cache_control" } },
-  // DeepSeek OpenAI-compatible (chat): the model id picks reasoning (deepseek-reasoner reasons, -chat
-  // doesn't); there's no per-request toggle on this path → leave it alone.
-  { test: /api\.deepseek\.com/i, caps: { wireApi: "chat", reasoning: "none", cache: "auto" } },
+  // DeepSeek OpenAI-compatible (chat): DeepSeek V4 (v4-pro/v4-flash) exposes a per-request thinking switch
+  // (`thinking: {type}`) + `reasoning_effort` (high|max) on this path — the `deepseek` style sends both.
+  { test: /api\.deepseek\.com/i, caps: { wireApi: "chat", reasoning: "deepseek", cache: "auto" } },
 ];
 
 /** Per-provider-id overrides (built-in providers whose id alone fixes the shape). */
@@ -57,7 +57,7 @@ const BY_PROVIDER: Record<string, Partial<PlatformCaps>> = {
   qwen: { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" }, // DashScope
   "qwen-oauth": { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" },
   glm: { wireApi: "chat", reasoning: "none", cache: "auto" }, // Zhipu native /paas/v4 — different thinking param; leave alone (its /anthropic endpoint resolves via baseURL)
-  deepseek: { wireApi: "chat", reasoning: "none", cache: "auto" },
+  deepseek: { wireApi: "chat", reasoning: "deepseek", cache: "auto" }, // V4: thinking:{type} + reasoning_effort(high|max)
   ollama: { wireApi: "chat", reasoning: "ollama_think", cache: "none" }, // local; `think` toggles reasoning
   openai: { wireApi: "chat", reasoning: "reasoning_effort", cache: "auto" },
   openrouter: { wireApi: "chat", reasoning: "none", cache: "auto" },

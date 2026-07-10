@@ -5,11 +5,12 @@ import assert from "node:assert/strict";
 import { levelsFor, levelLabel, movePicker } from "../dist/tui/model-picker.js";
 import { listModels } from "../dist/providers/models.js";
 
-test("levelsFor: binary thinking styles → off/on; graded → full dial; none → nothing", () => {
+test("levelsFor: binary thinking styles → off/on; graded → full dial; deepseek adds max; none → nothing", () => {
   assert.deepEqual(levelsFor("enable_thinking"), ["off", "high"]);
   assert.deepEqual(levelsFor("ollama_think"), ["off", "high"]);
   assert.deepEqual(levelsFor("reasoning_effort"), ["off", "low", "medium", "high"]);
   assert.deepEqual(levelsFor("thinking_budget"), ["off", "low", "medium", "high"]);
+  assert.deepEqual(levelsFor("deepseek"), ["off", "low", "medium", "high", "max"]);
   assert.deepEqual(levelsFor("none"), []);
 });
 
@@ -34,6 +35,10 @@ test("movePicker: ←→ cycles the thinking level for the endpoint's style", ()
   // graded (reasoning_effort): off → low → medium → high → off
   assert.equal(movePicker({ modelIdx: 0, effort: "low" }, "right", 3, "reasoning_effort").effort, "medium");
   assert.equal(movePicker({ modelIdx: 0, effort: "off" }, "left", 3, "reasoning_effort").effort, "high", "left from off wraps to high");
+  // deepseek: high → max → (wrap) off; left from off wraps to max
+  assert.equal(movePicker({ modelIdx: 0, effort: "high" }, "right", 3, "deepseek").effort, "max");
+  assert.equal(movePicker({ modelIdx: 0, effort: "max" }, "right", 3, "deepseek").effort, "off", "max wraps to off");
+  assert.equal(movePicker({ modelIdx: 0, effort: "off" }, "left", 3, "deepseek").effort, "max", "left from off wraps to max");
   // none: ←→ is a no-op
   assert.equal(movePicker({ modelIdx: 0, effort: "off" }, "right", 3, "none").effort, "off");
 });

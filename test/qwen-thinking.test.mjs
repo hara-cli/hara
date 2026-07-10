@@ -54,9 +54,13 @@ test("resolvePlatform: ANY vendor's /anthropic endpoint → anthropic wire + thi
   }
 });
 
-test("resolvePlatform: DeepSeek OpenAI-compat (chat) → no per-request thinking toggle", () => {
-  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com").reasoning, "none");
+test("resolvePlatform: DeepSeek OpenAI-compat (chat) → the deepseek style (thinking:{type} + reasoning_effort)", () => {
+  // DeepSeek V4 (v4-pro/v4-flash) added a per-request thinking switch + reasoning_effort(high|max) on the
+  // OpenAI-compat chat path — see the `deepseek` reasoning style in reasoning.ts.
+  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com").reasoning, "deepseek");
   assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/v1").wireApi, "chat");
+  // The vendor's /anthropic endpoint still wins (checked first) → anthropic wire, not the chat deepseek style.
+  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/anthropic").reasoning, "thinking_budget");
 });
 
 test("resolvePlatform: a custom DashScope baseURL → chat + enable_thinking (custom:qwen3.7-plus)", () => {
