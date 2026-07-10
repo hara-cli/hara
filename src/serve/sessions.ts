@@ -42,6 +42,8 @@ export interface ServeSession {
   projectContext?: string;
   busy: boolean; // one turn per session at a time
   abort: AbortController | null; // in-flight turn's interrupt handle
+  /** per-session thinking dial override (set via session.set-model) — informational; the provider carries it */
+  effort?: string;
 }
 
 export class SessionHub {

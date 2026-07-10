@@ -15,6 +15,8 @@
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}
 //   automation.list   {}                          → {jobs:[{id,name,mode,enabled,lastRunAt,lastStatus,…}],
 //                                                    sessions:[{id,title,source,sourceName,updatedAt,…}]}
+//   models.list       {}                          → {models:[…], current, effortLevels:[…]}
+//   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)
 // Server → client notifications (all carry sessionId):
 //   event.text / event.reasoning {delta} · event.tool {name,preview} · event.diff {text}
 //   event.notice {text} · event.turn_end {reply,usage,error?} · approval.request {approvalId,question}

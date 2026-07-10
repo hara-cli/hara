@@ -83,6 +83,7 @@ import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
 import { resolvePlatform } from "./providers/registry.js";
+import { levelsFor } from "./tui/model-picker.js";
 import { listModels } from "./providers/models.js";
 import { listJobs, tailJob, killJob } from "./exec/jobs.js";
 
@@ -1652,6 +1653,10 @@ program
         providerId: cfg.provider,
         model: cfg.model,
         buildSessionProvider: async () => withRouting(await buildProvider(cfg), cfg),
+        buildProviderFor: async (model, effort) =>
+          withRouting(await buildProvider({ ...cfg, model, reasoningEffort: (effort as HaraConfig["reasoningEffort"]) ?? cfg.reasoningEffort }), cfg),
+        listModels: () => listModels(cfg.baseURL ?? providerDefaultBaseURL(cfg.provider), cfg.apiKey ?? ""),
+        effortLevels: levelsFor(resolvePlatform(cfg.provider, cfg.baseURL ?? providerDefaultBaseURL(cfg.provider)).reasoning).filter((e): e is NonNullable<typeof e> => !!e),
         spawnSubagent: (provider, scwd, projectContext, stats, task, role) => runSubagent(cfg, provider, scwd, sandbox, projectContext, stats, task, role),
         guardian: guardianOpt,
         sandbox,

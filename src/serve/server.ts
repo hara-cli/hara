@@ -28,6 +28,12 @@ export interface ServeDeps {
   providerId: string;
   model: string;
   buildSessionProvider: () => Promise<Provider | null>; // fresh provider per session (stateless today, cheap)
+  /** provider for a specific model/effort — powers per-session model switching (composer picker) */
+  buildProviderFor?: (model: string, effort?: string) => Promise<Provider | null>;
+  /** live model list from the endpoint (may be empty — not every endpoint enumerates) */
+  listModels?: () => Promise<string[]>;
+  /** thinking-dial levels valid for this endpoint's reasoning style (from the provider registry) */
+  effortLevels?: string[];
   spawnSubagent: (provider: Provider, cwd: string, projectContext: string | undefined, stats: { input: number; output: number; lastInput?: number }, task: string, role?: string) => Promise<string>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
   sandbox: SandboxMode;
@@ -225,6 +231,27 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!listInstalled().some((pl) => pl.name === p.name)) return reply(rpcError(id, ERR.PARAMS, `no installed plugin "${p.name}"`));
             setPluginEnabled(p.name, p.enabled);
             return reply(rpcResult(id!, { name: p.name, enabled: p.enabled })); // takes effect on the next session/turn (loaders re-read)
+          }
+          case "models.list": {
+            const models = deps.listModels ? await deps.listModels().catch(() => []) : [];
+            return reply(rpcResult(id!, { models, current: deps.model, effortLevels: deps.effortLevels ?? [] }));
+          }
+          case "session.set-model": {
+            // per-session model / thinking-effort switch (the composer picker). Rebuilds the session's
+            // provider; takes effect on the NEXT turn. Refused mid-turn.
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            const s = hub.get(p.sessionId);
+            if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            if (s.busy) return reply(rpcError(id, ERR.BUSY, "a turn is running — switch after it finishes"));
+            const model = typeof p.model === "string" && p.model ? p.model : s.meta.model;
+            const effort = typeof p.effort === "string" && p.effort ? p.effort : undefined;
+            if (!deps.buildProviderFor) return reply(rpcError(id, ERR.METHOD, "model switching not supported by this server"));
+            const provider = await deps.buildProviderFor(model, effort);
+            if (!provider) return reply(rpcError(id, ERR.INTERNAL, `could not build provider for ${model}`));
+            s.provider = provider;
+            s.meta.model = model;
+            s.effort = effort;
+            return reply(rpcResult(id!, { sessionId: s.meta.id, model, effort: effort ?? null }));
           }
           case "automation.list": {
             // The automation timeline's data: cron jobs with their last outcome, plus this machine's
