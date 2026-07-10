@@ -155,6 +155,12 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(badSet.error.code, -32602, "plugins.set on unknown plugin → params error (never writes config)");
     const skills = await c.call("skills.list", {});
     assert.ok(Array.isArray(skills.result.skills), "skills.list returns an array");
+    const auto = await c.call("automation.list", {});
+    assert.ok(Array.isArray(auto.result.jobs) && Array.isArray(auto.result.sessions), "automation.list returns jobs + sessions");
+    // sessions created through serve are stamped interactive → never leak into the automation timeline
+    assert.equal(auto.result.sessions.some((s) => s.id === sid), false, "serve session not in automation list");
+    const listed2 = await c.call("session.list", {});
+    assert.equal(listed2.result.sessions[0].source, "interactive", "session.list carries source");
   } finally {
     c.close();
     await srv.close();

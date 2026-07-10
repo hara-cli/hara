@@ -116,6 +116,8 @@ import {
   listSessions,
   latestForCwd,
   titleFrom,
+  sessionSourceFromEnv,
+  automatedTitle,
   slugify,
   type SessionMeta,
   type SessionData,
@@ -2299,7 +2301,19 @@ program.action(async (opts) => {
       const rid = opts.resume ? (resolveSessionId(opts.resume) ?? opts.resume) : latestForCwd(cwd)?.meta.id;
       const prior = rid ? loadSession(rid) : null;
       if (prior?.history) history.push(...prior.history);
-      meta = prior?.meta ?? { id: rid ?? newSessionId(), cwd, provider: cfg.provider, model: cfg.model, title: "", createdAt: new Date().toISOString(), updatedAt: "" };
+      // Stamp who created this session (cron runner sets HARA_CRON, gateway sets HARA_GATEWAY) and give
+      // automated sessions a "name · time" title UP FRONT — the raw prompt must never become the title.
+      const src = sessionSourceFromEnv();
+      meta = prior?.meta ?? {
+        id: rid ?? newSessionId(),
+        cwd,
+        provider: cfg.provider,
+        model: cfg.model,
+        title: src.source === "interactive" ? "" : automatedTitle(src.source, src.sourceName),
+        createdAt: new Date().toISOString(),
+        updatedAt: "",
+        ...(src.source !== "interactive" ? { source: src.source, sourceName: src.sourceName } : { source: "interactive" as const }),
+      };
       // Apply per-session pinned model on headless resume (mirrors the interactive path).
       // --model flag wins (already on cfg.model) and is written back; otherwise restore meta.model.
       if (prior) {
@@ -2461,6 +2475,7 @@ program.action(async (opts) => {
     title: "",
     createdAt: new Date().toISOString(),
     updatedAt: "",
+    source: "interactive",
   };
   // Single-writer guard: two hara processes on the SAME session race writes to its append-only history and
   // corrupt it. Lock it here (a brand-new session's id is unique, so this only ever blocks a DOUBLE-resume

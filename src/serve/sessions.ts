@@ -57,6 +57,7 @@ export class SessionHub {
       title: "",
       createdAt: new Date().toISOString(),
       updatedAt: "",
+      source: "interactive", // serve sessions are user-driven (desktop/IDE clients)
     };
     this.store.acquire(meta.id); // fresh id — always ours; registers the single-writer claim
     const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, busy: false, abort: null };

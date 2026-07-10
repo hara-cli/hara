@@ -18,6 +18,7 @@ import { loadAgentsMd } from "../context/agents-md.js";
 import { memoryDigest } from "../memory/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled } from "../plugins/plugins.js";
 import { loadSkillIndex } from "../skills/skills.js";
+import { loadJobs } from "../cron/store.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 
@@ -176,7 +177,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
         switch (req.method) {
           case "session.list":
-            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, updatedAt: m.updatedAt })) }));
+            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName })) }));
           case "session.create": {
             const provider = await deps.buildSessionProvider();
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — run `hara setup`"));
@@ -224,6 +225,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!listInstalled().some((pl) => pl.name === p.name)) return reply(rpcError(id, ERR.PARAMS, `no installed plugin "${p.name}"`));
             setPluginEnabled(p.name, p.enabled);
             return reply(rpcResult(id!, { name: p.name, enabled: p.enabled })); // takes effect on the next session/turn (loaders re-read)
+          }
+          case "automation.list": {
+            // The automation timeline's data: cron jobs with their last outcome, plus this machine's
+            // automated sessions (source=cron/gateway) so the desktop can render results and "continue
+            // as conversation". Read-only.
+            const jobs = loadJobs().map((j) => ({ id: j.id, name: j.name, mode: j.mode, cwd: j.cwd, enabled: j.enabled, deliver: j.deliver, lastRunAt: j.lastRunAt, lastStatus: j.lastStatus, lastError: j.lastError }));
+            const automated = hub.list().filter((m) => m.source === "cron" || m.source === "gateway").map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, source: m.source, sourceName: m.sourceName, updatedAt: m.updatedAt }));
+            return reply(rpcResult(id!, { jobs, sessions: automated }));
           }
           case "skills.list": {
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;

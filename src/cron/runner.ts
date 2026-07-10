@@ -59,7 +59,9 @@ export function runJobOnce(job: CronJob): Promise<{ ok: boolean; error?: string;
       job.mode === "command"
         ? ["bash", ["-lc", job.task]]
         : [self[0], [...self.slice(1), ...(job.mode === "org" ? ["org", job.task] : ["-p", job.task, "--approval", "full-auto"])]];
-    const child = spawn(cmd, argv as string[], { cwd: job.cwd, env: { ...process.env, HARA_CRON: "1" } });
+    // HARA_CRON_NAME rides along so the child session's meta gets a human title ("job name · time")
+    // instead of the raw prompt (session store's automated-title strategy).
+    const child = spawn(cmd, argv as string[], { cwd: job.cwd, env: { ...process.env, HARA_CRON: "1", HARA_CRON_NAME: job.name } });
     let tail = ""; // last few KB, for chat delivery (the full stream goes to the log file)
     const append = (d: Buffer): void => {
       tail = (tail + d.toString()).slice(-4_000);

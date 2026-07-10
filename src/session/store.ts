@@ -5,6 +5,26 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync
 import { randomUUID } from "node:crypto";
 import type { NeutralMsg } from "../providers/types.js";
 
+/** Who created a session. Absent = legacy/interactive. Drives UI segregation (desktop: automated
+ *  sessions render as a status timeline, never mixed into the manual list) and the title strategy
+ *  (automated sessions get "name · time", NEVER the raw prompt). */
+export type SessionSource = "interactive" | "gateway" | "cron";
+
+/** Derive the session source from the spawn environment — the gateway subprocess runs with
+ *  HARA_GATEWAY=<platform>, the cron runner with HARA_CRON=1 (+ HARA_CRON_NAME=<job name>). */
+export function sessionSourceFromEnv(): { source: SessionSource; sourceName?: string } {
+  if (process.env.HARA_CRON) return { source: "cron", sourceName: process.env.HARA_CRON_NAME || undefined };
+  if (process.env.HARA_GATEWAY) return { source: "gateway", sourceName: process.env.HARA_GATEWAY };
+  return { source: "interactive" };
+}
+
+/** Title for a NON-interactive session: "name · MM-DD HH:mm" — the raw prompt never becomes a title. */
+export function automatedTitle(source: SessionSource, sourceName: string | undefined, at = new Date()): string {
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  const stamp = `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}:${pad(at.getMinutes())}`;
+  return `${sourceName || source} · ${stamp}`;
+}
+
 export interface SessionMeta {
   id: string;
   cwd: string;
@@ -18,6 +38,10 @@ export interface SessionMeta {
   updatedAt: string;
   /** short-term working memory — a few durable one-liners that survive /compact + resume */
   workingSet?: string[];
+  /** creator of this session (absent = legacy/interactive) — see SessionSource */
+  source?: SessionSource;
+  /** human tag for automated sessions: cron job name / gateway platform */
+  sourceName?: string;
 }
 export interface SessionData {
   meta: SessionMeta;
