@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.116.0 — the desktop-grade serve protocol (models · automation · rename/archive · capabilities)
+
+- **Session source stamping.** Sessions now record WHO created them (`interactive` / `gateway` / `cron`,
+  env-derived; the cron runner passes the job name along) — and automated sessions get a
+  **"name · MM-DD HH:mm" title at creation**, so a cron prompt never becomes a session title again.
+- **`hara serve` protocol, batch 2** (everything the Hara desktop app drives):
+  - `models.list` (endpoint model catalog + thinking-effort levels) and `session.set-model`
+    (per-session model/effort switch, applies next turn)
+  - `automation.list` — cron jobs with last outcome + automated sessions, for the desktop's
+    automation timeline
+  - `session.rename` + `session.archive` (archived sessions hidden from lists, kept on disk)
+  - `initialize` now advertises `capabilities.methods` — clients feature-detect instead of
+    probing for method-not-found
+  - `session.send` expands `@file` mentions (CLI parity)
+  - `session.list` carries `source` / `sourceName` / `archived`
+
 ## 0.115.0 — serve exposes plugins & skills (desktop plugin panel)
 
 - **`hara serve` protocol grows a plugin surface**: `plugins.list` (installed plugins with enabled state +
