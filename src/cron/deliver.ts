@@ -4,9 +4,12 @@
 //   telegram:<chatId>   (HARA_TELEGRAM_TOKEN)
 //   feishu:<chatId>     (HARA_FEISHU_APP_ID + HARA_FEISHU_APP_SECRET)
 //   webhook:<url>       (plain POST {name,status,text} JSON — for anything else)
-// WeChat is intentionally absent: its transport needs the long-lived gateway session, so a one-shot
-// cron process can't speak it — use feishu/telegram/webhook for cron delivery.
+//   weixin:owner        (sends over stored ~/.hara/weixin creds — no live daemon needed, same path the
+//                        wechat-send skill uses; "owner" auto-resolves the bot owner, or give weixin:<peerId>)
 // Adapters are imported LAZILY so the (heavy) SDKs never load unless a job actually delivers.
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 export interface DeliverTarget {
   platform: "telegram" | "feishu" | "webhook";

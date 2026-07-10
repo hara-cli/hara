@@ -5,6 +5,13 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.115.0 — serve exposes plugins & skills (desktop plugin panel)
+
+- **`hara serve` protocol grows a plugin surface**: `plugins.list` (installed plugins with enabled state +
+  contribution counts), `plugins.set` (enable/disable by name — applies to future sessions/turns), and
+  `skills.list` (the skill index for a cwd). This powers the hara desktop app's plugin manager panel;
+  any WS client gets it for free.
+
 ## 0.114.0 — long files read in slices · repeat-guard anti-spinning · `hara serve` (the desktop/IDE backbone)
 
 - **Long files no longer flood the context.** `read_file` now returns cat-n numbered lines with

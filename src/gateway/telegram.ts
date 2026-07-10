@@ -15,6 +15,11 @@ export interface InboundMsg {
   text: string;
   /** local paths to inbound images the agent should SEE (attached inline / described downstream) */
   images?: string[];
+  /** Chat kind, when the adapter can tell — lets gateway flows target groups vs DMs. Omitted = adapter didn't say. */
+  chatType?: "p2p" | "group";
+  /** People @-mentioned in this message, when the platform surfaces them. `isSelf` = the gateway bot itself was
+   *  mentioned — the permission-friendly signal a `mention:"self"` flow triggers on. */
+  mentions?: { id?: string; name?: string; isSelf?: boolean }[];
 }
 export interface ChatAdapter {
   name: string;
