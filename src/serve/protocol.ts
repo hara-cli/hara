@@ -17,6 +17,8 @@
 //   automation.list   {}                          → {jobs:[{id,name,mode,enabled,lastRunAt,lastStatus,…}],
 //                                                    sessions:[{id,title,source,sourceName,updatedAt,…}]}
 //   models.list       {}                          → {models:[…], current, effortLevels:[…]}
+//   session.rename    {sessionId,title}           → {sessionId,title}
+//   session.archive   {sessionId,archived}        → {sessionId,archived}   (list hides archived unless {archived:true})
 //   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)
 // Server → client notifications (all carry sessionId):
 //   event.text / event.reasoning {delta} · event.tool {name,preview} · event.diff {text}

@@ -42,6 +42,8 @@ export interface SessionMeta {
   source?: SessionSource;
   /** human tag for automated sessions: cron job name / gateway platform */
   sourceName?: string;
+  /** archived sessions are hidden from pickers/lists but kept on disk (codex thread/archive) */
+  archived?: boolean;
 }
 export interface SessionData {
   meta: SessionMeta;

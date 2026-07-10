@@ -100,6 +100,36 @@ export class SessionHub {
     this.store.save(s.meta, s.history);
   }
 
+  /** Rename a session (live or on-disk). Returns false when the id is unknown. */
+  rename(id: string, title: string): boolean {
+    const live = this.sessions.get(id);
+    if (live) {
+      live.meta.title = title;
+      this.store.save(live.meta, live.history);
+      return true;
+    }
+    const prior = this.store.load(id);
+    if (!prior) return false;
+    prior.meta.title = title;
+    this.store.save(prior.meta, prior.history);
+    return true;
+  }
+
+  /** Archive/unarchive (hidden from lists, kept on disk). Returns false when unknown. */
+  setArchived(id: string, on: boolean): boolean {
+    const live = this.sessions.get(id);
+    if (live) {
+      live.meta.archived = on;
+      this.store.save(live.meta, live.history);
+      return true;
+    }
+    const prior = this.store.load(id);
+    if (!prior) return false;
+    prior.meta.archived = on;
+    this.store.save(prior.meta, prior.history);
+    return true;
+  }
+
   /** Release all locks (server shutdown). In-flight turns are aborted by the caller first. */
   releaseAll(): void {
     for (const id of this.sessions.keys()) this.store.release(id);

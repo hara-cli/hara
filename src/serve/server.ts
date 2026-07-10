@@ -190,7 +190,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
         switch (req.method) {
           case "session.list":
-            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName })) }));
+            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, archived: m.archived ?? false })) }));
           case "session.create": {
             const provider = await deps.buildSessionProvider();
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — run `hara setup`"));
@@ -238,6 +238,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!listInstalled().some((pl) => pl.name === p.name)) return reply(rpcError(id, ERR.PARAMS, `no installed plugin "${p.name}"`));
             setPluginEnabled(p.name, p.enabled);
             return reply(rpcResult(id!, { name: p.name, enabled: p.enabled })); // takes effect on the next session/turn (loaders re-read)
+          }
+          case "session.rename": {
+            if (typeof p.sessionId !== "string" || typeof p.title !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId + title required"));
+            if (!hub.rename(p.sessionId, p.title.slice(0, 120))) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            return reply(rpcResult(id!, { sessionId: p.sessionId, title: p.title.slice(0, 120) }));
+          }
+          case "session.archive": {
+            if (typeof p.sessionId !== "string" || typeof p.archived !== "boolean") return reply(rpcError(id, ERR.PARAMS, "sessionId + archived required"));
+            if (!hub.setArchived(p.sessionId, p.archived)) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            return reply(rpcResult(id!, { sessionId: p.sessionId, archived: p.archived }));
           }
           case "models.list": {
             const models = deps.listModels ? await deps.listModels().catch(() => []) : [];
