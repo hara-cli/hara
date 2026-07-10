@@ -1624,6 +1624,48 @@ program
   });
 
 program
+  .command("serve")
+  .description("run the local hara server (WebSocket JSON-RPC) that desktop shells / IDE clients drive — persistent sessions, streaming events, approval round-trips")
+  .option("--host <host>", "bind address — keep it loopback unless you know what you're doing", "127.0.0.1")
+  .option("--port <n>", "port to listen on", "8790")
+  .option("--token <token>", "auth token (default: generated; written to ~/.hara/serve.json for clients to discover)")
+  .option("--cwd <dir>", "default working directory for new sessions (default: current directory)")
+  .option("--approval <mode>", "default approval mode for sessions: suggest | auto-edit | full-auto", "auto-edit")
+  .action(async (o) => {
+    const cfg = loadConfig();
+    const provider0 = await withRouting(await buildProvider(cfg), cfg);
+    if (!provider0) {
+      out(c.red(`Not authenticated for '${cfg.provider}' — run \`hara setup\` first.\n`));
+      process.exit(1);
+    }
+    const guardianOpt = await buildGuardian(cfg, provider0);
+    const cwd = o.cwd ? (await import("node:path")).resolve(o.cwd) : process.cwd();
+    const sandbox = (process.env.HARA_SANDBOX ?? cfg.sandbox ?? "off") as SandboxMode;
+    const approval = (APPROVAL_MODES as readonly string[]).includes(o.approval) ? (o.approval as ApprovalMode) : "auto-edit";
+    const { startServe } = await import("./serve/server.js");
+    const handle = await startServe(
+      { host: o.host, port: Number(o.port) || 8790, token: o.token, cwd },
+      {
+        version: pkg.version,
+        providerId: cfg.provider,
+        model: cfg.model,
+        buildSessionProvider: async () => withRouting(await buildProvider(cfg), cfg),
+        spawnSubagent: (provider, scwd, projectContext, stats, task, role) => runSubagent(cfg, provider, scwd, sandbox, projectContext, stats, task, role),
+        guardian: guardianOpt,
+        sandbox,
+        approval,
+      },
+    );
+    out(c.bold("hara serve") + c.dim(`  ·  ws://${o.host}:${handle.port}  ·  ${cfg.provider}:${cfg.model}  ·  approval ${approval}  ·  token → ~/.hara/serve.json\n`));
+    const bye = async (): Promise<void> => {
+      await handle.close();
+      process.exit(0);
+    };
+    process.on("SIGINT", bye);
+    process.on("SIGTERM", bye);
+  });
+
+program
   .command("remote [action] [text]")
   .description("drive THIS tmux session from chat: register the pane so WeChat replies inject back into it. actions: ask \"<q>\" | bind | back | status")
   .action(async (action = "status", text?: string) => {

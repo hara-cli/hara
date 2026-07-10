@@ -1,0 +1,69 @@
+// hara serve protocol v1 — JSON-RPC 2.0 over WebSocket text frames. This is the contract the desktop
+// shell (and any ACP/IDE client) speaks; the transport lives in server.ts, sessions in sessions.ts.
+// Everything here is PURE (parse + frame builders + error codes) and unit-tested.
+//
+// Client → server requests:
+//   initialize        {token}                    → {name,version,protocol,cwd,provider,model}
+//   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,updatedAt}]}
+//   session.create    {cwd?,approval?}           → {sessionId,model}
+//   session.resume    {sessionId}                → {sessionId,model,history:[{role,text}]}
+//   session.send      {sessionId,text}           → (streams events, then) {reply,usage}
+//   session.interrupt {sessionId}                → {}
+//   approval.reply    {approvalId,allow,always?}  → {}
+// Server → client notifications (all carry sessionId):
+//   event.text / event.reasoning {delta} · event.tool {name,preview} · event.diff {text}
+//   event.notice {text} · event.turn_end {reply,usage,error?} · approval.request {approvalId,question}
+
+export const PROTOCOL_VERSION = 1;
+
+export interface RpcRequest {
+  jsonrpc: "2.0";
+  id?: number | string;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+/** JSON-RPC error codes: standard ones plus hara-specific (-320xx). */
+export const ERR = {
+  PARSE: -32700,
+  INVALID: -32600,
+  METHOD: -32601,
+  PARAMS: -32602,
+  INTERNAL: -32603,
+  UNAUTHORIZED: -32001, // initialize first (or bad token)
+  BUSY: -32002, // session already has a turn in flight
+  NO_SESSION: -32003, // unknown/expired sessionId
+  LOCKED: -32004, // session held by another live hara process (single-writer lock)
+} as const;
+
+/** Parse one inbound text frame into a request. Returns {error} (never throws) on malformed input —
+ *  the transport turns that into a PARSE/INVALID error response. */
+export function parseFrame(raw: string): { req: RpcRequest } | { error: string } {
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    return { error: "not JSON" };
+  }
+  const o = v as Partial<RpcRequest> | null;
+  if (!o || typeof o !== "object" || o.jsonrpc !== "2.0" || typeof o.method !== "string" || !o.method) {
+    return { error: "not a JSON-RPC 2.0 request" };
+  }
+  if (o.id !== undefined && typeof o.id !== "number" && typeof o.id !== "string") return { error: "bad id" };
+  if (o.params !== undefined && (typeof o.params !== "object" || o.params === null || Array.isArray(o.params))) {
+    return { error: "params must be an object" };
+  }
+  return { req: o as RpcRequest };
+}
+
+export function rpcResult(id: number | string, result: unknown): string {
+  return JSON.stringify({ jsonrpc: "2.0", id, result });
+}
+
+export function rpcError(id: number | string | null, code: number, message: string): string {
+  return JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } });
+}
+
+export function rpcNotify(method: string, params: Record<string, unknown>): string {
+  return JSON.stringify({ jsonrpc: "2.0", method, params });
+}
