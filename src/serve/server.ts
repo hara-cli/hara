@@ -5,11 +5,18 @@
 // (no import cycle back into the CLI entry).
 import { WebSocketServer, type WebSocket } from "ws";
 import { randomBytes, randomUUID, timingSafeEqual, createHash } from "node:crypto";
-import { writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { runAgent } from "../agent/loop.js";
+import { COMPACT_SYSTEM, buildFileRestore, workingSetFromSummary } from "../agent/compact.js";
+import { rewindTo } from "../agent/rewind.js";
+import { analyzeContext } from "../agent/context-report.js";
+import { recentTouched } from "../agent/touched.js";
+import { contextWindow, ctxPctFor } from "../statusbar.js";
+import { listProjectFiles } from "../fs-walk.js";
+import { fuzzyRank } from "../fuzzy.js";
 import type { Provider, NeutralMsg } from "../providers/types.js";
 import type { UiSink } from "../tools/registry.js";
 import type { ApprovalMode } from "../config.js";
@@ -112,7 +119,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   }
 
   /** Run one turn on a session, streaming events to all authed clients. */
-  const runTurn = async (s: ServeSession, text: string, images?: { path: string; mediaType: string }[]): Promise<{ reply: string; usage: { input: number; output: number } }> => {
+  const runTurn = async (
+    s: ServeSession,
+    text: string,
+    images?: { path: string; mediaType: string }[],
+  ): Promise<{ reply: string; usage: { input: number; output: number }; ctx: { lastInput: number; window: number; pct: number } }> => {
     const sessionId = s.meta.id;
     s.busy = true;
     s.abort = new AbortController();
@@ -161,12 +172,53 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       hub.save(s);
       const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
       const reply = lastAssistantText(s.history);
-      broadcast("event.turn_end", { sessionId, reply, usage });
-      return { reply, usage };
+      // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
+      // clients render a meter without an extra round-trip.
+      const ctx = ctxOf(s);
+      broadcast("event.turn_end", { sessionId, reply, usage, ctx });
+      return { reply, usage, ctx };
     } finally {
       s.busy = false;
       s.abort = null;
     }
+  };
+
+  /** Context watermark for a session: how full the model's window was on the last turn. */
+  const ctxOf = (s: ServeSession): { lastInput: number; window: number; pct: number } => {
+    const lastInput = s.stats.lastInput ?? 0;
+    return { lastInput, window: contextWindow(s.meta.model), pct: ctxPctFor(s.meta.model, lastInput) };
+  };
+
+  /** Summarize + replace a session's history — the CLI's /compact, serve-side (codex thread/compact).
+   *  Mirrors index.ts compactConversation; the file restore is limited to files under the session's own
+   *  cwd because serve is multi-session (recentTouched is process-wide and must not leak across projects). */
+  const compactSession = async (s: ServeSession): Promise<string | null> => {
+    const r = await s.provider.turn({
+      system: COMPACT_SYSTEM,
+      history: [...s.history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
+      tools: [],
+      onText: () => {},
+    });
+    if (r.stop === "error") return null;
+    const summary = r.text.trim();
+    if (!summary) return null;
+    s.meta.workingSet = workingSetFromSummary(summary);
+    s.history.length = 0;
+    s.history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
+    const touched = recentTouched(20).filter((f) => f.startsWith(s.meta.cwd)).slice(0, 5);
+    const restore = buildFileRestore(touched, (f) => {
+      try {
+        return readFileSync(f, "utf8");
+      } catch {
+        return null;
+      }
+    });
+    if (restore) s.history.push({ role: "user", content: restore });
+    s.stats.input += r.usage?.input ?? 0;
+    s.stats.output += r.usage?.output ?? 0;
+    s.stats.lastInput = r.usage?.input ?? 0; // ctx% now reflects the (small) summary
+    hub.save(s);
+    return summary;
   };
 
   wss.on("connection", (ws: WebSocket) => {
@@ -186,7 +238,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
             "session.list", "session.create", "session.resume", "session.send", "session.interrupt", "session.set-model",
-            "approval.reply", "plugins.list", "plugins.set", "skills.list", "automation.list", "models.list",
+            "session.rename", "session.archive", "session.compact", "session.rewind", "session.context",
+            "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search",
+            "automation.list", "automation.add", "automation.toggle", "automation.delete",
           ];
           return reply(rpcResult(id!, { name: "hara", version: deps.version, protocol: PROTOCOL_VERSION, cwd: opts.cwd, provider: deps.providerId, model: deps.model, capabilities: { methods } }));
         }
@@ -321,6 +375,58 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           case "skills.list": {
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             return reply(rpcResult(id!, { skills: loadSkillIndex(cwd).map((s) => ({ id: s.id, description: s.description, source: s.source })) }));
+          }
+          case "files.search": {
+            // fuzzy file lookup for the composer's @-mention autocomplete (codex fuzzyFileSearch).
+            // Relative POSIX paths; empty query returns the first files as a browse list.
+            const sess = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
+            const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : (sess?.meta.cwd ?? opts.cwd);
+            const limit = Math.min(Math.max(Math.trunc(Number(p.limit) || 20), 1), 50);
+            const all = listProjectFiles(cwd);
+            const query = typeof p.query === "string" ? p.query : "";
+            const files = query ? fuzzyRank(query, all, (f) => f).slice(0, limit).map((r) => r.item) : all.slice(0, limit);
+            return reply(rpcResult(id!, { files, cwd }));
+          }
+          case "session.context": {
+            // context-spend breakdown + watermark on demand (codex thread/tokenUsage + /context).
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            const s = hub.get(p.sessionId);
+            if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            const report = analyzeContext(s.history);
+            return reply(rpcResult(id!, { sessionId: s.meta.id, ...ctxOf(s), total: report.total, rows: report.rows.slice(0, 8) }));
+          }
+          case "session.compact": {
+            // manual compaction (codex thread/compact/start): summarize + replace history, keep working
+            // notes, restore this-cwd touched files. Busy-guarded like a turn — it IS a provider call.
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            const s = hub.get(p.sessionId);
+            if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            if (s.busy) return reply(rpcError(id, ERR.BUSY, "a turn is running — compact after it finishes"));
+            if (s.history.length < 2) return reply(rpcError(id, ERR.PARAMS, "nothing to compact yet"));
+            s.busy = true;
+            try {
+              broadcast("event.notice", { sessionId: s.meta.id, text: "✻ Compacting conversation…" });
+              const summary = await compactSession(s);
+              if (!summary) return reply(rpcError(id, ERR.INTERNAL, "compaction failed — try again or /clear"));
+              broadcast("event.notice", { sessionId: s.meta.id, text: `(compacted — history replaced with a summary; ${s.meta.workingSet?.length ?? 0} notes kept)` });
+              return reply(rpcResult(id!, { sessionId: s.meta.id, ctx: ctxOf(s), notes: s.meta.workingSet?.length ?? 0, history: historyForClient(s.history) }));
+            } finally {
+              s.busy = false;
+            }
+          }
+          case "session.rewind": {
+            // fork the thread back to before the n-th-most-recent user turn (codex thread/rollback;
+            // n=1 drops the last exchange). History-only — file edits are not reverted.
+            if (typeof p.sessionId !== "string" || !Number.isInteger(p.n)) return reply(rpcError(id, ERR.PARAMS, "sessionId + n required"));
+            const s = hub.get(p.sessionId);
+            if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            if (s.busy) return reply(rpcError(id, ERR.BUSY, "a turn is running — rewind after it finishes"));
+            const next = rewindTo(s.history, p.n);
+            if (!next) return reply(rpcError(id, ERR.PARAMS, `n out of range (1..${s.history.filter((m) => m.role === "user").length})`));
+            s.history.length = 0;
+            s.history.push(...next);
+            hub.save(s);
+            return reply(rpcResult(id!, { sessionId: s.meta.id, history: historyForClient(s.history) }));
           }
           default:
             return reply(rpcError(id, ERR.METHOD, `unknown method ${req.method}`));

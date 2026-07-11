@@ -3,7 +3,7 @@
 // dir under approval "suggest" forces the confirm gate).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
@@ -162,6 +162,71 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(auto.result.sessions.some((s) => s.id === sid), false, "serve session not in automation list");
     const listed2 = await c.call("session.list", {});
     assert.equal(listed2.result.sessions[0].source, "interactive", "session.list carries source");
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: files.search + session.context + compact + rewind (codex desktop parity set)", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-"));
+  mkdirSync(join(dir, "src"), { recursive: true });
+  writeFileSync(join(dir, "src", "alpha.ts"), "export const a = 1;\n");
+  writeFileSync(join(dir, "src", "beta.ts"), "export const b = 2;\n");
+  writeFileSync(join(dir, "readme.md"), "# hi\n");
+  const store = memStore();
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(textProvider, store));
+  const c = await connect(srv.port);
+  try {
+    const init = await c.call("initialize", { token: "tok" });
+    for (const m of ["files.search", "session.context", "session.compact", "session.rewind"]) {
+      assert.ok(init.result.capabilities.methods.includes(m), `capability ${m} advertised`);
+    }
+
+    // files.search: fuzzy match + browse-all on empty query (relative POSIX paths)
+    const hit = await c.call("files.search", { cwd: dir, query: "alpha" });
+    assert.ok(hit.result.files.includes("src/alpha.ts"), `fuzzy hit, got ${JSON.stringify(hit.result.files)}`);
+    const all = await c.call("files.search", { cwd: dir, query: "" });
+    assert.ok(all.result.files.length >= 3, "empty query lists files");
+
+    const { result } = await c.call("session.create", {});
+    const sid = result.sessionId;
+
+    // session.context resolves the session's cwd when cwd is omitted from files.search
+    const viaSession = await c.call("files.search", { sessionId: sid, query: "beta" });
+    assert.ok(viaSession.result.files.includes("src/beta.ts"), "files.search resolves cwd from sessionId");
+
+    // two turns → history u,a,u,a; turn_end carries the ctx watermark
+    const sent1 = await c.call("session.send", { sessionId: sid, text: "one" });
+    assert.ok(sent1.result.ctx && typeof sent1.result.ctx.pct === "number" && sent1.result.ctx.window > 0, "send returns ctx watermark");
+    await c.call("session.send", { sessionId: sid, text: "two" });
+    const te = c.events.find((e) => e.method === "event.turn_end");
+    assert.ok(te.params.ctx && typeof te.params.ctx.pct === "number", "turn_end event carries ctx");
+
+    // session.context: watermark + spend breakdown
+    const ctx = await c.call("session.context", { sessionId: sid });
+    assert.ok(ctx.result.window > 0 && Array.isArray(ctx.result.rows) && ctx.result.total > 0, "context report shape");
+
+    // session.rewind n=1 → drops the last exchange (4 → 2 entries client-side)
+    const rew = await c.call("session.rewind", { sessionId: sid, n: 1 });
+    assert.equal(rew.result.history.length, 2, "rewind dropped the last exchange");
+    assert.equal(rew.result.history[0].text, "one", "the first exchange survived");
+    const oor = await c.call("session.rewind", { sessionId: sid, n: 99 });
+    assert.equal(oor.error.code, -32602, "out-of-range n → params error");
+
+    // session.compact: history replaced with a summary (fake provider's "hello"), notes kept
+    const comp = await c.call("session.compact", { sessionId: sid });
+    assert.ok(comp.result.history[0].text.startsWith("Summary of our conversation"), "history replaced by summary");
+    assert.ok(comp.result.notes >= 1, "working notes distilled");
+    assert.ok(comp.result.ctx && typeof comp.result.ctx.pct === "number", "compact returns fresh ctx");
+    const notices = c.events.filter((e) => e.method === "event.notice").map((e) => e.params.text);
+    assert.ok(notices.some((t) => t.includes("Compacting")), "compaction announced");
+    assert.ok(store.saved.get(sid).history.length <= 2, "compacted history persisted");
+    // compacting an (effectively) empty session refuses politely
+    const { result: fresh } = await c.call("session.create", {});
+    const nothing = await c.call("session.compact", { sessionId: fresh.sessionId });
+    assert.equal(nothing.error.code, -32602, "nothing to compact → params error");
   } finally {
     c.close();
     await srv.close();

@@ -62,7 +62,7 @@ import {
 } from "./profile/profile.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
-import { shouldAutoCompact, shouldAutoCompactTokens, AUTO_COMPACT_TOKEN_CAP, COMPACT_SYSTEM, buildFileRestore } from "./agent/compact.js";
+import { shouldAutoCompact, shouldAutoCompactTokens, AUTO_COMPACT_TOKEN_CAP, COMPACT_SYSTEM, buildFileRestore, workingSetFromSummary } from "./agent/compact.js";
 import { recentTouched } from "./agent/touched.js";
 import { INTERJECT_PREFIX } from "./agent/reminders.js";
 import { checkForUpdate } from "./update-check.js";
@@ -817,14 +817,8 @@ const MEMORY_DISTILL_SYSTEM =
   "conventions / user preferences from the logs that are NOT already captured, and persist each with " +
   "memory_write (target=memory, or target=user for preferences; pick the right scope=project|global). " +
   "Skip the ephemeral, the one-off, and anything already known. Be terse and de-duplicated. Then reply DONE.";
-// COMPACT_SYSTEM (the 8-section brief) lives in agent/compact.ts so tests can pin its structure.
-const workingSetFromSummary = (s: string): string[] =>
-  s
-    .split("\n")
-    .map((l) => l.replace(/^[-*\d.\s]+/, "").trim())
-    .filter((l) => l.length > 3)
-    .slice(0, 12)
-    .map((l) => l.slice(0, 140));
+// COMPACT_SYSTEM (the 8-section brief) + workingSetFromSummary live in agent/compact.ts so tests can
+// pin their structure and serve's session.compact shares the exact same distillation.
 
 /** Summarize the conversation and replace history with the summary (keeping working-memory notes). Shared by
  *  /compact (manual) and auto-compaction. Returns the summary, or null on failure / nothing to do. */
