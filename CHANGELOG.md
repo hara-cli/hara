@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.117.0 — serve batch 3: context watermark · compact · rewind · fuzzy file search
+
+Codex-desktop parity for the conversation-hygiene set — everything a client needs to keep a long
+session healthy without dropping to the CLI:
+
+- **Context watermark everywhere.** Every `session.send` result and `event.turn_end` now carries
+  `ctx: { lastInput, window, pct }` — how full the model's window was on the last turn. Clients
+  render a live meter with zero extra round-trips. `session.context` returns the same watermark
+  plus the spend breakdown (your messages / assistant / per-tool) on demand.
+- **`session.compact`** — the CLI's `/compact`, serve-side: summarize-and-replace with the same
+  8-section brief, working-memory notes kept on the session, and the recently-touched-file restore
+  (limited to files under the session's own cwd — serve is multi-session; nothing leaks across
+  projects). Busy-guarded like a turn.
+- **`session.rewind`** — fork the thread back to before the n-th-most-recent user turn (codex
+  `thread/rollback`). History-only; file edits are not reverted.
+- **`files.search`** — fuzzy project-file lookup (git-aware listing + the CLI's fuzzy ranker),
+  powering @-mention autocomplete in the desktop composer. Resolves the search root from an
+  explicit `cwd` or a `sessionId`.
+
 ## 0.116.0 — the desktop-grade serve protocol (models · automation · rename/archive · capabilities)
 
 - **Session source stamping.** Sessions now record WHO created them (`interactive` / `gateway` / `cron`,
