@@ -103,6 +103,23 @@ export function releaseSessionLock(id: string): void {
   }
 }
 
+/** Permanently delete a session from disk (codex thread/delete — unlike archive, irreversible).
+ *  Refuses when a LIVE other process holds the lock; removes the session file and any lock we may hold.
+ *  Returns false when the session doesn't exist or is held elsewhere. */
+export function deleteSession(id: string): boolean {
+  const f = sessionFile(id);
+  if (!existsSync(f)) return false;
+  const lock = acquireSessionLock(id);
+  if (!lock.ok) return false;
+  try {
+    rmSync(f);
+    rmSync(lockFile(id), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** A full UUID per session (the stable identity). */
 export const newSessionId = (): string => randomUUID();
 /** First segment of the UUID — a compact label for the status bar / `/sessions`. */

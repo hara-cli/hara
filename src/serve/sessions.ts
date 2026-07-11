@@ -12,6 +12,7 @@ import {
   listSessions,
   acquireSessionLock,
   releaseSessionLock,
+  deleteSession,
   deriveTitle,
 } from "../session/store.js";
 
@@ -21,6 +22,8 @@ export interface SessionStore {
   list(cwd?: string): SessionMeta[];
   acquire(id: string): { ok: boolean; pid?: number };
   release(id: string): void;
+  /** permanent removal (codex thread/delete); false = missing or held by a live other process */
+  delete(id: string): boolean;
 }
 
 /** The real ~/.hara/sessions store (default). */
@@ -30,6 +33,7 @@ export const realStore: SessionStore = {
   list: listSessions,
   acquire: acquireSessionLock,
   release: releaseSessionLock,
+  delete: deleteSession,
 };
 
 export interface ServeSession {
@@ -128,6 +132,18 @@ export class SessionHub {
     prior.meta.archived = on;
     this.store.save(prior.meta, prior.history);
     return true;
+  }
+
+  /** Permanently delete (live or on-disk). Refuses a busy live session. Returns:
+   *  "gone" on success, "busy" when a turn is running, "missing" when unknown/held elsewhere. */
+  delete(id: string): "gone" | "busy" | "missing" {
+    const live = this.sessions.get(id);
+    if (live?.busy) return "busy";
+    const ok = this.store.delete(id);
+    if (!ok && !live) return "missing";
+    if (live) this.sessions.delete(id);
+    this.store.release(id);
+    return "gone";
   }
 
   /** Release all locks (server shutdown). In-flight turns are aborted by the caller first. */

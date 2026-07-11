@@ -69,6 +69,7 @@ const memStore = () => {
     list: () => [...files.values()].map((d) => d.meta),
     acquire: () => ({ ok: true }),
     release: () => {},
+    delete: (id) => files.delete(id),
   };
 };
 
@@ -227,6 +228,15 @@ test("serve e2e: files.search + session.context + compact + rewind (codex deskto
     const { result: fresh } = await c.call("session.create", {});
     const nothing = await c.call("session.compact", { sessionId: fresh.sessionId });
     assert.equal(nothing.error.code, -32602, "nothing to compact → params error");
+
+    // session.delete: permanent — gone from the store and from session.list
+    const del = await c.call("session.delete", { sessionId: sid });
+    assert.equal(del.result.deleted, true, "delete acked");
+    assert.equal(store.saved.has(sid), false, "session file removed");
+    const after = await c.call("session.list", {});
+    assert.equal(after.result.sessions.some((s) => s.id === sid), false, "deleted session not listed");
+    const again = await c.call("session.delete", { sessionId: sid });
+    assert.equal(again.error.code, -32003, "double delete → no-session error");
   } finally {
     c.close();
     await srv.close();

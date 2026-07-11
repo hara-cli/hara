@@ -25,7 +25,7 @@ import { loadAgentsMd } from "../context/agents-md.js";
 import { expandMentions } from "../context/mentions.js";
 import { memoryDigest } from "../memory/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled } from "../plugins/plugins.js";
-import { loadSkillIndex } from "../skills/skills.js";
+import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
 import { loadJobs, saveJobs, addJob } from "../cron/store.js";
 import { parseSchedule, describeSchedule } from "../cron/schedule.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
@@ -149,9 +149,21 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         broadcast("approval.request", { sessionId, approvalId, question: q });
       });
     try {
+      // Slash skills, CLI parity: "/skill-id request…" expands into the skill-entering message, so a
+      // desktop composer's "/" popup triggers the exact behavior the terminal gets. Unknown ids fall
+      // through as plain text (the model sees what the user typed).
+      let content = text;
+      const slash = /^\/([a-z0-9][\w-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());
+      if (slash) {
+        const sk = loadSkillIndex(s.meta.cwd).find((k) => k.id === slash[1]);
+        if (sk) {
+          const rest = slash[2]?.trim();
+          content = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest ? ` — request: ${rest}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
+        }
+      }
       // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works).
       // Pasted images ride along as NeutralMsg.images — a vision-capable model sees them inline.
-      s.history.push({ role: "user", content: expandMentions(text, s.meta.cwd), ...(images && images.length ? { images } : {}) });
+      s.history.push({ role: "user", content: expandMentions(content, s.meta.cwd), ...(images && images.length ? { images } : {}) });
       await runAgent(s.history, {
         provider: s.provider,
         ctx: {
@@ -238,7 +250,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
             "session.list", "session.create", "session.resume", "session.send", "session.interrupt", "session.set-model",
-            "session.rename", "session.archive", "session.compact", "session.rewind", "session.context",
+            "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
           ];
@@ -309,6 +321,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string" || typeof p.archived !== "boolean") return reply(rpcError(id, ERR.PARAMS, "sessionId + archived required"));
             if (!hub.setArchived(p.sessionId, p.archived)) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             return reply(rpcResult(id!, { sessionId: p.sessionId, archived: p.archived }));
+          }
+          case "session.delete": {
+            // permanent removal (codex thread/delete) — archive is the soft path; this one is forever
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            const r = hub.delete(p.sessionId);
+            if (r === "busy") return reply(rpcError(id, ERR.BUSY, "a turn is running — delete after it finishes"));
+            if (r === "missing") return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId} (or held by another process)`));
+            return reply(rpcResult(id!, { sessionId: p.sessionId, deleted: true }));
           }
           case "models.list": {
             const models = deps.listModels ? await deps.listModels().catch(() => []) : [];
