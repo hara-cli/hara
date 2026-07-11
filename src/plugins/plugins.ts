@@ -31,6 +31,10 @@ export interface PanelSpec {
   command: string;
   args?: string[];
   port?: number;
+  /** project markers (paths relative to a project cwd, e.g. ".hara/design", "remotion.config.ts"):
+   *  when ANY exists under a project, the desktop surfaces this panel next to that project's
+   *  conversation (the chat ↔ live-preview split). Absent = global-only (settings page). */
+  detect?: string[];
 }
 export interface Plugin {
   name: string;
@@ -192,6 +196,23 @@ export function uninstallPlugin(name: string): boolean {
   unlinkPluginBins(readManifest(dest)); // remove any linked CLI commands first
   rmSync(dest, { recursive: true, force: true });
   return true;
+}
+
+/** Panels applicable to a project cwd — a panel matches when any of its `detect` markers exists under
+ *  the cwd. Pure over the given plugin list (testable); `panelsForProject` binds it to enabled plugins. */
+export function matchPanels(plugins: Plugin[], cwd: string): { plugin: string; panel: PanelSpec }[] {
+  const out: { plugin: string; panel: PanelSpec }[] = [];
+  for (const pl of plugins) {
+    for (const panel of pl.manifest.panels ?? []) {
+      if (!panel.detect?.length) continue; // global-only panels stay off project surfaces
+      if (panel.detect.some((m) => existsSync(join(cwd, m)))) out.push({ plugin: pl.name, panel });
+    }
+  }
+  return out;
+}
+
+export function panelsForProject(cwd: string): { plugin: string; panel: PanelSpec }[] {
+  return matchPanels(enabledPlugins(), cwd);
 }
 
 /** Persist a plugin's enabled flag in ~/.hara/config.json (`plugins.enabled[name]`). */

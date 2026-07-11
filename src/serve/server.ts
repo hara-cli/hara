@@ -24,7 +24,7 @@ import type { SandboxMode } from "../sandbox.js";
 import { loadAgentsMd } from "../context/agents-md.js";
 import { expandMentions } from "../context/mentions.js";
 import { memoryDigest } from "../memory/store.js";
-import { listInstalled, enabledPlugins, setPluginEnabled } from "../plugins/plugins.js";
+import { listInstalled, enabledPlugins, setPluginEnabled, panelsForProject } from "../plugins/plugins.js";
 import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
 import { loadJobs, saveJobs, addJob } from "../cron/store.js";
 import { parseSchedule, describeSchedule } from "../cron/schedule.js";
@@ -251,7 +251,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           const methods = [
             "session.list", "session.create", "session.resume", "session.send", "session.interrupt", "session.set-model",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
-            "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search",
+            "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
           ];
           return reply(rpcResult(id!, { name: "hara", version: deps.version, protocol: PROTOCOL_VERSION, cwd: opts.cwd, provider: deps.providerId, model: deps.model, capabilities: { methods } }));
@@ -406,6 +406,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           case "skills.list": {
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             return reply(rpcResult(id!, { skills: loadSkillIndex(cwd).map((s) => ({ id: s.id, description: s.description, source: s.source })) }));
+          }
+          case "project.panels": {
+            // panels applicable to a project (plugin manifest `detect` markers under the cwd) — powers
+            // the desktop's chat ↔ live-preview split for design/video projects.
+            const ps = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
+            const pcwd = typeof p.cwd === "string" && p.cwd ? p.cwd : (ps?.meta.cwd ?? opts.cwd);
+            const panels = panelsForProject(pcwd).map(({ plugin, panel }) => ({ plugin, id: panel.id, title: panel.title, command: panel.command, args: panel.args ?? [], port: panel.port }));
+            return reply(rpcResult(id!, { cwd: pcwd, panels }));
           }
           case "files.search": {
             // fuzzy file lookup for the composer's @-mention autocomplete (codex fuzzyFileSearch).
