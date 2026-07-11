@@ -19,7 +19,8 @@ import { expandMentions } from "../context/mentions.js";
 import { memoryDigest } from "../memory/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled } from "../plugins/plugins.js";
 import { loadSkillIndex } from "../skills/skills.js";
-import { loadJobs } from "../cron/store.js";
+import { loadJobs, saveJobs, addJob } from "../cron/store.js";
+import { parseSchedule, describeSchedule } from "../cron/schedule.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 
@@ -276,9 +277,42 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             // The automation timeline's data: cron jobs with their last outcome, plus this machine's
             // automated sessions (source=cron/gateway) so the desktop can render results and "continue
             // as conversation". Read-only.
-            const jobs = loadJobs().map((j) => ({ id: j.id, name: j.name, mode: j.mode, cwd: j.cwd, enabled: j.enabled, deliver: j.deliver, lastRunAt: j.lastRunAt, lastStatus: j.lastStatus, lastError: j.lastError }));
+            const jobs = loadJobs().map((j) => ({ id: j.id, name: j.name, mode: j.mode, cwd: j.cwd, enabled: j.enabled, deliver: j.deliver, lastRunAt: j.lastRunAt, lastStatus: j.lastStatus, lastError: j.lastError, schedule: describeSchedule(j.schedule) }));
             const automated = hub.list().filter((m) => m.source === "cron" || m.source === "gateway").map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, source: m.source, sourceName: m.sourceName, updatedAt: m.updatedAt }));
             return reply(rpcResult(id!, { jobs, sessions: automated }));
+          }
+          case "automation.add": {
+            if (typeof p.name !== "string" || !p.name || typeof p.schedule !== "string" || typeof p.task !== "string" || !p.task) {
+              return reply(rpcError(id, ERR.PARAMS, "name + schedule + task required"));
+            }
+            const sched = parseSchedule(p.schedule, Date.now());
+            if ("error" in sched) return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${sched.error}`));
+            const job = addJob({
+              name: p.name.slice(0, 60),
+              schedule: sched,
+              task: p.task,
+              mode: (["print", "org", "command"] as const).includes(p.mode) ? p.mode : "print",
+              cwd: typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd,
+              ...(typeof p.tz === "string" && p.tz ? { tz: p.tz } : {}),
+              createdAt: Date.now(),
+            });
+            return reply(rpcResult(id!, { id: job.id, name: job.name, schedule: describeSchedule(job.schedule) }));
+          }
+          case "automation.toggle": {
+            if (typeof p.id !== "string" || typeof p.enabled !== "boolean") return reply(rpcError(id, ERR.PARAMS, "id + enabled required"));
+            const jobs = loadJobs();
+            const job = jobs.find((j) => j.id === p.id);
+            if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            job.enabled = p.enabled;
+            saveJobs(jobs);
+            return reply(rpcResult(id!, { id: job.id, enabled: job.enabled }));
+          }
+          case "automation.delete": {
+            if (typeof p.id !== "string") return reply(rpcError(id, ERR.PARAMS, "id required"));
+            const jobs = loadJobs();
+            if (!jobs.some((j) => j.id === p.id)) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            saveJobs(jobs.filter((j) => j.id !== p.id));
+            return reply(rpcResult(id!, { id: p.id, deleted: true }));
           }
           case "skills.list": {
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
