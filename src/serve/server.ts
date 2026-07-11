@@ -112,7 +112,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   }
 
   /** Run one turn on a session, streaming events to all authed clients. */
-  const runTurn = async (s: ServeSession, text: string): Promise<{ reply: string; usage: { input: number; output: number } }> => {
+  const runTurn = async (s: ServeSession, text: string, images?: { path: string; mediaType: string }[]): Promise<{ reply: string; usage: { input: number; output: number } }> => {
     const sessionId = s.meta.id;
     s.busy = true;
     s.abort = new AbortController();
@@ -138,8 +138,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         broadcast("approval.request", { sessionId, approvalId, question: q });
       });
     try {
-      // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works)
-      s.history.push({ role: "user", content: expandMentions(text, s.meta.cwd) });
+      // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works).
+      // Pasted images ride along as NeutralMsg.images — a vision-capable model sees them inline.
+      s.history.push({ role: "user", content: expandMentions(text, s.meta.cwd), ...(images && images.length ? { images } : {}) });
       await runAgent(s.history, {
         provider: s.provider,
         ctx: {
@@ -217,7 +218,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId} — session.create/resume first`));
             if (s.busy) return reply(rpcError(id, ERR.BUSY, "a turn is already running on this session"));
-            const r = await runTurn(s, p.text);
+            const images = Array.isArray(p.images)
+              ? p.images.filter((im: any) => im && typeof im.path === "string").map((im: any) => ({ path: im.path, mediaType: typeof im.mediaType === "string" ? im.mediaType : "image/png" }))
+              : undefined;
+            const r = await runTurn(s, p.text, images);
             return reply(rpcResult(id!, r));
           }
           case "session.interrupt": {
