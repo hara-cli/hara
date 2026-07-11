@@ -134,6 +134,42 @@ export class SessionHub {
     return true;
   }
 
+  /** Fork: duplicate a session's history into a NEW session (codex thread/fork) — the non-destructive
+   *  sibling of rewind. Source may be live or on-disk; the fork is always a fresh live session. */
+  fork(
+    id: string,
+    o: { provider: Provider; providerId: string; approval: ApprovalMode; projectContext?: string },
+  ): { session: ServeSession } | { missing: true } {
+    const live = this.sessions.get(id);
+    const src: { meta: SessionMeta; history: NeutralMsg[] } | null = live ?? this.store.load(id);
+    if (!src) return { missing: true };
+    const meta: SessionMeta = {
+      id: newSessionId(),
+      cwd: src.meta.cwd,
+      provider: o.providerId,
+      model: src.meta.model,
+      title: src.meta.title ? `${src.meta.title} ⑂` : "",
+      createdAt: new Date().toISOString(),
+      updatedAt: "",
+      source: "interactive",
+    };
+    this.store.acquire(meta.id);
+    const s: ServeSession = {
+      meta,
+      history: [...src.history],
+      provider: o.provider,
+      approval: o.approval,
+      autoApprove: new Set(),
+      stats: { input: 0, output: 0 },
+      projectContext: o.projectContext,
+      busy: false,
+      abort: null,
+    };
+    this.sessions.set(meta.id, s);
+    this.store.save(meta, s.history); // persist immediately — a fork should survive a crash unsent
+    return { session: s };
+  }
+
   /** Permanently delete (live or on-disk). Refuses a busy live session. Returns:
    *  "gone" on success, "busy" when a turn is running, "missing" when unknown/held elsewhere. */
   delete(id: string): "gone" | "busy" | "missing" {

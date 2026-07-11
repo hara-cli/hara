@@ -250,7 +250,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
             "session.list", "session.create", "session.resume", "session.send", "session.interrupt", "session.set-model",
-            "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete",
+            "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
           ];
@@ -321,6 +321,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string" || typeof p.archived !== "boolean") return reply(rpcError(id, ERR.PARAMS, "sessionId + archived required"));
             if (!hub.setArchived(p.sessionId, p.archived)) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             return reply(rpcResult(id!, { sessionId: p.sessionId, archived: p.archived }));
+          }
+          case "session.fork": {
+            // duplicate the conversation into a new session (codex thread/fork) — rewind's
+            // non-destructive sibling: explore a different direction without losing the original
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            const provider = await deps.buildSessionProvider();
+            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — run `hara setup`"));
+            const r = hub.fork(p.sessionId, { provider, providerId: deps.providerId, approval: deps.approval, projectContext: undefined });
+            if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            r.session.projectContext = loadAgentsMd(r.session.meta.cwd) || undefined;
+            return reply(rpcResult(id!, { sessionId: r.session.meta.id, title: r.session.meta.title, model: r.session.meta.model, history: historyForClient(r.session.history) }));
           }
           case "session.delete": {
             // permanent removal (codex thread/delete) — archive is the soft path; this one is forever

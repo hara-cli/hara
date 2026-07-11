@@ -229,6 +229,17 @@ test("serve e2e: files.search + session.context + compact + rewind (codex deskto
     const nothing = await c.call("session.compact", { sessionId: fresh.sessionId });
     assert.equal(nothing.error.code, -32602, "nothing to compact → params error");
 
+    // session.fork: duplicate history into a NEW live session; original untouched
+    const fk = await c.call("session.fork", { sessionId: sid });
+    assert.ok(fk.result.sessionId && fk.result.sessionId !== sid, "fork got a fresh id");
+    assert.equal(fk.result.history.length, 1, "fork copied the (compacted) history");
+    assert.ok(store.saved.has(fk.result.sessionId), "fork persisted immediately");
+    const fsend = await c.call("session.send", { sessionId: fk.result.sessionId, text: "diverge" });
+    assert.equal(fsend.result.reply, "hello", "fork is a working session");
+    assert.equal(store.saved.get(sid).history.length <= 2, true, "original unchanged by fork's turn");
+    const nofork = await c.call("session.fork", { sessionId: "nope" });
+    assert.equal(nofork.error.code, -32003, "fork of unknown session errors");
+
     // session.delete: permanent — gone from the store and from session.list
     const del = await c.call("session.delete", { sessionId: sid });
     assert.equal(del.result.deleted, true, "delete acked");
