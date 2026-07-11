@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.118.0 — session delete & fork · slash skills over serve
+
+- **`session.delete`** — permanent removal (codex thread/delete; archive stays the soft path).
+  Lock-aware: refuses when a live other process holds the session; busy-guarded on live turns.
+- **`session.fork`** — duplicate a session's history into a new live session (codex thread/fork),
+  rewind's non-destructive sibling: explore a different direction without losing the original.
+  Forks persist immediately.
+- **Slash skills over the wire** — `session.send` with a leading `/skill-id request…` expands into
+  the CLI's skill-entering flow, so a desktop composer's "/" popup triggers exactly what the
+  terminal gets. Unknown ids fall through as plain text.
+
 ## 0.117.0 — serve batch 3: context watermark · compact · rewind · fuzzy file search
 
 Codex-desktop parity for the conversation-hygiene set — everything a client needs to keep a long
