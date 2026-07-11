@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.119.0 — project panels: the chat ↔ live-preview split
+
+- **Plugin panels become project-aware.** A plugin panel can declare `detect` markers (e.g.
+  `.hara/design`, `remotion.config.ts`); `project.panels` returns the panels applicable to a
+  project's cwd. In Hara Desktop, opening a design/video project surfaces a preview toggle right
+  on the conversation — talk to the agent on the left, watch the live preview react on the right.
+  Detect-less panels stay global-only (settings page).
+
 ## 0.118.0 — session delete & fork · slash skills over serve
 
 - **`session.delete`** — permanent removal (codex thread/delete; archive stays the soft path).
