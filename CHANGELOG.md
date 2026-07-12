@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.120.0 — `hara feedback`: one door for humans and agents
+
+- **`hara feedback "what happened"`** files a structured GitHub issue (repo hara-cli/hara,
+  label `feedback`) via the gh CLI, with a copy-paste fallback. Auto-collects hara version /
+  OS / Node / provider:model (never keys) and aggressively redacts credentials
+  (sk-/ghp_/AWS/Bearer/JWT/key=value families). `--session` opt-in attaches a redacted session
+  tail (issues are public); `--dry-run` prints without filing. Matching .github issue forms
+  ship in the repo — hand-filed and command-filed reports read identically.
+- **Security stance (documented)**: hara agents exchange structured data — they never accept
+  task instructions from untrusted parties. Cross-trust-boundary agent task-passing is
+  permanently out of scope; feedback/issues are the entire agent-to-agent surface.
+
 ## 0.119.2 — TUI: update notices actually visible · CJK-correct input wrapping
 
 - **Update notices now render INSIDE the TUI** (yellow line under the header card). They used to
