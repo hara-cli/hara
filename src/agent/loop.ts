@@ -1,5 +1,5 @@
 import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
-import { getTool, toolSpecs, type Tool, type ToolContext } from "../tools/registry.js";
+import { getTool, toolSpecs, missingRequired, type Tool, type ToolContext } from "../tools/registry.js";
 import { stdout } from "node:process";
 import { c, out } from "../ui.js";
 import { activity } from "../activity.js";
@@ -87,7 +87,12 @@ can't serve private repos), don't switch protocols — hara already fast-fails r
 diagnose instead. git ignores the macOS system / Clash proxy unless configured (git config --global
 http.proxy), so a browser that reaches a site doesn't mean the terminal does — verify connectivity yourself
 rather than trusting "the network is fine". If a step's output artifact already exists and is newer than its
-inputs, skip re-running it. After completing a task, give a one-line summary.`;
+inputs, skip re-running it — and the INVERSE: before serving or previewing GENERATED artifacts (a gallery,
+site, build output), check they are newer than their sources (compare mtimes or the latest commit time); if
+the sources changed since the artifacts were built, run the project's documented build/render steps FIRST.
+When AGENTS.md / README / package.json document a command sequence (e.g. pull → render → build → preview),
+that ordering is authoritative — never skip the middle steps, or you serve stale output and the user sees
+two-day-old work. After completing a task, give a one-line summary.`;
 
 /** When running inside `hara gateway`, tell the agent it's in a chat — so it delivers files via send_file
  *  (the only channel that reaches the peer) and never reaches for the desktop client / computer tool. */
@@ -474,6 +479,17 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       }
       activity.inc();
       try {
+        // Defensive parameter gate — some models drop required tool parameters outright (observed:
+        // qwen3.7-plus sending write_file without path/content, then retrying the same broken call
+        // forever). Reject precisely and name what's missing; repeat-guard escalates if it loops.
+        const missing = missingRequired(p.tool!, p.tu.input);
+        if (missing.length) {
+          const msg =
+            `Error: tool call NOT executed — missing required parameter${missing.length > 1 ? "s" : ""}: ` +
+            `${missing.join(", ")}. Send the call again with ALL required parameters (${(p.tool!.input_schema.required ?? []).join(", ")}) present and complete.`;
+          results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + recordCall(p.tu.name, p.tu.input, msg, true), isError: true };
+          return;
+        }
         const pre = runHooks("PreToolUse", p.tu.name, p.tu.input, ctx.cwd); // a hook may veto the call
         if (pre.block) {
           results[idx] = { id: p.tu.id, name: p.tu.name, content: pre.message, isError: true };

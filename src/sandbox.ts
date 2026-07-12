@@ -111,7 +111,16 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
   const { cmd, args } = shellCommand(command, cwd, mode);
 
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd });
+    // Non-interactive by contract: there is no terminal to answer a credential prompt, so a git
+    // https op against a private repo would otherwise sit silently until the timeout (observed as
+    // "git hangs 5 minutes"). With prompts disabled it fails in seconds with a real auth error.
+    // Users' credential helpers (keychain/GCM store) still work — only interactive PROMPTS are off.
+    const env = {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT ?? "0",
+      GCM_INTERACTIVE: process.env.GCM_INTERACTIVE ?? "never",
+    };
+    const child = spawn(cmd, args, { cwd, env });
     let stdout = "";
     let stderr = "";
     let timedOut = false;

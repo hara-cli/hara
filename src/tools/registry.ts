@@ -46,6 +46,17 @@ export interface Tool {
   run(input: any, ctx: ToolContext): Promise<string>;
 }
 
+/** Names of required parameters that are ABSENT (undefined/null) in a tool call's input. Defends
+ *  against models that drop parameters outright (observed: qwen3.7-plus losing write_file's
+ *  path/content mid-stream) — the loop rejects the call with a precise error instead of executing
+ *  garbage, and repeat-guard escalates if the model loops on the same broken shape. Empty strings
+ *  are NOT flagged (writing an empty file is legitimate). */
+export function missingRequired(tool: Tool, input: unknown): string[] {
+  const req = tool.input_schema.required ?? [];
+  const obj = (input && typeof input === "object" ? (input as Record<string, unknown>) : {});
+  return req.filter((k) => obj[k] === undefined || obj[k] === null);
+}
+
 const registry = new Map<string, Tool>();
 
 export function registerTool(t: Tool): void {

@@ -190,7 +190,15 @@ registerTool({
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
       return capHeadTail(combined.trim() || "(no output)");
     } catch (e: any) {
-      const base = `Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`;
+      let base = `Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`;
+      // Timeout gets an ACTIONABLE next step, not just a corpse — the model (and user) should pick a
+      // lane instead of blind-retrying into the same wall.
+      if (/timed out after \d+ms/.test(String(e.message))) {
+        base +=
+          `\n⏱ hara: the command hit its ${input.timeout_ms ?? 300_000}ms cap and was killed. Pick ONE: ` +
+          `a long build/transform → re-run with a larger timeout_ms; a server/watcher → background:true; ` +
+          `a network op (git/curl/npm) → do NOT just retry — check connectivity/proxy or skip this step and tell the user.`;
+      }
       // Network fault tolerance — if this was a genuine host-unreachability (connect timeout / DNS, NOT
       // auth / 404 / connection-refused), remember the host so we fast-fail future ops to it this session.
       if (isConnectFailure(base)) {
