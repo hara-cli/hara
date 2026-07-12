@@ -1,10 +1,11 @@
 // @file mentions — expand `@path` references in user input into appended file contents,
 // and provide fuzzy file candidates for REPL tab-completion.
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { listProjectFiles, dirPrefixes, walkFiles } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
 import { mediaTypeFor } from "../images.js";
+import { readTextPrefixSync } from "../fs-read.js";
 
 const MAX_FILE = 50_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
@@ -53,8 +54,9 @@ function expandRef(ref: string, cwd: string): string | null {
     if (st.isFile()) {
       // don't inline binary image bytes as text — paste with Ctrl+V (or drag the file in) to attach visually
       if (mediaTypeFor(abs)) return `Referenced \`${ref}\` is an image — paste it with Ctrl+V to attach it visually.`;
-      let txt = readFileSync(abs, "utf8");
-      if (txt.length > MAX_FILE) txt = txt.slice(0, MAX_FILE) + "\n…[truncated]";
+      const prefix = readTextPrefixSync(abs, MAX_FILE);
+      if (prefix.binary) return `Referenced \`${ref}\` appears to be binary — it was not inserted into the model context.`;
+      const txt = prefix.text + (prefix.truncated ? "\n…[truncated]" : "");
       return `\nReferenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\`\n`;
     }
     if (st.isDirectory()) {

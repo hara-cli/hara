@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BinaryFileError, streamFileSlice } from "../dist/fs-read.js";
+import { BinaryFileError, readTextPrefixSync, streamFileSlice } from "../dist/fs-read.js";
 
 const fixture = () => mkdtempSync(join(tmpdir(), "hara-stream-read-"));
 
@@ -46,6 +46,24 @@ test("streamFileSlice bounds a giant single line and rejects sampled binary cont
     const binary = join(dir, "binary.dat");
     writeFileSync(binary, Buffer.from([1, 2, 0, 3]));
     await assert.rejects(streamFileSlice(binary), (error) => error instanceof BinaryFileError);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readTextPrefixSync reads a UTF-8 prefix without loading the whole file", () => {
+  const dir = fixture();
+  try {
+    const path = join(dir, "mention.txt");
+    writeFileSync(path, "界".repeat(100_000));
+    const prefix = readTextPrefixSync(path, 50_000);
+    assert.equal(prefix.text, "界".repeat(50_000));
+    assert.equal(prefix.truncated, true);
+    assert.equal(prefix.binary, false);
+
+    const binary = join(dir, "mention.bin");
+    writeFileSync(binary, Buffer.from([1, 0, 2]));
+    assert.equal(readTextPrefixSync(binary, 50_000).binary, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

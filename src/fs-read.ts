@@ -1,6 +1,6 @@
 // Bounded streaming line reader for files too large to load as one string. It stores only the requested
 // window and a capped prefix of each line, so huge logs/JSONL and minified one-line files stay safe.
-import { createReadStream } from "node:fs";
+import { closeSync, createReadStream, fstatSync, openSync, readSync } from "node:fs";
 
 export class BinaryFileError extends Error {
   constructor(path: string) {
@@ -16,6 +16,35 @@ export interface StreamSliceOptions {
 
 const DEFAULT_LINE_CAP = 2000;
 const DEFAULT_MAX_SCAN = 64 * 1024 * 1024;
+
+/** Read only enough bytes to produce a bounded UTF-8 prefix (used by synchronous @file expansion). */
+export function readTextPrefixSync(path: string, maxChars: number): { text: string; truncated: boolean; binary: boolean } {
+  const chars = Math.max(0, Math.floor(maxChars));
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size;
+    // Four bytes per Unicode scalar plus a small boundary cushion guarantees enough decoded input for
+    // `chars` without allocating the entire file. readSync can short-read, so fill in a loop.
+    const byteLimit = Math.min(size, chars * 4 + 4);
+    const buffer = Buffer.allocUnsafe(byteLimit);
+    let read = 0;
+    while (read < byteLimit) {
+      const n = readSync(fd, buffer, read, byteLimit - read, read);
+      if (n === 0) break;
+      read += n;
+    }
+    const bytes = buffer.subarray(0, read);
+    const binary = bytes.subarray(0, Math.min(bytes.length, 4096)).includes(0);
+    const decoded = binary ? "" : bytes.toString("utf8");
+    return {
+      text: decoded.slice(0, chars),
+      truncated: size > read || decoded.length > chars,
+      binary,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
 
 /** Render a line slice without retaining the entire file. Total line count is shown only when EOF is reached. */
 export async function streamFileSlice(

@@ -71,6 +71,18 @@ test("mentions: email-like a@b.com is NOT treated as a file mention", () => {
   assert.equal(o, "mail me at a@b.com please");
 });
 
+test("mentions: binary files are described but never injected as text", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-ctx-"));
+  try {
+    writeFileSync(join(dir, "blob.bin"), Buffer.from([1, 2, 0, 3]));
+    const out = expandMentions("inspect @blob.bin", dir);
+    assert.match(out, /appears to be binary/i);
+    assert.ok(!out.includes("\u0000"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("edit_file: single unique replacement", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-ctx-"));
   try {
