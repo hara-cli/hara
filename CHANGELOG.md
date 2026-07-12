@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.119.1 — field-feedback robustness: param gate · no-hang git · actionable timeouts · stale-artifact rule
+
+- **Required-parameter gate.** A tool call arriving WITHOUT its required parameters (observed:
+  qwen3.7-plus dropping write_file's path/content, then retrying the same broken call forever) is
+  now rejected before execution with an error naming exactly what's missing; repeat-guard
+  escalates if the model loops anyway. Empty strings stay legal.
+- **git can no longer hang to the timeout.** Shell commands run with `GIT_TERMINAL_PROMPT=0` +
+  `GCM_INTERACTIVE=never` (user env overrides win): an https op that wants credentials fails in
+  seconds with a real auth error instead of sitting silently for 5 minutes.
+- **Timeouts tell you what to do next**: larger `timeout_ms` for long builds, `background:true`
+  for servers, and for network ops — diagnose or skip, never blind-retry.
+- **Stale-artifact rule** (prompt): before previewing generated artifacts, verify they're newer
+  than their sources; AGENTS.md/README command sequences are authoritative — middle steps (render/
+  build) are never skipped. Pairs with hara-design 0.3.6's deterministic staleness tripwire +
+  preview idle auto-exit.
+
 ## 0.119.0 — project panels: the chat ↔ live-preview split
 
 - **Plugin panels become project-aware.** A plugin panel can declare `detect` markers (e.g.
