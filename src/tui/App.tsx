@@ -719,7 +719,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         new Promise((resolve) => setAskText({ title, resolve }));
       // ask_user: when options are given, offer them as a select + a "type my own" escape hatch; otherwise (or
       // when the user chooses to type their own) capture a free-text line. Returns the chosen/typed answer.
-      const OTHER = " __ask_other__"; // sentinel value for the "type my own" option
+      const OTHER = "\\0__ask_other__"; // escaped sentinel keeps this TypeScript file text-only
       const askFn = async (question: string, options?: string[]): Promise<string> => {
         if (options && options.length) {
           const choice = await openPrompt<string>(question, [
