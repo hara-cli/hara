@@ -163,6 +163,36 @@ export interface Row {
   end: number;
 }
 
+/** Terminal cell width of one code point: CJK/fullwidth/emoji render 2 cells, combining marks and
+ *  joiners 0, everything else 1. Wrapping used to count `.length` (1 per char) — mixed CJK+ASCII
+ *  input then overflowed the real terminal width and ink soft-wrapped a second time mid-word
+ *  (field report: "output" torn into "ou/tput" while typing a URL + 中文 prompt). */
+export function charCells(ch: string): number {
+  const cp = ch.codePointAt(0)!;
+  if ((cp >= 0x300 && cp <= 0x36f) || cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f)) return 0; // combining/ZWJ/VS
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+    (cp >= 0x2e80 && cp <= 0xa4cf) || // CJK radicals … Yi
+    (cp >= 0xa960 && cp <= 0xa97f) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) || // Hangul syllables
+    (cp >= 0xf900 && cp <= 0xfaff) || // CJK compatibility ideographs
+    (cp >= 0xfe30 && cp <= 0xfe4f) || // CJK compatibility forms
+    (cp >= 0xff00 && cp <= 0xff60) || // fullwidth forms
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1faff) || // emoji
+    (cp >= 0x20000 && cp <= 0x3fffd) // CJK extension planes
+  )
+    return 2;
+  return 1;
+}
+
+/** Display width of a string in terminal cells (sum of charCells over code points). */
+export function cells(s: string): number {
+  let n = 0;
+  for (const ch of s) n += charCells(ch);
+  return n;
+}
+
 /** Wrap `value` into rows that each fit within `cols` cells, breaking on spaces where possible but
  *  never inside an `[Image #N]` token. Deterministic (no reliance on ink's soft-wrap) so wrapped rows
  *  align under a stable gutter and the cursor position is exact. Always returns at least one row. */
@@ -206,21 +236,23 @@ export function wrapRows(value: string, cols: number): Row[] {
       flush(aEnd);
       continue;
     }
-    if (a.atomic || a.text.length <= width) {
+    const aCells = cells(a.text);
+    if (a.atomic || aCells <= width) {
       // A whole unit (image token OR a word chunk that fits within a full row): if it doesn't fit in
       // the remaining room and the row already has content, wrap to a fresh row FIRST — never split it.
-      if (a.text.length > width - col && col > 0) flush(a.start);
-      col += a.text.length; // an oversized atomic token may exceed width — acceptable (rare, kept whole)
+      if (aCells > width - col && col > 0) flush(a.start);
+      col += aCells; // an oversized atomic token may exceed width — acceptable (rare, kept whole)
       if (col >= width) flush(aEnd);
     } else {
-      // A single word longer than the whole width: hard-break it across rows.
+      // A single word longer than the whole width: hard-break it across rows — walking CODE POINTS
+      // and accumulating CELLS, so a double-width char never straddles the terminal edge.
       let s = a.start;
       if (col > 0) flush(s); // start the long word on a fresh row
-      while (s < aEnd) {
-        const room = width - col;
-        const take = Math.min(room, aEnd - s);
-        col += take;
-        s += take;
+      for (const ch of a.text) {
+        const w = charCells(ch);
+        if (col + w > width && col > 0) flush(s);
+        col += w;
+        s += ch.length;
         if (col >= width) flush(s);
       }
     }

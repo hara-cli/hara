@@ -81,6 +81,10 @@ export interface HeaderInfo {
    *  images when the main model is text-only. When set, the model line gets a dim `· vision <model>`
    *  clause. When undefined we render nothing (native-vision main models stay silent — 顾雅 spec). */
   visionModel?: string;
+  /** Update-available notice ("0.112.5 → 0.119.1 · npm i -g @nanhara/hara"). Rendered INSIDE the TUI —
+   *  the pre-mount stdout print never survives ink taking over the screen, which is why TUI users
+   *  reported the update check as "completely dead" while stuck versions piled up. */
+  updateNotice?: string;
 }
 
 export interface AppProps {
@@ -390,6 +394,7 @@ function HeaderCard(props: HeaderInfo) {
       </Box>
       {/* Tip block — moved OUT of the card (顾雅 spec). Dim discoverability line below the card. */}
       <Text dimColor>{"  Tip: @ attach file · ctrl+t transcript · ctrl+r reasoning · shift+tab approval · esc interrupt"}</Text>
+      {props.updateNotice ? <Text color="yellow">{`  ⬆ ${props.updateNotice}`}</Text> : null}
     </Box>
   );
 }

@@ -319,3 +319,32 @@ test("InputBox: a lone newline in the input stream = Enter (submits the current 
   assert.equal(submitted, "hello", "lone newline still submits");
   unmount();
 });
+
+// ── CJK-aware wrapping (field report: mixed 中文+URL input overflowed the real terminal width and
+// ink soft-wrapped a second time, tearing "output" into "ou/tput") ──
+import { cells, charCells } from "../dist/tui/InputBox.js";
+
+test("cells: CJK counts 2, ASCII 1, combining 0", () => {
+  assert.equal(cells("abc"), 3);
+  assert.equal(cells("中文"), 4);
+  assert.equal(cells("中a文b"), 6);
+  assert.equal(charCells("́"), 0);
+  assert.equal(cells("卜瓜🦊"), 6, "emoji is double-width");
+});
+
+test("wrapRows: CJK text wraps by CELLS, not chars — no row exceeds the terminal width", () => {
+  // 10 CJK chars = 20 cells; at cols=10 each row fits at most 5 CJK chars
+  const v = "汉字宽度测试一二三四";
+  const rows = wrapRows(v, 10);
+  for (const r of rows) {
+    assert.ok(cells(v.slice(r.start, r.end).replace(/\n/g, "")) <= 10, `row [${r.start},${r.end}) fits 10 cells`);
+  }
+  assert.equal(rows[rows.length - 1].end, v.length, "rows cover the whole value");
+});
+
+test("wrapRows: mixed CJK + long ASCII word — the ASCII word is not torn by phantom width", () => {
+  // "可能在" (6 cells) + "output" (6 cells) at cols=13: together 12 cells → ONE row, no split
+  const v = "可能在output";
+  const rows = wrapRows(v, 13);
+  assert.equal(rows.length, 1, `expected one row, got ${JSON.stringify(rows)}`);
+});

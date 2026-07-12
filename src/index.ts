@@ -2933,6 +2933,9 @@ program.action(async (opts) => {
         routeHost: __routeForHeader?.host,
         modelSource: __modelSource,
         visionModel: cfg.visionModel,
+        // the pre-mount stdout notice (line ~2497) doesn't survive ink taking the screen — TUI users
+        // never saw update notices and versions silently went stale (field report: stuck on 0.112.5)
+        updateNotice: cfg.updateCheck ? (checkForUpdate(pkg.version) ?? undefined) : undefined,
       },
       visionNotice: __visionNotice,
       cycleApproval: (m) => cycleMode(m),
