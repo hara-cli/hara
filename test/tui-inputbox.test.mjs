@@ -62,6 +62,48 @@ test("InputBox accepts typed text and submits on Enter", async () => {
   unmount();
 });
 
+test("InputBox: Up/Down recalls submissions and restores the unsent draft", async () => {
+  const submitted = [];
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => submitted.push(v) }),
+  );
+  stdin.write("first command");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("unfinished draft");
+  await tick();
+
+  stdin.write("\x1b[A");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("first command"), "Up recalls the last submission");
+  stdin.write("\x1b[B");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("unfinished draft"), "Down past newest restores the draft");
+  stdin.write("\r");
+  await tick();
+  assert.deepEqual(submitted, ["first command", "unfinished draft"]);
+  unmount();
+});
+
+test("InputBox: Backspace removes a whole emoji grapheme and Ctrl+W removes a word", async () => {
+  let submitted = null;
+  const family = "👨‍👩‍👧‍👦";
+  const { stdin, unmount } = render(
+    React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }),
+  );
+  stdin.write(`alpha beta ${family}`);
+  await tick();
+  stdin.write("\x7f");
+  await tick();
+  stdin.write("\x17"); // Ctrl+W
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.equal(submitted, "alpha ", "emoji is removed whole, then Ctrl+W removes beta");
+  unmount();
+});
+
 test("InputBox backspace deletes before the cursor", async () => {
   const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5" }));
   stdin.write("abcd");

@@ -13,11 +13,19 @@
 //      of leaning on ink's soft-wrap of a single <Text>, which mis-aligns wrapped rows against the
 //      "› " prompt gutter and reflows unpredictably as you type.
 import { Box, Text, useInput, useStdout } from "ink";
-import { memo, useMemo, useState, type ReactNode } from "react";
+import { memo, useMemo, useRef, useState, type ReactNode } from "react";
 import { fileCandidates } from "../context/mentions.js";
 import { imagePathFromPaste } from "../images.js";
 import { vimNormal, type VimMode } from "./vim.js";
 import type { ImageAttachment } from "../providers/types.js";
+import {
+  ComposerHistory,
+  moveCursorLine,
+  nextGraphemeIndex,
+  previousGraphemeIndex,
+  previousWordIndex,
+  type InputDraft,
+} from "./input-history.js";
 
 export const MODES = ["suggest", "auto-edit", "full-auto", "plan"] as const;
 export type Approval = (typeof MODES)[number];
@@ -430,10 +438,24 @@ export function InputBox({
   const [mode, setMode] = useState<VimMode>("insert"); // vim only
   const [pending, setPending] = useState(""); // vim operator-pending (d/c/g)
   const [register, setRegister] = useState(""); // vim yank/delete register
+  const historyRef = useRef<ComposerHistory<ImageAttachment> | null>(null);
+  if (!historyRef.current) historyRef.current = new ComposerHistory<ImageAttachment>();
+  const inputHistory = historyRef.current;
 
   const set = (v: string, c: number): void => {
+    inputHistory.abandonNavigation();
     setValue(v);
     setCursor(c);
+    setSel(0);
+    setDismissed(false);
+  };
+
+  const snapshot = (): InputDraft<ImageAttachment> => ({ value, attachments: images, pastes });
+  const restore = (draft: InputDraft<ImageAttachment>): void => {
+    setValue(draft.value);
+    setCursor(draft.value.length);
+    setImages(draft.attachments);
+    setPastes(draft.pastes);
     setSel(0);
     setDismissed(false);
   };
@@ -441,6 +463,7 @@ export function InputBox({
   // Attach an image: drop a highlighted `[Image #N]` token inline at the cursor and track the file
   // (codex / Claude-Code style). Backspace over the token removes both.
   const addImage = (img: ImageAttachment): void => {
+    inputHistory.abandonNavigation();
     const tok = `[Image #${images.length + 1}]`;
     const before = value.slice(0, cursor);
     const ins = (before && !/\s$/.test(before) ? " " : "") + tok + " ";
@@ -455,6 +478,7 @@ export function InputBox({
   // the box: typing stays smooth (the VALUE stays short), the box stays small, and a multi-line paste
   // can no longer fire the newline-submit path mid-paste. Expanded back to the full text on submit.
   const addPaste = (text: string): void => {
+    inputHistory.abandonNavigation();
     const lines = text.split("\n").length;
     const tok = `[Paste #${pastes.length + 1} +${lines} lines]`;
     const before = value.slice(0, cursor);
@@ -470,6 +494,7 @@ export function InputBox({
 
   const submit = (text: string): void => {
     if (!text.trim() && images.length === 0) return; // nothing to send
+    inputHistory.record(snapshot());
     onSubmit?.(expandPastes(text), images.length ? images : undefined);
     set("", 0);
     setImages([]);
@@ -491,6 +516,7 @@ export function InputBox({
 
   const complete = (cand: string): void => {
     if (!mention) return;
+    inputHistory.abandonNavigation();
     const before = value.slice(0, mention.start); // includes the leading '@'
     const after = value.slice(cursor);
     const insert = cand.endsWith("/") ? cand : cand + " "; // dirs keep drilling; files end the mention
@@ -530,6 +556,7 @@ export function InputBox({
         if (key.backspace || key.delete) return setCursor((c) => Math.max(0, c - 1));
         if (input && !key.ctrl && !key.meta) {
           const st = vimNormal({ value, cursor, mode, pending, register }, input);
+          if (st.value !== value) inputHistory.abandonNavigation();
           setValue(st.value);
           setCursor(st.cursor);
           setMode(st.mode);
@@ -540,15 +567,44 @@ export function InputBox({
         }
         return;
       }
+      if (key.upArrow) {
+        const onFirstLine = cursor === 0 || value.lastIndexOf("\n", cursor - 1) < 0;
+        if (onFirstLine) {
+          const draft = inputHistory.older(snapshot());
+          if (draft) restore(draft);
+        } else {
+          setCursor(moveCursorLine(value, cursor, -1));
+        }
+        return;
+      }
+      if (key.downArrow) {
+        const onLastLine = value.indexOf("\n", cursor) < 0;
+        if (onLastLine) {
+          const draft = inputHistory.newer();
+          if (draft) restore(draft);
+        } else {
+          setCursor(moveCursorLine(value, cursor, 1));
+        }
+        return;
+      }
       if (key.return) {
+        if (key.shift || key.meta) {
+          set(value.slice(0, cursor) + "\n" + value.slice(cursor), cursor + 1);
+          return;
+        }
         submit(value);
         return;
       }
-      if (key.leftArrow) return setCursor((c) => Math.max(0, c - 1));
-      if (key.rightArrow) return setCursor((c) => Math.min(value.length, c + 1));
+      if (key.leftArrow) return setCursor((c) => previousGraphemeIndex(value, c));
+      if (key.rightArrow) return setCursor((c) => nextGraphemeIndex(value, c));
       if (key.ctrl && input === "a") return setCursor(0);
       if (key.ctrl && input === "e") return setCursor(value.length);
       if (key.ctrl && input === "u") return set(value.slice(cursor), 0);
+      if (key.ctrl && input === "w") {
+        const start = previousWordIndex(value, cursor);
+        return set(value.slice(0, start) + value.slice(cursor), start);
+      }
+      if (key.ctrl && input === "k") return set(value.slice(0, cursor), cursor);
       if (key.ctrl && input === "v") {
         // paste a screenshot / image from the OS clipboard
         const img = onClipboardImage?.();
@@ -560,6 +616,7 @@ export function InputBox({
           const head = value.slice(0, cursor);
           const pm = /\[Paste #(\d+) \+\d+ lines\]\s?$/.exec(head); // paste token deletes whole + renumbers
           if (pm) {
+            inputHistory.abandonNavigation();
             const n = Number(pm[1]);
             const kept = head.slice(0, pm.index) + value.slice(cursor);
             const renumbered = kept.replace(/\[Paste #(\d+)( \+\d+ lines\])/g, (m2, d, tail) => (Number(d) > n ? `[Paste #${Number(d) - 1}${tail}` : m2));
@@ -572,6 +629,7 @@ export function InputBox({
           }
           const tm = /\[Image #(\d+)\]\s?$/.exec(head); // backspacing over an attachment token removes it whole
           if (tm) {
+            inputHistory.abandonNavigation();
             const n = Number(tm[1]);
             const kept = head.slice(0, tm.index) + value.slice(cursor);
             const renumbered = kept.replace(/\[Image #(\d+)\]/g, (m2, d) => (Number(d) > n ? `[Image #${Number(d) - 1}]` : m2));
@@ -582,7 +640,8 @@ export function InputBox({
             setDismissed(false);
             return;
           }
-          set(value.slice(0, cursor - 1) + value.slice(cursor), cursor - 1);
+          const previous = previousGraphemeIndex(value, cursor);
+          set(value.slice(0, previous) + value.slice(cursor), previous);
         }
         return;
       }
