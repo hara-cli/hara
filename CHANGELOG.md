@@ -5,6 +5,26 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.121.0 — `hara desk` · crash-safe coding/files · bounded interactive I/O
+
+- **`hara desk` connects the CLI to the shared coordination desk.** Register an agent, post/list/
+  claim/complete/ack/cancel tasks, and persist the desk token with owner-only file permissions. The
+  client identifies itself as `hara-cli`, so mixed Codex/Claude Code/hara fleets remain legible.
+- **Coding edits are transaction-safe.** `write_file` uses same-directory atomic replacement;
+  multi-file patches validate every destination before writing and roll back already-committed
+  files if a later commit fails. Undo snapshots are captured before mutation, failed writes do not
+  create false undo history, and symlink/non-regular destinations are rejected consistently.
+- **Large files stay useful without flooding memory or context.** Slice reads stream only the
+  requested line window, `@file` mentions have explicit byte/line caps, and tool results are
+  bounded centrally (including plugin/MCP results) with clear truncation metadata.
+- **Interactive input is friendlier and bounded.** The TUI composer has shell-style up/down history
+  with draft restoration, duplicate suppression, navigation reset after edits, and a fixed maximum
+  history size. The ask-mode sentinel is also source-safe on every supported Node runtime.
+- **Faster cold start.** Unicode-width data and the write/edit tool graph are loaded only when the
+  active command needs them, reducing startup work for lightweight commands such as `--version`.
+- **Production dependency hardening.** The Lark SDK's Axios transport is pinned to a patched 1.x
+  release instead of its vulnerable `~1.13.3` range; the production npm audit is clean at release.
+
 ## 0.120.0 — `hara feedback`: one door for humans and agents
 
 - **`hara feedback "what happened"`** files a structured GitHub issue (repo hara-cli/hara,

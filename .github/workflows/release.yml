@@ -17,6 +17,8 @@ jobs:
         with:
           node-version: "22"
       - run: npm ci
+      - run: npm audit --omit=dev --registry https://registry.npmjs.org/
+      - run: npm test
       - run: npm run build:binaries
       - uses: softprops/action-gh-release@v2
         with:
@@ -28,6 +30,7 @@ jobs:
 
   # Build + push the container image so `docker run ghcr.io/hara-cli/hara` works after a release.
   image:
+    needs: binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

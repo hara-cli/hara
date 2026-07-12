@@ -25,6 +25,7 @@ jobs:
           node-version: "22"
           registry-url: https://registry.npmjs.org/
       - run: npm ci
+      - run: npm audit --omit=dev --registry https://registry.npmjs.org/
       - run: npm test
       - name: Publish to npm (idempotent)
         env:

@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.120.0",
+  "version": "0.121.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "dist/index.js"
@@ -70,5 +70,10 @@
   "optionalDependencies": {
     "@zvec/zvec": "^0.5.0",
     "qrcode-terminal": "^0.12.0"
+  },
+  "overrides": {
+    "@larksuiteoapi/node-sdk": {
+      "axios": "1.18.1"
+    }
   }
 }
