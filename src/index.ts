@@ -2087,6 +2087,85 @@ program
     }
   });
 
+// `hara desk` — connect to a hara-desk coordination server (identity registry + task board).
+// The desk is the closed-source enterprise piece; this is the open-source client side.
+const deskCmd = program.command("desk").description("coordinate with a hara-desk server (register · post · board · claim · complete)");
+deskCmd
+  .command("register")
+  .description("register this agent with a desk and save credentials to ~/.hara/desk.json")
+  .requiredOption("--url <url>", "desk base URL (e.g. http://127.0.0.1:4200)")
+  .requiredOption("--key <enrollKey>", "the desk's enroll key")
+  .option("--name <name>", "agent name shown in the registry", "hara-cli")
+  .option("--owner <owner>", "the human this agent belongs to", "me")
+  .action(async (o: { url: string; key: string; name: string; owner: string }) => {
+    const { registerAgent } = await import("./desk.js");
+    try {
+      const creds = await registerAgent(o.url, o.key, o.name, o.owner);
+      out(c.green("✓ registered ") + `${creds.agentId} (owner ${creds.owner}) → ${creds.url}\n`);
+    } catch (e: any) {
+      out(c.red(`register failed: ${e.message}\n`));
+    }
+  });
+deskCmd
+  .command("post [title...]")
+  .description("post a task or feedback report to the board")
+  .option("--dispatch", "a dispatch task (someone does work) instead of a feedback report")
+  .option("--high", "high-risk dispatch (needs an owner ack before it can complete)")
+  .option("--body <text>", "task body / details", "")
+  .action(async (parts: string[], o: { dispatch?: boolean; high?: boolean; body: string }) => {
+    const { loadCreds, deskCall } = await import("./desk.js");
+    const creds = loadCreds();
+    if (!creds) return void out(c.red("not registered — run `hara desk register --url … --key …` first\n"));
+    const title = (parts ?? []).join(" ").trim();
+    if (!title) return void out("Usage: hara desk post <title> [--dispatch] [--high] [--body …]\n");
+    try {
+      const r = await deskCall(creds.url, "POST", "/tasks", { token: creds.token, body: { kind: o.dispatch ? "dispatch" : "feedback", risk: o.high ? "high" : "low", title, body: o.body } });
+      out(c.green("✓ posted ") + `${r.task.id} (${r.task.kind}/${r.task.state})\n`);
+    } catch (e: any) {
+      out(c.red(`post failed: ${e.message}\n`));
+    }
+  });
+deskCmd
+  .command("board")
+  .description("list the board (default: open tasks)")
+  .option("--state <state>", "open | claimed | done | cancelled", "open")
+  .option("--kind <kind>", "feedback | dispatch")
+  .action(async (o: { state: string; kind?: string }) => {
+    const { loadCreds, deskCall } = await import("./desk.js");
+    const creds = loadCreds();
+    if (!creds) return void out(c.red("not registered — run `hara desk register` first\n"));
+    try {
+      const q = `/tasks?state=${encodeURIComponent(o.state)}${o.kind ? `&kind=${encodeURIComponent(o.kind)}` : ""}`;
+      const r = await deskCall(creds.url, "GET", q, { token: creds.token });
+      if (!r.tasks.length) return void out(c.dim("(board empty)\n"));
+      for (const t of r.tasks) out(`${t.id}  ${c.bold(t.kind)}${t.risk === "high" ? c.red("!") : " "} ${t.state.padEnd(8)} ${t.title}\n`);
+    } catch (e: any) {
+      out(c.red(`board failed: ${e.message}\n`));
+    }
+  });
+for (const [verb, path, ok] of [
+  ["claim", "claim", "claimed"],
+  ["complete", "complete", "completed"],
+  ["ack", "ack", "acked"],
+  ["cancel", "cancel", "cancelled"],
+] as const) {
+  deskCmd
+    .command(`${verb} <taskId>`)
+    .description(`${verb} a task`)
+    .option("--detail <text>", "note (complete)", "")
+    .action(async (taskId: string, o: { detail: string }) => {
+      const { loadCreds, deskCall } = await import("./desk.js");
+      const creds = loadCreds();
+      if (!creds) return void out(c.red("not registered — run `hara desk register` first\n"));
+      try {
+        const r = await deskCall(creds.url, "POST", `/tasks/${taskId}/${path}`, { token: creds.token, body: verb === "complete" ? { detail: o.detail } : {} });
+        out(c.green(`✓ ${ok} `) + `${r.task?.id ?? taskId}${r.task ? ` (${r.task.state})` : ""}\n`);
+      } catch (e: any) {
+        out(c.red(`${verb} failed: ${e.message}\n`));
+      }
+    });
+}
+
 const skillsCmd = program.command("skills").description("manage skills (.hara/skills/<name>/SKILL.md)");
 skillsCmd
   .command("init")
