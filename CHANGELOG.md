@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.119.2 — TUI: update notices actually visible · CJK-correct input wrapping
+
+- **Update notices now render INSIDE the TUI** (yellow line under the header card). They used to
+  print to stdout before ink mounted and vanished when the TUI took the screen — which is why TUI
+  users never saw them and versions silently went stale (field report: stuck on 0.112.5).
+- **Input wrapping measures terminal CELLS, not characters.** CJK/emoji render 2 cells wide;
+  mixed 中文+ASCII prompts used to overflow the real width and get soft-wrapped a second time
+  mid-word ("output" torn into "ou/tput"). Long words hard-break per code point so a double-width
+  char never straddles the terminal edge.
+
 ## 0.119.1 — field-feedback robustness: param gate · no-hang git · actionable timeouts · stale-artifact rule
 
 - **Required-parameter gate.** A tool call arriving WITHOUT its required parameters (observed:
