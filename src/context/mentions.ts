@@ -73,14 +73,21 @@ const cache = new Map<string, { at: number; entries: string[] }>();
 const CACHE_MS = 5000;
 
 function projectEntries(cwd: string): string[] {
-  const hit = cache.get(cwd);
+  const key = resolve(cwd);
+  const hit = cache.get(key);
   const now = Date.now();
   if (hit && now - hit.at < CACHE_MS) return hit.entries;
-  const files = listProjectFiles(cwd);
+  const files = listProjectFiles(key);
   // files + their directory prefixes (so `@src/` drills into the subtree)
   const entries = [...dirPrefixes(files), ...files];
-  cache.set(cwd, { at: now, entries });
+  cache.set(key, { at: now, entries });
   return entries;
+}
+
+/** Invalidate the derived @path inventory after a coding tool creates/deletes a file. */
+export function invalidateFileCandidates(cwd?: string): void {
+  if (cwd) cache.delete(resolve(cwd));
+  else cache.clear();
 }
 
 /**

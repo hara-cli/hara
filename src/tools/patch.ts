@@ -1,11 +1,13 @@
 // apply_patch — change MULTIPLE files atomically (all-or-nothing). Everything is validated and
 // computed in memory first; nothing is written unless every change applies cleanly.
-import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
-import { isAbsolute, resolve, dirname } from "node:path";
+import { lstat, readFile, unlink } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { registerTool } from "./registry.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
+import { atomicWriteText, FileChangedError } from "../fs-write.js";
+import { invalidateFileCandidates } from "../context/mentions.js";
 
 interface Change {
   path: string;
@@ -69,12 +71,26 @@ registerTool({
 
     // PHASE 1 — validate + compute every change in memory; bail before writing anything.
     const plans: Plan[] = [];
+    const plannedPaths = new Set<string>();
     for (let i = 0; i < changes.length; i++) {
       const ch = changes[i];
       const tag = `change ${i + 1}/${changes.length}`;
       if (typeof ch.path !== "string" || !ch.path) return `Error: ${tag} is missing a path. Nothing written.`;
       const p = abs(ch.path);
-      const type = ch.type ?? (ch.edits ? "update" : "create");
+      if (plannedPaths.has(p)) return `Error: ${tag} repeats path ${ch.path}. Combine edits for one file into a single change. Nothing written.`;
+      plannedPaths.add(p);
+
+      let type = ch.type ?? (ch.edits ? "update" : "create");
+      // Backward-compatible shorthand: {path, content} updates an existing file and creates a missing
+      // one. An EXPLICIT type:create is stricter and never clobbers an existing path.
+      if (!ch.type && !ch.edits) {
+        try {
+          await lstat(p);
+          type = "update";
+        } catch (error: any) {
+          if (error?.code !== "ENOENT") return `Error: ${tag} cannot inspect ${ch.path}: ${error?.message ?? String(error)}. Nothing written.`;
+        }
+      }
 
       if (type === "delete") {
         let before: string;
@@ -86,15 +102,13 @@ registerTool({
         plans.push({ path: ch.path, abs: p, type, before, after: null, existed: true });
       } else if (type === "create") {
         if (typeof ch.content !== "string") return `Error: ${tag} create ${ch.path} needs \`content\`. Nothing written.`;
-        let before = "";
-        let existed = false;
         try {
-          before = await readFile(p, "utf8");
-          existed = true;
-        } catch {
-          /* new file */
+          await lstat(p);
+          return `Error: ${tag} create ${ch.path}: path already exists (use type:update to replace it). Nothing written.`;
+        } catch (error: any) {
+          if (error?.code !== "ENOENT") return `Error: ${tag} create ${ch.path}: ${error?.message ?? String(error)}. Nothing written.`;
         }
-        plans.push({ path: ch.path, abs: p, type, before, after: ch.content, existed });
+        plans.push({ path: ch.path, abs: p, type, before: "", after: ch.content, existed: false });
       } else {
         // update
         let before: string;
@@ -119,21 +133,31 @@ registerTool({
     try {
       for (const pl of plans) {
         if (pl.type === "delete") {
+          let current: string;
+          try {
+            current = await readFile(pl.abs, "utf8");
+          } catch {
+            throw new FileChangedError(pl.path);
+          }
+          if (current !== pl.before) throw new FileChangedError(pl.path);
           await unlink(pl.abs);
         } else {
-          await mkdir(dirname(pl.abs), { recursive: true });
-          await writeFile(pl.abs, pl.after as string, "utf8");
+          await atomicWriteText(pl.abs, pl.after as string, { expected: pl.existed ? pl.before : null });
         }
         applied.push(pl);
       }
     } catch (e) {
+      const rollbackFailures: string[] = [];
       for (const pl of applied.reverse()) {
         try {
           if (pl.type === "create" && !pl.existed) await unlink(pl.abs); // remove a file we created
-          else await writeFile(pl.abs, pl.before, "utf8"); // restore an updated/deleted file's prior content
-        } catch {
-          /* best-effort rollback */
+          else await atomicWriteText(pl.abs, pl.before); // restore an updated/deleted file's prior content
+        } catch (rollbackError: any) {
+          rollbackFailures.push(`${pl.path}: ${rollbackError?.message ?? String(rollbackError)}`);
         }
+      }
+      if (rollbackFailures.length) {
+        return `Error: apply_patch failed (${e instanceof Error ? e.message : String(e)}); rollback was INCOMPLETE: ${rollbackFailures.join("; ")}. Inspect these files before continuing.`;
       }
       return `Error: apply_patch failed writing a file (${e instanceof Error ? e.message : String(e)}) — rolled back, nothing left changed.`;
     }
@@ -143,6 +167,7 @@ registerTool({
       return pl.type === "delete" ? `deleted ${pl.path}` : `${pl.type === "create" ? "created" : "updated"} ${pl.path}`;
     });
     recordEdit(plans.map((pl) => ({ path: pl.path, absPath: pl.abs, before: pl.existed ? pl.before : null })));
+    invalidateFileCandidates(ctx.cwd);
     return `apply_patch: ${plans.length} file(s) — ${summary.join("; ")}.`;
   },
 });

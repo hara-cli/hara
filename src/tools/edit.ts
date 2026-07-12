@@ -1,10 +1,12 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { registerTool } from "./registry.js";
 import { nearestPaths } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
 import { recordEdit } from "../undo.js";
+import { atomicWriteText } from "../fs-write.js";
+import { invalidateFileCandidates } from "../context/mentions.js";
 
 registerTool({
   name: "edit_file",
@@ -56,9 +58,14 @@ registerTool({
 
     const res = applyEdits(text, edits);
     if ("error" in res) return `Error: ${res.error} in ${input.path}. No changes written.`;
-    await writeFile(p, res.text, "utf8");
+    try {
+      await atomicWriteText(p, res.text, { expected: text });
+    } catch (error: any) {
+      return `Error: cannot edit ${input.path}: ${error?.message ?? String(error)} No changes written.`;
+    }
     emitDiff(input.path, text, res.text, ctx.ui);
     recordEdit([{ path: input.path, absPath: p, before: text }]);
+    invalidateFileCandidates(ctx.cwd);
     const note = res.fuzzy ? " (quote-normalized)" : "";
     const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
     return `Edited ${input.path}: ${plural(edits.length, "edit")}, ${plural(res.total, "replacement")}${note}.`;

@@ -7,13 +7,13 @@ import { applyEdits } from "../dist/tools/apply-core.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/patch.js";
 
-test("apply_patch: a mid-write failure rolls back — never leaves a half-patched tree", async () => {
+test("apply_patch: invalid destination is rejected in preflight — never leaves a half-patched tree", async () => {
   const d = mkdtempSync(join(tmpdir(), "hara-patch-rb-"));
   try {
     const a = join(d, "a.txt");
     writeFileSync(a, "original A\n");
-    // change A (succeeds) then create a file UNDER a.txt — a.txt is a file, so mkdir fails in Phase 2,
-    // AFTER A was written. True atomicity requires A to be rolled back.
+    // A file cannot be used as a parent directory. Preflight now catches that before Phase 2, so the
+    // otherwise-valid first change must remain untouched.
     const res = await getTool("apply_patch").run(
       {
         changes: [
@@ -23,8 +23,8 @@ test("apply_patch: a mid-write failure rolls back — never leaves a half-patche
       },
       { cwd: d },
     );
-    assert.match(res, /rolled back|failed/i, "reports the failure + rollback");
-    assert.equal(readFileSync(a, "utf8"), "original A\n", "A is restored — not left half-patched");
+    assert.match(res, /nothing written/i, "reports the preflight failure");
+    assert.equal(readFileSync(a, "utf8"), "original A\n", "A is never changed");
     assert.ok(!existsSync(join(d, "a.txt", "b.txt")), "B was not created");
   } finally {
     rmSync(d, { recursive: true, force: true });
@@ -91,6 +91,39 @@ test("apply_patch: multi-file update + create + delete", async () => {
     assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "ALPHA");
     assert.equal(readFileSync(join(dir, "c.txt"), "utf8"), "gamma");
     assert.ok(!existsSync(join(dir, "b.txt")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("apply_patch: rejects duplicate aliases for one path instead of losing an edit", async () => {
+  const dir = fixture();
+  try {
+    const out = await getTool("apply_patch").run(
+      {
+        changes: [
+          { path: "a.txt", edits: [{ old_string: "alpha", new_string: "first" }] },
+          { path: "./a.txt", edits: [{ old_string: "alpha", new_string: "second" }] },
+        ],
+      },
+      { cwd: dir },
+    );
+    assert.match(out, /repeats path/i);
+    assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "alpha", "neither overlapping change is written");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("apply_patch: explicit create never overwrites an existing file", async () => {
+  const dir = fixture();
+  try {
+    const out = await getTool("apply_patch").run(
+      { changes: [{ path: "a.txt", type: "create", content: "replacement" }] },
+      { cwd: dir },
+    );
+    assert.match(out, /already exists/i);
+    assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "alpha");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

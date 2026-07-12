@@ -1,11 +1,13 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname, resolve, isAbsolute } from "node:path";
+import { readFile } from "node:fs/promises";
+import { resolve, isAbsolute } from "node:path";
 import { stdout as procOut } from "node:process";
 import { registerTool } from "./registry.js";
 import { runShell } from "../sandbox.js";
 import { nearestPaths } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
+import { atomicWriteText } from "../fs-write.js";
+import { invalidateFileCandidates } from "../context/mentions.js";
 import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
 import {
   hostsInCommand,
@@ -120,16 +122,22 @@ registerTool({
   kind: "edit",
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
+    if (typeof input.content !== "string") return "Error: write_file `content` must be a string. No changes written.";
     let prev: string | null = null;
     try {
       prev = await readFile(p, "utf8");
-    } catch {
-      /* new file */
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") return `Error: cannot inspect ${input.path}: ${error?.code ?? error?.message}. No changes written.`;
     }
-    await mkdir(dirname(p), { recursive: true });
-    await writeFile(p, input.content, "utf8");
+    if (prev === input.content) return `Unchanged ${p} (${input.content.length} chars already match).`;
+    try {
+      await atomicWriteText(p, input.content, { expected: prev });
+    } catch (error: any) {
+      return `Error: cannot write ${input.path}: ${error?.message ?? String(error)} No changes written.`;
+    }
     emitDiff(input.path, prev ?? "", input.content, ctx.ui);
     recordEdit([{ path: input.path, absPath: p, before: prev }]);
+    invalidateFileCandidates(ctx.cwd);
     return `Wrote ${String(input.content).length} chars to ${p}`;
   },
 });

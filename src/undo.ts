@@ -1,7 +1,8 @@
 // In-session undo stack for file changes. Each edit tool records the prior state of the files it
 // touched; `/undo` pops the last group and restores it. Process-scoped (one REPL session).
-import { writeFile, unlink, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { unlink } from "node:fs/promises";
+import { atomicWriteText } from "./fs-write.js";
+import { invalidateFileCandidates } from "./context/mentions.js";
 
 export interface FileSnap {
   path: string; // display path (as given by the tool)
@@ -33,13 +34,13 @@ export async function undoLast(): Promise<{ files: string[] } | { error: string 
       if (s.before === null) {
         await unlink(s.absPath).catch(() => {}); // was newly created → remove
       } else {
-        await mkdir(dirname(s.absPath), { recursive: true });
-        await writeFile(s.absPath, s.before, "utf8");
+        await atomicWriteText(s.absPath, s.before);
       }
       files.push(s.path);
     } catch {
       /* skip a file we can't restore */
     }
   }
+  if (files.length) invalidateFileCandidates();
   return { files };
 }
