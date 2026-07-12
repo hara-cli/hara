@@ -1,6 +1,5 @@
 // Crash-safe UTF-8 writes for coding tools. Content is staged beside the destination, fsynced, then
 // renamed into place so a killed process never leaves a half-written source file.
-import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { link, lstat, mkdir, open, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 
@@ -17,6 +16,8 @@ export interface AtomicWriteOptions {
   /** undefined = unconditional; string = current content must match; null = path must not exist. */
   expected?: string | null;
 }
+
+let tempSequence = 0;
 
 async function writeTarget(path: string): Promise<string> {
   try {
@@ -60,7 +61,7 @@ export async function atomicWriteText(path: string, content: string, options: At
 
   // Keep the staging basename fixed-size: prefixing the destination's full basename would make a
   // perfectly valid near-NAME_MAX file impossible to edit because the temporary name becomes longer.
-  const temp = join(dir, `.hara-${process.pid}-${randomUUID()}.tmp`);
+  const temp = join(dir, `.hara-${process.pid}-${Date.now().toString(36)}-${tempSequence++}.tmp`);
   let staged = false;
   try {
     const handle = await open(temp, "wx", mode);

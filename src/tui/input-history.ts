@@ -78,19 +78,26 @@ export class ComposerHistory<Attachment> {
   }
 }
 
-const segmenter = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+let segmenter: Intl.Segmenter | null | undefined;
+function graphemeSegmenter(): Intl.Segmenter | null {
+  // Constructing Intl.Segmenter loads ICU data. Defer that cost until the first actual cursor edit so
+  // lightweight commands such as `hara --version` do not pay for TUI Unicode support.
+  if (segmenter === undefined) segmenter = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+  return segmenter;
+}
 
 /** Previous user-perceived character boundary (keeps emoji ZWJ sequences/combining marks intact). */
 export function previousGraphemeIndex(value: string, cursor: number): number {
   const at = Math.max(0, Math.min(value.length, cursor));
   if (at === 0) return 0;
-  if (!segmenter) {
+  const segments = graphemeSegmenter();
+  if (!segments) {
     const low = value.charCodeAt(at - 1);
     const paired = low >= 0xdc00 && low <= 0xdfff && at > 1 && value.charCodeAt(at - 2) >= 0xd800 && value.charCodeAt(at - 2) <= 0xdbff;
     return Math.max(0, at - (paired ? 2 : 1));
   }
   let previous = 0;
-  for (const part of segmenter.segment(value)) {
+  for (const part of segments.segment(value)) {
     if (part.index >= at) break;
     previous = part.index;
   }
@@ -101,11 +108,12 @@ export function previousGraphemeIndex(value: string, cursor: number): number {
 export function nextGraphemeIndex(value: string, cursor: number): number {
   const at = Math.max(0, Math.min(value.length, cursor));
   if (at >= value.length) return value.length;
-  if (!segmenter) {
+  const segments = graphemeSegmenter();
+  if (!segments) {
     const cp = value.codePointAt(at);
     return Math.min(value.length, at + (cp !== undefined && cp > 0xffff ? 2 : 1));
   }
-  for (const part of segmenter.segment(value)) {
+  for (const part of segments.segment(value)) {
     const end = part.index + part.segment.length;
     if (end > at) return end;
   }
@@ -131,9 +139,10 @@ export function previousWordIndex(value: string, cursor: number): number {
 function graphemeFloor(value: string, cursor: number): number {
   const at = Math.max(0, Math.min(value.length, cursor));
   if (at === value.length) return at;
-  if (!segmenter) return at > 0 && /[\uDC00-\uDFFF]/.test(value[at]) ? at - 1 : at;
+  const segments = graphemeSegmenter();
+  if (!segments) return at > 0 && /[\uDC00-\uDFFF]/.test(value[at]) ? at - 1 : at;
   let floor = 0;
-  for (const part of segmenter.segment(value)) {
+  for (const part of segments.segment(value)) {
     if (part.index > at) break;
     floor = part.index;
     if (part.index + part.segment.length === at) return at;
