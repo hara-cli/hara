@@ -1,5 +1,6 @@
 import type { ToolSpec } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
+import { limitToolResult } from "./result-limit.js";
 
 /** Where agent-side output goes. In the TUI it drives ink state; in plain mode it's absent and
  *  the loop/tools fall back to writing the terminal directly. */
@@ -58,9 +59,17 @@ export function missingRequired(tool: Tool, input: unknown): string[] {
 }
 
 const registry = new Map<string, Tool>();
+let specsCache: ToolSpec[] | null = null;
 
 export function registerTool(t: Tool): void {
-  registry.set(t.name, t);
+  const run = t.run;
+  registry.set(t.name, {
+    ...t,
+    // Apply the context boundary at registration so every caller (main loop, tests, embedders) gets
+    // identical behavior instead of relying on one orchestration path to remember the cap.
+    run: async (input, ctx) => limitToolResult(await run(input, ctx)),
+  });
+  specsCache = null;
 }
 
 export function getTool(name: string): Tool | undefined {
@@ -73,9 +82,14 @@ export function getTools(): Tool[] {
 
 /** Provider-neutral tool specs derived from the registry. */
 export function toolSpecs(): ToolSpec[] {
-  return getTools().map((t) => ({
-    name: t.name,
-    description: t.description,
-    input_schema: t.input_schema,
-  }));
+  if (!specsCache) {
+    specsCache = getTools().map((t) => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.input_schema,
+    }));
+  }
+  // Callers commonly filter the array for a role. Return a shallow copy so that never mutates the
+  // stable cached snapshot shared by subsequent agent rounds.
+  return specsCache.slice();
 }
