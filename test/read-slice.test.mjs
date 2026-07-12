@@ -17,11 +17,11 @@ test("trailing newline doesn't produce a phantom empty last line", () => {
   assert.ok(renderFileSlice("a\nb").includes("     2\tb"));
 });
 
-test("long file: default window is 2000 lines + a continue hint", () => {
-  const out = renderFileSlice(file(2500));
-  assert.ok(out.startsWith("(lines 1–2000 of 2500 — continue with offset:2001)\n"), out.slice(0, 60));
-  assert.ok(out.includes("  2000\tline 2000"));
-  assert.ok(!out.includes("line 2001"), "nothing past the window");
+test("long file: default window is 300 lines + a continue hint", () => {
+  const out = renderFileSlice(file(500));
+  assert.ok(out.startsWith("(lines 1–300 of 500 — continue with offset:301)\n"), out.slice(0, 60));
+  assert.ok(out.includes("   300\tline 300"));
+  assert.ok(!out.includes("line 301"), "nothing past the window");
 });
 
 test("offset/limit read a middle slice; final slice has no continue hint", () => {

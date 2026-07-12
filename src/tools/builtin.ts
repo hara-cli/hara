@@ -1,13 +1,14 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { resolve, isAbsolute } from "node:path";
 import { stdout as procOut } from "node:process";
 import { registerTool } from "./registry.js";
 import { runShell } from "../sandbox.js";
-import { nearestPaths } from "../fs-walk.js";
+import { isProbablyBinary, nearestPaths } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
 import { atomicWriteText } from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
+import { BinaryFileError, streamFileSlice } from "../fs-read.js";
 import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
 import {
   hostsInCommand,
@@ -58,8 +59,9 @@ export function capHeadTail(s: string, max = MAX): string {
   return s.slice(0, head) + `\n…[${s.length - max} chars truncated]…\n` + s.slice(s.length - (max - head));
 }
 
-const READ_LINES = 2000; // default lines per read_file call (a long file is read in slices, not dumped whole)
+const READ_LINES = 300; // sized to stay useful under the global 24k-char tool-result context boundary
 const LINE_CAP = 2000; // chars per line before truncation (minified bundles / data lines)
+const BUFFERED_READ_BYTES = 4 * 1024 * 1024;
 
 /** Render a line slice of a file, cat -n style. The old read_file dumped the WHOLE file (100K-char cap,
  *  tail simply lost) — on long files that both flooded the context (~25k tokens per read, again on every
@@ -87,21 +89,27 @@ export function renderFileSlice(text: string, offset?: number, limit?: number): 
 registerTool({
   name: "read_file",
   description:
-    "Read a UTF-8 text file; returns cat -n style numbered lines. Reads up to 2000 lines by default — for a longer file pass offset/limit to read the next slice (the output header tells you the total and where to continue). Prefer grep to locate, then read just that region.",
+    "Read a UTF-8 text file; returns cat -n style numbered lines. Reads up to 300 lines by default — for a longer file pass offset/limit to read the next slice (the header tells you where to continue). Large files are streamed instead of loaded whole. Prefer grep to locate, then read just that region.",
   input_schema: {
     type: "object",
     properties: {
       path: { type: "string", description: "File path, relative to cwd or absolute" },
       offset: { type: "number", description: "1-based line number to start from (for long files)" },
-      limit: { type: "number", description: "max lines to return (default 2000)" },
+      limit: { type: "number", description: "max lines to return (default 300)" },
     },
     required: ["path"],
   },
   kind: "read",
   async run(input, ctx) {
+    const p = abs(input.path, ctx.cwd);
     try {
-      return cap(renderFileSlice(await readFile(abs(input.path, ctx.cwd), "utf8"), input.offset, input.limit));
+      const info = await stat(p);
+      if (info.size > BUFFERED_READ_BYTES) return cap(await streamFileSlice(p, input.offset, input.limit ?? READ_LINES, { lineCap: LINE_CAP }));
+      const buf = await readFile(p);
+      if (isProbablyBinary(buf)) throw new BinaryFileError(p);
+      return cap(renderFileSlice(buf.toString("utf8"), input.offset, input.limit));
     } catch (e: any) {
+      if (e instanceof BinaryFileError) return `Error: cannot read ${input.path}: file appears binary; use an image/media-specific tool or inspect it with \`file\`.`;
       const near = nearestPaths(ctx.cwd, input.path);
       return `Error: cannot read ${input.path}: ${e.code ?? e.message}.` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
     }

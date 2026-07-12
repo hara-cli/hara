@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { capHeadTail } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
@@ -41,6 +41,31 @@ test("write_file creates nested parent directories", async () => {
     await getTool("write_file").run({ path: "deep/nested/b.txt", content: "x" }, ctx);
     const r = await getTool("read_file").run({ path: "deep/nested/b.txt" }, ctx);
     assert.equal(r, "     1\tx"); // cat -n numbered
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file streams a file larger than the in-memory threshold", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-test-"));
+  try {
+    const path = join(dir, "large.log");
+    writeFileSync(path, (`${"x".repeat(1000)}\n`).repeat(5000)); // ~5 MB
+    const out = await getTool("read_file").run({ path: "large.log", limit: 2 }, { cwd: dir });
+    assert.match(out, /^\(lines 1–2; more lines follow — continue with offset:3\)/);
+    assert.ok(out.includes("     2\t"), "requested line window is present");
+    assert.ok(!out.includes("     3\t"), "the reader stops after proving more content exists");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file rejects binary content instead of injecting it into model context", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-test-"));
+  try {
+    writeFileSync(join(dir, "blob.bin"), Buffer.from([1, 2, 0, 3]));
+    const out = await getTool("read_file").run({ path: "blob.bin" }, { cwd: dir });
+    assert.match(out, /appears binary/i);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
