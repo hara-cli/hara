@@ -66,9 +66,11 @@ export async function deskCall(
   return data;
 }
 
-/** Register this machine's agent with a desk and persist the returned credentials. */
-export async function registerAgent(url: string, enrollKey: string, name: string, owner: string): Promise<DeskCreds> {
-  const r = await deskCall(url, "POST", "/register", { body: { enrollKey, name, owner } });
+/** Register this machine's agent with a desk and persist the returned credentials. `client`
+ *  identifies the kind of client (defaults "hara-cli"); the desk is client-agnostic, so any agent
+ *  may pass its own label. */
+export async function registerAgent(url: string, enrollKey: string, name: string, owner: string, client = "hara-cli"): Promise<DeskCreds> {
+  const r = await deskCall(url, "POST", "/register", { body: { enrollKey, name, owner, client } });
   const creds: DeskCreds = { url, agentId: r.agentId, owner: r.owner, token: r.token };
   saveCreds(creds);
   return creds;
