@@ -1,0 +1,14 @@
+name: Feature request
+description: Something hara should do
+labels: [feedback, enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What do you want hara to do
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why / what workflow does it unblock

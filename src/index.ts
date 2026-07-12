@@ -2041,6 +2041,52 @@ rolesCmd.action(() => {
   }
 });
 
+program
+  .command("feedback [description...]")
+  .description("file a structured bug/feature report to GitHub (hara-cli/hara) — humans and agents use the same door")
+  .option("--session", "append a REDACTED tail of the most recent session (the issue is PUBLIC)")
+  .option("--dry-run", "print the issue body without filing")
+  .action(async (parts: string[], o: { session?: boolean; dryRun?: boolean }) => {
+    // the hara-hub verdict: feedback is a command, not a server — GitHub Issues is the bus
+    const { collectEnv, buildIssueBody, issueTitle, FEEDBACK_REPO, NEW_ISSUE_URL } = await import("./feedback.js");
+    const desc = (parts ?? []).join(" ").trim();
+    if (!desc) {
+      out(`Usage: hara feedback "what happened…" [--session] [--dry-run] — files a structured issue to ${FEEDBACK_REPO}\n`);
+      return;
+    }
+    let tail: string | undefined;
+    if (o.session) {
+      const { listSessions, loadSession } = await import("./session/store.js");
+      const metas = listSessions();
+      const last = metas[0] ? loadSession(metas[0].id) : null;
+      if (last) {
+        tail = last.history
+          .slice(-8)
+          .map((m: any) => (m.role === "user" ? `user: ${m.content}` : m.role === "assistant" && m.text ? `assistant: ${m.text}` : ""))
+          .filter(Boolean)
+          .join("\n")
+          .slice(-3000);
+        out(c.yellow("⚠ --session attaches a redacted tail of your last session to a PUBLIC issue.\n"));
+      }
+    }
+    const { readRawConfig } = await import("./config.js");
+    const raw = readRawConfig() as { provider?: string; model?: string };
+    const modelLabel = raw.provider && raw.model ? `${raw.provider}:${raw.model}` : undefined;
+    const body = buildIssueBody(desc, collectEnv(pkg.version, modelLabel), tail);
+    if (o.dryRun) {
+      out(body + "\n");
+      return;
+    }
+    const { execFileSync } = await import("node:child_process");
+    try {
+      execFileSync("gh", ["--version"], { stdio: "ignore" });
+      const url = execFileSync("gh", ["issue", "create", "--repo", FEEDBACK_REPO, "--title", issueTitle(desc), "--body", body, "--label", "feedback"], { encoding: "utf8" });
+      out(c.green("✓ filed: ") + url.trim() + "\n");
+    } catch {
+      out(`\n(gh CLI unavailable or filing failed — copy everything below into ${NEW_ISSUE_URL})\n\n# ${issueTitle(desc)}\n\n${body}\n`);
+    }
+  });
+
 const skillsCmd = program.command("skills").description("manage skills (.hara/skills/<name>/SKILL.md)");
 skillsCmd
   .command("init")
