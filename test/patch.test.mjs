@@ -413,10 +413,14 @@ test("apply_patch delete cleanup preserves a replacement inserted during claimed
       { cwd: dir },
     );
     assert.equal(swapped, true, "fixture replaces the claimed path after its old inode has been opened");
-    assert.match(out, /Warning:.*claimed entry is preserved at/i);
+    // Loaded Linux runners can schedule the swap either before or after the long descriptor read. Both
+    // safe paths must warn, retain the unexpected inode, and never put it back at the visible target.
+    assert.match(out, /Warning:.*cleanup was refused/i);
+    assert.equal(existsSync(deleted), false, "the unrelated replacement never reappears at the deleted path");
     assert.equal(existsSync(savedDelete), true, "the intended deleted inode remains with the external mover");
-    const retained = readdirSync(dir).find((entry) => entry.startsWith(".hara-discard-") && entry.endsWith(".tmp"));
-    assert.ok(retained, "the replacement is retained under the warning's recovery name");
+    const retained = readdirSync(dir).find((entry) =>
+      (entry.startsWith(".hara-discard-") || entry.startsWith(".hara-delete-")) && entry.endsWith(".tmp"));
+    assert.ok(retained, "the replacement is retained under a warned recovery name");
     assert.equal(readFileSync(join(dir, retained), "utf8"), "external victim\n", "cleanup never unlinks the unrelated replacement");
   } finally {
     clearInterval(watcher);
