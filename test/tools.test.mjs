@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { capHeadTail } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
+import { capHeadTail, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
 
 test("capHeadTail: keeps head + tail of long output (errors live at the end)", () => {
@@ -14,6 +14,17 @@ test("capHeadTail: keeps head + tail of long output (errors live at the end)", (
   assert.match(out, /chars truncated/);
   assert.ok(out.length < s.length);
   assert.equal(capHeadTail("short output"), "short output"); // under the cap → unchanged
+});
+
+test("long package installs and ngrok tunnel commands are classified for preflight/background handling", () => {
+  for (const c of ["npm install", "npm i react", "npm ci", "pnpm add zod", "yarn install", "bun install"]) {
+    assert.equal(isPackageInstallCommand(c), true, c);
+  }
+  for (const c of ["npm test", "pnpm check", "node install.js"]) assert.equal(isPackageInstallCommand(c), false, c);
+  assert.equal(isNgrokTunnelCommand("ngrok http 3000"), true);
+  assert.equal(isNgrokTunnelCommand("ngrok config check"), false);
+  assert.equal(ngrokAuthConfigured({ NGROK_AUTHTOKEN: "present" }, "/no-home"), true);
+  assert.equal(ngrokAuthConfigured({}, "/no-home"), false);
 });
 
 test("registry contains the built-in tools", () => {

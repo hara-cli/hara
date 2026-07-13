@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { htmlToText, parseSearchResults, isPrivateIp } from "../dist/tools/web.js";
+import { htmlToText, parseSearchResults, parseBaiduSearchResults, parseBingSearchResults, parseGoogleSearchResults, looksLikeJsRenderedShell, isPrivateIp } from "../dist/tools/web.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/web.js";
 
@@ -22,6 +22,62 @@ test("parseSearchResults: respects the limit + empty on no matches", () => {
   assert.deepEqual(parseSearchResults("<html>nothing here</html>", 5), []);
   const many = Array.from({ length: 10 }, (_, i) => `<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fx${i}.com">R${i}</a>`).join("");
   assert.equal(parseSearchResults(many, 3).length, 3);
+});
+
+test("parseBaiduSearchResults: server-rendered headings + snippets", () => {
+  const html = `
+    <div class="result c-container"><h3 class="t"><a href="https://www.baidu.com/link?url=abc">Hara <em>CLI</em></a></h3><div class="c-abstract">A coding agent for teams.</div></div>
+    <div class="result c-container"><h3 class="t"><a href='https://example.com/two'>Second result</a></h3><div class="c-abstract">More text.</div></div>`;
+  const r = parseBaiduSearchResults(html, 5);
+  assert.equal(r.length, 2);
+  assert.equal(r[0].title, "Hara CLI");
+  assert.equal(r[0].url, "https://www.baidu.com/link?url=abc");
+  assert.match(r[0].snippet, /coding agent/);
+});
+
+test("parseBingSearchResults: server-rendered b_algo blocks", () => {
+  const html = `<ol><li class="b_algo"><h2><a href="https://example.com/hara">Hara <strong>CLI</strong></a></h2><div class="b_caption"><p>A mainland-accessible result.</p></div></li></ol>`;
+  assert.deepEqual(parseBingSearchResults(html, 3), [
+    { title: "Hara CLI", url: "https://example.com/hara", snippet: "A mainland-accessible result." },
+  ]);
+});
+
+test("parseGoogleSearchResults: classic h3 links and /url redirects", () => {
+  const html = `<a href="/url?q=https%3A%2F%2Fexample.com%2Fone&sa=U"><h3>First result</h3></a><a href="https://two.example/page"><span><h3>Second</h3></span></a>`;
+  assert.deepEqual(parseGoogleSearchResults(html, 3), [
+    { title: "First result", url: "https://example.com/one", snippet: "" },
+    { title: "Second", url: "https://two.example/page", snippet: "" },
+  ]);
+});
+
+test("web_search: Tavily connection failure races and falls back to Bing CN", async () => {
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.HARA_SEARCH_API_KEY;
+  const calls = [];
+  try {
+    process.env.HARA_SEARCH_API_KEY = "test-key";
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      if (String(url).includes("tavily")) throw new Error("fetch failed");
+      if (String(url).includes("cn.bing.com")) {
+        return new Response('<li class="b_algo"><h2><a href="https://example.com/result">Domestic result</a></h2><p>Useful snippet</p></li>', { status: 200, headers: { "content-type": "text/html" } });
+      }
+      throw new Error("unexpected provider");
+    };
+    const out = await getTool("web_search").run({ query: "hara", limit: 3 }, { cwd: "." });
+    assert.match(out, /Domestic result/);
+    assert.deepEqual(new Set(calls.map((u) => new URL(u).host)), new Set(["api.tavily.com", "cn.bing.com"]));
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.HARA_SEARCH_API_KEY;
+    else process.env.HARA_SEARCH_API_KEY = savedKey;
+  }
+});
+
+test("looksLikeJsRenderedShell: catches an empty SPA shell, not real article text", () => {
+  assert.equal(looksLikeJsRenderedShell('<div id="root"></div><script src="app.js"></script>', ""), true);
+  assert.equal(looksLikeJsRenderedShell('<main id="app"></main><script>boot()</script>', "Loading…"), true);
+  assert.equal(looksLikeJsRenderedShell(`<article>${"readable ".repeat(40)}</article>`, "readable ".repeat(40)), false);
 });
 
 test("htmlToText: strips tags/scripts, decodes entities, keeps list structure", () => {

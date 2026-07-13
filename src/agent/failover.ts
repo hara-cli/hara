@@ -40,7 +40,7 @@ export function failoverAction(kind: ErrKind, s: FailoverState): "fallback" | "f
 export function errorHint(kind: ErrKind): string {
   switch (kind) {
     case "auth":
-      return " — check your API key / auth (try `hara setup`)";
+      return " — the configured credential was rejected or expired; update ~/.hara/config.json, the active profile, or its environment variable, then retry. Do not paste the key into chat";
     case "rate_limit":
       return " — rate-limited; wait a moment, or set `fallbackModel` to auto-switch";
     case "overloaded":

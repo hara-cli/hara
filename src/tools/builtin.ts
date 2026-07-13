@@ -1,4 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve, isAbsolute } from "node:path";
 import { stdout as procOut } from "node:process";
 import { registerTool } from "./registry.js";
@@ -21,6 +23,35 @@ import {
 } from "./net-reachability.js";
 
 const MAX = 100_000;
+
+/** Package installs are network-bound and routinely exceed the foreground cap. When the model omits an
+ *  explicit foreground/background choice, detach these commands into the existing job system so the UI
+ *  remains responsive and the agent can poll output instead of waiting five minutes for a hard kill. */
+export function isPackageInstallCommand(command: string): boolean {
+  return /(?:^|[;&|]\s*)(?:npm\s+(?:i|install|ci)\b|pnpm\s+(?:i|install|add)\b|yarn(?:\s+(?:install|add))?(?:\s|$)|bun\s+(?:i|install|add)\b)/i.test(command.trim());
+}
+
+export function isNgrokTunnelCommand(command: string): boolean {
+  return /(?:^|[;&|]\s*)ngrok\s+(?:http|tcp|tls|start)\b/i.test(command.trim());
+}
+
+/** Read only the presence of ngrok auth — never return or print its value. */
+export function ngrokAuthConfigured(env: NodeJS.ProcessEnv = process.env, home = homedir()): boolean {
+  if (env.NGROK_AUTHTOKEN || env.NGROK_API_KEY) return true;
+  const files = [
+    resolve(home, ".config/ngrok/ngrok.yml"),
+    resolve(home, "Library/Application Support/ngrok/ngrok.yml"),
+    resolve(home, ".ngrok2/ngrok.yml"),
+  ];
+  for (const file of files) {
+    try {
+      if (existsSync(file) && /^\s*(?:authtoken|api_key)\s*:\s*\S+/im.test(readFileSync(file, "utf8"))) return true;
+    } catch {
+      /* unreadable config counts as unconfigured */
+    }
+  }
+  return false;
+}
 
 /** Resolve the remote HOST a bare `git pull/fetch/push` targets (no URL in the command → host lives in the
  *  repo's remote config). Local + fast (no network); best-effort — returns "" on any hiccup. Only ever
@@ -157,16 +188,23 @@ registerTool({
     type: "object",
     properties: {
       command: { type: "string" },
-      timeout_ms: { type: "number", description: "default 300000 (5 min); raise for a long build/transform, or use background:true for a server" },
-      background: { type: "boolean", description: "run as a background job (dev server, watcher, long task); returns a job id immediately — tail/kill it with the `job` tool" },
+      timeout_ms: { type: "number", description: "default 300000 (5 min); set explicitly for a foreground long build/transform" },
+      background: { type: "boolean", description: "run as a background job (dev server, watcher, long task). Package installs auto-background when this field and timeout_ms are omitted. Poll with the `job` tool before depending on completion." },
     },
     required: ["command"],
   },
   kind: "exec",
   async run(input, ctx) {
-    if (input.background) {
+    if (isNgrokTunnelCommand(input.command) && !ngrokAuthConfigured()) {
+      return (
+        "Skipped ngrok tunnel: no authentication was found in NGROK_AUTHTOKEN/NGROK_API_KEY or the standard ngrok config files. " +
+        "Configure ngrok authentication first, then retry. Do not rotate through other tunnel providers blindly; ask the user which authenticated provider to use."
+      );
+    }
+    const autoPackageJob = input.background === undefined && input.timeout_ms === undefined && isPackageInstallCommand(input.command);
+    if (input.background || autoPackageJob) {
       const id = startJob(input.command, ctx.cwd, ctx.sandbox ?? "off");
-      return `Started background job ${id}: \`${input.command}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all.`;
+      return `${autoPackageJob ? "Package install auto-started" : "Started"} background job ${id}: \`${input.command}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all. Poll until it exits before running steps that depend on installed packages.`;
     }
     // Network fault tolerance — short-circuit if this command targets a host already found unreachable this
     // session, so a repeat doesn't burn another ~75s OS connect timeout. Only pays the git-remote lookup

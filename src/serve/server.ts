@@ -263,16 +263,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, archived: m.archived ?? false })) }));
           case "session.create": {
             const provider = await deps.buildSessionProvider();
-            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — run `hara setup`"));
+            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const approval = (["suggest", "auto-edit", "full-auto"] as ApprovalMode[]).includes(p.approval) ? (p.approval as ApprovalMode) : deps.approval;
-            const s = hub.create({ cwd, provider, providerId: deps.providerId, model: deps.model, approval, projectContext: loadAgentsMd(cwd) || undefined });
+            const s = hub.create({ cwd, provider, providerId: provider.id, model: provider.model, approval, projectContext: loadAgentsMd(cwd) || undefined });
             return reply(rpcResult(id!, { sessionId: s.meta.id, model: s.meta.model }));
           }
           case "session.resume": {
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const provider = await deps.buildSessionProvider();
-            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — run `hara setup`"));
+            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const r = hub.resume(p.sessionId, { provider, approval: deps.approval, projectContext: undefined });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if ("lockedBy" in r) return reply(rpcError(id, ERR.LOCKED, `session held by live pid ${r.lockedBy}`));
@@ -327,8 +327,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             // non-destructive sibling: explore a different direction without losing the original
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const provider = await deps.buildSessionProvider();
-            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — run `hara setup`"));
-            const r = hub.fork(p.sessionId, { provider, providerId: deps.providerId, approval: deps.approval, projectContext: undefined });
+            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
+            const r = hub.fork(p.sessionId, { provider, providerId: provider.id, approval: deps.approval, projectContext: undefined });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             r.session.projectContext = loadAgentsMd(r.session.meta.cwd) || undefined;
             return reply(rpcResult(id!, { sessionId: r.session.meta.id, title: r.session.meta.title, model: r.session.meta.model, history: historyForClient(r.session.history) }));

@@ -1,9 +1,22 @@
 // Session persistence — conversations saved as JSON under ~/.hara/sessions, resumable.
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { NeutralMsg } from "../providers/types.js";
+import { redactSensitiveValue } from "../security/secrets.js";
 
 /** Who created a session. Absent = legacy/interactive. Drives UI segregation (desktop: automated
  *  sessions render as a status timeline, never mixed into the manual list) and the title strategy
@@ -52,7 +65,8 @@ export interface SessionData {
 
 function sessionsDir(): string {
   const d = join(homedir(), ".hara", "sessions");
-  mkdirSync(d, { recursive: true });
+  mkdirSync(d, { recursive: true, mode: 0o700 });
+  chmodSync(d, 0o700); // tighten legacy installs too; session transcripts are private
   return d;
 }
 const sessionFile = (id: string) => join(sessionsDir(), `${id}.json`);
@@ -190,7 +204,43 @@ export function slugify(text: string, max = 40): string {
 export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {
   meta.updatedAt = new Date().toISOString();
   const data: SessionData = { meta, history };
-  writeFileSync(sessionFile(meta.id), JSON.stringify(data, null, 2), "utf8");
+  // Redact a deep COPY: the live turn may still need a credential the user supplied, but the durable
+  // transcript never should. Tool inputs/results are included, not just user message content.
+  const safe = redactSensitiveValue(data).value;
+  // Keep structural routing/identity fields stable even if a path/model happens to resemble a secret.
+  safe.meta.id = meta.id;
+  safe.meta.cwd = meta.cwd;
+  safe.meta.provider = meta.provider;
+  safe.meta.model = meta.model;
+  safe.meta.createdAt = meta.createdAt;
+  safe.meta.updatedAt = meta.updatedAt;
+
+  const target = sessionFile(meta.id);
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(tmp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(safe, null, 2), "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, target); // same filesystem: readers see the complete old or complete new JSON
+    chmodSync(target, 0o600);
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* preserve the original error */
+      }
+    }
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* preserve the original error */
+    }
+    throw error;
+  }
 }
 
 /** True if a parsed object has the SessionData shape we can safely use (meta object + history array). */
@@ -199,15 +249,22 @@ function isSessionData(d: unknown): d is SessionData {
   return !!o && typeof o === "object" && !!o.meta && typeof o.meta === "object" && Array.isArray(o.history);
 }
 
-export function loadSession(id: string): SessionData | null {
-  const p = sessionFile(id);
-  if (!existsSync(p)) return null;
+/** Parse a legacy session and redact the in-memory copy. Reads stay read-only (no unlocked migration race);
+ *  the next explicit save atomically replaces the old file with its private, redacted form. */
+function readSessionFile(p: string): SessionData | null {
   try {
     const d = JSON.parse(readFileSync(p, "utf8"));
-    return isSessionData(d) ? d : null; // a corrupt / hand-edited file resumes as "no session" instead of crashing
+    if (!isSessionData(d)) return null;
+    return redactSensitiveValue(d).value;
   } catch {
     return null;
   }
+}
+
+export function loadSession(id: string): SessionData | null {
+  const p = sessionFile(id);
+  if (!existsSync(p)) return null;
+  return readSessionFile(p); // a corrupt / hand-edited file resumes as "no session" instead of crashing
 }
 
 /** Session metas, newest first; optionally filtered to a cwd. */
@@ -215,12 +272,8 @@ export function listSessions(cwd?: string): SessionMeta[] {
   let metas: SessionMeta[] = [];
   for (const f of readdirSync(sessionsDir())) {
     if (!f.endsWith(".json")) continue;
-    try {
-      const d = JSON.parse(readFileSync(join(sessionsDir(), f), "utf8")) as { meta?: SessionMeta };
-      if (d?.meta && typeof d.meta === "object" && d.meta.id && d.meta.updatedAt) metas.push(d.meta); // skip metaless/corrupt
-    } catch {
-      /* skip corrupt */
-    }
+    const d = readSessionFile(join(sessionsDir(), f));
+    if (d?.meta.id && d.meta.updatedAt) metas.push(d.meta); // skip metaless/corrupt; never mutate while listing
   }
   if (cwd) metas = metas.filter((m) => m.cwd === cwd);
   return metas.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));

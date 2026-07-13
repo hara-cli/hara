@@ -83,6 +83,10 @@ export class SessionHub {
     const lock = this.store.acquire(id);
     if (!lock.ok) return { lockedBy: lock.pid ?? 0 };
     const s: ServeSession = { meta: prior.meta, history: [...prior.history], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, busy: false, abort: null };
+    // A rotated config may change the provider/model between runs. The resumed transcript is preserved,
+    // while new turns and subsequent persistence accurately reflect the live route.
+    s.meta.provider = o.provider.id;
+    s.meta.model = o.provider.model;
     this.sessions.set(id, s);
     return { session: s };
   }
@@ -147,7 +151,7 @@ export class SessionHub {
       id: newSessionId(),
       cwd: src.meta.cwd,
       provider: o.providerId,
-      model: src.meta.model,
+      model: o.provider.model,
       title: src.meta.title ? `${src.meta.title} ⑂` : "",
       createdAt: new Date().toISOString(),
       updatedAt: "",

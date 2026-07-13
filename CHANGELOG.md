@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.121.1 — field-feedback reliability & credential safety
+
+- **Terminal resize no longer erases the composer.** Hara clears stale Ink output only before a real
+  width change; height-only window drags keep the input box visible and width changes repaint immediately.
+- **Credentials stay out of durable transcripts and generated code.** Session writes deeply redact likely
+  keys/tokens/passwords (including tool inputs/results); legacy content is redacted when loaded and migrated
+  on its next atomic, private save. Interactive pastes get a warning without echoing the value. The agent must use environment references,
+  never literal secrets in code/commands, and may only populate a real-secret `.env` when explicitly asked.
+- **`web_search` has a verified mainland path.** A configured Tavily request races the keyless Bing China
+  HTML path; Baidu, Google, and DuckDuckGo remain concurrent secondary fallbacks. Provider timeouts are
+  isolated, and JavaScript-only `web_fetch` pages now explain that a browser/API/connector is required
+  instead of returning a misleading empty body.
+- **Long setup commands fail usefully.** Package installs automatically become background jobs unless the
+  caller explicitly sets timeout/background, while ngrok tunnels preflight local authentication once and
+  stop with a focused fix instead of cycling through unrelated tunnel tools.
+- **Persistent desktop sessions re-read configuration.** New/resumed `hara serve` sessions pick up rotated
+  `apiKey`/model/baseURL values without a restart; empty env/project values no longer mask valid global
+  config, and a 401 says the configured credential expired rather than asking users to paste it into chat.
+
 ## 0.121.0 — `hara desk` · crash-safe coding/files · bounded interactive I/O
 
 - **`hara desk` connects the CLI to the shared coordination desk.** Register an agent, post/list/

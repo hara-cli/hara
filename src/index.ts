@@ -1646,10 +1646,24 @@ program
         version: pkg.version,
         providerId: cfg.provider,
         model: cfg.model,
-        buildSessionProvider: async () => withRouting(await buildProvider(cfg), cfg),
-        buildProviderFor: async (model, effort) =>
-          withRouting(await buildProvider({ ...cfg, model, reasoningEffort: (effort as HaraConfig["reasoningEffort"]) ?? cfg.reasoningEffort }), cfg),
-        listModels: () => listModels(cfg.baseURL ?? providerDefaultBaseURL(cfg.provider), cfg.apiKey ?? ""),
+        // `hara serve` is persistent, but config.json is user-editable at any time. Re-read it for every
+        // new/resumed session and model operation so a repaired/rotated key takes effect without restarting
+        // the desktop server (and, critically, never ask for a key that is already on disk).
+        buildSessionProvider: async () => {
+          const live = loadConfig();
+          return withRouting(await buildProvider(live), live);
+        },
+        buildProviderFor: async (model, effort) => {
+          const live = loadConfig();
+          return withRouting(
+            await buildProvider({ ...live, model, reasoningEffort: (effort as HaraConfig["reasoningEffort"]) ?? live.reasoningEffort }),
+            live,
+          );
+        },
+        listModels: () => {
+          const live = loadConfig();
+          return listModels(live.baseURL ?? providerDefaultBaseURL(live.provider), live.apiKey ?? "");
+        },
         effortLevels: levelsFor(resolvePlatform(cfg.provider, cfg.baseURL ?? providerDefaultBaseURL(cfg.provider)).reasoning).filter((e): e is NonNullable<typeof e> => !!e),
         spawnSubagent: (provider, scwd, projectContext, stats, task, role) => runSubagent(cfg, provider, scwd, sandbox, projectContext, stats, task, role),
         guardian: guardianOpt,

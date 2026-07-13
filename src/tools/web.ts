@@ -8,6 +8,9 @@ import { isIP } from "node:net";
 import { wrapUntrusted } from "../security/external-content.js";
 
 const MAX = 60_000;
+const SEARCH_ATTEMPT_MS = 8_000;
+const SEARCH_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
+type SearchResult = { title: string; url: string; snippet: string };
 
 /** True for loopback / private / link-local / ULA / CGNAT addresses we must not let web_fetch reach. */
 export function isPrivateIp(ip: string): boolean {
@@ -112,6 +115,149 @@ export function parseSearchResults(html: string, limit: number): { title: string
   return out;
 }
 
+/** Parse Baidu's server-rendered result headings. Baidu result links are redirects, which is fine:
+ *  web_fetch follows redirects while re-running its SSRF check on every hop. This gives mainland users a
+ *  keyless search path that does not depend on an overseas API being reachable. */
+export function parseBaiduSearchResults(html: string, limit: number): { title: string; url: string; snippet: string }[] {
+  const strip = (s: string): string =>
+    s
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;|&#160;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&#x27;/gi, "'")
+      .replace(/\s+/g, " ")
+      .trim();
+  const headings: { at: number; end: number; title: string; url: string }[] = [];
+  const re = /<h3\b[^>]*>[\s\S]*?<a\b[^>]*href=(?:"([^"]+)"|'([^']+)')[^>]*>([\s\S]*?)<\/a>[\s\S]*?<\/h3>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) && headings.length < limit) {
+    const title = strip(m[3]);
+    const url = (m[1] ?? m[2] ?? "").replace(/&amp;/g, "&");
+    if (title && /^https?:\/\//i.test(url)) headings.push({ at: m.index, end: re.lastIndex, title, url });
+  }
+  return headings.map((h, i) => {
+    // The abstract normally sits between this heading and the next result heading. Strip that bounded
+    // slice and cap it; if Baidu changes class names the title/link still survive.
+    const boundary = headings[i + 1]?.at ?? Math.min(html.length, h.end + 1800);
+    const snippet = strip(html.slice(h.end, boundary)).slice(0, 240);
+    return { title: h.title, url: h.url, snippet };
+  });
+}
+
+/** Parse Bing's stable server-rendered result list (`cn.bing.com` is reachable in the mainland network
+ *  where overseas agent-search APIs commonly fail). */
+export function parseBingSearchResults(html: string, limit: number): SearchResult[] {
+  const strip = (s: string): string =>
+    s
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;|&#160;/gi, " ")
+      .replace(/&ensp;|&#8194;/gi, " ")
+      .replace(/&emsp;|&#8195;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&#x27;/gi, "'")
+      .replace(/\s+/g, " ")
+      .trim();
+  const out: SearchResult[] = [];
+  const blockRe = /<li\b[^>]*class=(?:"[^"]*\bb_algo\b[^"]*"|'[^']*\bb_algo\b[^']*')[^>]*>([\s\S]*?)<\/li>/gi;
+  let block: RegExpExecArray | null;
+  while ((block = blockRe.exec(html)) && out.length < limit) {
+    const link = /<h2\b[^>]*>[\s\S]*?<a\b[^>]*href=(?:"([^"]+)"|'([^']+)')[^>]*>([\s\S]*?)<\/a>[\s\S]*?<\/h2>/i.exec(block[1]);
+    if (!link) continue;
+    const url = (link[1] ?? link[2] ?? "").replace(/&amp;/g, "&");
+    const title = strip(link[3]);
+    if (!title || !/^https?:\/\//i.test(url)) continue;
+    const paragraph = /<p\b[^>]*>([\s\S]*?)<\/p>/i.exec(block[1]);
+    out.push({ title, url, snippet: strip(paragraph?.[1] ?? "").slice(0, 240) });
+  }
+  return out;
+}
+
+/** Best-effort parser for Google's classic HTML result shape. Google often serves a redirect/challenge
+ *  shell in mainland environments, so this is a fallback, not the sole search path. */
+export function parseGoogleSearchResults(html: string, limit: number): SearchResult[] {
+  const strip = (s: string): string =>
+    s
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;|&#x27;/gi, "'")
+      .replace(/\s+/g, " ")
+      .trim();
+  const out: SearchResult[] = [];
+  const linkRe = /<a\b[^>]*href=(?:"([^"]+)"|'([^']+)')[^>]*>[\s\S]{0,1600}?<h3\b[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<\/a>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = linkRe.exec(html)) && out.length < limit) {
+    let url = (m[1] ?? m[2] ?? "").replace(/&amp;/g, "&");
+    if (url.startsWith("/url?")) {
+      try {
+        url = new URL(url, "https://www.google.com").searchParams.get("q") ?? "";
+      } catch {
+        url = "";
+      }
+    }
+    const title = strip(m[3]);
+    if (!title || !/^https?:\/\//i.test(url) || /(?:^|\.)google\.[^/]+\//i.test(url)) continue;
+    out.push({ title, url, snippet: "" });
+  }
+  return out;
+}
+
+/** Detect the common HTML shell returned by SPAs (root element + scripts/loading text, no readable body).
+ *  web_fetch intentionally does not execute arbitrary page JavaScript, so surfacing the limitation is
+ *  better than returning a misleading successful "(empty body)". */
+export function looksLikeJsRenderedShell(html: string, readable: string): boolean {
+  if (readable.trim().length >= 180) return false;
+  const hasRoot = /<(?:div|main)\b[^>]*(?:id=["'](?:root|app|__next)["']|data-reactroot)/i.test(html);
+  const scripts = (html.match(/<script\b/gi) ?? []).length;
+  const shellText = /(?:enable javascript|javascript is required|loading[.…]*|正在加载|请启用\s*javascript)/i.test(readable || html);
+  return (hasRoot && scripts > 0) || (scripts >= 2 && readable.trim().length < 40) || shellText;
+}
+
+async function searchFetch(url: string, init: RequestInit): Promise<Response> {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(SEARCH_ATTEMPT_MS) });
+}
+
+async function firstSuccessfulSearch(
+  attempts: { name: string; run: () => Promise<SearchResult[]> }[],
+  failures: string[],
+): Promise<SearchResult[] | null> {
+  if (!attempts.length) return null;
+  return new Promise((resolve) => {
+    let remaining = attempts.length;
+    let settled = false;
+    for (const attempt of attempts) {
+      void attempt
+        .run()
+        .then((results) => {
+          if (results.length && !settled) {
+            settled = true;
+            resolve(results);
+          } else if (!results.length) {
+            failures.push(`${attempt.name} no results`);
+          }
+        })
+        .catch((e: any) => {
+          const reason = e?.name === "TimeoutError" || e?.name === "AbortError" ? "timeout" : (e?.message ?? String(e));
+          failures.push(`${attempt.name} ${reason}`);
+        })
+        .finally(() => {
+          remaining--;
+          if (remaining === 0 && !settled) resolve(null);
+        });
+    }
+  });
+}
+
 registerTool({
   name: "web_search",
   description:
@@ -131,48 +277,89 @@ registerTool({
     const q = String(input.query ?? "").trim();
     if (!q) return "(empty query)";
     const limit = Math.min(Math.max(1, Number(input.limit) || 6), 10);
-    const fmt = (rs: { title: string; url: string; snippet: string }[]): string =>
+    const fmt = (rs: SearchResult[]): string =>
       rs.map((r, n) => `${n + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ""}`).join("\n\n");
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20_000);
-    try {
-      // Reliable path: Tavily (designed for agents, free tier) when a key is configured.
-      const key = process.env.HARA_SEARCH_API_KEY || process.env.TAVILY_API_KEY;
-      if (key) {
-        const res = await fetch("https://api.tavily.com/search", {
+    const failures: string[] = [];
+    // Race the configured agent-search API against a mainland-accessible HTML source. A blocked Tavily
+    // endpoint no longer adds an 8-second penalty before Hara starts the domestic fallback.
+    const key = process.env.HARA_SEARCH_API_KEY || process.env.TAVILY_API_KEY;
+    const primaryAttempts: { name: string; run: () => Promise<SearchResult[]> }[] = [];
+    if (key) {
+      primaryAttempts.push({
+        name: "Tavily",
+        run: async () => {
+        const res = await searchFetch("https://api.tavily.com/search", {
           method: "POST",
-          signal: ctrl.signal,
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ api_key: key, query: q, max_results: limit }),
         });
-        if (res.ok) {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const j = (await res.json()) as { results?: { title?: string; url?: string; content?: string }[] };
-          const rs = (j.results ?? []).map((x) => ({ title: String(x.title ?? x.url ?? ""), url: String(x.url ?? ""), snippet: String(x.content ?? "").slice(0, 200) }));
-          if (rs.length) return wrapUntrusted(fmt(rs), `web_search: ${q}`);
-        }
-        // Tavily failed → fall through to the keyless best-effort path.
-      }
-      // Keyless fallback: DuckDuckGo HTML (POST — GET returns a 202 challenge). May be rate-limited.
-      const res = await fetch("https://html.duckduckgo.com/html/", {
-        method: "POST",
-        signal: ctrl.signal,
-        redirect: "follow",
-        headers: {
-          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-          "content-type": "application/x-www-form-urlencoded",
-          accept: "text/html",
+          return (j.results ?? []).map((x) => ({ title: String(x.title ?? x.url ?? ""), url: String(x.url ?? ""), snippet: String(x.content ?? "").slice(0, 200) }));
         },
-        body: `q=${encodeURIComponent(q)}`,
       });
-      if (!res.ok) return `Search failed: HTTP ${res.status}. Keyless search is rate-limited — set HARA_SEARCH_API_KEY (Tavily) for reliable search, or web_fetch a known URL.`;
-      const results = parseSearchResults(await res.text(), limit);
-      if (!results.length) return "(no results — the keyless endpoint is rate-limited or changed. Set HARA_SEARCH_API_KEY (Tavily) for reliable search, or web_fetch a known URL.)";
-      return wrapUntrusted(fmt(results), `web_search: ${q}`);
-    } catch (e: any) {
-      return `Search failed: ${e?.name === "AbortError" ? "timed out (20s)" : (e?.message ?? e)}`;
-    } finally {
-      clearTimeout(timer);
     }
+    primaryAttempts.push({
+      name: "Bing CN",
+      run: async () => {
+        const res = await searchFetch(`https://cn.bing.com/search?q=${encodeURIComponent(q)}&count=${limit}&setlang=zh-Hans`, {
+          method: "GET",
+          redirect: "follow",
+          headers: { "user-agent": SEARCH_UA, accept: "text/html" },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return parseBingSearchResults(await res.text(), limit);
+      },
+    });
+    const primary = await firstSuccessfulSearch(primaryAttempts, failures);
+    if (primary) return wrapUntrusted(fmt(primary), `web_search: ${q}`);
+
+    // Secondary sources run concurrently, keeping total failure latency bounded. Google is included as a
+    // user-friendly fallback where it is reachable, but is never the sole path (mainland often gets a shell).
+    const secondary = await firstSuccessfulSearch(
+      [
+        {
+          name: "Baidu",
+          run: async () => {
+            const res = await searchFetch(`https://www.baidu.com/s?wd=${encodeURIComponent(q)}&rn=${limit}`, {
+              method: "GET",
+              redirect: "follow",
+              headers: { "user-agent": SEARCH_UA, accept: "text/html" },
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return parseBaiduSearchResults(await res.text(), limit);
+          },
+        },
+        {
+          name: "Google",
+          run: async () => {
+            const res = await searchFetch(`https://www.google.com/search?q=${encodeURIComponent(q)}&num=${limit}&hl=zh-CN`, {
+              method: "GET",
+              redirect: "follow",
+              headers: { "user-agent": SEARCH_UA, accept: "text/html" },
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return parseGoogleSearchResults(await res.text(), limit);
+          },
+        },
+        {
+          name: "DuckDuckGo",
+          run: async () => {
+            const res = await searchFetch("https://html.duckduckgo.com/html/", {
+              method: "POST",
+              redirect: "follow",
+              headers: { "user-agent": SEARCH_UA, "content-type": "application/x-www-form-urlencoded", accept: "text/html" },
+              body: `q=${encodeURIComponent(q)}`,
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return parseSearchResults(await res.text(), limit);
+          },
+        },
+      ],
+      failures,
+    );
+    if (secondary) return wrapUntrusted(fmt(secondary), `web_search: ${q}`);
+    return `Search failed across available providers (${failures.join("; ")}). Check connectivity/proxy, configure HARA_SEARCH_API_KEY, or web_fetch a known URL.`;
   },
 });
 
@@ -222,6 +409,12 @@ registerTool({
       const raw = await readCapped(res, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
       let text = /html/i.test(ct) ? htmlToText(raw) : raw;
       if (text.length > cap) text = text.slice(0, cap) + `\n…[truncated ${text.length - cap} chars]`;
+      if (/html/i.test(ct) && looksLikeJsRenderedShell(raw, text)) {
+        const hint =
+          "This page appears to be JavaScript-rendered; web_fetch received only the SPA shell and does not execute page scripts. " +
+          "Use an available browser/web skill for the rendered page, or the site's authenticated API/connector (for example the Feishu Docs API).";
+        return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(`${text || "(empty shell)"}\n\n${hint}`, current.href)}`;
+      }
       return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(text || "(empty body)", current.href)}`;
     } catch (e: any) {
       return `Error fetching ${url.href}: ${e?.name === "AbortError" ? "timed out (30s)" : (e?.message ?? e)}`;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, statSync, mkdirSync, mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -55,6 +55,9 @@ test("deriveTitle tolerates a non-string (a malformed history's content)", () =>
 });
 
 test("session: save → load round-trip, title, latestForCwd, list", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-sess-roundtrip-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
   const id = newSessionId();
   const cwd = "/tmp/hara-sess-" + id;
   try {
@@ -82,6 +85,53 @@ test("session: save → load round-trip, title, latestForCwd, list", () => {
     assert.ok(listSessions(cwd).some((m) => m.id === id));
     assert.equal(resolveSessionId(shortId(id)), id); // resume by short-id prefix resolves to the full UUID
   } finally {
-    rmSync(join(homedir(), ".hara", "sessions", `${id}.json`), { force: true });
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session persistence redacts user text/tool data and safely migrates legacy content on next save", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-sess-redact-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  const id = newSessionId();
+  const legacyId = newSessionId();
+  const secret = "feishu-super-secret-123456";
+  const legacySecret = "legacy-super-secret-987654";
+  const dir = join(homedir(), ".hara", "sessions");
+  const meta = {
+    id,
+    cwd: "/tmp/hara-redaction-test",
+    provider: "qwen",
+    model: "glm-5",
+    title: "redaction test",
+    createdAt: new Date().toISOString(),
+    updatedAt: "",
+  };
+  const history = [
+    { role: "user", content: `FEISHU_APP_SECRET=${secret}` },
+    { role: "assistant", text: "using env", toolUses: [{ id: "t1", name: "bash", input: { command: `tool --token=${secret}` } }] },
+    { role: "tool", results: [{ id: "t1", name: "bash", content: `Authorization: Bearer ${secret}` }] },
+  ];
+  try {
+    saveSession(meta, history);
+    assert.ok(history[0].content.includes(secret), "live history is not mutated");
+    assert.ok(!readFileSync(join(dir, `${id}.json`), "utf8").includes(secret), "new session file is safe");
+
+    const legacyMeta = { ...meta, id: legacyId };
+    writeFileSync(join(dir, `${legacyId}.json`), JSON.stringify({ meta: legacyMeta, history: [{ role: "user", content: `API_KEY=${legacySecret}` }] }, null, 2));
+    const loaded = loadSession(legacyId);
+    assert.ok(loaded);
+    assert.ok(!loaded.history[0].content.includes(legacySecret));
+    assert.ok(readFileSync(join(dir, `${legacyId}.json`), "utf8").includes(legacySecret), "a read does not race by rewriting the legacy file");
+    saveSession(loaded.meta, loaded.history);
+    const migrated = join(dir, `${legacyId}.json`);
+    assert.ok(!readFileSync(migrated, "utf8").includes(legacySecret), "the next explicit save migrates the file");
+    assert.equal(statSync(migrated).mode & 0o777, 0o600, "session file is private");
+  } finally {
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
   }
 });

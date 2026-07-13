@@ -139,6 +139,29 @@ export function readRawConfig(): Record<string, any> {
   }
 }
 
+const ROUTING_CONFIG_KEYS = new Set(["provider", "apiKey", "model", "baseURL"]);
+
+/** Empty routing values are not meaningful credentials/endpoints. Ignore them at each precedence layer so
+ *  an empty project override (or launcher-exported empty env var) cannot hide a valid global config value. */
+function withoutBlankRoutingValues(input: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (ROUTING_CONFIG_KEYS.has(key) && typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) continue;
+      out[key] = trimmed;
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function nonBlankEnv(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
 /** Nearest project override `.hara/config.json`, searching cwd up to the repo root. */
 function readProjectConfig(cwd: string): Record<string, any> {
   let dir = resolve(cwd);
@@ -209,13 +232,17 @@ export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
   const overlayName = process.env.HARA_OVERLAY ?? opts.overlay;
   const overlayMap = overlays && typeof overlays === "object" ? overlays : profiles && typeof profiles === "object" ? profiles : null;
   const overlay = overlayName && overlayMap && overlayMap[overlayName] ? overlayMap[overlayName] : {};
-  const merged: Record<string, any> = { ...globalBase, ...project, ...overlay };
+  const merged: Record<string, any> = {
+    ...withoutBlankRoutingValues(globalBase),
+    ...withoutBlankRoutingValues(project),
+    ...withoutBlankRoutingValues(overlay),
+  };
 
-  const provider = (process.env.HARA_PROVIDER ?? merged.provider ?? "anthropic") as ProviderId;
+  const provider = (nonBlankEnv(process.env.HARA_PROVIDER) ?? merged.provider ?? "anthropic") as ProviderId;
   const d = PROVIDER_DEFAULTS[provider] ?? PROVIDER_DEFAULTS.anthropic;
-  const model = process.env.HARA_MODEL ?? merged.model ?? d.model;
-  const baseURL = process.env.HARA_BASE_URL ?? merged.baseURL ?? d.baseURL;
-  const apiKey = process.env.HARA_API_KEY ?? process.env[d.envKey] ?? merged.apiKey;
+  const model = nonBlankEnv(process.env.HARA_MODEL) ?? merged.model ?? d.model;
+  const baseURL = nonBlankEnv(process.env.HARA_BASE_URL) ?? merged.baseURL ?? d.baseURL;
+  const apiKey = nonBlankEnv(process.env.HARA_API_KEY) ?? nonBlankEnv(process.env[d.envKey]) ?? merged.apiKey;
   const approval = (process.env.HARA_APPROVAL ?? merged.approval ?? "suggest") as ApprovalMode;
   const sandbox = (process.env.HARA_SANDBOX ?? merged.sandbox ?? "off") as SandboxMode;
   const theme = (process.env.HARA_THEME ?? merged.theme ?? "dark") as "dark" | "light";

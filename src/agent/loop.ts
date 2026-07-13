@@ -18,6 +18,7 @@ import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_ST
 import { setTurnPhase } from "./phase.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
+import { redactSensitiveText } from "../security/secrets.js";
 
 /** File tools whose `path` input marks the file as "recently worked with" (post-compaction restore). */
 const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
@@ -69,7 +70,14 @@ re-reading a big file after every edit is the slowest habit an agent can have.
 When an attempt FAILS, never repeat it unchanged — read the error, form a hypothesis about the cause, and
 change something (arguments / approach / tool) before trying again. After two failed variants of the same
 approach, stop: re-plan from what you learned, or ask the user, stating concisely what you tried and what
-the errors said. Repeating a failed action hoping for a different result is how sessions die. For broad,
+the errors said. Repeating a failed action hoping for a different result is how sessions die.
+Never put a literal password, API key, token, App Secret, Authorization header, or other credential in a
+source file or shell command. Reference an environment variable instead (for example process.env.API_KEY or
+$API_KEY). Keep real values in the user's environment or an approved secret store; do not create/populate a
+.env file with a real secret unless the user explicitly asks and it is excluded from version control. Never
+echo credentials back. Session persistence redacts likely secrets as a last line of defense, but that does
+not make embedding credentials acceptable.
+For broad,
 open-ended exploration (more than ~3 searches), spawn \`agent\` sub-agents — several in one response for
 independent questions (role "explore") — each returns conclusions, not dumps. Messages the user sends
 mid-task arrive marked as interjections — triage them (refine current / queue as todo / urgent-switch)
@@ -92,7 +100,10 @@ site, build output), check they are newer than their sources (compare mtimes or 
 the sources changed since the artifacts were built, run the project's documented build/render steps FIRST.
 When AGENTS.md / README / package.json document a command sequence (e.g. pull → render → build → preview),
 that ordering is authoritative — never skip the middle steps, or you serve stale output and the user sees
-two-day-old work. After completing a task, give a one-line summary.`;
+two-day-old work. Package-manager installs auto-start as background jobs when you omit background/timeout;
+poll the returned job until it exits before depending on its packages. Before opening a public tunnel,
+verify that provider's authentication/config once; if it is missing, stop and ask instead of trying a chain
+of unrelated tunnel tools. After completing a task, give a one-line summary.`;
 
 /** When running inside `hara gateway`, tell the agent it's in a chat — so it delivers files via send_file
  *  (the only channel that reaches the peer) and never reaches for the desktop client / computer tool. */
@@ -165,6 +176,16 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
   let triedFallback = false;
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
+
+  // Warn at the interaction boundary without echoing the value. Headless/gateway stdout is the response
+  // transport, so keep the banner to interactive surfaces; persistence is still redacted everywhere.
+  const latestUser = [...history].reverse().find((m) => m.role === "user");
+  const sensitive = latestUser?.role === "user" ? redactSensitiveText(latestUser.content).redactions : [];
+  if (sensitive.length && !opts.quiet) {
+    const note = "⚠ possible credential detected — the saved session copy will be redacted; prefer passing secrets through environment variables.";
+    if (ctx.ui) ctx.ui.notice(note);
+    else if (stdout.isTTY) out(c.yellow(note + "\n"));
+  }
 
   // Stuck/loop guard — only in headless chat (`hara gateway`), where a wrong approach can grind forever with
   // nobody to hit Esc (e.g. screenshots it can't read). Once per run, when the agent keeps repeating one

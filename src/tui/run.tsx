@@ -5,33 +5,43 @@ import { render, Box, Text, useApp, useInput } from "ink";
 import { createElement } from "react";
 import { App, type AppProps } from "./App.js";
 
+type ResizeOutput = {
+  columns?: number;
+  prependListener(event: "resize", listener: () => void): unknown;
+  off(event: "resize", listener: () => void): unknown;
+};
+
+/** Ink 6.8 clears before repainting when a terminal gets narrower, but not when it gets wider. Install a
+ *  complementary WIDTH-only clear ahead of Ink's own resize listener so Ink's normal layout pass redraws
+ *  the frame immediately afterwards. Never clear on a rows-only resize: `instance.clear()` erases the
+ *  dynamic region without scheduling a React render, which made an idle input box disappear when a user
+ *  dragged only the top/bottom edge of the terminal window. Exported for a small ordering regression test. */
+export function installResizeRepaint(out: ResizeOutput, instance: { clear(): void }): () => void {
+  let lastColumns = out.columns;
+  const onResize = (): void => {
+    const columns = out.columns;
+    if (!columns || columns === lastColumns) return;
+    lastColumns = columns;
+    try {
+      instance.clear();
+    } catch {
+      /* best-effort — never let a repaint fix crash the session */
+    }
+  };
+  // Ink registered its listener inside render() already. Prepending is essential: clearing AFTER Ink's
+  // repaint is precisely what leaves the prompt blank until some unrelated state update happens.
+  out.prependListener("resize", onResize);
+  return () => out.off("resize", onResize);
+}
+
 export async function runTui(props: AppProps): Promise<void> {
   const instance = render(createElement(App, props));
-  // Resize repaint fix. ink 6.8's own resize handler only clears the screen when the terminal gets
-  // NARROWER; on a WIDEN (or a resize it doesn't classify as narrowing) it just re-renders, so the old
-  // frame — reflowed at the new width — is never erased, and the ~125ms spinner tick stacks a fresh copy
-  // each time (the "moved the window and the UI stacked up" garble). We complement it: on ANY resize,
-  // clear ink's tracked output so the next render starts clean. Debounced by a microtask so a burst of
-  // resize events during a window drag collapses to one clear.
   const out = process.stdout;
-  let pending = false;
-  const onResize = (): void => {
-    if (pending) return;
-    pending = true;
-    queueMicrotask(() => {
-      pending = false;
-      try {
-        instance.clear();
-      } catch {
-        /* best-effort — never let a repaint fix crash the session */
-      }
-    });
-  };
-  out.on("resize", onResize);
+  const removeResizeRepaint = installResizeRepaint(out, instance);
   try {
     await instance.waitUntilExit();
   } finally {
-    out.off("resize", onResize);
+    removeResizeRepaint();
   }
 }
 

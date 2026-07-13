@@ -3,6 +3,7 @@
 // humans and agents file through the same door (gh CLI when present, copy-paste text otherwise).
 // The session tail is OFF by default and explicitly opt-in (--session) because issues are public.
 import { platform, release, arch } from "node:os";
+import { redactSensitiveText } from "./security/secrets.js";
 
 export interface FeedbackEnv {
   version: string;
@@ -24,13 +25,7 @@ export function collectEnv(version: string, model?: string): FeedbackEnv {
 /** Strip credential-looking material from text that is about to become a PUBLIC issue.
  *  Deliberately aggressive: false positives cost a little readability, false negatives leak keys. */
 export function redact(text: string): string {
-  return text
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, "sk-***")
-    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}/g, "gh*_***")
-    .replace(/\b(AKIA|ASIA)[A-Z0-9]{16}\b/g, "AWS-KEY-***")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/gi, "Bearer ***")
-    .replace(/\b(api[_-]?key|apikey|token|secret|password|passwd|authorization)(["']?\s*[:=]\s*["']?)[^\s"',;]{6,}/gi, "$1$2***")
-    .replace(/\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "JWT-***");
+  return redactSensitiveText(text).text;
 }
 
 /** The structured issue body — same shape as .github/ISSUE_TEMPLATE/bug_report.yml so hand-filed
