@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: [20, 22]
+        node: ["22.12.0", "24"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -20,3 +20,16 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+
+  legacy-runtime-message:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - name: Old Node exits with an upgrade instruction
+        run: |
+          ! node runtime-bootstrap.cjs --version 2>legacy-runtime.err
+          grep -q 'requires Node.js 22.12.0 or newer' legacy-runtime.err
+          grep -q 'nvm install 22' legacy-runtime.err
