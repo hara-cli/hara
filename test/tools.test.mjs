@@ -1,10 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { capHeadTail, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
+import { capHeadTail, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
+import { atomicWriteText } from "../dist/fs-write.js";
+import { readRegularFileSnapshot } from "../dist/fs-read.js";
+
+async function settleWithin(promise, ms = 1500) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`operation did not settle within ${ms}ms`)), ms); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 test("capHeadTail: keeps head + tail of long output (errors live at the end)", () => {
   const s = "HEAD_START" + "x".repeat(200_000) + "TAIL_ERROR";
@@ -16,7 +31,7 @@ test("capHeadTail: keeps head + tail of long output (errors live at the end)", (
   assert.equal(capHeadTail("short output"), "short output"); // under the cap → unchanged
 });
 
-test("long package installs and ngrok tunnel commands are classified for preflight/background handling", () => {
+test("package installs and ngrok tunnels are classified for safe timeout/preflight handling", () => {
   for (const c of ["npm install", "npm i react", "npm ci", "pnpm add zod", "yarn install", "bun install"]) {
     assert.equal(isPackageInstallCommand(c), true, c);
   }
@@ -25,6 +40,11 @@ test("long package installs and ngrok tunnel commands are classified for preflig
   assert.equal(isNgrokTunnelCommand("ngrok config check"), false);
   assert.equal(ngrokAuthConfigured({ NGROK_AUTHTOKEN: "present" }, "/no-home"), true);
   assert.equal(ngrokAuthConfigured({}, "/no-home"), false);
+  assert.equal(shellTimeoutMs("npm ci"), 900_000, "installs remain attached with a longer safe default");
+  assert.equal(shellTimeoutMs("npm test"), 300_000);
+  assert.equal(shellTimeoutMs("npm ci", 42_000), 42_000);
+  assert.equal(shellTimeoutMs("npm ci", -1), 900_000, "invalid requested timeout falls back safely");
+  assert.equal(shellTimeoutMs("npm ci", 9_999_999), 3_600_000, "requested timeouts are bounded");
 });
 
 test("registry contains the built-in tools", () => {
@@ -77,6 +97,102 @@ test("read_file rejects binary content instead of injecting it into model contex
     writeFileSync(join(dir, "blob.bin"), Buffer.from([1, 2, 0, 3]));
     const out = await getTool("read_file").run({ path: "blob.bin" }, { cwd: dir });
     assert.match(out, /appears binary/i);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("read_file and write_file reject FIFOs without blocking", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-fifo-"));
+  try {
+    const fifo = join(dir, "generator.pipe");
+    execFileSync("mkfifo", [fifo]);
+    const read = await settleWithin(getTool("read_file").run({ path: fifo }, { cwd: dir }));
+    assert.match(read, /not a regular file/i);
+    const write = await settleWithin(getTool("write_file").run({ path: fifo, content: "must not replace" }, { cwd: dir }));
+    assert.match(write, /not a regular file/i);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("atomic writes never overwrite an entry created while the claimed old fd is being verified", { timeout: 15000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-write-claim-cas-"));
+  const target = join(dir, "target.txt");
+  const external = join(dir, "external.txt");
+  const old = "O".repeat(60 * 1024 * 1024);
+  writeFileSync(target, old);
+  writeFileSync(external, "EXTERNAL-DATA");
+  let scheduled = false;
+  let inserted = false;
+  const watcher = setInterval(() => {
+    if (scheduled) return;
+    if (!readdirSync(dir).some((name) => name.startsWith(".hara-claim-") && name.endsWith(".tmp"))) return;
+    scheduled = true;
+    setTimeout(() => {
+      try {
+        renameSync(external, target);
+        inserted = true;
+      } catch {
+        // Asserted below: the fixture must land during the deliberately long claim read.
+      }
+    }, 10);
+  }, 0);
+  try {
+    await assert.rejects(atomicWriteText(target, "NEW", { expected: old }), /changed|another entry|retained/i);
+    assert.equal(inserted, true);
+    assert.equal(readFileSync(target, "utf8"), "EXTERNAL-DATA", "create-if-absent commit preserves the external file");
+    const retained = readdirSync(dir).find((name) => name.startsWith(".hara-claim-") && name.endsWith(".tmp"));
+    assert.ok(retained, "the move-claimed old file is retained when its visible path is occupied");
+    assert.equal(readFileSync(join(dir, retained), "utf8").length, old.length);
+  } finally {
+    clearInterval(watcher);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("atomic writes reject and restore a same-content symlink replacement", { timeout: 15000, skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-write-link-cas-"));
+  const target = join(dir, "target.txt");
+  const alternate = join(dir, "alternate.txt");
+  const saved = join(dir, "saved.txt");
+  writeFileSync(target, "old");
+  writeFileSync(alternate, "old");
+  let swapped = false;
+  const watcher = setInterval(() => {
+    if (swapped) return;
+    const staging = readdirSync(dir).find((name) => name.startsWith(".hara-") && !name.startsWith(".hara-claim-") && name.endsWith(".tmp"));
+    if (!staging) return;
+    try {
+      renameSync(target, saved);
+      symlinkSync("alternate.txt", target);
+      swapped = true;
+    } catch {
+      // Poll across the short staging-open window.
+    }
+  }, 0);
+  try {
+    await assert.rejects(atomicWriteText(target, "N".repeat(60 * 1024 * 1024), { expected: "old" }), /symbolic link|changed|safe restore/i);
+    assert.equal(swapped, true);
+    assert.equal(lstatSync(target).isSymbolicLink(), true, "the concurrent symlink topology is restored");
+    assert.equal(readFileSync(target, "utf8"), "old");
+    assert.equal(readFileSync(alternate, "utf8"), "old");
+    assert.equal(existsSync(saved), true);
+  } finally {
+    clearInterval(watcher);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("atomic expected-identity updates preserve the exact preflight mode", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-write-mode-"));
+  try {
+    const target = join(dir, "run.sh");
+    writeFileSync(target, "old\n");
+    chmodSync(target, 0o775);
+    const snapshot = await readRegularFileSnapshot(target);
+    await atomicWriteText(target, "new\n", { expected: snapshot.text, expectedIdentity: snapshot });
+    assert.equal(statSync(target).mode & 0o777, 0o775, "group-write/executable bits are not filtered through umask or a path-level re-stat");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -1,16 +1,15 @@
-import { readFile, stat } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve, isAbsolute } from "node:path";
 import { stdout as procOut } from "node:process";
 import { registerTool } from "./registry.js";
 import { runShell } from "../sandbox.js";
-import { isProbablyBinary, nearestPaths } from "../fs-walk.js";
+import { nearestPaths } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
 import { atomicWriteText } from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
-import { BinaryFileError, streamFileSlice } from "../fs-read.js";
+import { BinaryFileError, readRegularFileSnapshot, streamFileSlice } from "../fs-read.js";
 import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
 import {
   hostsInCommand,
@@ -24,11 +23,18 @@ import {
 
 const MAX = 100_000;
 
-/** Package installs are network-bound and routinely exceed the foreground cap. When the model omits an
- *  explicit foreground/background choice, detach these commands into the existing job system so the UI
- *  remains responsive and the agent can poll output instead of waiting five minutes for a hard kill. */
+/** Package installs are network-bound and routinely exceed the ordinary foreground cap. */
 export function isPackageInstallCommand(command: string): boolean {
   return /(?:^|[;&|]\s*)(?:npm\s+(?:i|install|ci)\b|pnpm\s+(?:i|install|add)\b|yarn(?:\s+(?:install|add))?(?:\s|$)|bun\s+(?:i|install|add)\b)/i.test(command.trim());
+}
+
+/** Resolve a bounded foreground timeout. Installs get a longer default, but remain attached so a headless
+ * run cannot exit, kill its background child, and leave node_modules half-written. */
+export function shellTimeoutMs(command: string, requested?: number): number {
+  if (Number.isFinite(requested) && (requested as number) > 0) {
+    return Math.min(Math.max(Math.trunc(requested as number), 1_000), 3_600_000);
+  }
+  return isPackageInstallCommand(command) ? 900_000 : 300_000;
 }
 
 export function isNgrokTunnelCommand(command: string): boolean {
@@ -92,8 +98,6 @@ export function capHeadTail(s: string, max = MAX): string {
 
 const READ_LINES = 300; // sized to stay useful under the global 24k-char tool-result context boundary
 const LINE_CAP = 2000; // chars per line before truncation (minified bundles / data lines)
-const BUFFERED_READ_BYTES = 4 * 1024 * 1024;
-
 /** Render a line slice of a file, cat -n style. The old read_file dumped the WHOLE file (100K-char cap,
  *  tail simply lost) — on long files that both flooded the context (~25k tokens per read, again on every
  *  re-read) and made everything past the cap unreachable. Now: line numbers (anchor for edits and for
@@ -134,15 +138,13 @@ registerTool({
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
     try {
-      const info = await stat(p);
-      if (info.size > BUFFERED_READ_BYTES) return cap(await streamFileSlice(p, input.offset, input.limit ?? READ_LINES, { lineCap: LINE_CAP }));
-      const buf = await readFile(p);
-      if (isProbablyBinary(buf)) throw new BinaryFileError(p);
-      return cap(renderFileSlice(buf.toString("utf8"), input.offset, input.limit));
+      // streamFileSlice opens O_NONBLOCK, validates the same fd as a regular file, and stops after the
+      // requested window. Using it for every size removes the path-level stat→read race entirely.
+      return cap(await streamFileSlice(p, input.offset, input.limit ?? READ_LINES, { lineCap: LINE_CAP }));
     } catch (e: any) {
       if (e instanceof BinaryFileError) return `Error: cannot read ${input.path}: file appears binary; use an image/media-specific tool or inspect it with \`file\`.`;
       const near = nearestPaths(ctx.cwd, input.path);
-      return `Error: cannot read ${input.path}: ${e.code ?? e.message}.` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
+      return `Error: cannot read ${input.path}: ${e.message ?? e.code}.` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
     }
   },
 });
@@ -162,22 +164,24 @@ registerTool({
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
     if (typeof input.content !== "string") return "Error: write_file `content` must be a string. No changes written.";
-    let prev: string | null = null;
+    let prevSnapshot: Awaited<ReturnType<typeof readRegularFileSnapshot>> | null = null;
     try {
-      prev = await readFile(p, "utf8");
+      prevSnapshot = await readRegularFileSnapshot(p);
     } catch (error: any) {
-      if (error?.code !== "ENOENT") return `Error: cannot inspect ${input.path}: ${error?.code ?? error?.message}. No changes written.`;
+      if (error?.code !== "ENOENT") return `Error: cannot inspect ${input.path}: ${error?.message ?? error?.code}. No changes written.`;
     }
+    const prev = prevSnapshot?.text ?? null;
     if (prev === input.content) return `Unchanged ${p} (${input.content.length} chars already match).`;
+    let committed;
     try {
-      await atomicWriteText(p, input.content, { expected: prev });
+      committed = await atomicWriteText(p, input.content, { expected: prev, expectedIdentity: prevSnapshot ?? undefined });
     } catch (error: any) {
       return `Error: cannot write ${input.path}: ${error?.message ?? String(error)} No changes written.`;
     }
     emitDiff(input.path, prev ?? "", input.content, ctx.ui);
-    recordEdit([{ path: input.path, absPath: p, before: prev }]);
+    recordEdit([{ path: input.path, absPath: p, before: prev, beforeMode: prevSnapshot?.mode, committed, after: input.content }]);
     invalidateFileCandidates(ctx.cwd);
-    return `Wrote ${String(input.content).length} chars to ${p}`;
+    return `Wrote ${String(input.content).length} chars to ${p}` + (committed.warnings?.length ? ` Warning: ${committed.warnings.join("; ")}` : "");
   },
 });
 
@@ -188,8 +192,8 @@ registerTool({
     type: "object",
     properties: {
       command: { type: "string" },
-      timeout_ms: { type: "number", description: "default 300000 (5 min); set explicitly for a foreground long build/transform" },
-      background: { type: "boolean", description: "run as a background job (dev server, watcher, long task). Package installs auto-background when this field and timeout_ms are omitted. Poll with the `job` tool before depending on completion." },
+      timeout_ms: { type: "number", description: "default 300000 (5 min), or 900000 (15 min) for package installs; bounded to 1s..1h" },
+      background: { type: "boolean", description: "run as a background job (dev server, watcher, long task); package installs stay foreground unless explicitly requested" },
     },
     required: ["command"],
   },
@@ -201,10 +205,9 @@ registerTool({
         "Configure ngrok authentication first, then retry. Do not rotate through other tunnel providers blindly; ask the user which authenticated provider to use."
       );
     }
-    const autoPackageJob = input.background === undefined && input.timeout_ms === undefined && isPackageInstallCommand(input.command);
-    if (input.background || autoPackageJob) {
+    if (input.background) {
       const id = startJob(input.command, ctx.cwd, ctx.sandbox ?? "off");
-      return `${autoPackageJob ? "Package install auto-started" : "Started"} background job ${id}: \`${input.command}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all. Poll until it exits before running steps that depend on installed packages.`;
+      return `Started background job ${id}: \`${input.command}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all. Poll until it exits before running steps that depend on it.`;
     }
     // Network fault tolerance — short-circuit if this command targets a host already found unreachable this
     // session, so a repeat doesn't burn another ~75s OS connect timeout. Only pays the git-remote lookup
@@ -234,9 +237,10 @@ registerTool({
       : procOut.isTTY
         ? (s: string) => procOut.write(s) // stream output in a plain terminal
         : undefined;
+    const timeout = shellTimeoutMs(input.command, input.timeout_ms);
     try {
       const { stdout, stderr } = await runShell(input.command, ctx.cwd, ctx.sandbox ?? "off", {
-        timeout: input.timeout_ms ?? 300_000, // was 120s — a long file transform/build legitimately runs longer
+        timeout,
         maxBuffer: 10 * 1024 * 1024,
         onData: live,
       });
@@ -249,7 +253,7 @@ registerTool({
       // lane instead of blind-retrying into the same wall.
       if (/timed out after \d+ms/.test(String(e.message))) {
         base +=
-          `\n⏱ hara: the command hit its ${input.timeout_ms ?? 300_000}ms cap and was killed. Pick ONE: ` +
+          `\n⏱ hara: the command hit its ${timeout}ms cap and was killed. Pick ONE: ` +
           `a long build/transform → re-run with a larger timeout_ms; a server/watcher → background:true; ` +
           `a network op (git/curl/npm) → do NOT just retry — check connectivity/proxy or skip this step and tell the user.`;
       }

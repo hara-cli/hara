@@ -100,8 +100,8 @@ site, build output), check they are newer than their sources (compare mtimes or 
 the sources changed since the artifacts were built, run the project's documented build/render steps FIRST.
 When AGENTS.md / README / package.json document a command sequence (e.g. pull → render → build → preview),
 that ordering is authoritative — never skip the middle steps, or you serve stale output and the user sees
-two-day-old work. Package-manager installs auto-start as background jobs when you omit background/timeout;
-poll the returned job until it exits before depending on its packages. Before opening a public tunnel,
+two-day-old work. Package-manager installs receive a longer attached timeout by default; use background jobs
+only when explicitly appropriate, and poll a background job before depending on it. Before opening a public tunnel,
 verify that provider's authentication/config once; if it is missing, stop and ask instead of trying a chain
 of unrelated tunnel tools. After completing a task, give a one-line summary.`;
 
@@ -116,7 +116,9 @@ function gatewayNote(): string {
     `To send a file or image to them, call the \`send_file\` tool with an absolute path; that is the ONLY channel ` +
     `that reaches this chat. Do NOT use the \`computer\` tool, AppleScript, or any desktop/${plat}-client automation ` +
     `to deliver files — that drives a different window and silently fails to reach the user. Never tell the user a ` +
-    `file was sent unless \`send_file\` returned success. Keep replies short and chat-friendly.`
+    `file was sent unless \`send_file\` returned success. Keep replies short and chat-friendly. ` +
+    `PLAIN TEXT ONLY: chat bubbles render markdown literally — never use **bold**, # headers, backticks, tables, ` +
+    `or [text](url); write list items as "- " lines and links as bare URLs.`
   );
 }
 
@@ -147,12 +149,19 @@ export interface RunOpts {
   systemOverride?: string;
   /** restrict which tools this run may use (by name) */
   toolFilter?: (name: string) => boolean;
+  /** Disable every user/plugin shell hook for a genuinely read-only run. Both PreToolUse and PostToolUse
+   *  commands are arbitrary shell and can mutate state even when the model only receives read tools. */
+  hooks?: boolean;
   /** Ad-hoc tools for THIS run only (e.g. plan mode's `exit_plan`) — appended AFTER toolFilter (so a
    *  filter can't accidentally drop them) and resolved BEFORE the registry on dispatch. Never
    *  registered globally, so other runs/modes can't see or call them. */
   extraTools?: Tool[];
   /** abort the in-flight LLM request (user interrupt) */
   signal?: AbortSignal;
+  /** Observe each provider Promise's physical lifetime. The agent loop races cancellation against providers
+   *  that ignore AbortSignal, but serve keeps its cross-process session lock until the abandoned Promise
+   *  actually settles. Observers must attach both fulfillment and rejection handlers. */
+  onProviderTurn?: (turn: Promise<unknown>) => void;
   /** suppress streaming/tool output (sub-agents running in parallel) */
   quiet?: boolean;
   /** Type-ahead steering (TUI): pull messages the user submitted *while this turn was running* and
@@ -169,13 +178,26 @@ export interface RunOpts {
   guardian?: { provider?: Provider | null; enabled?: boolean };
 }
 
+export interface RunOutcome {
+  status: "completed" | "error" | "empty" | "halted";
+  error?: string;
+}
+
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
-export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<void> {
+export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<RunOutcome> {
   const { provider, ctx } = opts;
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
   let triedFallback = false;
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
+  const interruptedOutcome = (): RunOutcome => {
+    const msg = "(interrupted)";
+    if (!opts.quiet) {
+      if (ctx.ui) ctx.ui.notice(msg);
+      else out(c.dim(`\n${msg}\n`));
+    }
+    return { status: "error", error: msg };
+  };
 
   // Warn at the interaction boundary without echoing the value. Headless/gateway stdout is the response
   // transport, so keep the banner to interactive surfaces; persistence is still redacted everywhere.
@@ -214,7 +236,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     // lands as ONE wrapped user message the UI never renders. Quiet runs don't drain — a parallel
     // sub-agent must not steal the main conversation's reminders.
     if (!opts.quiet) {
-      const reminders = drainReminders();
+      const reminders = drainReminders(ctx.todoScope);
       if (reminders.length) history.push({ role: "user", content: wrapReminders(reminders) });
     }
     const baseSpecs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
@@ -259,7 +281,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     const STALL_MS = stallMs();
     const attempt = new AbortController();
     const onUserAbort = (): void => attempt.abort();
-    opts.signal?.addEventListener("abort", onUserAbort, { once: true });
+    // AbortSignal does not replay an already-fired event to a late listener. A serve shutdown can cancel
+    // while provider routing is still refreshing, so inherit that state synchronously before the call.
+    if (opts.signal?.aborted) attempt.abort();
+    else opts.signal?.addEventListener("abort", onUserAbort, { once: true });
     let lastEvent = Date.now();
     let stalled = false;
     const stallTimer = setInterval(() => {
@@ -274,17 +299,29 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     };
     if (!opts.quiet) setTurnPhase("waiting"); // request sent, nothing streamed yet — the status row shows it
     let r!: Awaited<ReturnType<Provider["turn"]>>;
+    let removeAttemptStop = (): void => {};
     try {
-      r = await activeProvider.turn({
+      // AbortSignal is advisory: a custom/provider SDK can ignore it and leave its Promise pending forever.
+      // Race the attempt itself so the watchdog and user cancellation remain hard boundaries. The abandoned
+      // Promise retains a rejection handler through Promise.race, and all late stream callbacks below are muted.
+      const attemptStopped = new Promise<Awaited<ReturnType<Provider["turn"]>>>((resolveStopped) => {
+        const onAttemptStop = (): void => resolveStopped({ text: "", toolUses: [], stop: "error", errorMsg: "interrupted" });
+        removeAttemptStop = () => attempt.signal.removeEventListener("abort", onAttemptStop);
+        if (attempt.signal.aborted) onAttemptStop();
+        else attempt.signal.addEventListener("abort", onAttemptStop, { once: true });
+      });
+      const providerTurn = activeProvider.turn({
       system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
       history,
       tools: specs,
       // Any stream chunk keeps the connection considered alive — even suppressed reasoning_content, so a
       // reasoning model thinking for a long while before its first `content` token can't be false-timed-out.
       onActivity: () => {
+        if (attempt.signal.aborted) return;
         lastEvent = Date.now();
       },
       onText: (d) => {
+        if (attempt.signal.aborted) return;
         alive();
         if (opts.quiet) return;
         if (sink) {
@@ -299,6 +336,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       onReasoning:
         sink || tty
           ? (d) => {
+              if (attempt.signal.aborted) return;
               alive();
               if (opts.quiet) return;
               if (sink) {
@@ -323,11 +361,19 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
                 }
               }
             }
-          : (d) => alive(), // quiet runs still feed the watchdog (reasoning-only stretches are progress)
+          : () => {
+              if (!attempt.signal.aborted) alive();
+            }, // quiet runs still feed the watchdog (reasoning-only stretches are progress)
       signal: attempt.signal,
-    });
+      });
+      opts.onProviderTurn?.(providerTurn);
+      r = await Promise.race([providerTurn, attemptStopped]);
+    } catch (error) {
+      if (!opts.signal?.aborted) throw error;
+      r = { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
     } finally {
       clearInterval(stallTimer);
+      removeAttemptStop();
       opts.signal?.removeEventListener("abort", onUserAbort);
     }
     // A watchdog abort surfaces from the provider as "interrupted" — rewrite it to a timeout-class
@@ -344,6 +390,9 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       opts.stats.output += r.usage.output;
       opts.stats.lastInput = r.usage.input;
     }
+    // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
+    // The original run signal is authoritative: do not append/approve/execute any late response.
+    if (opts.signal?.aborted) return interruptedOutcome();
     history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 
     if (r.stop === "error") {
@@ -360,11 +409,24 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         continue; // retry once on the fallback model (guarded by triedFallback)
       }
       const msg = kind === "interrupted" ? "(interrupted)" : `[${activeProvider.id} error] ${r.errorMsg ?? "unknown"}${errorHint(kind)}`;
+      if (r.toolUses.length) {
+        // A provider can fail after partially assembling tool calls. The assistant turn is already persisted;
+        // close every call explicitly so the next request is valid, while never executing partial work.
+        history.push({
+          role: "tool",
+          results: r.toolUses.map((toolUse) => ({
+            id: toolUse.id,
+            name: toolUse.name,
+            content: `Error: provider failed before this tool call could be executed. ${r.errorMsg ?? "unknown provider error"}`,
+            isError: true,
+          })),
+        });
+      }
       if (!opts.quiet) {
         if (sink) sink.notice(msg);
         else out(kind === "interrupted" ? c.dim(`\n${msg}\n`) : c.red(`${msg}\n`));
       }
-      return;
+      return { status: "error", error: msg };
     }
 
     // Empty-turn guard. The model returned nothing actionable — no text AND no tool calls (a blank
@@ -389,11 +451,29 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         if (sink) sink.notice(note);
         else out(c.dim(`${note}\n`));
       }
-      return;
+      return { status: "empty" };
     }
     // A "tool_use" stop with text but no tools (rare) has nothing to execute — end after showing the text
     // rather than pushing an empty tool round and re-requesting in a loop.
-    if (r.stop !== "tool_use" || r.toolUses.length === 0) return;
+    if (r.stop !== "tool_use" || r.toolUses.length === 0) return { status: "completed" };
+    // Once an assistant tool_use turn enters history, every tool_use MUST receive a matching tool result.
+    // OpenAI/Anthropic both reject a later user turn after an unclosed tool round. Cancellation can happen
+    // while planning, approving, or executing, so finalize the round with real results for work that already
+    // completed and explicit interruption errors for everything else before persisting the session.
+    const results: ToolResult[] = new Array(r.toolUses.length);
+    const finalizeInterruptedToolRound = (): RunOutcome => {
+      history.push({
+        role: "tool",
+        results: r.toolUses.map((tu, idx) => results[idx] ?? ({
+          id: tu.id,
+          name: tu.name,
+          content: "Error: interrupted before this tool call completed.",
+          isError: true,
+        })),
+      });
+      return interruptedOutcome();
+    };
+    if (opts.signal?.aborted) return finalizeInterruptedToolRound();
 
     // Resolve + gate each call first (confirmations must be sequential — can't prompt in parallel).
     interface Plan {
@@ -405,6 +485,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     // Extra (per-run) tools win over the registry so a run-scoped tool can't be shadowed by a global one.
     const resolveTool = (name: string): Tool | undefined => opts.extraTools?.find((t) => t.name === name) ?? getTool(name);
     for (const tu of r.toolUses) {
+      if (opts.signal?.aborted) return finalizeInterruptedToolRound();
       if (breakerHalt) {
         // Circuit-breaker halted the run: refuse every remaining call in this round with a clear message
         // (no hang, no further tools) so the model + user get a definitive stop.
@@ -443,6 +524,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
             history,
             { signal: opts.signal },
           );
+          if (opts.signal?.aborted) return finalizeInterruptedToolRound();
           if (verdict.decision === "block") {
             const tripped = recordBlock(breaker); // deterministic circuit-breaker: N blocks → hard stop
             plans.push({
@@ -464,6 +546,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
               const cont = interactive
                 ? await opts.confirm(`${c.red("⛔ guardian circuit-breaker")} — ${breaker.blocks} high-risk actions blocked this turn. Continue anyway?`)
                 : false;
+              if (opts.signal?.aborted) return finalizeInterruptedToolRound();
               if (cont === false) {
                 breakerHalt = true;
               } else {
@@ -477,6 +560,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       }
       if (cmdDecision !== "allow" && needsConfirm(tool.kind, opts.approval) && (alwaysGate || !opts.autoApprove?.has(tu.name))) {
         const reply = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
+        if (opts.signal?.aborted) return finalizeInterruptedToolRound();
         if (reply === false) {
           plans.push({ tu, tool, denied: "User denied this action." });
           continue;
@@ -492,8 +576,9 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     }
 
     // Execute: read-only tools run concurrently; edit/exec run alone, in order.
-    const results: ToolResult[] = new Array(plans.length);
+    if (opts.signal?.aborted) return finalizeInterruptedToolRound();
     const runOne = async (idx: number, p: Plan): Promise<void> => {
+      if (opts.signal?.aborted) return;
       if (p.denied !== undefined) {
         results[idx] = { id: p.tu.id, name: p.tu.name, content: p.denied, isError: true };
         return;
@@ -508,27 +593,37 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
           const msg =
             `Error: tool call NOT executed — missing required parameter${missing.length > 1 ? "s" : ""}: ` +
             `${missing.join(", ")}. Send the call again with ALL required parameters (${(p.tool!.input_schema.required ?? []).join(", ")}) present and complete.`;
-          results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + recordCall(p.tu.name, p.tu.input, msg, true), isError: true };
+          results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + recordCall(p.tu.name, p.tu.input, msg, true, ctx.todoScope), isError: true };
           return;
         }
-        const pre = runHooks("PreToolUse", p.tu.name, p.tu.input, ctx.cwd); // a hook may veto the call
+        if (opts.signal?.aborted) return;
+        const pre = opts.hooks === false
+          ? { block: false, message: "" }
+          : runHooks("PreToolUse", p.tu.name, p.tu.input, ctx.cwd); // a hook may veto the call
         if (pre.block) {
           results[idx] = { id: p.tu.id, name: p.tu.name, content: pre.message, isError: true };
           return;
         }
+        if (opts.signal?.aborted) return;
         // Track the MAIN conversation's working files for post-compaction restore (quiet fan-out
         // sub-agents read broadly — their files aren't "what the user was working on").
         if (!opts.quiet && FILE_TOUCH_TOOLS.has(p.tu.name) && typeof (p.tu.input as { path?: unknown })?.path === "string") {
-          recordTouch(resolvePath(ctx.cwd, String((p.tu.input as { path: string }).path)));
+          recordTouch(resolvePath(ctx.cwd, String((p.tu.input as { path: string }).path)), ctx.todoScope);
         }
         const res = await p.tool!.run(p.tu.input, ctx);
         // append any not-yet-seen subdirectory AGENTS.md/CLAUDE.md this call touched (monorepo-local conventions)
         // + the repeat-guard's anti-spinning note when this exact call keeps failing (repeat-guard.ts)
-        results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) + recordCall(p.tu.name, p.tu.input, res) };
-        runHooks("PostToolUse", p.tu.name, { input: p.tu.input, result: res }, ctx.cwd); // observe-only
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) + recordCall(p.tu.name, p.tu.input, res, false, ctx.todoScope) };
+        // The tool may have completed a side effect and then triggered/observed cancellation. Preserve its
+        // actual result in the closing tool round, but do not run any post hook or later tool afterward.
+        if (opts.signal?.aborted) return;
+        if (opts.hooks !== false) {
+          runHooks("PostToolUse", p.tu.name, { input: p.tu.input, result: res }, ctx.cwd); // observe-only
+        }
       } catch (e: any) {
         const msg = `Error: ${e.message}`;
-        results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + recordCall(p.tu.name, p.tu.input, msg, true), isError: true };
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + recordCall(p.tu.name, p.tu.input, msg, true, ctx.todoScope), isError: true };
+        if (opts.signal?.aborted) return;
       } finally {
         activity.dec();
       }
@@ -541,15 +636,19 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
       await mapLimit(idx, maxParallel(), (i) => runOne(i, plans[i])); // bounded fan-out (e.g. 20 parallel agents → 8 at a time)
     };
     for (let i = 0; i < plans.length; i++) {
+      if (opts.signal?.aborted) return finalizeInterruptedToolRound();
       const p = plans[i];
       if (p.denied === undefined && p.tool?.kind === "read") {
         batch.push(i); // safe → accumulate to run concurrently
       } else {
         await flush(); // flush pending reads before an edit/exec
+        if (opts.signal?.aborted) return finalizeInterruptedToolRound();
         await runOne(i, p);
+        if (opts.signal?.aborted) return finalizeInterruptedToolRound();
       }
     }
     await flush();
+    if (opts.signal?.aborted) return finalizeInterruptedToolRound();
     history.push({ role: "tool", results });
 
     // Synthesis nudge (CC's KN5, hara-shaped): a round that fanned out to several parallel agents just
@@ -557,7 +656,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     // of anchoring on whichever report happens to sit last in context.
     if (!opts.quiet) {
       const fanout = r.toolUses.filter((tu) => tu.name === "agent").length;
-      if (fanout >= SYNTHESIS_MIN_AGENTS) pushReminder(synthesisReminder(fanout));
+      if (fanout >= SYNTHESIS_MIN_AGENTS) pushReminder(synthesisReminder(fanout), ctx.todoScope);
     }
 
     // Todo attention-refresh: a round that touched the checklist resets the clock; rounds that leave
@@ -566,10 +665,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
     if (!opts.quiet) {
       if (r.toolUses.some((tu) => tu.name === "todo_write")) {
         todoIdleRounds = 0;
-      } else if (currentTodos().some((t) => t.status !== "done")) {
+      } else if (currentTodos(ctx.todoScope).some((t) => t.status !== "done")) {
         todoIdleRounds++;
         if (todoIdleRounds >= TODO_STALE_ROUNDS) {
-          pushReminder(todoStaleReminder(renderTodos(currentTodos())));
+          pushReminder(todoStaleReminder(renderTodos(currentTodos(ctx.todoScope))), ctx.todoScope);
           todoIdleRounds = 0;
         }
       }
@@ -583,7 +682,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<vo
         if (sink) sink.notice(note);
         else out(c.red(`${note}\n`));
       }
-      return;
+      return { status: "halted" };
     }
 
     if (guard && !nudged) {

@@ -10,11 +10,11 @@
 // chunked protocol → AES-256-CBC decrypt inbound media that carries an `aeskey`. Every request frame carries a
 // `headers.req_id` and the server echoes it back so request/response are correlated. v1 limitations are documented
 // at the bottom of this file (the public spec is thin — fields are best-effort and tolerant of shape drift).
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, basename, extname } from "node:path";
-import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { basename, extname } from "node:path";
 import { randomUUID, createDecipheriv, createHash } from "node:crypto";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
+import { InboundMediaBudget, decodeBase64Media, readResponseBytesLimited, savePrivateMediaBytes } from "./media.js";
 
 const DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com";
 const WSImpl: any = (globalThis as any).WebSocket;
@@ -156,12 +156,17 @@ export function parseWecomMessage(
   const media = extractWecomMedia(body);
   if (!text && !media.length) return null; // unsupported type or empty
 
+  // WeCom AI Bot callbacks use chattype="single" or "group". Only the explicit single value proves a DM;
+  // missing/unknown types fail closed as group even when chatid happens to be absent.
+  const chatType = String(body.chattype ?? "").trim().toLowerCase() === "single" ? "p2p" : "group";
+
   return {
     msg: {
       chatId,
       userId: senderId || chatId,
       userName: String(sender.name ?? sender.userid ?? senderId ?? chatId),
       text: text || "[图片]",
+      chatType,
     },
     media,
   };
@@ -169,27 +174,29 @@ export function parseWecomMessage(
 
 /** Download (and AES-decrypt if needed) a WeCom inbound media ref → a local path under ~/.hara/wecom/media. null on
  *  failure. Inline base64 and remote (optionally encrypted) urls are both handled. */
-async function downloadWecomMedia(ref: WecomMediaRef): Promise<string | null> {
+async function downloadWecomMedia(
+  ref: WecomMediaRef,
+  options: { maxBytes: number; signal: AbortSignal },
+): Promise<string | null> {
   try {
     let data: Buffer | null = null;
     if (ref.base64) {
-      data = Buffer.from(ref.base64.split(",").pop()!.trim(), "base64");
+      data = decodeBase64Media(ref.base64, options.maxBytes);
     } else if (ref.url) {
-      const r = await fetch(ref.url);
+      const r = await fetch(ref.url, { signal: options.signal });
       if (!r.ok) return null;
-      let buf: Buffer = Buffer.from(await r.arrayBuffer());
-      if (buf.length > ABSOLUTE_MAX_BYTES) return null;
-      if (ref.aesKeyB64) buf = decryptWecomMedia(buf, ref.aesKeyB64);
-      data = buf;
+      data = await readResponseBytesLimited(r, options.maxBytes, options.signal);
     }
     if (!data || !data.length) return null;
-    const dir = join(homedir(), ".hara", "wecom", "media");
-    mkdirSync(dir, { recursive: true });
+    if (ref.aesKeyB64) data = decryptWecomMedia(data, ref.aesKeyB64);
+    if (!data.length || data.length > options.maxBytes) return null;
     let name = ref.fileName ? basename(ref.fileName) : "";
     if (!name || (ref.kind === "image" && !extname(name))) name = `image${imageExtFromBytes(data)}`;
-    const path = join(dir, `wc_${Date.now()}_${name || "file.bin"}`);
-    writeFileSync(path, data);
-    return path;
+    return await savePrivateMediaBytes(data, {
+      platform: "wecom",
+      filenameHint: name || "file.bin",
+      ...options,
+    });
   } catch {
     return null;
   }
@@ -246,13 +253,13 @@ export function wecomAdapter(botId: string, secret: string, wsUrl: string = DEFA
         /* upload/send failed — caller surfaces a generic failure; nothing else to do */
       }
     },
-    async start(onMessage, signal) {
+    async start(onMessage, signal, shouldDownload) {
       if (!WSImpl) {
         console.error("hara gateway: WeCom needs Node ≥ 22 (global WebSocket). Upgrade Node.");
         return;
       }
       while (!signal.aborted) {
-        await connectOnce(botId, secret, wsUrl, conn, onMessage, signal);
+        await connectOnce(botId, secret, wsUrl, conn, onMessage, signal, shouldDownload);
         if (!signal.aborted) await sleep(3000, signal); // reconnect backoff
       }
     },
@@ -269,6 +276,7 @@ function connectOnce(
   conn: { send: ((cmd: string, body: any) => Promise<any>) | null },
   onMessage: (m: InboundMsg) => Promise<void>,
   signal: AbortSignal,
+  shouldDownload?: (m: InboundMsg) => boolean,
 ): Promise<void> {
   return new Promise((resolve) => {
     const ws = new WSImpl(wsUrl);
@@ -364,9 +372,15 @@ function connectOnce(
       }
       const parsed = parseWecomMessage(p, botId);
       if (parsed) {
-        for (const ref of parsed.media) {
-          const path = await downloadWecomMedia(ref);
-          if (path) (parsed.msg.images ??= []).push(path);
+        if (shouldDownload?.(parsed.msg) === true) {
+          const budget = new InboundMediaBudget("wecom", signal);
+          for (const ref of parsed.media) {
+            const path = await budget.download((options) => downloadWecomMedia(ref, options));
+            if (path) {
+              (parsed.msg.images ??= []).push(path);
+              (parsed.msg.transientFiles ??= []).push(path);
+            }
+          }
         }
         await onMessage(parsed.msg).catch(() => {});
       }

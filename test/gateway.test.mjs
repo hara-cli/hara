@@ -1,20 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseTelegramUpdate, chunkText, photoFileId } from "../dist/gateway/telegram.js";
+import { pathToFileURL } from "node:url";
+import { parseTelegramUpdate, chunkText, photoFileId, telegramAdapter } from "../dist/gateway/telegram.js";
 import { parseDiscordMessage } from "../dist/gateway/discord.js";
 import { parseFeishuContent, flattenPost } from "../dist/gateway/feishu.js";
 import { parseSlackEvent } from "../dist/gateway/slack.js";
 import { parseMattermostPost } from "../dist/gateway/mattermost.js";
-import { parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
+import { matrixChatType, matrixDirectRoomsFromSync, parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
 import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
 import { parseSignalMessage } from "../dist/gateway/signal.js";
 import { parseWecomMessage } from "../dist/gateway/wecom.js";
 import { pickRoute, outputDelta } from "../dist/gateway/tmux-routes.js";
-import { parseCommand, isAllowed, resolveAllowlist, cleanReply } from "../dist/gateway/serve.js";
-import { chatContext, chatCd, newChatSession, setChatSession, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
+import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
+import { chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
 import { ttsConfigFromEnv, ttsCleanText } from "../dist/gateway/tts.js";
 
@@ -23,6 +26,60 @@ test("parseTelegramUpdate: text message → InboundMsg; non-text → null", () =
   assert.deepEqual(m, { chatId: 42, userId: 7, userName: "jeff", text: "hi" });
   assert.equal(parseTelegramUpdate({ update_id: 6, message: { photo: [], chat: { id: 1 } } }), null); // empty photo array
   assert.equal(parseTelegramUpdate({}), null);
+  assert.equal(parseTelegramUpdate({ message: { text: "dm", chat: { id: 1, type: "private" }, from: { id: 1 } } }).chatType, "p2p");
+  assert.equal(parseTelegramUpdate({ message: { text: "group", chat: { id: -1, type: "supergroup" }, from: { id: 2 } } }).chatType, "group");
+});
+
+test("telegram media preflight still dispatches metadata but never fetches rejected bytes", async () => {
+  const savedFetch = globalThis.fetch;
+  const controller = new AbortController();
+  const calls = [];
+  let received;
+  try {
+    globalThis.fetch = async (url) => {
+      calls.push(String(url));
+      if (!String(url).includes("getUpdates")) throw new Error("media fetch must not run");
+      return new Response(JSON.stringify({
+        result: [{
+          update_id: 1,
+          message: {
+            photo: [{ file_id: "small" }, { file_id: "large" }],
+            chat: { id: 7, type: "private" },
+            from: { id: 99, username: "blocked" },
+          },
+        }],
+      }), { headers: { "content-type": "application/json" } });
+    };
+    await telegramAdapter("test-token").start(async (message) => {
+      received = message;
+      controller.abort();
+    }, controller.signal, () => false);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+  assert.equal(received.text, "[图片]");
+  assert.equal(received.images, undefined);
+  assert.equal(received.transientFiles, undefined);
+  assert.equal(calls.length, 1);
+});
+
+test("telegramAdapter surfaces send failures instead of reporting false success", async () => {
+  const savedFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({ ok: false, description: "chat not found" }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+    await assert.rejects(telegramAdapter("test-token").send("missing", "hello"), /chat not found/);
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ ok: true, result: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    await telegramAdapter("test-token").send("chat", "hello");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 });
 
 test("parseTelegramUpdate: photo message → caption (or [图片]) text; photoFileId picks the largest", () => {
@@ -41,9 +98,12 @@ test("parseDiscordMessage: ignores self+bots, parses text, surfaces image attach
   assert.equal(parseDiscordMessage({ channel_id: "c", author: { id: "5", bot: true }, content: "hi" }, self), null); // another bot
   assert.equal(parseDiscordMessage({ channel_id: "c", author: { id: "5" }, content: "" }, self), null); // empty, no media
 
-  const txt = parseDiscordMessage({ channel_id: "c1", author: { id: "5", username: "jeff" }, content: "yo" }, self);
-  assert.deepEqual(txt.msg, { chatId: "c1", userId: "5", userName: "jeff", text: "yo" });
+  const txt = parseDiscordMessage({ channel_id: "c1", author: { id: "5", username: "jeff" }, content: "yo" }, self, 1);
+  assert.deepEqual(txt.msg, { chatId: "c1", userId: "5", userName: "jeff", text: "yo", chatType: "p2p" });
   assert.deepEqual(txt.imageUrls, []);
+  assert.equal(parseDiscordMessage({ channel_id: "c2", guild_id: "g1", author: { id: "5" }, content: "guild" }, self, 1).msg.chatType, "group");
+  assert.equal(parseDiscordMessage({ channel_id: "unknown", author: { id: "5" }, content: "unknown" }, self).msg.chatType, "group");
+  assert.equal(parseDiscordMessage({ channel_id: "group-dm", author: { id: "5" }, content: "group" }, self, 3).msg.chatType, "group");
 
   const img = parseDiscordMessage(
     { channel_id: "c1", author: { id: "5", global_name: "Jeff" }, content: "", attachments: [{ url: "https://cdn/x.png", filename: "x.png", content_type: "image/png" }, { url: "https://cdn/d.pdf", filename: "d.pdf", content_type: "application/pdf" }] },
@@ -76,7 +136,10 @@ test("parseSlackEvent: filters non-messages/bots/subtypes, parses text + image f
   assert.equal(parseSlackEvent({ type: "message", user: "UBOT", channel: "C", text: "hi" }, self), null); // self
   assert.equal(parseSlackEvent({ type: "message", subtype: "message_changed", channel: "C", user: "U1", text: "x" }, self), null);
   const t = parseSlackEvent({ type: "message", channel: "C9", user: "U1", text: "yo" }, self);
-  assert.deepEqual(t.msg, { chatId: "C9", userId: "U1", userName: "U1", text: "yo" });
+  assert.deepEqual(t.msg, { chatId: "C9", userId: "U1", userName: "U1", text: "yo", chatType: "group" });
+  assert.equal(parseSlackEvent({ type: "message", channel: "D9", channel_type: "channel", user: "U1", text: "dm" }, self).msg.chatType, "p2p", "D ids prove a DM even if the field disagrees");
+  assert.equal(parseSlackEvent({ type: "message", channel: "legacy", channel_type: "im", user: "U1", text: "dm" }, self).msg.chatType, "p2p");
+  assert.equal(parseSlackEvent({ type: "message", channel: "G9", channel_type: "mpim", user: "U1", text: "group dm" }, self).msg.chatType, "group");
   const img = parseSlackEvent({ type: "message", subtype: "file_share", channel: "C9", user: "U1", text: "", files: [{ name: "p.png", mimetype: "image/png", url_private_download: "https://s/p.png" }] }, self);
   assert.equal(img.msg.text, "[图片]");
   assert.deepEqual(img.imageUrls, [{ url: "https://s/p.png", name: "p.png" }]);
@@ -87,7 +150,9 @@ test("parseMattermostPost: ignores self/system posts, surfaces file_ids", () => 
   assert.equal(parseMattermostPost({ channel_id: "c", user_id: "ubot", message: "hi" }, self), null); // self
   assert.equal(parseMattermostPost({ channel_id: "c", user_id: "u1", type: "system_join_channel", message: "x" }, self), null);
   const t = parseMattermostPost({ channel_id: "c1", user_id: "u1", message: "yo" }, self);
-  assert.deepEqual(t.msg, { chatId: "c1", userId: "u1", userName: "u1", text: "yo" });
+  assert.deepEqual(t.msg, { chatId: "c1", userId: "u1", userName: "u1", text: "yo", chatType: "group" });
+  assert.equal(parseMattermostPost({ channel_id: "dm", user_id: "u1", message: "yo" }, self, "D").msg.chatType, "p2p");
+  assert.equal(parseMattermostPost({ channel_id: "g", user_id: "u1", message: "yo" }, self, "G").msg.chatType, "group");
   const f = parseMattermostPost({ channel_id: "c1", user_id: "u1", message: "", file_ids: ["f1", "f2"] }, self);
   assert.equal(f.msg.text, "[图片]");
   assert.deepEqual(f.imageFileIds, ["f1", "f2"]);
@@ -100,20 +165,28 @@ test("parseMxc + parseMatrixEvent: text/image, self + non-message filtering", ()
   assert.equal(parseMatrixEvent({ type: "m.room.encrypted", sender: "@u:s", __roomId: "!r" }, self), null);
   assert.equal(parseMatrixEvent({ type: "m.room.message", sender: "@bot:s", __roomId: "!r", content: { msgtype: "m.text", body: "hi" } }, self), null); // self
   const t = parseMatrixEvent({ type: "m.room.message", sender: "@u:s", __roomId: "!r1", content: { msgtype: "m.text", body: "yo" } }, self);
-  assert.deepEqual(t.msg, { chatId: "!r1", userId: "@u:s", userName: "@u:s", text: "yo" });
+  assert.deepEqual(t.msg, { chatId: "!r1", userId: "@u:s", userName: "@u:s", text: "yo", chatType: "group" });
   assert.equal(t.imageMxc, null);
   const img = parseMatrixEvent({ type: "m.room.message", sender: "@u:s", __roomId: "!r1", content: { msgtype: "m.image", body: "pic.png", url: "mxc://s/m1" } }, self);
   assert.equal(img.msg.text, "pic.png");
   assert.equal(img.imageMxc, "mxc://s/m1");
+
+  const direct = matrixDirectRoomsFromSync({ account_data: { events: [{ type: "m.direct", content: { "@u:s": ["!r1", "not-a-room"] } }] } });
+  assert.deepEqual([...direct], ["!r1"]);
+  assert.equal(matrixDirectRoomsFromSync({ account_data: { events: [] } }), null, "no account-data update preserves the prior mapping");
+  assert.equal(matrixChatType("!r1", self, "@u:s", direct, { [self]: {}, "@u:s": {} }), "p2p");
+  assert.equal(matrixChatType("!r1", self, "@u:s", direct, { [self]: {}, "@u:s": {}, "@third:s": {} }), "group", "stale m.direct cannot turn a shared room into a DM");
+  assert.equal(matrixChatType("!other", self, "@u:s", direct, { [self]: {}, "@u:s": {} }), "group");
 });
 
 test("parseDingtalkMessage: text/picture/richText, captures sessionWebhook", () => {
   assert.equal(parseDingtalkMessage(null), null);
   assert.equal(parseDingtalkMessage({ msgtype: "audio", conversationId: "c" }), null); // unsupported → empty → null
-  const t = parseDingtalkMessage({ msgtype: "text", conversationId: "cid", senderStaffId: "s1", senderNick: "Jeff", text: { content: "hi" }, sessionWebhook: "https://wh" });
-  assert.deepEqual(t.msg, { chatId: "cid", userId: "s1", userName: "Jeff", text: "hi" });
+  const t = parseDingtalkMessage({ msgtype: "text", conversationType: 1, conversationId: "cid", senderStaffId: "s1", senderNick: "Jeff", text: { content: "hi" }, sessionWebhook: "https://wh" });
+  assert.deepEqual(t.msg, { chatId: "cid", userId: "s1", userName: "Jeff", text: "hi", chatType: "p2p" });
   assert.equal(t.sessionWebhook, "https://wh");
-  assert.equal(parseDingtalkMessage({ msgtype: "picture", conversationId: "cid", senderId: "s2" }).msg.text, "[图片]");
+  assert.equal(parseDingtalkMessage({ msgtype: "picture", conversationType: 2, conversationId: "cid", senderId: "s2" }).msg.chatType, "group");
+  assert.equal(parseDingtalkMessage({ msgtype: "picture", conversationId: "cid", senderId: "s2" }).msg.chatType, "group", "unknown conversation type fails closed");
 });
 
 test("parseSignalMessage: skips sync/self, parses text/group/image", () => {
@@ -121,9 +194,11 @@ test("parseSignalMessage: skips sync/self, parses text/group/image", () => {
   assert.equal(parseSignalMessage({ envelope: { syncMessage: {} } }, self), null);
   assert.equal(parseSignalMessage({ envelope: { sourceNumber: "+1555", dataMessage: { message: "hi" } } }, self), null); // self
   const t = parseSignalMessage({ envelope: { sourceNumber: "+1666", sourceName: "Jeff", dataMessage: { message: "yo" } } }, self);
-  assert.deepEqual(t.msg, { chatId: "+1666", userId: "+1666", userName: "Jeff", text: "yo" });
+  assert.deepEqual(t.msg, { chatId: "+1666", userId: "+1666", userName: "Jeff", text: "yo", chatType: "p2p" });
   const g = parseSignalMessage({ envelope: { sourceNumber: "+1666", dataMessage: { message: "hey", groupInfo: { groupId: "GRP" } } } }, self);
   assert.equal(g.msg.chatId, "group:GRP");
+  assert.equal(g.msg.chatType, "group");
+  assert.equal(parseSignalMessage({ envelope: { sourceNumber: "+1666", dataMessage: { message: "malformed group", groupInfo: {} } } }, self).msg.chatType, "group");
   const img = parseSignalMessage({ envelope: { sourceNumber: "+1666", dataMessage: { message: "", attachments: [{ id: "a1", contentType: "image/jpeg" }] } } }, self);
   assert.equal(img.msg.text, "[图片]");
   assert.equal(img.images.length, 1);
@@ -133,10 +208,13 @@ test("parseWecomMessage: needs body, skips self, parses text", () => {
   const self = "botX";
   assert.equal(parseWecomMessage({}, self), null);
   assert.equal(parseWecomMessage({ body: { from: { userid: "botX" }, msgtype: "text", text: { content: "hi" } } }, self), null); // self
-  const t = parseWecomMessage({ body: { from: { userid: "u1", name: "Jeff" }, chatid: "c1", msgtype: "text", text: { content: "yo" } } }, self);
-  assert.equal(t.msg.chatId, "c1");
+  const t = parseWecomMessage({ body: { from: { userid: "u1", name: "Jeff" }, chattype: "single", msgtype: "text", text: { content: "yo" } } }, self);
+  assert.equal(t.msg.chatId, "u1");
   assert.equal(t.msg.userId, "u1");
   assert.equal(t.msg.text, "yo");
+  assert.equal(t.msg.chatType, "p2p");
+  assert.equal(parseWecomMessage({ body: { from: { userid: "u1" }, chattype: "group", chatid: "c1", msgtype: "text", text: { content: "group" } } }, self).msg.chatType, "group");
+  assert.equal(parseWecomMessage({ body: { from: { userid: "u1" }, msgtype: "text", text: { content: "unknown" } } }, self).msg.chatType, "group");
 });
 
 test("pickRoute: oldest live pane chosen (FIFO), dead pruned, chosen consumed", () => {
@@ -191,11 +269,27 @@ test("isAllowed: empty allowlist = nobody (safe); else membership", () => {
   assert.equal(isAllowed(8, new Set(["7"])), false);
 });
 
+test("media preflight requires both an allowed sender and an explicitly classified DM", () => {
+  const allowlist = new Set(["owner"]);
+  const base = { chatId: "chat", userId: "owner", userName: "owner", text: "[图片]" };
+  assert.equal(shouldDownloadInboundMedia({ ...base, chatType: "p2p" }, allowlist), true);
+  assert.equal(shouldDownloadInboundMedia({ ...base, chatType: "group" }, allowlist), false);
+  assert.equal(shouldDownloadInboundMedia(base, allowlist), false, "legacy/unknown chat shapes fail closed for bytes");
+  assert.equal(shouldDownloadInboundMedia({ ...base, userId: "stranger", chatType: "p2p" }, allowlist), false);
+});
+
 test("resolveAllowlist: env ids ∪ bot owner (weixin auto-allows the scanner)", () => {
   assert.deepEqual([...resolveAllowlist("a,b", "owner")].sort(), ["a", "b", "owner"]);
   assert.deepEqual([...resolveAllowlist("", "owner")], ["owner"]); // owner alone — no env needed
   assert.deepEqual([...resolveAllowlist("a, a ", undefined)], ["a"]); // trims + dedups, no owner
   assert.equal(resolveAllowlist("", undefined).size, 0); // telegram, no env = nobody
+});
+
+test("gateway aliases canonicalize before flow/session/approval identities are built", () => {
+  assert.equal(canonicalGatewayPlatform("lark"), "feishu");
+  assert.equal(canonicalGatewayPlatform("DING"), "dingtalk");
+  assert.equal(canonicalGatewayPlatform(" wework "), "wecom");
+  assert.equal(canonicalGatewayPlatform("slack"), "slack");
 });
 
 test("cleanReply: strips mcp status lines + token footer, keeps the answer", () => {
@@ -210,7 +304,127 @@ test("cleanReply: strips mcp status lines + token footer, keeps the answer", () 
   assert.equal(cleanReply("just an answer\nwith two lines"), "just an answer\nwith two lines"); // no chrome → untouched
 });
 
-test("chat ctx: cwd-scoped session; /cd switches project+thread, /new forks, /resume sets id+cwd (isolated HOME)", () => {
+test("KeyedSerialQueue serializes one session, runs separate sessions concurrently, and cleans up", async () => {
+  const queue = new KeyedSerialQueue(3);
+  const events = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => (releaseFirst = resolve));
+
+  const first = queue.run("session-a", async () => {
+    events.push("a1:start");
+    await firstGate;
+    events.push("a1:end");
+    return 1;
+  });
+  const second = queue.run("session-a", async () => {
+    events.push("a2:start");
+    return 2;
+  });
+  const other = queue.run("session-b", async () => {
+    events.push("b:start");
+    return 3;
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["a1:start", "b:start"], "a second session starts without waiting for session-a");
+  assert.equal(queue.pending("session-a"), 2);
+  assert.equal(queue.size, 1, "the already-settled session-b key is cleaned eagerly");
+  releaseFirst();
+  assert.deepEqual(await Promise.all([first, second, other]), [1, 2, 3]);
+  assert.deepEqual(events, ["a1:start", "b:start", "a1:end", "a2:start"]);
+  assert.equal(queue.pending("session-a"), 0);
+  assert.equal(queue.size, 0, "settled session keys do not accumulate");
+});
+
+test("KeyedSerialQueue bounds backlog and a rejected task cannot poison its session", async () => {
+  const queue = new KeyedSerialQueue(2);
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const running = queue.run("busy", () => gate);
+  const waiting = queue.run("busy", () => "next");
+  await assert.rejects(
+    queue.run("busy", () => "overflow"),
+    (error) => error instanceof GatewayQueueFullError && error.limit === 2,
+  );
+  release();
+  await running;
+  assert.equal(await waiting, "next");
+
+  await assert.rejects(queue.run("busy", async () => { throw new Error("boom"); }), /boom/);
+  assert.equal(await queue.run("busy", () => "recovered"), "recovered");
+  assert.equal(queue.size, 0);
+});
+
+test("KeyedSerialQueue enforces a global active-child semaphore while preserving cross-session progress", async () => {
+  const queue = new KeyedSerialQueue(8, 2, 16, 16);
+  let active = 0;
+  let peak = 0;
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const runs = Array.from({ length: 8 }, (_, index) => queue.run(`rotating-${index}`, async () => {
+    active++;
+    peak = Math.max(peak, active);
+    await gate;
+    active--;
+    return index;
+  }));
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(queue.activeCount, 2);
+  assert.equal(queue.queuedCount, 6);
+  assert.equal(peak, 2, "rotating session ids cannot exceed the process-wide concurrency cap");
+  release();
+  assert.deepEqual(await Promise.all(runs), Array.from({ length: 8 }, (_, index) => index));
+  assert.equal(peak, 2);
+  assert.equal(queue.size, 0);
+});
+
+test("KeyedSerialQueue hard-caps rotating keys and the global waiting backlog", async () => {
+  let releaseKeys;
+  const keyGate = new Promise((resolve) => (releaseKeys = resolve));
+  const keys = new KeyedSerialQueue(8, 1, 8, 3);
+  const keyRuns = ["one", "two", "three"].map((key) => keys.run(key, () => keyGate));
+  await assert.rejects(
+    keys.run("four", () => undefined),
+    (error) => error instanceof GatewayQueueFullError && error.scope === "keys" && error.limit === 3,
+  );
+  releaseKeys();
+  await Promise.all(keyRuns);
+
+  let releaseQueue;
+  const queueGate = new Promise((resolve) => (releaseQueue = resolve));
+  const backlog = new KeyedSerialQueue(8, 1, 2, 10);
+  const backlogRuns = ["active", "waiting-a", "waiting-b"].map((key) => backlog.run(key, () => queueGate));
+  assert.equal(backlog.activeCount, 1);
+  assert.equal(backlog.queuedCount, 2);
+  await assert.rejects(
+    backlog.run("overflow", () => undefined),
+    (error) => error instanceof GatewayQueueFullError && error.scope === "queued" && error.limit === 2,
+  );
+  assert.equal(backlog.size, 3, "a rejected rotating key is removed immediately");
+  releaseQueue();
+  await Promise.all(backlogRuns);
+});
+
+test("KeyedSerialQueue shutdown rejects queued/new work and drains the one in-flight task", async () => {
+  const queue = new KeyedSerialQueue(8, 1, 8, 8);
+  let release;
+  const gate = new Promise((resolve) => (release = resolve));
+  const running = queue.run("one", () => gate);
+  const waiting = queue.run("two", () => "never");
+  const waitingRejected = assert.rejects(waiting, (error) => error instanceof GatewayQueueClosedError);
+  queue.close();
+  await waitingRejected;
+  await assert.rejects(queue.run("three", () => undefined), (error) => error instanceof GatewayQueueClosedError);
+  assert.equal(queue.activeCount, 1);
+  assert.equal(queue.queuedCount, 0);
+  release();
+  await running;
+  await queue.waitForIdle();
+  assert.equal(queue.size, 0);
+});
+
+test("chat ctx: /cd round trips restore each cwd thread and mutations preserve chat preferences", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-gw-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
@@ -221,29 +435,178 @@ test("chat ctx: cwd-scoped session; /cd switches project+thread, /new forks, /re
     assert.equal(a.sessionId, `telegram-42-${cwdTag(def)}`);
     assert.deepEqual(chatContext("telegram", 42, def), a); // stable
 
+    assert.equal(toggleVoice("telegram", 42), true);
+    assert.equal(setChatAgent("telegram", 42, "reviewer"), "reviewer");
+    const beforeSwitch = JSON.parse(readFileSync(join(home, ".hara", "gateway", "chats.json"), "utf8"))["telegram:42"].lastUsed;
+
     const projSid = chatCd("telegram", 42, "/work/projB"); // /cd → that project's own thread
+    const afterSwitch = JSON.parse(readFileSync(join(home, ".hara", "gateway", "chats.json"), "utf8"))["telegram:42"];
+    assert.equal(afterSwitch.lastUsed, beforeSwitch, "/cd preserves lastUsed instead of replacing the entry");
     assert.equal(projSid, `telegram-42-${cwdTag("/work/projB")}`);
     assert.notEqual(cwdTag("/work/projB"), cwdTag(def)); // different dirs → different threads
     const b = chatContext("telegram", 42, def);
     assert.equal(b.cwd, "/work/projB");
     assert.equal(b.sessionId, projSid);
+    assert.equal(b.voice, true, "/cd preserves voice");
+    assert.equal(b.agent, "reviewer", "/cd preserves agent selection");
 
     const forked = newChatSession("telegram", 42, def); // /new forks the CURRENT dir's thread
     assert.equal(forked, `telegram-42-${cwdTag("/work/projB")}-1`);
     assert.equal(chatContext("telegram", 42, def).sessionId, forked);
 
+    assert.equal(chatCd("telegram", 42, def), a.sessionId, "returning to a cwd restores its original thread");
+    assert.equal(chatCd("telegram", 42, "/work/projB"), forked, "returning again restores its forked thread");
+
     setChatSession("telegram", 42, "explicit-session", "/work/other"); // /resume sets id + follows its cwd
     const c = chatContext("telegram", 42, def);
     assert.equal(c.sessionId, "explicit-session");
     assert.equal(c.cwd, "/work/other");
+    assert.equal(chatCd("telegram", 42, "/work/projB"), forked, "/resume does not discard another cwd's thread");
+    assert.equal(chatCd("telegram", 42, "/work/other"), "explicit-session", "/resume selection survives cwd round trips");
 
-    assert.equal(chatContext("telegram", 42, def).voice, false); // /voice off by default
-    assert.equal(toggleVoice("telegram", 42), true); // toggles on
     assert.equal(chatContext("telegram", 42, def).voice, true);
-    assert.equal(toggleVoice("telegram", 42), false); // and back off
+    assert.equal(toggleVoice("telegram", 42), false); // and back off without replacing the entry
+    assert.equal(chatContext("telegram", 42, def).agent, "reviewer");
+
+    const stored = JSON.parse(readFileSync(join(home, ".hara", "gateway", "chats.json"), "utf8"))["telegram:42"];
+    assert.ok(stored.lastUsed >= beforeSwitch, "lastUsed survives entry mutations");
+    assert.equal(statSync(join(home, ".hara", "gateway")).mode & 0o777, 0o700);
+    assert.equal(statSync(join(home, ".hara", "gateway", "chats.json")).mode & 0o777, 0o600);
+    assert.deepEqual(readdirSync(join(home, ".hara", "gateway")), ["chats.json"], "atomic writes leave no lock/temp files");
   } finally {
     if (prev === undefined) delete process.env.HOME;
     else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("chat agent homes preserve their own threads and /agent main restores the prior cwd", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-gw-agent-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const main = chatContext("feishu", "dm-1", "/work/main");
+    assert.equal(toggleVoice("feishu", "dm-1"), true);
+
+    assert.equal(setChatAgent("feishu", "dm-1", "coder", undefined, "/agents/coder"), "coder");
+    const coder = chatContext("feishu", "dm-1", "/ignored");
+    assert.equal(coder.cwd, "/agents/coder");
+    assert.equal(coder.agent, "coder");
+    assert.equal(coder.voice, true);
+    const coderFork = newChatSession("feishu", "dm-1", "/ignored");
+
+    assert.equal(setChatAgent("feishu", "dm-1", "reviewer", undefined, "/agents/reviewer"), "reviewer");
+    assert.equal(chatContext("feishu", "dm-1", "/ignored").cwd, "/agents/reviewer");
+
+    assert.equal(setChatAgent("feishu", "dm-1", undefined), undefined);
+    const restored = chatContext("feishu", "dm-1", "/ignored");
+    assert.equal(restored.cwd, "/work/main");
+    assert.equal(restored.sessionId, main.sessionId);
+    assert.equal(restored.agent, undefined);
+    assert.equal(restored.voice, true);
+
+    setChatAgent("feishu", "dm-1", "coder", undefined, "/agents/coder");
+    assert.equal(chatContext("feishu", "dm-1", "/ignored").sessionId, coderFork, "role home restores its prior fork");
+    setChatAgent("feishu", "dm-1", undefined);
+    assert.equal(chatContext("feishu", "dm-1", "/ignored").sessionId, main.sessionId);
+
+    setChatAgent("feishu", "dm-1", "project:coder", undefined, "/agents/coder");
+    setChatAgent("feishu", "dm-1", "global:reviewer");
+    assert.equal(chatContext("feishu", "dm-1", "/ignored").cwd, "/agents/coder", "a portable global role keeps the current project");
+    const portableThread = chatCd("feishu", "dm-1", "/work/portable");
+    setChatAgent("feishu", "dm-1", undefined);
+    const afterGlobal = chatContext("feishu", "dm-1", "/ignored");
+    assert.equal(afterGlobal.cwd, "/work/portable", "clearing a global role does not resurrect a stale project-role return cwd");
+    assert.equal(afterGlobal.sessionId, portableThread);
+  } finally {
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("group chat APIs isolate every member across cwd, session, voice, and agent state", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-gw-group-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  const alice = { chatType: "group", userId: "alice" };
+  const bob = { chatType: "group", userId: "bob" };
+  try {
+    const a0 = chatContext("telegram", "room-1", "/work/shared", alice);
+    const b0 = chatContext("telegram", "room-1", "/work/shared", bob);
+    assert.notEqual(a0.sessionId, b0.sessionId);
+
+    assert.equal(toggleVoice("telegram", "room-1", alice), true);
+    assert.equal(setChatAgent("telegram", "room-1", "coder", alice, "/agents/alice"), "coder");
+    const aExplicit = "alice-explicit";
+    setChatSession("telegram", "room-1", aExplicit, "/agents/alice", alice);
+
+    const bobProject = chatCd("telegram", "room-1", "/work/bob", bob);
+    const bobFork = newChatSession("telegram", "room-1", "/work/shared", bob);
+    assert.notEqual(bobProject, bobFork);
+
+    const a = chatContext("telegram", "room-1", "/ignored", alice);
+    const b = chatContext("telegram", "room-1", "/ignored", bob);
+    assert.deepEqual({ cwd: a.cwd, sessionId: a.sessionId, voice: a.voice, agent: a.agent }, {
+      cwd: "/agents/alice", sessionId: aExplicit, voice: true, agent: "coder",
+    });
+    assert.deepEqual({ cwd: b.cwd, sessionId: b.sessionId, voice: b.voice, agent: b.agent }, {
+      cwd: "/work/bob", sessionId: bobFork, voice: false, agent: undefined,
+    });
+
+    assert.throws(() => chatContext("telegram", "room-1", "/work/shared", { chatType: "group" }), /requires a userId/);
+    assert.throws(() => toggleVoice("telegram", "room-1", { chatType: "group" }), /requires a userId/);
+  } finally {
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gateway compact session ids resolve only within one chat identity and only when unique", () => {
+  const alice = { chatType: "group", userId: "alice" };
+  const bob = { chatType: "group", userId: "bob" };
+  const userTag = (id) => createHash("sha256").update(id).digest("hex").slice(0, 24);
+  const aPrefix = `telegram-room-1-u${userTag("alice")}-`;
+  const bPrefix = `telegram-room-1-u${userTag("bob")}-`;
+  const ids = [`${aPrefix}abcdef-1`, `${aPrefix}abcdef-2`, `${bPrefix}fedcba-9`, "telegram-other-abcdef-1"];
+  assert.equal(ownsChatSession("telegram", "room-1", ids[0], alice), true);
+  assert.equal(ownsChatSession("telegram", "room-1", ids[2], alice), false);
+  assert.deepEqual(resolveOwnedSessionId("telegram", "room-1", ids[0], ids, alice), { id: ids[0] });
+  assert.deepEqual(resolveOwnedSessionId("telegram", "room-1", "abcdef-2", ids, alice), { id: ids[1] }, "displayed suffix resumes");
+  assert.deepEqual(resolveOwnedSessionId("telegram", "room-1", `${aPrefix}abcdef`, ids, alice), { ambiguous: [ids[0], ids[1]] });
+  assert.equal(resolveOwnedSessionId("telegram", "room-1", "fedcba-9", ids, alice), null, "another user's matching suffix stays invisible");
+  assert.deepEqual(resolveOwnedSessionId("telegram", "room-1", "fedcba-9", ids, bob), { id: ids[2] });
+  assert.equal(ownsChatSession("telegram", "room", "telegram-room-extra-abcdef-1"), false, "chat-id prefixes cannot cross ownership boundaries");
+});
+
+test("gateway chat persistence keeps concurrent cross-process mutations", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-gw-race-"));
+  const moduleUrl = pathToFileURL(join(process.cwd(), "dist", "gateway", "sessions.js")).href;
+  const run = (index) => new Promise((resolve, reject) => {
+    const source = `import { chatContext } from ${JSON.stringify(moduleUrl)}; chatContext("telegram", ${JSON.stringify(`parallel-${index}`)}, ${JSON.stringify(`/work/${index}`)});`;
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", source], {
+      env: { ...process.env, HOME: home, HARA_GATEWAY_IDLE_HOURS: "0" },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`child ${index} exited ${code}: ${stderr}`)));
+  });
+  try {
+    await Promise.all(Array.from({ length: 16 }, (_, index) => run(index)));
+    const gatewayDir = join(home, ".hara", "gateway");
+    const stored = JSON.parse(readFileSync(join(gatewayDir, "chats.json"), "utf8"));
+    assert.equal(Object.keys(stored).length, 16);
+    for (let index = 0; index < 16; index += 1) {
+      assert.equal(stored[`telegram:parallel-${index}`].cwd, `/work/${index}`);
+    }
+    assert.deepEqual(readdirSync(gatewayDir), ["chats.json"]);
+    assert.equal(statSync(gatewayDir).mode & 0o777, 0o700);
+    assert.equal(statSync(join(gatewayDir, "chats.json")).mode & 0o777, 0o600);
+  } finally {
     rmSync(home, { recursive: true, force: true });
   }
 });

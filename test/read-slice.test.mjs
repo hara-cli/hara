@@ -2,7 +2,12 @@
 // long-line truncation. The pure renderer is exported from builtin.ts.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { renderFileSlice } from "../dist/tools/builtin.js";
+import { readTextPrefixSync } from "../dist/fs-read.js";
 
 const file = (n) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join("\n") + "\n";
 
@@ -40,4 +45,15 @@ test("very long lines are truncated with a char count", () => {
   const out = renderFileSlice("x".repeat(5000) + "\nshort\n");
   assert.ok(out.includes("…[+3000 chars]"), "5000-char line capped at 2000");
   assert.ok(out.includes("     2\tshort"));
+});
+
+test("synchronous @file prefix reads reject FIFOs without blocking", { skip: process.platform === "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-prefix-fifo-"));
+  try {
+    const fifo = join(dir, "mention.pipe");
+    execFileSync("mkfifo", [fifo]);
+    assert.throws(() => readTextPrefixSync(fifo, 1000), /not a regular file/i);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

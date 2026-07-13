@@ -60,9 +60,10 @@ export function buildIssueBody(description: string, env: FeedbackEnv, sessionTai
   return parts.join("\n");
 }
 
-/** Issue title from the description: first line, trimmed, capped. */
+/** Issue title from the description: first line, redacted BEFORE it crosses the public issue boundary,
+ *  trimmed and capped. Body-only redaction is insufficient because GitHub titles are public too. */
 export function issueTitle(description: string): string {
-  const first = (description.trim().split("\n")[0] || "feedback").trim();
+  const first = redact((description.trim().split("\n")[0] || "feedback").trim());
   return first.length > 70 ? first.slice(0, 67) + "…" : first;
 }
 

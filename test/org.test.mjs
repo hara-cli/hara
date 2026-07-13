@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadRoles, scaffoldRoles, subagentToolFilter } from "../dist/org/roles.js";
+import { loadRoles, scaffoldRoles, subagentToolFilter, roleToolFilter } from "../dist/org/roles.js";
 import { routeByKeywords, parseRoleId, buildDispatchPrompt } from "../dist/org/router.js";
 
 // Hermetic HOME: loadRoles merges ~/.hara/roles + ~/.hara/org-roles (os.homedir() honors $HOME), so a
@@ -39,12 +39,33 @@ test("org: scaffold + load roles (frontmatter + tool restriction)", () => {
     const roles = loadRoles(dir);
     assert.deepEqual(roles.map((r) => r.id).sort(), ["docs", "implementer", "reviewer"]);
     const reviewer = roles.find((r) => r.id === "reviewer");
-    assert.deepEqual(reviewer.allowTools, ["read_file", "bash"]);
+    assert.deepEqual(reviewer.allowTools, ["read_file", "grep", "glob", "ls", "codebase_search"]);
+    assert.equal(reviewer.readOnly, true);
     assert.ok(reviewer.system.length > 0);
     assert.ok(reviewer.owns.includes("review"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("reviewer/readOnly roles cannot smuggle writes through an allowed bash tool", () => {
+  const filter = roleToolFilter({ id: "reviewer", description: "", owns: [], rejects: [], allowTools: ["read_file", "bash"], readOnly: true, system: "review" });
+  assert.equal(filter("read_file"), true);
+  for (const tool of ["bash", "edit_file", "write_file", "apply_patch", "computer", "external_agent", "memory_write", "send_file", "task"]) {
+    assert.equal(filter(tool), false, `${tool} cannot bypass a read-only role even when dynamically registered`);
+  }
+});
+
+test("role policies intersect allowTools and denyTools so an explicit deny always wins", () => {
+  const role = { id: "mixed", description: "", owns: [], rejects: [], allowTools: ["read_file", "grep"], denyTools: ["grep"], system: "mixed" };
+  const normal = roleToolFilter(role);
+  assert.equal(normal("read_file"), true);
+  assert.equal(normal("grep"), false, "deny wins over the simultaneous allow");
+  assert.equal(normal("ls"), false, "the allow-list still narrows everything else");
+
+  const sub = subagentToolFilter(role, () => true);
+  assert.equal(sub("read_file"), true);
+  assert.equal(sub("grep"), false, "sub-agents apply the same deny-over-allow rule");
 });
 
 test("org: keyword routing picks the owning role", () => {

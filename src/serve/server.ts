@@ -5,15 +5,31 @@
 // (no import cycle back into the CLI entry).
 import { WebSocketServer, type WebSocket } from "ws";
 import { randomBytes, randomUUID, timingSafeEqual, createHash } from "node:crypto";
-import { writeFileSync, unlinkSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { runAgent } from "../agent/loop.js";
 import { COMPACT_SYSTEM, buildFileRestore, workingSetFromSummary } from "../agent/compact.js";
 import { rewindTo } from "../agent/rewind.js";
 import { analyzeContext } from "../agent/context-report.js";
-import { recentTouched } from "../agent/touched.js";
+import { clearTouched, recentTouched } from "../agent/touched.js";
+import { resetRepeatGuard } from "../agent/repeat-guard.js";
 import { contextWindow, ctxPctFor } from "../statusbar.js";
 import { listProjectFiles } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
@@ -28,6 +44,10 @@ import { listInstalled, enabledPlugins, setPluginEnabled, panelsForProject } fro
 import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
 import { loadJobs, saveJobs, addJob } from "../cron/store.js";
 import { parseSchedule, describeSchedule } from "../cron/schedule.js";
+import { loadTasks } from "../tools/task.js";
+import { listPending, resolvePending } from "../gateway/flows-pending.js";
+import { disposeTodoScope, restoreTodos, serializeTodos } from "../tools/todo.js";
+import { disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 
@@ -36,19 +56,24 @@ export interface ServeDeps {
   version: string;
   providerId: string;
   model: string;
-  buildSessionProvider: () => Promise<Provider | null>; // fresh provider per session (stateless today, cheap)
+  buildSessionProvider: (cwd?: string) => Promise<Provider | null>; // fresh live config/credential route
   /** provider for a specific model/effort — powers per-session model switching (composer picker) */
-  buildProviderFor?: (model: string, effort?: string) => Promise<Provider | null>;
+  buildProviderFor?: (model: string, effort?: string, cwd?: string) => Promise<Provider | null>;
   /** live model list from the endpoint (may be empty — not every endpoint enumerates) */
-  listModels?: () => Promise<string[]>;
+  listModels?: (cwd?: string) => Promise<string[]>;
   /** thinking-dial levels valid for this endpoint's reasoning style (from the provider registry) */
   effortLevels?: string[];
+  /** Live defaults advertised to persistent clients after config/profile edits. */
+  runtimeInfo?: (cwd?: string) => { providerId: string; model: string; effortLevels?: string[] };
   spawnSubagent: (provider: Provider, cwd: string, projectContext: string | undefined, stats: { input: number; output: number; lastInput?: number }, task: string, role?: string) => Promise<string>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
+  buildGuardian?: (cwd?: string) => Promise<{ provider?: Provider | null; enabled?: boolean } | undefined>;
   sandbox: SandboxMode;
   approval: ApprovalMode;
   store?: SessionStore; // tests inject a hermetic store
   quietDiscovery?: boolean; // tests: skip ~/.hara/serve.json
+  discoveryHome?: string; // tests: isolate the discovery file from the real home directory
+  compactTimeoutMs?: number; // tests/embedders: bound a provider that ignores cancellation
 }
 
 export interface ServeOpts {
@@ -65,6 +90,170 @@ export interface ServeHandle {
 }
 
 const APPROVAL_TIMEOUT_MS = 300_000; // an unanswered approval denies after 5 min (never hangs a turn)
+const COMPACT_TIMEOUT_MS = 60_000;
+const SHUTDOWN_GRACE_MS = 2_000;
+const SOCKET_CLOSE_GRACE_MS = 250;
+const DISCOVERY_LOCK_WAIT_MS = 2_000;
+
+interface DiscoveryRecord {
+  host: string;
+  port: number;
+  token: string;
+  pid: number;
+  version: string;
+  instanceId: string;
+}
+
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isPidAlive = (pid: number): boolean => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code === "EPERM";
+  }
+};
+
+const ensurePrivateDiscoveryDir = (dir: string): void => {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  let fd: number | undefined;
+  try {
+    fd = openSync(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    const st = fstatSync(fd);
+    if (!st.isDirectory()) throw new Error(`${dir} must be a private directory, not a symlink`);
+    // mkdir's mode does not affect a legacy directory. Operate through the verified descriptor so a path
+    // replacement cannot redirect chmod to a symlink target between validation and permission tightening.
+    fchmodSync(fd, 0o700);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+};
+
+/** Serialize discovery replacement/removal across serve instances. The instance-stamped lock owner lets a
+ * later process reclaim a crash-stale lock without ever treating a live writer as stale. */
+const withDiscoveryLock = async <T>(dir: string, instanceId: string, fn: () => T, waitMs = DISCOVERY_LOCK_WAIT_MS): Promise<T> => {
+  const lockDir = join(dir, ".serve.json.lock");
+  const ownerPath = join(lockDir, "owner.json");
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      mkdirSync(lockDir, { mode: 0o700 });
+      writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, instanceId }), { mode: 0o600, flag: "wx" });
+      break;
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+      let stale = false;
+      try {
+        const owner = JSON.parse(readFileSync(ownerPath, "utf8")) as { pid?: unknown };
+        stale = typeof owner.pid === "number" && !isPidAlive(owner.pid);
+      } catch {
+        // A writer may be between mkdir and owner creation. Only reclaim a malformed lock after a full
+        // grace interval; a normally running write holds it for just a few synchronous filesystem calls.
+        try {
+          stale = Date.now() - statSync(lockDir).mtimeMs > DISCOVERY_LOCK_WAIT_MS;
+        } catch {
+          continue;
+        }
+      }
+      if (stale) {
+        try {
+          renameSync(lockDir, join(dir, `.serve.json.lock.stale-${process.pid}-${randomUUID()}`));
+          continue;
+        } catch (renameError: any) {
+          if (renameError?.code === "ENOENT") continue;
+        }
+      }
+      if (Date.now() >= deadline) throw new Error("timed out waiting for the serve discovery lock");
+      await pause(10);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    // Only remove the lock directory if its owner record is still ours. This is deliberately conservative:
+    // leaving a recoverable stale lock is safer than deleting a replacement owned by another instance.
+    try {
+      const owner = JSON.parse(readFileSync(ownerPath, "utf8")) as { pid?: unknown; instanceId?: unknown };
+      if (owner.pid === process.pid && owner.instanceId === instanceId) {
+        unlinkSync(ownerPath);
+        rmdirSync(lockDir);
+      }
+    } catch {
+      /* stale-lock recovery handles interrupted cleanup */
+    }
+  }
+};
+
+const syncDirectory = (dir: string): void => {
+  let fd: number | undefined;
+  try {
+    fd = openSync(dir, fsConstants.O_RDONLY);
+    fsyncSync(fd);
+  } catch {
+    // Some filesystems do not support fsync on directories. The atomic rename and private file mode still
+    // hold; directory fsync is an extra crash-durability barrier where the platform supports it.
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+};
+
+const writeDiscovery = async (dir: string, path: string, record: DiscoveryRecord): Promise<void> => {
+  ensurePrivateDiscoveryDir(dir);
+  await withDiscoveryLock(dir, record.instanceId, () => {
+    const temp = join(dir, `.serve.json.${process.pid}.${record.instanceId}.tmp`);
+    let fd: number | undefined;
+    try {
+      fd = openSync(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW, 0o600);
+      fchmodSync(fd, 0o600);
+      writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      // rename replaces a legacy file or symlink inode; it never follows serve.json's symlink target.
+      renameSync(temp, path);
+      syncDirectory(dir);
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+      try {
+        unlinkSync(temp);
+      } catch {
+        /* renamed or never created */
+      }
+    }
+  });
+};
+
+const removeOwnedDiscovery = async (dir: string, path: string, record: DiscoveryRecord): Promise<void> => {
+  await withDiscoveryLock(dir, record.instanceId, () => {
+    let fd: number | undefined;
+    try {
+      fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const opened = fstatSync(fd);
+      if (!opened.isFile() || opened.size > 64 * 1024) return;
+      const current = JSON.parse(readFileSync(fd, "utf8")) as Partial<DiscoveryRecord>;
+      if (
+        current.instanceId !== record.instanceId
+        || current.pid !== record.pid
+        || current.port !== record.port
+        || typeof current.token !== "string"
+        || !sameToken(current.token, record.token)
+      ) return;
+      // Re-check the directory entry against the already-open, verified inode. Cooperating writers are
+      // serialized by the lock; this check also refuses an uncooperative symlink/replacement race.
+      const linked = lstatSync(path);
+      if (!linked.isFile() || linked.isSymbolicLink() || linked.dev !== opened.dev || linked.ino !== opened.ino) return;
+      unlinkSync(path);
+      syncDirectory(dir);
+    } catch (error: any) {
+      if (error?.code !== "ENOENT" && error?.code !== "ELOOP") throw error;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+  }, 250);
+};
 
 const sameToken = (a: string, b: string): boolean => {
   // constant-time compare over digests (inputs differ in length)
@@ -95,7 +284,26 @@ export function historyForClient(history: NeutralMsg[]): { role: string; text: s
 
 export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<ServeHandle> {
   const token = opts.token ?? randomBytes(16).toString("hex");
+  const instanceId = randomUUID();
   const hub = new SessionHub(deps.store ?? realStore);
+  const runtimeInfo = (cwd?: string): { providerId: string; model: string; effortLevels: string[] } => {
+    const live = deps.runtimeInfo?.(cwd);
+    return {
+      providerId: live?.providerId ?? deps.providerId,
+      model: live?.model ?? deps.model,
+      effortLevels: live?.effortLevels ?? deps.effortLevels ?? [],
+    };
+  };
+  const refreshSessionProvider = async (session: ServeSession): Promise<boolean> => {
+    const fresh = deps.buildProviderFor
+      ? await deps.buildProviderFor(session.meta.model, session.effort, session.meta.cwd)
+      : await deps.buildSessionProvider(session.meta.cwd);
+    if (!fresh) return false;
+    session.provider = fresh;
+    session.meta.provider = fresh.id;
+    // Preserve the user's pinned model in meta; provider factories should honor it, but fail closed if they do not.
+    return fresh.model === session.meta.model;
+  };
   const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 10 * 1024 * 1024 });
   await new Promise<void>((res, rej) => {
     wss.once("listening", res);
@@ -105,6 +313,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
   const authed = new Set<WebSocket>();
   const pendingApprovals = new Map<string, (v: boolean | "always") => void>();
+  const inFlightRequests = new Set<Promise<void>>();
+  let closing = false;
+  let closePromise: Promise<void> | null = null;
 
   const broadcast = (method: string, params: Record<string, unknown>): void => {
     const frame = rpcNotify(method, params);
@@ -112,10 +323,29 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   };
 
   // Discovery file — the desktop shell reads this to find the running server (like a pid/port file).
-  const discoveryPath = join(homedir(), ".hara", "serve.json");
+  const discoveryDir = join(deps.discoveryHome ?? homedir(), ".hara");
+  const discoveryPath = join(discoveryDir, "serve.json");
+  const discovery: DiscoveryRecord = { host: opts.host, port, token, pid: process.pid, version: deps.version, instanceId };
   if (!deps.quietDiscovery) {
-    mkdirSync(join(homedir(), ".hara"), { recursive: true });
-    writeFileSync(discoveryPath, JSON.stringify({ host: opts.host, port, token, pid: process.pid, version: deps.version }, null, 2), { mode: 0o600 });
+    try {
+      await writeDiscovery(discoveryDir, discoveryPath, discovery);
+    } catch (error) {
+      // The socket is already listening so its assigned port can be advertised. If advertising fails,
+      // fail atomically as a server too: never leave an unreachable/authentication-less listener behind.
+      await removeOwnedDiscovery(discoveryDir, discoveryPath, discovery).catch(() => {});
+      for (const client of wss.clients) client.terminate();
+      await Promise.race([
+        new Promise<void>((resolve) => {
+          try {
+            wss.close(() => resolve());
+          } catch {
+            resolve();
+          }
+        }),
+        pause(SOCKET_CLOSE_GRACE_MS),
+      ]);
+      throw error;
+    }
   }
 
   /** Run one turn on a session, streaming events to all authed clients. */
@@ -126,7 +356,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   ): Promise<{ reply: string; usage: { input: number; output: number }; ctx: { lastInput: number; window: number; pct: number } }> => {
     const sessionId = s.meta.id;
     s.busy = true;
-    s.abort = new AbortController();
+    const turnAbort = new AbortController();
+    s.abort = turnAbort;
+    const historyStart = s.history.length;
     const before = { input: s.stats.input, output: s.stats.output };
     const sink: UiSink = {
       text: (d) => broadcast("event.text", { sessionId, delta: d }),
@@ -138,17 +370,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const confirm = (q: string): Promise<boolean | "always"> =>
       new Promise((resolve) => {
         const approvalId = randomUUID();
-        const timer = setTimeout(() => {
-          if (pendingApprovals.delete(approvalId)) resolve(false); // unanswered → deny, turn continues
-        }, APPROVAL_TIMEOUT_MS);
-        pendingApprovals.set(approvalId, (v) => {
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout>;
+        const finish = (v: boolean | "always"): void => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
           pendingApprovals.delete(approvalId);
+          turnAbort.signal.removeEventListener("abort", onAbort);
           resolve(v);
-        });
-        broadcast("approval.request", { sessionId, approvalId, question: q });
+        };
+        const onAbort = (): void => finish(false);
+        timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS); // unanswered → deny, turn continues
+        pendingApprovals.set(approvalId, finish);
+        if (turnAbort.signal.aborted) finish(false);
+        else {
+          turnAbort.signal.addEventListener("abort", onAbort, { once: true });
+          broadcast("approval.request", { sessionId, approvalId, question: q });
+        }
       });
     try {
+      if (!(await refreshSessionProvider(s))) {
+        throw new Error(`provider not authenticated for pinned model '${s.meta.model}' at ${s.meta.cwd}`);
+      }
+      const turnGuardian = deps.buildGuardian ? await deps.buildGuardian(s.meta.cwd) : deps.guardian;
+      restoreTodos(s.meta.todos, sessionId);
       // Slash skills, CLI parity: "/skill-id request…" expands into the skill-entering message, so a
       // desktop composer's "/" popup triggers the exact behavior the terminal gets. Unknown ids fall
       // through as plain text (the model sees what the user typed).
@@ -164,11 +410,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works).
       // Pasted images ride along as NeutralMsg.images — a vision-capable model sees them inline.
       s.history.push({ role: "user", content: expandMentions(content, s.meta.cwd), ...(images && images.length ? { images } : {}) });
-      await runAgent(s.history, {
+      const outcome = await runAgent(s.history, {
         provider: s.provider,
         ctx: {
           cwd: s.meta.cwd,
           sandbox: deps.sandbox,
+          todoScope: sessionId,
           spawn: (t, role) => deps.spawnSubagent(s.provider, s.meta.cwd, s.projectContext, s.stats, t, role),
           ui: sink,
         },
@@ -178,15 +425,35 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         projectContext: s.projectContext,
         memory: memoryDigest(s.meta.cwd),
         stats: s.stats,
-        signal: s.abort.signal,
-        guardian: deps.guardian,
+        signal: turnAbort.signal,
+        onProviderTurn: (turn) => {
+          s.pendingProviderTurns += 1;
+          const settled = (): void => {
+            s.pendingProviderTurns = Math.max(0, s.pendingProviderTurns - 1);
+            if (closing) hub.releaseIdle();
+          };
+          void turn.then(settled, settled);
+        },
+        guardian: turnGuardian,
       });
+      s.meta.todos = serializeTodos(sessionId);
       hub.save(s);
       const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
-      const reply = lastAssistantText(s.history);
       // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
       // clients render a meter without an extra round-trip.
       const ctx = ctxOf(s);
+      if (outcome.status !== "completed") {
+        const failure = outcome.status === "error"
+          ? (outcome.error ?? "agent turn failed")
+          : outcome.status === "empty"
+            ? "the model returned an empty response after retrying"
+            : "agent turn halted by the safety circuit-breaker";
+        broadcast("event.turn_end", { sessionId, reply: "", error: failure, status: outcome.status, usage, ctx });
+        throw new Error(failure);
+      }
+      // A persistent session may already contain many assistant messages. Only messages appended by THIS
+      // request are eligible for its reply; a failed/empty turn must never replay a previous success.
+      const reply = lastAssistantText(s.history.slice(historyStart));
       broadcast("event.turn_end", { sessionId, reply, usage, ctx });
       return { reply, usage, ctx };
     } finally {
@@ -204,12 +471,38 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   /** Summarize + replace a session's history — the CLI's /compact, serve-side (codex thread/compact).
    *  Mirrors index.ts compactConversation; the file restore is limited to files under the session's own
    *  cwd because serve is multi-session (recentTouched is process-wide and must not leak across projects). */
-  const compactSession = async (s: ServeSession): Promise<string | null> => {
-    const r = await s.provider.turn({
-      system: COMPACT_SYSTEM,
-      history: [...s.history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
-      tools: [],
-      onText: () => {},
+  const compactSession = async (s: ServeSession, controller: AbortController): Promise<string | null> => {
+    const timeoutMs = Math.max(1, Math.min(deps.compactTimeoutMs ?? COMPACT_TIMEOUT_MS, COMPACT_TIMEOUT_MS));
+    const r = await new Promise<Awaited<ReturnType<Provider["turn"]>>>((resolve, reject) => {
+      let settled = false;
+      let timedOut = false;
+      const finish = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        controller.signal.removeEventListener("abort", onAbort);
+        fn();
+      };
+      const onAbort = (): void => finish(() => reject(new Error(timedOut ? "compaction timed out" : "compaction interrupted")));
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort(); // cooperative providers stop their own network/body work too
+        onAbort(); // AbortController dispatch is synchronous, but keep this idempotent fallback explicit
+      }, timeoutMs);
+      timer.unref();
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      if (controller.signal.aborted) return onAbort();
+      // Promise.resolve protects this boundary even if a non-conforming provider throws synchronously.
+      void Promise.resolve().then(() => s.provider.turn({
+        system: COMPACT_SYSTEM,
+        history: [...s.history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
+        tools: [],
+        onText: () => {},
+        signal: controller.signal,
+      })).then(
+        (result) => finish(() => resolve(result)),
+        (error) => finish(() => reject(error)),
+      );
     });
     if (r.stop === "error") return null;
     const summary = r.text.trim();
@@ -217,7 +510,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     s.meta.workingSet = workingSetFromSummary(summary);
     s.history.length = 0;
     s.history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
-    const touched = recentTouched(20).filter((f) => f.startsWith(s.meta.cwd)).slice(0, 5);
+    const touched = recentTouched(20, s.meta.id).filter((file) => {
+      const rel = relative(s.meta.cwd, file);
+      return !!rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+    }).slice(0, 5);
     const restore = buildFileRestore(touched, (f) => {
       try {
         return readFileSync(f, "utf8");
@@ -234,14 +530,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   };
 
   wss.on("connection", (ws: WebSocket) => {
-    ws.on("message", async (raw) => {
-      const parsed = parseFrame(String(raw));
-      if ("error" in parsed) return void ws.send(rpcError(null, ERR.PARSE, parsed.error));
-      const { req } = parsed;
-      const id = req.id ?? null;
-      const reply = (frame: string): void => void (id !== null && ws.send(frame));
-      const p = (req.params ?? {}) as Record<string, any>;
-      try {
+    if (closing) {
+      ws.close(1012, "server shutting down");
+      return;
+    }
+    ws.on("message", (raw) => {
+      const task = (async (): Promise<void> => {
+        if (closing) return;
+        const parsed = parseFrame(String(raw));
+        if ("error" in parsed) {
+          if (ws.readyState === ws.OPEN) ws.send(rpcError(null, ERR.PARSE, parsed.error));
+          return;
+        }
+        const { req } = parsed;
+        const id = req.id ?? null;
+        const reply = (frame: string): void => void (id !== null && ws.readyState === ws.OPEN && ws.send(frame));
+        const p = (req.params ?? {}) as Record<string, any>;
+        try {
         if (req.method === "initialize") {
           if (typeof p.token !== "string" || !sameToken(p.token, token)) return reply(rpcError(id, ERR.UNAUTHORIZED, "bad token"));
           authed.add(ws);
@@ -253,8 +558,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
+            "tasks.list", "approvals.list", "approvals.resolve",
           ];
-          return reply(rpcResult(id!, { name: "hara", version: deps.version, protocol: PROTOCOL_VERSION, cwd: opts.cwd, provider: deps.providerId, model: deps.model, capabilities: { methods } }));
+          const runtime = runtimeInfo();
+          return reply(rpcResult(id!, { name: "hara", version: deps.version, protocol: PROTOCOL_VERSION, cwd: opts.cwd, provider: runtime.providerId, model: runtime.model, capabilities: { methods } }));
         }
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
 
@@ -262,20 +569,39 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           case "session.list":
             return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, archived: m.archived ?? false })) }));
           case "session.create": {
-            const provider = await deps.buildSessionProvider();
-            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const provider = await deps.buildSessionProvider(cwd);
+            if (closing) return;
+            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const approval = (["suggest", "auto-edit", "full-auto"] as ApprovalMode[]).includes(p.approval) ? (p.approval as ApprovalMode) : deps.approval;
             const s = hub.create({ cwd, provider, providerId: provider.id, model: provider.model, approval, projectContext: loadAgentsMd(cwd) || undefined });
             return reply(rpcResult(id!, { sessionId: s.meta.id, model: s.meta.model }));
           }
           case "session.resume": {
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
-            const provider = await deps.buildSessionProvider();
+            const live = hub.get(p.sessionId);
+            if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
+            const priorMeta = hub.peekMeta(p.sessionId);
+            const provider = priorMeta && deps.buildProviderFor
+              ? await deps.buildProviderFor(priorMeta.model, undefined, priorMeta.cwd)
+              : await deps.buildSessionProvider(priorMeta?.cwd);
+            if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const r = hub.resume(p.sessionId, { provider, approval: deps.approval, projectContext: undefined });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if ("lockedBy" in r) return reply(rpcError(id, ERR.LOCKED, `session held by live pid ${r.lockedBy}`));
+            if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
+            r.session.configuring = true;
+            let refreshed = false;
+            try {
+              refreshed = await refreshSessionProvider(r.session);
+            } finally {
+              r.session.configuring = false;
+            }
+            if (!refreshed) {
+              hub.detach(r.session.meta.id);
+              return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
+            }
             r.session.projectContext = loadAgentsMd(r.session.meta.cwd) || undefined;
             return reply(rpcResult(id!, { sessionId: r.session.meta.id, model: r.session.meta.model, history: historyForClient(r.session.history) }));
           }
@@ -283,7 +609,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string" || typeof p.text !== "string" || !p.text) return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId} — session.create/resume first`));
-            if (s.busy) return reply(rpcError(id, ERR.BUSY, "a turn is already running on this session"));
+            if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "this session is busy or changing configuration"));
             const images = Array.isArray(p.images)
               ? p.images.filter((im: any) => im && typeof im.path === "string").map((im: any) => ({ path: im.path, mediaType: typeof im.mediaType === "string" ? im.mediaType : "image/png" }))
               : undefined;
@@ -314,11 +640,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }
           case "session.rename": {
             if (typeof p.sessionId !== "string" || typeof p.title !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId + title required"));
+            const live = hub.get(p.sessionId);
+            if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — rename after it finishes"));
             if (!hub.rename(p.sessionId, p.title.slice(0, 120))) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             return reply(rpcResult(id!, { sessionId: p.sessionId, title: p.title.slice(0, 120) }));
           }
           case "session.archive": {
             if (typeof p.sessionId !== "string" || typeof p.archived !== "boolean") return reply(rpcError(id, ERR.PARAMS, "sessionId + archived required"));
+            const live = hub.get(p.sessionId);
+            if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — archive after it finishes"));
             if (!hub.setArchived(p.sessionId, p.archived)) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             return reply(rpcResult(id!, { sessionId: p.sessionId, archived: p.archived }));
           }
@@ -326,10 +656,26 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             // duplicate the conversation into a new session (codex thread/fork) — rewind's
             // non-destructive sibling: explore a different direction without losing the original
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
-            const provider = await deps.buildSessionProvider();
+            const sourceMeta = hub.peekMeta(p.sessionId);
+            const provider = sourceMeta && deps.buildProviderFor
+              ? await deps.buildProviderFor(sourceMeta.model, undefined, sourceMeta.cwd)
+              : await deps.buildSessionProvider(sourceMeta?.cwd);
+            if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const r = hub.fork(p.sessionId, { provider, providerId: provider.id, approval: deps.approval, projectContext: undefined });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "source session is mid-turn — fork after it completes"));
+            r.session.configuring = true;
+            let refreshed = false;
+            try {
+              refreshed = await refreshSessionProvider(r.session);
+            } finally {
+              r.session.configuring = false;
+            }
+            if (!refreshed) {
+              hub.delete(r.session.meta.id);
+              return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
+            }
             r.session.projectContext = loadAgentsMd(r.session.meta.cwd) || undefined;
             return reply(rpcResult(id!, { sessionId: r.session.meta.id, title: r.session.meta.title, model: r.session.meta.model, history: historyForClient(r.session.history) }));
           }
@@ -339,11 +685,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const r = hub.delete(p.sessionId);
             if (r === "busy") return reply(rpcError(id, ERR.BUSY, "a turn is running — delete after it finishes"));
             if (r === "missing") return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId} (or held by another process)`));
+            disposeTodoScope(p.sessionId);
+            disposeReminderScope(p.sessionId);
+            resetRepeatGuard(p.sessionId);
+            clearTouched(p.sessionId);
             return reply(rpcResult(id!, { sessionId: p.sessionId, deleted: true }));
           }
           case "models.list": {
-            const models = deps.listModels ? await deps.listModels().catch(() => []) : [];
-            return reply(rpcResult(id!, { models, current: deps.model, effortLevels: deps.effortLevels ?? [] }));
+            const session = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : (session?.meta.cwd ?? opts.cwd);
+            const models = deps.listModels ? await deps.listModels(targetCwd).catch(() => []) : [];
+            const runtime = runtimeInfo(targetCwd);
+            return reply(rpcResult(id!, { models, current: session?.meta.model ?? runtime.model, effort: session?.effort ?? null, effortLevels: runtime.effortLevels }));
           }
           case "session.set-model": {
             // per-session model / thinking-effort switch (the composer picker). Rebuilds the session's
@@ -351,16 +704,26 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
-            if (s.busy) return reply(rpcError(id, ERR.BUSY, "a turn is running — switch after it finishes"));
+            if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — switch after it finishes"));
             const model = typeof p.model === "string" && p.model ? p.model : s.meta.model;
             const effort = typeof p.effort === "string" && p.effort ? p.effort : undefined;
             if (!deps.buildProviderFor) return reply(rpcError(id, ERR.METHOD, "model switching not supported by this server"));
-            const provider = await deps.buildProviderFor(model, effort);
-            if (!provider) return reply(rpcError(id, ERR.INTERNAL, `could not build provider for ${model}`));
-            s.provider = provider;
-            s.meta.model = model;
-            s.effort = effort;
-            return reply(rpcResult(id!, { sessionId: s.meta.id, model, effort: effort ?? null }));
+            s.configuring = true;
+            try {
+              const provider = await deps.buildProviderFor(model, effort, s.meta.cwd);
+              if (closing) return;
+              if (!provider) return reply(rpcError(id, ERR.INTERNAL, `could not build provider for ${model}`));
+              if (provider.model !== model) return reply(rpcError(id, ERR.INTERNAL, `provider did not honor requested model ${model}`));
+              s.provider = provider;
+              s.meta.provider = provider.id;
+              s.meta.model = model;
+              s.meta.effort = effort;
+              s.effort = effort;
+              hub.save(s); // persist the picker immediately, even if no next turn is sent
+              return reply(rpcResult(id!, { sessionId: s.meta.id, model, effort: effort ?? null }));
+            } finally {
+              s.configuring = false;
+            }
           }
           case "automation.list": {
             // The automation timeline's data: cron jobs with their last outcome, plus this machine's
@@ -369,6 +732,27 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const jobs = loadJobs().map((j) => ({ id: j.id, name: j.name, mode: j.mode, cwd: j.cwd, enabled: j.enabled, deliver: j.deliver, lastRunAt: j.lastRunAt, lastStatus: j.lastStatus, lastError: j.lastError, schedule: describeSchedule(j.schedule) }));
             const automated = hub.list().filter((m) => m.source === "cron" || m.source === "gateway").map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, source: m.source, sourceName: m.sourceName, updatedAt: m.updatedAt }));
             return reply(rpcResult(id!, { jobs, sessions: automated }));
+          }
+          case "tasks.list": {
+            // The project's persistent task pool (the `task` tool's file store) — desktop's tasks panel.
+            // File-backed, so it reflects tasks created by ANY hara process in that cwd. Read-only.
+            const taskCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, { tasks: loadTasks(taskCwd) }));
+          }
+          case "approvals.list": {
+            // Unified approvals inbox: gateway-flow drafts awaiting the owner's verdict. (Per-turn tool
+            // approvals stay on the live approval.request/reply channel — they are transient by nature.)
+            return reply(rpcResult(id!, { flowDrafts: listPending() }));
+          }
+          case "approvals.resolve": {
+            if (typeof p.id !== "string" || !["approve", "edit", "reject"].includes(p.verdict as string)) {
+              return reply(rpcError(id, ERR.PARAMS, "id + verdict(approve|edit|reject) required"));
+            }
+            if (p.verdict === "edit" && (typeof p.draft !== "string" || !p.draft.trim())) {
+              return reply(rpcError(id, ERR.PARAMS, "a non-empty draft is required for edit"));
+            }
+            const outcome = await resolvePending(p.id, p.verdict as "approve" | "edit" | "reject", typeof p.draft === "string" ? p.draft : undefined);
+            return reply(rpcResult(id!, { outcome }));
           }
           case "automation.add": {
             if (typeof p.name !== "string" || !p.name || typeof p.schedule !== "string" || typeof p.task !== "string" || !p.task) {
@@ -440,17 +824,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
-            if (s.busy) return reply(rpcError(id, ERR.BUSY, "a turn is running — compact after it finishes"));
+            if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — compact after it finishes"));
             if (s.history.length < 2) return reply(rpcError(id, ERR.PARAMS, "nothing to compact yet"));
             s.busy = true;
+            const compactAbort = new AbortController();
+            s.abort = compactAbort;
             try {
+              if (!(await refreshSessionProvider(s))) {
+                return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${s.meta.model}'`));
+              }
               broadcast("event.notice", { sessionId: s.meta.id, text: "✻ Compacting conversation…" });
-              const summary = await compactSession(s);
+              const summary = await compactSession(s, compactAbort);
               if (!summary) return reply(rpcError(id, ERR.INTERNAL, "compaction failed — try again or /clear"));
               broadcast("event.notice", { sessionId: s.meta.id, text: `(compacted — history replaced with a summary; ${s.meta.workingSet?.length ?? 0} notes kept)` });
               return reply(rpcResult(id!, { sessionId: s.meta.id, ctx: ctxOf(s), notes: s.meta.workingSet?.length ?? 0, history: historyForClient(s.history) }));
             } finally {
               s.busy = false;
+              if (s.abort === compactAbort) s.abort = null;
             }
           }
           case "session.rewind": {
@@ -459,7 +849,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string" || !Number.isInteger(p.n)) return reply(rpcError(id, ERR.PARAMS, "sessionId + n required"));
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
-            if (s.busy) return reply(rpcError(id, ERR.BUSY, "a turn is running — rewind after it finishes"));
+            if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — rewind after it finishes"));
             const next = rewindTo(s.history, p.n);
             if (!next) return reply(rpcError(id, ERR.PARAMS, `n out of range (1..${s.history.filter((m) => m.role === "user").length})`));
             s.history.length = 0;
@@ -470,9 +860,21 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           default:
             return reply(rpcError(id, ERR.METHOD, `unknown method ${req.method}`));
         }
-      } catch (e: any) {
-        return reply(rpcError(id, ERR.INTERNAL, String(e?.message ?? e)));
-      }
+        } catch (e: any) {
+          return reply(rpcError(id, ERR.INTERNAL, String(e?.message ?? e)));
+        }
+      })();
+      inFlightRequests.add(task);
+      const settled = (): void => {
+        inFlightRequests.delete(task);
+        // close() may already have returned after its bounded grace period. Once a late turn/provider
+        // handshake clears busy/configuring, releaseIdle finishes the lock cleanup without waiting for exit.
+        if (closing) hub.releaseIdle();
+      };
+      void task.then(
+        settled,
+        settled,
+      );
     });
     ws.on("close", () => {
       authed.delete(ws);
@@ -484,18 +886,62 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     });
   });
 
-  const close = async (): Promise<void> => {
-    for (const resolve of pendingApprovals.values()) resolve(false);
-    pendingApprovals.clear();
-    hub.releaseAll();
-    if (!deps.quietDiscovery) {
-      try {
-        unlinkSync(discoveryPath);
-      } catch {
-        /* already gone */
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closing = true; // message handlers check this before parsing, so no new work enters the hub
+    closePromise = (async () => {
+      const deadline = Date.now() + SHUTDOWN_GRACE_MS;
+      const serverClosed = new Promise<void>((resolve) => {
+        try {
+          wss.close(() => resolve()); // stop accepting sockets immediately
+        } catch {
+          resolve(); // already closed/not running
+        }
+      });
+
+      for (const resolve of pendingApprovals.values()) resolve(false);
+      pendingApprovals.clear();
+      for (const session of hub.active()) session.abort?.abort();
+
+      for (const client of wss.clients) {
+        try {
+          client.close(1001, "server shutting down");
+        } catch {
+          client.terminate();
+        }
       }
-    }
-    await new Promise<void>((res) => wss.close(() => res()));
+      const terminateTimer = setTimeout(() => {
+        for (const client of wss.clients) client.terminate();
+      }, SOCKET_CLOSE_GRACE_MS);
+      terminateTimer.unref();
+
+      if (!deps.quietDiscovery) await removeOwnedDiscovery(discoveryDir, discoveryPath, discovery).catch(() => {});
+
+      let quiet = false;
+      while (Date.now() < deadline) {
+        if (inFlightRequests.size === 0 && hub.active().every((session) => !session.busy && !session.configuring && session.pendingProviderTurns === 0)) {
+          quiet = true;
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+      }
+      // Never release a lock while its turn/configuration may still persist. Idle sessions are safe to
+      // release; an uncooperative in-flight operation retains ownership until it settles/process exit.
+      if (quiet) hub.releaseAll();
+      else hub.releaseIdle();
+
+      for (const client of wss.clients) client.terminate();
+      const remaining = deadline - Date.now();
+      if (remaining > 0) {
+        await Promise.race([
+          serverClosed,
+          new Promise<void>((resolve) => setTimeout(resolve, remaining)),
+        ]);
+      }
+      clearTimeout(terminateTimer);
+      authed.clear();
+    })();
+    return closePromise;
   };
   return { port, token, close };
 }

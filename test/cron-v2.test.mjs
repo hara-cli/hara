@@ -58,9 +58,11 @@ test("delivery + failure alert: outcome pushed; 🚨 fires at the threshold with
   assert.equal(findJob(job.id).consecutiveErrors, 0, "streak reset on success");
 });
 
-test("parseDeliver: platforms validated, wechat clearly rejected", () => {
+test("parseDeliver: platforms validated, Weixin requires an explicit peer", () => {
   assert.deepEqual(parseDeliver("feishu:oc_abc"), { platform: "feishu", to: "oc_abc" });
-  assert.ok("error" in parseDeliver("weixin:me"), "wechat unsupported (needs live gateway)");
+  assert.deepEqual(parseDeliver("weixin:wxid_explicit"), { platform: "weixin", to: "wxid_explicit" });
+  assert.ok("error" in parseDeliver("weixin:owner"), "never guess an owner from a multi-DM cache");
+  assert.ok("error" in parseDeliver("sms:123"), "unknown platform rejected");
   assert.ok("error" in parseDeliver("nonsense"), "missing colon rejected");
 });
 

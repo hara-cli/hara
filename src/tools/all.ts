@@ -12,6 +12,7 @@ import "./memory.js"; // memory_search/get/write/forget + skill_create
 import "./skill.js"; // skill loader
 import "./codebase.js"; // codebase_search
 import "./todo.js"; // todo_write
+import "./task.js"; // task (project-level persistent task pool)
 import "./send.js"; // send_file (self-gates on HARA_GATEWAY)
 import "./external_agent.js"; // external_agent (claude-code / codex delegation)
 import "./ask_user.js"; // ask_user

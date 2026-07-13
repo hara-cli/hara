@@ -12,7 +12,7 @@
 
 **Highlights**
 - **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**), and `hara plan --parallel` runs independent atoms concurrently.
-- **Drive it from chat** — `hara gateway` runs your local hara from **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk · WeCom · Signal** (10 platforms), with **two-way images** (send a photo → it sees it; ask for a file → it sends one), per-chat resumable sessions, and project roaming. Connects out — no public webhook. See **[docs/gateway.md](docs/gateway.md)**.
+- **Drive it from chat** — `hara gateway` runs your local hara from **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk · WeCom · Signal** (10 platforms), with **two-way images**, resumable per-chat sessions, project/agent roaming, bounded per-thread queues, and approval-gated group automations. Connects out — no public webhook. See **[docs/gateway.md](docs/gateway.md)**.
 - **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only investigation → the model submits its plan via `exit_plan` → approve → execute), selectable approvals with "don't ask again", windowed reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
 - **Persistent memory + self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting, **proactively saves** durable facts, and grows its own playbooks (a lexical guard screens what it writes). Inspect/consolidate it with **`hara memory show`** and **`hara memory distill`** (promote recent daily logs → durable memory). Lexical-first by design — semantic search is opt-in, never required.
 - **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
@@ -135,8 +135,11 @@ hara expresses it the way each endpoint wants (OpenAI `reasoning_effort`, Anthro
 DashScope `enable_thinking`, **DeepSeek** V4 `thinking` + `reasoning_effort` where `max` genuinely raises the
 effort). In the TUI, bare `/model` opens a picker — ↑↓ pick a model, **←→ set the thinking level**.
 
-Config lives in `~/.hara/config.json`. Env vars override it: `HARA_PROVIDER`, `HARA_MODEL`,
-`HARA_BASE_URL`, `HARA_API_KEY`, or the provider key (`ANTHROPIC_API_KEY` / `DASHSCOPE_API_KEY`).
+Config lives in `~/.hara/config.json`; the nearest project `.hara/config.json` can specialize it. Effective
+precedence is **environment > project > selected overlay > global**. Empty routing values are ignored, so an
+empty project/env value cannot hide a working global credential or endpoint. Env overrides include
+`HARA_PROVIDER`, `HARA_MODEL`, `HARA_BASE_URL`, `HARA_API_KEY`, and the provider key
+(`ANTHROPIC_API_KEY` / `DASHSCOPE_API_KEY`).
 
 ## Use
 
@@ -146,18 +149,29 @@ hara init                  # analyze the project & (re)generate AGENTS.md
 hara doctor                # check your setup (auth / model / node / assets / roles)
 hara roles init            # scaffold role-agents (implementer / reviewer / docs)
 hara org "review src/ for bugs"   # dispatch a task to the role that owns it (or --role <id>)
+hara projects add shop /absolute/path/to/shop   # register an agent home
+hara agents                # list global + registered project agents
+hara org --role shop:reviewer "audit auth"     # run that agent at its own home
 hara plan "add a /health endpoint with a test"   # decompose → sequence (DAG) → run each step + verify
 hara plan --parallel "..."  # run independent atoms concurrently  ·  hara plan resume  # continue a stopped plan
 hara review                 # review uncommitted changes for bugs/security/missing tests (--staged · --base main)
 hara commit                 # AI commit message from staged changes, then commit (-a to stage all · -y to skip confirm)
 hara index                 # build the semantic search index (after: hara config set embedProvider ollama|qwen)
 hara -p "summarize @README.md and fix the lint errors in src/"   # one-shot; @path attaches a file
+hara -p "extract package metadata" --schema ./schema.json         # stdout is exactly schema-valid JSON
+hara -p "review the current diff" --role reviewer                 # persona + model + tool policy from the role
 hara --approval auto-edit  # suggest (default) | auto-edit | full-auto   (-y = full-auto)
 hara --sandbox workspace-write   # confine shell writes to the project (macOS Seatbelt)
 hara -c                    # resume the most recent session in this directory
 hara --profile work        # use a named profile from ~/.hara/config.json
 hara -m glm-5              # pick a model
 ```
+
+For automation, `--schema` accepts inline JSON Schema or a schema file. The model must return through the
+validated `structured_output` tool; on success stdout contains only the JSON value, while diagnostics go to
+stderr and missing/invalid output exits non-zero. `--role reviewer` resolves locally, `--role global:reviewer`
+uses the portable global persona in the current project, and `--role shop:reviewer` runs at that registered
+project home. Each form enforces the role's persona, model, `allowTools`/`denyTools`, and `readOnly` policy.
 
 Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/usage` `/doctor` `/sessions` `/undo` `/compact` `/recall` `/reset` `/exit` (type `/`+Tab to complete). Type `@` + Tab to attach a file (fuzzy, walks subdirectories).
 
@@ -216,9 +230,22 @@ vision model into **actionable** output — interactive elements + positions (pa
 **MCP**: add an `mcpServers` map to config (global or project `.hara/config.json`); their tools appear to the agent as `mcp__<server>__<tool>`. hara can also **be** an MCP server — `hara mcp` exposes its read/search tools (esp. **`codebase_search`**) over stdio so other clients (Claude Desktop, Cursor, another hara) can use them; read-only by default (`HARA_MCP_TOOLS` to override).
 **Vim mode**: `hara config set vimMode true` makes the prompt modal — Esc → normal, `i/a/A/I` insert, `h l 0 $ w b e` motions, `x D C dd cw p` edits. Off by default.
 **Scheduled tasks**: `hara cron add "0 9 * * 1-5" "<task>"` (or `"every 30m"`, `"in 2h"`) runs a task on a schedule — each run is a fresh hara session. `hara cron install` wires a per-minute tick into launchd/crontab (no daemon); `--org` routes through the role org. Manage with `hara cron list/run/enable/disable/remove/logs`.
+**Work coordination**: `todo_write` is the agent's short, session-scoped checklist; it persists with that
+session and is isolated between simultaneous sub-agents and serve sessions. `task` is the durable project pool
+for work that outlives a conversation: add/update/list/remove items with `pending|in_progress|done`, an optional
+owner, and `blockedBy` dependencies. The private, atomic store is shared by concurrent hara processes for the
+same project and rejects missing/self/cyclic dependencies.
 **Notifications**: `hara config set notify bell` (terminal bell) or `notify system` (OS notification) pings you when a turn finishes — handy for long runs you've stepped away from. Gated on elapsed time so quick turns stay quiet; off by default.
 **Hooks**: run your own shell commands around tool calls via a `"hooks"` map in config. A **`PreToolUse`** hook can **veto** a call (non-zero exit blocks it; its output becomes the reason the model sees) — gate `bash`, forbid edits outside a path, require a clean tree. A **`PostToolUse`** hook observes (format/lint a file the agent just wrote, log, notify). Each has a `matcher` (regex/literal on the tool name, `*` = all) and gets `{tool, payload}` on stdin + `HARA_TOOL_NAME` in env. Plugins can contribute hooks too.
-**Profiles**: add a `profiles` map to `~/.hara/config.json` (`--profile <name>`), or drop a project-level `.hara/config.json` that overrides the global config.
+Reviewer/read-only/plan runs and parallel read-only sub-agents suppress both hook phases: PreToolUse and
+PostToolUse commands are arbitrary shell, so either could otherwise bypass their read-only contract indirectly.
+They also skip configured and plugin-provided MCP server processes, so starting an external tool server cannot
+bypass the same contract before the first model turn.
+**Profiles and live config**: select an identity with `--profile <name>`; use `overlays` in
+`~/.hara/config.json` for named config overlays, and a project `.hara/config.json` for project-specific routing.
+Long-lived `hara serve` processes reload provider credentials/routes and guardian settings for the target cwd on
+new sessions and turns. `models.list` and new sessions see current defaults; a resumed session keeps its explicit
+model pin while using the live provider route. No server restart is required after a credential rotation.
 
 ### The org — what makes hara different
 
@@ -233,6 +260,13 @@ the diff and either approves or sends it back with fixes — looping implement �
 to a clean start tree; a review that doesn't pass leaves the work uncommitted). The
 **`agent`** tool spawns **parallel read-only sub-agents** for fan-out — analyze / review / search
 several things at once (each can take a `role`), bounded to 8 concurrent (`HARA_MAX_CONCURRENCY`).
+
+Register project homes with `hara projects add <name> <absolute-path>`, then `hara agents` becomes a global
+address book across `~/.hara/roles` and each registered project's roles. A qualified address such as
+`shop:reviewer` is unambiguous; both `hara org --role shop:reviewer "<task>"` and one-shot `hara -p "<task>"
+--role shop:reviewer` execute at that agent's home, with its own `AGENTS.md`, live project config, role model,
+and allow/deny/read-only tool policy. `global:<name>` is portable and runs in the current project. A bare name
+uses the local role first and otherwise must resolve unambiguously.
 
 Beyond routing, **`hara plan "<task>"`** makes the org *plan*: it decomposes the task into atoms,
 sequences them as a DAG, and executes each step (optionally routed to a role) behind a per-step
@@ -255,11 +289,11 @@ turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
 - **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. `@<dir>` loads a directory listing, `@src/`+Tab drills into a folder, and mistyped tool/file paths get a "did you mean" suggestion.
 - **Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) — **all streamed live**.
-- **Chat gateway**: drive your local hara from a chat app — **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk**. The daemon connects out (no public webhook), with per-chat sessions, project roaming (`/cd`), and **two-way images** (send a photo → it sees it; ask for a file → it sends one). Setup per platform: **[docs/gateway.md](docs/gateway.md)**.
+- **Chat gateway**: drive your local hara from **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk · WeCom · Signal**. The daemon connects out (no public webhook), with per-chat sessions, project roaming (`/cd`), agent switching (`/agent`), and **two-way images** (send a photo → it sees it; ask for a file → it sends one). Setup and the group-flow security model: **[docs/gateway.md](docs/gateway.md)**.
 
 ### Roadmap
 
-**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · **chat gateway (8 platforms, two-way images)** · **single-binary distribution** · **Docker image** · `/compact` context management.
+**Shipped:** ink TUI · plan mode · persistent memory + self-evolution · atomization planner · parallel plan atoms · **multi-role review chains** · global project-agent index · durable project tasks · parallel sub-agents · MCP client *and* server · **scheduled tasks (`hara cron`)** · **chat gateway (10 platforms, two-way images)** · **single-binary distribution** · **Docker image** · `/compact` context management.
 **Next:** SSOT data authority · an enterprise control-plane (fleet + central token management).
 
 ## Security

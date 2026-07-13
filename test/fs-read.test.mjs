@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BinaryFileError, readTextPrefixSync, streamFileSlice } from "../dist/fs-read.js";
+import { BinaryFileError, FileReadLimitError, readRegularFileText, readTextPrefixSync, streamFileSlice } from "../dist/fs-read.js";
 
 const fixture = () => mkdtempSync(join(tmpdir(), "hara-stream-read-"));
 
@@ -64,6 +64,19 @@ test("readTextPrefixSync reads a UTF-8 prefix without loading the whole file", (
     const binary = join(dir, "mention.bin");
     writeFileSync(binary, Buffer.from([1, 0, 2]));
     assert.equal(readTextPrefixSync(binary, 50_000).binary, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readRegularFileText reads the validated fd and enforces its hard byte ceiling", async () => {
+  const dir = fixture();
+  try {
+    const path = join(dir, "editable.txt");
+    writeFileSync(path, "safe text");
+    assert.equal(await readRegularFileText(path), "safe text");
+    truncateSync(path, 64 * 1024 * 1024 + 1); // sparse: validates the bound without allocating 64 MiB.
+    await assert.rejects(readRegularFileText(path), (error) => error instanceof FileReadLimitError);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -13,7 +13,8 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join, relative } from "node:path";
+import { randomUUID } from "node:crypto";
+import { dirname, join, relative, resolve } from "node:path";
 import {
   loadConfig,
   configPath,
@@ -30,7 +31,8 @@ import {
   type ApprovalMode,
   type ProviderId,
 } from "./config.js";
-import { runAgent } from "./agent/loop.js";
+import { runAgent, type RunOutcome } from "./agent/loop.js";
+import { parseSchemaArg, structuredOutputTool, STRUCTURED_INSTRUCTION, STRUCTURED_NUDGE } from "./agent/structured.js";
 import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { completionScript } from "./completions.js";
@@ -63,8 +65,8 @@ import {
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
 import { shouldAutoCompact, shouldAutoCompactTokens, AUTO_COMPACT_TOKEN_CAP, COMPACT_SYSTEM, buildFileRestore, workingSetFromSummary } from "./agent/compact.js";
-import { recentTouched } from "./agent/touched.js";
-import { INTERJECT_PREFIX } from "./agent/reminders.js";
+import { recentTouched, clearTouched } from "./agent/touched.js";
+import { INTERJECT_PREFIX, disposeReminderScope } from "./agent/reminders.js";
 import { checkForUpdate } from "./update-check.js";
 import { formatContextReport } from "./agent/context-report.js";
 import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
@@ -110,6 +112,8 @@ import {
   newSessionId,
   shortId,
   resolveSessionId,
+  validSessionId,
+  sessionFileExists,
   saveSession,
   loadSession,
   acquireSessionLock,
@@ -124,7 +128,8 @@ import {
   type SessionData,
 } from "./session/store.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
-import { loadRoles, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
+import { loadGlobalRoles, loadRoles, roleToolFilter, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
+import { buildAgentsIndex, canonicalProjectPath, resolveAgent, loadProjects, addProject, removeProject, type AgentIndexEntry } from "./org/projects.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks, haraBinDir } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
@@ -147,6 +152,8 @@ import "./tools/memory.js"; // register memory_search/get/write/forget/skill_cre
 import "./tools/skill.js"; // register the skill loader tool
 import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
 import "./tools/todo.js"; // register todo_write (inline task checklist)
+import { clearTodos, disposeTodoScope, restoreTodos, onTodosChange } from "./tools/todo.js"; // scoped session todo persistence
+import "./tools/task.js"; // register task (project-level durable task pool)
 import "./tools/send.js"; // register send_file (self-gates on HARA_GATEWAY — pushes a file to the chat)
 import "./tools/external_agent.js"; // register external_agent (delegate to claude-code / codex headless)
 import "./tools/ask_user.js"; // register ask_user (pause mid-turn to ask the user a structured question)
@@ -505,18 +512,26 @@ async function commitStep(provider: Provider, cwd: string): Promise<void> {
 }
 
 /** Dispatch a task to the owning role and run that role's agent (its persona + tool subset + model). */
-async function runOrg(task: string, o: OrgOpts): Promise<void> {
+function runFailureDetail(outcome: RunOutcome): string | null {
+  if (outcome.status === "completed") return null;
+  if (outcome.error?.trim()) return outcome.error.trim();
+  if (outcome.status === "empty") return "the model returned an empty response";
+  if (outcome.status === "halted") return "the run was halted by safety controls";
+  return "the agent run failed";
+}
+
+async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   const roles = loadRoles(o.cwd);
   if (!roles.length) {
     out(c.yellow("No roles defined — run ") + c.bold("hara roles init") + c.yellow(" to scaffold some.\n"));
-    return;
+    return { status: "error", error: "no roles are defined" };
   }
   let role: Role | undefined;
   if (o.forceRole) {
     role = roles.find((r) => r.id === o.forceRole);
     if (!role) {
       out(c.red(`No role '${o.forceRole}'. Available: ${roles.map((r) => r.id).join(", ")}\n`));
-      return;
+      return { status: "error", error: `no role '${o.forceRole}' is available` };
     }
   } else {
     const kw = routeByKeywords(task, roles);
@@ -539,15 +554,11 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
   const roleProvider = __roleModel
     ? ((await buildProvider({ ...o.cfg, model: __roleModel })) ?? o.baseProvider)
     : o.baseProvider;
-  const toolFilter = role.allowTools
-    ? (n: string) => role!.allowTools!.includes(n)
-    : role.denyTools
-      ? (n: string) => !role!.denyTools!.includes(n)
-      : undefined;
+  const toolFilter = roleToolFilter(role);
 
   const history: NeutralMsg[] = [{ role: "user", content: expandMentions(task, o.cwd) }];
-  const runImplementer = (): Promise<void> =>
-    runAgent(history, {
+  const runImplementer = async (): Promise<RunOutcome> => {
+    return runAgent(history, {
       provider: roleProvider,
       ctx: { cwd: o.cwd, sandbox: o.sandbox },
       approval: o.approval,
@@ -557,7 +568,9 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
       stats: o.stats,
       systemOverride: role.system,
       toolFilter,
+      ...(role.readOnly ? { hooks: false } : {}),
     });
+  };
   const wasClean = o.commit ? isTreeClean(o.cwd) : false; // capture BEFORE the implementer edits anything
   const doCommit = async (ok: boolean): Promise<void> => {
     if (!o.commit) return;
@@ -565,11 +578,12 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
     if (!wasClean) return void out(c.yellow("(not auto-committing — the tree wasn't clean before this run; commit manually)\n"));
     await commitStep(o.baseProvider, o.cwd);
   };
-  await runImplementer();
+  let implementerOutcome = await runImplementer();
+  if (implementerOutcome.status !== "completed") return implementerOutcome;
 
   if (!o.review) {
     await doCommit(true);
-    return;
+    return implementerOutcome;
   }
 
   // Review chain: a reviewer role inspects the diff and APPROVES or sends it back, looping until clean.
@@ -577,17 +591,17 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
   const __revModel = effectiveRoleModel(reviewer?.model, o.cfg.model);
   const revProvider = __revModel ? ((await buildProvider({ ...o.cfg, model: __revModel })) ?? o.baseProvider) : o.baseProvider;
   const revSystem = reviewer?.system ?? REVIEWER_SYSTEM;
-  const revTools = reviewer?.allowTools ? (n: string) => reviewer.allowTools!.includes(n) : (n: string) => READONLY_TOOLS.has(n);
+  const revTools = roleToolFilter(reviewer ? { ...reviewer, readOnly: true } : undefined) ?? ((n: string) => READONLY_TOOLS.has(n));
   const maxRounds = Math.max(1, o.rounds ?? 3);
   for (let round = 1; round <= maxRounds; round++) {
     const changes = captureChanges(o.cwd);
     if (!changes.diff && !changes.newFiles.length) {
       out(c.dim("(no changes to review)\n"));
-      return;
+      return implementerOutcome;
     }
     out(c.dim(`🔍 reviewer · round ${round}/${maxRounds}\n`));
     const rHist: NeutralMsg[] = [{ role: "user", content: reviewPrompt(task, changes) }];
-    await runAgent(rHist, {
+    const reviewerOutcome = await runAgent(rHist, {
       provider: revProvider,
       ctx: { cwd: o.cwd, sandbox: o.sandbox },
       approval: "full-auto", // reviewer is read-only via revTools, so nothing to confirm
@@ -597,22 +611,26 @@ async function runOrg(task: string, o: OrgOpts): Promise<void> {
       stats: o.stats,
       systemOverride: revSystem,
       toolFilter: revTools,
+      hooks: false,
     });
+    if (reviewerOutcome.status !== "completed") return reviewerOutcome;
     const verdict = parseVerdict(lastAssistantText(rHist));
     if (verdict.approved) {
       out(c.green(`✓ reviewer approved after ${round} round(s)\n`));
       await doCommit(true);
-      return;
+      return implementerOutcome;
     }
     if (round === maxRounds) {
       out(c.yellow(`⚠ stopped after ${maxRounds} round(s) — reviewer still wants changes.\n`));
       await doCommit(false);
-      return;
+      return { status: "halted", error: `reviewer did not approve after ${maxRounds} round(s)` };
     }
     out(c.yellow(`✗ changes requested — back to ${role.id} (round ${round})\n`));
     history.push({ role: "user", content: fixPrompt(verdict.issues) });
-    await runImplementer();
+    implementerOutcome = await runImplementer();
+    if (implementerOutcome.status !== "completed") return implementerOutcome;
   }
+  return implementerOutcome;
 }
 
 function lastAssistantText(history: NeutralMsg[]): string {
@@ -630,14 +648,10 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
   const role = atom.role ? roles.find((r) => r.id === atom.role) : undefined;
   const __atomModel = effectiveRoleModel(role?.model, o.cfg.model);
   const roleProvider = __atomModel ? ((await buildProvider({ ...o.cfg, model: __atomModel })) ?? o.baseProvider) : o.baseProvider;
-  const toolFilter = role?.allowTools
-    ? (n: string) => role.allowTools!.includes(n)
-    : role?.denyTools
-      ? (n: string) => !role.denyTools!.includes(n)
-      : undefined;
+  const toolFilter = roleToolFilter(role);
   const history: NeutralMsg[] = [{ role: "user", content: atomPrompt(atom, plan, done) }];
   try {
-    await runAgent(history, {
+    const outcome = await runAgent(history, {
       provider: roleProvider,
       ctx: { cwd: o.cwd, sandbox: o.sandbox },
       approval: o.approval,
@@ -647,8 +661,17 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
       stats: o.stats,
       systemOverride: role?.system,
       toolFilter,
+      ...(role?.readOnly ? { hooks: false } : {}),
       quiet: o.parallel, // concurrent atoms would otherwise interleave their streamed output
     });
+    const failure = runFailureDetail(outcome);
+    if (failure) {
+      atom.status = "failed";
+      atom.note = failure;
+      savePlan(o.cwd, plan);
+      out(c.red(`  ✗ ${atom.id} agent ${outcome.status}: ${failure}\n`));
+      return false;
+    }
   } catch (e: any) {
     atom.status = "failed";
     atom.note = e.message;
@@ -666,13 +689,17 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
 
 /** Execute a plan's atoms (sequential, or parallel waves with --parallel). Atoms already marked `done`
  *  are skipped — so this doubles as the resume engine. Stops on the first failure. */
-async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<void> {
+async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<RunOutcome> {
   const done: Atom[] = plan.atoms.filter((a) => a.status === "done");
   const doneIds = new Set(done.map((a) => a.id));
+  let failed = false;
 
   if (o.parallel) {
     const waved = topoWaves(plan.atoms);
-    if ("error" in waved) return void out(c.red(`${waved.error}\n`));
+    if ("error" in waved) {
+      out(c.red(`${waved.error}\n`));
+      return { status: "error", error: waved.error };
+    }
     out(c.dim(`Parallel mode — ${waved.ok.length} wave(s).\n`));
     for (const wave of waved.ok) {
       const todo = wave.filter((a) => !doneIds.has(a.id));
@@ -686,13 +713,17 @@ async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<void>
         }
       });
       if (results.some((r) => !r)) {
+        failed = true;
         out(c.dim("Stopping — a wave atom failed. Inspect .hara/org/plan.json, then fix & `hara plan resume`.\n"));
         break;
       }
     }
   } else {
     const ord = topoOrder(plan.atoms);
-    if ("error" in ord) return void out(c.red(`${ord.error}\n`));
+    if ("error" in ord) {
+      out(c.red(`${ord.error}\n`));
+      return { status: "error", error: ord.error };
+    }
     for (const atom of ord.ok) {
       if (doneIds.has(atom.id)) continue; // resume: skip completed atoms
       out(c.cyan(`\n▶ ${atom.id} ${atom.title}\n`));
@@ -700,28 +731,37 @@ async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<void>
         done.push(atom);
         doneIds.add(atom.id);
       } else {
+        failed = true;
         out(c.dim("Stopping — inspect .hara/org/plan.json, then fix & `hara plan resume`.\n"));
         break;
       }
     }
   }
   out(c.bold(`\nPlan: ${plan.atoms.filter((a) => a.status === "done").length}/${plan.atoms.length} atoms done.\n`));
+  if (failed || plan.atoms.some((atom) => atom.status === "failed")) {
+    const first = plan.atoms.find((atom) => atom.status === "failed");
+    return { status: "error", error: first ? `atom ${first.id} failed${first.note ? `: ${first.note}` : ""}` : "plan execution failed" };
+  }
+  if (plan.atoms.some((atom) => atom.status !== "done")) {
+    return { status: "halted", error: "plan stopped before every atom completed" };
+  }
+  return { status: "completed" };
 }
 
 /** Decompose a task into atoms, sequence them (DAG), and execute each with a verify gate.
  *  With `parallel`, independent atoms (the same dependency wave) run concurrently. */
-async function runPlan(task: string, o: OrgOpts): Promise<void> {
+async function runPlan(task: string, o: OrgOpts): Promise<RunOutcome> {
   const roles = loadRoles(o.cwd);
   out(c.dim("Planning…\n"));
   const plan = await decompose(o.baseProvider, task, roles);
   if (!plan.atoms.length) {
     out(c.red("Planner returned no atoms — try rephrasing the task.\n"));
-    return;
+    return { status: "error", error: "planner returned no atoms" };
   }
   const ord = topoOrder(plan.atoms);
   if ("error" in ord) {
     out(c.red(`${ord.error}\n`));
-    return;
+    return { status: "error", error: ord.error };
   }
   out(c.bold(`\nPlan (${ord.ok.length} atoms):\n`));
   for (const a of ord.ok) {
@@ -729,28 +769,40 @@ async function runPlan(task: string, o: OrgOpts): Promise<void> {
   }
   if (o.approval !== "full-auto") {
     const ok = await o.confirm(`${c.yellow("▶")} Execute this ${ord.ok.length}-atom plan?`);
-    if (!ok) return void out(c.dim("(cancelled)\n"));
+    if (!ok) {
+      out(c.dim("(cancelled)\n"));
+      return { status: "halted", error: "plan execution was cancelled" };
+    }
   }
   savePlan(o.cwd, plan);
-  await executePlan(plan, roles, o);
+  return executePlan(plan, roles, o);
 }
 
 /** Resume the saved plan (.hara/org/plan.json): re-run atoms that aren't done; completed atoms are skipped. */
-async function runResume(o: OrgOpts): Promise<void> {
+async function runResume(o: OrgOpts): Promise<RunOutcome> {
   const roles = loadRoles(o.cwd);
   const plan = loadPlan(o.cwd);
-  if (!plan) return void out(c.red('No saved plan at .hara/org/plan.json — run `hara plan "<task>"` first.\n'));
+  if (!plan) {
+    out(c.red('No saved plan at .hara/org/plan.json — run `hara plan "<task>"` first.\n'));
+    return { status: "error", error: "no saved plan" };
+  }
   const remaining = plan.atoms.filter((a) => a.status !== "done");
-  if (!remaining.length) return void out(c.green(`Plan already complete — ${plan.atoms.length}/${plan.atoms.length} done.\n`));
+  if (!remaining.length) {
+    out(c.green(`Plan already complete — ${plan.atoms.length}/${plan.atoms.length} done.\n`));
+    return { status: "completed" };
+  }
   out(c.bold(`Resuming: ${plan.task}\n`) + c.dim(`${plan.atoms.length - remaining.length}/${plan.atoms.length} done · ${remaining.length} to go\n`));
   for (const a of remaining) out(`  ${c.cyan(a.id)} ${a.title} ${c.dim("(" + a.status + ")")}\n`);
   if (o.approval !== "full-auto") {
     const ok = await o.confirm(`${c.yellow("▶")} Resume the ${remaining.length} remaining atom(s)?`);
-    if (!ok) return void out(c.dim("(cancelled)\n"));
+    if (!ok) {
+      out(c.dim("(cancelled)\n"));
+      return { status: "halted", error: "plan resume was cancelled" };
+    }
   }
   for (const a of plan.atoms) if (a.status === "failed" || a.status === "running") a.status = "pending"; // retry interrupted
   savePlan(o.cwd, plan);
-  await executePlan(plan, roles, o);
+  return executePlan(plan, roles, o);
 }
 
 const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write"]);
@@ -883,29 +935,61 @@ async function runSubagent(
   roleId?: string,
 ): Promise<string> {
   const roles = loadRoles(cwd);
-  const role = roleId ? roles.find((r) => r.id === roleId) : undefined;
+  const roleRef = roleId?.trim();
+  if (roleId !== undefined && !roleRef) return "Error: sub-agent role cannot be blank.";
+  let role: Role | undefined;
+  if (roleRef?.includes(":")) {
+    const hit = resolveAgent(roleRef, cwd);
+    if (hit && "ambiguous" in hit) {
+      return `Error: sub-agent role '${roleRef}' is ambiguous; use one of: ${hit.ambiguous.map((entry) => `${entry.project}:${entry.name}`).join(", ")}.`;
+    }
+    if (hit?.project && resolve(hit.home) !== resolve(cwd)) {
+      return `Error: sub-agent role '${roleRef}' belongs to ${hit.home}; nested read-only agents stay in their parent home (${cwd}).`;
+    }
+    if (hit && !("ambiguous" in hit)) {
+      role = hit.project
+        ? roles.find((candidate) => candidate.id === hit.name)
+        : loadGlobalRoles().find((candidate) => candidate.id === hit.name);
+    }
+  } else if (roleRef) {
+    role = roles.find((candidate) => candidate.id === roleRef);
+  }
   // Built-in explore persona: `agent(role:"explore")` works with ZERO user setup (a user-defined
   // explore role still wins — it was found above and carries its own system).
-  const builtinSystem = !role && roleId === "explore" ? EXPLORE_SYSTEM : undefined;
-  const __subModel = effectiveRoleModel(role?.model, cfg.model);
-  const provider = __subModel ? ((await buildProvider({ ...cfg, model: __subModel })) ?? baseProvider) : baseProvider;
+  const builtinSystem = !role && roleRef === "explore" ? EXPLORE_SYSTEM : undefined;
+  if (roleRef && !role && !builtinSystem) {
+    return `Error: no sub-agent role '${roleRef}' is available in ${cwd}. Use a local role id, global:<name>, or role "explore".`;
+  }
+  const __subModel = effectiveRoleModel(role?.model, baseProvider.model);
+  const provider = __subModel && __subModel !== baseProvider.model
+    ? ((await buildProvider({ ...cfg, model: __subModel })) ?? baseProvider)
+    : baseProvider;
   // A sub-agent runs full-auto + UNCONFIRMED + parallel, so it is ALWAYS read-only — a role may narrow
   // further but can never GRANT write/exec to a fan-out sub-agent (that would bypass the approval gate).
   // Write-capable roles run in the main loop via `hara org`, behind the user's gate.
   const toolFilter = subagentToolFilter(role, (n: string) => READONLY_TOOLS.has(n));
   const subHistory: NeutralMsg[] = [{ role: "user", content: task }];
-  await runAgent(subHistory, {
-    provider,
-    ctx: { cwd, sandbox }, // no `spawn` here → sub-agents can't recurse
-    approval: "full-auto", // read-only tools, so no prompts (can't prompt in parallel)
-    confirm: async () => true,
-    projectContext,
-    memory: memoryDigest(cwd),
-    stats,
-    systemOverride: role?.system ?? builtinSystem,
-    toolFilter,
-    quiet: true,
-  });
+  const todoScope = `subagent:${randomUUID()}`;
+  try {
+    await runAgent(subHistory, {
+      provider,
+      ctx: { cwd, sandbox, todoScope }, // isolated checklist; no spawn → no recursion
+      approval: "full-auto", // read-only tools, so no prompts (can't prompt in parallel)
+      confirm: async () => true,
+      projectContext,
+      memory: memoryDigest(cwd),
+      stats,
+      systemOverride: role?.system ?? builtinSystem,
+      toolFilter,
+      hooks: false,
+      quiet: true,
+    });
+  } finally {
+    disposeTodoScope(todoScope);
+    disposeReminderScope(todoScope);
+    resetRepeatGuard(todoScope);
+    clearTouched(todoScope);
+  }
   for (let i = subHistory.length - 1; i >= 0; i--) {
     const m = subHistory[i] as { role: string; text?: string };
     if (m.role === "assistant" && typeof m.text === "string" && m.text.trim()) return m.text.trim();
@@ -972,6 +1056,8 @@ program
   .description("A coding agent CLI that runs like an engineering org.")
   .version(pkg.version)
   .option("-p, --print <prompt>", "run a single prompt non-interactively, then exit")
+  .option("--schema <json|file>", "(with -p) force a schema-shaped result: the model must call structured_output; stdout = that JSON")
+  .option("--role <id>", "(with -p) run as a local, global:name, or project:name role (qualified projects run at their registered home)")
   .option("-y, --yes", "auto-approve all tool actions (= --approval full-auto)")
   .option("-m, --model <model>", "model id (overrides config)")
   .option("--approval <mode>", "approval mode: suggest | auto-edit | full-auto")
@@ -1057,30 +1143,99 @@ program
   .option("--review", "after implementing, loop a reviewer role until it approves (implement → review → fix)")
   .option("--rounds <n>", "max review rounds with --review (default 3)", (v) => parseInt(v, 10))
   .option("--commit", "commit the result with an AI message (with --review: only after approval; needs a clean start tree)")
-  .action(async (taskParts: string[], opts2: { role?: string; review?: boolean; rounds?: number; commit?: boolean }) => {
-    const cfg = loadConfig();
+  .action(async (
+    taskParts: string[],
+    _localOpts: { role?: string; review?: boolean; rounds?: number; commit?: boolean },
+    command: Command,
+  ) => {
+    // The root headless command and `org` both expose --role. Commander stores that shared flag on the
+    // parent command, while review/rounds/commit stay local; optsWithGlobals is the supported merged view.
+    // Without it, flow-approved `hara org --role ...` children silently fell back to model dispatching.
+    const opts2 = command.optsWithGlobals() as { role?: string; review?: boolean; rounds?: number; commit?: boolean };
+    let cfg = loadConfig();
+    // Home dispatch (globally addressable, executes at home): a --role of "project:name" — or a bare name
+    // that only exists in a REGISTERED project — resolves via the global agent index and runs with cwd =
+    // that project (its AGENTS.md/data context), instead of failing or running context-blind here.
+    let orgCwd = cfg.cwd;
+    let forceRole = opts2.role;
+    if (opts2.role && (opts2.role.includes(":") || !loadRoles(cfg.cwd).some((r) => r.id === opts2.role))) {
+      const hit = resolveAgent(opts2.role);
+      if (hit && "ambiguous" in hit) {
+        out(c.yellow(`'${opts2.role}' exists in several projects — qualify it:\n`) + hit.ambiguous.map((e) => `  ${e.project}:${e.name}`).join("\n") + "\n");
+        process.exit(1);
+      }
+      if (hit?.home) {
+        orgCwd = hit.home;
+        forceRole = hit.name;
+        cfg = loadConfig({ cwd: hit.home });
+        out(c.dim(`(dispatching to ${hit.project}:${hit.name} · home ${hit.home})\n`));
+      } else if (hit) {
+        // Explicit `global:name` is an address, not the literal role id. Global roles intentionally run
+        // in the caller's current project so they retain that project's AGENTS.md and tool context.
+        forceRole = hit.name;
+        out(c.dim(`(dispatching to global:${hit.name} · current home ${orgCwd})\n`));
+      } else if (!hit) {
+        out(c.red(`No agent '${opts2.role}' was found here or in the registered project index.\n`));
+        process.exit(1);
+      }
+    }
     const provider = await buildProvider(cfg);
     if (!provider) {
-      out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
+      out(c.red(`Not authenticated for provider '${cfg.provider}' at ${orgCwd}.\n`) + authHint(cfg) + "\n");
       process.exit(1);
     }
     const stats = { input: 0, output: 0, lastInput: 0 };
-    await runOrg(taskParts.join(" "), {
+    const outcome = await runOrg(taskParts.join(" "), {
       cfg,
       baseProvider: provider,
-      cwd: cfg.cwd,
+      cwd: orgCwd,
       sandbox: cfg.sandbox,
       approval: "full-auto",
       confirm: async () => true,
-      projectContext: loadAgentsMd(cfg.cwd) || undefined,
+      projectContext: loadAgentsMd(orgCwd) || undefined,
       stats,
-      forceRole: opts2.role,
+      forceRole,
       review: opts2.review,
       rounds: opts2.rounds,
       commit: opts2.commit,
     });
+    const failure = runFailureDetail(outcome);
+    if (failure) {
+      process.stderr.write(`hara: org run failed (${outcome.status}) — ${failure}\n`);
+      process.exitCode = 2;
+    }
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
+
+program
+  .command("agents")
+  .description("global agent index — every addressable agent (global roles + registered projects) and its home")
+  .action(() => {
+    const idx = buildAgentsIndex();
+    if (!idx.length) {
+      out(c.dim("(no agents — add roles to ~/.hara/roles, or register projects: hara projects add <name> <path>)\n"));
+      return;
+    }
+    for (const e of idx) {
+      out(c.bold(e.project ? `${e.project}:${e.name}` : `global:${e.name}`) + c.dim(e.home ? `  · ${e.home}` : "  · current project") + "\n");
+      if (e.description) out(c.dim(`  ${e.description.slice(0, 120)}\n`));
+    }
+    out(c.dim(`\n${idx.length} agent(s). Run one: hara org --role <global:name|project:name> "<task>"\n`));
+  });
+
+const projectsCmd = program.command("projects").description("register project homes for the global agent index (see `hara agents`)");
+projectsCmd.command("list").action(() => {
+  const list = loadProjects();
+  out(list.length ? list.map((p) => `${c.bold(p.name)}  ${c.dim(p.path)}`).join("\n") + "\n" : c.dim("(none — hara projects add <name> <path>)\n"));
+});
+projectsCmd.command("add <name> <path>").action((name: string, path: string) => {
+  const err = addProject(name, resolve(path));
+  out(err ? c.red(`${err}\n`) : c.green(`✓ registered ${name} → ${resolve(path)}\n`));
+  if (err) process.exit(1);
+});
+projectsCmd.command("remove <name>").action((name: string) => {
+  out(removeProject(name) ? c.green(`✓ removed ${name}\n`) : c.yellow(`no project '${name}'\n`));
+});
 
 program
   .command("plan [task...]")
@@ -1106,9 +1261,17 @@ program
       parallel: opts.parallel,
     };
     const task = (taskParts ?? []).join(" ").trim();
-    if (task === "resume") await runResume(o);
+    let outcome: RunOutcome | undefined;
+    if (task === "resume") outcome = await runResume(o);
     else if (!task) out(c.dim('usage: hara plan "<task>"   (or: hara plan resume)\n'));
-    else await runPlan(task, o);
+    else outcome = await runPlan(task, o);
+    if (outcome) {
+      const failure = runFailureDetail(outcome);
+      if (failure) {
+        process.stderr.write(`hara: plan run failed (${outcome.status}) — ${failure}\n`);
+        process.exitCode = 2;
+      }
+    }
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
 
@@ -1649,24 +1812,40 @@ program
         // `hara serve` is persistent, but config.json is user-editable at any time. Re-read it for every
         // new/resumed session and model operation so a repaired/rotated key takes effect without restarting
         // the desktop server (and, critically, never ask for a key that is already on disk).
-        buildSessionProvider: async () => {
-          const live = loadConfig();
+        buildSessionProvider: async (targetCwd) => {
+          const live = loadConfig({ cwd: targetCwd ?? cwd });
           return withRouting(await buildProvider(live), live);
         },
-        buildProviderFor: async (model, effort) => {
-          const live = loadConfig();
+        buildProviderFor: async (model, effort, targetCwd) => {
+          const live = loadConfig({ cwd: targetCwd ?? cwd });
           return withRouting(
             await buildProvider({ ...live, model, reasoningEffort: (effort as HaraConfig["reasoningEffort"]) ?? live.reasoningEffort }),
             live,
           );
         },
-        listModels: () => {
-          const live = loadConfig();
+        listModels: (targetCwd) => {
+          const live = loadConfig({ cwd: targetCwd ?? cwd });
           return listModels(live.baseURL ?? providerDefaultBaseURL(live.provider), live.apiKey ?? "");
         },
         effortLevels: levelsFor(resolvePlatform(cfg.provider, cfg.baseURL ?? providerDefaultBaseURL(cfg.provider)).reasoning).filter((e): e is NonNullable<typeof e> => !!e),
-        spawnSubagent: (provider, scwd, projectContext, stats, task, role) => runSubagent(cfg, provider, scwd, sandbox, projectContext, stats, task, role),
+        runtimeInfo: (targetCwd) => {
+          const live = loadConfig({ cwd: targetCwd ?? cwd });
+          return {
+            providerId: live.provider,
+            model: live.model,
+            effortLevels: levelsFor(resolvePlatform(live.provider, live.baseURL ?? providerDefaultBaseURL(live.provider)).reasoning).filter((e): e is NonNullable<typeof e> => !!e),
+          };
+        },
+        spawnSubagent: (provider, scwd, projectContext, stats, task, role) => {
+          const live = loadConfig({ cwd: scwd });
+          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role);
+        },
         guardian: guardianOpt,
+        buildGuardian: async (targetCwd) => {
+          const live = loadConfig({ cwd: targetCwd ?? cwd });
+          const base = await withRouting(await buildProvider(live), live);
+          return buildGuardian(live, base);
+        },
         sandbox,
         approval,
       },
@@ -1806,6 +1985,7 @@ program
       confirm: async () => true,
       systemOverride: REVIEW_SYSTEM,
       toolFilter: (n) => READONLY_TOOLS.has(n), // read-only: the reviewer can inspect, never edit
+      hooks: false,
       projectContext: loadAgentsMd(cfg.cwd) || undefined,
       memory: memoryDigest(cfg.cwd),
       stats,
@@ -2333,7 +2513,50 @@ program.action(async (opts) => {
   // hook above — see setFlagOverride() + resolveActive() in profile.ts. activeId() / loadActiveProfile()
   // pick it up automatically. `HARA_PROFILE` env still works as a transient override (one slot lower
   // in the priority chain than --profile).
-  const cfg = loadConfig({ overlay: opts.overlay });
+  // Resolve addressable headless roles BEFORE loading config/provider/MCP. A qualified project role is
+  // an execution-home selection, so every downstream route (credentials, model, AGENTS.md, tools) must be
+  // constructed from that home rather than from the shell directory that happened to launch hara.
+  let requestedHeadlessAgent: AgentIndexEntry | undefined;
+  if (opts.print && opts.role) {
+    const ref = String(opts.role).trim();
+    const isLocalRole = !ref.includes(":") && loadRoles(process.cwd()).some((role) => role.id === ref);
+    if (!isLocalRole) {
+      const hit = resolveAgent(ref, process.cwd());
+      if (hit && "ambiguous" in hit) {
+        process.stderr.write(
+          `hara: role '${ref}' is ambiguous; choose one of: ${hit.ambiguous.map((entry) => `${entry.project}:${entry.name}`).join(", ")}\n`,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      if (!hit) {
+        process.stderr.write(`hara: no agent '${ref}' was found locally, globally, or in the registered project index.\n`);
+        process.exitCode = 2;
+        return;
+      }
+      requestedHeadlessAgent = hit;
+    }
+  }
+  const cfg = loadConfig({ overlay: opts.overlay, ...(requestedHeadlessAgent?.home ? { cwd: requestedHeadlessAgent.home } : {}) });
+  const cwd = cfg.cwd;
+  // Resolve the concrete role before constructing any user/plugin MCP transport. MCP servers are arbitrary
+  // stdio subprocesses, so a read-only persona must not start them merely by launching a turn. Reusing this
+  // object later also closes the resolve→connect→re-resolve race where a role could disappear or change policy.
+  let requestedHeadlessRole: Role | undefined;
+  if (opts.print && opts.role) {
+    const requestedRole = String(opts.role).trim();
+    requestedHeadlessRole = requestedHeadlessAgent?.project
+      ? loadRoles(requestedHeadlessAgent.home).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+      : requestedHeadlessAgent
+        ? loadGlobalRoles().find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+        : loadRoles(cwd).find((candidate) => candidate.id === requestedRole);
+    if (!requestedHeadlessRole) {
+      process.stderr.write(`hara: role '${opts.role}' disappeared from its declared home (${cwd}); refusing to start providers or MCP servers under the wrong persona.\n`);
+      process.exitCode = 2;
+      return;
+    }
+  }
+  const machineOutput = !!opts.print && !!opts.schema;
   if (opts.model) cfg.model = opts.model;
   const provider0 = await withRouting(await buildProvider(cfg), cfg);
   // Fallback provider, built correctly for CROSS-PROVIDER failover. The old `baseURL: fallbackBaseURL ??
@@ -2375,7 +2598,9 @@ program.action(async (opts) => {
         process.exit(0);
       }
     }
-    out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
+    const message = `Not authenticated for provider '${cfg.provider}'.\n${authHint(cfg)}\n`;
+    if (machineOutput) process.stderr.write(message);
+    else out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
     process.exit(1);
   }
   let provider: Provider = provider0;
@@ -2394,24 +2619,32 @@ program.action(async (opts) => {
     void heartbeat(); // fleet visibility — fire-and-forget, never blocks startup
     void syncOrgRoles(); // refresh governed org-role bundle (B3) in the background; best-effort, never blocks
   }
-  const cwd = cfg.cwd;
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
   let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it
   const autoApprove = new Set<string>(); // tools the user chose "don't ask again" for, this session
   let recalledContext = ""; // snippets queued by /recall, prepended to the next message
   const sandbox: SandboxMode = (opts.sandbox as SandboxMode) || cfg.sandbox;
   if (sandbox !== "off" && !sandboxSupported()) {
-    out(c.yellow(`(sandbox '${sandbox}' is macOS-only; shell runs unsandboxed here)\n`));
+    const message = `(sandbox '${sandbox}' is macOS-only; shell runs unsandboxed here)\n`;
+    if (machineOutput) process.stderr.write(message);
+    else out(c.yellow(message));
   }
   const stats = { input: 0, output: 0, lastInput: 0 };
 
-  const mcpAll = { ...pluginMcpServers(), ...cfg.mcpServers }; // user config wins over plugin-contributed servers
-  if (Object.keys(mcpAll).length) {
-    await connectMcpServers(mcpAll, (m) => out(c.dim(m + "\n")));
+  // A read-only role has a process-side-effect-free tool surface: even connecting to an MCP server runs an
+  // arbitrary configured command before a tool is selected. Interactive sessions and non-read-only roles keep
+  // the existing MCP behavior unchanged.
+  if (!requestedHeadlessRole?.readOnly) {
+    const mcpAll = { ...pluginMcpServers(), ...cfg.mcpServers }; // user config wins over plugin-contributed servers
+    if (Object.keys(mcpAll).length) {
+      await connectMcpServers(mcpAll, (m) => machineOutput ? process.stderr.write(m + "\n") : out(c.dim(m + "\n")));
+    }
   }
 
   // one-shot
   if (opts.print) {
+    let headlessLockId: string | null = null;
+    try {
     const projectContext = loadAgentsMd(cwd) || undefined;
     // Vision sidecar for headless runs (gateway/cron): without it the computer tool's screenshots come back
     // "configure a vision model" even when one is set, leaving a headless agent blind. Mirrors the interactive
@@ -2436,14 +2669,61 @@ program.action(async (opts) => {
     let meta: SessionMeta | null = null;
     const history: NeutralMsg[] = [];
     if (opts.resume || opts.continue) {
-      const rid = opts.resume ? (resolveSessionId(opts.resume) ?? opts.resume) : latestForCwd(cwd)?.meta.id;
-      const prior = rid ? loadSession(rid) : null;
+      const resumeArg = opts.resume ? String(opts.resume) : undefined;
+      if (resumeArg && !validSessionId(resumeArg)) {
+        process.stderr.write("hara: --resume contains an invalid session id. Use an id shown by `hara sessions`.\n");
+        process.exitCode = 2;
+        return;
+      }
+      const resolvedResume = resumeArg ? resolveSessionId(resumeArg) : null;
+      if (resumeArg && !resolvedResume) {
+        const prefixMatches = listSessions().filter((session) => session.id.startsWith(resumeArg));
+        if (prefixMatches.length > 1) {
+          process.stderr.write(`hara: session prefix '${resumeArg}' is ambiguous; use more characters.\n`);
+          process.exitCode = 2;
+          return;
+        }
+      }
+      const rid = (resumeArg ? (resolvedResume ?? resumeArg) : latestForCwd(cwd)?.meta.id) ?? newSessionId();
+      const lock = acquireSessionLock(rid);
+      if (!lock.ok) {
+        process.stderr.write(`hara: session ${shortId(rid)} is already open in another process (pid ${lock.pid ?? "unknown"}); refusing a concurrent headless resume.\n`);
+        process.exitCode = 1;
+        await closeMcp();
+        return;
+      }
+      headlessLockId = rid;
+      // Re-read only after acquiring the single-writer lock. Loading first would leave a race window where
+      // another gateway/cron process appends history that this stale snapshot later overwrites.
+      const prior = loadSession(rid);
+      if (sessionFileExists(rid) && !prior) {
+        process.stderr.write(`hara: session ${shortId(rid)} exists but is unreadable or corrupt; refusing to overwrite it. Inspect ~/.hara/sessions/${rid}.json.\n`);
+        process.exitCode = 2;
+        return;
+      }
+      if (prior && canonicalProjectPath(prior.meta.cwd) !== canonicalProjectPath(cwd)) {
+        process.stderr.write(
+          `hara: session ${shortId(rid)} belongs to ${prior.meta.cwd}, but this run is rooted at ${cwd}; refusing to resume across project homes. Run hara from the session's project directory instead.\n`,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      if (prior && requestedHeadlessAgent?.project) {
+        const priorHome = canonicalProjectPath(prior.meta.cwd);
+        if (priorHome !== requestedHeadlessAgent.home) {
+          process.stderr.write(
+            `hara: session ${shortId(rid)} belongs to ${prior.meta.cwd}; refusing to resume it as ${requestedHeadlessAgent.project}:${requestedHeadlessAgent.name} at ${requestedHeadlessAgent.home}. Start a new role session or resume one from that home.\n`,
+          );
+          process.exitCode = 2;
+          return;
+        }
+      }
       if (prior?.history) history.push(...prior.history);
       // Stamp who created this session (cron runner sets HARA_CRON, gateway sets HARA_GATEWAY) and give
       // automated sessions a "name · time" title UP FRONT — the raw prompt must never become the title.
       const src = sessionSourceFromEnv();
       meta = prior?.meta ?? {
-        id: rid ?? newSessionId(),
+        id: rid,
         cwd,
         provider: cfg.provider,
         model: cfg.model,
@@ -2452,6 +2732,12 @@ program.action(async (opts) => {
         updatedAt: "",
         ...(src.source !== "interactive" ? { source: src.source, sourceName: src.sourceName } : { source: "interactive" as const }),
       };
+      // Task-state continuity: restore the persisted checklist, then mirror every change back onto meta
+      // live — all existing saveSession() sites persist it for free (no per-site threading).
+      restoreTodos(meta.todos);
+      onTodosChange((list) => {
+        if (meta) meta.todos = [...list];
+      });
       // Apply per-session pinned model on headless resume (mirrors the interactive path).
       // --model flag wins (already on cfg.model) and is written back; otherwise restore meta.model.
       if (prior) {
@@ -2475,10 +2761,26 @@ program.action(async (opts) => {
         }
       }
     }
+    // --schema: schema-enforced structured output. The schema (inline JSON or a file path) becomes a run-scoped
+    // structured_output tool the model MUST call; stdout is then exactly that JSON (streaming suppressed), so
+    // scripts / gateway flows / cron parse a guaranteed shape instead of regex-fishing prose.
+    let schemaObj: object | null = null;
+    if (opts.schema) {
+      const rawArg = String(opts.schema);
+      const raw = existsSync(rawArg) ? readFileSync(rawArg, "utf8") : rawArg;
+      const parsed = parseSchemaArg(raw);
+      if ("error" in parsed) {
+        process.stderr.write(`hara: ${parsed.error}\n`);
+        process.exitCode = 2;
+        await closeMcp();
+        return;
+      }
+      schemaObj = parsed;
+    }
     // Inbound images (gateway): the platform downloaded the user's photo(s) and passed their paths via env.
     // Let the agent actually SEE them — attached inline for a vision-capable main model, else described via the
     // visionModel sidecar and folded into the message (text-only models can't take image blocks).
-    const userText = expandMentions(String(opts.print), cwd);
+    const userText = expandMentions(String(opts.print), cwd) + (schemaObj ? STRUCTURED_INSTRUCTION : "");
     const inboundImgs = (process.env.HARA_GATEWAY_IMAGES ?? "")
       .split("\n")
       .map((s) => s.trim())
@@ -2502,25 +2804,89 @@ program.action(async (opts) => {
     } else {
       history.push({ role: "user", content: userText });
     }
-    await runAgent(history, {
-      provider,
-      ctx: { cwd, sandbox, spawn: (t, role) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role), describeImage },
-      approval: "full-auto",
+    // --role: run this headless turn AS an org role/agent persona (the gateway's /agent switch lands here).
+    // Local roles resolve at cwd; qualified project agents were resolved before config/provider startup and
+    // cwd is already their registered home. Explicit global roles remain portable in the current project.
+    let roleOverride: string | undefined;
+    let headlessProvider = provider;
+    let headlessToolFilter: ((name: string) => boolean) | undefined;
+    let headlessHooks = true;
+    if (requestedHeadlessRole) {
+      roleOverride = requestedHeadlessRole.system;
+      headlessToolFilter = roleToolFilter(requestedHeadlessRole);
+      if (requestedHeadlessRole.readOnly) headlessHooks = false;
+      const roleModel = effectiveRoleModel(requestedHeadlessRole.model, cfg.model);
+      if (roleModel && roleModel !== provider.model) {
+        const selected = await buildProvider({ ...cfg, model: roleModel });
+        if (!selected) {
+          process.stderr.write(`hara: role '${opts.role}' requires model '${roleModel}', but that provider is not authenticated.\n`);
+          process.exitCode = 2;
+          await closeMcp();
+          return;
+        }
+        headlessProvider = selected;
+      }
+    }
+    let structured: unknown;
+    let structuredSet = false;
+    const printRunOpts = {
+      provider: headlessProvider,
+      ctx: { cwd, sandbox, spawn: (t: string, role?: string) => runSubagent(cfg, headlessProvider, cwd, sandbox, projectContext, stats, t, role), describeImage },
+      approval: "full-auto" as const,
       confirm: async () => true,
       projectContext,
       memory: memoryDigest(cwd),
+      ...(roleOverride ? { systemOverride: roleOverride } : {}),
+      ...(headlessToolFilter ? { toolFilter: headlessToolFilter } : {}),
+      hooks: headlessHooks,
       stats,
       guardian: guardianOpt, // safety layer stays on in headless -p (fail-open; breaker aborts, never hangs)
-    });
+      ...(schemaObj
+        ? {
+            extraTools: [structuredOutputTool(schemaObj, (v: unknown) => ((structured = v), (structuredSet = true)))],
+            quiet: true, // stdout must be exactly the JSON — no streamed prose
+          }
+        : {}),
+    };
+    let runOutcome = await runAgent(history, printRunOpts);
+    if (schemaObj) {
+      // The tool call IS the answer — if the model finished without it, nudge and retry (bounded).
+      for (let attempt = 0; attempt < 2 && !structuredSet && runOutcome.status === "completed"; attempt++) {
+        history.push({ role: "user", content: STRUCTURED_NUDGE });
+        runOutcome = await runAgent(history, printRunOpts);
+      }
+      const failure = runFailureDetail(runOutcome);
+      if (failure) {
+        // A valid structured_output call is provisional until the whole agent run completes. A later provider
+        // error or safety halt must never be hidden behind stale-looking success JSON on stdout.
+        process.stderr.write(`hara: structured run failed (${runOutcome.status}) — ${failure}\n`);
+        process.exitCode = 2;
+      }
+      else if (structuredSet) out(JSON.stringify(structured) + "\n");
+      else {
+        process.stderr.write("hara: model never called structured_output — no result.\n");
+        process.exitCode = 2;
+      }
+    } else {
+      const failure = runFailureDetail(runOutcome);
+      if (failure) {
+        process.stderr.write(`hara: headless run failed (${runOutcome.status}) — ${failure}\n`);
+        process.exitCode = 2;
+      }
+    }
     if (meta) {
       // Long-session safety: auto-compact before saving so a long chat/cron thread never overflows context.
       // Silent (no-op notify) in headless mode so nothing leaks into a captured -p reply. Opt-out via config.
-      await maybeAutoCompact(provider, history, meta, stats, cfg, () => {});
+      await maybeAutoCompact(headlessProvider, history, meta, stats, cfg, () => {});
       saveSession(meta, history); // persist when resuming/continuing; plain -p stays stateless
     }
-    if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
+    if (!schemaObj && runOutcome.status === "completed" && (stats.input || stats.output)) out(statusLine(headlessProvider.model, stats.input, stats.output) + "\n");
     await closeMcp();
     return;
+    } finally {
+      if (headlessLockId) releaseSessionLock(headlessLockId);
+      await closeMcp();
+    }
   }
 
   // interactive REPL — ink TUI by default on a real terminal; HARA_TUI=0 forces the classic readline path
@@ -2596,17 +2962,44 @@ program.action(async (opts) => {
   const spawn = (t: string, role?: string) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role);
 
   // session: --resume <id> / --continue (latest in this cwd) / new
-  let resumed: SessionData | null = null;
+  let resumeId: string | null = null;
   if (opts.resume) {
     const rid = resolveSessionId(opts.resume); // accept a full UUID or a unique prefix (short id)
-    resumed = rid ? loadSession(rid) : null;
-    if (!resumed) out(c.yellow(`(no session '${opts.resume}'; starting fresh)\n`));
+    resumeId = rid;
+    if (!resumeId) out(c.yellow(`(no session '${opts.resume}'; starting fresh)\n`));
   } else if (opts.continue) {
-    resumed = latestForCwd(cwd);
-    if (!resumed) out(c.dim("(no prior session in this directory; starting fresh)\n"));
+    resumeId = latestForCwd(cwd)?.meta.id ?? null;
+    if (!resumeId) out(c.dim("(no prior session in this directory; starting fresh)\n"));
+  }
+  // Single-writer guard: two hara processes on the SAME session race writes to its append-only history and
+  // corrupt it. Acquire BEFORE reading the history, then re-read under the lock so no stale snapshot can
+  // overwrite a turn appended between load and lock.
+  const sessionId = resumeId ?? newSessionId();
+  const lock = acquireSessionLock(sessionId);
+  if (!lock.ok) {
+    out(
+      c.red(`Session ${shortId(sessionId)} is already open in another hara process (pid ${lock.pid}).`) +
+        c.dim(` Resuming the same session twice races writes and can corrupt its history. Close that one, or run \`hara\` for a new session. (Override: rm ~/.hara/sessions/${sessionId}.lock)\n`),
+    );
+    process.exit(1);
+  }
+  process.on("exit", () => releaseSessionLock(sessionId));
+  const resumed: SessionData | null = resumeId ? loadSession(resumeId) : null;
+  if (resumeId && sessionFileExists(resumeId) && !resumed) {
+    releaseSessionLock(sessionId);
+    out(c.red(`Session ${shortId(resumeId)} exists but is unreadable or corrupt; refusing to overwrite it. Inspect ~/.hara/sessions/${resumeId}.json.\n`));
+    process.exit(2);
+  }
+  if (resumed && canonicalProjectPath(resumed.meta.cwd) !== canonicalProjectPath(cwd)) {
+    releaseSessionLock(sessionId);
+    out(
+      c.red(`Session ${shortId(resumed.meta.id)} belongs to ${resumed.meta.cwd}, but this run is rooted at ${cwd}; refusing to resume across project homes.\n`) +
+        c.dim(`Run hara from the session's project directory instead.\n`),
+    );
+    process.exit(2);
   }
   const meta: SessionMeta = resumed?.meta ?? {
-    id: newSessionId(),
+    id: sessionId,
     cwd,
     provider: cfg.provider,
     model: cfg.model,
@@ -2615,18 +3008,11 @@ program.action(async (opts) => {
     updatedAt: "",
     source: "interactive",
   };
-  // Single-writer guard: two hara processes on the SAME session race writes to its append-only history and
-  // corrupt it. Lock it here (a brand-new session's id is unique, so this only ever blocks a DOUBLE-resume
-  // of a session already open elsewhere). Released on exit.
-  const lock = acquireSessionLock(meta.id);
-  if (!lock.ok) {
-    out(
-      c.red(`Session ${shortId(meta.id)} is already open in another hara process (pid ${lock.pid}).`) +
-        c.dim(` Resuming the same session twice races writes and can corrupt its history. Close that one, or run \`hara\` for a new session. (Override: rm ~/.hara/sessions/${meta.id}.lock)\n`),
-    );
-    process.exit(1);
-  }
-  process.on("exit", () => releaseSessionLock(meta.id));
+  // Task-state continuity (interactive twin of the -p path): restore the checklist, mirror changes onto meta.
+  restoreTodos(meta.todos);
+  onTodosChange((list) => {
+    meta.todos = [...list];
+  });
   // Per-session model precedence on resume:
   //   1. --model flag (already applied to cfg.model up-top) → wins and is written back to meta.model.
   //   2. resumed meta.model → restored into cfg.model (the user's last /model choice).
@@ -2922,7 +3308,22 @@ program.action(async (opts) => {
         out(c.green(`(renamed → ${meta.title})\n`));
       },
     },
-    { name: "reset", aliases: ["clear"], desc: "clear conversation context", run: () => void ((history.length = 0), (recalledContext = ""), out(c.dim("(context cleared)\n"))) },
+    {
+      name: "reset",
+      aliases: ["clear"],
+      desc: "clear conversation context",
+      run: () => {
+        history.length = 0;
+        recalledContext = "";
+        clearTodos();
+        meta.todos = [];
+        resetReachability();
+        resetRepeatGuard();
+        clearTouched();
+        saveSession(meta, history);
+        out(c.dim("(context cleared)\n"));
+      },
+    },
     { name: "exit", aliases: ["quit"], desc: "leave", run: () => "exit" },
   ];
   const byName = new Map<string, Slash>();
@@ -3116,6 +3517,10 @@ program.action(async (opts) => {
             recalledContext = "";
             resetReachability(); // fresh start — drop any "host unreachable" marks (network may be fixed)
             resetRepeatGuard(); // …and the repeated-failure streaks (the user may have fixed the cause)
+            clearTouched();
+            clearTodos();
+            meta.todos = [];
+            saveSession(meta, history);
             return void h.sink.notice("(context cleared)");
           }
           if (nm === "undo") {
@@ -3291,6 +3696,7 @@ program.action(async (opts) => {
               approval: "full-auto", // read-only via the tool filter, so nothing prompts
               confirm: h.confirm,
               toolFilter: (n) => READONLY_TOOLS.has(n),
+              hooks: false,
               systemOverride: REVIEW_SYSTEM,
               memory: buildMemory(),
               stats,
@@ -3386,6 +3792,7 @@ program.action(async (opts) => {
             approval: "suggest",
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n),
+            hooks: false,
             extraTools: [exitPlanTool],
             systemOverride: PLAN_SYSTEM,
             memory: buildMemory(),

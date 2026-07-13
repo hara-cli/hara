@@ -4,27 +4,40 @@
 //   telegram:<chatId>   (HARA_TELEGRAM_TOKEN)
 //   feishu:<chatId>     (HARA_FEISHU_APP_ID + HARA_FEISHU_APP_SECRET)
 //   webhook:<url>       (plain POST {name,status,text} JSON — for anything else)
-//   weixin:owner        (sends over stored ~/.hara/weixin creds — no live daemon needed, same path the
-//                        wechat-send skill uses; "owner" auto-resolves the bot owner, or give weixin:<peerId>)
+//   weixin:<peerId>     (sends over stored ~/.hara/weixin creds — explicit peer required; guessing the
+//                        "owner" from a multi-DM context-token cache can deliver private results to the wrong person)
 // Adapters are imported LAZILY so the (heavy) SDKs never load unless a job actually delivers.
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 
 export interface DeliverTarget {
-  platform: "telegram" | "feishu" | "webhook";
+  platform: "telegram" | "feishu" | "webhook" | "weixin";
   to: string;
 }
 
 /** Parse a `--deliver` spec; error string on anything unsupported (listing what IS supported). */
 export function parseDeliver(spec: string): DeliverTarget | { error: string } {
   const i = spec.indexOf(":");
-  if (i <= 0) return { error: `bad deliver spec "${spec}" — use telegram:<chatId>, feishu:<chatId>, or webhook:<url>` };
+  if (i <= 0) return { error: `bad deliver spec "${spec}" — use telegram:<chatId>, feishu:<chatId>, weixin:<peerId>, or webhook:<url>` };
   const platform = spec.slice(0, i).toLowerCase();
   const to = spec.slice(i + 1).trim();
   if (!to) return { error: `deliver spec "${spec}" is missing a target after ":"` };
-  if (platform === "telegram" || platform === "feishu" || platform === "webhook") return { platform, to };
-  return { error: `unsupported deliver platform "${platform}" — supported: telegram, feishu, webhook (WeChat needs the live gateway)` };
+  if (platform === "weixin" && to.toLowerCase() === "owner") {
+    return { error: "weixin:owner is ambiguous when several people have messaged the bot — use an explicit weixin:<peerId>" };
+  }
+  if (platform === "telegram" || platform === "feishu" || platform === "webhook" || platform === "weixin") return { platform, to };
+  return { error: `unsupported deliver platform "${platform}" — supported: telegram, feishu, weixin, webhook` };
+}
+
+/** Flatten markdown for plain-text chat surfaces (Feishu/WeChat/Telegram text messages render syntax
+ *  literally): drop code fences/inline backticks/bold/headers, turn [text](url) into "text (url)". */
+export function plainChat(text: string): string {
+  return text
+    .replace(/```[a-zA-Z0-9_-]*\n?/g, "")
+    .replace(/```/g, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");
 }
 
 /** Send `text` to the target. Returns null on success, or an error string (never throws — cron
@@ -32,6 +45,7 @@ export function parseDeliver(spec: string): DeliverTarget | { error: string } {
 export async function deliverResult(spec: string, text: string): Promise<string | null> {
   const t = parseDeliver(spec);
   if ("error" in t) return t.error;
+  if (t.platform !== "webhook") text = plainChat(text); // chat surfaces are plain text; webhooks get raw payload
   try {
     if (t.platform === "webhook") {
       const r = await fetch(t.to, {
@@ -47,6 +61,13 @@ export async function deliverResult(spec: string, text: string): Promise<string 
       if (!token) return "HARA_TELEGRAM_TOKEN not set";
       const { telegramAdapter } = await import("../gateway/telegram.js");
       await telegramAdapter(token).send(t.to, text);
+      return null;
+    }
+    if (t.platform === "weixin") {
+      const { loadWeixinCreds, weixinAdapter } = await import("../gateway/weixin.js");
+      const creds = loadWeixinCreds();
+      if (!creds) return "hara weixin not logged in (~/.hara/weixin/creds.json missing)";
+      await weixinAdapter(creds).send(t.to, text);
       return null;
     }
     // feishu

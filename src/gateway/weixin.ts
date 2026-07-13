@@ -5,10 +5,18 @@
 // (iLink only uses crypto for media upload/download, which v1 doesn't do).
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { basename } from "node:path";
 import { randomBytes, randomUUID, createHash, createCipheriv, createDecipheriv } from "node:crypto";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
+import {
+  INBOUND_MEDIA_MAX_BYTES,
+  INBOUND_MEDIA_TIMEOUT_MS,
+  InboundMediaBudget,
+  cleanupTransientMedia,
+  readResponseBytesLimited,
+  savePrivateMediaBytes,
+} from "./media.js";
 
 const ILINK_BASE_URL = "https://ilinkai.weixin.qq.com";
 const CHANNEL_VERSION = "2.2.0";
@@ -47,7 +55,6 @@ const WEIXIN_CDN_ALLOWLIST = new Set([
   "mmbiz.qlogo.cn",
 ]);
 const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp"]);
-const INBOUND_MEDIA_MAX = 128 * 1024 * 1024; // 128 MiB cap, per the reference
 
 export interface WeixinCreds {
   account_id: string;
@@ -238,36 +245,66 @@ function saveCursor(accountId: string, buf: string): void {
 
 // Per-peer context_token: every reply must echo the latest token iLink sent for that peer.
 class TokenStore {
-  private cache: Record<string, string> = {};
+  private readonly cache = new Map<string, string>();
   constructor(private accountId: string) {
     try {
-      if (existsSync(this.file())) this.cache = JSON.parse(readFileSync(this.file(), "utf8"));
+      const exists = existsSync(this.file());
+      const parsed = exists ? JSON.parse(readFileSync(this.file(), "utf8")) : {};
+      if (exists) chmodSync(this.file(), 0o600);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [peer, token] of Object.entries(parsed).slice(-1000)) {
+          if (peer && typeof token === "string" && token) this.cache.set(peer, token);
+        }
+      }
     } catch {
-      this.cache = {};
+      this.cache.clear();
     }
   }
   private file(): string {
     return join(weixinDir(), `${this.accountId}.context-tokens.json`);
   }
+  private peerKey(peer: string): string {
+    return String(peer ?? "").trim().slice(0, 256);
+  }
   private persist(): void {
+    const temporary = `${this.file()}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      mkdirSync(weixinDir(), { recursive: true });
-      writeFileSync(this.file(), JSON.stringify(this.cache));
+      mkdirSync(weixinDir(), { recursive: true, mode: 0o700 });
+      chmodSync(weixinDir(), 0o700);
+      writeFileSync(temporary, JSON.stringify(Object.fromEntries(this.cache)), { mode: 0o600, flag: "wx" });
+      renameSync(temporary, this.file());
+      chmodSync(this.file(), 0o600);
     } catch {
       /* best-effort */
+    } finally {
+      try {
+        rmSync(temporary, { force: true });
+      } catch {
+        /* best-effort */
+      }
     }
   }
   get(peer: string): string | undefined {
-    return this.cache[peer] || undefined;
+    const key = this.peerKey(peer);
+    const token = this.cache.get(key);
+    if (token) {
+      this.cache.delete(key);
+      this.cache.set(key, token);
+    }
+    return token;
   }
   set(peer: string, token: string): void {
-    if (token) {
-      this.cache[peer] = token;
+    const key = this.peerKey(peer);
+    const boundedToken = String(token ?? "").slice(0, 4096);
+    if (key && boundedToken) {
+      this.cache.delete(key);
+      this.cache.set(key, boundedToken);
+      while (this.cache.size > 1000) this.cache.delete(this.cache.keys().next().value!);
       this.persist();
     }
   }
   del(peer: string): void {
-    delete this.cache[peer];
+    this.cache.delete(this.peerKey(peer));
     this.persist();
   }
 }
@@ -343,13 +380,23 @@ async function sendChunk(creds: WeixinCreds, tokenStore: TokenStore, peer: strin
   const post = (ctx: string | undefined): Promise<any> =>
     apiPost(creds.base_url, EP.sendMessage, buildSendBody(peer, text, ctx, clientId), creds.token, API_TIMEOUT_MS).catch((e) => ({ ret: 1, errmsg: String(e?.message ?? e) }));
   let resp = await post(tokenStore.get(peer));
+  // HARA_WX_DEBUG=1 → dump the raw send response (protocol exploration: does iLink return a message id we
+  // could use for a future recall/revoke?). Off by default; stderr only.
+  if (process.env.HARA_WX_DEBUG === "1") console.error("weixin send resp:", JSON.stringify(resp).slice(0, 500));
   let [ret, errcode, errmsg] = [num(resp.ret), num(resp.errcode), str(resp.errmsg ?? resp.msg)];
   if (isSessionExpired(ret, errcode, errmsg)) {
     tokenStore.del(peer); // stale → drop it and retry once tokenless (iLink accepts that, degraded)
     resp = await post(undefined);
     [ret, errcode, errmsg] = [num(resp.ret), num(resp.errcode), str(resp.errmsg ?? resp.msg)];
   }
-  if (ret !== 0 || errcode !== 0) console.error(`weixin send: ret=${ret} errcode=${errcode} errmsg=${errmsg}`);
+  // Rate-limit (ret=-2, empty errmsg): iLink throttles cold/rapid proactive pushes. Back off and retry a few
+  // times instead of silently dropping the message — the reused clientId dedups so a retry can't double-send.
+  for (let attempt = 0; ret === RATE_LIMIT && errcode === 0 && attempt < 3; attempt++) {
+    await sleep(1500 * (attempt + 1));
+    resp = await post(tokenStore.get(peer));
+    [ret, errcode, errmsg] = [num(resp.ret), num(resp.errcode), str(resp.errmsg ?? resp.msg)];
+  }
+  if (ret !== 0 || errcode !== 0) throw new Error(`weixin send failed: ret=${ret} errcode=${errcode} errmsg=${errmsg || "unknown error"}`);
 }
 
 function aes128EcbEncrypt(plaintext: Buffer, key: Buffer): Buffer {
@@ -412,8 +459,6 @@ export function inboundMediaRefs(itemList: unknown): InboundMediaRef[] {
 }
 
 const cdnDownloadUrl = (param: string): string => `${WEIXIN_CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(param)}`;
-const mediaDir = (): string => join(weixinDir(), "media");
-const sanitizeName = (name: string): string => name.replace(/[^\w.\- ]+/g, "_").slice(-80) || "file.bin";
 
 function assertCdnHost(url: string): void {
   let u: URL;
@@ -427,7 +472,13 @@ function assertCdnHost(url: string): void {
 }
 
 /** Download (+ AES-decrypt if keyed) an inbound media item to a local file. Returns its path + mime, or null. */
-export async function downloadInboundMedia(ref: InboundMediaRef): Promise<{ path: string; mime: string } | null> {
+export async function downloadInboundMedia(
+  ref: InboundMediaRef,
+  options: { maxBytes: number; signal: AbortSignal } = {
+    maxBytes: INBOUND_MEDIA_MAX_BYTES,
+    signal: AbortSignal.timeout(INBOUND_MEDIA_TIMEOUT_MS),
+  },
+): Promise<{ path: string; mime: string } | null> {
   try {
     let url: string;
     if (ref.encryptQueryParam) url = cdnDownloadUrl(ref.encryptQueryParam);
@@ -435,18 +486,17 @@ export async function downloadInboundMedia(ref: InboundMediaRef): Promise<{ path
       assertCdnHost(ref.fullUrl);
       url = ref.fullUrl;
     } else return null;
-    const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+    const res = await fetch(url, { signal: options.signal });
     if (!res.ok) throw new Error(`media download HTTP ${res.status}`);
-    const ab = await res.arrayBuffer();
-    if (ab.byteLength > INBOUND_MEDIA_MAX) throw new Error("media exceeds size cap");
-    let buf: Buffer = Buffer.from(ab);
+    let buf = await readResponseBytesLimited(res, options.maxBytes, options.signal);
     if (ref.aesKeyB64) buf = aes128EcbDecrypt(buf, parseAesKey(ref.aesKeyB64));
     if (!buf.length) return null;
-    mkdirSync(mediaDir(), { recursive: true });
-    const tag = randomUUID().slice(0, 8);
-    const name = ref.kind === "image" ? `img_${tag}.jpg` : ref.kind === "voice" ? `audio_${tag}.silk` : `${tag}_${sanitizeName(ref.fileName || "document.bin")}`;
-    const path = join(mediaDir(), name);
-    writeFileSync(path, buf);
+    const filenameHint = ref.kind === "image" ? "image.jpg" : ref.kind === "voice" ? "audio.silk" : ref.fileName || "document.bin";
+    const path = await savePrivateMediaBytes(buf, {
+      platform: "weixin",
+      filenameHint,
+      ...options,
+    });
     return { path, mime: ref.kind === "image" ? "image/jpeg" : ref.kind === "voice" ? "audio/silk" : "application/octet-stream" };
   } catch (e) {
     console.error(`weixin inbound media (${ref.kind}): ${(e as Error)?.message ?? e}`);
@@ -514,29 +564,63 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
   const tokenStore = new TokenStore(creds.account_id);
   // Reuse parseWeixinMessage for text/voice-transcription, then download any image/file/voice media and append
   // a `[kind: localpath]` reference so hara can read the file. Handles media-only messages (no text) too.
-  const buildInbound = async (msg: any): Promise<InboundMsg | null> => {
+  const buildInbound = async (
+    msg: any,
+    signal: AbortSignal,
+    shouldDownload?: (m: InboundMsg) => boolean,
+  ): Promise<InboundMsg | null> => {
     const parsed = parseWeixinMessage(msg, creds.account_id);
     const from = str(msg?.from_user_id).trim();
     if (!from || from === creds.account_id) return null;
-    if (guessChatType(msg, creds.account_id).kind !== "dm") return null;
-    let text = parsed?.inbound.text ?? "";
+    const chat = guessChatType(msg, creds.account_id);
+    const refs = inboundMediaRefs(msg?.item_list);
+    let text = parsed?.inbound.text ?? extractText(msg?.item_list);
+    const base: InboundMsg = {
+      chatId: chat.id,
+      userId: from,
+      userName: from,
+      text: text || (refs.some((ref) => ref.kind === "image") ? "[图片]" : refs.length ? "[附件]" : ""),
+      chatType: chat.kind === "dm" ? "p2p" : "group",
+    };
+    if (!base.text) return null;
+    const downloadAllowed = base.chatType === "p2p" && shouldDownload?.(base) === true;
+    // Persist context only for an authenticated DM, before any download. Rejected senders cannot grow state.
+    if (downloadAllowed) tokenStore.set(from, parsed?.contextToken || str(msg?.context_token).trim());
     const images: string[] = [];
-    for (const ref of inboundMediaRefs(msg?.item_list)) {
-      const dl = await downloadInboundMedia(ref);
-      if (!dl) continue;
-      if (ref.kind === "image") {
-        // images go through as real attachments (seen/described downstream); leave only a light marker in text
-        images.push(dl.path);
-        text += `${text ? "\n" : ""}[图片]`;
-      } else {
-        const label = ref.kind === "voice" ? "语音" : `文件 ${ref.fileName ?? ""}`.trim();
-        text += `${text ? "\n" : ""}[${label}: ${dl.path}]`;
+    const transientFiles: string[] = [];
+    let handedOff = false;
+    try {
+      if (downloadAllowed) {
+        const budget = new InboundMediaBudget("weixin", signal);
+        for (const ref of refs) {
+          let downloaded: { path: string; mime: string } | null = null;
+          const path = await budget.download(async (options) => {
+            downloaded = await downloadInboundMedia(ref, options);
+            return downloaded?.path ?? null;
+          });
+          if (!path || !downloaded) continue;
+          transientFiles.push(path);
+          if (ref.kind === "image") {
+            // images go through as real attachments (seen/described downstream); leave only a light marker in text
+            images.push(path);
+            if (text !== "[图片]") text += `${text ? "\n" : ""}[图片]`;
+          } else {
+            const label = ref.kind === "voice" ? "语音" : `文件 ${ref.fileName ?? ""}`.trim();
+            text = text === "[附件]" ? `[${label}: ${path}]` : `${text}${text ? "\n" : ""}[${label}: ${path}]`;
+          }
+        }
       }
+      const inbound: InboundMsg = {
+        ...base,
+        text: text.trim() || base.text,
+        images: images.length ? images : undefined,
+        transientFiles: transientFiles.length ? transientFiles : undefined,
+      };
+      handedOff = true;
+      return inbound;
+    } finally {
+      if (!handedOff && transientFiles.length) await cleanupTransientMedia("weixin", transientFiles);
     }
-    text = text.trim();
-    if (!text && !images.length) return null;
-    tokenStore.set(from, parsed?.contextToken || str(msg?.context_token).trim());
-    return { chatId: from, userId: from, userName: from, text: text || "[图片]", images: images.length ? images : undefined };
   };
   return {
     name: "weixin",
@@ -545,9 +629,9 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
       for (const part of chunkText(text || "(empty)")) await sendChunk(creds, tokenStore, peer, part);
     },
     async sendFile(chatId, filePath) {
-      await sendMediaFile(creds, tokenStore, String(chatId), filePath);
+      if (!(await sendMediaFile(creds, tokenStore, String(chatId), filePath))) throw new Error(`weixin file delivery failed: ${filePath}`);
     },
-    async start(onMessage, signal) {
+    async start(onMessage, signal, shouldDownload) {
       let buf = loadCursor(creds.account_id);
       let pollMs = LONG_POLL_TIMEOUT_MS;
       while (!signal.aborted) {
@@ -574,7 +658,7 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
         buf = str(resp.get_updates_buf) || buf;
         saveCursor(creds.account_id, buf);
         for (const msg of Array.isArray(resp.msgs) ? resp.msgs : []) {
-          const inbound = await buildInbound(msg);
+          const inbound = await buildInbound(msg, signal, shouldDownload);
           if (inbound) await onMessage(inbound).catch(() => {});
         }
         const lp = num(resp.longpolling_timeout_ms);

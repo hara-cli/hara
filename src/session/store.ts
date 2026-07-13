@@ -51,12 +51,19 @@ export interface SessionMeta {
   updatedAt: string;
   /** short-term working memory — a few durable one-liners that survive /compact + resume */
   workingSet?: string[];
+  /** the agent's todo checklist snapshot — kept live by single-session runners (TUI / -p resume) so a
+   *  resumed session picks its task state back up instead of starting amnesiac */
+  todos?: import("../tools/todo.js").Todo[];
   /** creator of this session (absent = legacy/interactive) — see SessionSource */
   source?: SessionSource;
   /** human tag for automated sessions: cron job name / gateway platform */
   sourceName?: string;
+  /** Per-session reasoning effort pin used by persistent Serve clients. */
+  effort?: string;
   /** archived sessions are hidden from pickers/lists but kept on disk (codex thread/archive) */
   archived?: boolean;
+  /** Gateway thread ownership marker; absent for interactive/cron and legacy sessions. */
+  gatewayOwner?: string;
 }
 export interface SessionData {
   meta: SessionMeta;
@@ -66,11 +73,101 @@ export interface SessionData {
 function sessionsDir(): string {
   const d = join(homedir(), ".hara", "sessions");
   mkdirSync(d, { recursive: true, mode: 0o700 });
-  chmodSync(d, 0o700); // tighten legacy installs too; session transcripts are private
+  // `mode` is ignored when the directory already exists. Tighten legacy installs too: a session holds
+  // private conversation history, so inheriting a permissive umask (typically 0755) is not acceptable.
+  chmodSync(d, 0o700);
   return d;
 }
-const sessionFile = (id: string) => join(sessionsDir(), `${id}.json`);
-const lockFile = (id: string) => join(sessionsDir(), `${id}.lock`);
+
+/** Session ids become filenames. Gateway/platform ids are not always UUIDs, so allow printable filename
+ * characters broadly while rejecting separators, traversal sentinels, NULs, and unbounded names. */
+export function validSessionId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0 && id.length <= 220 && id !== "." && id !== ".." && !/[\\/\0]/.test(id);
+}
+
+function checkedSessionId(id: unknown): string {
+  if (!validSessionId(id)) throw new Error("invalid session id");
+  return id;
+}
+
+const sessionFile = (id: string) => join(sessionsDir(), `${checkedSessionId(id)}.json`);
+const lockFile = (id: string) => join(sessionsDir(), `${checkedSessionId(id)}.lock`);
+const reclaimFile = (id: string) => join(sessionsDir(), `${checkedSessionId(id)}.lock.reclaim`);
+
+/** Distinguish a missing session from an existing but unreadable/corrupt one without exposing its path. */
+export function sessionFileExists(id: unknown): boolean {
+  if (!validSessionId(id)) return false;
+  return existsSync(sessionFile(id));
+}
+
+interface LockRecord {
+  pid: number;
+  startedAt: number;
+  /** Added by the atomic-lock format. Legacy pid-only locks remain readable for safe live/stale handling,
+   *  but can never be mistaken for a lock owned by this module instance. */
+  token?: string;
+}
+
+// A pid alone is not ownership: pids are reused, and another writer could replace a lock between read and
+// release. Keep the random token for every lock this module actually created and require both on release.
+const ownedLocks = new Map<string, string>();
+
+function readLockRecord(path: string): LockRecord | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<LockRecord>;
+    if (
+      !Number.isInteger(parsed.pid) ||
+      Number(parsed.pid) <= 0 ||
+      typeof parsed.startedAt !== "number" ||
+      (parsed.token !== undefined && (typeof parsed.token !== "string" || !parsed.token))
+    ) {
+      return null;
+    }
+    return { pid: Number(parsed.pid), startedAt: parsed.startedAt, ...(parsed.token ? { token: parsed.token } : {}) };
+  } catch {
+    return null;
+  }
+}
+
+/** Create one private file without ever replacing an existing path. On a partial write, remove only the
+ *  inode we just created. Callers use this for both the primary lock and the stale-lock reclaimer. */
+function writeExclusive(path: string, record: LockRecord): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(record), "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+        fd = undefined;
+      } catch {
+        /* continue with best-effort removal */
+      }
+      try {
+        rmSync(path, { force: true });
+      } catch {
+        /* the original error is more useful */
+      }
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* the acquisition will fail closed */
+      }
+    }
+  }
+}
+
+function newLockRecord(): LockRecord & { token: string } {
+  return { pid: process.pid, startedAt: Date.now(), token: randomUUID() };
+}
 
 /** Is a process with this pid alive? `process.kill(pid, 0)` sends no signal — it just probes: throws
  *  ESRCH if dead, EPERM if alive-but-not-ours (still alive). Best-effort across platforms. */
@@ -83,37 +180,102 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** Take an exclusive lock on a session so two hara processes can't resume the SAME session and corrupt
- *  its append-only history by racing writes. Returns `{ ok: true }` if acquired (or the previous holder
- *  is dead → we take over), or `{ ok: false, pid }` if a LIVE process already holds it. Best-effort: any
- *  filesystem hiccup resolves to `ok:true` so a lock problem never blocks the user. Pair with
- *  `releaseSessionLock` on exit. */
+/** Take an O_EXCL lock on a session so two hara processes cannot both pass a check-then-write race.
+ *  Filesystem/malformed-lock errors fail CLOSED. A well-formed dead holder can be reclaimed under a second
+ *  O_EXCL guard; a corrupt lock is deliberately left for explicit operator inspection/removal. */
 export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
-  const f = lockFile(id);
+  let f: string;
+  let reclaim: string;
   try {
-    if (existsSync(f)) {
-      const held = JSON.parse(readFileSync(f, "utf8")) as { pid?: number };
-      if (typeof held.pid === "number" && held.pid !== process.pid && pidAlive(held.pid)) {
-        return { ok: false, pid: held.pid };
-      }
-      // stale (dead pid) or already ours → fall through and (re)claim it
+    f = lockFile(id);
+    reclaim = reclaimFile(id);
+  } catch {
+    return { ok: false };
+  }
+
+  // A stale-lock recovery is changing the primary lock. New contenders wait/fail instead of creating a
+  // primary lock in the short remove→create window.
+  if (existsSync(reclaim)) {
+    const stale = readLockRecord(reclaim);
+    if (!stale?.token || !Number.isFinite(stale.startedAt) || stale.startedAt <= 0 || pidAlive(stale.pid)) {
+      return { ok: false, pid: readLockRecord(f)?.pid };
     }
-    writeFileSync(f, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+    const current = readLockRecord(reclaim);
+    if (
+      !current?.token ||
+      current.pid !== stale.pid ||
+      current.token !== stale.token ||
+      current.startedAt !== stale.startedAt ||
+      pidAlive(current.pid)
+    ) {
+      return { ok: false, pid: readLockRecord(f)?.pid };
+    }
+    try {
+      rmSync(reclaim);
+    } catch {
+      return { ok: false, pid: readLockRecord(f)?.pid };
+    }
+  }
+
+  const claim = newLockRecord();
+  try {
+    writeExclusive(f, claim);
+    ownedLocks.set(id, claim.token);
+    return { ok: true };
+  } catch (error: any) {
+    if (error?.code !== "EEXIST") return { ok: false };
+  }
+
+  const held = readLockRecord(f);
+  if (!held) return { ok: false }; // malformed/unreadable is not proof that the owner is dead
+  if (held.pid === process.pid && !!held.token && ownedLocks.get(id) === held.token) return { ok: true }; // re-entrant
+  if (pidAlive(held.pid)) return { ok: false, pid: held.pid };
+
+  // Serialize stale takeover. All participants check this guard before attempting the primary O_EXCL create,
+  // so no second contender can steal the freshly-created primary lock during reclamation.
+  const reclaimClaim = newLockRecord();
+  try {
+    writeExclusive(reclaim, reclaimClaim);
+  } catch {
+    return { ok: false, pid: held.pid };
+  }
+  try {
+    const current = readLockRecord(f);
+    if (!current) return { ok: false }; // disappeared/corrupted unexpectedly: fail closed
+    if (current.pid === process.pid && !!current.token && ownedLocks.get(id) === current.token) return { ok: true };
+    if (pidAlive(current.pid)) return { ok: false, pid: current.pid };
+
+    rmSync(f); // known-dead, well-formed owner; protected by the reclaim guard
+    const replacement = newLockRecord();
+    writeExclusive(f, replacement);
+    ownedLocks.set(id, replacement.token);
     return { ok: true };
   } catch {
-    return { ok: true };
+    return { ok: false };
+  } finally {
+    // Only remove our own reclaimer. A replacement would indicate outside interference and must survive.
+    const currentReclaim = readLockRecord(reclaim);
+    if (currentReclaim?.pid === process.pid && currentReclaim.token === reclaimClaim.token) {
+      try {
+        rmSync(reclaim);
+      } catch {
+        /* fail closed on the next acquisition until this guard can be inspected/removed */
+      }
+    }
   }
 }
 
 /** Release a session lock we hold (only removes it if the pid matches ours — never steals another's). */
 export function releaseSessionLock(id: string): void {
+  const token = ownedLocks.get(id);
+  if (!token) return;
   try {
     const f = lockFile(id);
-    if (!existsSync(f)) return;
-    const held = JSON.parse(readFileSync(f, "utf8")) as { pid?: number };
-    if (held?.pid === process.pid) rmSync(f);
+    const held = readLockRecord(f);
+    if (held?.pid === process.pid && held.token === token) rmSync(f);
+    ownedLocks.delete(id);
   } catch {
-    /* best-effort */
+    // Keep the ownership token so a later cleanup attempt can still prove ownership. Never unlink blindly.
   }
 }
 
@@ -121,16 +283,27 @@ export function releaseSessionLock(id: string): void {
  *  Refuses when a LIVE other process holds the lock; removes the session file and any lock we may hold.
  *  Returns false when the session doesn't exist or is held elsewhere. */
 export function deleteSession(id: string): boolean {
-  const f = sessionFile(id);
+  let f: string;
+  try {
+    f = sessionFile(id);
+  } catch {
+    return false;
+  }
   if (!existsSync(f)) return false;
+  const ownedBefore = ownedLocks.has(id);
   const lock = acquireSessionLock(id);
   if (!lock.ok) return false;
+  let deleted = false;
   try {
     rmSync(f);
-    rmSync(lockFile(id), { force: true });
+    deleted = true;
     return true;
   } catch {
     return false;
+  } finally {
+    // A successful delete ends the session. On failure, release only a lock acquired by this call; a live
+    // SessionHub that already owned the lock must retain it and remain protected.
+    if (deleted || !ownedBefore) releaseSessionLock(id);
   }
 }
 
@@ -141,9 +314,10 @@ export const shortId = (id: string): string => id.slice(0, 8);
 
 /** Resolve a full id OR a unique prefix (e.g. the short id) to a session id, for `--resume`. */
 export function resolveSessionId(idOrPrefix: string): string | null {
+  if (!validSessionId(idOrPrefix)) return null;
   if (existsSync(sessionFile(idOrPrefix))) return idOrPrefix;
-  const hit = listSessions().find((m) => m.id.startsWith(idOrPrefix));
-  return hit ? hit.id : null;
+  const hits = listSessions().filter((m) => m.id.startsWith(idOrPrefix));
+  return hits.length === 1 ? hits[0]!.id : null;
 }
 
 const STOP = new Set(
@@ -201,19 +375,31 @@ export function slugify(text: string, max = 40): string {
     .replace(/-+$/, "");
 }
 
-export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {
-  meta.updatedAt = new Date().toISOString();
-  const data: SessionData = { meta, history };
+/** Redact a deep in-memory copy while retaining fields that define session identity/routing. */
+function redactedSessionCopy(data: SessionData): SessionData {
   // Redact a deep COPY: the live turn may still need a credential the user supplied, but the durable
   // transcript never should. Tool inputs/results are included, not just user message content.
   const safe = redactSensitiveValue(data).value;
-  // Keep structural routing/identity fields stable even if a path/model happens to resemble a secret.
-  safe.meta.id = meta.id;
-  safe.meta.cwd = meta.cwd;
-  safe.meta.provider = meta.provider;
-  safe.meta.model = meta.model;
-  safe.meta.createdAt = meta.createdAt;
-  safe.meta.updatedAt = meta.updatedAt;
+  // Structural routing/identity fields must remain byte-for-byte stable even if a path happens to contain
+  // credential-looking text. Free-form meta (title, workingSet, todos, sourceName) and ALL history remain
+  // deeply redacted. The live objects are not modified by the redaction walk.
+  safe.meta.id = data.meta.id;
+  safe.meta.cwd = data.meta.cwd;
+  safe.meta.provider = data.meta.provider;
+  safe.meta.model = data.meta.model;
+  safe.meta.createdAt = data.meta.createdAt;
+  safe.meta.updatedAt = data.meta.updatedAt;
+  if (data.meta.source !== undefined) safe.meta.source = data.meta.source;
+  if (data.meta.effort !== undefined) safe.meta.effort = data.meta.effort;
+  if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
+  if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
+  return safe;
+}
+
+export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {
+  checkedSessionId(meta.id);
+  meta.updatedAt = new Date().toISOString();
+  const safe = redactedSessionCopy({ meta, history });
 
   const target = sessionFile(meta.id);
   const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
@@ -224,7 +410,8 @@ export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
-    renameSync(tmp, target); // same filesystem: readers see the complete old or complete new JSON
+    // Same directory/filesystem: readers observe the complete old JSON or complete new JSON, never a prefix.
+    renameSync(tmp, target);
     chmodSync(target, 0o600);
   } catch (error) {
     if (fd !== undefined) {
@@ -243,28 +430,103 @@ export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {
   }
 }
 
-/** True if a parsed object has the SessionData shape we can safely use (meta object + history array). */
-function isSessionData(d: unknown): d is SessionData {
-  const o = d as { meta?: unknown; history?: unknown } | null;
-  return !!o && typeof o === "object" && !!o.meta && typeof o.meta === "object" && Array.isArray(o.history);
+function isTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Number.isFinite(Date.parse(value));
 }
 
-/** Parse a legacy session and redact the in-memory copy. Reads stay read-only (no unlocked migration race);
- *  the next explicit save atomically replaces the old file with its private, redacted form. */
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isPersistedTodo(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const todo = value as { text?: unknown; status?: unknown; activeForm?: unknown; blockedBy?: unknown; owner?: unknown };
+  return (
+    typeof todo.text === "string" &&
+    (todo.status === "pending" || todo.status === "in_progress" || todo.status === "done") &&
+    (todo.activeForm === undefined || typeof todo.activeForm === "string") &&
+    (todo.blockedBy === undefined || isStringArray(todo.blockedBy)) &&
+    (todo.owner === undefined || typeof todo.owner === "string")
+  );
+}
+
+function isNeutralMessage(value: unknown): value is NeutralMsg {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const message = value as Record<string, unknown>;
+  if (message.role === "user") {
+    return typeof message.content === "string" && (
+      message.images === undefined || (
+        Array.isArray(message.images) && message.images.every((image) => {
+          if (!image || typeof image !== "object" || Array.isArray(image)) return false;
+          const attachment = image as Record<string, unknown>;
+          return typeof attachment.path === "string" && typeof attachment.mediaType === "string";
+        })
+      )
+    );
+  }
+  if (message.role === "assistant") {
+    return typeof message.text === "string" && Array.isArray(message.toolUses) && message.toolUses.every((use) => {
+      if (!use || typeof use !== "object" || Array.isArray(use)) return false;
+      const tool = use as Record<string, unknown>;
+      return typeof tool.id === "string" && typeof tool.name === "string" && Object.hasOwn(tool, "input");
+    });
+  }
+  if (message.role === "tool") {
+    return Array.isArray(message.results) && message.results.every((result) => {
+      if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+      const tool = result as Record<string, unknown>;
+      return typeof tool.id === "string" && typeof tool.name === "string" && typeof tool.content === "string" &&
+        (tool.isError === undefined || typeof tool.isError === "boolean");
+    });
+  }
+  return false;
+}
+
+function isSessionMeta(value: unknown): value is SessionMeta {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const meta = value as Partial<Record<keyof SessionMeta, unknown>>;
+  return (
+    validSessionId(meta.id) &&
+    typeof meta.cwd === "string" &&
+    typeof meta.provider === "string" &&
+    typeof meta.model === "string" &&
+    typeof meta.title === "string" &&
+    isTimestamp(meta.createdAt) &&
+    isTimestamp(meta.updatedAt) &&
+    (meta.workingSet === undefined || isStringArray(meta.workingSet)) &&
+    (meta.todos === undefined || (Array.isArray(meta.todos) && meta.todos.every(isPersistedTodo))) &&
+    (meta.source === undefined || meta.source === "interactive" || meta.source === "gateway" || meta.source === "cron") &&
+    (meta.sourceName === undefined || typeof meta.sourceName === "string") &&
+    (meta.effort === undefined || typeof meta.effort === "string") &&
+    (meta.archived === undefined || typeof meta.archived === "boolean") &&
+    (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string")
+  );
+}
+
+/** True if a parsed object has the SessionData shape we can safely use. */
+function isSessionData(d: unknown): d is SessionData {
+  const o = d as { meta?: unknown; history?: unknown } | null;
+  return !!o && typeof o === "object" && !Array.isArray(o) && isSessionMeta(o.meta) &&
+    Array.isArray(o.history) && o.history.every(isNeutralMessage);
+}
+
+/** Read only. Legacy plaintext is redacted in the returned in-memory copy but intentionally not migrated
+ *  here: listing/resuming must not perform an unlocked write. The next explicit save atomically migrates it. */
 function readSessionFile(p: string): SessionData | null {
   try {
     const d = JSON.parse(readFileSync(p, "utf8"));
-    if (!isSessionData(d)) return null;
-    return redactSensitiveValue(d).value;
+    return isSessionData(d) ? redactedSessionCopy(d) : null;
   } catch {
     return null;
   }
 }
 
 export function loadSession(id: string): SessionData | null {
+  if (!validSessionId(id)) return null;
   const p = sessionFile(id);
   if (!existsSync(p)) return null;
-  return readSessionFile(p); // a corrupt / hand-edited file resumes as "no session" instead of crashing
+  const data = readSessionFile(p);
+  return data?.meta.id === id ? data : null; // a corrupt, spoofed, or hand-edited file resumes as "no session"
 }
 
 /** Session metas, newest first; optionally filtered to a cwd. */
@@ -273,10 +535,10 @@ export function listSessions(cwd?: string): SessionMeta[] {
   for (const f of readdirSync(sessionsDir())) {
     if (!f.endsWith(".json")) continue;
     const d = readSessionFile(join(sessionsDir(), f));
-    if (d?.meta.id && d.meta.updatedAt) metas.push(d.meta); // skip metaless/corrupt; never mutate while listing
+    if (d?.meta.id && validSessionId(d.meta.id) && f === `${d.meta.id}.json` && d.meta.updatedAt) metas.push(d.meta); // skip spoofed/metalless/corrupt; never mutate while listing
   }
   if (cwd) metas = metas.filter((m) => m.cwd === cwd);
-  return metas.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return metas.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 }
 
 export function latestForCwd(cwd: string): SessionData | null {

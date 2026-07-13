@@ -1,8 +1,9 @@
 // Lifecycle hooks — run user/plugin shell commands around tool calls (codex/Claude-Code parity).
-// PreToolUse runs BEFORE a tool: a non-zero exit BLOCKS the call (its output becomes the denial message).
+// PreToolUse runs BEFORE a tool: non-zero, timeout, signal, or launch failure BLOCKS the call.
 // PostToolUse runs AFTER: observe-only (format, log, notify). Configured in config.json `hooks` + contributed
 // by plugins. The command receives {tool, payload} as JSON on stdin + HARA_TOOL_NAME in the env.
 import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 import { loadConfig } from "./config.js";
 import { pluginHooks } from "./plugins/plugins.js";
 
@@ -13,19 +14,22 @@ export interface HookEntry {
 }
 export type HooksConfig = Partial<Record<HookEvent, HookEntry[]>>;
 
-let cache: HooksConfig | null = null;
+const cache = new Map<string, HooksConfig>();
 export function resetHooksCache(): void {
-  cache = null;
+  cache.clear();
 }
-function merged(): HooksConfig {
-  if (cache) return cache;
-  const cfg = loadConfig().hooks ?? {};
+function merged(cwd: string): HooksConfig {
+  const key = resolve(cwd);
+  const cached = cache.get(key);
+  if (cached) return cached;
+  const cfg = loadConfig({ cwd: key }).hooks ?? {};
   const plg = pluginHooks();
-  cache = {
+  const value = {
     PreToolUse: [...(cfg.PreToolUse ?? []), ...(plg.PreToolUse ?? [])],
     PostToolUse: [...(cfg.PostToolUse ?? []), ...(plg.PostToolUse ?? [])],
   };
-  return cache;
+  cache.set(key, value);
+  return value;
 }
 const matches = (m: string | undefined, name: string): boolean => {
   if (!m || m === "*") return true;
@@ -37,15 +41,21 @@ const matches = (m: string | undefined, name: string): boolean => {
 };
 
 /** True if any hook is configured (lets the loop skip the work entirely in the common case). */
-export function hasHooks(): boolean {
-  const h = merged();
+export function hasHooks(cwd = process.cwd()): boolean {
+  const h = merged(cwd);
   return !!(h.PreToolUse?.length || h.PostToolUse?.length);
 }
 
-/** Run hooks for an event matching `toolName`. PreToolUse: a non-zero exit BLOCKS (returns the message);
- *  PostToolUse: observe-only, never blocks. Sync (hooks are short, opt-in); 30s timeout each. */
-export function runHooks(event: HookEvent, toolName: string, payload: unknown, cwd: string): { block: boolean; message: string } {
-  for (const h of merged()[event] ?? []) {
+/** Run hooks for an event matching `toolName`. Any abnormal PreToolUse termination fails closed;
+ *  PostToolUse remains observe-only. Sync (hooks are short, opt-in); 30s timeout each. */
+export function runHooks(
+  event: HookEvent,
+  toolName: string,
+  payload: unknown,
+  cwd: string,
+  timeoutMs = 30_000,
+): { block: boolean; message: string } {
+  for (const h of merged(cwd)[event] ?? []) {
     if (!matches(h.matcher, toolName)) continue;
     let r: ReturnType<typeof spawnSync>;
     try {
@@ -54,15 +64,20 @@ export function runHooks(event: HookEvent, toolName: string, payload: unknown, c
         cwd,
         input: JSON.stringify({ tool: toolName, payload }),
         encoding: "utf8",
-        timeout: 30_000,
+        timeout: timeoutMs,
         env: { ...process.env, HARA_TOOL_NAME: toolName },
       });
-    } catch {
+    } catch (error) {
+      if (event === "PreToolUse") {
+        const detail = error instanceof Error ? error.message : String(error);
+        return { block: true, message: `⛔ blocked because a PreToolUse hook could not start${detail ? `: ${detail}` : ""}` };
+      }
       continue;
     }
-    if (event === "PreToolUse" && r.status !== 0 && r.status !== null) {
-      const msg = (String(r.stdout ?? "") + String(r.stderr ?? "")).trim();
-      return { block: true, message: `⛔ blocked by a PreToolUse hook${msg ? `: ${msg}` : ` (exit ${r.status})`}` };
+    if (event === "PreToolUse" && (r.status !== 0 || !!r.signal || !!r.error)) {
+      const output = (String(r.stdout ?? "") + String(r.stderr ?? "")).trim();
+      const failure = r.error?.message || (r.signal ? `terminated by ${r.signal}` : `exit ${r.status ?? "unknown"}`);
+      return { block: true, message: `⛔ blocked by a PreToolUse hook${output ? `: ${output}` : ` (${failure})`}` };
     }
   }
   return { block: false, message: "" };

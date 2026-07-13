@@ -4,9 +4,9 @@
 // API (bot token, xoxb-). Same ChatAdapter shape as Discord/Telegram, so all cross-platform gateway plumbing
 // (send_file, in-chat system context, stuck-guard, image attach/describe) works unchanged. Two tokens are
 // required because Socket Mode (xapp-) and the Web API (xoxb-) are separate auth scopes.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, basename } from "node:path";
-import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
+import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
 const WEB = "https://slack.com/api";
@@ -38,15 +38,16 @@ async function slackApi(method: string, token: string, body: Record<string, unkn
 
 /** Slack file url_private is gated — it needs the BOT token as a Bearer header (a plain GET returns the login
  *  page HTML, not the bytes). Download into ~/.hara/slack/media so the agent can SEE it. */
-async function downloadSlackFile(url: string, name: string, botToken: string): Promise<string | null> {
+async function downloadSlackFile(
+  url: string,
+  name: string,
+  botToken: string,
+  options: { maxBytes: number; signal: AbortSignal },
+): Promise<string | null> {
   try {
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${botToken}` } });
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${botToken}` }, signal: options.signal });
     if (!r.ok) return null;
-    const dir = join(homedir(), ".hara", "slack", "media");
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, `sl_${Date.now()}_${basename(name) || "file.bin"}`);
-    writeFileSync(path, Buffer.from(await r.arrayBuffer()));
-    return path;
+    return await savePrivateResponse(r, { platform: "slack", filenameHint: name, ...options });
   } catch {
     return null;
   }
@@ -55,6 +56,13 @@ async function downloadSlackFile(url: string, name: string, botToken: string): P
 /** Parse a Slack Events API `event` (the inner `payload.event`) → InboundMsg + its image file refs (pure;
  *  download happens in start()). null = ignore (not a user message / our own / an edit/delete subtype / empty).
  *  Mirrors discord.ts's parseDiscordMessage so it's unit-testable without the network. */
+export function slackChatType(event: any): "p2p" | "group" {
+  const channel = String(event?.channel ?? "").trim();
+  // Slack reserves D-prefixed ids for direct-message channels. It is stronger than a contradictory event field.
+  if (channel.startsWith("D")) return "p2p";
+  return String(event?.channel_type ?? "").trim().toLowerCase() === "im" ? "p2p" : "group";
+}
+
 export function parseSlackEvent(event: any, selfId: string): { msg: InboundMsg; imageUrls: { url: string; name: string }[] } | null {
   if (event?.type !== "message") return null;
   if (event.bot_id || (selfId && event.user === selfId)) return null; // ignore bots + our own messages
@@ -74,6 +82,7 @@ export function parseSlackEvent(event: any, selfId: string): { msg: InboundMsg; 
       userId: String(event.user),
       userName: String(event.user), // Slack events carry only the id; users.info would resolve a name (skipped for zero extra calls)
       text: text || "[图片]",
+      chatType: slackChatType(event),
     },
     imageUrls,
   };
@@ -103,7 +112,7 @@ export function slackAdapter(appToken: string, botToken: string): ChatAdapter {
         /* upload/send failed — surfaced upstream as "no file delivered" */
       }
     },
-    async start(onMessage, signal) {
+    async start(onMessage, signal, shouldDownload) {
       if (!WSImpl) {
         console.error("hara gateway: Slack needs Node ≥ 22 (global WebSocket). Upgrade Node.");
         return;
@@ -113,7 +122,7 @@ export function slackAdapter(appToken: string, botToken: string): ChatAdapter {
       const selfId = String(auth?.user_id ?? "");
       while (!signal.aborted) {
         const wss = await openSocketUrl(appToken);
-        if (wss) await connectOnce(wss, botToken, selfId, onMessage, signal);
+        if (wss) await connectOnce(wss, botToken, selfId, onMessage, signal, shouldDownload);
         if (!signal.aborted) await sleep(3000, signal); // reconnect backoff (and re-open: each URL is single-use)
       }
     },
@@ -135,6 +144,7 @@ function connectOnce(
   selfId: string,
   onMessage: (m: InboundMsg) => Promise<void>,
   signal: AbortSignal,
+  shouldDownload?: (m: InboundMsg) => boolean,
 ): Promise<void> {
   return new Promise((resolve) => {
     const ws = new WSImpl(url);
@@ -175,9 +185,15 @@ function connectOnce(
       if (p.type === "events_api") {
         const parsed = parseSlackEvent(p.payload?.event, selfId);
         if (parsed) {
-          for (const im of parsed.imageUrls) {
-            const path = await downloadSlackFile(im.url, im.name, botToken);
-            if (path) (parsed.msg.images ??= []).push(path);
+          if (shouldDownload?.(parsed.msg) === true) {
+            const budget = new InboundMediaBudget("slack", signal);
+            for (const im of parsed.imageUrls) {
+              const path = await budget.download((options) => downloadSlackFile(im.url, im.name, botToken, options));
+              if (path) {
+                (parsed.msg.images ??= []).push(path);
+                (parsed.msg.transientFiles ??= []).push(path);
+              }
+            }
           }
           await onMessage(parsed.msg).catch(() => {});
         }

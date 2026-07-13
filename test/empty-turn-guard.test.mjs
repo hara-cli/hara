@@ -58,3 +58,10 @@ test("tool_use stop with text but no tools ends cleanly (shows text, no loop, no
   const last = history[history.length - 1];
   assert.equal(last.text, "partial thought");
 });
+
+test("runAgent returns a machine-readable provider error outcome", async () => {
+  const provider = { id: "p", model: "m", async turn() { return { text: "", toolUses: [], stop: "error", errorMsg: "bad credentials" }; } };
+  const outcome = await runAgent([{ role: "user", content: "go" }], { provider, ...base([]), quiet: true });
+  assert.equal(outcome.status, "error");
+  assert.match(outcome.error, /bad credentials/);
+});

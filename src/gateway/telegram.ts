@@ -1,9 +1,9 @@
 // Telegram adapter for `hara gateway` — long-poll getUpdates + sendMessage over the Bot API (built-in
 // fetch, zero new dep). Token from HARA_TELEGRAM_TOKEN. The generic `ChatAdapter` shape is what WeChat(iLink)
 // / Feishu plug into next.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, basename } from "node:path";
-import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
+import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 
 const API = "https://api.telegram.org";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -15,6 +15,8 @@ export interface InboundMsg {
   text: string;
   /** local paths to inbound images the agent should SEE (attached inline / described downstream) */
   images?: string[];
+  /** Adapter-owned local downloads. The gateway removes these after this message finishes handling. */
+  transientFiles?: string[];
   /** Chat kind, when the adapter can tell — lets gateway flows target groups vs DMs. Omitted = adapter didn't say. */
   chatType?: "p2p" | "group";
   /** People @-mentioned in this message, when the platform surfaces them. `isSelf` = the gateway bot itself was
@@ -23,10 +25,20 @@ export interface InboundMsg {
 }
 export interface ChatAdapter {
   name: string;
-  start(onMessage: (m: InboundMsg) => Promise<void>, signal: AbortSignal): Promise<void>;
+  start(
+    onMessage: (m: InboundMsg) => Promise<void>,
+    signal: AbortSignal,
+    /** Fail-closed authorization preflight. Media is never fetched when omitted or false. */
+    shouldDownload?: (m: InboundMsg) => boolean,
+  ): Promise<void>;
   send(chatId: number | string, text: string): Promise<void>;
   /** Optional: send a local file (voice/image/document). Adapters without it just don't send files. */
   sendFile?(chatId: number | string, filePath: string): Promise<void>;
+  /** Optional: send a message and return its platform message id — so transient UX messages ("⟳ working…")
+   *  can be recalled later. Platforms without it just leave such messages in place. */
+  sendTracked?(chatId: number | string, text: string): Promise<string | undefined>;
+  /** Optional: delete/recall one of the BOT's own messages (e.g. Feishu allows it; WeChat iLink does not). */
+  recall?(chatId: number | string, messageId: string): Promise<void>;
 }
 
 /** Extract an InboundMsg from a Telegram getUpdates result item (pure). Accepts text and photo messages
@@ -42,6 +54,7 @@ export function parseTelegramUpdate(u: any): InboundMsg | null {
     userId: m.from?.id ?? 0,
     userName: m.from?.username || m.from?.first_name || String(m.from?.id ?? ""),
     text: text || "[图片]",
+    ...(m.chat?.type === "private" ? { chatType: "p2p" as const } : ["group", "supergroup"].includes(m.chat?.type) ? { chatType: "group" as const } : {}),
   };
 }
 
@@ -52,19 +65,20 @@ export function photoFileId(u: any): string | null {
 }
 
 /** Download a Telegram file by file_id → a local path under ~/.hara/telegram/media (getFile then the file CDN). */
-async function downloadTelegramFile(base: string, token: string, fileId: string): Promise<string | null> {
+async function downloadTelegramFile(
+  base: string,
+  token: string,
+  fileId: string,
+  options: { maxBytes: number; signal: AbortSignal },
+): Promise<string | null> {
   try {
-    const r = await fetch(`${base}/getFile?file_id=${encodeURIComponent(fileId)}`);
+    const r = await fetch(`${base}/getFile?file_id=${encodeURIComponent(fileId)}`, { signal: options.signal });
     const j = (await r.json()) as { result?: { file_path?: string } };
     const fp = j?.result?.file_path;
     if (!fp) return null;
-    const dl = await fetch(`${API}/file/bot${token}/${fp}`);
+    const dl = await fetch(`${API}/file/bot${token}/${fp}`, { signal: options.signal });
     if (!dl.ok) return null;
-    const dir = join(homedir(), ".hara", "telegram", "media");
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, `tg_${Date.now()}_${basename(fp)}`);
-    writeFileSync(path, Buffer.from(await dl.arrayBuffer()));
-    return path;
+    return await savePrivateResponse(dl, { platform: "telegram", filenameHint: fp, ...options });
   } catch {
     return null;
   }
@@ -80,15 +94,28 @@ export function chunkText(text: string, max = 4000): string[] {
 
 export function telegramAdapter(token: string): ChatAdapter {
   const base = `${API}/bot${token}`;
+  const request = async (method: string, init: RequestInit): Promise<any> => {
+    const response = await fetch(`${base}/${method}`, init);
+    let body: any;
+    try {
+      body = await response.json();
+    } catch {
+      body = undefined;
+    }
+    if (!response.ok || body?.ok === false) {
+      throw new Error(`Telegram ${method} failed: HTTP ${response.status}${body?.description ? ` · ${body.description}` : ""}`);
+    }
+    return body;
+  };
   return {
     name: "telegram",
     async send(chatId, text) {
       for (const part of chunkText(text || "(empty)")) {
-        await fetch(`${base}/sendMessage`, {
+        await request("sendMessage", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ chat_id: chatId, text: part }),
-        }).catch(() => {});
+        });
       }
     },
     async sendFile(chatId, filePath) {
@@ -98,9 +125,9 @@ export function telegramAdapter(token: string): ChatAdapter {
       const form = new FormData();
       form.append("chat_id", String(chatId));
       form.append(isImg ? "photo" : "document", new Blob([readFileSync(filePath)]), name);
-      await fetch(`${base}/${isImg ? "sendPhoto" : "sendDocument"}`, { method: "POST", body: form }).catch(() => {});
+      await request(isImg ? "sendPhoto" : "sendDocument", { method: "POST", body: form });
     },
-    async start(onMessage, signal) {
+    async start(onMessage, signal, shouldDownload) {
       let offset = 0;
       while (!signal.aborted) {
         try {
@@ -115,9 +142,13 @@ export function telegramAdapter(token: string): ChatAdapter {
             const msg = parseTelegramUpdate(u);
             if (!msg) continue;
             const fid = photoFileId(u); // a photo message → download it so the agent can SEE it
-            if (fid) {
-              const path = await downloadTelegramFile(base, token, fid);
-              if (path) msg.images = [path];
+            if (fid && shouldDownload?.(msg) === true) {
+              const budget = new InboundMediaBudget("telegram", signal);
+              const path = await budget.download((options) => downloadTelegramFile(base, token, fid, options));
+              if (path) {
+                msg.images = [path];
+                msg.transientFiles = [path];
+              }
             }
             await onMessage(msg).catch(() => {});
           }

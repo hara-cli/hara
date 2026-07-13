@@ -7,19 +7,36 @@
 // Claude Code's disclaimer is preserved: the model is told the context may be irrelevant, so an
 // injected nudge never derails an unrelated task.
 
-const queue: string[] = [];
+const DEFAULT_SCOPE = "default";
+const queues = new Map<string, string[]>();
+
+function scopeKey(scope?: string): string {
+  return scope?.trim() || DEFAULT_SCOPE;
+}
 
 /** Queue a reminder for injection before the next model call (main loop only — quiet/sub-agent runs
  *  neither push nor drain, so a parallel fan-out can't steal the main conversation's reminders). */
-export function pushReminder(text: string): void {
+export function pushReminder(text: string, scope?: string): void {
   const t = text.trim();
-  if (t) queue.push(t);
+  if (!t) return;
+  const key = scopeKey(scope);
+  const queue = queues.get(key) ?? [];
+  queue.push(t);
+  queues.set(key, queue);
 }
 
 /** Take everything queued (FIFO), clearing the queue. */
-export function drainReminders(): string[] {
-  if (!queue.length) return [];
-  return queue.splice(0, queue.length);
+export function drainReminders(scope?: string): string[] {
+  const key = scopeKey(scope);
+  const queue = queues.get(key);
+  if (!queue?.length) return [];
+  queues.delete(key);
+  return queue;
+}
+
+/** Drop an ephemeral session's pending reminders without exposing them to another run. */
+export function disposeReminderScope(scope: string): void {
+  queues.delete(scopeKey(scope));
 }
 
 /** Merge queued reminders into the single injected message. */

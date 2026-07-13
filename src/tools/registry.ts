@@ -15,6 +15,8 @@ export interface UiSink {
 export interface ToolContext {
   cwd: string;
   sandbox?: SandboxMode;
+  /** Isolate the in-memory todo_write checklist for concurrent agent runs (serve sessions/sub-agents). */
+  todoScope?: string;
   /** spawn a sub-agent for a sub-task (set by the REPL/-p; absent inside sub-agents) */
   spawn?: (task: string, role?: string) => Promise<string>;
   /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */

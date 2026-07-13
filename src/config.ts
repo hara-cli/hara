@@ -129,17 +129,27 @@ export function configPath(): string {
   return join(homedir(), ".hara", "config.json");
 }
 
+function configRecord(value: unknown): Record<string, any> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, any>) : {};
+}
+
 export function readRawConfig(): Record<string, any> {
   const p = configPath();
   if (!existsSync(p)) return {};
   try {
-    return JSON.parse(readFileSync(p, "utf8")) as Record<string, any>;
+    return configRecord(JSON.parse(readFileSync(p, "utf8")));
   } catch {
     return {};
   }
 }
 
-const ROUTING_CONFIG_KEYS = new Set(["provider", "apiKey", "model", "baseURL"]);
+const ROUTING_CONFIG_KEYS = new Set([
+  "provider", "apiKey", "model", "baseURL",
+  "fallbackProvider", "fallbackApiKey", "fallbackModel", "fallbackBaseURL",
+  "visionApiKey", "visionModel", "visionBaseURL",
+  "embedProvider", "embedApiKey", "embedModel", "embedBaseURL",
+  "routeApiKey", "routeModel", "routeBaseURL",
+]);
 
 /** Empty routing values are not meaningful credentials/endpoints. Ignore them at each precedence layer so
  *  an empty project override (or launcher-exported empty env var) cannot hide a valid global config value. */
@@ -169,7 +179,7 @@ function readProjectConfig(cwd: string): Record<string, any> {
     const p = join(dir, ".hara", "config.json");
     if (existsSync(p)) {
       try {
-        return JSON.parse(readFileSync(p, "utf8")) as Record<string, any>;
+        return configRecord(JSON.parse(readFileSync(p, "utf8")));
       } catch {
         return {};
       }
@@ -223,19 +233,20 @@ export function setModelVisionOverride(model: string, cap: "yes" | "no" | null):
  * key for one release for back-compat. Overlays are addressed by env var
  * `HARA_OVERLAY=<name>` (or `opts.overlay`).
  */
-export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
+export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraConfig {
   const global = readRawConfig();
   // Strip both the new (`overlays`) and legacy (`profiles`) overlay containers from the base merge.
   // The legacy `profiles` key is kept readable for back-compat with users who already have it.
   const { overlays, profiles, ...globalBase } = global;
-  const project = readProjectConfig(process.cwd());
-  const overlayName = process.env.HARA_OVERLAY ?? opts.overlay;
+  const effectiveCwd = resolve(opts.cwd ?? process.cwd());
+  const project = readProjectConfig(effectiveCwd);
+  const overlayName = nonBlankEnv(process.env.HARA_OVERLAY) ?? nonBlankEnv(opts.overlay);
   const overlayMap = overlays && typeof overlays === "object" ? overlays : profiles && typeof profiles === "object" ? profiles : null;
-  const overlay = overlayName && overlayMap && overlayMap[overlayName] ? overlayMap[overlayName] : {};
+  const overlay = configRecord(overlayName && overlayMap ? overlayMap[overlayName] : undefined);
   const merged: Record<string, any> = {
     ...withoutBlankRoutingValues(globalBase),
-    ...withoutBlankRoutingValues(project),
     ...withoutBlankRoutingValues(overlay),
+    ...withoutBlankRoutingValues(project),
   };
 
   const provider = (nonBlankEnv(process.env.HARA_PROVIDER) ?? merged.provider ?? "anthropic") as ProviderId;
@@ -250,21 +261,21 @@ export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
   const assetCapture = (process.env.HARA_ASSET_CAPTURE ?? merged.assetCapture ?? "ask") as "off" | "ask" | "auto";
   const computerUse = (process.env.HARA_COMPUTER_USE ?? merged.computerUse ?? "off") as "off" | "read" | "click" | "full";
   const computerApps = String(process.env.HARA_COMPUTER_APPS ?? merged.computerApps ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  const visionModel = process.env.HARA_VISION_MODEL ?? merged.visionModel;
-  const visionBaseURL = process.env.HARA_VISION_BASE_URL ?? merged.visionBaseURL;
-  const visionApiKey = process.env.HARA_VISION_API_KEY ?? merged.visionApiKey;
+  const visionModel = nonBlankEnv(process.env.HARA_VISION_MODEL) ?? merged.visionModel;
+  const visionBaseURL = nonBlankEnv(process.env.HARA_VISION_BASE_URL) ?? merged.visionBaseURL;
+  const visionApiKey = nonBlankEnv(process.env.HARA_VISION_API_KEY) ?? merged.visionApiKey;
   const modelVision = merged.modelVision && typeof merged.modelVision === "object" ? (merged.modelVision as Record<string, "yes" | "no">) : {};
-  const embedProvider = (process.env.HARA_EMBED_PROVIDER ?? merged.embedProvider ?? "off") as "off" | "ollama" | "qwen" | "openai";
-  const embedModel = process.env.HARA_EMBED_MODEL ?? merged.embedModel;
-  const embedBaseURL = process.env.HARA_EMBED_BASE_URL ?? merged.embedBaseURL;
-  const embedApiKey = process.env.HARA_EMBED_API_KEY ?? merged.embedApiKey;
-  const routeModel = process.env.HARA_ROUTE_MODEL ?? merged.routeModel;
-  const routeBaseURL = process.env.HARA_ROUTE_BASE_URL ?? merged.routeBaseURL;
-  const routeApiKey = process.env.HARA_ROUTE_API_KEY ?? merged.routeApiKey;
+  const embedProvider = (nonBlankEnv(process.env.HARA_EMBED_PROVIDER) ?? merged.embedProvider ?? "off") as "off" | "ollama" | "qwen" | "openai";
+  const embedModel = nonBlankEnv(process.env.HARA_EMBED_MODEL) ?? merged.embedModel;
+  const embedBaseURL = nonBlankEnv(process.env.HARA_EMBED_BASE_URL) ?? merged.embedBaseURL;
+  const embedApiKey = nonBlankEnv(process.env.HARA_EMBED_API_KEY) ?? merged.embedApiKey;
+  const routeModel = nonBlankEnv(process.env.HARA_ROUTE_MODEL) ?? merged.routeModel;
+  const routeBaseURL = nonBlankEnv(process.env.HARA_ROUTE_BASE_URL) ?? merged.routeBaseURL;
+  const routeApiKey = nonBlankEnv(process.env.HARA_ROUTE_API_KEY) ?? merged.routeApiKey;
   const mcpServers: Record<string, McpServerConfig> = {
     ...(globalBase.mcpServers ?? {}),
-    ...(project.mcpServers ?? {}),
     ...(overlay.mcpServers ?? {}),
+    ...(project.mcpServers ?? {}),
   };
   const hooks = (merged.hooks && typeof merged.hooks === "object" ? merged.hooks : {}) as HooksConfig;
   // Guardian: default ON; env HARA_GUARDIAN=0/off/false or config guardian:"off" disables it.
@@ -275,16 +286,16 @@ export function loadConfig(opts: { overlay?: string } = {}): HaraConfig {
   const autoCompact = !(process.env.HARA_AUTO_COMPACT === "0" || merged.autoCompact === false || merged.autoCompact === "false"); // default ON
   const fileCheckpoints = !(process.env.HARA_CHECKPOINTS === "0" || merged.fileCheckpoints === false || merged.fileCheckpoints === "false"); // default ON
   const updateCheck = !(process.env.HARA_UPDATE_CHECK === "0" || merged.updateCheck === false || merged.updateCheck === "false"); // default ON
-  const fallbackModel = process.env.HARA_FALLBACK_MODEL ?? merged.fallbackModel;
-  const fallbackProvider = (process.env.HARA_FALLBACK_PROVIDER ?? merged.fallbackProvider) as ProviderId | undefined;
-  const fallbackBaseURL = process.env.HARA_FALLBACK_BASE_URL ?? merged.fallbackBaseURL;
-  const fallbackApiKey = process.env.HARA_FALLBACK_API_KEY ?? merged.fallbackApiKey;
+  const fallbackModel = nonBlankEnv(process.env.HARA_FALLBACK_MODEL) ?? merged.fallbackModel;
+  const fallbackProvider = (nonBlankEnv(process.env.HARA_FALLBACK_PROVIDER) ?? merged.fallbackProvider) as ProviderId | undefined;
+  const fallbackBaseURL = nonBlankEnv(process.env.HARA_FALLBACK_BASE_URL) ?? merged.fallbackBaseURL;
+  const fallbackApiKey = nonBlankEnv(process.env.HARA_FALLBACK_API_KEY) ?? merged.fallbackApiKey;
   const reasoningRaw = process.env.HARA_REASONING_EFFORT ?? merged.reasoningEffort;
   const reasoningEffort = reasoningRaw && (["off", "low", "medium", "high", "max"] as const).includes(reasoningRaw as never)
     ? (reasoningRaw as "off" | "low" | "medium" | "high" | "max")
     : undefined;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, vimMode, autoCompact, fileCheckpoints, updateCheck, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: process.cwd() };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, vimMode, autoCompact, fileCheckpoints, updateCheck, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

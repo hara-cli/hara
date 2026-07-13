@@ -5,7 +5,7 @@
 // draining nor nagging, and (e) the 8-section compaction brief keeping user messages verbatim.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { pushReminder, drainReminders, wrapReminders, todoStaleReminder, TODO_STALE_ROUNDS } from "../dist/agent/reminders.js";
+import { pushReminder, drainReminders, wrapReminders, todoStaleReminder, TODO_STALE_ROUNDS, disposeReminderScope } from "../dist/agent/reminders.js";
 import { COMPACT_SYSTEM } from "../dist/agent/compact.js";
 import { runAgent } from "../dist/agent/loop.js";
 import { getTool } from "../dist/tools/registry.js";
@@ -24,6 +24,16 @@ test("reminders: FIFO queue + wrap carries the ignore-if-irrelevant disclaimer",
   assert.ok(wrapped.startsWith("<system-reminder>"), "wrapped in the reminder tag");
   assert.ok(wrapped.includes("first\n\nsecond"), "items merged");
   assert.ok(/ignore it unless it is relevant/i.test(wrapped), "disclaimer present (never derails unrelated work)");
+});
+
+test("reminders: concurrent run scopes cannot drain each other's context", () => {
+  disposeReminderScope("serve:a");
+  disposeReminderScope("serve:b");
+  pushReminder("private task A", "serve:a");
+  pushReminder("private task B", "serve:b");
+  assert.deepEqual(drainReminders("serve:b"), ["private task B"]);
+  assert.deepEqual(drainReminders("serve:a"), ["private task A"]);
+  assert.deepEqual(drainReminders("serve:b"), []);
 });
 
 // A fake provider that runs `rounds` tool rounds (each calling the given tool uses), then ends.

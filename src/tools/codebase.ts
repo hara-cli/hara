@@ -70,7 +70,9 @@ registerTool({
     // to pure lexical when no index/embedder — zero behaviour change for the default install.
     const out: string[] = [];
     const seen = new Set<string>();
-    const cfg = loadConfig();
+    // Tool execution can be dispatched to a registered agent home without changing process.cwd(). Its
+    // semantic-search provider/index settings belong to the tool context, not to the launcher directory.
+    const cfg = loadConfig({ cwd: ctx.cwd });
     const embed = getEmbedder(cfg);
     if (embed && indexExists("repo", ctx.cwd)) {
       try {

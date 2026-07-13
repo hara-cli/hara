@@ -5,6 +5,72 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## Unreleased — planned 0.122.0 — structured runs, durable work, and a fail-closed gateway
+
+- **Machine-safe headless runs.** `hara -p … --schema <json|file>` installs a run-scoped
+  `structured_output` contract, validates the value against JSON Schema, and writes exactly one JSON value to
+  stdout. Prose, auth notices, retries, and provider/schema failures cannot masquerade as machine output:
+  diagnostics go to stderr and failures exit non-zero. `hara -p … --role <id>` now applies the role's persona,
+  model, and allow/deny tool policy instead of changing the prompt alone.
+- **Agents have stable homes.** `hara projects add/list/remove` maintains a private, atomic registry of project
+  homes; `hara agents` builds one address book from global and registered-project roles.
+  `hara org --role project:agent …` resolves unambiguously and executes at that home with its project context/config. Concurrent
+  CLIs safely share the registry, and dead lock owners can be reclaimed without stealing a live lock.
+- **Two levels of work state.** `todo_write` is now isolated per interactive/headless/sub-agent/serve session
+  and persists with the session, so concurrent agents cannot overwrite each other's checklist. The new `task`
+  tool is a durable cross-session project pool with owners, statuses, `blockedBy` dependencies, cycle checks,
+  and private atomic cross-process persistence. `hara serve` exposes the pool through `tasks.list`.
+- **10-platform gateway, with project-agent roaming.** Telegram, WeChat, Discord, Feishu/Lark, Slack,
+  Mattermost, Matrix, DingTalk, WeCom, and Signal adapters now classify direct vs multi-party chats
+  conservatively. The full coding agent accepts only verified private messages; unknown channel shapes fail
+  closed. `/agent <name|project:name>` pins a thread to an indexed agent and its home, while `/agent main`
+  restores the prior project thread. Chat/session preferences survive project round-trips and group-member
+  state is isolated.
+- **Untrusted group flows cannot reach coding tools.** Opt-in `~/.hara/flows.json` rules are hot-reloaded and
+  evaluated through a bounded, stateless provider call with `tools: []` — no shell, files, MCP, session, or
+  project context. Rules support trigger filters, JSON Schema, disposition-based notification/auto-reply,
+  redacted rotating logs, and rate/concurrency caps. Proposed sends and agent dispatches are parked unless an
+  explicitly configured safe `replyOn` disposition applies.
+- **Single-owner, idempotent approvals.** Consequential flow actions require a unique allowlisted owner and a
+  verified private channel. Deterministic `/approve <id>`, `/edit <id> <content>`, and `/reject <id>` commands
+  avoid “latest draft” ambiguity; blank edits fail closed. Pending actions use private atomic storage and a
+  compare-and-set execution claim, shared by chat and the new serve `approvals.list/resolve` inbox, so two
+  approval surfaces cannot double-send. Deferred actions are parked only for one-shot delivery targets
+  (Telegram, Feishu/Lark, or WeChat); other adapters fail closed instead of presenting an unusable approval.
+- **Bounded gateway execution and media.** Turns are FIFO per session (depth 8), with four active children,
+  bounded global/session-key backlogs, a 15-minute default/30-minute hard timeout, and TERM-to-KILL shutdown;
+  non-zero or signalled children fail visibly. Inbound attachments are authorized before download, limited to
+  four files and 20 MiB each, streamed into private random paths with time/concurrency/retention quotas, and
+  expired after 24 hours. Progress markers are recalled in `finally`, gateway chat/session files are `0600`
+  with lock-before-load persistence, and ambiguous/stale locks are never reclaimed merely by age.
+- **Layered flow admission.** Group classifiers are capped globally (20/minute, 120/hour), per rule/platform/chat
+  (10/minute, 60/hour), per sender (5/minute), and at four active runs. Rate maps and key sizes are bounded and
+  saturation fails closed, so rotating identities cannot grow memory or bypass the host-wide ceiling.
+- **Live config for persistent clients.** `hara serve` rebuilds cwd-specific provider routes, credentials, and
+  guardian settings on sessions/turns; `initialize`, `models.list`, and new sessions reflect current defaults.
+  Resumed sessions retain their explicit model pin while using the live provider route, so credential rotation
+  and project config edits no longer require a server restart.
+- **Coding-path robustness.** File reads/search/edit/patch now reject FIFOs/devices and symlink races, cap reads,
+  use bounded subprocess search with a linear glob matcher, preserve exact file modes, and roll back multi-file
+  patches without overwriting concurrent replacements; writes move-claim the expected inode and commit with
+  create-if-absent semantics, while `/undo` applies the same identity checks. Blank
+  project/env routing values no longer mask valid global config; precedence is environment > project > overlay
+  > global. Web fetch/search blocks IPv4-mapped and full link-local IPv6 SSRF forms and tries regional providers
+  sequentially instead of broadcasting a successful query. Package installs stay attached with bounded
+  long-operation timeouts, tunnel commands preflight their binaries, TUI resize repaints reliably, persisted/
+  public text redacts secrets, and session writes are private, atomic, and cross-process safe.
+- **Interrupts and non-interactive outcomes are honest.** Cancelling a parallel tool round records matching
+  interrupted results while preserving completed side effects; serve approvals settle immediately on interrupt.
+  The stream-stall watchdog is a hard Promise boundary even when a provider ignores its abort signal.
+  Headless and org runs now exit non-zero on provider errors, empty/halted turns, schema failures, and rejected
+  reviews; plan atoms stop on the same outcomes instead of being verified as done, and failed implementers are
+  never committed. Read-only roles are resolved before startup and launch neither hooks nor configured/plugin
+  MCP subprocesses.
+- **Private serve lifecycle.** `~/.hara`/`serve.json` are tightened to `0700`/`0600` and discovery is fsynced,
+  atomically replaced without following symlinks, and removed only by its owning instance. Discovery failures
+  close the listening socket. Serve-side compaction is mutually exclusive with turns/config changes, carries an
+  abort signal, releases locks on interrupt/shutdown, and has a 60-second hard deadline.
+
 ## 0.121.1 — field-feedback reliability & credential safety
 
 - **Terminal resize no longer erases the composer.** Hara clears stale Ink output only before a real

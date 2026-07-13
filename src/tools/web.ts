@@ -1,10 +1,12 @@
 // web_fetch — fetch an http(s) URL and return readable text (HTML reduced to text). Read-only.
-// Uses Node's global fetch (Node >=20). NOT sandboxed (network egress is in-process, not via bash) —
-// so it carries an SSRF guard: private/loopback/link-local targets are refused, re-checked on every
-// redirect hop, and the body is read under a hard byte ceiling.
+// NOT sandboxed (network egress is in-process, not via bash) — so it carries an SSRF guard: private/
+// loopback/link-local targets are refused, the verified DNS address is pinned to the actual socket on
+// every redirect hop (DNS-rebinding safe), and the body is read under a hard byte ceiling.
 import { registerTool } from "./registry.js";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { request as httpRequest, type IncomingMessage } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { wrapUntrusted } from "../security/external-content.js";
 
 const MAX = 60_000;
@@ -12,30 +14,141 @@ const SEARCH_ATTEMPT_MS = 8_000;
 const SEARCH_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
 type SearchResult = { title: string; url: string; snippet: string };
 
+function ipv6Words(input: string): number[] | null {
+  let value = input.toLowerCase();
+  const dotted = value.lastIndexOf(":") >= 0 ? value.slice(value.lastIndexOf(":") + 1) : "";
+  if (dotted.includes(".")) {
+    const octets = dotted.split(".").map(Number);
+    if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+    value = `${value.slice(0, value.lastIndexOf(":") + 1)}${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
+  }
+  const halves = value.split("::");
+  if (halves.length > 2) return null;
+  const parse = (part: string): number[] | null => {
+    if (!part) return [];
+    const pieces = part.split(":");
+    if (pieces.some((piece) => !/^[0-9a-f]{1,4}$/.test(piece))) return null;
+    return pieces.map((piece) => Number.parseInt(piece, 16));
+  };
+  const left = parse(halves[0]);
+  const right = parse(halves[1] ?? "");
+  if (!left || !right) return null;
+  if (halves.length === 1) return left.length === 8 ? left : null;
+  const zeros = 8 - left.length - right.length;
+  return zeros > 0 ? [...left, ...Array<number>(zeros).fill(0), ...right] : null;
+}
+
 /** True for loopback / private / link-local / ULA / CGNAT addresses we must not let web_fetch reach. */
 export function isPrivateIp(ip: string): boolean {
   const host = ip.replace(/^\[|\]$/g, "");
   if (isIP(host) === 4) {
     const p = host.split(".").map(Number);
-    return p[0] === 0 || p[0] === 10 || p[0] === 127 || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 192 && p[1] === 168) || (p[0] === 169 && p[1] === 254) || (p[0] === 100 && p[1] >= 64 && p[1] <= 127);
+    return (
+      p[0] === 0 || p[0] === 10 || p[0] === 127 ||
+      (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||
+      (p[0] === 169 && p[1] === 254) ||
+      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+      (p[0] === 192 && p[1] === 0 && p[2] === 0 && p[3] !== 9 && p[3] !== 10) ||
+      (p[0] === 192 && p[1] === 0 && p[2] === 2) ||
+      (p[0] === 192 && p[1] === 88 && p[2] === 99) ||
+      (p[0] === 192 && p[1] === 168) ||
+      (p[0] === 198 && (p[1] === 18 || p[1] === 19)) ||
+      (p[0] === 198 && p[1] === 51 && p[2] === 100) ||
+      (p[0] === 203 && p[1] === 0 && p[2] === 113) ||
+      p[0] >= 224 // multicast + reserved/broadcast space is not a public unicast web destination
+    );
   }
   const l = host.toLowerCase();
-  if (l === "::1" || l === "::") return true;
-  if (l.startsWith("fe80") || l.startsWith("fc") || l.startsWith("fd")) return true; // link-local + unique-local
-  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(l); // IPv4-mapped IPv6
-  return m ? isPrivateIp(m[1]) : false;
+  const words = ipv6Words(l);
+  if (!words) return false;
+  if (words.every((word) => word === 0) || words.slice(0, 7).every((word) => word === 0) && words[7] === 1) return true;
+  if ((words[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local (fe80..febf)
+  if ((words[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 unique-local
+  if ((words[0] & 0xffc0) === 0xfec0) return true; // fec0::/10 deprecated site-local, still internal
+  // IPv4-mapped/compatible spellings are normalized by URL to hexadecimal (for example
+  // ::ffff:127.0.0.1 → ::ffff:7f00:1), so classify the embedded address from parsed words.
+  const mapped = words.slice(0, 5).every((word) => word === 0) && words[5] === 0xffff;
+  const compatible = words.slice(0, 6).every((word) => word === 0);
+  if (mapped || compatible) {
+    const v4 = `${words[6] >>> 8}.${words[6] & 0xff}.${words[7] >>> 8}.${words[7] & 0xff}`;
+    return isPrivateIp(v4);
+  }
+  // Native public IPv6 is global-unicast 2000::/3. Also reject special-use ranges that sit inside it:
+  // Teredo, benchmarking/ORCHID/documentation, and deprecated 6to4 transition addresses.
+  if ((words[0] & 0xe000) !== 0x2000) return true;
+  if (words[0] === 0x2002) return true; // 6to4 can tunnel an embedded non-public IPv4 target
+  if (words[0] === 0x2001) {
+    if (words[1] === 0x0000 || words[1] === 0x0002 || words[1] === 0x0db8) return true;
+    if ((words[1] & 0xfff0) === 0x0010 || (words[1] & 0xfff0) === 0x0020) return true;
+  }
+  return words[0] === 0x3fff && (words[1] & 0xf000) === 0x0000; // 3fff::/20 documentation
 }
 
 /** Refuse to fetch a host that is (or resolves to) a private/internal address — defeats metadata-endpoint
  *  / localhost SSRF. Throws (caught by the caller) on a blocked or unresolvable host. */
-async function assertPublicHost(hostname: string): Promise<void> {
+export interface PinnedHost {
+  address: string;
+  family: 4 | 6;
+}
+
+/** Resolve once, reject the hostname if ANY answer is internal, then return the exact public address the
+ * socket must use. Rejecting mixed public/private answers prevents round-robin records from becoming a
+ * probabilistic bypass. The optional resolver keeps the policy directly testable. */
+export async function resolvePublicHost(
+  hostname: string,
+  resolver: typeof lookup = lookup,
+): Promise<PinnedHost> {
   const host = hostname.replace(/^\[|\]$/g, "");
   if (isIP(host)) {
     if (isPrivateIp(host)) throw new Error(`refusing to fetch ${host} (private/loopback address)`);
-    return;
+    return { address: host, family: isIP(host) as 4 | 6 };
   }
-  const addrs = await lookup(host, { all: true });
-  for (const a of addrs) if (isPrivateIp(a.address)) throw new Error(`refusing to fetch ${host} — resolves to a private/internal address (${a.address})`);
+  const addrs = await resolver(host, { all: true });
+  if (!addrs.length) throw new Error(`could not resolve ${host}`);
+  for (const a of addrs) {
+    const family = isIP(a.address);
+    if (!family || family !== a.family) throw new Error(`resolver returned an invalid address for ${host}`);
+    if (isPrivateIp(a.address)) throw new Error(`refusing to fetch ${host} — resolves to a private/internal address (${a.address})`);
+  }
+  const chosen = addrs[0];
+  return { address: chosen.address, family: chosen.family as 4 | 6 };
+}
+
+interface PinnedResponse {
+  status: number;
+  headers: Headers;
+  body: IncomingMessage;
+}
+
+/** One HTTP hop whose TCP socket is pinned to the address approved above. `Host` and TLS SNI retain the
+ * original hostname, so virtual hosting/certificate checks work without a second DNS lookup. */
+async function requestPinned(url: URL, pinned: PinnedHost, signal: AbortSignal): Promise<PinnedResponse> {
+  return new Promise((resolve, reject) => {
+    const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(
+      {
+        protocol: url.protocol,
+        hostname: pinned.address,
+        family: pinned.family,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: "GET",
+        signal,
+        servername: url.hostname.replace(/^\[|\]$/g, ""),
+        headers: {
+          host: url.host,
+          "user-agent": "hara-cli",
+          accept: "text/html,text/plain,application/json,*/*",
+        },
+      },
+      (body) => {
+        const headers = new Headers();
+        for (let i = 0; i < body.rawHeaders.length; i += 2) headers.append(body.rawHeaders[i], body.rawHeaders[i + 1]);
+        resolve({ status: body.statusCode ?? 0, headers, body });
+      },
+    );
+    request.once("error", reject);
+    request.end();
+  });
 }
 
 /** Read a fetch Response body up to `maxBytes`, then stop (avoids materializing a huge / bomb body). */
@@ -57,6 +170,26 @@ async function readCapped(res: Response, maxBytes: number): Promise<string> {
       } catch {
         /* already closing */
       }
+      break;
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function readPinnedCapped(res: IncomingMessage, maxBytes: number): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const value of res) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    const remaining = maxBytes - total;
+    if (remaining <= 0) {
+      res.destroy();
+      break;
+    }
+    chunks.push(chunk.length > remaining ? chunk.subarray(0, remaining) : chunk);
+    total += Math.min(chunk.length, remaining);
+    if (chunk.length >= remaining) {
+      res.destroy();
       break;
     }
   }
@@ -231,31 +364,20 @@ async function firstSuccessfulSearch(
   attempts: { name: string; run: () => Promise<SearchResult[]> }[],
   failures: string[],
 ): Promise<SearchResult[] | null> {
-  if (!attempts.length) return null;
-  return new Promise((resolve) => {
-    let remaining = attempts.length;
-    let settled = false;
-    for (const attempt of attempts) {
-      void attempt
-        .run()
-        .then((results) => {
-          if (results.length && !settled) {
-            settled = true;
-            resolve(results);
-          } else if (!results.length) {
-            failures.push(`${attempt.name} no results`);
-          }
-        })
-        .catch((e: any) => {
-          const reason = e?.name === "TimeoutError" || e?.name === "AbortError" ? "timeout" : (e?.message ?? String(e));
-          failures.push(`${attempt.name} ${reason}`);
-        })
-        .finally(() => {
-          remaining--;
-          if (remaining === 0 && !settled) resolve(null);
-        });
+  // Try one provider at a time. Search terms can be sensitive; a successful request must not be mirrored
+  // to unrelated providers merely to save a few seconds, and sequential fallback also avoids leaving
+  // losing requests running after the tool has already returned.
+  for (const attempt of attempts) {
+    try {
+      const results = await attempt.run();
+      if (results.length) return results;
+      failures.push(`${attempt.name} no results`);
+    } catch (e: any) {
+      const reason = e?.name === "TimeoutError" || e?.name === "AbortError" ? "timeout" : (e?.message ?? String(e));
+      failures.push(`${attempt.name} ${reason}`);
     }
-  });
+  }
+  return null;
 }
 
 registerTool({
@@ -280,8 +402,8 @@ registerTool({
     const fmt = (rs: SearchResult[]): string =>
       rs.map((r, n) => `${n + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ""}`).join("\n\n");
     const failures: string[] = [];
-    // Race the configured agent-search API against a mainland-accessible HTML source. A blocked Tavily
-    // endpoint no longer adds an 8-second penalty before Hara starts the domestic fallback.
+    // Prefer the explicitly configured agent-search API. Only disclose the query to another provider if
+    // that request fails or returns no results; without a key, start with mainland-accessible Bing CN.
     const key = process.env.HARA_SEARCH_API_KEY || process.env.TAVILY_API_KEY;
     const primaryAttempts: { name: string; run: () => Promise<SearchResult[]> }[] = [];
     if (key) {
@@ -314,8 +436,8 @@ registerTool({
     const primary = await firstSuccessfulSearch(primaryAttempts, failures);
     if (primary) return wrapUntrusted(fmt(primary), `web_search: ${q}`);
 
-    // Secondary sources run concurrently, keeping total failure latency bounded. Google is included as a
-    // user-friendly fallback where it is reachable, but is never the sole path (mainland often gets a shell).
+    // Secondary sources are ordered fallbacks. Google is included where reachable, but is never the sole
+    // path because mainland networks commonly receive a challenge or JavaScript shell.
     const secondary = await firstSuccessfulSearch(
       [
         {
@@ -391,22 +513,24 @@ registerTool({
     try {
       // Follow redirects manually so the SSRF guard runs on EVERY hop (a public URL can 30x to 169.254…).
       let current = url;
-      let res: Response;
+      let res: PinnedResponse;
       for (let hop = 0; ; hop++) {
-        await assertPublicHost(current.hostname);
-        res = await fetch(current, {
-          signal: ctrl.signal,
-          redirect: "manual",
-          headers: { "user-agent": "hara-cli", accept: "text/html,text/plain,application/json,*/*" },
-        });
+        const pinned = await resolvePublicHost(current.hostname);
+        res = await requestPinned(current, pinned, ctrl.signal);
         const loc = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
         if (!loc || hop >= 5) break;
         const next = new URL(loc, current);
-        if (next.protocol !== "http:" && next.protocol !== "https:") return "Error: redirect to a non-http(s) URL was blocked.";
+        if (next.protocol !== "http:" && next.protocol !== "https:") {
+          res.body.destroy();
+          return "Error: redirect to a non-http(s) URL was blocked.";
+        }
+        // We never consume redirect bodies. Destroy the socket before following the next pinned hop so a
+        // server cannot accumulate idle response streams across a redirect chain.
+        res.body.destroy();
         current = next;
       }
       const ct = res.headers.get("content-type") ?? "";
-      const raw = await readCapped(res, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
+      const raw = await readPinnedCapped(res.body, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
       let text = /html/i.test(ct) ? htmlToText(raw) : raw;
       if (text.length > cap) text = text.slice(0, cap) + `\n…[truncated ${text.length - cap} chars]`;
       if (/html/i.test(ct) && looksLikeJsRenderedShell(raw, text)) {

@@ -1,5 +1,5 @@
 // Org roles — markdown agent definitions in <project>/.hara/roles/*.md.
-// Frontmatter: name, description, owns[], rejects[], model?, allowTools[], denyTools[]. Body = persona/system.
+// Frontmatter: name, description, owns[], rejects[], model?, allowTools[], denyTools[], readOnly?. Body = persona/system.
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -14,6 +14,8 @@ export interface Role {
   model?: string;
   allowTools?: string[];
   denyTools?: string[];
+  /** Enforce a genuinely read-only tool surface. Reviewer roles default to true unless explicitly disabled. */
+  readOnly?: boolean;
   system: string;
 }
 
@@ -92,24 +94,51 @@ function parseFrontmatter(text: string): { fm: Record<string, any>; body: string
  *  parallel), with a role allowed to narrow further but never to grant write/exec. `isReadonly` is the
  *  read-kind predicate. This is the guard that keeps the `agent` tool from bypassing the approval gate. */
 export function subagentToolFilter(role: Role | undefined, isReadonly: (n: string) => boolean): (n: string) => boolean {
-  const roleFilter = role?.allowTools
-    ? (n: string) => role.allowTools!.includes(n)
-    : role?.denyTools
-      ? (n: string) => !role.denyTools!.includes(n)
-      : null;
+  // Treat allow + deny as an intersection when both are present. A deny must never disappear merely
+  // because an allow-list was also declared (mixed policies are common in generated role bundles).
+  const roleFilter = role?.allowTools || role?.denyTools
+    ? (n: string) => (!role.allowTools || role.allowTools.includes(n)) && (!role.denyTools || !role.denyTools.includes(n))
+    : null;
   return (n) => isReadonly(n) && (roleFilter ? roleFilter(n) : true);
 }
 
+/** Apply a role's declared tool policy to a normal (approval-gated) run. Undefined means unrestricted. */
+export function roleToolFilter(role: Role | undefined): ((name: string) => boolean) | undefined {
+  if (!role) return undefined;
+  const declared = (name: string): boolean =>
+    (!role.allowTools || role.allowTools.includes(name)) && (!role.denyTools || !role.denyTools.includes(name));
+  if (role.readOnly) {
+    // Raw bash is intentionally absent: even commands that look read-only can hide redirection, command
+    // substitution, hooks, or an executable with side effects. Reviewers get dedicated read/search tools.
+    const safe = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write"]);
+    return (name) => safe.has(name) && declared(name);
+  }
+  return role.allowTools || role.denyTools ? declared : undefined;
+}
+
 export function loadRoles(cwd: string): Role[] {
-  const byId = new Map<string, Role>();
   // lowest→highest precedence: plugins < org(B-end push) < global < .claude/agents < .hara/roles (project wins)
-  for (const dir of [...pluginRoleDirs(), orgRolesDir(), globalRolesDir(), claudeAgentsDir(cwd), rolesDir(cwd)]) {
+  return [...rolesFromDirs([...pluginRoleDirs(), orgRolesDir(), globalRolesDir(), claudeAgentsDir(cwd), rolesDir(cwd)]).values()];
+}
+
+/** The project-independent layers only (plugins + org-pushed + ~/.hara/roles) — what the global agent
+ *  index lists as "runs anywhere". Excludes cwd-derived layers by construction. */
+export function loadGlobalRoles(): Role[] {
+  return [...rolesFromDirs([...pluginRoleDirs(), orgRolesDir(), globalRolesDir()]).values()];
+}
+
+function rolesFromDirs(dirs: string[]): Map<string, Role> {
+  const byId = new Map<string, Role>();
+  for (const dir of dirs) {
     if (!existsSync(dir)) continue;
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".md") || f === "README.md") continue;
       try {
         const { fm, body } = parseFrontmatter(readFileSync(join(dir, f), "utf8"));
         const id = (fm.name as string) || f.replace(/\.md$/, "");
+        const explicitReadOnly = /^(true|false)$/i.test(String(fm.readOnly ?? ""))
+          ? String(fm.readOnly).toLowerCase() === "true"
+          : undefined;
         byId.set(id, {
           id,
           description: (fm.description as string) || "",
@@ -120,6 +149,7 @@ export function loadRoles(cwd: string): Role[] {
           model: fm.model && !/^(sonnet|opus|haiku|inherit)$/i.test(String(fm.model)) ? fm.model : undefined,
           allowTools: Array.isArray(fm.allowTools) ? fm.allowTools : claudeTools(fm.tools),
           denyTools: Array.isArray(fm.denyTools) ? fm.denyTools : undefined,
+          readOnly: explicitReadOnly ?? (id.toLowerCase() === "reviewer" ? true : undefined),
           system: body,
         });
       } catch {
@@ -127,7 +157,7 @@ export function loadRoles(cwd: string): Role[] {
       }
     }
   }
-  return [...byId.values()];
+  return byId;
 }
 
 export function hasRoles(cwd: string): boolean {
@@ -149,10 +179,11 @@ End with a one-line summary of what changed.
 name: reviewer
 description: Reviews code for bugs, correctness, security, and style. Does not modify code.
 owns: [review, audit, check, correctness, security, vulnerability, lint, quality]
-allowTools: [read_file, bash]
+allowTools: [read_file, grep, glob, ls, codebase_search]
+readOnly: true
 ---
 You are the **reviewer**. Read the relevant code and report concrete issues (bug / correctness /
-security / style) with file:line and a suggested fix. Do NOT edit files — you have read-only tools.
+security / style) with file:line and a suggested fix. Do NOT edit files — your tool surface is enforced read-only.
 Be specific; skip nitpicks unless asked.
 `,
   "docs.md": `---
@@ -173,6 +204,7 @@ Each \`*.md\` here is a role-agent. Frontmatter:
 - \`rejects\` — keywords that exclude this role (REJECT)
 - \`model\` — optional model override
 - \`allowTools\` / \`denyTools\` — restrict the role's tools
+- \`readOnly\` — enforce read/search-only tools (defaults on for a role named \`reviewer\`)
 
 Run \`hara org "<task>"\` to dispatch a task to the owning role, or \`hara org --role <id> "<task>"\`.
 `,

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { walkFiles, dirPrefixes, listProjectFiles } from "../dist/fs-walk.js";
@@ -62,7 +63,49 @@ test("grep tool: matches across subdirs with path:line, skips node_modules", asy
     assert.ok(!out.includes("node_modules"), "ignores node_modules");
     const none = await getTool("grep").run({ pattern: "ZZZ_NOPE" }, { cwd: dir });
     assert.match(none, /No matches/);
+    // Rust regex intentionally rejects lookbehind; grep must retain the old JavaScript-regex capability
+    // by moving this pattern into the same bounded worker used when rg is absent.
+    const lookbehind = await getTool("grep").run({ pattern: "(?<=NEEDLE) here" }, { cwd: dir });
+    assert.match(lookbehind, /README\.md:2:/);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("grep tool: preserves regex support without rg via a bounded Node worker", async () => {
+  const dir = fixture();
+  const previousPath = process.env.PATH;
+  try {
+    process.env.PATH = ""; // Force the dependency-free worker path; process.execPath remains absolute.
+    const out = await getTool("grep").run({ pattern: "NEEDLE\\s+here", glob: "**/*.md" }, { cwd: dir });
+    assert.match(out, /README\.md:2:/);
+    assert.ok(!out.includes("src/app.ts"), "glob is enforced by the fallback worker");
+    const invalid = await getTool("grep").run({ pattern: "[" }, { cwd: dir });
+    assert.match(invalid, /invalid regex/i);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("grep tool: catastrophic JavaScript regex is isolated and hard-stopped", { timeout: 8000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-grep-redos-"));
+  const previousPath = process.env.PATH;
+  try {
+    writeFileSync(join(dir, "redos.txt"), `${"a".repeat(100_000)}!\n`);
+    process.env.PATH = ""; // Exercise the JavaScript-regex fallback, not rg's linear-time engine.
+    let eventLoopResponsive = false;
+    const tick = setTimeout(() => { eventLoopResponsive = true; }, 50);
+    const started = Date.now();
+    const out = await getTool("grep").run({ pattern: "^(a+)+$" }, { cwd: dir });
+    clearTimeout(tick);
+    assert.match(out, /safety timeout.*stopped/i);
+    assert.equal(eventLoopResponsive, true, "regex work never blocks the CLI event loop");
+    assert.ok(Date.now() - started < 7500, "worker obeys the five-second hard deadline");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -74,6 +117,13 @@ test("glob tool: ** matches nested, ls lists a dir", async () => {
     assert.match(g, /src\/app\.ts/);
     assert.match(g, /src\/deep\/util\.ts/);
     assert.ok(!/README\.md/.test(g), "glob *.ts excludes README");
+    const repeatedGlobstar = `${"**/".repeat(80)}*.ts`;
+    const started = Date.now();
+    const repeated = await getTool("glob").run({ pattern: repeatedGlobstar }, { cwd: dir });
+    assert.match(repeated, /src\/app\.ts/);
+    assert.ok(Date.now() - started < 500, "repeated globstars are handled without regex backtracking");
+    const oversized = await getTool("glob").run({ pattern: "*".repeat(257) }, { cwd: dir });
+    assert.match(oversized, /pattern exceeds 256/i);
     const l = await getTool("ls").run({ path: "src" }, { cwd: dir });
     assert.match(l, /deep\//, "ls shows subdir with trailing slash");
     assert.match(l, /app\.ts/);
@@ -112,6 +162,21 @@ test("edit_file: quote-normalized fallback matches curly quotes", async () => {
     const txt = readFileSync(f, "utf8");
     assert.match(txt, /world/);
     assert.ok(!txt.includes("hello"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("edit_file rejects a FIFO without blocking", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-edit-fifo-"));
+  try {
+    const fifo = join(dir, "source.pipe");
+    execFileSync("mkfifo", [fifo]);
+    const out = await getTool("edit_file").run(
+      { path: fifo, old_string: "before", new_string: "after" },
+      { cwd: dir },
+    );
+    assert.match(out, /not a regular file/i);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

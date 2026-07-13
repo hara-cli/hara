@@ -19,6 +19,14 @@ test("touched: most-recent-first, capped, clearable", async () => {
   assert.deepEqual(recentTouched(), [], "clearable");
 });
 
+test("touched files are isolated by serve session scope", () => {
+  clearTouched();
+  recordTouch("/work/foo/a.ts", "serve:a");
+  recordTouch("/work/foobar/secret.ts", "serve:b");
+  assert.deepEqual(recentTouched(5, "serve:a"), ["/work/foo/a.ts"]);
+  assert.deepEqual(recentTouched(5, "serve:b"), ["/work/foobar/secret.ts"]);
+});
+
 test("loop records MAIN-loop file-tool touches (quiet fan-outs don't pollute the working set)", async () => {
   clearTouched();
   const fileTool = {

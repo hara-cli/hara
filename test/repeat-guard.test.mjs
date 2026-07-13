@@ -41,6 +41,14 @@ test("streak keeps counting past 2 and resetRepeatGuard clears it", () => {
   assert.equal(recordCall("bash", args, "Command failed: 1"), "", "cleared");
 });
 
+test("failure streaks are isolated between concurrent serve sessions", () => {
+  const args = { command: "git pull" };
+  assert.equal(recordCall("bash", args, "Command failed: A", false, "serve:a"), "");
+  assert.equal(recordCall("bash", args, "Command failed: B", false, "serve:b"), "");
+  assert.match(recordCall("bash", args, "Command failed: A", false, "serve:a"), /FAILED 2×/);
+  assert.match(recordCall("bash", args, "Command failed: B", false, "serve:b"), /FAILED 2×/);
+});
+
 test("keyOf: space-separated identity + survives unserializable args", () => {
   assert.equal(keyOf("bash", { command: "ls" }), 'bash {"command":"ls"}');
   const cyc = {};

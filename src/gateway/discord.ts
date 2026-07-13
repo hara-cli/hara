@@ -4,9 +4,9 @@
 // the cross-platform gateway plumbing (send_file, in-chat system context, stuck-guard, image attach/describe)
 // works unchanged. NOTE: receiving message text needs the privileged "Message Content Intent" enabled for the
 // bot in the Discord developer portal.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, basename } from "node:path";
-import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
+import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
 const REST = "https://discord.com/api/v10";
@@ -24,15 +24,15 @@ const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
 
 const isImage = (name: string, mime?: string): boolean => (mime?.startsWith("image/") ?? false) || /\.(png|jpe?g|gif|webp)$/i.test(name);
 
-async function downloadDiscordAttachment(url: string, filename: string): Promise<string | null> {
+async function downloadDiscordAttachment(
+  url: string,
+  filename: string,
+  options: { maxBytes: number; signal: AbortSignal },
+): Promise<string | null> {
   try {
-    const r = await fetch(url);
+    const r = await fetch(url, { signal: options.signal });
     if (!r.ok) return null;
-    const dir = join(homedir(), ".hara", "discord", "media");
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, `dc_${Date.now()}_${basename(filename) || "file.bin"}`);
-    writeFileSync(path, Buffer.from(await r.arrayBuffer()));
-    return path;
+    return await savePrivateResponse(r, { platform: "discord", filenameHint: filename, ...options });
   } catch {
     return null;
   }
@@ -40,7 +40,13 @@ async function downloadDiscordAttachment(url: string, filename: string): Promise
 
 /** Parse a Discord MESSAGE_CREATE payload → InboundMsg + its image attachment URLs (pure; download happens in
  *  start()). null = ignore (own message / another bot / empty). */
-export function parseDiscordMessage(d: any, selfId: string): { msg: InboundMsg; imageUrls: { url: string; name: string }[] } | null {
+export function discordChatType(message: any, resolvedChannelType?: unknown): "p2p" | "group" {
+  if (message?.guild_id) return "group";
+  // Discord channel type 1 is a one-to-one DM; type 3 is a group DM. Missing/failed REST metadata stays group.
+  return Number(resolvedChannelType) === 1 ? "p2p" : "group";
+}
+
+export function parseDiscordMessage(d: any, selfId: string, resolvedChannelType?: unknown): { msg: InboundMsg; imageUrls: { url: string; name: string }[] } | null {
   if (!d?.channel_id || !d?.author?.id) return null;
   if (d.author.id === selfId || d.author.bot) return null; // ignore our own messages + other bots
   const atts = Array.isArray(d.attachments) ? d.attachments : [];
@@ -55,6 +61,7 @@ export function parseDiscordMessage(d: any, selfId: string): { msg: InboundMsg; 
       userId: String(d.author.id),
       userName: d.author.global_name || d.author.username || String(d.author.id),
       text: text || "[图片]",
+      chatType: discordChatType(d, resolvedChannelType),
     },
     imageUrls,
   };
@@ -79,13 +86,13 @@ export function discordAdapter(token: string): ChatAdapter {
       form.append("files[0]", new Blob([readFileSync(filePath)]), basename(filePath));
       await fetch(`${REST}/channels/${chatId}/messages`, { method: "POST", headers: auth, body: form }).catch(() => {});
     },
-    async start(onMessage, signal) {
+    async start(onMessage, signal, shouldDownload) {
       if (!WSImpl) {
         console.error("hara gateway: Discord needs Node ≥ 22 (global WebSocket). Upgrade Node.");
         return;
       }
       while (!signal.aborted) {
-        await connectOnce(token, onMessage, signal);
+        await connectOnce(token, onMessage, signal, shouldDownload);
         if (!signal.aborted) await sleep(3000, signal); // reconnect backoff
       }
     },
@@ -94,9 +101,15 @@ export function discordAdapter(token: string): ChatAdapter {
 
 /** One gateway connection: HELLO→heartbeat, IDENTIFY, then dispatch MESSAGE_CREATE. Resolves on close/abort;
  *  the caller reconnects. v1 keeps it simple — fresh IDENTIFY each time, no RESUME. */
-function connectOnce(token: string, onMessage: (m: InboundMsg) => Promise<void>, signal: AbortSignal): Promise<void> {
+function connectOnce(
+  token: string,
+  onMessage: (m: InboundMsg) => Promise<void>,
+  signal: AbortSignal,
+  shouldDownload?: (m: InboundMsg) => boolean,
+): Promise<void> {
   return new Promise((resolve) => {
     const ws = new WSImpl(GATEWAY);
+    const channelTypes = new Map<string, number>();
     let hb: ReturnType<typeof setInterval> | null = null;
     let seq: number | null = null;
     let selfId = "";
@@ -138,11 +151,41 @@ function connectOnce(token: string, onMessage: (m: InboundMsg) => Promise<void>,
       } else if (p.op === 0) {
         if (p.t === "READY") selfId = p.d?.user?.id ?? "";
         else if (p.t === "MESSAGE_CREATE") {
+          // Parse/filter first with the safe group default, then resolve non-guild channel metadata only for a
+          // real user message. Channel type is immutable, so known results are safe to cache for this connection.
           const parsed = parseDiscordMessage(p.d, selfId);
           if (parsed) {
-            for (const im of parsed.imageUrls) {
-              const path = await downloadDiscordAttachment(im.url, im.name);
-              if (path) (parsed.msg.images ??= []).push(path);
+            if (!p.d?.guild_id) {
+              const channelId = String(p.d?.channel_id ?? "");
+              let channelType = channelTypes.get(channelId);
+              if (channelType === undefined && channelId) {
+                try {
+                  const response = await fetch(`${REST}/channels/${encodeURIComponent(channelId)}`, {
+                    headers: { Authorization: `Bot ${token}` },
+                    signal,
+                  });
+                  const body = response.ok ? ((await response.json()) as { type?: unknown }) : null;
+                  const candidate = Number(body?.type);
+                  if (Number.isSafeInteger(candidate)) {
+                    channelType = candidate;
+                    channelTypes.set(channelId, candidate);
+                    if (channelTypes.size > 1000) channelTypes.delete(channelTypes.keys().next().value!);
+                  }
+                } catch {
+                  /* cannot prove a DM → retain the safe group classification and retry on the next message */
+                }
+              }
+              parsed.msg.chatType = discordChatType(p.d, channelType);
+            }
+            if (shouldDownload?.(parsed.msg) === true) {
+              const budget = new InboundMediaBudget("discord", signal);
+              for (const im of parsed.imageUrls) {
+                const path = await budget.download((options) => downloadDiscordAttachment(im.url, im.name, options));
+                if (path) {
+                  (parsed.msg.images ??= []).push(path);
+                  (parsed.msg.transientFiles ??= []).push(path);
+                }
+              }
             }
             await onMessage(parsed.msg).catch(() => {});
           }

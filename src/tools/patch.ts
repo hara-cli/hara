@@ -1,13 +1,16 @@
 // apply_patch — change MULTIPLE files atomically (all-or-nothing). Everything is validated and
 // computed in memory first; nothing is written unless every change applies cleanly.
-import { lstat, readFile, unlink } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { linkSync, lstatSync, readlinkSync, symlinkSync } from "node:fs";
+import { lstat, readlink, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { registerTool } from "./registry.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
-import { atomicWriteText, FileChangedError } from "../fs-write.js";
+import { atomicWriteText, discardClaimedPath, FileChangedError, removeCreatedDirectories, type AtomicWriteResult } from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
+import { readRegularFileSnapshot, readRegularFileSnapshotNoFollow, type RegularFileSnapshot } from "../fs-read.js";
 
 interface Change {
   path: string;
@@ -23,6 +26,153 @@ interface Plan {
   before: string;
   after: string | null; // null = delete
   existed: boolean; // did the file exist before (for undo: false → undo deletes)
+  beforeMode?: number;
+  beforeIdentity?: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">;
+  beforePathIdentity?: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">;
+  beforeLinkTarget?: string;
+  committed?: AtomicWriteResult;
+  quarantine?: string;
+}
+
+async function restoreMovedFile(quarantine: string, target: string): Promise<void> {
+  let identity;
+  try {
+    // Keep source inspection + create-if-absent in one JS turn. The subsequent discard performs another
+    // synchronous identity claim, so a watcher cannot turn cleanup into an unlink of an unrelated entry.
+    const info = lstatSync(quarantine);
+    const linkTarget = info.isSymbolicLink() ? readlinkSync(quarantine) : undefined;
+    if (linkTarget !== undefined) symlinkSync(linkTarget, target);
+    else linkSync(quarantine, target);
+    identity = {
+      dev: info.dev,
+      ino: info.ino,
+      mode: info.mode & 0o777,
+      nlink: info.nlink + (linkTarget === undefined ? 1 : 0),
+      linkTarget,
+    };
+  } catch (error: any) {
+    if (error?.code === "EEXIST") {
+      throw new Error(`another file appeared at ${target}; the concurrently moved file is preserved at ${quarantine}`);
+    }
+    throw error;
+  }
+  discardClaimedPath(quarantine, identity);
+}
+
+/** Roll back a file we wrote without read→unlink/rename TOCTOU. First atomically move whichever inode is
+ * currently at the path aside, then inspect that moved inode. A concurrent replacement is restored with
+ * create-if-absent and never deleted/overwritten. */
+async function rollbackWrittenPlan(plan: Plan): Promise<void> {
+  if (!plan.committed || plan.after === null) throw new Error(`missing commit identity for ${plan.path}`);
+  const target = plan.committed.target;
+  const quarantine = join(dirname(target), `.hara-rollback-${process.pid}-${randomUUID()}.tmp`);
+  // atomicWriteText follows a destination symlink and replaces its real target. Roll back that exact returned
+  // target path; moving plan.abs would destroy the symlink while leaving the changed target untouched.
+  await rename(target, quarantine);
+
+  let current: RegularFileSnapshot;
+  try {
+    current = await readRegularFileSnapshotNoFollow(quarantine);
+  } catch (error) {
+    await restoreMovedFile(quarantine, target);
+    throw error;
+  }
+  const owned = current.dev === plan.committed.dev && current.ino === plan.committed.ino && current.mode === plan.committed.mode && current.nlink === plan.committed.nlink && current.text === plan.after;
+  if (!owned) {
+    await restoreMovedFile(quarantine, target);
+    throw new FileChangedError(plan.path);
+  }
+
+  if (plan.type === "create") {
+    discardClaimedPath(quarantine, plan.committed);
+    await removeCreatedDirectories(plan.committed.createdDirs);
+    return;
+  }
+  if (plan.beforeMode === undefined) {
+    await restoreMovedFile(quarantine, target);
+    throw new Error(`missing preflight mode for ${plan.path}`);
+  }
+  try {
+    await atomicWriteText(target, plan.before, { expected: null, mode: plan.beforeMode });
+  } catch (error) {
+    try {
+      await restoreMovedFile(quarantine, target);
+    } catch (restoreError: any) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; could not restore quarantine: ${restoreError?.message ?? String(restoreError)}`);
+    }
+    throw error;
+  }
+  discardClaimedPath(quarantine, plan.committed);
+}
+
+async function quarantineExpectedDelete(plan: Plan): Promise<void> {
+  if (!plan.beforeIdentity || !plan.beforePathIdentity || plan.beforeMode === undefined) throw new Error(`missing preflight identity for ${plan.path}`);
+  // Keep the initially moved path private until it has been verified. A directory watcher must not be able
+  // to mistake an unverified staging entry for the durable delete quarantine used by the commit/cleanup
+  // phases. Recording it immediately also lets the outer rollback recover (or accurately report) a failure
+  // that happens after rename but before verification completes.
+  const staging = join(dirname(plan.abs), `.hara-stage-delete-${process.pid}-${randomUUID()}.tmp`);
+  await rename(plan.abs, staging);
+  plan.quarantine = staging;
+  const movedPath = await lstat(staging);
+  const samePath = movedPath.dev === plan.beforePathIdentity.dev && movedPath.ino === plan.beforePathIdentity.ino && (movedPath.mode & 0o777) === plan.beforePathIdentity.mode && movedPath.nlink === plan.beforePathIdentity.nlink;
+  const isExpectedLink = plan.beforeLinkTarget !== undefined;
+  const sameLink = movedPath.isSymbolicLink() === isExpectedLink && (!isExpectedLink || await readlink(staging) === plan.beforeLinkTarget);
+  if (!samePath || !sameLink) throw new FileChangedError(plan.path);
+  const moved = isExpectedLink
+    ? await readRegularFileSnapshot(staging)
+    : await readRegularFileSnapshotNoFollow(staging);
+  if (moved.dev !== plan.beforeIdentity.dev || moved.ino !== plan.beforeIdentity.ino || moved.mode !== plan.beforeMode || moved.nlink !== plan.beforeIdentity.nlink || moved.text !== plan.before) {
+    throw new FileChangedError(plan.path);
+  }
+  const quarantine = join(dirname(plan.abs), `.hara-delete-${process.pid}-${randomUUID()}.tmp`);
+  await rename(staging, quarantine);
+  plan.quarantine = quarantine;
+}
+
+/** Move a delete quarantine to a fresh name and verify that exact moved path before restore/cleanup. If a
+ * concurrent process replaced the known quarantine name, preserve the unexpected inode and fail closed. */
+async function claimDeleteQuarantine(plan: Plan, purpose: "restore" | "cleanup"): Promise<string> {
+  if (!plan.quarantine || !plan.beforePathIdentity || !plan.beforeIdentity || plan.beforeMode === undefined) {
+    throw new Error(`missing delete quarantine identity for ${plan.path}`);
+  }
+  const claimed = join(dirname(plan.quarantine), `.hara-${purpose}-${process.pid}-${randomUUID()}.tmp`);
+  await rename(plan.quarantine, claimed);
+  try {
+    const pathInfo = await lstat(claimed);
+    const expectedPath = plan.beforePathIdentity;
+    const expectedLink = plan.beforeLinkTarget !== undefined;
+    if (
+      pathInfo.dev !== expectedPath.dev ||
+      pathInfo.ino !== expectedPath.ino ||
+      (pathInfo.mode & 0o777) !== expectedPath.mode ||
+      pathInfo.nlink !== expectedPath.nlink ||
+      pathInfo.isSymbolicLink() !== expectedLink ||
+      (expectedLink && await readlink(claimed) !== plan.beforeLinkTarget)
+    ) {
+      throw new FileChangedError(plan.path);
+    }
+    if (!expectedLink) {
+      const file = await readRegularFileSnapshotNoFollow(claimed);
+      if (
+        file.dev !== plan.beforeIdentity.dev ||
+        file.ino !== plan.beforeIdentity.ino ||
+        file.mode !== plan.beforeMode ||
+        file.nlink !== plan.beforeIdentity.nlink ||
+        file.text !== plan.before
+      ) {
+        throw new FileChangedError(plan.path);
+      }
+    }
+    return claimed;
+  } catch (error) {
+    try {
+      await restoreMovedFile(claimed, plan.quarantine);
+    } catch (restoreError: any) {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; unexpected quarantine is preserved at ${claimed}: ${restoreError?.message ?? String(restoreError)}`);
+    }
+    throw error;
+  }
 }
 
 registerTool({
@@ -93,13 +243,28 @@ registerTool({
       }
 
       if (type === "delete") {
-        let before: string;
+        let before: RegularFileSnapshot;
+        let pathInfo: Awaited<ReturnType<typeof lstat>>;
+        let beforeLinkTarget: string | undefined;
         try {
-          before = await readFile(p, "utf8");
-        } catch {
-          return `Error: ${tag} delete ${ch.path}: file not found. Nothing written.`;
+          pathInfo = await lstat(p);
+          if (pathInfo.isSymbolicLink()) beforeLinkTarget = await readlink(p);
+          before = await readRegularFileSnapshot(p);
+        } catch (error: any) {
+          return `Error: ${tag} delete ${ch.path}: ${error?.message ?? "file not found"}. Nothing written.`;
         }
-        plans.push({ path: ch.path, abs: p, type, before, after: null, existed: true });
+        plans.push({
+          path: ch.path,
+          abs: p,
+          type,
+          before: before.text,
+          beforeMode: before.mode,
+          beforeIdentity: { dev: before.dev, ino: before.ino, mode: before.mode, nlink: before.nlink },
+          beforePathIdentity: { dev: pathInfo.dev, ino: pathInfo.ino, mode: pathInfo.mode & 0o777, nlink: pathInfo.nlink },
+          beforeLinkTarget,
+          after: null,
+          existed: true,
+        });
       } else if (type === "create") {
         if (typeof ch.content !== "string") return `Error: ${tag} create ${ch.path} needs \`content\`. Nothing written.`;
         try {
@@ -111,18 +276,18 @@ registerTool({
         plans.push({ path: ch.path, abs: p, type, before: "", after: ch.content, existed: false });
       } else {
         // update
-        let before: string;
+        let before: RegularFileSnapshot;
         try {
-          before = await readFile(p, "utf8");
-        } catch {
-          return `Error: ${tag} update ${ch.path}: cannot read (use type:create for a new file). Nothing written.`;
+          before = await readRegularFileSnapshot(p);
+        } catch (error: any) {
+          return `Error: ${tag} update ${ch.path}: cannot read (${error?.message ?? "unknown error"}; use type:create for a new file). Nothing written.`;
         }
         if (typeof ch.content === "string" && !ch.edits) {
-          plans.push({ path: ch.path, abs: p, type, before, after: ch.content, existed: true });
+          plans.push({ path: ch.path, abs: p, type, before: before.text, beforeMode: before.mode, beforeIdentity: { dev: before.dev, ino: before.ino, mode: before.mode, nlink: before.nlink }, after: ch.content, existed: true });
         } else {
-          const res = applyEdits(before, ch.edits ?? []);
+          const res = applyEdits(before.text, ch.edits ?? []);
           if ("error" in res) return `Error: ${tag} ${ch.path} — ${res.error}. Nothing written.`;
-          plans.push({ path: ch.path, abs: p, type, before, after: res.text, existed: true });
+          plans.push({ path: ch.path, abs: p, type, before: before.text, beforeMode: before.mode, beforeIdentity: { dev: before.dev, ino: before.ino, mode: before.mode, nlink: before.nlink }, after: res.text, existed: true });
         }
       }
     }
@@ -133,25 +298,35 @@ registerTool({
     try {
       for (const pl of plans) {
         if (pl.type === "delete") {
-          let current: string;
-          try {
-            current = await readFile(pl.abs, "utf8");
-          } catch {
-            throw new FileChangedError(pl.path);
-          }
-          if (current !== pl.before) throw new FileChangedError(pl.path);
-          await unlink(pl.abs);
+          // Atomic move-then-inspect: a replacement inode is moved aside and restored, never unlinked.
+          // The expected inode remains quarantined until every other patch step has committed.
+          await quarantineExpectedDelete(pl);
         } else {
-          await atomicWriteText(pl.abs, pl.after as string, { expected: pl.existed ? pl.before : null });
+          pl.committed = await atomicWriteText(pl.abs, pl.after as string, {
+            expected: pl.existed ? pl.before : null,
+            expectedIdentity: pl.existed ? pl.beforeIdentity : undefined,
+          });
         }
         applied.push(pl);
       }
     } catch (e) {
       const rollbackFailures: string[] = [];
-      for (const pl of applied.reverse()) {
+      // A delete becomes a visible mutation at its first rename, before its verification can finish. Include
+      // that partially staged plan in rollback instead of claiming that an empty `applied` list means the
+      // tree was untouched.
+      const rollbackPlans = [...applied];
+      for (const pl of plans) {
+        if (pl.quarantine && !rollbackPlans.includes(pl)) rollbackPlans.push(pl);
+      }
+      for (const pl of rollbackPlans.reverse()) {
         try {
-          if (pl.type === "create" && !pl.existed) await unlink(pl.abs); // remove a file we created
-          else await atomicWriteText(pl.abs, pl.before); // restore an updated/deleted file's prior content
+          if (pl.type === "delete") {
+            if (!pl.quarantine) throw new Error(`missing delete quarantine for ${pl.path}`);
+            const claimed = await claimDeleteQuarantine(pl, "restore");
+            await restoreMovedFile(claimed, pl.abs);
+          } else {
+            await rollbackWrittenPlan(pl);
+          }
         } catch (rollbackError: any) {
           rollbackFailures.push(`${pl.path}: ${rollbackError?.message ?? String(rollbackError)}`);
         }
@@ -161,13 +336,38 @@ registerTool({
       }
       return `Error: apply_patch failed writing a file (${e instanceof Error ? e.message : String(e)}) — rolled back, nothing left changed.`;
     }
+    // Deletes become final only after every commit step succeeds. Cleanup cannot affect visible paths;
+    // report a rare failure rather than rolling back after another quarantine may already be removed.
+    const cleanupFailures: string[] = [];
+    for (const pl of plans) {
+      for (const warning of pl.committed?.warnings ?? []) cleanupFailures.push(`${pl.path}: ${warning}`);
+    }
+    for (const pl of plans) {
+      if (!pl.quarantine) continue;
+      try {
+        const claimed = await claimDeleteQuarantine(pl, "cleanup");
+        if (!pl.beforePathIdentity) throw new Error(`missing delete path identity for ${pl.path}`);
+        discardClaimedPath(claimed, { ...pl.beforePathIdentity, linkTarget: pl.beforeLinkTarget });
+      } catch (error: any) {
+        cleanupFailures.push(`${pl.path}: old entry cleanup was refused (${error?.message ?? String(error)})`);
+      }
+    }
     // All writes succeeded → now show diffs + record the undo snapshot.
     const summary = plans.map((pl) => {
       emitDiff(pl.path, pl.before, pl.type === "delete" ? "" : (pl.after as string), ctx.ui);
       return pl.type === "delete" ? `deleted ${pl.path}` : `${pl.type === "create" ? "created" : "updated"} ${pl.path}`;
     });
-    recordEdit(plans.map((pl) => ({ path: pl.path, absPath: pl.abs, before: pl.existed ? pl.before : null })));
+    recordEdit(plans.map((pl) => ({
+      path: pl.path,
+      absPath: pl.abs,
+      before: pl.existed ? pl.before : null,
+      beforeMode: pl.beforeMode,
+      linkTarget: pl.type === "delete" ? pl.beforeLinkTarget : undefined,
+      removed: pl.type === "delete",
+      committed: pl.committed,
+      after: pl.after ?? undefined,
+    })));
     invalidateFileCandidates(ctx.cwd);
-    return `apply_patch: ${plans.length} file(s) — ${summary.join("; ")}.`;
+    return `apply_patch: ${plans.length} file(s) — ${summary.join("; ")}.` + (cleanupFailures.length ? ` Warning: ${cleanupFailures.join("; ")}` : "");
   },
 });

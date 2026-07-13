@@ -4,9 +4,9 @@
 // allow users via HARA_GATEWAY_ALLOWED (Mattermost user ids). Same ChatAdapter shape as Telegram/Discord, so all
 // the cross-platform gateway plumbing (send_file, in-chat system context, stuck-guard, image attach/describe)
 // works unchanged. Auth is a WS "authentication_challenge" rather than an HTTP header.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, basename } from "node:path";
-import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { basename } from "node:path";
+import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
 const WSImpl: any = (globalThis as any).WebSocket;
@@ -30,17 +30,20 @@ function wsUrlFromBase(base: string): string {
   return normalizeBase(base).replace(/^http/i, "ws") + "/api/v4/websocket";
 }
 
-async function downloadMattermostFile(base: string, token: string, fileId: string, name: string): Promise<string | null> {
+async function downloadMattermostFile(
+  base: string,
+  token: string,
+  fileId: string,
+  name: string,
+  options: { maxBytes: number; signal: AbortSignal },
+): Promise<string | null> {
   try {
     const r = await fetch(`${normalizeBase(base)}/api/v4/files/${encodeURIComponent(fileId)}`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: options.signal,
     });
     if (!r.ok) return null;
-    const dir = join(homedir(), ".hara", "mattermost", "media");
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, `mm_${Date.now()}_${basename(name) || "file.bin"}`);
-    writeFileSync(path, Buffer.from(await r.arrayBuffer()));
-    return path;
+    return await savePrivateResponse(r, { platform: "mattermost", filenameHint: name, ...options });
   } catch {
     return null;
   }
@@ -49,7 +52,12 @@ async function downloadMattermostFile(base: string, token: string, fileId: strin
 /** Parse a Mattermost "posted" event's post → InboundMsg + its image file ids (pure; download happens in
  *  start()). The post is the already-parsed object (the event's data.post is a JSON string the caller decodes).
  *  null = ignore (own post / system post / empty). */
-export function parseMattermostPost(post: any, selfUserId: string): { msg: InboundMsg; imageFileIds: string[] } | null {
+export function mattermostChatType(channelType: unknown): "p2p" | "group" {
+  // Mattermost channel types: D=direct, G=group DM, O=open, P=private. Unknown is never assumed to be a DM.
+  return String(channelType ?? "").trim().toUpperCase() === "D" ? "p2p" : "group";
+}
+
+export function parseMattermostPost(post: any, selfUserId: string, channelType?: unknown): { msg: InboundMsg; imageFileIds: string[] } | null {
   if (!post?.channel_id || !post?.user_id) return null;
   if (post.user_id === selfUserId) return null; // ignore our own posts
   if (post.type) return null; // system post (join/leave/etc.) — type "" is a normal user post
@@ -65,6 +73,7 @@ export function parseMattermostPost(post: any, selfUserId: string): { msg: Inbou
       userId: String(post.user_id),
       userName: String(post.user_id), // enriched by start() from the event's sender_name when available
       text: text || "[图片]",
+      chatType: mattermostChatType(channelType),
     },
     imageFileIds,
   };
@@ -101,13 +110,13 @@ export function mattermostAdapter(serverUrl: string, token: string): ChatAdapter
         body: JSON.stringify({ channel_id: chatId, message: "", file_ids: [fileId] }),
       }).catch(() => {});
     },
-    async start(onMessage, signal) {
+    async start(onMessage, signal, shouldDownload) {
       if (!WSImpl) {
         console.error("hara gateway: Mattermost needs Node ≥ 22 (global WebSocket). Upgrade Node.");
         return;
       }
       while (!signal.aborted) {
-        await connectOnce(base, token, onMessage, signal);
+        await connectOnce(base, token, onMessage, signal, shouldDownload);
         if (!signal.aborted) await sleep(3000, signal); // reconnect backoff
       }
     },
@@ -117,7 +126,13 @@ export function mattermostAdapter(serverUrl: string, token: string): ChatAdapter
 /** One WS connection: send authentication_challenge, then dispatch "posted" events. Resolves on close/abort;
  *  the caller reconnects. v1 keeps it simple — fresh auth each time, no resume. The bot's own user id is
  *  resolved via GET /users/me so we can drop our own echoes. */
-function connectOnce(base: string, token: string, onMessage: (m: InboundMsg) => Promise<void>, signal: AbortSignal): Promise<void> {
+function connectOnce(
+  base: string,
+  token: string,
+  onMessage: (m: InboundMsg) => Promise<void>,
+  signal: AbortSignal,
+  shouldDownload?: (m: InboundMsg) => boolean,
+): Promise<void> {
   return new Promise((resolve) => {
     const ws = new WSImpl(wsUrlFromBase(base));
     let seq = 1;
@@ -165,28 +180,39 @@ function connectOnce(base: string, token: string, onMessage: (m: InboundMsg) => 
       } catch {
         return;
       }
-      const parsed = parseMattermostPost(post, selfId);
+      const parsed = parseMattermostPost(post, selfId, p.data?.channel_type);
       if (!parsed) return;
       // enrich the display name from the event payload when the server includes it
       const senderName = String(p.data?.sender_name ?? "").replace(/^@/, "");
       if (senderName) parsed.msg.userName = senderName;
-      for (const fid of parsed.imageFileIds) {
-        // resolve the file's mime/name, then download only images so the agent can SEE them
-        let name = "image";
-        let mime = "";
-        try {
-          const info = await fetch(`${base}/api/v4/files/${encodeURIComponent(fid)}/info`, { headers: { Authorization: `Bearer ${token}` } });
-          if (info.ok) {
-            const ij = (await info.json()) as { name?: string; mime_type?: string };
-            name = String(ij?.name ?? name);
-            mime = String(ij?.mime_type ?? "");
+      if (shouldDownload?.(parsed.msg) === true) {
+        const budget = new InboundMediaBudget("mattermost", signal);
+        for (const fid of parsed.imageFileIds) {
+          const path = await budget.download(async (options) => {
+            // Resolve mime/name inside the same bounded slot; metadata is part of the download lifecycle too.
+            let name = "image";
+            let mime = "";
+            try {
+              const info = await fetch(`${base}/api/v4/files/${encodeURIComponent(fid)}/info`, {
+                headers: { Authorization: `Bearer ${token}` },
+                signal: options.signal,
+              });
+              if (info.ok) {
+                const ij = (await info.json()) as { name?: string; mime_type?: string };
+                name = String(ij?.name ?? name);
+                mime = String(ij?.mime_type ?? "");
+              }
+            } catch {
+              /* fall back to extension sniff below */
+            }
+            if (!isImage(name, mime)) return null;
+            return downloadMattermostFile(base, token, fid, name, options);
+          });
+          if (path) {
+            (parsed.msg.images ??= []).push(path);
+            (parsed.msg.transientFiles ??= []).push(path);
           }
-        } catch {
-          /* fall back to extension sniff below */
         }
-        if (!isImage(name, mime)) continue;
-        const path = await downloadMattermostFile(base, token, fid, name);
-        if (path) (parsed.msg.images ??= []).push(path);
       }
       await onMessage(parsed.msg).catch(() => {});
     });

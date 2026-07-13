@@ -3,7 +3,8 @@
 // dir under approval "suggest" forces the confirm gate).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
@@ -112,6 +113,109 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
   quietDiscovery: true,
 });
 
+const reservePort = () => new Promise((resolve, reject) => {
+  const server = createServer();
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => {
+    const port = server.address().port;
+    server.close((error) => error ? reject(error) : resolve(port));
+  });
+});
+
+const assertPortCanListen = (port) => new Promise((resolve, reject) => {
+  const server = createServer();
+  server.once("error", reject);
+  server.listen(port, "127.0.0.1", () => server.close((error) => error ? reject(error) : resolve()));
+});
+
+const hangingCompactProvider = () => {
+  let calls = 0;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  let compactSignal;
+  return {
+    provider: {
+      id: "fake",
+      model: "fake-1",
+      turn({ onText, signal }) {
+        if (calls++ === 0) {
+          onText("ready");
+          return Promise.resolve({ text: "ready", toolUses: [], stop: "end", usage: { input: 1, output: 1 } });
+        }
+        compactSignal = signal;
+        markStarted();
+        return new Promise(() => {}); // intentionally ignores abort: serve must settle its own operation
+      },
+    },
+    started,
+    signal: () => compactSignal,
+  };
+};
+
+test("serve discovery: private atomic replacement, symlink safety, and instance-owned cleanup", { timeout: 10000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-serve-home-"));
+  const haraDir = join(home, ".hara");
+  const discoveryPath = join(haraDir, "serve.json");
+  const victimPath = join(home, "victim.txt");
+  mkdirSync(haraDir, { mode: 0o777 });
+  chmodSync(haraDir, 0o777);
+  writeFileSync(discoveryPath, "legacy", { mode: 0o644 });
+  chmodSync(discoveryPath, 0o644);
+  const deps = { ...baseDeps(textProvider, memStore()), quietDiscovery: false, discoveryHome: home };
+  let legacy;
+  let older;
+  let newer;
+  try {
+    legacy = await startServe({ host: "127.0.0.1", port: 0, token: "legacy-token", cwd: home }, deps);
+    assert.equal(statSync(haraDir).mode & 0o777, 0o700, "legacy ~/.hara mode is tightened");
+    assert.equal(statSync(discoveryPath).mode & 0o777, 0o600, "legacy 0644 discovery is replaced privately");
+    assert.equal(JSON.parse(readFileSync(discoveryPath, "utf8")).token, "legacy-token");
+    await legacy.close();
+    legacy = undefined;
+
+    writeFileSync(victimPath, "do not follow me", { mode: 0o644 });
+    symlinkSync(victimPath, discoveryPath);
+    older = await startServe({ host: "127.0.0.1", port: 0, token: "older-token", cwd: home }, deps);
+    const olderRecord = JSON.parse(readFileSync(discoveryPath, "utf8"));
+    assert.equal(lstatSync(discoveryPath).isSymbolicLink(), false, "serve.json symlink inode was replaced");
+    assert.equal(readFileSync(victimPath, "utf8"), "do not follow me", "symlink target was untouched");
+    assert.ok(olderRecord.instanceId, "discovery is stamped with an instance nonce");
+
+    newer = await startServe({ host: "127.0.0.1", port: 0, token: "newer-token", cwd: home }, deps);
+    const newerRecord = JSON.parse(readFileSync(discoveryPath, "utf8"));
+    assert.notEqual(newerRecord.instanceId, olderRecord.instanceId);
+    await older.close();
+    older = undefined;
+    assert.equal(JSON.parse(readFileSync(discoveryPath, "utf8")).instanceId, newerRecord.instanceId, "old close preserved newer discovery");
+    await newer.close();
+    newer = undefined;
+    assert.equal(existsSync(discoveryPath), false, "owning instance removes its discovery on close");
+  } finally {
+    await legacy?.close();
+    await older?.close();
+    await newer?.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("serve discovery: a write failure closes the already-listening socket", { timeout: 10000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-serve-bad-home-"));
+  writeFileSync(join(home, ".hara"), "not a directory");
+  const port = await reservePort();
+  try {
+    await assert.rejects(
+      startServe(
+        { host: "127.0.0.1", port, token: "tok", cwd: home },
+        { ...baseDeps(textProvider, memStore()), quietDiscovery: false, discoveryHome: home },
+      ),
+      /EEXIST|ENOTDIR|directory/i,
+    );
+    await assertPortCanListen(port);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: auth gate → create → send streams text events and returns the reply", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-"));
   const store = memStore();
@@ -167,6 +271,278 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     c.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: live metadata and resume are serialized with an active turn", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-busy-"));
+  const store = memStore();
+  let markStarted;
+  let finishTurn;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn() {
+      markStarted();
+      return new Promise((resolve) => {
+        finishTurn = () => resolve({ text: "finished", toolUses: [], stop: "end", usage: { input: 1, output: 1 } });
+      });
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  let sending;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    sending = c.call("session.send", { sessionId: result.sessionId, text: "hold this turn" });
+    await started;
+
+    for (const [method, params] of [
+      ["session.resume", { sessionId: result.sessionId }],
+      ["session.rename", { sessionId: result.sessionId, title: "racy title" }],
+      ["session.archive", { sessionId: result.sessionId, archived: true }],
+    ]) {
+      const response = await c.call(method, params);
+      assert.equal(response.error.code, -32002, `${method} rejects while the turn is active`);
+    }
+    assert.equal(store.saved.get(result.sessionId).meta.title, "", "busy rename did not persist");
+    assert.equal(store.saved.get(result.sessionId).meta.archived, undefined, "busy archive did not persist");
+
+    finishTurn();
+    const sent = await sending;
+    assert.equal(sent.result.reply, "finished");
+    assert.equal((await c.call("session.rename", { sessionId: result.sessionId, title: "settled title" })).result.title, "settled title");
+    assert.equal((await c.call("session.archive", { sessionId: result.sessionId, archived: true })).result.archived, true);
+  } finally {
+    finishTurn?.();
+    if (sending) await sending.catch(() => {});
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: failed and empty turns never replay an earlier assistant reply", { timeout: 20000 }, async () => {
+  for (const mode of ["error", "empty"]) {
+    const dir = mkdtempSync(join(tmpdir(), `hara-serve-${mode}-`));
+    let calls = 0;
+    const provider = {
+      id: "fake",
+      model: "fake-1",
+      async turn({ onText }) {
+        calls++;
+        if (calls === 1) {
+          onText("previous success");
+          return { text: "previous success", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+        }
+        if (mode === "error") {
+          return { text: "", toolUses: [], stop: "error", errorMsg: "upstream exploded", usage: { input: 1, output: 0 } };
+        }
+        return { text: "", toolUses: [], stop: "end", usage: { input: 1, output: 0 } };
+      },
+    };
+    const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, memStore()));
+    const c = await connect(srv.port);
+    try {
+      await c.call("initialize", { token: "tok" });
+      const { result } = await c.call("session.create", {});
+      assert.equal((await c.call("session.send", { sessionId: result.sessionId, text: "first" })).result.reply, "previous success");
+
+      const failed = await c.call("session.send", { sessionId: result.sessionId, text: "now fail" });
+      assert.equal(failed.error.code, -32603, `${mode} is an explicit RPC failure`);
+      assert.doesNotMatch(failed.error.message, /previous success/, `${mode} did not reuse old assistant text`);
+      assert.match(failed.error.message, mode === "error" ? /upstream exploded/ : /empty response/);
+      const turnEnd = c.events.filter((event) => event.method === "event.turn_end").at(-1);
+      assert.equal(turnEnd.params.status, mode);
+      assert.equal(turnEnd.params.reply, "", `${mode} event has no stale reply`);
+    } finally {
+      c.close();
+      await srv.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("serve e2e: graceful close aborts turns, closes clients, releases settled locks, and is idempotent", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-close-"));
+  const store = memStore();
+  const released = [];
+  store.release = (id) => released.push(id);
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  let aborted = false;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ signal }) {
+      markStarted();
+      return new Promise((resolve) => {
+        const interrupt = () => {
+          aborted = true;
+          resolve({ text: "", toolUses: [], stop: "error", errorMsg: "interrupted", usage: { input: 0, output: 0 } });
+        };
+        if (signal?.aborted) interrupt();
+        else signal?.addEventListener("abort", interrupt, { once: true });
+      });
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    void c.call("session.send", { sessionId: result.sessionId, text: "keep running" });
+    await started;
+    const socketClosed = new Promise((resolve) => c.ws.once("close", resolve));
+    const outcome = await Promise.race([
+      srv.close().then(() => "closed"),
+      new Promise((resolve) => setTimeout(() => resolve("timeout"), 3_000)),
+    ]);
+    assert.equal(outcome, "closed", "close is bounded even with a connected WebSocket");
+    await socketClosed;
+    assert.equal(aborted, true, "active provider received the shutdown abort");
+    assert.ok(released.includes(result.sessionId), "a settled turn's session lock was released");
+    await srv.close(); // repeat callers share the completed close promise
+  } finally {
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: operations settling after shutdown grace release their retained locks", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-late-close-"));
+  const store = memStore();
+  const released = [];
+  store.release = (id) => released.push(id);
+  let markTurnStarted;
+  let finishTurn;
+  const turnStarted = new Promise((resolve) => { markTurnStarted = resolve; });
+  const slowTurnProvider = {
+    id: "fake",
+    model: "fake-1",
+    async turn() {
+      markTurnStarted();
+      return new Promise((resolve) => {
+        finishTurn = () => resolve({ text: "late finish", toolUses: [], stop: "end", usage: { input: 1, output: 1 } });
+      });
+    },
+  };
+  let markFactoryStarted;
+  let finishFactory;
+  const factoryStarted = new Promise((resolve) => { markFactoryStarted = resolve; });
+  const switchedProvider = { id: "fake", model: "fake-2", async turn() { throw new Error("unused"); } };
+  const deps = {
+    ...baseDeps(slowTurnProvider, store),
+    buildProviderFor: async (model) => {
+      if (model !== "fake-2") return slowTurnProvider;
+      markFactoryStarted();
+      return new Promise((resolve) => { finishFactory = () => resolve(switchedProvider); });
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const turnSession = (await c.call("session.create", {})).result.sessionId;
+    const configSession = (await c.call("session.create", {})).result.sessionId;
+    void c.call("session.send", { sessionId: turnSession, text: "ignore shutdown abort" });
+    void c.call("session.set-model", { sessionId: configSession, model: "fake-2" });
+    await Promise.all([turnStarted, factoryStarted]);
+
+    const outcome = await Promise.race([
+      srv.close().then(() => "closed"),
+      new Promise((resolve) => setTimeout(() => resolve("timeout"), 3_500)),
+    ]);
+    assert.equal(outcome, "closed", "shutdown returns after its bounded grace period");
+    assert.equal(released.includes(turnSession), false, "busy turn lock remained held at the timeout boundary");
+    assert.equal(released.includes(configSession), false, "configuring lock remained held at the timeout boundary");
+
+    finishTurn();
+    finishFactory();
+    const cleanupDeadline = Date.now() + 1_000;
+    while ((!released.includes(turnSession) || !released.includes(configSession)) && Date.now() < cleanupDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(released.includes(turnSession), "late turn completion released its lock");
+    assert.ok(released.includes(configSession), "late provider factory completion released its lock");
+  } finally {
+    finishTurn?.();
+    finishFactory?.();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: session.interrupt settles a compaction even when its provider ignores abort", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-compact-interrupt-"));
+  const store = memStore();
+  const hanging = hangingCompactProvider();
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(hanging.provider, store));
+  const c = await connect(srv.port);
+  let compacting;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const sid = (await c.call("session.create", {})).result.sessionId;
+    await c.call("session.send", { sessionId: sid, text: "make history" });
+    compacting = c.call("session.compact", { sessionId: sid });
+    await hanging.started;
+    assert.equal(hanging.signal()?.aborted, false);
+    assert.deepEqual((await c.call("session.interrupt", { sessionId: sid })).result, {});
+    const result = await Promise.race([
+      compacting,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("interrupted compact did not settle")), 1_000)),
+    ]);
+    assert.equal(result.error.code, -32603);
+    assert.match(result.error.message, /compaction interrupted/);
+    assert.equal(hanging.signal()?.aborted, true, "compact provider receives the interrupt signal");
+    assert.equal((await c.call("session.rename", { sessionId: sid, title: "idle again" })).result.title, "idle again", "busy clears after interruption");
+  } finally {
+    if (compacting) await compacting.catch(() => {});
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: compaction has a hard timeout and close releases its lock", { timeout: 10000 }, async () => {
+  for (const mode of ["timeout", "close"]) {
+    const dir = mkdtempSync(join(tmpdir(), `hara-serve-compact-${mode}-`));
+    const store = memStore();
+    const released = [];
+    store.release = (id) => released.push(id);
+    const hanging = hangingCompactProvider();
+    const deps = { ...baseDeps(hanging.provider, store), compactTimeoutMs: mode === "timeout" ? 40 : 5_000 };
+    const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+    const c = await connect(srv.port);
+    let compacting;
+    try {
+      await c.call("initialize", { token: "tok" });
+      const sid = (await c.call("session.create", {})).result.sessionId;
+      await c.call("session.send", { sessionId: sid, text: "make history" });
+      compacting = c.call("session.compact", { sessionId: sid });
+      await hanging.started;
+      if (mode === "timeout") {
+        const result = await Promise.race([
+          compacting,
+          new Promise((_, reject) => setTimeout(() => reject(new Error("compact hard timeout did not settle")), 1_000)),
+        ]);
+        assert.equal(result.error.code, -32603);
+        assert.match(result.error.message, /compaction timed out/);
+        assert.equal(hanging.signal()?.aborted, true, "hard timeout also aborts provider work");
+        assert.equal((await c.call("session.rename", { sessionId: sid, title: "after timeout" })).result.title, "after timeout");
+        c.close();
+        await srv.close();
+      } else {
+        await srv.close();
+        assert.equal(hanging.signal()?.aborted, true, "shutdown interrupts compact");
+      }
+      assert.ok(released.includes(sid), `${mode} shutdown released the attached session lock`);
+    } finally {
+      await srv.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -290,6 +666,46 @@ test("serve e2e: denied approval blocks the tool", { timeout: 20000 }, async () 
     assert.equal(sent.result.reply, "done", "turn still completes (model told of the denial)");
     assert.equal(existsSync(join(dir, "approved.txt")), false, "denied tool did NOT run");
   } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: interrupt settles a pending approval immediately and leaves valid history", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-interrupt-approval-"));
+  const store = memStore();
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(toolProvider(), store, "suggest"));
+  const c = await connect(srv.port);
+  let sending;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    sending = c.call("session.send", { sessionId: result.sessionId, text: "write it" });
+    const approval = await c.waitEvent("approval.request");
+
+    const interrupted = await c.call("session.interrupt", { sessionId: result.sessionId });
+    assert.deepEqual(interrupted.result, {});
+    const failed = await Promise.race([
+      sending,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("turn stayed blocked on approval after interrupt")), 1_000)),
+    ]);
+    assert.equal(failed.error.code, -32603, "interrupted send fails instead of reporting success");
+    assert.match(failed.error.message, /interrupted/);
+    assert.equal(existsSync(join(dir, "approved.txt")), false, "interrupted approval never runs the tool");
+
+    const saved = store.saved.get(result.sessionId);
+    assert.deepEqual(saved.history.slice(-2).map((message) => message.role), ["assistant", "tool"]);
+    assert.equal(saved.history.at(-1).results[0].id, "t1");
+    assert.equal(saved.history.at(-1).results[0].isError, true);
+    // A reply racing in after cancellation is idempotent and cannot revive the old call.
+    assert.deepEqual((await c.call("approval.reply", { approvalId: approval.params.approvalId, allow: true })).result, {});
+
+    // The session is no longer busy immediately after the interrupted turn settles.
+    const renamed = await c.call("session.rename", { sessionId: result.sessionId, title: "interrupt settled" });
+    assert.equal(renamed.result.title, "interrupt settled");
+  } finally {
+    if (sending) await sending.catch(() => {});
     c.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });

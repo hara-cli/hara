@@ -280,6 +280,11 @@ export function computerBackends(): string {
   return `unsupported (${process.platform})`;
 }
 
+// Gateway runs get NO computer tool by default (HARA_GATEWAY_COMPUTER=1 opts back in): a chat-driven, full-auto
+// agent reaching for desktop automation is how "check Feishu" turns into blindly clicking another app's windows.
+// In a gateway context the right lever is an API/skill, and send_file already covers delivery — so the safe
+// default is to not offer screen control at all rather than trust the model to decline it.
+if (!process.env.HARA_GATEWAY || process.env.HARA_GATEWAY_COMPUTER === "1") {
 registerTool({
   name: "computer",
   description:
@@ -367,3 +372,4 @@ registerTool({
     return r.ok ? ok(`✓ ${r.msg}${needsLocate ? ` (located "${input.target}")` : ""}`) : fail(r.msg);
   },
 });
+}

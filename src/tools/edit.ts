@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { registerTool } from "./registry.js";
 import { nearestPaths } from "../fs-walk.js";
@@ -7,6 +6,7 @@ import { applyEdits, type OneEdit } from "./apply-core.js";
 import { recordEdit } from "../undo.js";
 import { atomicWriteText } from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
+import { readRegularFileSnapshot } from "../fs-read.js";
 
 registerTool({
   name: "edit_file",
@@ -48,26 +48,29 @@ registerTool({
         ? input.edits
         : [{ old_string: input.old_string, new_string: input.new_string, replace_all: input.replace_all }];
 
-    let text: string;
+    let snapshot: Awaited<ReturnType<typeof readRegularFileSnapshot>>;
     try {
-      text = await readFile(p, "utf8");
-    } catch {
+      snapshot = await readRegularFileSnapshot(p);
+    } catch (error: any) {
       const near = nearestPaths(ctx.cwd, input.path);
-      return `Error: cannot read ${input.path} (use write_file to create a new file).` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
+      return `Error: cannot read ${input.path}: ${error?.message ?? "unknown error"} (use write_file to create a new file).` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
     }
+    const text = snapshot.text;
 
     const res = applyEdits(text, edits);
     if ("error" in res) return `Error: ${res.error} in ${input.path}. No changes written.`;
+    let committed;
     try {
-      await atomicWriteText(p, res.text, { expected: text });
+      committed = await atomicWriteText(p, res.text, { expected: text, expectedIdentity: snapshot });
     } catch (error: any) {
       return `Error: cannot edit ${input.path}: ${error?.message ?? String(error)} No changes written.`;
     }
     emitDiff(input.path, text, res.text, ctx.ui);
-    recordEdit([{ path: input.path, absPath: p, before: text }]);
+    recordEdit([{ path: input.path, absPath: p, before: text, beforeMode: snapshot.mode, committed, after: res.text }]);
     invalidateFileCandidates(ctx.cwd);
     const note = res.fuzzy ? " (quote-normalized)" : "";
     const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;
-    return `Edited ${input.path}: ${plural(edits.length, "edit")}, ${plural(res.total, "replacement")}${note}.`;
+    return `Edited ${input.path}: ${plural(edits.length, "edit")}, ${plural(res.total, "replacement")}${note}.` +
+      (committed.warnings?.length ? ` Warning: ${committed.warnings.join("; ")}` : "");
   },
 });

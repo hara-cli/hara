@@ -11,12 +11,18 @@
 // EXTERNAL DEPENDENCY: signal-cli is NOT bundled — it's a separate program the user installs and runs (it is the
 // only way to speak Signal's protocol; there is no official cloud API). The adapter just speaks HTTP/JSON-RPC to
 // the daemon the user has running. See setup notes at the bottom of this file.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, basename } from "node:path";
-import { homedir } from "node:os";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
+import {
+  INBOUND_MEDIA_MAX_BYTES,
+  InboundMediaBudget,
+  decodeBase64Media,
+  readResponseBytesLimited,
+  savePrivateMediaBytes,
+} from "./media.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+// Base64 expands by 4/3; leave a small fixed budget for the JSON-RPC envelope without permitting an unlimited body.
+const ATTACHMENT_RPC_MAX_BYTES = Math.ceil(INBOUND_MEDIA_MAX_BYTES / 3) * 4 + 64 * 1024;
 
 // E.164 phone numbers (+15551234567) anywhere in a string → +155****4567 (mirrors hermes' _redact_phone).
 const PHONE_RE = /\+[1-9]\d{6,14}/g;
@@ -86,7 +92,10 @@ export function parseSignalMessage(
   if (!data || typeof data !== "object") return null;
 
   const group = data.groupInfo;
-  const groupId: string | undefined = group?.groupId;
+  // signal-cli omits (or nulls) groupInfo for a direct envelope. A present non-null but malformed group object
+  // remains group-classified even without an id, which is the conservative behavior during protocol drift.
+  const isGroup = group != null;
+  const groupId = typeof group?.groupId === "string" && group.groupId.trim() ? group.groupId.trim() : undefined;
   const chatId = groupId ? `group:${groupId}` : String(sender);
 
   const atts = Array.isArray(data.attachments) ? data.attachments : [];
@@ -103,6 +112,7 @@ export function parseSignalMessage(
       userId: String(sender),
       userName: env.sourceName || String(sender),
       text: text || "[图片]",
+      chatType: isGroup ? "group" : "p2p",
     },
     images,
   };
@@ -113,7 +123,12 @@ export function signalAdapter(rpcUrl: string, selfNumber: string): ChatAdapter {
   let rpcSeq = 0;
 
   /** One JSON-RPC 2.0 call to the signal-cli daemon. Returns `result` (any) or null on error. */
-  async function rpc(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
+  async function rpc(
+    method: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    responseLimit?: number,
+  ): Promise<any> {
     const id = `${method}_${++rpcSeq}`;
     try {
       const res = await fetch(`${base}/api/v1/rpc`, {
@@ -123,7 +138,9 @@ export function signalAdapter(rpcUrl: string, selfNumber: string): ChatAdapter {
         signal,
       });
       if (!res.ok) return null;
-      const j = (await res.json()) as { result?: any; error?: any };
+      const j = (responseLimit
+        ? JSON.parse((await readResponseBytesLimited(res, responseLimit, signal)).toString("utf8"))
+        : await res.json()) as { result?: any; error?: any };
       if (j.error) {
         console.error(`hara gateway[signal]: RPC ${method} error:`, redactPhone(JSON.stringify(j.error)));
         return null;
@@ -142,20 +159,20 @@ export function signalAdapter(rpcUrl: string, selfNumber: string): ChatAdapter {
   };
 
   /** Fetch a signal-cli attachment by id (base64 over JSON-RPC) → a local path under ~/.hara/signal/media. */
-  async function downloadAttachment(ref: SignalImageRef): Promise<string | null> {
+  async function downloadAttachment(
+    ref: SignalImageRef,
+    options: { maxBytes: number; signal: AbortSignal },
+  ): Promise<string | null> {
     try {
-      const result = await rpc("getAttachment", { account: selfNumber, id: ref.id });
+      const encodedLimit = Math.ceil(options.maxBytes / 3) * 4 + 64 * 1024;
+      const result = await rpc("getAttachment", { account: selfNumber, id: ref.id }, options.signal, Math.min(encodedLimit, ATTACHMENT_RPC_MAX_BYTES));
       // signal-cli returns either a raw base64 string or { data: "base64..." }
       const b64 = typeof result === "string" ? result : result && typeof result === "object" ? result.data : null;
       if (!b64 || typeof b64 !== "string") return null;
-      const bytes = Buffer.from(b64, "base64");
+      const bytes = decodeBase64Media(b64, options.maxBytes);
       let ext = attachmentExt(ref.contentType, ref.filename);
       if (ext === ".bin") ext = extFromBytes(bytes); // last-resort magic-byte sniff
-      const dir = join(homedir(), ".hara", "signal", "media");
-      mkdirSync(dir, { recursive: true });
-      const path = join(dir, `sig_${Date.now()}_${ref.id.slice(-12)}${ext}`);
-      writeFileSync(path, bytes);
-      return path;
+      return await savePrivateMediaBytes(bytes, { platform: "signal", filenameHint: `attachment${ext}`, ...options });
     } catch {
       return null;
     }
@@ -172,11 +189,8 @@ export function signalAdapter(rpcUrl: string, selfNumber: string): ChatAdapter {
       // Signal has no separate photo/document endpoints — everything is an `attachments` path on `send`.
       // signal-cli reads the file off the local disk by path, so we just hand it the path (no upload step).
       await rpc("send", { account: selfNumber, message: "", attachments: [filePath], ...target(chatId) }).catch(() => {});
-      // (readFileSync/basename imported for parity with the other adapters' file plumbing; signal-cli reads by path.)
-      void readFileSync;
-      void basename;
     },
-    async start(onMessage, signal) {
+    async start(onMessage, signal, shouldDownload) {
       console.error(
         `hara gateway[signal]: polling signal-cli daemon at ${base} as ${redactPhone(selfNumber)} (ensure \`signal-cli -a <number> daemon --http\` is running).`,
       );
@@ -189,9 +203,15 @@ export function signalAdapter(rpcUrl: string, selfNumber: string): ChatAdapter {
           for (const raw of envelopes) {
             const parsed = parseSignalMessage(raw, selfNumber);
             if (!parsed) continue;
-            for (const ref of parsed.images) {
-              const path = await downloadAttachment(ref);
-              if (path) (parsed.msg.images ??= []).push(path);
+            if (shouldDownload?.(parsed.msg) === true) {
+              const budget = new InboundMediaBudget("signal", signal);
+              for (const ref of parsed.images) {
+                const path = await budget.download((options) => downloadAttachment(ref, options));
+                if (path) {
+                  (parsed.msg.images ??= []).push(path);
+                  (parsed.msg.transientFiles ??= []).push(path);
+                }
+              }
             }
             await onMessage(parsed.msg).catch(() => {});
           }

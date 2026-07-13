@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import "../dist/tools/todo.js"; // register the tool
 import { getTools } from "../dist/tools/registry.js";
+import { disposeTodoScope, restoreTodos, serializeTodos } from "../dist/tools/todo.js";
 import { currentTodos, renderTodos, onTodosChange, clearTodos } from "../dist/tools/todo.js";
 import { spinnerVerb } from "../dist/agent/loop.js";
 
@@ -66,6 +67,31 @@ test("onTodosChange: subscriber fires on todo_write and unsubscribe stops it", a
   unsub();
   await todoTool().run({ todos: [{ text: "x", status: "pending" }] }, {});
   assert.equal(calls, 2, "no more callbacks after unsubscribe");
+});
+
+test("restoreTodos replaces stale state and serialization does not share dependency arrays", async () => {
+  restoreTodos([{ text: "restored", status: "pending", blockedBy: ["first"] }]);
+  const snapshot = serializeTodos();
+  snapshot[0].blockedBy.push("mutated-copy");
+  assert.deepEqual(serializeTodos()[0].blockedBy, ["first"]);
+
+  restoreTodos(undefined);
+  assert.deepEqual(serializeTodos(), [], "a new session clears the prior process-global checklist");
+});
+
+test("todo scopes isolate concurrent agent and serve checklists", async () => {
+  restoreTodos([{ text: "main", status: "pending" }]);
+  restoreTodos([{ text: "session A", status: "in_progress" }], "serve:a");
+  await todoTool().run(
+    { todos: [{ text: "sub-agent", status: "done" }] },
+    { cwd: process.cwd(), todoScope: "sub:1" },
+  );
+  assert.deepEqual(serializeTodos().map((todo) => todo.text), ["main"]);
+  assert.deepEqual(serializeTodos("serve:a").map((todo) => todo.text), ["session A"]);
+  assert.deepEqual(serializeTodos("sub:1").map((todo) => todo.text), ["sub-agent"]);
+  clearTodos("serve:a");
+  disposeTodoScope("sub:1");
+  assert.deepEqual(serializeTodos("sub:1"), []);
 });
 
 test("clearTodos: empties the list and emits", async () => {

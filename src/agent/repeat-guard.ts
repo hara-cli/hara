@@ -4,8 +4,17 @@
 // covers FAILED ones. Deterministic and session-scoped (module state, same pattern as net-reachability):
 // when an identical (tool, args) call fails twice in a row, the tool result gets an explicit "stop
 // repeating this" note the model can't miss. Successful repeats are NOT flagged — a re-read after an edit
-// or a re-run after a fix is legitimate, and a success resets the failure streak.
-const seen = new Map<string, { fails: number }>();
+// or a re-run after a fix is legitimate, and a success resets the failure streak. Serve can run several
+// sessions in one process, so streaks are keyed by the same run scope as todo/reminder state.
+const DEFAULT_SCOPE = "default";
+const seenByScope = new Map<string, Map<string, { fails: number }>>();
+
+function scopedSeen(scope?: string): Map<string, { fails: number }> {
+  const key = scope?.trim() || DEFAULT_SCOPE;
+  const seen = seenByScope.get(key) ?? new Map<string, { fails: number }>();
+  seenByScope.set(key, seen);
+  return seen;
+}
 
 /** Identity of a call = tool name + exact JSON of its arguments (tool names contain no spaces,
  *  so a space separator is unambiguous). */
@@ -26,12 +35,19 @@ export function looksFailed(content: string): boolean {
 
 /** Record a completed call; returns a warning to APPEND to the tool result when the same call has now
  *  failed >=2x in a row (empty string otherwise). Pure aside from the session-scoped map. */
-export function recordCall(name: string, input: unknown, content: string, isError = false): string {
+export function recordCall(name: string, input: unknown, content: string, isError = false, scope?: string): string {
   const k = keyOf(name, input);
   const failed = isError || looksFailed(content);
+  const seen = scopedSeen(scope);
   const s = seen.get(k) ?? { fails: 0 };
-  s.fails = failed ? s.fails + 1 : 0; // success resets the streak
-  seen.set(k, s);
+  if (!failed) {
+    seen.delete(k); // successes have no useful state; don't leak every unique tool call in a long-lived server
+    return "";
+  }
+  s.fails++;
+  seen.delete(k);
+  seen.set(k, s); // refresh insertion order for the bounded per-scope LRU
+  if (seen.size > 500) seen.delete(seen.keys().next().value!);
   if (s.fails < 2) return "";
   return (
     `\n\n⟳ hara: this exact ${name} call has now FAILED ${s.fails}× with identical arguments — ` +
@@ -41,6 +57,7 @@ export function recordCall(name: string, input: unknown, content: string, isErro
 }
 
 /** Clear the streaks — /reset (fresh start) and tests. */
-export function resetRepeatGuard(): void {
-  seen.clear();
+export function resetRepeatGuard(scope?: string): void {
+  if (scope) seenByScope.delete(scope.trim() || DEFAULT_SCOPE);
+  else seenByScope.clear();
 }

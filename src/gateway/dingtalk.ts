@@ -35,7 +35,10 @@ export function parseDingtalkMessage(msg: any): { msg: InboundMsg; sessionWebhoo
   else if (type === "picture") text = "[图片]"; // v1: inbound image not downloaded (downloadCode in content)
   else if (type === "richText") text = flattenRichText(msg.content?.richText).trim();
   if (!text) return null; // unsupported type (audio/file/etc.) or empty
-  return { msg: { chatId, userId, userName, text }, sessionWebhook };
+  // DingTalk documents conversationType=1 for a one-to-one bot chat and 2 for groups. Missing/novel values
+  // stay group-classified so protocol drift cannot expose the full-auto DM driver in a channel.
+  const chatType = String(msg.conversationType ?? "").trim() === "1" ? "p2p" : "group";
+  return { msg: { chatId, userId, userName, text, chatType }, sessionWebhook };
 }
 
 /** Flatten a DingTalk richText message (an array of {text}/{type} runs) into plain text (pure). */
