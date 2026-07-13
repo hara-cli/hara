@@ -8,8 +8,6 @@
 // every binaries release fail. This form works under both resolutions.
 import * as larkNs from "@larksuiteoapi/node-sdk";
 const lark = ((larkNs as { default?: unknown }).default ?? larkNs) as typeof import("@larksuiteoapi/node-sdk");
-import { createReadStream } from "node:fs";
-import { basename } from "node:path";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import { InboundMediaBudget, cleanupTransientMedia, savePrivateMedia } from "./media.js";
 
@@ -205,16 +203,16 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
         /* best-effort cleanup — an unrecallable message just stays */
       }
     },
-    async sendFile(chatId, filePath) {
-      const name = basename(filePath);
+    async sendFile(chatId, file) {
+      const name = file.safeName;
       const isImg = /\.(png|jpe?g|gif|webp)$/i.test(name);
       if (isImg) {
-        const up: any = await client.im.image.create({ data: { image_type: "message", image: createReadStream(filePath) } });
+        const up: any = await client.im.image.create({ data: { image_type: "message", image: file.bytes } });
         const key = up?.image_key ?? up?.data?.image_key;
         if (!key) throw new Error("Feishu image upload returned no image_key");
         await sendMsg(chatId, "image", { image_key: key });
       } else {
-        const up: any = await client.im.file.create({ data: { file_type: "stream", file_name: name, file: createReadStream(filePath) } });
+        const up: any = await client.im.file.create({ data: { file_type: "stream", file_name: name, file: file.bytes } });
         const key = up?.file_key ?? up?.data?.file_key;
         if (!key) throw new Error("Feishu file upload returned no file_key");
         await sendMsg(chatId, "file", { file_key: key });

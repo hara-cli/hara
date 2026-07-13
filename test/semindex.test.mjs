@@ -1,6 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, utimesSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chunkText, buildIndex, queryIndex, indexExists, collectRepoChunks, collectDirChunks } from "../dist/search/semindex.js";
@@ -33,6 +45,7 @@ test("buildIndex + queryIndex round-trips and ranks by cosine", async () => {
       { id: "2", text: "function renderButton() { return button }", file: "ui.ts", source: "repo" },
       { id: "3", text: "function connectDatabase() { retry on error }", file: "db.ts", source: "repo" },
     ];
+    for (const chunk of chunks) writeFileSync(join(dir, chunk.file), `${chunk.text}\n`);
     assert.equal(indexExists("repo", dir), false);
     const r = await buildIndex("repo", chunks, mockEmbed, dir);
     assert.equal(r.total, 3);
@@ -49,10 +62,199 @@ test("buildIndex + queryIndex round-trips and ranks by cosine", async () => {
   }
 });
 
+test("queryIndex never returns current-format text after its verified source changes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-sem-freshness-"));
+  const file = join(dir, "safe.ts");
+  const marker = "STALE_FORMAT2_SECRET_MUST_NOT_RETURN";
+  try {
+    writeFileSync(join(dir, "package.json"), "{}");
+    writeFileSync(file, `export const old = '${marker}';\n`);
+    await buildIndex("repo", collectRepoChunks(dir), mockEmbed, dir);
+    writeFileSync(file, "export const current = 'ordinary';\n");
+
+    const hits = await queryIndex("repo", "token", mockEmbed, dir, 20);
+    assert.ok(!hits.some((hit) => hit.text.includes(marker)), "stale cached text is rejected by source hash");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("buildIndex creates owner-only state and repairs legacy index modes", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-sem-modes-"));
+  const indexDir = join(dir, ".hara", "index");
+  const ignore = join(indexDir, ".gitignore");
+  const index = join(indexDir, "repo.json");
+  try {
+    mkdirSync(indexDir, { recursive: true });
+    chmodSync(dir, 0o755);
+    chmodSync(join(dir, ".hara"), 0o755);
+    writeFileSync(ignore, "!repo.json\n");
+    writeFileSync(index, "{not-json");
+    chmodSync(indexDir, 0o777);
+    chmodSync(ignore, 0o666);
+    chmodSync(index, 0o666);
+
+    await buildIndex(
+      "repo",
+      [{ id: "safe#0", text: "ordinary indexed source text", file: "safe.ts", source: "repo" }],
+      async () => [[1, 0, 0]],
+      dir,
+    );
+
+    assert.equal(statSync(indexDir).mode & 0o777, 0o700);
+    assert.equal(statSync(ignore).mode & 0o777, 0o600);
+    assert.equal(statSync(index).mode & 0o777, 0o600);
+    assert.equal(readFileSync(ignore, "utf8"), "*\n", "unsafe legacy ignore rules are repaired");
+    assert.equal(statSync(dir).mode & 0o777, 0o755, "the project root mode is never changed");
+    assert.equal(statSync(join(dir, ".hara")).mode & 0o777, 0o755, "user-authored project .hara content keeps its sharing mode");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("buildIndex rejects symlink and hard-link aliases for every private index file", { skip: process.platform === "win32" }, async (t) => {
+  for (const entry of ["repo.json", ".gitignore"]) {
+    for (const alias of ["symlink", "hardlink"]) {
+      await t.test(`${entry} ${alias}`, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "hara-sem-state-alias-"));
+        const indexDir = join(dir, ".hara", "index");
+        const outside = join(dir, `outside-${entry.replace(/[^a-z]/gi, "")}-${alias}`);
+        const marker = `EXTERNAL_${entry}_${alias}`;
+        try {
+          mkdirSync(indexDir, { recursive: true });
+          writeFileSync(outside, marker);
+          chmodSync(outside, 0o664);
+          const beforeMode = statSync(outside).mode & 0o777;
+          if (alias === "symlink") symlinkSync(outside, join(indexDir, entry));
+          else linkSync(outside, join(indexDir, entry));
+
+          let embedded = false;
+          await assert.rejects(
+            buildIndex(
+              "repo",
+              [{ id: "safe#0", text: "ordinary indexed source text", file: "safe.ts", source: "repo" }],
+              async () => {
+                embedded = true;
+                return [[1, 0, 0]];
+              },
+              dir,
+            ),
+            alias === "symlink" ? /not a regular file|symbolic/i : /multiple hard links/i,
+          );
+          assert.equal(embedded, false, "private state is validated before embedding work starts");
+          assert.equal(readFileSync(outside, "utf8"), marker, "the aliased external inode is not overwritten");
+          assert.equal(statSync(outside).mode & 0o777, beforeMode, "the aliased external inode is not chmod'd");
+          assert.equal(indexExists("repo", dir), false, "an aliased cache never counts as an index");
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("buildIndex rejects symlinked .hara/index directory components without touching their targets", { skip: process.platform === "win32" }, async (t) => {
+  for (const component of [".hara", "index"]) {
+    await t.test(component, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "hara-sem-state-dirlink-"));
+      const external = join(dir, "external-state");
+      const externalIndex = component === ".hara" ? join(external, "index") : external;
+      const externalIndexFile = join(externalIndex, "repo.json");
+      const externalIgnore = join(externalIndex, ".gitignore");
+      try {
+        mkdirSync(externalIndex, { recursive: true });
+        writeFileSync(externalIndexFile, "EXTERNAL_INDEX_SENTINEL");
+        writeFileSync(externalIgnore, "EXTERNAL_IGNORE_SENTINEL");
+        chmodSync(externalIndexFile, 0o664);
+        chmodSync(externalIgnore, 0o664);
+        const indexMode = statSync(externalIndexFile).mode & 0o777;
+        const ignoreMode = statSync(externalIgnore).mode & 0o777;
+        if (component === ".hara") {
+          symlinkSync(external, join(dir, ".hara"));
+        } else {
+          mkdirSync(join(dir, ".hara"));
+          symlinkSync(external, join(dir, ".hara", "index"));
+        }
+
+        await assert.rejects(
+          buildIndex(
+            "repo",
+            [{ id: "safe#0", text: "ordinary indexed source text", file: "safe.ts", source: "repo" }],
+            async () => [[1, 0, 0]],
+            dir,
+          ),
+          /symbolic-link component|not a real directory/i,
+        );
+        assert.equal(readFileSync(externalIndexFile, "utf8"), "EXTERNAL_INDEX_SENTINEL");
+        assert.equal(readFileSync(externalIgnore, "utf8"), "EXTERNAL_IGNORE_SENTINEL");
+        assert.equal(statSync(externalIndexFile).mode & 0o777, indexMode);
+        assert.equal(statSync(externalIgnore).mode & 0o777, ignoreMode);
+        assert.equal(indexExists("repo", dir), false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("buildIndex aborts if the private index parent is retargeted while embeddings are prepared", { skip: process.platform === "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-sem-state-retarget-"));
+  const heldHara = join(dir, ".hara-held");
+  const externalHara = join(dir, "external-hara");
+  const externalIndex = join(externalHara, "index");
+  const externalIndexFile = join(externalIndex, "repo.json");
+  const externalIgnore = join(externalIndex, ".gitignore");
+  try {
+    await assert.rejects(
+      buildIndex(
+        "repo",
+        [{ id: "safe#0", text: "ordinary indexed source text", file: "safe.ts", source: "repo" }],
+        async () => {
+          renameSync(join(dir, ".hara"), heldHara);
+          mkdirSync(externalIndex, { recursive: true });
+          writeFileSync(externalIndexFile, "EXTERNAL_INDEX_SENTINEL");
+          writeFileSync(externalIgnore, "EXTERNAL_IGNORE_SENTINEL");
+          symlinkSync(externalHara, join(dir, ".hara"));
+          return [[1, 0, 0]];
+        },
+        dir,
+      ),
+      /changed/i,
+    );
+    assert.equal(readFileSync(externalIndexFile, "utf8"), "EXTERNAL_INDEX_SENTINEL");
+    assert.equal(readFileSync(externalIgnore, "utf8"), "EXTERNAL_IGNORE_SENTINEL");
+    assert.equal(indexExists("repo", dir), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("queryIndex returns empty when no index exists", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-sem-"));
   try {
     assert.deepEqual(await queryIndex("repo", "anything", mockEmbed, dir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("queryIndex rotates a versionless legacy cache instead of returning historical text", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-sem-legacy-"));
+  const indexDir = join(dir, ".hara", "index");
+  const index = join(indexDir, "repo.json");
+  const zvec = join(indexDir, "repo.zvec");
+  try {
+    mkdirSync(zvec, { recursive: true });
+    writeFileSync(join(dir, "safe.ts"), "export const safe = true;\n");
+    writeFileSync(index, JSON.stringify({
+      model: "embed",
+      items: [{ id: "safe.ts#0", text: "HISTORICAL_SECRET_MUST_NOT_RETURN", file: "safe.ts", source: "repo", vec: [1, 0, 0] }],
+    }));
+
+    assert.deepEqual(await queryIndex("repo", "auth", mockEmbed, dir), []);
+    assert.equal(indexExists("repo", dir), false, "versionless JSON is removed");
+    assert.equal(statSync(indexDir).isDirectory(), true);
+    assert.equal((await import("node:fs")).existsSync(zvec), false, "paired ANN cache is removed");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -103,6 +305,15 @@ test("buildIndex is incremental — unchanged files keep their vectors", async (
     const r3 = await buildIndex("repo", collectDirChunks(dir, "assets"), counting, dir);
     assert.ok(r3.embedded >= 1, "changed file re-embedded");
     assert.ok(r3.reused >= 1, "unchanged file reused");
+
+    // Preserve the same mtime while changing bytes: content identity, not timestamp alone, must decide reuse.
+    const stableMtime = statSync(join(dir, "b.md")).mtime;
+    writeFileSync(join(dir, "b.md"), "# Beta\nchanged bytes with the original timestamp\n");
+    utimesSync(join(dir, "b.md"), stableMtime, stableMtime);
+    const r4 = await buildIndex("repo", collectDirChunks(dir, "assets"), counting, dir);
+    assert.ok(r4.embedded >= 1, "same-mtime content changes are re-embedded");
+    const stored = JSON.parse(readFileSync(join(dir, ".hara", "index", "repo.json"), "utf8"));
+    assert.equal(stored.format, 2, "protected cache format is explicit");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

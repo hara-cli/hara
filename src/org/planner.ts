@@ -2,11 +2,13 @@
 // FRAME the task → ATOMIZE into smallest verifiable steps → SEQUENCE as a DAG →
 // execute each atom (optionally routed to a role) → VERIFY gate. State is the SSOT
 // at .hara/org/plan.json. This is hara's differentiator: not one agent, an org that plans.
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Provider } from "../providers/types.js";
 import type { Role } from "./roles.js";
 import { runShell, type SandboxMode } from "../sandbox.js";
+import { readModelContextFileSync, readVerifiedRegularFileSnapshot } from "../fs-read.js";
+import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
 
 export type AtomStatus = "pending" | "running" | "done" | "failed";
 export interface Atom {
@@ -171,22 +173,42 @@ export async function runCheck(cmd: string, cwd: string, sandbox: SandboxMode): 
   }
 }
 
-function planDir(cwd: string): string {
-  const d = join(cwd, ".hara", "org");
-  mkdirSync(d, { recursive: true });
-  return d;
-}
-const planFile = (cwd: string): string => join(planDir(cwd), "plan.json");
+const planFile = (cwd: string): string => join(cwd, ".hara", "org", "plan.json");
+const planWriteTails = new Map<string, Promise<void>>();
 
 /** SSOT: persist plan state so it's inspectable / resumable. */
-export function savePlan(cwd: string, plan: Plan): void {
-  writeFileSync(planFile(cwd), JSON.stringify(plan, null, 2), "utf8");
+export async function savePlan(cwd: string, plan: Plan): Promise<void> {
+  const p = planFile(cwd);
+  const previous = planWriteTails.get(p) ?? Promise.resolve();
+  const operation = previous.catch(() => {}).then(async () => {
+    // Serialize the live shared plan inside the per-path queue so parallel atoms cannot overwrite a newer
+    // sibling state with an older snapshot. The atomic writer binds parent identity and rejects links.
+    const text = JSON.stringify(plan, null, 2);
+    const boundary = bindAtomicWritePath(p, "save plan");
+    let snapshot: Awaited<ReturnType<typeof readVerifiedRegularFileSnapshot>> | null = null;
+    try {
+      snapshot = await readVerifiedRegularFileSnapshot(boundary.target, undefined, "save plan");
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await atomicWriteText(boundary.target, text, {
+      expected: snapshot?.text ?? null,
+      expectedIdentity: snapshot ?? undefined,
+      boundary,
+    });
+  });
+  planWriteTails.set(p, operation);
+  try {
+    await operation;
+  } finally {
+    if (planWriteTails.get(p) === operation) planWriteTails.delete(p);
+  }
 }
 export function loadPlan(cwd: string): Plan | null {
   const p = planFile(cwd);
   if (!existsSync(p)) return null;
   try {
-    return JSON.parse(readFileSync(p, "utf8")) as Plan;
+    return JSON.parse(readModelContextFileSync(p, 64 * 1024 * 1024)) as Plan;
   } catch {
     return null;
   }

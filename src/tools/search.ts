@@ -1,10 +1,17 @@
 // Search/listing tools — grep (regex across files), glob (path patterns), ls (one directory).
 // All read-only (kind: "read"), so they never hit the approval gate and run in parallel.
-import { readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, resolve, join, relative, sep } from "node:path";
 import { registerTool } from "./registry.js";
 import { IGNORE_DIRS, walkFiles } from "../fs-walk.js";
+import {
+  isSensitiveFilePath,
+  sensitiveFileError,
+  sensitiveFilesAllowed,
+  SENSITIVE_SEARCH_GLOBS,
+} from "../security/sensitive-files.js";
+import { toolSubprocessEnv } from "../security/subprocess-env.js";
 
 const MAX_OUT = 60_000;
 const MAX_MATCHES = 300;
@@ -107,10 +114,15 @@ function runRipgrep(
     ];
     for (const ignored of IGNORE_DIRS) args.push("--glob", `!**/${ignored}/**`);
     if (glob) args.push("--glob", glob);
+    // Keep protected exclusions last: ripgrep resolves overlapping globs in argument order, so a caller's
+    // positive glob must not re-include a safe-looking .env template during a broad directory search.
+    if (!isFile && !sensitiveFilesAllowed()) {
+      for (const protectedGlob of SENSITIVE_SEARCH_GLOBS) args.push("--glob", `!${protectedGlob}`);
+    }
     if (ignoreCase) args.push("--ignore-case");
     args.push("--", pattern, target);
 
-    const child = spawn("rg", args, { cwd: runCwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("rg", args, { cwd: runCwd, stdio: ["ignore", "pipe", "pipe"], env: toolSubprocessEnv() });
     const lines: string[] = [];
     let matches = 0;
     let scanned = 0;
@@ -152,6 +164,7 @@ function runRipgrep(
       const content = event?.data?.lines?.text;
       if (typeof pathText !== "string" || !Number.isFinite(lineNo) || typeof content !== "string") return;
       const absolute = resolve(runCwd, pathText);
+      if (isSensitiveFilePath(absolute)) return; // defense if a user glob overrides rg's exclusion ordering
       const shown = toPosix(relative(cwd, absolute)) || toPosix(relative(root, absolute)) || basename(absolute);
       const rendered = `${shown}:${lineNo}: ${content.replace(/\r?\n$/, "").trim().slice(0, 300)}`;
       lines.push(rendered);
@@ -209,7 +222,7 @@ const NODE_GREP_SOURCE = String.raw`
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
-const MAX_INPUT_BYTES = 64 * 1024;
+const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 let input = "";
 let inputRejected = false;
 function execute() {
@@ -269,33 +282,23 @@ function execute() {
     return patternAt === patternParts.length;
   }
 
-  const ignored = new Set(cfg.ignoreDirs);
-  const files = [];
-  if (cfg.isFile) files.push(cfg.root);
-  else {
-    const stack = [cfg.root];
-    while (stack.length && files.length < cfg.maxFiles) {
-      const dir = stack.pop();
-      let entries;
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-      catch (error) { continue; }
-      for (const entry of entries) {
-        if (files.length >= cfg.maxFiles) break;
-        const absolute = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (!ignored.has(entry.name)) stack.push(absolute);
-        } else if (entry.isFile()) files.push(absolute);
-      }
-    }
-  }
+  // Candidate discovery and the complete protected-file policy run in the parent process. The worker gets
+  // only paths whose exact identity was already approved, then verifies that identity again on the opened fd.
+  const files = Array.isArray(cfg.files) ? cfg.files : [];
 
   const readBuffer = Buffer.allocUnsafe(cfg.maxFileBytes + 1);
-  function safeReadText(absolute) {
+  function sameIdentity(info, candidate) {
+    return String(info.dev) === candidate.dev && String(info.ino) === candidate.ino;
+  }
+  function safeReadText(candidate) {
+    const absolute = candidate.path;
     let fd;
     try {
-      fd = fs.openSync(absolute, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
-      const info = fs.fstatSync(fd);
-      if (!info.isFile() || info.size > cfg.maxFileBytes) return null;
+      const before = fs.lstatSync(absolute, { bigint: true });
+      if (!before.isFile() || before.nlink !== 1n || !sameIdentity(before, candidate)) return null;
+      fd = fs.openSync(absolute, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
+      const info = fs.fstatSync(fd, { bigint: true });
+      if (!info.isFile() || info.nlink !== 1n || !sameIdentity(info, candidate) || info.size > BigInt(cfg.maxFileBytes)) return null;
       let total = 0;
       while (total <= cfg.maxFileBytes) {
         const count = fs.readSync(fd, readBuffer, total, cfg.maxFileBytes + 1 - total, total);
@@ -303,6 +306,10 @@ function execute() {
         total += count;
       }
       if (total > cfg.maxFileBytes) return null;
+      const latest = fs.fstatSync(fd, { bigint: true });
+      const current = fs.lstatSync(absolute, { bigint: true });
+      if (!latest.isFile() || latest.nlink !== 1n || !sameIdentity(latest, candidate) || !sameIdentity(current, candidate)) return null;
+      if (latest.size !== info.size || latest.mtimeNs !== info.mtimeNs || latest.ctimeNs !== info.ctimeNs) return null;
       const bytes = readBuffer.subarray(0, total);
       if (bytes.subarray(0, Math.min(bytes.length, 4096)).includes(0)) return null;
       return bytes.toString("utf8");
@@ -317,12 +324,13 @@ function execute() {
   let matches = 0;
   let scanned = 0;
   let outputChars = 0;
-  let truncated = files.length >= cfg.maxFiles;
-  for (const absolute of files) {
+  let truncated = cfg.candidatesTruncated === true;
+  for (const candidate of files) {
+    const absolute = candidate.path;
     if (matches >= cfg.maxMatches || outputChars >= cfg.maxOutputChars) { truncated = true; break; }
     const relativeForGlob = path.relative(cfg.isFile ? cfg.cwd : cfg.root, absolute).split(path.sep).join("/");
     if (cfg.glob && !matchesGlob(cfg.glob, relativeForGlob)) continue;
-    const text = safeReadText(absolute);
+    const text = safeReadText(candidate);
     if (text === null) continue;
     scanned++;
     const fileLines = text.split("\n");
@@ -369,6 +377,26 @@ function runNodeGrep(
   glob: string | undefined,
   ignoreCase: boolean,
 ): Promise<GrepResult> {
+  const allowSensitive = sensitiveFilesAllowed();
+  const discovered = isFile ? [root] : walkFiles(root, 8_001).map((path) => join(root, path));
+  const candidatesTruncated = !isFile && discovered.length > 8_000;
+  const files: { path: string; dev: string; ino: string }[] = [];
+  for (const path of discovered.slice(0, 8_000)) {
+    // Broad searches intentionally omit every .env variant, including safe templates. Explicitly searching
+    // one safe template remains supported, matching the ripgrep branch.
+    const securityBase = basename(path).replace(/:.*$/u, "").replace(/[. ]+$/u, "").toLowerCase();
+    if (!allowSensitive && !isFile && (securityBase === ".env" || securityBase.startsWith(".env."))) continue;
+    if (sensitiveFileError(path, "search")) continue;
+    try {
+      const info = lstatSync(path, { bigint: true });
+      // A hard-linked safe alias cannot prove where its other name lives. Reject every multi-link candidate
+      // before it can cross into the isolated regex worker.
+      if (!info.isFile() || info.nlink !== 1n || info.size > BigInt(MAX_FILE_BYTES)) continue;
+      files.push({ path, dev: String(info.dev), ino: String(info.ino) });
+    } catch {
+      // Raced, unreadable, symlink, FIFO, or device: omit it rather than weakening the read boundary.
+    }
+  }
   const payload = JSON.stringify({
     pattern,
     root,
@@ -376,13 +404,14 @@ function runNodeGrep(
     cwd,
     glob,
     ignoreCase,
-    ignoreDirs: [...IGNORE_DIRS],
+    files,
+    candidatesTruncated,
     maxFiles: 8_000,
     maxFileBytes: MAX_FILE_BYTES,
     maxMatches: MAX_MATCHES,
     maxOutputChars: MAX_OUT,
   });
-  if (Buffer.byteLength(payload, "utf8") > 64 * 1024) {
+  if (Buffer.byteLength(payload, "utf8") > 16 * 1024 * 1024) {
     return Promise.resolve({ kind: "error", lines: [], matches: 0, scanned: 0, truncated: false, error: "grep input exceeds its safety limit" });
   }
   return new Promise((resolveResult) => {
@@ -390,7 +419,7 @@ function runNodeGrep(
     const args = isBun ? ["-e", NODE_GREP_SOURCE] : ["--max-old-space-size=128", "-e", NODE_GREP_SOURCE];
     // In a Bun --compile build process.execPath is the hara executable. BUN_BE_BUN makes that embedded
     // runtime act as the Bun CLI for this isolated eval subprocess instead of recursively launching hara.
-    const env = isBun ? { ...process.env, BUN_BE_BUN: "1" } : process.env;
+    const env = toolSubprocessEnv(process.env, isBun ? { BUN_BE_BUN: "1" } : {});
     const child = spawn(process.execPath, args, { stdio: ["pipe", "pipe", "pipe"], env });
     let stdout = "";
     let stderr = "";
@@ -459,6 +488,8 @@ registerTool({
     if (pattern.length > MAX_PATTERN_CHARS) return `Error: grep pattern exceeds ${MAX_PATTERN_CHARS} characters.`;
     if (typeof input.glob === "string" && input.glob.length > MAX_GLOB_CHARS) return `Error: grep glob exceeds ${MAX_GLOB_CHARS} characters.`;
     const root = absOf(input.path, ctx.cwd);
+    const denied = sensitiveFileError(root, "search");
+    if (denied) return denied;
     let isFile = false;
     try {
       const info = statSync(root);
@@ -467,23 +498,40 @@ registerTool({
     } catch {
       return `Error: no such path: ${input.path ?? "."}`;
     }
-    const rg = await runRipgrep(pattern, root, isFile, ctx.cwd, typeof input.glob === "string" ? input.glob : undefined, input.ignore_case === true);
-    if (rg.kind === "timeout") return `Error: grep exceeded its ${GREP_TIMEOUT_MS}ms safety timeout and was stopped.`;
+    const searchArgs = [
+      pattern,
+      root,
+      isFile,
+      ctx.cwd,
+      typeof input.glob === "string" ? input.glob : undefined,
+      input.ignore_case === true,
+    ] as const;
+    // ripgrep opens pathnames itself, so a cooperating background process could exchange a candidate after
+    // discovery and restore it before the post-filter. While the protected-file policy is active, use the
+    // hardened worker that binds device+inode and reads through O_NOFOLLOW fds. The faster rg path is safe to
+    // opt back into only with the explicit one-process sensitive-file waiver.
+    const primary = sensitiveFilesAllowed()
+      ? await runRipgrep(...searchArgs)
+      : await runNodeGrep(...searchArgs);
+    if (primary.kind === "timeout") return `Error: grep exceeded its ${GREP_TIMEOUT_MS}ms safety timeout and was stopped.`;
+    if (primary.kind === "invalid") return `Error: invalid regex: ${primary.error ?? "invalid pattern"}`;
 
-    let { lines, matches, scanned } = rg;
-    let truncated = rg.truncated;
-    if (rg.kind === "missing" || rg.kind === "error") {
+    let { lines, matches, scanned } = primary;
+    let truncated = primary.truncated;
+    if (sensitiveFilesAllowed() && (primary.kind === "missing" || primary.kind === "error")) {
       const fallback = await runNodeGrep(pattern, root, isFile, ctx.cwd, typeof input.glob === "string" ? input.glob : undefined, input.ignore_case === true);
       if (fallback.kind === "timeout") return `Error: grep exceeded its ${GREP_TIMEOUT_MS}ms safety timeout and was stopped.`;
       if (fallback.kind === "invalid") return `Error: invalid regex: ${fallback.error ?? "invalid pattern"}`;
       if (fallback.kind !== "ok") {
-        const rgDetail = rg.kind === "error" && rg.error ? `; ripgrep: ${rg.error}` : "";
+        const rgDetail = primary.kind === "error" && primary.error ? `; ripgrep: ${primary.error}` : "";
         return `Error: grep regex failed safely: ${fallback.error ?? "unknown worker error"}${rgDetail}`;
       }
       lines = fallback.lines;
       matches = fallback.matches;
       scanned = fallback.scanned;
       truncated = fallback.truncated;
+    } else if (primary.kind !== "ok") {
+      return `Error: grep regex failed safely: ${primary.error ?? "unknown worker error"}`;
     }
     if (!lines.length) return `No matches for /${input.pattern}/ (scanned ${scanned} files).`;
     let body = lines.join("\n");
@@ -507,6 +555,8 @@ registerTool({
   kind: "read",
   async run(input, ctx) {
     const root = absOf(input.path, ctx.cwd);
+    const denied = sensitiveFileError(root, "search");
+    if (denied) return denied;
     const pattern = typeof input.pattern === "string" ? input.pattern : "";
     if (pattern.length > MAX_GLOB_CHARS) return `Error: glob pattern exceeds ${MAX_GLOB_CHARS} characters.`;
     const files = walkFiles(root);
@@ -545,14 +595,17 @@ registerTool({
   kind: "read",
   async run(input, ctx) {
     const dir = absOf(input.path, ctx.cwd);
+    const denied = sensitiveFileError(dir, "list");
+    if (denied) return denied;
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch (e: any) {
       return `Error: cannot list ${input.path ?? "."}: ${e.message}`;
     }
+    const protectedCount = entries.filter((entry) => !entry.isDirectory() && isSensitiveFilePath(join(dir, entry.name))).length;
     const rows = entries
-      .filter((e) => !(e.isDirectory() && e.name === ".git"))
+      .filter((e) => !(e.isDirectory() && e.name === ".git") && (e.isDirectory() || !isSensitiveFilePath(join(dir, e.name))))
       .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
       .map((e) => {
         if (e.isDirectory()) return `  ${e.name}/`;
@@ -564,7 +617,8 @@ registerTool({
         }
         return `  ${e.name}  ${c_size(size)}`;
       });
-    return rows.length ? rows.join("\n") : "(empty directory)";
+    const note = protectedCount ? `(${protectedCount} protected file${protectedCount === 1 ? "" : "s"} hidden)` : "";
+    return rows.length ? rows.join("\n") + (note ? `\n${note}` : "") : note || "(empty directory)";
   },
 });
 

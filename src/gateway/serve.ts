@@ -16,6 +16,14 @@ import { listSessions, loadSession } from "../session/store.js";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chmodSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
+import { redactToolSubprocessOutput, terminateSubprocessTree } from "../security/subprocess-env.js";
+import {
+  cleanupOutboundSnapshot,
+  cleanupOutboundSnapshots,
+  consumeOutboundSnapshots,
+  queueOutboundSnapshot,
+  type OutboundFilePayload,
+} from "./outbound-files.js";
 
 /** Parse a leading slash-command from a chat message (pure). null if it isn't one. */
 export function parseCommand(text: string): { cmd: string; arg: string } | null {
@@ -47,7 +55,7 @@ export function canonicalGatewayPlatform(platform: string): string {
 /** Strip hara's CLI chrome from captured `-p` output so a chat reply is just the answer: MCP status lines
  *  (`mcp: …`) and the token-usage footer (`… · ↑N ↓N tok`). Colors are off when piped, so no ANSI to strip. */
 export function cleanReply(raw: string): string {
-  return raw
+  return redactToolSubprocessOutput(raw)
     .split("\n")
     .filter((ln) => !/^\s*mcp: /.test(ln) && !/·\s*↑\d+\s*↓\d+\s*tok\s*$/.test(ln))
     .join("\n")
@@ -57,8 +65,31 @@ export function cleanReply(raw: string): string {
 let outboxSeq = 0;
 export interface HaraRun {
   reply: string;
-  /** absolute paths the agent asked to deliver to the chat via the send_file tool (drained from the outbox) */
-  files: string[];
+  /** bounded, verified attachment bytes the agent asked to deliver via send_file */
+  files: OutboundFilePayload[];
+}
+
+/** Snapshot and materialize a direct gateway file before an adapter sees it. This also covers TTS output, so
+ * every outbound attachment crosses the same verified-byte boundary rather than handing adapters a pathname. */
+async function deliverVerifiedLocalFile(
+  adapter: ChatAdapter,
+  chatId: number | string,
+  sourcePath: string,
+): Promise<void> {
+  const sendFile = adapter.sendFile;
+  if (!sendFile) throw new Error("this platform can't send files yet");
+  const outbox = join(tmpdir(), `hara-direct-send-${process.pid}-${Date.now()}-${outboxSeq++}.txt`);
+  let payload: OutboundFilePayload | undefined;
+  try {
+    await queueOutboundSnapshot(sourcePath, outbox);
+    [payload] = await consumeOutboundSnapshots(outbox);
+    cleanupOutboundSnapshots(outbox, payload ? [payload.snapshotPath] : []);
+    if (!payload) throw new Error("the private file snapshot could not be verified");
+    await sendFile(chatId, payload);
+  } finally {
+    if (payload) cleanupOutboundSnapshot(payload.snapshotPath);
+    cleanupOutboundSnapshots(outbox);
+  }
 }
 
 interface QueueEntry {
@@ -261,20 +292,6 @@ function durationLabel(ms: number): string {
   return `${Math.round(ms / 1_000)}s`;
 }
 
-function signalProcess(child: ChildProcess, signal: NodeJS.Signals): boolean {
-  try {
-    // A detached POSIX child leads its own process group. Kill that group so bash/tool grandchildren cannot
-    // survive a timed-out agent. Windows has no negative-pid process-group signaling; use ChildProcess.kill.
-    if (process.platform !== "win32" && child.pid) {
-      process.kill(-child.pid, signal);
-      return true;
-    }
-    return child.kill(signal);
-  } catch {
-    return false;
-  }
-}
-
 /** Run hara headlessly on a chat's session. Returns its cleaned text reply plus any files the agent queued
  *  via send_file. The gateway env (HARA_GATEWAY + a per-message outbox file) is what makes send_file and the
  *  in-chat system context active in the subprocess; the daemon delivers the queued files after it exits. */
@@ -319,10 +336,11 @@ export function runHara(
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
     let stopReason: "timeout" | "shutdown" | undefined;
-    let killTimer: NodeJS.Timeout | undefined;
     let drainTimer: NodeJS.Timeout | undefined;
-    let forceSettleTimer: NodeJS.Timeout | undefined;
+    let forceIssued = false;
+    let cancelTermination: ((cancelForce?: boolean) => void) | undefined;
     const cap = (d: Buffer): void => {
+      if (settled || stopReason) return;
       out = (out + d.toString().slice(-12_000)).slice(-12_000);
     };
     child.stdout?.on("data", cap);
@@ -333,16 +351,11 @@ export function runHara(
     (child.stdout as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
     (child.stderr as (NodeJS.ReadableStream & { unref?: () => void }) | null)?.unref?.();
 
-    const readOutbox = (): string[] => {
-      let files: string[] = [];
-      try {
-        if (existsSync(outbox)) {
-          files = readFileSync(outbox, "utf8").split("\n").map((s) => s.trim()).filter(Boolean);
-          rmSync(outbox, { force: true });
-        }
-      } catch {
-        /* outbox is best-effort; a missing/unreadable file just means nothing to send */
-      }
+    const readOutbox = async (): Promise<OutboundFilePayload[]> => {
+      const files = await consumeOutboundSnapshots(outbox);
+      // Remove abandoned partials and invalid queue entries, but retain accepted snapshots until the adapter
+      // has finished uploading them in the parent gateway process.
+      cleanupOutboundSnapshots(outbox, files.map((file) => file.snapshotPath));
       return files;
     };
 
@@ -350,16 +363,26 @@ export function runHara(
       if (settled) return;
       settled = true;
       clearTimeout(timeoutTimer);
-      if (killTimer) clearTimeout(killTimer);
       if (drainTimer) clearTimeout(drainTimer);
-      if (forceSettleTimer) clearTimeout(forceSettleTimer);
+      // The helper deliberately keeps its force timer alive by default. When a direct child closes after
+      // TERM, that timer must still SIGKILL the owned group before this stopped run can be considered gone.
+      cancelTermination?.();
       options.signal?.removeEventListener("abort", abortRun);
       child.stdout?.destroy();
       child.stderr?.destroy();
-      res({ reply, files: readOutbox() });
+      void readOutbox().then(
+        (files) => res({ reply, files }),
+        () => {
+          cleanupOutboundSnapshots(outbox);
+          res({ reply, files: [] });
+        },
+      );
     };
 
     const finishFromExit = (): void => {
+      // `exit`/`close` describes only the direct child. During a timeout/shutdown, wait until the forced
+      // process-group signal has been issued so a quiet TERM-resistant descendant cannot escape cleanup.
+      if (stopReason && !forceIssued) return;
       if (stopReason === "timeout") {
         finish(runFailure(`hara timed out after ${durationLabel(timeoutMs)}; the run was stopped.`, out));
       } else if (stopReason === "shutdown") {
@@ -375,29 +398,40 @@ export function runHara(
     };
 
     const terminate = (reason: "timeout" | "shutdown"): void => {
-      if (settled || exited) return;
+      if (settled || cancelTermination) return;
       stopReason ??= reason;
-      signalProcess(child, "SIGTERM");
-      killTimer = setTimeout(() => {
-        if (settled || exited) return;
-        signalProcess(child, "SIGKILL");
-        // `exit` normally arrives immediately. This fallback releases the daemon even if a platform/runtime
-        // never reports it; the detached process and destroyed pipes cannot hold the parent open afterwards.
-        forceSettleTimer = setTimeout(finishFromExit, 250);
-      }, killGraceMs);
+      cancelTermination = terminateSubprocessTree(child, {
+        processGroup: process.platform !== "win32",
+        graceMs: killGraceMs,
+        fallbackMs: 250,
+        onForce: () => {
+          forceIssued = true;
+          if (exited) finishFromExit();
+        },
+        // A daemon may escape the group or a runtime may fail to emit exit/close. Destroying our pipe ends in
+        // `finish` keeps gateway shutdown and per-run timeout bounded even in that case.
+        onFallback: finishFromExit,
+      });
     };
     const abortRun = (): void => terminate("shutdown");
     const timeoutTimer = setTimeout(() => terminate("timeout"), timeoutMs);
     if (options.signal) options.signal.addEventListener("abort", abortRun, { once: true });
+    // Close the narrow race where the signal aborts after the entry check but before the listener is attached.
+    if (options.signal?.aborted) abortRun();
 
-    child.once("error", (error) => finish(runFailure(`couldn't start hara: ${error.message}`, out)));
+    child.once("error", (error) => {
+      if (!stopReason) return finish(runFailure(`couldn't start hara: ${error.message}`, out));
+      exited = true;
+      if (forceIssued) finishFromExit();
+    });
     child.once("exit", (code, signal) => {
       exited = true;
       exitCode = code;
       exitSignal = signal;
       // Usually `close` follows after the final pipe data. A grandchild can retain stdout/stderr forever, so
       // cap that drain window and then destroy the pipes ourselves.
-      drainTimer = setTimeout(finishFromExit, 100);
+      if (stopReason) finishFromExit();
+      else drainTimer = setTimeout(finishFromExit, 100);
     });
     child.once("close", (code, signal) => {
       exited = true;
@@ -764,15 +798,22 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         if (!cmd.arg) return adapter.send(m.chatId, "usage: /say <text to speak>");
         const audio = await synthesize(cmd.arg);
         if (!audio) return adapter.send(m.chatId, "✗ TTS failed (check HARA_TTS_* config).");
-        await adapter.sendFile(m.chatId, audio);
-        rmSync(audio, { force: true });
+        try {
+          await deliverVerifiedLocalFile(adapter, m.chatId, audio);
+        } finally {
+          rmSync(audio, { force: true });
+        }
         return;
       }
       if (cmd.cmd === "send") {
         if (!adapter.sendFile) return adapter.send(m.chatId, "this platform can't send files yet.");
         const p = cmd.arg ? resolve(ctx.cwd, cmd.arg.replace(/^~(?=\/|$)/, homedir())) : "";
-        if (!p || !existsSync(p) || !statSync(p).isFile()) return adapter.send(m.chatId, `✗ not a file: ${p || "(none)"}\nusage: /send <path> (abs, ~, or relative to current dir)`);
-        await adapter.sendFile(m.chatId, p);
+        if (!p) return adapter.send(m.chatId, "usage: /send <path> (abs, ~, or relative to current dir)");
+        try {
+          await deliverVerifiedLocalFile(adapter, m.chatId, p);
+        } catch (error) {
+          return adapter.send(m.chatId, `✗ couldn't send ${p}: ${error instanceof Error ? error.message : String(error)}`);
+        }
         return;
       }
       // any other slash word → treat as a normal task
@@ -800,29 +841,37 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     } finally {
       if (workingId && adapter.recall) await adapter.recall(m.chatId, workingId).catch(() => {});
     }
-    if (ac.signal.aborted) return;
     const { reply, files } = result;
-    const hasReply = Boolean(reply);
-    if (hasReply) await adapter.send(m.chatId, plainChat(reply)); // chat bubbles are plain text — flatten markdown
-    else if (files.length) await adapter.send(m.chatId, "📎");
-    // Deliver any files the agent queued via send_file (images inline, others as attachments).
-    for (const f of files) {
-      if (!adapter.sendFile) {
-        await adapter.send(m.chatId, "(this platform can't send files yet)");
-        break;
+    try {
+      if (ac.signal.aborted) return;
+      const hasReply = Boolean(reply);
+      if (hasReply) await adapter.send(m.chatId, plainChat(reply)); // chat bubbles are plain text — flatten markdown
+      else if (files.length) await adapter.send(m.chatId, "📎");
+      // Deliver only immutable private snapshots produced by send_file.
+      for (const f of files) {
+        if (!adapter.sendFile) {
+          await adapter.send(m.chatId, "(this platform can't send files yet)");
+          break;
+        }
+        try {
+          await adapter.sendFile(m.chatId, f);
+        } catch (e: any) {
+          await adapter.send(m.chatId, `✗ couldn't send attachment: ${e.message}`);
+        }
       }
-      try {
-        await adapter.sendFile(m.chatId, f);
-      } catch (e: any) {
-        await adapter.send(m.chatId, `✗ couldn't send ${f}: ${e.message}`);
+      if (hasReply && ctx.voice && adapter.sendFile) {
+        const audio = await synthesize(reply);
+        if (audio) {
+          try {
+            await deliverVerifiedLocalFile(adapter, m.chatId, audio);
+          } finally {
+            rmSync(audio, { force: true });
+          }
+        }
       }
-    }
-    if (hasReply && ctx.voice && adapter.sendFile) {
-      const audio = await synthesize(reply);
-      if (audio) {
-        await adapter.sendFile(m.chatId, audio);
-        rmSync(audio, { force: true });
-      }
+    } finally {
+      // Text-send failures, shutdown races, unsupported adapters, and upload failures all remove snapshots.
+      for (const f of files) cleanupOutboundSnapshot(f.snapshotPath);
     }
     } finally {
       await cleanupTransientMedia(platform, m.transientFiles).catch((error) => {

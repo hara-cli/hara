@@ -5,6 +5,60 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.122.1 — 2026-07-14 — protected files and explicit extension trust
+
+- **The npm CLI now requires Node.js 22.12+.** Node 20 is end-of-life, so Hara no longer makes a security or
+  compatibility promise for it. npm metadata, `hara doctor`, and startup diagnostics now agree; an older
+  runtime exits with a direct `nvm install 22 && nvm use 22` upgrade hint. Standalone binaries and Desktop
+  sidecars remain self-contained and do not require a host Node installation.
+- **Built-in file access fails closed before ordinary approval/dispatch.** Canonical and real-path checks
+  reject `.env`/`.env.*`, credential stores, private keys, and private Hara runtime state in file reads,
+  edit/patch pre-reads, grep/glob/ls, `@file`/completion, codebase and stale semantic indexes, checkpoints,
+  gateway file delivery, and cron command admission. Safe templates such as `.env.example`, `.env.sample`,
+  and `.env.template` remain readable. `HARA_ALLOW_SENSITIVE_FILES=1` is an explicit launch-time exposure
+  switch for one process; it removes both these built-in denies and that process's shell protected-read mask.
+- **Shell protection now reflects the host's guarantees.** Tool subprocesses receive a scrubbed environment;
+  inherited variables can be explicitly retained with the launch-time `HARA_SUBPROCESS_ENV_ALLOW` list, and
+  output is redacted by secret pattern and exact inherited value. Under the default protected-file policy,
+  shell admission blocks literal protected paths and environment dump commands on every platform. macOS
+  additionally applies a Seatbelt read mask to existing protected
+  files/directories, even when the general write sandbox is off. Linux and Windows do not have that kernel
+  read mask: their arbitrary shell code is not a security sandbox and static preflight can be bypassed.
+- **MCP servers and external coding agents are explicit trusted extensions.** They execute outside Hara's
+  protected-file boundary, require confirmation on every interactive tool call (including `full-auto`), and
+  are disabled in non-interactive runs by default. Reviewed automation may opt in before launch with
+  `HARA_ALLOW_TRUSTED_EXTENSIONS=1`; inherited credentials are still scrubbed.
+- **Repositories no longer silently control Hara's privileged configuration.** Project config is limited by
+  default to validated presentation/model preferences; provider routes, credentials, hooks, MCP, sandbox,
+  guardian, approval, and automation settings require the launch-time `HARA_TRUST_PROJECT_CONFIG=1` opt-in.
+  Project permissions may tighten global policy but cannot grant new access, and Git-tracked `.hara-profile`
+  pins are ignored unless that same trust decision was made before startup. Symlink, hard-link, size, identity,
+  and concurrent-change checks protect each of these inputs, while diagnostics reveal key names but no values.
+- **Coding and project-state writes are transactional.** Edit, patch, undo, memory, skills, plans, profiles,
+  indexes, and gateway state use no-follow descriptors, inode checks, bounded reads, atomic replace or
+  compare-and-swap semantics, and private modes where appropriate. Protected search uses the same verified
+  descriptor path instead of handing sensitive-path decisions to `rg`, closing replacement and hard-link
+  races. `AGENTS.md`, subdirectory hints, mentions, and touched-file recall are bounded and reject protected
+  aliases before adding repository content to model context.
+- **Semantic search and review automation distrust stale or historical content.** Semantic indexes carry a
+  versioned manifest with content hashes and are rebuilt when source identity or bytes change. Review-chain
+  prompts receive bounded status/path metadata rather than Git patches; an auto-commit proceeds only when the
+  staged blob still matches the verified worktree descriptor, including deletion and SHA-256 repository edge
+  cases. Read-only auto-run Git policy excludes commands that can expose historical blobs, credentials, remote
+  URLs, or patch bodies.
+- **Old private state is tightened and stale checkpoint history is rotated.** Startup repairs `~/.hara` and
+  sensitive runtime trees to owner-only modes on POSIX systems. The protected checkpoint format rebuilds old
+  derived shadow repositories, filters protected paths independently of the launch-time exposure switch, and
+  purges a checkpoint repository if a protected blob ever reaches its index.
+- **Long-running work has bounded ownership and shutdown.** Shell jobs, external agents, gateway children,
+  approved organization flows, and cron commands terminate the whole process tree with TERM-to-KILL escalation
+  and stop accepting output after cancellation. Background job counts, cron run time/log size, lock takeover,
+  and context fan-out are capped; Windows shell aliases and environment-dump variants are denied consistently.
+- **Gateway outbound files are immutable after admission.** Telegram, Feishu, Slack, Discord, Mattermost,
+  Matrix, WeCom, and Weixin upload verified in-memory bytes plus a safe filename, so a queued path cannot be
+  swapped for a secret before delivery. Counts and bytes are bounded at queue and consume time, cleanup checks
+  inode identity, and Signal outbound files fail closed because its RPC accepts only reopenable filesystem paths.
+
 ## 0.122.0 — 2026-07-13 — structured runs, durable work, and a fail-closed gateway
 
 - **Machine-safe headless runs.** `hara -p … --schema <json|file>` installs a run-scoped

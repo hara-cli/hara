@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,6 +85,67 @@ test("grep tool: preserves regex support without rg via a bounded Node worker", 
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("grep Node fallback reuses the protected-file boundary and rejects hard-link aliases", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-grep-hardlink-"));
+  const previousPath = process.env.PATH;
+  const marker = "MUST_NOT_CROSS_FALLBACK_BOUNDARY";
+  try {
+    const protectedFile = join(dir, ".env");
+    writeFileSync(protectedFile, `${marker}=secret\n`);
+    linkSync(protectedFile, join(dir, "apparently-safe.txt"));
+    writeFileSync(join(dir, "ordinary.txt"), `${marker}_SAFE=visible\n`);
+    process.env.PATH = "";
+
+    const out = await getTool("grep").run({ pattern: marker }, { cwd: dir });
+    assert.match(out, /ordinary\.txt:1:/);
+    assert.ok(!out.includes("apparently-safe.txt"), "a hard-link alias never enters fallback output");
+    assert.ok(!out.includes("=secret"), "protected content never enters fallback output");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("grep omits safe .env templates from broad searches but permits an explicit file path in rg and fallback", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-grep-env-template-"));
+  const previousPath = process.env.PATH;
+  const previousAllow = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  const pattern = "SAFE_TEMPLATE_SEARCH_NEEDLE";
+  writeFileSync(join(dir, ".env.example"), `${pattern}=replace-me\n`);
+  delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+
+  const assertPolicy = async (label) => {
+    const broad = await getTool("grep").run({ pattern, glob: "**/.env.example" }, { cwd: dir });
+    assert.match(broad, /No matches/, `${label}: broad search excludes templates even with a positive glob`);
+    assert.ok(!broad.includes(".env.example:"), `${label}: no template match line is returned`);
+
+    const explicit = await getTool("grep").run({ pattern, path: ".env.example" }, { cwd: dir });
+    assert.match(explicit, /\.env\.example:1:/, `${label}: an explicit safe template remains searchable`);
+    assert.match(explicit, new RegExp(pattern));
+  };
+
+  try {
+    let ripgrepAvailable = true;
+    try {
+      execFileSync("rg", ["--version"], { stdio: "ignore" });
+    } catch (error) {
+      ripgrepAvailable = false;
+      t.diagnostic(`ripgrep unavailable; native branch skipped (${error?.message ?? error})`);
+    }
+    if (ripgrepAvailable) await assertPolicy("ripgrep");
+
+    process.env.PATH = "";
+    await assertPolicy("Node fallback");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousAllow === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previousAllow;
     rmSync(dir, { recursive: true, force: true });
   }
 });

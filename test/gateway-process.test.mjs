@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { gatewayRunTimeoutMs, runHara } from "../dist/gateway/serve.js";
 import { approvedOrgTimeoutMs, runApprovedOrgProcess } from "../dist/gateway/flows-pending.js";
 
@@ -11,6 +12,24 @@ async function waitForPath(path, timeoutMs = 5_000) {
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for child readiness: ${path}`);
     await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+const processAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+async function assertProcessGone(pid, label) {
+  const deadline = Date.now() + 2_000;
+  while (processAlive(pid) && Date.now() < deadline) await sleep(25);
+  if (processAlive(pid)) {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    assert.fail(`${label} (${pid}) survived process-tree termination`);
   }
 }
 
@@ -23,8 +42,20 @@ if (mode === "ok") console.log("mcp: hidden status\\nhello from child\\n  model 
 else if (mode === "empty") process.exit(0);
 else if (mode === "failure") { console.error("provider unavailable"); process.exit(7); }
 else if (mode === "sigkill") process.kill(process.pid, "SIGKILL");
-else if (mode === "hang-ignore-term") { process.on("SIGTERM", () => {}); setInterval(() => {}, 1000); }
+else if (mode === "hang-ignore-term") {
+  process.on("SIGTERM", () => console.log("late-after-stop"));
+  setInterval(() => {}, 1000);
+}
 else if (mode === "hang") setInterval(() => {}, 1000);
+else if (mode === "quiet-resistant-grandchild") {
+  const { spawn } = await import("node:child_process");
+  const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
+    stdio: "ignore",
+  });
+  grandchild.unref();
+  console.log("grandchild:" + grandchild.pid);
+  setInterval(() => {}, 1000);
+}
 else if (mode === "inherited-pipe") {
   const { spawn } = await import("node:child_process");
   const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
@@ -65,7 +96,7 @@ test("approved org subprocesses have a hard ceiling and die with gateway shutdow
   writeFileSync(helper, `
 import { writeFileSync } from "node:fs";
 process.stdout.write("pid:" + process.pid + "\\n", () => writeFileSync(${JSON.stringify(ready)}, ""));
-process.on("SIGTERM", () => {});
+process.on("SIGTERM", () => process.stdout.write("late-after-stop\\n"));
 setInterval(() => {}, 1000);
 `);
   const controller = new AbortController();
@@ -83,6 +114,7 @@ setInterval(() => {}, 1000);
     const result = await running;
     assert.equal(result.stopReason, "shutdown");
     assert.match(result.output, /pid:\d+/);
+    assert.doesNotMatch(result.output, /late-after-stop/, "output emitted after shutdown must be discarded");
     assert.ok(Date.now() - started < 1_500, "a TERM-ignoring approved delegation cannot pin daemon shutdown");
   } finally {
     controller.abort();
@@ -109,7 +141,57 @@ test("runHara times out, escalates TERM to KILL, and settles promptly", async ()
   const started = Date.now();
   const result = await withChild("hang-ignore-term", { timeoutMs: 80, killGraceMs: 50 });
   assert.match(result.reply, /^✗ hara timed out after 80ms; the run was stopped\.$/);
+  assert.doesNotMatch(result.reply, /late-after-stop/, "output emitted after timeout must be discarded");
   assert.ok(Date.now() - started < 1_500, "a TERM-ignoring child must not pin the gateway");
+});
+
+test("runHara still force-kills a quiet TERM-resistant grandchild after its direct child closes", { skip: process.platform === "win32" }, async () => {
+  const started = Date.now();
+  const result = await withChild("quiet-resistant-grandchild", { timeoutMs: 250, killGraceMs: 50 });
+  const pid = Number(/grandchild:(\d+)/.exec(result.reply)?.[1]);
+  try {
+    assert.match(result.reply, /^✗ hara timed out after 250ms; the run was stopped\./);
+    assert.ok(Number.isSafeInteger(pid) && pid > 0, result.reply);
+    assert.ok(Date.now() - started < 1_500, "quiet descendants cannot extend the gateway timeout indefinitely");
+    await assertProcessGone(pid, "runHara quiet grandchild");
+  } finally {
+    if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  }
+});
+
+test("approved org timeout force-kills a quiet TERM-resistant grandchild after its direct child closes", { skip: process.platform === "win32" }, async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hara-approved-org-tree-"));
+  const helper = join(cwd, "org-tree.mjs");
+  writeFileSync(helper, `
+import { spawn } from "node:child_process";
+const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
+  stdio: "ignore",
+});
+grandchild.unref();
+console.log("grandchild:" + grandchild.pid);
+setInterval(() => {}, 1000);
+`);
+  let pid = 0;
+  try {
+    const started = Date.now();
+    const result = await runApprovedOrgProcess(process.execPath, [helper], {
+      cwd,
+      timeoutMs: 250,
+      killGraceMs: 50,
+    });
+    pid = Number(/grandchild:(\d+)/.exec(result.output)?.[1]);
+    assert.equal(result.stopReason, "timeout");
+    assert.ok(Number.isSafeInteger(pid) && pid > 0, result.output);
+    assert.ok(Date.now() - started < 1_500, "quiet descendants cannot extend an approved-org timeout indefinitely");
+    await assertProcessGone(pid, "approved-org quiet grandchild");
+  } finally {
+    if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("runHara does not wait forever when a grandchild inherits its output pipes", async (t) => {

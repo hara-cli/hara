@@ -50,6 +50,7 @@ import { disposeTodoScope, restoreTodos, serializeTodos } from "../tools/todo.js
 import { disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
+import { readModelContextFileSync } from "../fs-read.js";
 
 /** What the CLI entry injects (built in index.ts, where config/providers/guardian already live). */
 export interface ServeDeps {
@@ -516,7 +517,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     }).slice(0, 5);
     const restore = buildFileRestore(touched, (f) => {
       try {
-        return readFileSync(f, "utf8");
+        return readModelContextFileSync(f, 32 * 1024);
       } catch {
         return null;
       }

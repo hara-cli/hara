@@ -7,10 +7,12 @@ import { runShell } from "../sandbox.js";
 import { nearestPaths } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
-import { atomicWriteText } from "../fs-write.js";
+import { atomicWriteText, bindAtomicWritePath, type AtomicWriteBoundary } from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
-import { BinaryFileError, readRegularFileSnapshot, streamFileSlice } from "../fs-read.js";
+import { BinaryFileError, readVerifiedRegularFileSnapshot, resolveVerifiedModelPath, streamFileSlice } from "../fs-read.js";
 import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
+import { sensitiveFileError, sensitiveShellCommandReason } from "../security/sensitive-files.js";
+import { createToolOutputLineRedactor, redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import {
   hostsInCommand,
   isNetworkGitOp,
@@ -137,10 +139,16 @@ registerTool({
   kind: "read",
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
+    const denied = sensitiveFileError(p, "read");
+    if (denied) return denied;
     try {
+      const target = resolveVerifiedModelPath(p, "read");
       // streamFileSlice opens O_NONBLOCK, validates the same fd as a regular file, and stops after the
       // requested window. Using it for every size removes the path-level stat→read race entirely.
-      return cap(await streamFileSlice(p, input.offset, input.limit ?? READ_LINES, { lineCap: LINE_CAP }));
+      return cap(await streamFileSlice(target, input.offset, input.limit ?? READ_LINES, {
+        lineCap: LINE_CAP,
+        protectSensitive: true,
+      }));
     } catch (e: any) {
       if (e instanceof BinaryFileError) return `Error: cannot read ${input.path}: file appears binary; use an image/media-specific tool or inspect it with \`file\`.`;
       const near = nearestPaths(ctx.cwd, input.path);
@@ -163,23 +171,32 @@ registerTool({
   kind: "edit",
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
+    const denied = sensitiveFileError(p, "write");
+    if (denied) return denied;
     if (typeof input.content !== "string") return "Error: write_file `content` must be a string. No changes written.";
-    let prevSnapshot: Awaited<ReturnType<typeof readRegularFileSnapshot>> | null = null;
+    let prevSnapshot: Awaited<ReturnType<typeof readVerifiedRegularFileSnapshot>> | null = null;
+    let boundary: AtomicWriteBoundary | undefined;
     try {
-      prevSnapshot = await readRegularFileSnapshot(p);
+      boundary = bindAtomicWritePath(p, "write");
+      prevSnapshot = await readVerifiedRegularFileSnapshot(boundary.target, undefined, "write");
     } catch (error: any) {
-      if (error?.code !== "ENOENT") return `Error: cannot inspect ${input.path}: ${error?.message ?? error?.code}. No changes written.`;
+      if (error?.code !== "ENOENT" || !boundary) return `Error: cannot inspect ${input.path}: ${error?.message ?? error?.code}. No changes written.`;
     }
+    if (!boundary) return `Error: cannot bind ${input.path} to a stable parent. No changes written.`;
     const prev = prevSnapshot?.text ?? null;
     if (prev === input.content) return `Unchanged ${p} (${input.content.length} chars already match).`;
     let committed;
     try {
-      committed = await atomicWriteText(p, input.content, { expected: prev, expectedIdentity: prevSnapshot ?? undefined });
+      committed = await atomicWriteText(boundary.target, input.content, {
+        expected: prev,
+        expectedIdentity: prevSnapshot ?? undefined,
+        boundary,
+      });
     } catch (error: any) {
       return `Error: cannot write ${input.path}: ${error?.message ?? String(error)} No changes written.`;
     }
     emitDiff(input.path, prev ?? "", input.content, ctx.ui);
-    recordEdit([{ path: input.path, absPath: p, before: prev, beforeMode: prevSnapshot?.mode, committed, after: input.content }]);
+    recordEdit([{ path: input.path, absPath: boundary.target, before: prev, beforeMode: prevSnapshot?.mode, committed, after: input.content }]);
     invalidateFileCandidates(ctx.cwd);
     return `Wrote ${String(input.content).length} chars to ${p}` + (committed.warnings?.length ? ` Warning: ${committed.warnings.join("; ")}` : "");
   },
@@ -199,6 +216,13 @@ registerTool({
   },
   kind: "exec",
   async run(input, ctx) {
+    const protectedReason = sensitiveShellCommandReason(String(input.command ?? ""), ctx.cwd);
+    if (protectedReason) {
+      return (
+        `Blocked: shell command crosses Hara's protected secret boundary (${protectedReason}). ` +
+        "This deny is not bypassed by full-auto. Restart hara with HARA_ALLOW_SENSITIVE_FILES=1 only for an intentional, user-approved exposure."
+      );
+    }
     if (isNgrokTunnelCommand(input.command) && !ngrokAuthConfigured()) {
       return (
         "Skipped ngrok tunnel: no authentication was found in NGROK_AUTHTOKEN/NGROK_API_KEY or the standard ngrok config files. " +
@@ -207,7 +231,8 @@ registerTool({
     }
     if (input.background) {
       const id = startJob(input.command, ctx.cwd, ctx.sandbox ?? "off");
-      return `Started background job ${id}: \`${input.command}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all. Poll until it exits before running steps that depend on it.`;
+      const safeCommand = redactToolSubprocessOutput(String(input.command));
+      return `Started background job ${id}: \`${safeCommand}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all. Poll until it exits before running steps that depend on it.`;
     }
     // Network fault tolerance — short-circuit if this command targets a host already found unreachable this
     // session, so a repeat doesn't burn another ~75s OS connect timeout. Only pays the git-remote lookup
@@ -224,19 +249,19 @@ registerTool({
         return `Skipped without running: host "${blocked}" already failed to connect earlier in THIS session — hara does not retry network operations to a host known unreachable this session (a retry just hangs ~75s again). Do not swap in a public mirror (won't serve private repos) or switch protocols; diagnose instead.${proxyHint(blocked)}`;
       }
     }
-    let buf = ""; // TUI: line-buffer live output into the sink (one notice per line)
-    const live = ctx.ui
-      ? (s: string) => {
-          buf += s;
-          let i: number;
-          while ((i = buf.indexOf("\n")) >= 0) {
-            ctx.ui!.notice(buf.slice(0, i));
-            buf = buf.slice(i + 1);
-          }
-        }
+    const liveEmit = ctx.ui
+      ? (line: string) => ctx.ui!.notice(line.replace(/\r?\n$/, ""))
       : procOut.isTTY
-        ? (s: string) => procOut.write(s) // stream output in a plain terminal
-        : undefined;
+        ? (line: string) => procOut.write(line)
+        : null;
+    // stdout/stderr are independent byte streams. A shared partial-line buffer could splice stderr into
+    // the middle of a stdout credential and defeat exact-value redaction in the live UI.
+    const liveStdout = liveEmit ? createToolOutputLineRedactor(liveEmit) : null;
+    const liveStderr = liveEmit ? createToolOutputLineRedactor(liveEmit) : null;
+    const live = liveEmit
+      ? (s: string, stream: "stdout" | "stderr") => (stream === "stdout" ? liveStdout : liveStderr)!.push(s)
+      : undefined;
+    const flushLive = (): void => { liveStdout?.flush(); liveStderr?.flush(); };
     const timeout = shellTimeoutMs(input.command, input.timeout_ms);
     try {
       const { stdout, stderr } = await runShell(input.command, ctx.cwd, ctx.sandbox ?? "off", {
@@ -244,10 +269,11 @@ registerTool({
         maxBuffer: 10 * 1024 * 1024,
         onData: live,
       });
-      if (ctx.ui && buf) ctx.ui.notice(buf); // flush trailing partial line
+      flushLive();
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
-      return capHeadTail(combined.trim() || "(no output)");
+      return capHeadTail(redactToolSubprocessOutput(combined.trim() || "(no output)"));
     } catch (e: any) {
+      flushLive();
       let base = `Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`;
       // Timeout gets an ACTIONABLE next step, not just a corpse — the model (and user) should pick a
       // lane instead of blind-retrying into the same wall.
@@ -265,10 +291,10 @@ registerTool({
         if (host) {
           markHostUnreachable(host);
           ctx.ui?.notice(`↯ ${host} marked unreachable for this session — won't retry network ops to it`);
-          return capHeadTail(base + proxyHint(host));
+          return capHeadTail(redactToolSubprocessOutput(base + proxyHint(host)));
         }
       }
-      return capHeadTail(base);
+      return capHeadTail(redactToolSubprocessOutput(base));
     }
   },
 });
@@ -291,13 +317,13 @@ registerTool({
     if (action === "list") {
       const js = listJobs();
       if (!js.length) return "(no background jobs)";
-      return js.map((j) => `${j.id}  [${j.status}${j.code != null ? " " + j.code : ""}]  ${Math.round(j.ageMs / 1000)}s  ${j.command}`).join("\n");
+      return js.map((j) => `${j.id}  [${j.status}${j.code != null ? " " + j.code : ""}]  ${Math.round(j.ageMs / 1000)}s  ${redactToolSubprocessOutput(j.command)}`).join("\n");
     }
     const id = String(input.id ?? "");
     if (!id) return "Error: `id` is required for tail/kill.";
     if (action === "tail") {
       const t = tailJob(id, Number(input.lines) || 40);
-      return t == null ? `No job ${id}.` : t.trim() || "(no output yet)";
+      return t == null ? `No job ${id}.` : redactToolSubprocessOutput(t.trim() || "(no output yet)");
     }
     if (action === "kill") return killJob(id) ? `Killed ${id}.` : `No running job ${id} (already exited/killed or unknown).`;
     return `Error: unknown action '${action}'.`;

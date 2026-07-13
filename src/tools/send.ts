@@ -1,6 +1,6 @@
 import { registerTool } from "./registry.js";
-import { appendFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { queueOutboundSnapshot } from "../gateway/outbound-files.js";
 
 // `send_file` — the agent's ONLY way to push a file/image to the user when running inside `hara gateway`
 // (Telegram / WeChat). The gateway sets HARA_GATEWAY_OUTBOX to a per-message temp file; this tool appends the
@@ -27,10 +27,15 @@ if (process.env.HARA_GATEWAY) {
       const outbox = process.env.HARA_GATEWAY_OUTBOX;
       if (!outbox) return "send_file only works inside `hara gateway` — there is no chat to send to here.";
       const p = resolve(ctx.cwd, String(input.path ?? ""));
-      if (!existsSync(p) || !statSync(p).isFile())
-        return `No such file: ${p || "(none)"} — create the file first, then call send_file with its absolute path.`;
-      appendFileSync(outbox, p + "\n");
-      return `Queued for delivery to the user in this chat: ${p}`;
+      try {
+        await queueOutboundSnapshot(p, outbox);
+        return `Queued a private snapshot for delivery to the user in this chat: ${p}`;
+      } catch (error: any) {
+        if (error?.code === "ENOENT") {
+          return `No such file: ${p || "(none)"} — create the file first, then call send_file with its absolute path.`;
+        }
+        return error instanceof Error ? error.message : `Unable to queue ${p} for delivery.`;
+      }
     },
   });
 }

@@ -10,11 +10,11 @@
 // chunked protocol → AES-256-CBC decrypt inbound media that carries an `aeskey`. Every request frame carries a
 // `headers.req_id` and the server echoes it back so request/response are correlated. v1 limitations are documented
 // at the bottom of this file (the public spec is thin — fields are best-effort and tolerant of shape drift).
-import { readFileSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { randomUUID, createDecipheriv, createHash } from "node:crypto";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import { InboundMediaBudget, decodeBase64Media, readResponseBytesLimited, savePrivateMediaBytes } from "./media.js";
+import type { OutboundFilePayload } from "./outbound-files.js";
 
 const DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com";
 const WSImpl: any = (globalThis as any).WebSocket;
@@ -207,15 +207,15 @@ export function wecomAdapter(botId: string, secret: string, wsUrl: string = DEFA
   // it publishes through `conn`.
   const conn: { send: ((cmd: string, body: any) => Promise<any>) | null } = { send: null };
 
-  // Upload a local file to WeCom via the 3-step chunked protocol → its media_id. Throws on any step error.
-  async function uploadMedia(filePath: string, mediaType: "image" | "file"): Promise<string> {
+  // Upload already-verified bytes to WeCom via the 3-step chunked protocol → its media_id.
+  async function uploadMedia(file: OutboundFilePayload, mediaType: "image" | "file"): Promise<string> {
     if (!conn.send) throw new Error("WeCom socket not connected");
-    const data = readFileSync(filePath);
+    const data = file.bytes;
     if (data.length > ABSOLUTE_MAX_BYTES) throw new Error(`file exceeds WeCom 20MB limit: ${data.length} bytes`);
     const totalChunks = Math.max(1, Math.ceil(data.length / UPLOAD_CHUNK_SIZE));
     const init = await conn.send(CMD_UPLOAD_INIT, {
       type: mediaType,
-      filename: basename(filePath),
+      filename: file.safeName,
       total_size: data.length,
       total_chunks: totalChunks,
       md5: createHash("md5").update(data).digest("hex"),
@@ -243,11 +243,11 @@ export function wecomAdapter(botId: string, secret: string, wsUrl: string = DEFA
           .catch(() => {});
       }
     },
-    async sendFile(chatId, filePath) {
+    async sendFile(chatId, file) {
       if (!conn.send) return;
-      const mediaType: "image" | "file" = isImageName(filePath) ? "image" : "file";
+      const mediaType: "image" | "file" = isImageName(file.safeName) ? "image" : "file";
       try {
-        const mediaId = await uploadMedia(filePath, mediaType);
+        const mediaId = await uploadMedia(file, mediaType);
         await conn.send(CMD_SEND, { chatid: String(chatId), msgtype: mediaType, [mediaType]: { media_id: mediaId } });
       } catch {
         /* upload/send failed — caller surfaces a generic failure; nothing else to do */

@@ -2,13 +2,37 @@
 // AGENTS.md / CLAUDE.md (the local conventions for that package) by appending it to the tool result, so a
 // monorepo's per-package rules reach the model exactly when work moves into that package. Startup already
 // loads root→cwd (agents-md.ts); this covers the subdirs the agent navigates INTO. Each dir loaded once.
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join, dirname, resolve, relative, isAbsolute } from "node:path";
 import { findProjectRoot } from "./agents-md.js";
+import { readModelContextBytePrefixSync } from "../fs-read.js";
 
 const FILENAMES = ["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"];
 const MAX = 8 * 1024;
+const TRUNCATED = "\n…[truncated to subdirectory-context budget]";
 const loaded = new Set<string>(); // dirs whose local doc we've already injected (per process / session)
+
+function byteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (byteLength(value) <= maxBytes) return value;
+  let used = 0;
+  let out = "";
+  for (const char of value) {
+    const bytes = byteLength(char);
+    if (used + bytes > maxBytes) break;
+    out += char;
+    used += bytes;
+  }
+  return out;
+}
+
+function markBudgetTruncation(value: string): string {
+  return utf8Prefix(value, MAX - byteLength(TRUNCATED)) + TRUNCATED;
+}
 
 function isDir(p: string): boolean {
   try {
@@ -31,7 +55,7 @@ function pathsFrom(input: any): string[] {
 export function subdirHint(input: unknown, cwd: string): string {
   const base = resolve(cwd);
   const root = findProjectRoot(cwd);
-  const parts: string[] = [];
+  let hint = "";
   for (const raw of pathsFrom(input)) {
     const absPath = isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw);
     const startDir = isDir(absPath) ? absPath : dirname(absPath);
@@ -53,10 +77,18 @@ export function subdirHint(input: unknown, cwd: string): string {
         const fp = join(cd, name);
         if (!existsSync(fp)) continue;
         try {
-          let txt = readFileSync(fp, "utf8").trim();
+          const separator = "\n\n";
+          const header = `<!-- ${name} @ ${cd} — local conventions for this directory -->\n`;
+          const remaining = MAX - byteLength(hint) - byteLength(separator + header);
+          if (remaining <= byteLength(TRUNCATED)) return markBudgetTruncation(hint);
+          const read = readModelContextBytePrefixSync(fp, remaining);
+          if (read.binary) break;
+          let txt = read.text.trim();
           if (!txt) break;
-          if (Buffer.byteLength(txt, "utf8") > MAX) txt = txt.slice(0, MAX) + "\n…[truncated]";
-          parts.push(`<!-- ${name} @ ${cd} — local conventions for this directory -->\n${txt}`);
+          if (read.truncated) {
+            txt = utf8Prefix(txt, Math.max(0, remaining - byteLength(TRUNCATED))) + TRUNCATED;
+          }
+          hint += separator + header + utf8Prefix(txt, remaining);
         } catch {
           /* ignore unreadable */
         }
@@ -64,5 +96,5 @@ export function subdirHint(input: unknown, cwd: string): string {
       }
     }
   }
-  return parts.length ? "\n\n" + parts.join("\n\n") : "";
+  return hint;
 }

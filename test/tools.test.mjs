@@ -200,15 +200,86 @@ test("atomic expected-identity updates preserve the exact preflight mode", { ski
 
 test("bash runs in cwd and returns combined output", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-test-"));
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  process.env.HARA_ALLOW_SENSITIVE_FILES = "1"; // safe echo fixture; avoids nested sandbox-exec in CI
   try {
     const o = await getTool("bash").run({ command: "echo hi" }, { cwd: dir });
     assert.match(o, /hi/);
   } finally {
+    if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test("bash reports failures without throwing", async () => {
-  const o = await getTool("bash").run({ command: "exit 7" }, { cwd: process.cwd() });
-  assert.match(o, /failed/i);
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  process.env.HARA_ALLOW_SENSITIVE_FILES = "1";
+  try {
+    const o = await getTool("bash").run({ command: "exit 7" }, { cwd: process.cwd() });
+    assert.match(o, /failed/i);
+  } finally {
+    if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
+  }
+});
+
+test("background bash receipt and job tool views never replay command/output credentials", async () => {
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  process.env.HARA_ALLOW_SENSITIVE_FILES = "1";
+  const token = "sk-hara-background-12345678901234567890";
+  try {
+    const receipt = await getTool("bash").run(
+      { command: `printf '%s\\n' '${token}'`, background: true },
+      { cwd: process.cwd(), sandbox: "off" },
+    );
+    assert.ok(!receipt.includes(token));
+    assert.match(receipt, /sk-\*\*\*/);
+    const id = receipt.match(/background job (j\d+)/)?.[1];
+    assert.ok(id);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const list = await getTool("job").run({ action: "list" }, { cwd: process.cwd() });
+    const tail = await getTool("job").run({ action: "tail", id }, { cwd: process.cwd() });
+    for (const value of [list, tail]) {
+      assert.ok(!value.includes(token));
+      assert.match(value, /sk-\*\*\*/);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
+  }
+});
+
+test("live bash UI redacts stdout and stderr independently when chunks interleave", async () => {
+  const previousAllow = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  const previousToken = process.env.HARA_LIVE_STREAM_TOKEN;
+  process.env.HARA_ALLOW_SENSITIVE_FILES = "1";
+  const token = "opaque-live-stream-token-1234567890";
+  process.env.HARA_LIVE_STREAM_TOKEN = token;
+  const split = Math.floor(token.length / 2);
+  const first = token.slice(0, split);
+  const second = token.slice(split);
+  const notices = [];
+  try {
+    const script =
+      `process.stdout.write(${JSON.stringify(first)});` +
+      `setTimeout(()=>process.stderr.write('ordinary-stderr\\n'),20);` +
+      `setTimeout(()=>process.stdout.write(${JSON.stringify(second + "\\n")}),40);`;
+    const result = await getTool("bash").run(
+      { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}` },
+      { cwd: process.cwd(), sandbox: "off", ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice(line) { notices.push(line); } } },
+    );
+    const live = notices.join("\n");
+    assert.ok(!live.includes(first));
+    assert.ok(!live.includes(second));
+    assert.ok(!live.includes(token));
+    assert.match(live, /\*\*\*/);
+    assert.match(live, /ordinary-stderr/);
+    assert.ok(!result.includes(token));
+  } finally {
+    if (previousAllow === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previousAllow;
+    if (previousToken === undefined) delete process.env.HARA_LIVE_STREAM_TOKEN;
+    else process.env.HARA_LIVE_STREAM_TOKEN = previousToken;
+  }
 });

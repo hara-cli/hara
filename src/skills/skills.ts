@@ -2,12 +2,16 @@
 // ~/.hara/skills). Frontmatter: name, description (required) + when_to_use / allowed-tools /
 // context inline|fork / model / paths / user-invocable / disable-model-invocation. The body is the
 // instructions, loaded ON DEMAND (progressive disclosure) — only the frontmatter index sits in context.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { findProjectRoot } from "../context/agents-md.js";
 import { scanMemory } from "../memory/guard.js";
 import { pluginSkillDirs } from "../plugins/plugins.js";
+import { readModelContextFileSync, readVerifiedRegularFileSnapshot } from "../fs-read.js";
+import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
+
+const MAX_SKILL_BYTES = 512 * 1024;
 
 export interface Skill {
   id: string;
@@ -71,7 +75,7 @@ export function loadSkillIndex(cwd: string): Skill[] {
       const file = join(dir, entry, "SKILL.md"); // agentskills layout: <name>/SKILL.md
       if (!existsSync(file)) continue;
       try {
-        const { fm } = parseFrontmatter(readFileSync(file, "utf8"));
+        const { fm } = parseFrontmatter(readModelContextFileSync(file, MAX_SKILL_BYTES));
         const id = (fm.name as string) || entry;
         byId.set(id, {
           id,
@@ -97,7 +101,7 @@ export function loadSkillIndex(cwd: string): Skill[] {
 /** Read a skill's instruction body (progressive disclosure — only when the model/user opens it). */
 export function loadSkillBody(skill: Skill): string {
   try {
-    return parseFrontmatter(readFileSync(skill.file, "utf8")).body;
+    return parseFrontmatter(readModelContextFileSync(skill.file, MAX_SKILL_BYTES)).body;
   } catch {
     return "";
   }
@@ -139,12 +143,17 @@ when_to_use: after editing code, before declaring a task done
 `;
 
 /** Create ~/.hara/skills/verify-change/SKILL.md as a starter example. Returns the paths written. */
-export function scaffoldSkills(cwd: string): string[] {
+export async function scaffoldSkills(cwd: string): Promise<string[]> {
   const dir = join(skillsDir(cwd), "verify-change");
-  mkdirSync(dir, { recursive: true });
   const p = join(dir, "SKILL.md");
-  if (existsSync(p)) return [];
-  writeFileSync(p, SCAFFOLD, "utf8");
+  const boundary = bindAtomicWritePath(p, "scaffold skill");
+  try {
+    await readVerifiedRegularFileSnapshot(boundary.target, undefined, "scaffold skill");
+    return [];
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  await atomicWriteText(boundary.target, SCAFFOLD, { expected: null, boundary });
   invalidateSkillsCache();
   return [p];
 }

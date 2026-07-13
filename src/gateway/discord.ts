@@ -4,8 +4,6 @@
 // the cross-platform gateway plumbing (send_file, in-chat system context, stuck-guard, image attach/describe)
 // works unchanged. NOTE: receiving message text needs the privileged "Message Content Intent" enabled for the
 // bot in the Discord developer portal.
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
 import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
@@ -80,10 +78,10 @@ export function discordAdapter(token: string): ChatAdapter {
         }).catch(() => {});
       }
     },
-    async sendFile(chatId, filePath) {
+    async sendFile(chatId, file) {
       const form = new FormData();
       form.append("payload_json", JSON.stringify({}));
-      form.append("files[0]", new Blob([readFileSync(filePath)]), basename(filePath));
+      form.append("files[0]", new Blob([new Uint8Array(file.bytes)]), file.safeName);
       await fetch(`${REST}/channels/${chatId}/messages`, { method: "POST", headers: auth, body: form }).catch(() => {});
     },
     async start(onMessage, signal, shouldDownload) {

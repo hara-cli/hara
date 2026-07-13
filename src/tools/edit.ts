@@ -4,9 +4,10 @@ import { nearestPaths } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
 import { recordEdit } from "../undo.js";
-import { atomicWriteText } from "../fs-write.js";
+import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
-import { readRegularFileSnapshot } from "../fs-read.js";
+import { readVerifiedRegularFileSnapshot } from "../fs-read.js";
+import { sensitiveFileError } from "../security/sensitive-files.js";
 
 registerTool({
   name: "edit_file",
@@ -43,14 +44,18 @@ registerTool({
   kind: "edit",
   async run(input, ctx) {
     const p = isAbsolute(input.path) ? input.path : resolve(ctx.cwd, input.path);
+    const denied = sensitiveFileError(p, "edit");
+    if (denied) return denied;
     const edits: OneEdit[] =
       Array.isArray(input.edits) && input.edits.length
         ? input.edits
         : [{ old_string: input.old_string, new_string: input.new_string, replace_all: input.replace_all }];
 
-    let snapshot: Awaited<ReturnType<typeof readRegularFileSnapshot>>;
+    let snapshot: Awaited<ReturnType<typeof readVerifiedRegularFileSnapshot>>;
+    let boundary;
     try {
-      snapshot = await readRegularFileSnapshot(p);
+      boundary = bindAtomicWritePath(p, "edit");
+      snapshot = await readVerifiedRegularFileSnapshot(boundary.target, undefined, "edit");
     } catch (error: any) {
       const near = nearestPaths(ctx.cwd, input.path);
       return `Error: cannot read ${input.path}: ${error?.message ?? "unknown error"} (use write_file to create a new file).` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
@@ -61,12 +66,16 @@ registerTool({
     if ("error" in res) return `Error: ${res.error} in ${input.path}. No changes written.`;
     let committed;
     try {
-      committed = await atomicWriteText(p, res.text, { expected: text, expectedIdentity: snapshot });
+      committed = await atomicWriteText(boundary.target, res.text, {
+        expected: text,
+        expectedIdentity: snapshot,
+        boundary,
+      });
     } catch (error: any) {
       return `Error: cannot edit ${input.path}: ${error?.message ?? String(error)} No changes written.`;
     }
     emitDiff(input.path, text, res.text, ctx.ui);
-    recordEdit([{ path: input.path, absPath: p, before: text, beforeMode: snapshot.mode, committed, after: res.text }]);
+    recordEdit([{ path: input.path, absPath: boundary.target, before: text, beforeMode: snapshot.mode, committed, after: res.text }]);
     invalidateFileCandidates(ctx.cwd);
     const note = res.fuzzy ? " (quote-normalized)" : "";
     const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;

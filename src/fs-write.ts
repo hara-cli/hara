@@ -1,10 +1,15 @@
 // Crash-safe UTF-8 writes for coding tools. Content is staged beside the destination, fsynced, then
 // renamed into place so a killed process never leaves a half-written source file.
 import { randomUUID } from "node:crypto";
-import { basename, dirname, join } from "node:path";
-import { constants, linkSync, lstatSync, readlinkSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
-import { link, lstat, mkdir, open, realpath, rename, rmdir, stat, unlink } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
+import { constants, linkSync, lstatSync, readlinkSync, realpathSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
+import { lstat, mkdir, open, realpath, rmdir, stat, unlink } from "node:fs/promises";
 import { NonRegularFileError, readRegularFileSnapshotNoFollow, type RegularFileSnapshot } from "./fs-read.js";
+import {
+  canonicalizeProspectivePath,
+  lexicalSensitiveFileReason,
+  sensitiveFileError,
+} from "./security/sensitive-files.js";
 
 export class FileChangedError extends Error {
   readonly code = "HARA_FILE_CHANGED";
@@ -22,6 +27,18 @@ export interface AtomicWriteOptions {
   expectedIdentity?: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">;
   /** Explicit permission bits for the staged inode (used by transactional rollback). */
   mode?: number;
+  /** Canonical target + existing-ancestor identity captured by a coding tool during preflight. */
+  boundary?: AtomicWriteBoundary;
+}
+
+export interface AtomicWriteBoundary {
+  readonly target: string;
+  readonly action: string;
+  readonly ancestor: {
+    readonly path: string;
+    readonly dev: number;
+    readonly ino: number;
+  };
 }
 
 export interface CreatedDirectory extends Pick<RegularFileSnapshot, "dev" | "ino" | "mode"> {
@@ -43,6 +60,142 @@ export interface ClaimedPathIdentity extends Pick<RegularFileSnapshot, "dev" | "
 }
 
 let tempSequence = 0;
+
+// Internal Hara control-plane writers need the same identity/CAS guarantees as coding tools, but the
+// public protected-file policy intentionally rejects those destinations. Keep exemptions as object identity
+// rather than a forgeable boolean on AtomicWriteBoundary: only the narrow, destination-specific binders below
+// can mint one.
+const privateStateBoundaries = new WeakSet<AtomicWriteBoundary>();
+
+function protectedWriteError(path: string, action: string): Error | null {
+  const denied = sensitiveFileError(path, action);
+  return denied ? new Error(denied) : null;
+}
+
+function verifyDirectoryIdentity(boundary: AtomicWriteBoundary): void {
+  const current = lstatSync(boundary.ancestor.path);
+  const canonical = realpathSync.native(boundary.ancestor.path);
+  if (
+    !current.isDirectory()
+    || current.isSymbolicLink()
+    || current.dev !== boundary.ancestor.dev
+    || current.ino !== boundary.ancestor.ino
+    || canonical !== boundary.ancestor.path
+  ) throw new FileChangedError(boundary.target);
+}
+
+export function verifyAtomicWriteBoundary(boundary: AtomicWriteBoundary): void {
+  verifyDirectoryIdentity(boundary);
+  if (!privateStateBoundaries.has(boundary)) {
+    const denied = protectedWriteError(boundary.target, boundary.action);
+    if (denied) throw denied;
+  }
+}
+
+/**
+ * Bind one internal private-Hara-state file below a directory whose symlink-free construction and mode
+ * were already verified by the caller. The exemption cannot be used for `.env`/credential files or an
+ * arbitrary descendant: the target must be an immediate child classified specifically as Hara state.
+ */
+export function bindHaraPrivateStateWritePath(path: string, stateDir: string, action: string): AtomicWriteBoundary {
+  const dir = resolve(stateDir);
+  const target = resolve(path);
+  if (dirname(target) !== dir) throw new Error(`private Hara state target must be an immediate child of ${dir}`);
+  if (lexicalSensitiveFileReason(target) !== "private Hara state") {
+    throw new Error(`refusing private Hara state exemption for ${target}`);
+  }
+  const canonical = realpathSync.native(dir);
+  const info = lstatSync(dir);
+  if (!info.isDirectory() || info.isSymbolicLink() || canonical !== dir) {
+    throw new Error(`refusing private Hara state write: '${dir}' is not a canonical directory`);
+  }
+  const boundary = {
+    target,
+    action,
+    ancestor: { path: dir, dev: info.dev, ino: info.ino },
+  } satisfies AtomicWriteBoundary;
+  privateStateBoundaries.add(boundary);
+  verifyAtomicWriteBoundary(boundary);
+  return boundary;
+}
+
+/** Bind the personal identity pin without granting a general protected-file bypass. The final directory
+ * entry is deliberately not resolved: callers can no-follow inspect it and atomic CAS will reject any
+ * symlink or replacement that appears after preflight. */
+export function bindProfilePinWritePath(path: string, action = "write profile pin"): AtomicWriteBoundary {
+  const requested = resolve(path);
+  if (basename(requested) !== ".hara-profile") throw new Error("profile pin target must be named .hara-profile");
+  const parent = realpathSync.native(dirname(requested));
+  const target = join(parent, basename(requested));
+  if (lexicalSensitiveFileReason(target) !== "private Hara routing state") {
+    throw new Error(`refusing profile pin exemption for ${target}`);
+  }
+  const info = lstatSync(parent);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${parent} is not a canonical directory`);
+  const boundary = {
+    target,
+    action,
+    ancestor: { path: parent, dev: info.dev, ino: info.ino },
+  } satisfies AtomicWriteBoundary;
+  privateStateBoundaries.add(boundary);
+  verifyAtomicWriteBoundary(boundary);
+  return boundary;
+}
+
+/** Bind a directory entry while preserving its final symlink topology (used by transactional deletes). */
+export function bindAtomicParentEntryPath(path: string, action = "write"): AtomicWriteBoundary {
+  const lexicalDenied = protectedWriteError(path, action);
+  if (lexicalDenied) throw lexicalDenied;
+  const requested = resolve(path);
+  const parent = realpathSync.native(dirname(requested));
+  const target = join(parent, basename(requested));
+  const canonicalDenied = protectedWriteError(target, action);
+  if (canonicalDenied) throw canonicalDenied;
+  const info = lstatSync(parent);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${parent} is not a directory`);
+  const boundary = {
+    target,
+    action,
+    ancestor: { path: parent, dev: info.dev, ino: info.ino },
+  } satisfies AtomicWriteBoundary;
+  verifyAtomicWriteBoundary(boundary);
+  return boundary;
+}
+
+/**
+ * Bind a direct coding-tool path to one canonical candidate and the nearest existing parent directory.
+ * Missing tail directories remain below that identity; a parent symlink retarget or directory replacement
+ * between preflight and commit therefore fails instead of silently selecting another tree.
+ */
+export function bindAtomicWritePath(path: string, action = "write"): AtomicWriteBoundary {
+  const lexicalDenied = protectedWriteError(path, action);
+  if (lexicalDenied) throw lexicalDenied;
+  const target = canonicalizeProspectivePath(path);
+  const canonicalDenied = protectedWriteError(target, action);
+  if (canonicalDenied) throw canonicalDenied;
+
+  let current = dirname(target);
+  for (let depth = 0; depth < 128; depth++) {
+    try {
+      const canonical = realpathSync.native(current);
+      const info = lstatSync(canonical);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`${canonical} is not a directory`);
+      const boundary = {
+        target,
+        action,
+        ancestor: { path: canonical, dev: info.dev, ino: info.ino },
+      } satisfies AtomicWriteBoundary;
+      verifyAtomicWriteBoundary(boundary);
+      return boundary;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+    }
+    const parent = dirname(current);
+    if (parent === current) throw new Error(`cannot bind parent directory for ${path}`);
+    current = parent;
+  }
+  throw new Error(`write path exceeds 128 components: ${path}`);
+}
 
 async function writeTarget(path: string): Promise<string> {
   try {
@@ -195,6 +348,10 @@ async function syncDirectory(path: string): Promise<void> {
 
 /** Atomically replace/create a UTF-8 file, optionally refusing to overwrite a newer disk version. */
 export async function atomicWriteText(path: string, content: string, options: AtomicWriteOptions = {}): Promise<AtomicWriteResult> {
+  if (options.boundary) {
+    if (resolve(path) !== resolve(options.boundary.target)) throw new FileChangedError(path);
+    verifyAtomicWriteBoundary(options.boundary);
+  }
   let target = await writeTarget(path);
   let dir = dirname(target);
   const createdDirs: CreatedDirectory[] = [];
@@ -204,6 +361,22 @@ export async function atomicWriteText(path: string, content: string, options: At
   // later transaction steps to a different tree.
   dir = await realpath(dir);
   target = join(dir, basename(target));
+  if (options.boundary) {
+    if (target !== options.boundary.target) throw new FileChangedError(path);
+    verifyAtomicWriteBoundary(options.boundary);
+  }
+  const parentInfo = await lstat(dir);
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink()) throw new FileChangedError(dir);
+  const parentBoundary = {
+    target,
+    action: options.boundary?.action ?? "write",
+    ancestor: { path: dir, dev: parentInfo.dev, ino: parentInfo.ino },
+  } satisfies AtomicWriteBoundary;
+  const verifyCommitParent = (): void => {
+    verifyDirectoryIdentity(parentBoundary);
+    if (options.boundary) verifyAtomicWriteBoundary(options.boundary);
+  };
+  verifyCommitParent();
 
   // A caller-provided preflight identity is authoritative. Reading mode from a path before the move-claim
   // would let a temporary same-path replacement influence the mode even when the expected inode is restored
@@ -230,6 +403,8 @@ export async function atomicWriteText(path: string, content: string, options: At
     const handle = await open(temp, "wx", mode);
     staged = true;
     try {
+      const opened = await handle.stat();
+      writtenIdentity = { dev: opened.dev, ino: opened.ino, mode: opened.mode & 0o777, nlink: opened.nlink };
       await handle.writeFile(content, "utf8");
       // open(2) applies the process umask even when replacing an existing file. Restore that existing (or
       // explicit rollback) mode on the staged fd; brand-new ordinary files still honor the user's umask.
@@ -245,19 +420,23 @@ export async function atomicWriteText(path: string, content: string, options: At
       // link(2) is an atomic create-if-absent operation. A plain rename would overwrite a file that
       // appeared after validation, defeating create's no-clobber contract.
       try {
-        await link(temp, target);
+        // Keep the final parent-identity check and namespace mutation in one JS turn. Node has no portable
+        // openat/linkat API; synchronous link is the narrowest available commit boundary.
+        verifyCommitParent();
+        linkSync(temp, target);
       } catch (error: any) {
         if (error?.code === "EEXIST") throw new FileChangedError(path);
         throw error;
       }
-      await unlink(temp);
+      unlinkSync(temp);
       staged = false;
     } else if (typeof options.expected === "string") {
       // Claim the directory entry BEFORE verification. Reading the old fd and then rename-overwriting the
       // path leaves a verify→commit race; a concurrent replacement can otherwise be silently destroyed.
       const claimed = join(dir, `.hara-claim-${process.pid}-${randomUUID()}.tmp`);
       try {
-        await rename(target, claimed);
+        verifyCommitParent();
+        renameSync(target, claimed);
       } catch (error: any) {
         if (error?.code === "ENOENT") throw new FileChangedError(path);
         throw error;
@@ -306,10 +485,12 @@ export async function atomicWriteText(path: string, content: string, options: At
       if (!claimedIdentity) throw new Error(`Failed to identify claimed file for ${path}`);
 
       try {
-        await link(temp, target); // atomic create-if-absent: never overwrites an entry created after claim.
+        verifyCommitParent();
+        linkSync(temp, target); // atomic create-if-absent: never overwrites an entry created after claim.
       } catch (error: any) {
         let recovery = "";
         try {
+          verifyCommitParent();
           restoreClaimedPath(claimed, target, claimedIdentity);
         } catch (restoreError: any) {
           recovery = `; claimed old entry is retained: ${restoreError?.message ?? String(restoreError)}`;
@@ -317,21 +498,36 @@ export async function atomicWriteText(path: string, content: string, options: At
         if (error?.code === "EEXIST") throw new Error(`${new FileChangedError(path).message}${recovery}`);
         throw new Error(`${error?.message ?? String(error)}${recovery}`, { cause: error });
       }
-      await unlink(temp);
+      unlinkSync(temp);
       staged = false;
       try {
+        verifyCommitParent();
         discardClaimedPath(claimed, claimedIdentity);
       } catch (error: any) {
         warnings.push(`old entry cleanup was refused: ${error?.message ?? String(error)}`);
       }
     } else {
-      await rename(temp, target);
+      verifyCommitParent();
+      renameSync(temp, target);
       staged = false;
     }
     await syncDirectory(dir);
     succeeded = true;
   } finally {
-    if (staged) await unlink(temp).catch(() => {});
+    if (staged && writtenIdentity) {
+      try {
+        verifyCommitParent();
+        const current = lstatSync(temp);
+        if (
+          current.isFile()
+          && current.dev === writtenIdentity.dev
+          && current.ino === writtenIdentity.ino
+        ) unlinkSync(temp);
+      } catch {
+        // A changed parent makes path-based cleanup unsafe. Retaining an unpredictable private staging file
+        // is preferable to unlinking an entry supplied by a concurrent actor.
+      }
+    }
     if (!succeeded) await removeCreatedDirectories(createdDirs).catch(() => {});
   }
   if (!writtenIdentity) throw new Error(`Failed to identify staged file for ${path}`);

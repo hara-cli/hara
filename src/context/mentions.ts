@@ -1,11 +1,12 @@
 // @file mentions — expand `@path` references in user input into appended file contents,
 // and provide fuzzy file candidates for REPL tab-completion.
-import { existsSync, statSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { listProjectFiles, dirPrefixes, walkFiles } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
 import { mediaTypeFor } from "../images.js";
-import { readTextPrefixSync } from "../fs-read.js";
+import { readModelContextPrefixSync } from "../fs-read.js";
+import { sensitiveFileError } from "../security/sensitive-files.js";
 
 const MAX_FILE = 50_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
@@ -48,13 +49,16 @@ export function expandMentions(input: string, cwd: string): string {
 /** Render one mention as an inline block, or null if it isn't a readable file/dir. */
 function expandRef(ref: string, cwd: string): string | null {
   const abs = isAbsolute(ref) ? ref : resolve(cwd, ref);
+  const denied = sensitiveFileError(abs, "attach");
+  if (denied) return `\nProtected file \`${ref}\` was not inserted into model context. ${denied}\n`;
   try {
     if (!existsSync(abs)) return null;
-    const st = statSync(abs);
+    const st = lstatSync(abs);
+    if (st.isSymbolicLink()) return `Referenced \`${ref}\` is a symbolic link — it was not inserted into model context.`;
     if (st.isFile()) {
       // don't inline binary image bytes as text — paste with Ctrl+V (or drag the file in) to attach visually
       if (mediaTypeFor(abs)) return `Referenced \`${ref}\` is an image — paste it with Ctrl+V to attach it visually.`;
-      const prefix = readTextPrefixSync(abs, MAX_FILE);
+      const prefix = readModelContextPrefixSync(abs, MAX_FILE);
       if (prefix.binary) return `Referenced \`${ref}\` appears to be binary — it was not inserted into the model context.`;
       const txt = prefix.text + (prefix.truncated ? "\n…[truncated]" : "");
       return `\nReferenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\`\n`;

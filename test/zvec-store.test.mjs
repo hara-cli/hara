@@ -44,3 +44,62 @@ test("zvec store: no index yet → null (caller falls back to brute-force)", asy
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("zvec store: repeated rebuilds release locks and round-trip path-like ids", async () => {
+  if (!(await zvecAvailable())) return;
+  const cwd = tmpProject();
+  try {
+    const items = [
+      { id: join(cwd, "资料", "auth.ts#0"), vec: [1, 0, 0] },
+      { id: join(cwd, "source", "render.ts#0"), vec: [0, 1, 0] },
+    ];
+    for (let generation = 1; generation <= 3; generation++) {
+      assert.equal(await zvecBuild("repo", items, cwd), true, `build ${generation} succeeds`);
+      const ids = await zvecQueryIds("repo", [1, 0, 0], cwd, 2);
+      assert.equal(ids?.[0], items[0].id, `build ${generation} returns the original path id`);
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("zvec store: a failed insert is closed before the next rebuild", async () => {
+  if (!(await zvecAvailable())) return;
+  const cwd = tmpProject();
+  try {
+    const invalid = [
+      { id: "valid-dimension", vec: [1, 0, 0] },
+      { id: "wrong-dimension", vec: [1, 0] },
+    ];
+    assert.equal(await zvecBuild("repo", invalid, cwd), false, "native validation failure keeps the JSON fallback contract");
+    assert.equal(await zvecQueryIds("repo", [1, 0, 0], cwd, 1), null, "partial native index is not queryable");
+
+    const valid = [{ id: join(cwd, "recovered.ts#0"), vec: [1, 0, 0] }];
+    assert.equal(await zvecBuild("repo", valid, cwd), true, "next rebuild is not blocked by a leaked native lock");
+    assert.deepEqual(await zvecQueryIds("repo", [1, 0, 0], cwd, 1), [valid[0].id]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("zvec store: concurrent same-path operations are serialized", async () => {
+  if (!(await zvecAvailable())) return;
+  const cwd = tmpProject();
+  try {
+    const first = [{ id: "first", vec: [1, 0, 0] }];
+    const second = [{ id: "second", vec: [0, 1, 0] }];
+    assert.equal(await zvecBuild("repo", first, cwd), true);
+
+    const [buildOne, between, buildTwo] = await Promise.all([
+      zvecBuild("repo", first, cwd),
+      zvecQueryIds("repo", [1, 0, 0], cwd, 1),
+      zvecBuild("repo", second, cwd),
+    ]);
+    assert.equal(buildOne, true);
+    assert.deepEqual(between, ["first"]);
+    assert.equal(buildTwo, true);
+    assert.deepEqual(await zvecQueryIds("repo", [0, 1, 0], cwd, 1), ["second"]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});

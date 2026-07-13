@@ -25,7 +25,7 @@ it runs fine on your laptop behind NAT.
 | Matrix | `/sync` long-poll | none | ✅ in / ✅ out | unencrypted rooms only (v1) |
 | DingTalk (钉钉) | Stream Mode (WS) | none | ⬜ in / ⬜ out | text only in v1 |
 | WeCom (企业微信) | AI-Bot WS gateway | none | ✅ in / ✅ out | connects out; AES media |
-| Signal | local signal-cli (JSON-RPC) | none* | ✅ in / ✅ out | *needs the signal-cli daemon |
+| Signal | local signal-cli (JSON-RPC) | none* | ✅ in / ⬜ out | *needs the daemon; outbound RPC is path-only |
 
 ## Common setup (every platform)
 
@@ -45,10 +45,11 @@ it runs fine on your laptop behind NAT.
   runs hara on that session.
 - **Two-way images**: send the bot a photo and it sees it (inline for a vision model, else described via your
   configured `visionModel`); ask it to send a file/image back and it uses the `send_file` tool — both work in
-  plain conversation, no slash command needed (on platforms marked ✅ above). Authorization is checked before
+  plain conversation, no slash command needed (on platforms marked ✅ for outbound above). Authorization is checked before
   any inbound download. One message may claim at most four attachments, each streamed with a 20 MiB/60-second
   limit into private random paths; process-wide/per-platform concurrency and retention quotas fail closed, and
-  owned media expires after 24 hours.
+  owned media expires after 24 hours. Outbound delivery likewise accepts at most four files and 20 MiB total;
+  adapters receive verified in-memory bytes, never a pathname they could reopen after validation.
 - Default DM turns start a headless child process, so provider credentials/routes and the target project's
   `.hara/config.json` are re-read on every message. Existing sessions keep their pinned model unless changed.
 - **`HARA_GATEWAY_RUN_TIMEOUT_MS`** sets the per-turn child timeout (default 15 minutes, hard maximum 30
@@ -301,7 +302,9 @@ HARA_SIGNAL_RPC_URL=http://localhost:8080 HARA_SIGNAL_NUMBER=+1555… HARA_GATEW
 ```
 
 The signal-cli daemon must stay running alongside the gateway; phone numbers are redacted in logs. Inbound image
-attachments are downloaded to `~/.hara/signal/media`.
+attachments are downloaded to `~/.hara/signal/media`. Outbound files, `/send`, and TTS are intentionally disabled:
+signal-cli's JSON-RPC `send` accepts only a server-side pathname, which cannot preserve hara's verified-byte
+boundary. Text replies remain supported.
 
 ---
 

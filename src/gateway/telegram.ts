@@ -1,9 +1,8 @@
 // Telegram adapter for `hara gateway` — long-poll getUpdates + sendMessage over the Bot API (built-in
 // fetch, zero new dep). Token from HARA_TELEGRAM_TOKEN. The generic `ChatAdapter` shape is what WeChat(iLink)
 // / Feishu plug into next.
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
 import { InboundMediaBudget, savePrivateResponse } from "./media.js";
+import type { OutboundFilePayload } from "./outbound-files.js";
 
 const API = "https://api.telegram.org";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -32,8 +31,8 @@ export interface ChatAdapter {
     shouldDownload?: (m: InboundMsg) => boolean,
   ): Promise<void>;
   send(chatId: number | string, text: string): Promise<void>;
-  /** Optional: send a local file (voice/image/document). Adapters without it just don't send files. */
-  sendFile?(chatId: number | string, filePath: string): Promise<void>;
+  /** Optional: upload already-verified bytes. `snapshotPath` is cleanup-only and must never be reopened here. */
+  sendFile?(chatId: number | string, file: OutboundFilePayload): Promise<void>;
   /** Optional: send a message and return its platform message id — so transient UX messages ("⟳ working…")
    *  can be recalled later. Platforms without it just leave such messages in place. */
   sendTracked?(chatId: number | string, text: string): Promise<string | undefined>;
@@ -118,13 +117,13 @@ export function telegramAdapter(token: string): ChatAdapter {
         });
       }
     },
-    async sendFile(chatId, filePath) {
+    async sendFile(chatId, file) {
       // images → sendPhoto (inline preview); everything else → sendDocument (keeps the filename)
-      const name = basename(filePath);
+      const name = file.safeName;
       const isImg = /\.(png|jpe?g|gif|webp)$/i.test(name);
       const form = new FormData();
       form.append("chat_id", String(chatId));
-      form.append(isImg ? "photo" : "document", new Blob([readFileSync(filePath)]), name);
+      form.append(isImg ? "photo" : "document", new Blob([new Uint8Array(file.bytes)]), name);
       await request(isImg ? "sendPhoto" : "sendDocument", { method: "POST", body: form });
     },
     async start(onMessage, signal, shouldDownload) {

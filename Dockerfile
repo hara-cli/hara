@@ -17,6 +17,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
+COPY scripts/normalize-dist-modes.mjs ./scripts/normalize-dist-modes.mjs
 RUN npm run build
 
 # ── deps: production-only node_modules ──────────────────────────────────────
@@ -35,7 +36,8 @@ ENV NODE_ENV=production HARA_IN_DOCKER=1
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY runtime-bootstrap.cjs ./
 COPY package.json README.md ./
 # Operate on the user's mounted repo, not /app.
 WORKDIR /workspace
-ENTRYPOINT ["node", "/app/dist/index.js"]
+ENTRYPOINT ["node", "/app/runtime-bootstrap.cjs"]

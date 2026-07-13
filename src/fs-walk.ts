@@ -4,6 +4,8 @@ import { readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { execSync } from "node:child_process";
 import { fuzzyRank } from "./fuzzy.js";
+import { isSensitiveFilePath } from "./security/sensitive-files.js";
+import { toolSubprocessEnv } from "./security/subprocess-env.js";
 
 export const IGNORE_DIRS = new Set([
   ".git", "node_modules", "dist", "build", "out", ".next", ".nuxt", ".cache",
@@ -34,7 +36,9 @@ export function walkFiles(root: string, cap = 8000): string[] {
         if (IGNORE_DIRS.has(e.name)) continue;
         stack.push(join(dir, e.name));
       } else if (e.isFile()) {
-        files.push(toPosix(relative(root, join(dir, e.name))));
+        const absolute = join(dir, e.name);
+        if (isSensitiveFilePath(absolute)) continue;
+        files.push(toPosix(relative(root, absolute)));
       }
     }
   }
@@ -49,6 +53,7 @@ export function listProjectFiles(root: string, cap = 8000): string[] {
   try {
     const out = execSync("git ls-files --cached --others --exclude-standard", {
       cwd: root,
+      env: toolSubprocessEnv(),
       encoding: "utf8",
       maxBuffer: 32 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
@@ -58,7 +63,7 @@ export function listProjectFiles(root: string, cap = 8000): string[] {
     })
       .split("\n")
       .map((s) => s.trim())
-      .filter(Boolean);
+      .filter((path) => Boolean(path) && !isSensitiveFilePath(join(root, path)));
     if (out.length) return out.slice(0, cap);
   } catch {
     /* not a git repo — fall through to fs walk */

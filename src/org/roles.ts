@@ -1,10 +1,13 @@
 // Org roles — markdown agent definitions in <project>/.hara/roles/*.md.
 // Frontmatter: name, description, owns[], rejects[], model?, allowTools[], denyTools[], readOnly?. Body = persona/system.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { findProjectRoot } from "../context/agents-md.js";
 import { pluginRoleDirs } from "../plugins/plugins.js";
+import { readModelContextFileSync } from "../fs-read.js";
+
+const MAX_ROLE_BYTES = 512 * 1024;
 
 export interface Role {
   id: string;
@@ -134,7 +137,7 @@ function rolesFromDirs(dirs: string[]): Map<string, Role> {
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".md") || f === "README.md") continue;
       try {
-        const { fm, body } = parseFrontmatter(readFileSync(join(dir, f), "utf8"));
+        const { fm, body } = parseFrontmatter(readModelContextFileSync(join(dir, f), MAX_ROLE_BYTES));
         const id = (fm.name as string) || f.replace(/\.md$/, "");
         const explicitReadOnly = /^(true|false)$/i.test(String(fm.readOnly ?? ""))
           ? String(fm.readOnly).toLowerCase() === "true"

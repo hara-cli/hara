@@ -19,6 +19,7 @@ import { setTurnPhase } from "./phase.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText } from "../security/secrets.js";
+import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 
 /** File tools whose `path` input marks the file as "recently worked with" (post-compaction restore). */
 const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
@@ -76,7 +77,17 @@ source file or shell command. Reference an environment variable instead (for exa
 $API_KEY). Keep real values in the user's environment or an approved secret store; do not create/populate a
 .env file with a real secret unless the user explicitly asks and it is excluded from version control. Never
 echo credentials back. Session persistence redacts likely secrets as a last line of defense, but that does
-not make embedding credentials acceptable.
+not make embedding credentials acceptable. Built-in file, search, and context paths hard-reject protected
+files (.env/.env.*, credential stores, private keys, and private Hara state) before ordinary approval/dispatch;
+do not try to bypass that policy through shell indirection, another tool, a sub-agent, or full-auto. Safe
+templates such as .env.example may be read. Only a user who restarts Hara with
+HARA_ALLOW_SENSITIVE_FILES=1 explicitly removes the built-in deny and shell protected-read mask for that
+process. Shell subprocesses have credentials removed from their environment. macOS also applies an OS read
+mask to existing protected paths; Linux/Windows shell checks are
+static guardrails, not a kernel sandbox. MCP and external coding agents run outside this boundary: use them
+only as reviewed trusted extensions. Their tool calls require confirmation every time in interactive use and
+are disabled without an interactive approval channel unless the user launched with
+HARA_ALLOW_TRUSTED_EXTENSIONS=1.
 For broad,
 open-ended exploration (more than ~3 searches), spawn \`agent\` sub-agents — several in one response for
 independent questions (role "explore") — each returns conclusions, not dumps. Messages the user sends
@@ -498,11 +509,24 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
         continue;
       }
       const input = tu.input as Record<string, unknown>;
-      const preview = String(input.path ?? input.command ?? input.pattern ?? input.url ?? input.task ?? "")
-        .replace(/\s+/g, " ")
-        .trim();
-      // Screen control is gated on EVERY action — a prior "don't ask again" must never satisfy it.
-      const alwaysGate = tool.kind === "computer";
+      const preview = redactToolSubprocessOutput(
+        String(input.path ?? input.command ?? input.pattern ?? input.url ?? input.task ?? "")
+          .replace(/\s+/g, " ")
+          .trim(),
+      );
+      // Screen control and opaque host extensions are gated on EVERY action — a prior "don't ask again"
+      // and even full-auto must never silently turn them into a side channel.
+      const alwaysGate = tool.kind === "computer" || tool.trustBoundary === "external";
+      if (tool.trustBoundary === "external" && !ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
+        plans.push({
+          tu,
+          tool,
+          denied:
+            "Trusted extension blocked in this non-interactive run. MCP and external coding agents run outside Hara's file boundary; " +
+            "restart with HARA_ALLOW_TRUSTED_EXTENSIONS=1 only after reviewing that extension.",
+        });
+        continue;
+      }
       // Command-level policy for shell commands: a deny rule blocks even in full-auto; an allow rule (or a
       // read-only command) auto-runs even in suggest mode. Composes with, doesn't replace, the approval mode.
       const cmdDecision = tool.kind === "exec" && typeof input.command === "string" ? decideCommand(input.command, permRules) : null;
@@ -517,10 +541,13 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
       if (guardianOn && !breakerHalt) {
         const risk = classifyRisk(tu.name, tool.kind, input, ctx.cwd);
         if (risk.level === "high") {
-          const detail = String(input.command ?? input.path ?? "").replace(/\s+/g, " ").trim().slice(0, 400);
+          const safeRiskReason = redactToolSubprocessOutput(risk.reason);
+          const detail = redactToolSubprocessOutput(
+            String(input.command ?? input.path ?? "").replace(/\s+/g, " ").trim().slice(0, 400),
+          );
           const verdict = await guardianVeto(
             opts.guardian!.provider,
-            { tool: tu.name, detail, classifierReason: risk.reason },
+            { tool: tu.name, detail, classifierReason: safeRiskReason },
             history,
             { signal: opts.signal },
           );
@@ -530,10 +557,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
             plans.push({
               tu,
               tool,
-              denied: `Guardian blocked this high-risk action: ${verdict.reason || risk.reason}. Reconsider — take a safer, in-scope step, or ask the user before doing this.`,
+              denied: `Guardian blocked this high-risk action: ${verdict.reason || safeRiskReason}. Reconsider — take a safer, in-scope step, or ask the user before doing this.`,
             });
             if (!opts.quiet) {
-              const note = `⛔ guardian blocked ${tu.name} — ${verdict.reason || risk.reason}`;
+              const note = `⛔ guardian blocked ${tu.name} — ${verdict.reason || safeRiskReason}`;
               if (sink) sink.notice(note);
               else out(c.yellow(`  ${note}\n`));
             }
@@ -558,7 +585,8 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
           }
         }
       }
-      if (cmdDecision !== "allow" && needsConfirm(tool.kind, opts.approval) && (alwaysGate || !opts.autoApprove?.has(tu.name))) {
+      const shouldConfirm = alwaysGate || (cmdDecision !== "allow" && needsConfirm(tool.kind, opts.approval) && !opts.autoApprove?.has(tu.name));
+      if (shouldConfirm) {
         const reply = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
         if (opts.signal?.aborted) return finalizeInterruptedToolRound();
         if (reply === false) {

@@ -30,9 +30,18 @@
 // tolerates reading it from a legacy config.json (it just maps to the migrated gateway profile).
 // ────────────────────────────────────────────────────────────────────────────────
 import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { join, dirname, parse as parsePath, relative, resolve as resolvePath } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, renameSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, lstatSync, mkdirSync, chmodSync, realpathSync, renameSync } from "node:fs";
 import type { ProviderId } from "../config.js";
+import { readVerifiedRegularFileSnapshotSync, type RegularFileSnapshot } from "../fs-read.js";
+import {
+  atomicWriteText,
+  bindProfilePinWritePath,
+  discardClaimedPath,
+  verifyAtomicWriteBoundary,
+} from "../fs-write.js";
+import { projectRepositoryTrustedAtStartup } from "../security/project-trust.js";
 
 export type ProfileKind = "byok" | "gateway";
 
@@ -185,6 +194,78 @@ export function listProfiles(): Profile[] {
 // the global default (~/.hara/profiles.json `active`).
 // ────────────────────────────────────────────────────────────────────────────────
 const PIN_FILE = ".hara-profile";
+const MAX_PIN_BYTES = 4096;
+const warnedPinFiles = new Set<string>();
+
+function canonicalExistingDirectory(path: string): string {
+  try { return realpathSync.native(resolvePath(path)); } catch { return resolvePath(path); }
+}
+
+function warnIgnoredPin(file: string, reason: "unsafe" | "invalid" | "unavailable" | "tracked" | "unverified"): void {
+  const key = `${file}:${reason}`;
+  if (warnedPinFiles.has(key)) return;
+  warnedPinFiles.add(key);
+  const detail = {
+    unavailable: "names a profile that is not available",
+    tracked: "is tracked by Git and repository identity pins are untrusted by default",
+    unverified: "is inside a Git worktree but its tracked status could not be verified",
+    invalid: "has an invalid format",
+    unsafe: "failed filesystem identity checks",
+  }[reason];
+  const trustHint = reason === "tracked" || reason === "unverified"
+    ? " Set HARA_TRUST_PROJECT_CONFIG=1 before starting hara only for a repository you trust."
+    : "";
+  try {
+    // The directory path is repository input and may itself contain token-shaped text. The fixed basename
+    // is enough to identify the feature without reflecting any attacker-controlled path or file content.
+    process.stderr.write(`hara: ignored .hara-profile: it ${detail}.${trustHint} Run \`hara profile pin <id>\` or \`hara profile unpin\` to fix.\n`);
+  } catch {
+    /* best effort */
+  }
+}
+
+type PinTracking = "tracked" | "untracked" | "unknown" | "outside-git";
+
+function gitMarkerAbove(start: string): boolean {
+  let dir = start;
+  for (let depth = 0; depth < 128; depth++) {
+    try {
+      lstatSync(join(dir, ".git"));
+      return true;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") return true; // unreadable/suspicious marker: require a successful Git check
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return false;
+    dir = parent;
+  }
+  return true; // fail closed on a pathological path depth
+}
+
+/** Check only the index, with no shell and no repository-controlled command string. Unknown/error is distinct
+ * from untracked so a missing/failed git binary can never silently bless a committed identity pin. */
+function pinTracking(file: string): PinTracking {
+  const dir = dirname(file);
+  if (!gitMarkerAbove(dir)) return "outside-git";
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+  env.GIT_OPTIONAL_LOCKS = "0";
+  env.GIT_TERMINAL_PROMPT = "0";
+  const result = spawnSync("git", [
+    "-c", "core.fsmonitor=false",
+    "-c", "core.untrackedCache=false",
+    "-C", dir,
+    "ls-files", "--error-unmatch", "--", PIN_FILE,
+  ], {
+    env,
+    stdio: "ignore",
+    timeout: 2000,
+    windowsHide: true,
+  });
+  if (result.error || result.signal) return "unknown";
+  if (result.status === 0) return "tracked";
+  if (result.status === 1) return "untracked";
+  return "unknown";
+}
 
 export function pinFilePath(dir: string): string {
   return join(dir, PIN_FILE);
@@ -195,28 +276,43 @@ export function pinFilePath(dir: string): string {
  *  If a pin file exists but names an unknown profile, we emit a one-line stderr warn
  *  and return null (non-fatal — the active resolution falls through to the next layer). */
 export function findPinnedProfile(startDir: string): { id: string; file: string } | null {
-  const home = homedir();
-  const { root } = parsePath(startDir);
-  let dir = resolvePath(startDir);
+  const home = canonicalExistingDirectory(homedir());
+  let dir = canonicalExistingDirectory(startDir);
+  const { root } = parsePath(dir);
   // Track visited to defend against pathological symlink loops (best-effort).
   const seen = new Set<string>();
   while (!seen.has(dir)) {
     seen.add(dir);
     const file = pinFilePath(dir);
-    if (existsSync(file)) {
-      try {
-        const id = readFileSync(file, "utf8").split(/\r?\n/)[0].trim();
-        if (id && getProfile(id)) return { id, file };
-        if (id) {
-          // pin points to a profile that no longer exists — warn once, fall through.
-          try {
-            process.stderr.write(`hara: ${file} pins profile '${id}', but it doesn't exist — falling back. Run \`hara profile pin <id>\` or \`hara profile unpin\` to fix.\n`);
-          } catch {
-            /* ignore */
-          }
+    try {
+      const snapshot = readVerifiedRegularFileSnapshotSync(file, MAX_PIN_BYTES, {
+        action: "read profile pin",
+        protectSensitive: false,
+        rejectHardLinks: true,
+      });
+      if (snapshot.text.includes("\0")) {
+        warnIgnoredPin(file, "invalid");
+        return null;
+      }
+      if (!projectRepositoryTrustedAtStartup()) {
+        const tracking = pinTracking(file);
+        if (tracking === "tracked") {
+          warnIgnoredPin(file, "tracked");
+          return null;
         }
-      } catch {
-        /* unreadable pin — skip */
+        if (tracking === "unknown") {
+          warnIgnoredPin(file, "unverified");
+          return null;
+        }
+      }
+      const id = snapshot.text.split(/\r?\n/)[0].trim();
+      if (id && getProfile(id)) return { id, file };
+      if (id) warnIgnoredPin(file, "unavailable");
+      return null;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") {
+        warnIgnoredPin(file, error?.code === "HARA_FILE_TOO_LARGE" ? "invalid" : "unsafe");
+        return null;
       }
     }
     // Stop walking once we're at $HOME or the fs root (don't escape into shared parent dirs).
@@ -228,22 +324,46 @@ export function findPinnedProfile(startDir: string): { id: string; file: string 
   return null;
 }
 
-/** Write `.hara-profile` in the given dir with `id` as the only line. */
-export function writePin(dir: string, id: string): { file: string } {
+/** Atomically write `.hara-profile` in the given dir with `id` as the only line. */
+export async function writePin(dir: string, id: string): Promise<{ file: string }> {
   if (!getProfile(id)) throw new Error(`no profile '${id}' — list with \`hara profile list\``);
   const file = pinFilePath(dir);
-  writeFileSync(file, id + "\n", "utf8");
-  return { file };
+  const boundary = bindProfilePinWritePath(file);
+  let snapshot: RegularFileSnapshot | null = null;
+  try {
+    snapshot = readVerifiedRegularFileSnapshotSync(boundary.target, MAX_PIN_BYTES, {
+      action: "write profile pin",
+      protectSensitive: false,
+      rejectHardLinks: true,
+    });
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw new Error("refusing to replace an unsafe profile pin");
+  }
+  await atomicWriteText(boundary.target, id + "\n", {
+    expected: snapshot?.text ?? null,
+    expectedIdentity: snapshot ?? undefined,
+    boundary,
+    mode: 0o600,
+  });
+  return { file: boundary.target };
 }
 
 /** Remove `.hara-profile` from the given dir. Returns true if it was there. */
 export function removePin(dir: string): boolean {
   const file = pinFilePath(dir);
-  if (!existsSync(file)) return false;
+  let boundary;
   try {
-    unlinkSync(file);
+    boundary = bindProfilePinWritePath(file, "remove profile pin");
+    const snapshot = readVerifiedRegularFileSnapshotSync(boundary.target, MAX_PIN_BYTES, {
+      action: "remove profile pin",
+      protectSensitive: false,
+      rejectHardLinks: true,
+    });
+    verifyAtomicWriteBoundary(boundary);
+    discardClaimedPath(boundary.target, snapshot);
     return true;
-  } catch {
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") warnIgnoredPin(boundary?.target ?? file, "unsafe");
     return false;
   }
 }

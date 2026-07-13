@@ -1,6 +1,6 @@
 // apply_patch — change MULTIPLE files atomically (all-or-nothing). Everything is validated and
 // computed in memory first; nothing is written unless every change applies cleanly.
-import { linkSync, lstatSync, readlinkSync, symlinkSync } from "node:fs";
+import { linkSync, lstatSync, readlinkSync, renameSync, symlinkSync } from "node:fs";
 import { lstat, readlink, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -8,9 +8,26 @@ import { registerTool } from "./registry.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
-import { atomicWriteText, discardClaimedPath, FileChangedError, removeCreatedDirectories, type AtomicWriteResult } from "../fs-write.js";
+import {
+  atomicWriteText,
+  bindAtomicParentEntryPath,
+  bindAtomicWritePath,
+  discardClaimedPath,
+  FileChangedError,
+  removeCreatedDirectories,
+  verifyAtomicWriteBoundary,
+  type AtomicWriteBoundary,
+  type AtomicWriteResult,
+} from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
-import { readRegularFileSnapshot, readRegularFileSnapshotNoFollow, type RegularFileSnapshot } from "../fs-read.js";
+import {
+  readRegularFileSnapshot,
+  readRegularFileSnapshotNoFollow,
+  readVerifiedRegularFileSnapshot,
+  resolveVerifiedModelPath,
+  type RegularFileSnapshot,
+} from "../fs-read.js";
+import { sensitiveFileError } from "../security/sensitive-files.js";
 
 interface Change {
   path: string;
@@ -30,6 +47,7 @@ interface Plan {
   beforeIdentity?: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">;
   beforePathIdentity?: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">;
   beforeLinkTarget?: string;
+  writeBoundary?: AtomicWriteBoundary;
   committed?: AtomicWriteResult;
   quarantine?: string;
 }
@@ -107,12 +125,14 @@ async function rollbackWrittenPlan(plan: Plan): Promise<void> {
 
 async function quarantineExpectedDelete(plan: Plan): Promise<void> {
   if (!plan.beforeIdentity || !plan.beforePathIdentity || plan.beforeMode === undefined) throw new Error(`missing preflight identity for ${plan.path}`);
+  if (!plan.writeBoundary) throw new Error(`missing parent boundary for ${plan.path}`);
   // Keep the initially moved path private until it has been verified. A directory watcher must not be able
   // to mistake an unverified staging entry for the durable delete quarantine used by the commit/cleanup
   // phases. Recording it immediately also lets the outer rollback recover (or accurately report) a failure
   // that happens after rename but before verification completes.
   const staging = join(dirname(plan.abs), `.hara-stage-delete-${process.pid}-${randomUUID()}.tmp`);
-  await rename(plan.abs, staging);
+  verifyAtomicWriteBoundary(plan.writeBoundary);
+  renameSync(plan.abs, staging);
   plan.quarantine = staging;
   const movedPath = await lstat(staging);
   const samePath = movedPath.dev === plan.beforePathIdentity.dev && movedPath.ino === plan.beforePathIdentity.ino && (movedPath.mode & 0o777) === plan.beforePathIdentity.mode && movedPath.nlink === plan.beforePathIdentity.nlink;
@@ -126,18 +146,20 @@ async function quarantineExpectedDelete(plan: Plan): Promise<void> {
     throw new FileChangedError(plan.path);
   }
   const quarantine = join(dirname(plan.abs), `.hara-delete-${process.pid}-${randomUUID()}.tmp`);
-  await rename(staging, quarantine);
+  verifyAtomicWriteBoundary(plan.writeBoundary);
+  renameSync(staging, quarantine);
   plan.quarantine = quarantine;
 }
 
 /** Move a delete quarantine to a fresh name and verify that exact moved path before restore/cleanup. If a
  * concurrent process replaced the known quarantine name, preserve the unexpected inode and fail closed. */
 async function claimDeleteQuarantine(plan: Plan, purpose: "restore" | "cleanup"): Promise<string> {
-  if (!plan.quarantine || !plan.beforePathIdentity || !plan.beforeIdentity || plan.beforeMode === undefined) {
+  if (!plan.quarantine || !plan.beforePathIdentity || !plan.beforeIdentity || plan.beforeMode === undefined || !plan.writeBoundary) {
     throw new Error(`missing delete quarantine identity for ${plan.path}`);
   }
   const claimed = join(dirname(plan.quarantine), `.hara-${purpose}-${process.pid}-${randomUUID()}.tmp`);
-  await rename(plan.quarantine, claimed);
+  verifyAtomicWriteBoundary(plan.writeBoundary);
+  renameSync(plan.quarantine, claimed);
   try {
     const pathInfo = await lstat(claimed);
     const expectedPath = plan.beforePathIdentity;
@@ -227,6 +249,8 @@ registerTool({
       const tag = `change ${i + 1}/${changes.length}`;
       if (typeof ch.path !== "string" || !ch.path) return `Error: ${tag} is missing a path. Nothing written.`;
       const p = abs(ch.path);
+      const denied = sensitiveFileError(p, "patch");
+      if (denied) return `Error: ${tag}: ${denied} Nothing written.`;
       if (plannedPaths.has(p)) return `Error: ${tag} repeats path ${ch.path}. Combine edits for one file into a single change. Nothing written.`;
       plannedPaths.add(p);
 
@@ -246,48 +270,57 @@ registerTool({
         let before: RegularFileSnapshot;
         let pathInfo: Awaited<ReturnType<typeof lstat>>;
         let beforeLinkTarget: string | undefined;
+        let writeBoundary: AtomicWriteBoundary;
         try {
-          pathInfo = await lstat(p);
-          if (pathInfo.isSymbolicLink()) beforeLinkTarget = await readlink(p);
-          before = await readRegularFileSnapshot(p);
+          writeBoundary = bindAtomicParentEntryPath(p, "patch");
+          pathInfo = await lstat(writeBoundary.target);
+          if (pathInfo.isSymbolicLink()) beforeLinkTarget = await readlink(writeBoundary.target);
+          const target = resolveVerifiedModelPath(writeBoundary.target, "patch");
+          before = await readVerifiedRegularFileSnapshot(target, undefined, "patch");
         } catch (error: any) {
           return `Error: ${tag} delete ${ch.path}: ${error?.message ?? "file not found"}. Nothing written.`;
         }
         plans.push({
           path: ch.path,
-          abs: p,
+          abs: writeBoundary.target,
           type,
           before: before.text,
           beforeMode: before.mode,
           beforeIdentity: { dev: before.dev, ino: before.ino, mode: before.mode, nlink: before.nlink },
           beforePathIdentity: { dev: pathInfo.dev, ino: pathInfo.ino, mode: pathInfo.mode & 0o777, nlink: pathInfo.nlink },
           beforeLinkTarget,
+          writeBoundary,
           after: null,
           existed: true,
         });
       } else if (type === "create") {
         if (typeof ch.content !== "string") return `Error: ${tag} create ${ch.path} needs \`content\`. Nothing written.`;
+        let writeBoundary: AtomicWriteBoundary | undefined;
         try {
-          await lstat(p);
+          writeBoundary = bindAtomicWritePath(p, "patch");
+          await lstat(writeBoundary.target);
           return `Error: ${tag} create ${ch.path}: path already exists (use type:update to replace it). Nothing written.`;
         } catch (error: any) {
-          if (error?.code !== "ENOENT") return `Error: ${tag} create ${ch.path}: ${error?.message ?? String(error)}. Nothing written.`;
+          if (error?.code !== "ENOENT" || !writeBoundary) return `Error: ${tag} create ${ch.path}: ${error?.message ?? String(error)}. Nothing written.`;
         }
-        plans.push({ path: ch.path, abs: p, type, before: "", after: ch.content, existed: false });
+        if (!writeBoundary) return `Error: ${tag} create ${ch.path}: cannot bind a stable parent. Nothing written.`;
+        plans.push({ path: ch.path, abs: writeBoundary.target, type, before: "", after: ch.content, existed: false, writeBoundary });
       } else {
         // update
         let before: RegularFileSnapshot;
+        let writeBoundary: AtomicWriteBoundary;
         try {
-          before = await readRegularFileSnapshot(p);
+          writeBoundary = bindAtomicWritePath(p, "patch");
+          before = await readVerifiedRegularFileSnapshot(writeBoundary.target, undefined, "patch");
         } catch (error: any) {
           return `Error: ${tag} update ${ch.path}: cannot read (${error?.message ?? "unknown error"}; use type:create for a new file). Nothing written.`;
         }
         if (typeof ch.content === "string" && !ch.edits) {
-          plans.push({ path: ch.path, abs: p, type, before: before.text, beforeMode: before.mode, beforeIdentity: { dev: before.dev, ino: before.ino, mode: before.mode, nlink: before.nlink }, after: ch.content, existed: true });
+          plans.push({ path: ch.path, abs: writeBoundary.target, type, before: before.text, beforeMode: before.mode, beforeIdentity: { dev: before.dev, ino: before.ino, mode: before.mode, nlink: before.nlink }, after: ch.content, existed: true, writeBoundary });
         } else {
           const res = applyEdits(before.text, ch.edits ?? []);
           if ("error" in res) return `Error: ${tag} ${ch.path} — ${res.error}. Nothing written.`;
-          plans.push({ path: ch.path, abs: p, type, before: before.text, beforeMode: before.mode, beforeIdentity: { dev: before.dev, ino: before.ino, mode: before.mode, nlink: before.nlink }, after: res.text, existed: true });
+          plans.push({ path: ch.path, abs: writeBoundary.target, type, before: before.text, beforeMode: before.mode, beforeIdentity: { dev: before.dev, ino: before.ino, mode: before.mode, nlink: before.nlink }, after: res.text, existed: true, writeBoundary });
         }
       }
     }
@@ -305,6 +338,7 @@ registerTool({
           pl.committed = await atomicWriteText(pl.abs, pl.after as string, {
             expected: pl.existed ? pl.before : null,
             expectedIdentity: pl.existed ? pl.beforeIdentity : undefined,
+            boundary: pl.writeBoundary,
           });
         }
         applied.push(pl);

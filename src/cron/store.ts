@@ -3,7 +3,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import type { Schedule } from "./schedule.js";
 
 export interface CronJob {
@@ -55,11 +55,13 @@ export function loadJobs(): CronJob[] {
 
 /** Persist the job list with an atomic temp-write + rename (never leaves a half-written jobs.json). */
 export function saveJobs(jobs: CronJob[]): void {
-  mkdirSync(cronDir(), { recursive: true });
+  mkdirSync(cronDir(), { recursive: true, mode: 0o700 });
+  try { chmodSync(cronDir(), 0o700); } catch { /* best effort */ }
   const p = jobsPath();
   const tmp = `${p}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(jobs, null, 2) + "\n", "utf8");
+  writeFileSync(tmp, JSON.stringify(jobs, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
   renameSync(tmp, p);
+  try { chmodSync(p, 0o600); } catch { /* best effort */ }
 }
 
 export function addJob(j: Omit<CronJob, "id" | "createdAt" | "enabled"> & { enabled?: boolean; createdAt: number }): CronJob {

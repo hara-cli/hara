@@ -152,7 +152,7 @@ export function signalAdapter(rpcUrl: string, selfNumber: string): ChatAdapter {
     }
   }
 
-  /** Recipient/group routing shared by send + sendFile (mirrors hermes). */
+  /** Recipient/group routing for outbound text sends (mirrors hermes). */
   const target = (chatId: number | string): Record<string, unknown> => {
     const id = String(chatId);
     return id.startsWith("group:") ? { groupId: id.slice(6) } : { recipient: [id] };
@@ -185,11 +185,9 @@ export function signalAdapter(rpcUrl: string, selfNumber: string): ChatAdapter {
         await rpc("send", { account: selfNumber, message: part, ...target(chatId) });
       }
     },
-    async sendFile(chatId, filePath) {
-      // Signal has no separate photo/document endpoints — everything is an `attachments` path on `send`.
-      // signal-cli reads the file off the local disk by path, so we just hand it the path (no upload step).
-      await rpc("send", { account: selfNumber, message: "", attachments: [filePath], ...target(chatId) }).catch(() => {});
-    },
+    // signal-cli's JSON-RPC attachment API accepts only a server-side pathname. Exposing sendFile here would
+    // reopen the verified snapshot after the security boundary, so outbound files stay disabled for Signal
+    // until its daemon offers a byte-oriented upload API.
     async start(onMessage, signal, shouldDownload) {
       console.error(
         `hara gateway[signal]: polling signal-cli daemon at ${base} as ${redactPhone(selfNumber)} (ensure \`signal-cli -a <number> daemon --http\` is running).`,

@@ -4,7 +4,8 @@ Config lives in `~/.hara/config.json` (or env vars / `hara config set <key> <val
 provider is required; everything else has a sane default.
 
 ## Runtime
-- **Node ≥ 20** (`engines` in package.json). Or run the **standalone binary** (no Node) / **Docker image**.
+- **Node ≥ 22.12.0** (`engines` in package.json). Older Node releases exit before loading CLI dependencies
+  and print an upgrade command. Or run the **standalone binary** (no Node) / **Docker image**.
 
 ## Required — the LLM provider
 | key | what | example |

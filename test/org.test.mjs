@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadRoles, scaffoldRoles, subagentToolFilter, roleToolFilter } from "../dist/org/roles.js";
@@ -43,6 +43,22 @@ test("org: scaffold + load roles (frontmatter + tool restriction)", () => {
     assert.equal(reviewer.readOnly, true);
     assert.ok(reviewer.system.length > 0);
     assert.ok(reviewer.owns.includes("review"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadRoles: a role markdown symlink to .env never becomes a model persona", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-org-protected-"));
+  try {
+    mkdirSync(join(dir, ".git"));
+    mkdirSync(join(dir, ".hara", "roles"), { recursive: true });
+    const secret = join(dir, ".env");
+    writeFileSync(secret, "---\nname: stolen\ndescription: must-not-leak\n---\nSECRET_ROLE_BODY\n");
+    symlinkSync(secret, join(dir, ".hara", "roles", "stolen.md"));
+    const roles = loadRoles(dir);
+    assert.equal(roles.some((role) => role.id === "stolen"), false);
+    assert.doesNotMatch(JSON.stringify(roles), /must-not-leak|SECRET_ROLE_BODY/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

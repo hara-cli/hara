@@ -34,6 +34,7 @@ import { getValidQwenAuth } from "../providers/qwen-oauth.js";
 import { resolvePlatform } from "../providers/registry.js";
 import type { Provider, TurnResult } from "../providers/types.js";
 import { validateAgainstSchema } from "../agent/structured.js";
+import { terminateSubprocessTree } from "../security/subprocess-env.js";
 
 export interface PendingAction {
   id: string;
@@ -428,18 +429,6 @@ export interface ApprovedOrgProcessResult {
   error?: string;
 }
 
-function signalChildGroup(child: ChildProcess, signal: NodeJS.Signals): boolean {
-  try {
-    if (process.platform !== "win32" && child.pid) {
-      process.kill(-child.pid, signal);
-      return true;
-    }
-    return child.kill(signal);
-  } catch {
-    return false;
-  }
-}
-
 /** Run an approved delegation as one bounded process group. Exported for lifecycle regression tests. */
 export function runApprovedOrgProcess(
   command: string,
@@ -470,10 +459,12 @@ export function runApprovedOrgProcess(
     let code: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
     let stopReason: "timeout" | "shutdown" | undefined;
-    let killTimer: NodeJS.Timeout | undefined;
     let drainTimer: NodeJS.Timeout | undefined;
-    let forceTimer: NodeJS.Timeout | undefined;
+    let forceIssued = false;
+    let terminationError: string | undefined;
+    let cancelTermination: ((cancelForce?: boolean) => void) | undefined;
     const cap = (data: Buffer): void => {
+      if (settled || stopReason) return;
       output = (output + data.toString()).slice(-8_000);
     };
     child.stdout?.on("data", cap);
@@ -486,37 +477,50 @@ export function runApprovedOrgProcess(
       if (settled) return;
       settled = true;
       clearTimeout(timeoutTimer);
-      if (killTimer) clearTimeout(killTimer);
       if (drainTimer) clearTimeout(drainTimer);
-      if (forceTimer) clearTimeout(forceTimer);
+      // Preserve an already-scheduled force signal when the direct child closed after TERM. See the shared
+      // helper: close cancels only its API fallback, never the process-group SIGKILL.
+      cancelTermination?.();
       options.signal?.removeEventListener("abort", abortRun);
       child.stdout?.destroy();
       child.stderr?.destroy();
       resolveResult({ output, code, signal: exitSignal, ...(stopReason ? { stopReason } : {}), ...extra });
     };
-    const finishFromExit = (): void => finish();
+    const finishFromExit = (): void => {
+      if (stopReason && !forceIssued) return;
+      finish(terminationError ? { error: terminationError } : {});
+    };
     const terminate = (reason: "timeout" | "shutdown"): void => {
-      if (settled) return;
+      if (settled || cancelTermination) return;
       stopReason ??= reason;
-      if (exited) return finishFromExit();
-      signalChildGroup(child, "SIGTERM");
-      killTimer = setTimeout(() => {
-        if (settled || exited) return;
-        signalChildGroup(child, "SIGKILL");
-        forceTimer = setTimeout(finishFromExit, 250);
-      }, killGraceMs);
+      cancelTermination = terminateSubprocessTree(child, {
+        processGroup: process.platform !== "win32",
+        graceMs: killGraceMs,
+        fallbackMs: 250,
+        onForce: () => {
+          forceIssued = true;
+          if (exited) finishFromExit();
+        },
+        onFallback: finishFromExit,
+      });
     };
     const abortRun = (): void => terminate("shutdown");
     const timeoutTimer = setTimeout(() => terminate("timeout"), timeoutMs);
     options.signal?.addEventListener("abort", abortRun, { once: true });
     if (options.signal?.aborted) abortRun();
 
-    child.once("error", (error) => finish({ error: error.message }));
+    child.once("error", (error) => {
+      if (!stopReason) return finish({ error: error.message });
+      terminationError = error.message;
+      exited = true;
+      if (forceIssued) finishFromExit();
+    });
     child.once("exit", (nextCode, nextSignal) => {
       exited = true;
       code = nextCode;
       exitSignal = nextSignal;
-      drainTimer = setTimeout(finishFromExit, 100);
+      if (stopReason) finishFromExit();
+      else drainTimer = setTimeout(finishFromExit, 100);
     });
     child.once("close", (nextCode, nextSignal) => {
       exited = true;

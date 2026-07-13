@@ -1,7 +1,19 @@
 // Bounded streaming line reader for files too large to load as one string. It stores only the requested
 // window and a capped prefix of each line, so huge logs/JSONL and minified one-line files stay safe.
-import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
-import { open } from "node:fs/promises";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+  type Stats,
+} from "node:fs";
+import { open, type FileHandle } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
+import { sensitiveFileError } from "./security/sensitive-files.js";
 
 export class BinaryFileError extends Error {
   constructor(path: string) {
@@ -31,6 +43,8 @@ export class FileReadLimitError extends Error {
 export interface StreamSliceOptions {
   lineCap?: number;
   maxScanChars?: number;
+  /** Apply the protected-file policy, O_NOFOLLOW validation, and hard-link rejection to the opened fd. */
+  protectSensitive?: boolean;
 }
 
 const DEFAULT_LINE_CAP = 2000;
@@ -47,6 +61,329 @@ export interface RegularFileSnapshot {
   ino: number;
   mode: number;
   nlink: number;
+}
+
+/** A context-loader rejected a protected path before any bytes could enter a model prompt. */
+export class ProtectedContextFileError extends Error {
+  readonly code = "HARA_PROTECTED_CONTEXT_FILE";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ProtectedContextFileError";
+  }
+}
+
+export class HardLinkedFileError extends Error {
+  readonly code = "HARA_HARD_LINKED_FILE";
+
+  constructor(path: string) {
+    super(`${path} has multiple hard links; its protected identity cannot be established safely`);
+    this.name = "HardLinkedFileError";
+  }
+}
+
+export interface VerifiedRegularFile {
+  handle: FileHandle;
+  info: Stats;
+  canonicalPath: string;
+}
+
+export interface VerifiedRegularFileReadOptions {
+  action?: string;
+  rejectHardLinks?: boolean;
+  protectSensitive?: boolean;
+}
+
+/** Resolve a user-facing path once, checking both its lexical name and canonical target. Direct tools then
+ * open this canonical path with O_NOFOLLOW, so a safe symlink remains usable without a retarget race. */
+export function resolveVerifiedModelPath(path: string, action = "read"): string {
+  const denied = sensitiveFileError(path, action);
+  if (denied) throw new ProtectedContextFileError(denied);
+  const canonical = realpathSync.native(path);
+  const targetDenied = sensitiveFileError(canonical, action);
+  if (targetDenied) throw new ProtectedContextFileError(targetDenied);
+  return canonical;
+}
+
+/**
+ * Common post-open identity check for security-sensitive readers. `opened` MUST be the fstat result for an
+ * O_NOFOLLOW descriptor. It verifies that the current lexical/canonical name still identifies that inode,
+ * rejects hard-link aliases by default, and applies the central protected-file policy to the actual target.
+ */
+export function verifyOpenedRegularFileSync(
+  path: string,
+  opened: Stats,
+  options: { action?: string; rejectHardLinks?: boolean; protectSensitive?: boolean } = {},
+): string {
+  if (!opened.isFile()) throw new NonRegularFileError(path);
+  if (options.rejectHardLinks !== false && opened.nlink > 1) throw new HardLinkedFileError(path);
+  const canonical = realpathSync.native(path);
+  if (options.protectSensitive !== false) {
+    const targetDenied = sensitiveFileError(canonical, options.action ?? "read");
+    if (targetDenied) throw new ProtectedContextFileError(targetDenied);
+  }
+  const currentLink = lstatSync(path);
+  const currentTarget = statSync(canonical);
+  if (
+    currentLink.isSymbolicLink()
+    || currentLink.dev !== opened.dev
+    || currentLink.ino !== opened.ino
+    || currentTarget.dev !== opened.dev
+    || currentTarget.ino !== opened.ino
+  ) {
+    throw new Error(`refusing to access ${path}: path changed while opening it`);
+  }
+  return canonical;
+}
+
+/** Open + validate a regular file for direct tools that need to keep reading the verified descriptor. */
+export async function openVerifiedRegularFileNoFollow(
+  path: string,
+  options: { action?: string; rejectHardLinks?: boolean; protectSensitive?: boolean } = {},
+): Promise<VerifiedRegularFile> {
+  if (options.protectSensitive !== false) {
+    const denied = sensitiveFileError(path, options.action ?? "read");
+    if (denied) throw new ProtectedContextFileError(denied);
+  }
+  const before = lstatSync(path);
+  if (before.isSymbolicLink()) throw new NonRegularFileError(path);
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  try {
+    const info = await handle.stat();
+    const canonicalPath = verifyOpenedRegularFileSync(path, info, options);
+    return { handle, info, canonicalPath };
+  } catch (error) {
+    await handle.close().catch(() => {});
+    throw error;
+  }
+}
+
+/** Materialize a direct-tool pre-read from a verified descriptor. Safe symlinks should be canonicalized by
+ * `resolveVerifiedModelPath` first; hard-linked aliases are rejected because their protected origin cannot be
+ * inferred from the opened pathname alone. */
+export async function readVerifiedRegularFileSnapshot(
+  path: string,
+  maxBytes = MAX_EDIT_READ_BYTES,
+  action = "read",
+): Promise<RegularFileSnapshot> {
+  const limit = checkedContextLimit(maxBytes);
+  const verified = await openVerifiedRegularFileNoFollow(path, { action, rejectHardLinks: true, protectSensitive: true });
+  try {
+    const { handle, info } = verified;
+    if (info.size > limit) throw new FileReadLimitError(path, limit);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let position = 0;
+    while (total <= limit) {
+      const want = Math.min(READ_CHUNK_BYTES, limit + 1 - total);
+      const buffer = Buffer.allocUnsafe(want);
+      const { bytesRead } = await handle.read(buffer, 0, want, position);
+      if (!bytesRead) break;
+      chunks.push(buffer.subarray(0, bytesRead));
+      total += bytesRead;
+      position += bytesRead;
+    }
+    if (total > limit) throw new FileReadLimitError(path, limit);
+    const latest = await handle.stat();
+    verifyOpenedRegularFileSync(path, latest, { action, rejectHardLinks: true, protectSensitive: true });
+    if (
+      latest.dev !== info.dev
+      || latest.ino !== info.ino
+      || latest.size !== info.size
+      || latest.mtimeMs !== info.mtimeMs
+      || latest.ctimeMs !== info.ctimeMs
+    ) throw new Error(`refusing to read ${path}: file changed while reading it`);
+    return {
+      text: Buffer.concat(chunks, total).toString("utf8"),
+      dev: info.dev,
+      ino: info.ino,
+      mode: info.mode & 0o777,
+      nlink: info.nlink,
+    };
+  } finally {
+    await verified.handle.close().catch(() => {});
+  }
+}
+
+/** Synchronous counterpart for startup/configuration paths that cannot make their public API async. It
+ * validates and reads the same O_NOFOLLOW descriptor, rejects aliases with multiple hard links, bounds the
+ * allocation, and verifies identity/metadata again after the read. Internal state readers may explicitly
+ * disable the model-facing protected-file policy while retaining every filesystem identity check. */
+export function readVerifiedRegularFileSnapshotSync(
+  path: string,
+  maxBytes = MAX_EDIT_READ_BYTES,
+  options: VerifiedRegularFileReadOptions = {},
+): RegularFileSnapshot {
+  const action = options.action ?? "read";
+  if (options.protectSensitive !== false) {
+    const denied = sensitiveFileError(path, action);
+    if (denied) throw new ProtectedContextFileError(denied);
+  }
+  const before = lstatSync(path);
+  if (before.isSymbolicLink()) throw new NonRegularFileError(path);
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  try {
+    const info = fstatSync(fd);
+    verifyOpenedRegularFileSync(path, info, {
+      action,
+      rejectHardLinks: options.rejectHardLinks !== false,
+      protectSensitive: options.protectSensitive !== false,
+    });
+    const limit = checkedContextLimit(maxBytes);
+    if (info.size > limit) throw new FileReadLimitError(path, limit);
+    const bytes = readFdBytesSync(fd, Math.min(limit + 1, info.size + 1));
+    if (bytes.length > limit) throw new FileReadLimitError(path, limit);
+    const latest = fstatSync(fd);
+    verifyOpenedRegularFileSync(path, latest, {
+      action,
+      rejectHardLinks: options.rejectHardLinks !== false,
+      protectSensitive: options.protectSensitive !== false,
+    });
+    if (
+      latest.dev !== info.dev
+      || latest.ino !== info.ino
+      || latest.size !== info.size
+      || latest.mtimeMs !== info.mtimeMs
+      || latest.ctimeMs !== info.ctimeMs
+    ) throw new Error(`refusing to read ${path}: file changed while reading it`);
+    return {
+      text: bytes.toString("utf8"),
+      dev: info.dev,
+      ino: info.ino,
+      mode: info.mode & 0o777,
+      nlink: info.nlink,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Open a model-context source without following its final component, validate the SAME descriptor, and
+ * re-check the canonical target against the central protected-file policy. The identity comparison closes
+ * the ordinary validate-then-open race: if the pathname is exchanged while it is being inspected, callers
+ * get an error rather than bytes from an unverified inode.
+ *
+ * This is intentionally synchronous because AGENTS/skills/roles/memory are assembled synchronously before
+ * a provider turn. Keep the reader callback small and bounded.
+ */
+function withVerifiedContextFdSync<T>(path: string, read: (fd: number, size: number) => T): T {
+  const denied = sensitiveFileError(path, "load into model context");
+  if (denied) throw new ProtectedContextFileError(denied);
+
+  // O_NOFOLLOW is not exposed on every platform. The before/after lstat checks retain fail-closed symlink
+  // behaviour there; on POSIX O_NOFOLLOW makes the critical open itself atomic.
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const before = lstatSync(path);
+  if (before.isSymbolicLink()) throw new NonRegularFileError(path);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  try {
+    const info = fstatSync(fd);
+    verifyOpenedRegularFileSync(path, info, {
+      action: "load into model context",
+      rejectHardLinks: true,
+      protectSensitive: true,
+    });
+    const result = read(fd, info.size);
+    const latest = fstatSync(fd);
+    verifyOpenedRegularFileSync(path, latest, {
+      action: "load into model context",
+      rejectHardLinks: true,
+      protectSensitive: true,
+    });
+    if (
+      latest.dev !== info.dev
+      || latest.ino !== info.ino
+      || latest.size !== info.size
+      || latest.mtimeMs !== info.mtimeMs
+      || latest.ctimeMs !== info.ctimeMs
+    ) throw new Error(`refusing to read ${path}: file changed while reading it`);
+    return result;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function checkedContextLimit(maxBytes: number): number {
+  const requested = Number.isFinite(maxBytes) ? Math.floor(maxBytes) : MAX_EDIT_READ_BYTES;
+  return Math.min(MAX_EDIT_READ_BYTES, Math.max(1, requested));
+}
+
+function readFdBytesSync(fd: number, count: number): Buffer {
+  const out = Buffer.allocUnsafe(count);
+  let offset = 0;
+  while (offset < count) {
+    const n = readSync(fd, out, offset, count - offset, offset);
+    if (n === 0) break;
+    offset += n;
+  }
+  return out.subarray(0, offset);
+}
+
+/** Safely materialize a bounded UTF-8 context file. Oversized or binary inputs fail closed. */
+export function readModelContextFileSync(path: string, maxBytes: number): string {
+  const limit = checkedContextLimit(maxBytes);
+  return withVerifiedContextFdSync(path, (fd, size) => {
+    if (size > limit) throw new FileReadLimitError(path, limit);
+    // Read one byte past the stated size/limit so concurrent growth is never silently included or ignored.
+    const bytes = readFdBytesSync(fd, Math.min(limit + 1, size + 1));
+    if (bytes.length > limit) throw new FileReadLimitError(path, limit);
+    if (bytes.includes(0)) throw new BinaryFileError(path);
+    return bytes.toString("utf8");
+  });
+}
+
+/** Safe bounded-prefix counterpart for @file expansion; it never materializes the remainder of a huge file. */
+export function readModelContextPrefixSync(path: string, maxChars: number): { text: string; truncated: boolean; binary: boolean } {
+  const requested = Number.isFinite(maxChars) ? Math.floor(maxChars) : MAX_PREFIX_CHARS;
+  const chars = Math.min(MAX_PREFIX_CHARS, Math.max(0, requested));
+  return withVerifiedContextFdSync(path, (fd, size) => {
+    const byteLimit = Math.min(size, chars * 4 + 4);
+    const bytes = readFdBytesSync(fd, byteLimit);
+    const binary = bytes.subarray(0, Math.min(bytes.length, 4096)).includes(0);
+    const decoded = binary ? "" : bytes.toString("utf8");
+    return {
+      text: decoded.slice(0, chars),
+      truncated: size > bytes.length || decoded.length > chars,
+      binary,
+    };
+  });
+}
+
+function utf8BytePrefix(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let used = 0;
+  let end = 0;
+  for (const char of value) {
+    const bytes = Buffer.byteLength(char, "utf8");
+    if (used + bytes > maxBytes) break;
+    used += bytes;
+    end += char.length;
+  }
+  return value.slice(0, end);
+}
+
+/**
+ * Verified byte-budgeted prefix reader for project instructions. Unlike `readModelContextFileSync`, an
+ * oversized text file keeps its useful beginning instead of disappearing from model context. The returned
+ * text is always at most `maxBytes` UTF-8 bytes and never ends with half of a multibyte code point.
+ */
+export function readModelContextBytePrefixSync(path: string, maxBytes: number): { text: string; truncated: boolean; binary: boolean } {
+  const limit = checkedContextLimit(maxBytes);
+  return withVerifiedContextFdSync(path, (fd, size) => {
+    const bytes = readFdBytesSync(fd, Math.min(size, limit));
+    const binary = bytes.subarray(0, Math.min(bytes.length, 4096)).includes(0);
+    if (binary) return { text: "", truncated: size > bytes.length, binary: true };
+
+    // StringDecoder buffers an incomplete UTF-8 suffix when the file continues past this prefix. This
+    // avoids injecting U+FFFD merely because the byte budget happened to split a multibyte character.
+    const decoder = new StringDecoder("utf8");
+    const decoded = size > bytes.length ? decoder.write(bytes) : decoder.end(bytes);
+    const text = utf8BytePrefix(decoded, limit);
+    return { text, truncated: size > bytes.length || text.length < decoded.length, binary: false };
+  });
 }
 
 /** Open without blocking on a FIFO, validate the SAME descriptor, then read at most maxBytes from it.
@@ -200,10 +537,13 @@ export async function streamFileSlice(
 
   // Keep validation and streaming on the same non-blocking descriptor. This closes the stat→open race
   // where an attacker/local generator exchanges a regular path for a FIFO after validation.
-  const handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  const verified = options.protectSensitive
+    ? await openVerifiedRegularFileNoFollow(path, { action: "read", rejectHardLinks: true, protectSensitive: true })
+    : null;
+  const handle = verified?.handle ?? await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   let stream: ReturnType<typeof handle.createReadStream> | undefined;
   try {
-    const info = await handle.stat();
+    const info = verified?.info ?? await handle.stat();
     if (!info.isFile()) throw new NonRegularFileError(path);
     // `end` is an inclusive byte offset. It makes the scan ceiling a true fd-level byte bound (not just
     // a post-read character counter, which could overshoot badly on multi-byte text or a giant chunk).
@@ -240,6 +580,17 @@ export async function streamFileSlice(
         stoppedEarly = true;
         if (lineNo >= start && lineNo <= requestedEnd) finishLine(true);
       }
+    }
+    if (verified) {
+      const latest = await handle.stat();
+      verifyOpenedRegularFileSync(path, latest, { action: "read", rejectHardLinks: true, protectSensitive: true });
+      if (
+        latest.dev !== info.dev
+        || latest.ino !== info.ino
+        || latest.size !== info.size
+        || latest.mtimeMs !== info.mtimeMs
+        || latest.ctimeMs !== info.ctimeMs
+      ) throw new Error(`refusing to read ${path}: file changed while reading it`);
     }
   } finally {
     stream?.destroy();

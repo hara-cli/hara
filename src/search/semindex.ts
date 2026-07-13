@@ -2,12 +2,27 @@
 // code-asset / repo / knowledge-base scale (hundreds–low-thousands of chunks); the optional zvec adapter is
 // the scale-up path later. Markdown/code stays the SSOT; this index is a derived, rebuildable, gitignored
 // artifact. The embedder is injected (see embed.ts) so the store + chunking are testable without a model.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { basename, join, isAbsolute, resolve } from "node:path";
 import { findProjectRoot } from "../context/agents-md.js";
-import { listProjectFiles, walkFiles, isProbablyBinary, fileSize } from "../fs-walk.js";
-import { zvecBuild, zvecQueryIds } from "./zvec-store.js";
+import { listProjectFiles, walkFiles } from "../fs-walk.js";
+import { zvecBuild, zvecQueryIds, zvecRemove } from "./zvec-store.js";
+import { isSensitiveFilePath } from "../security/sensitive-files.js";
+import { readModelContextFileSync } from "../fs-read.js";
+import {
+  ensurePrivateStateSubdirectory,
+  readPrivateStateFileSnapshot,
+  removePrivateStateFile,
+  type PrivateStateDirectoryIdentity,
+  type PrivateStateFileSnapshot,
+} from "../security/private-state.js";
+import {
+  atomicWriteText,
+  bindHaraPrivateStateWritePath,
+  type AtomicWriteBoundary,
+} from "../fs-write.js";
 
 // Same code/text extensions codebase_search ranks lexically — keep the two walks in sync.
 const CODE_RE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|c|h|cc|cpp|hpp|cs|swift|scala|sh|bash|sql|md|mdx|json|ya?ml|toml|html|css|scss|less|vue|svelte|astro|tf|proto|graphql|gql|gradle|txt)$/i;
@@ -21,9 +36,11 @@ export interface Chunk {
   mtime?: number; // source file's mtimeMs — lets `hara index` reuse unchanged files (incremental)
 }
 interface Item extends Chunk {
+  contentHash: string;
   vec: number[];
 }
 interface IndexFile {
+  format: number;
   model: string;
   items: Item[];
 }
@@ -34,10 +51,68 @@ export interface SemHit {
   text: string;
 }
 
+// Version 2 is the first cache format built exclusively through the protected-file identity boundary and
+// keyed by source content rather than mtime alone. Versionless/older caches may contain historical aliases
+// of secret files and are never queried or reused.
+const INDEX_FORMAT = 2;
+
 /** Index location — repo index lives in the project (gitignore it); the rest are global. Derived/rebuildable. */
 export function indexPath(name: string, cwd: string): string {
   if (name === "repo") return join(findProjectRoot(cwd), ".hara", "index", "repo.json");
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(name)) throw new Error(`invalid semantic index name '${name}'`);
   return join(homedir(), ".hara", "index", `${name}.json`);
+}
+
+interface PrivateIndexState {
+  dir: PrivateStateDirectoryIdentity;
+  path: string;
+  ignore: string;
+  indexSnapshot: PrivateStateFileSnapshot | null;
+  ignoreSnapshot: PrivateStateFileSnapshot | null;
+  indexBoundary: AtomicWriteBoundary;
+  ignoreBoundary: AtomicWriteBoundary;
+}
+
+function indexBase(name: string, cwd: string): string {
+  return name === "repo" ? findProjectRoot(cwd) : homedir();
+}
+
+async function ensurePrivateIndexState(name: string, cwd: string): Promise<PrivateIndexState> {
+  const requested = indexPath(name, cwd); // validates non-repo names before touching the filesystem
+  // Project `.hara` also contains explicitly user-authored memory/roles and keeps its existing sharing
+  // mode; only the private `index` child is repaired. The global ~/.hara control plane is private in full.
+  const dir = ensurePrivateStateSubdirectory(indexBase(name, cwd), [".hara", "index"], name === "repo" ? 1 : 0);
+  const path = join(dir.path, basename(requested));
+  const ignore = join(dir.path, ".gitignore");
+  const indexSnapshot = await readPrivateStateFileSnapshot(path);
+  const ignoreSnapshot = await readPrivateStateFileSnapshot(ignore);
+  return {
+    dir,
+    path,
+    ignore,
+    indexSnapshot,
+    ignoreSnapshot,
+    indexBoundary: bindHaraPrivateStateWritePath(path, dir.path, "write semantic index"),
+    ignoreBoundary: bindHaraPrivateStateWritePath(ignore, dir.path, "write semantic index ignore rule"),
+  };
+}
+
+function existingPrivateIndexPath(name: string, cwd: string): string | null {
+  try {
+    const requested = indexPath(name, cwd);
+    const base = realpathSync.native(indexBase(name, cwd));
+    const hara = join(base, ".hara");
+    const dir = join(hara, "index");
+    for (const component of [hara, dir]) {
+      const info = lstatSync(component);
+      if (!info.isDirectory() || info.isSymbolicLink() || realpathSync.native(component) !== component) return null;
+    }
+    const path = join(dir, basename(requested));
+    const info = lstatSync(path);
+    return info.isFile() && !info.isSymbolicLink() && info.nlink === 1 ? path : null;
+  } catch {
+    return null;
+  }
 }
 
 function statMtime(p: string): number {
@@ -81,28 +156,49 @@ function cosine(a: number[], b: number[]): number {
   return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
 }
 
-/** Build/refresh the index. **Incremental**: files whose mtime is unchanged since the last build keep their
- *  existing vectors (no re-embed); only new/changed files are embedded, and deleted files drop out. A changed
+function contentHash(chunks: readonly Chunk[]): string {
+  const hash = createHash("sha256");
+  for (const chunk of chunks) {
+    const encoded = JSON.stringify([chunk.file, chunk.source, chunk.text]);
+    hash.update(String(Buffer.byteLength(encoded, "utf8"))).update(":").update(encoded);
+  }
+  return hash.digest("hex");
+}
+
+async function rotateLegacyIndex(name: string, cwd: string, state: PrivateIndexState): Promise<void> {
+  if (state.indexSnapshot) removePrivateStateFile(state.path, state.indexSnapshot, state.dir);
+  await zvecRemove(name, cwd);
+}
+
+/** Build/refresh the index. **Incremental**: files whose content hash is unchanged keep their existing
+ *  vectors (no re-embed); only new/changed files are embedded, and deleted files drop out. A changed
  *  embedding model forces a full rebuild (old vectors aren't comparable). Returns counts. */
 export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder, cwd: string, model = "embed"): Promise<{ total: number; embedded: number; reused: number }> {
-  const p = indexPath(name, cwd);
+  const state = await ensurePrivateIndexState(name, cwd);
+  const p = state.path;
 
   // Load the previous index → reuse vectors for unchanged files.
   const prevByFile = new Map<string, Item[]>();
   let prevModel = "";
-  if (existsSync(p)) {
+  let legacy = false;
+  if (state.indexSnapshot) {
     try {
-      const old = JSON.parse(readFileSync(p, "utf8")) as IndexFile;
-      prevModel = old.model;
-      for (const it of old.items ?? []) {
-        const arr = prevByFile.get(it.file);
-        if (arr) arr.push(it);
-        else prevByFile.set(it.file, [it]);
+      const old = JSON.parse(state.indexSnapshot.text) as IndexFile;
+      if (old.format !== INDEX_FORMAT) {
+        legacy = true;
+      } else {
+        prevModel = old.model;
+        for (const it of old.items ?? []) {
+          const arr = prevByFile.get(it.file);
+          if (arr) arr.push(it);
+          else prevByFile.set(it.file, [it]);
+        }
       }
     } catch {
-      /* corrupt index → full rebuild */
+      legacy = true; // corrupt/unknown cache → full rebuild and ANN rotation
     }
   }
+  if (legacy) await zvecRemove(name, cwd);
   const sameModel = prevModel === model;
 
   const byFile = new Map<string, Chunk[]>();
@@ -113,16 +209,20 @@ export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder,
   }
 
   const items: Item[] = [];
-  const toEmbed: Chunk[] = [];
+  const toEmbed: Array<Chunk & { contentHash: string }> = [];
   let reused = 0;
   for (const [file, fchunks] of byFile) {
-    const mtime = fchunks[0].mtime ?? 0;
+    const currentHash = contentHash(fchunks);
     const prev = prevByFile.get(file);
-    if (sameModel && prev?.length && mtime > 0 && prev.every((it) => it.mtime === mtime)) {
+    if (
+      sameModel
+      && prev?.length === fchunks.length
+      && prev.every((it) => it.contentHash === currentHash)
+    ) {
       items.push(...prev); // file unchanged → keep its vectors
       reused += prev.length;
     } else {
-      toEmbed.push(...fchunks);
+      toEmbed.push(...fchunks.map((chunk) => ({ ...chunk, contentHash: currentHash })));
     }
   }
 
@@ -133,18 +233,28 @@ export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder,
     batch.forEach((c, j) => vecs[j] && items.push({ ...c, vec: vecs[j] }));
   }
 
-  const dir = dirname(p);
-  mkdirSync(dir, { recursive: true });
   // The index is derived + rebuildable (and may embed file contents) — never let it be committed.
-  if (!existsSync(join(dir, ".gitignore"))) writeFileSync(join(dir, ".gitignore"), "*\n", "utf8");
-  writeFileSync(p, JSON.stringify({ model, items } satisfies IndexFile), "utf8");
+  if (!state.ignoreSnapshot || state.ignoreSnapshot.text !== "*\n") {
+    await atomicWriteText(state.ignoreBoundary.target, "*\n", {
+      expected: state.ignoreSnapshot?.text ?? null,
+      expectedIdentity: state.ignoreSnapshot ?? undefined,
+      mode: 0o600,
+      boundary: state.ignoreBoundary,
+    });
+  }
+  await atomicWriteText(p, JSON.stringify({ format: INDEX_FORMAT, model, items } satisfies IndexFile), {
+    expected: state.indexSnapshot?.text ?? null,
+    expectedIdentity: state.indexSnapshot ?? undefined,
+    mode: 0o600,
+    boundary: state.indexBoundary,
+  });
   // Build a zvec ANN index alongside the JSON cache (best-effort; queryIndex prefers it for retrieval).
   await zvecBuild(name, items.map((it) => ({ id: it.id, vec: it.vec })), cwd);
   return { total: items.length, embedded: toEmbed.length, reused };
 }
 
 export function indexExists(name: string, cwd: string): boolean {
-  return existsSync(indexPath(name, cwd));
+  return existingPrivateIndexPath(name, cwd) !== null;
 }
 
 // Never embed (and POST to an embedding provider, then persist in the index) a secret-bearing file —
@@ -163,15 +273,13 @@ export function collectDirChunks(dir: string, source: string): Chunk[] {
   for (const rel of walkFiles(dir)) {
     if (!CODE_RE.test(rel) || looksSecret(rel)) continue;
     const abs = join(dir, rel);
-    if (fileSize(abs) > 200_000) continue;
-    let buf: Buffer;
+    let text: string;
     try {
-      buf = readFileSync(abs);
+      text = readModelContextFileSync(abs, 200_000);
     } catch {
       continue;
     }
-    if (isProbablyBinary(buf)) continue;
-    chunks.push(...chunkText(buf.toString("utf8"), abs, source, statMtime(abs)));
+    chunks.push(...chunkText(text, abs, source, statMtime(abs)));
   }
   return chunks;
 }
@@ -182,49 +290,94 @@ export function collectRepoChunks(root: string): Chunk[] {
   for (const rel of listProjectFiles(root)) {
     if (!CODE_RE.test(rel) || looksSecret(rel)) continue;
     const abs = join(root, rel);
-    if (fileSize(abs) > 200_000) continue;
-    let buf: Buffer;
+    let text: string;
     try {
-      buf = readFileSync(abs);
+      text = readModelContextFileSync(abs, 200_000);
     } catch {
       continue;
     }
-    if (isProbablyBinary(buf)) continue;
-    chunks.push(...chunkText(buf.toString("utf8"), rel, "repo", statMtime(abs)));
+    chunks.push(...chunkText(text, rel, "repo", statMtime(abs)));
   }
   return chunks;
 }
 
 /** Cosine-rank the index against the query embedding. Returns top-k hits (empty if no index). */
 export async function queryIndex(name: string, query: string, embed: Embedder, cwd: string, k = 6): Promise<SemHit[]> {
-  const p = indexPath(name, cwd);
-  if (!existsSync(p)) return [];
-  let idx: IndexFile;
+  if (!existingPrivateIndexPath(name, cwd)) return [];
+  let state: PrivateIndexState;
   try {
-    idx = JSON.parse(readFileSync(p, "utf8")) as IndexFile;
+    state = await ensurePrivateIndexState(name, cwd);
   } catch {
     return [];
   }
+  const p = state.path;
+  if (!state.indexSnapshot) return [];
+  let idx: IndexFile;
+  try {
+    idx = JSON.parse(state.indexSnapshot.text) as IndexFile;
+  } catch {
+    return [];
+  }
+  if (idx.format !== INDEX_FORMAT) {
+    await rotateLegacyIndex(name, cwd, state);
+    return [];
+  }
   if (!idx.items?.length) return [];
+  // Old indexes may predate the sensitive-file boundary. Filter at query time as well as build time so a
+  // stale JSON/zvec cache can never resurrect protected content into model context.
+  const root = findProjectRoot(cwd);
+  const safeItems = idx.items.filter((item) => {
+    const path = isAbsolute(item.file) ? item.file : resolve(root, item.file);
+    return !looksSecret(item.file) && !isSensitiveFilePath(path);
+  });
+  if (!safeItems.length) return [];
   const [qv] = await embed([query]);
   if (!qv) return [];
+
+  // A format marker proves which writer created the cache, not that its source still has the same bytes.
+  // Validate only ranked candidate files (cached per path) before returning their historical text. Missing,
+  // replaced, hard-linked, protected, oversized, or changed sources fail closed without making every query
+  // reread the entire corpus.
+  const freshness = new Map<string, boolean>();
+  const isFresh = (item: Item): boolean => {
+    const path = isAbsolute(item.file) ? item.file : resolve(root, item.file);
+    const cached = freshness.get(path);
+    if (cached !== undefined) return cached;
+    let fresh = false;
+    try {
+      const text = readModelContextFileSync(path, 200_000);
+      fresh = contentHash(chunkText(text, item.file, item.source)) === item.contentHash;
+    } catch {
+      fresh = false;
+    }
+    freshness.set(path, fresh);
+    return fresh;
+  };
+
+  const rankFresh = (candidates: Item[]): SemHit[] => {
+    const ranked = candidates
+      .map((it) => ({ item: it, score: cosine(qv, it.vec) }))
+      .sort((a, b) => b.score - a.score);
+    const hits: SemHit[] = [];
+    for (const { item, score } of ranked) {
+      if (!isFresh(item)) continue;
+      hits.push({ file: item.file, source: item.source, text: item.text, score });
+      if (hits.length >= k) break;
+    }
+    return hits;
+  };
 
   // Prefer the zvec ANN index for candidate retrieval; re-rank candidates by EXACT cosine from the JSON
   // store (identical score semantics to the brute-force path). Fall back to full brute-force if zvec is
   // unavailable / has no index / errors.
   const ids = await zvecQueryIds(name, qv, cwd, k);
   if (ids?.length) {
-    const byId = new Map(idx.items.map((it) => [it.id, it]));
-    const hits = ids
+    const byId = new Map(safeItems.map((it) => [it.id, it]));
+    const candidates = ids
       .map((id) => byId.get(id))
-      .filter((it): it is Item => Boolean(it))
-      .map((it) => ({ file: it.file, source: it.source, text: it.text, score: cosine(qv, it.vec) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, k);
+      .filter((it): it is Item => Boolean(it));
+    const hits = rankFresh(candidates);
     if (hits.length) return hits;
   }
-  return idx.items
-    .map((it) => ({ file: it.file, source: it.source, text: it.text, score: cosine(qv, it.vec) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, k);
+  return rankFresh(safeItems);
 }

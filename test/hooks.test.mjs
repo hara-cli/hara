@@ -1,11 +1,25 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runHooks, resetHooksCache } from "../dist/hooks.js";
-import { runAgent } from "../dist/agent/loop.js";
-import "../dist/tools/builtin.js";
+
+// Codex/CI may itself run inside macOS Seatbelt, where launching a nested sandbox-exec is rejected before
+// the hook command starts. Most tests exercise hook semantics rather than the read mask, so disable only the
+// nested mask in this test process; the dedicated protected-file test below removes the waiver explicitly.
+const originalSensitiveFilesAllow = process.env.HARA_ALLOW_SENSITIVE_FILES;
+const originalTrustProjectConfig = process.env.HARA_TRUST_PROJECT_CONFIG;
+process.env.HARA_ALLOW_SENSITIVE_FILES = "1";
+process.env.HARA_TRUST_PROJECT_CONFIG = "1"; // these tests deliberately execute their fixture repo hooks
+const { runHooks, resetHooksCache } = await import("../dist/hooks.js");
+const { runAgent } = await import("../dist/agent/loop.js");
+await import("../dist/tools/builtin.js");
+after(() => {
+  if (originalSensitiveFilesAllow === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+  else process.env.HARA_ALLOW_SENSITIVE_FILES = originalSensitiveFilesAllow;
+  if (originalTrustProjectConfig === undefined) delete process.env.HARA_TRUST_PROJECT_CONFIG;
+  else process.env.HARA_TRUST_PROJECT_CONFIG = originalTrustProjectConfig;
+});
 
 // Each case runs in a throwaway project dir whose .hara/config.json carries the hooks under test.
 function withProject(hooks, fn) {
@@ -83,6 +97,52 @@ test("the hook receives {tool, payload} as JSON on stdin", () => {
     assert.equal(seen.tool, "bash");
     assert.equal(seen.payload.command, "ls -la");
   });
+});
+
+test("hooks inherit the subprocess secret scrubber", { skip: process.platform === "win32" }, () => {
+  const name = "HARA_HOOK_TEST_TOKEN";
+  const previous = process.env[name];
+  process.env[name] = "must-not-reach-hook";
+  try {
+    withProject(
+      { PreToolUse: [{ matcher: "bash", command: `printf '%s' "\${${name}:-missing}" > hook-env.txt` }] },
+      (dir) => {
+        assert.equal(runHooks("PreToolUse", "bash", {}, dir).block, false);
+        assert.equal(readFileSync(join(dir, "hook-env.txt"), "utf8"), "missing");
+      },
+    );
+  } finally {
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
+  }
+});
+
+test("PreToolUse fails closed and PostToolUse skips when a hook names a protected file", () => {
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+  try {
+    withProject(
+      {
+        PreToolUse: [{ matcher: "read_file", command: "cat .env >/dev/null; echo ran > pre-marker.txt" }],
+        PostToolUse: [{ matcher: "read_file", command: "cat .env > post-leak.txt" }],
+      },
+      (dir) => {
+        writeFileSync(join(dir, ".env"), "API_KEY=must-not-leak\n");
+
+        const pre = runHooks("PreToolUse", "read_file", {}, dir);
+        assert.equal(pre.block, true);
+        assert.match(pre.message, /protected secret boundary|environment file/i);
+        assert.equal(existsSync(join(dir, "pre-marker.txt")), false, "blocked PreToolUse was never launched");
+
+        const post = runHooks("PostToolUse", "read_file", {}, dir);
+        assert.equal(post.block, false, "PostToolUse remains observe-only");
+        assert.equal(existsSync(join(dir, "post-leak.txt")), false, "policy-blocked PostToolUse was not retried unsafely");
+      },
+    );
+  } finally {
+    if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
+  }
 });
 
 test("hook config is selected by the tool cwd instead of process.cwd or the first cached project", () => {

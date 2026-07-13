@@ -10,6 +10,7 @@ import { parseSchedule, describeSchedule, nextRun, validTz } from "../cron/sched
 import { runJobOnce } from "../cron/runner.js";
 import { parseDeliver } from "../cron/deliver.js";
 import { isInstalled } from "../cron/install.js";
+import { sensitiveShellCommandReason } from "../security/sensitive-files.js";
 
 const fmt = (ms: number | null): string => (ms ? new Date(ms).toLocaleString() : "—");
 
@@ -66,6 +67,10 @@ registerTool({
         if ("error" in d) return `Error: ${d.error}`;
       }
       const mode = input.mode === "org" || input.mode === "command" ? input.mode : "print";
+      if (mode === "command") {
+        const denied = sensitiveShellCommandReason(task, ctx.cwd);
+        if (denied) return `Error: scheduled shell command crosses Hara's protected secret boundary (${denied}).`;
+      }
       const job = addJob({
         name: input.name ? String(input.name) : task.slice(0, 48),
         schedule: sched,

@@ -13,7 +13,7 @@ import { parseSlackEvent } from "../dist/gateway/slack.js";
 import { parseMattermostPost } from "../dist/gateway/mattermost.js";
 import { matrixChatType, matrixDirectRoomsFromSync, parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
 import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
-import { parseSignalMessage } from "../dist/gateway/signal.js";
+import { parseSignalMessage, signalAdapter } from "../dist/gateway/signal.js";
 import { parseWecomMessage } from "../dist/gateway/wecom.js";
 import { pickRoute, outputDelta } from "../dist/gateway/tmux-routes.js";
 import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
@@ -202,6 +202,10 @@ test("parseSignalMessage: skips sync/self, parses text/group/image", () => {
   const img = parseSignalMessage({ envelope: { sourceNumber: "+1666", dataMessage: { message: "", attachments: [{ id: "a1", contentType: "image/jpeg" }] } } }, self);
   assert.equal(img.msg.text, "[图片]");
   assert.equal(img.images.length, 1);
+});
+
+test("signal adapter does not advertise unsafe path-only outbound files", () => {
+  assert.equal(signalAdapter("http://127.0.0.1:8080", "+15550000000").sendFile, undefined);
 });
 
 test("parseWecomMessage: needs body, skips self, parses text", () => {

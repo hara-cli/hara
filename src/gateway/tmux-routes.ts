@@ -6,7 +6,7 @@
 //
 // Safety: the daemon only reaches this AFTER its allow-list gate (so only the owner can trigger it), and it
 // ONLY injects into panes that opted in by registering — never an arbitrary pane.
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -36,8 +36,10 @@ function load(): TmuxRoute[] {
   }
 }
 function save(routes: TmuxRoute[]): void {
-  mkdirSync(dir(), { recursive: true });
-  writeFileSync(storePath(), JSON.stringify({ routes }, null, 2));
+  mkdirSync(dir(), { recursive: true, mode: 0o700 });
+  try { chmodSync(dir(), 0o700); } catch { /* best effort */ }
+  writeFileSync(storePath(), JSON.stringify({ routes }, null, 2), { mode: 0o600 });
+  try { chmodSync(storePath(), 0o600); } catch { /* best effort */ }
 }
 
 /** Register (or refresh) a pane as awaiting a reply. De-dups by pane. mode "once" (default) = consumed after one

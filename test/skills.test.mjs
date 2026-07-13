@@ -1,10 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadSkillIndex, loadSkillBody, skillsDigest, invalidateSkillsCache } from "../dist/skills/skills.js";
+import { loadSkillIndex, loadSkillBody, scaffoldSkills, skillsDigest, invalidateSkillsCache } from "../dist/skills/skills.js";
 import { searchAssets, assetSearchRoots } from "../dist/recall.js";
+import { getTool } from "../dist/tools/registry.js";
+import "../dist/tools/memory.js";
 
 function tmpProject() {
   const dir = join(tmpdir(), "hara-skills-" + Math.random().toString(36).slice(2));
@@ -52,6 +54,135 @@ test("skillsDigest: one line per model-invocable skill, drops disable-model-invo
     const digest = skillsDigest(proj);
     assert.match(digest, /alpha: Do alpha things/);
     assert.doesNotMatch(digest, /secret|hidden helper/); // disable-model-invocation hides it from the index
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("skills: SKILL.md symlink to .env is absent from both index and body", () => {
+  const proj = tmpProject();
+  try {
+    const secret = join(proj, ".env");
+    writeFileSync(secret, "---\nname: stolen\ndescription: must-not-leak\n---\nSECRET_BODY\n");
+    const dir = join(proj, ".hara", "skills", "stolen");
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(secret, join(dir, "SKILL.md"));
+    invalidateSkillsCache();
+    assert.equal(loadSkillIndex(proj).some((skill) => skill.id === "stolen"), false);
+    assert.doesNotMatch(skillsDigest(proj), /must-not-leak|SECRET_BODY/);
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("skills: skill_create and scaffold refuse symlinks to .env and preserve the target", async () => {
+  const proj = tmpProject();
+  try {
+    const secret = join(proj, ".env");
+    const original = "SKILL_WRITE_SECRET=preserve-me\n";
+    writeFileSync(secret, original);
+
+    const createDir = join(proj, ".hara", "skills", "linked-skill");
+    mkdirSync(createDir, { recursive: true });
+    symlinkSync(secret, join(createDir, "SKILL.md"));
+    const result = await getTool("skill_create").run({
+      name: "linked-skill",
+      description: "a safe description",
+      body: "safe instructions",
+      scope: "project",
+    }, { cwd: proj });
+    assert.match(result, /^Error: cannot save skill .*protected environment file/i);
+
+    const scaffoldDir = join(proj, ".hara", "skills", "verify-change");
+    mkdirSync(scaffoldDir, { recursive: true });
+    symlinkSync(secret, join(scaffoldDir, "SKILL.md"));
+    await assert.rejects(scaffoldSkills(proj), /protected|environment file/i);
+    assert.equal(readFileSync(secret, "utf8"), original, "the symlink target remains byte-for-byte unchanged");
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("skills: skill_create and scaffold reject hard-linked targets and preserve .env", async () => {
+  const proj = tmpProject();
+  try {
+    const secret = join(proj, ".env");
+    const original = "SKILL_HARDLINK_SECRET=preserve-me\n";
+    writeFileSync(secret, original);
+
+    const createDir = join(proj, ".hara", "skills", "hardlinked-skill");
+    mkdirSync(createDir, { recursive: true });
+    linkSync(secret, join(createDir, "SKILL.md"));
+    const result = await getTool("skill_create").run({
+      name: "hardlinked-skill",
+      description: "a safe description",
+      body: "safe instructions",
+      scope: "project",
+    }, { cwd: proj });
+    assert.match(result, /^Error: cannot save skill .*(hard link|protected)/i);
+
+    const scaffoldDir = join(proj, ".hara", "skills", "verify-change");
+    mkdirSync(scaffoldDir, { recursive: true });
+    linkSync(secret, join(scaffoldDir, "SKILL.md"));
+    await assert.rejects(scaffoldSkills(proj), /hard link|protected/i);
+    assert.equal(readFileSync(secret, "utf8"), original, "the hard-link target remains byte-for-byte unchanged");
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("skills: skill_create stays bound to the original parent when a skills symlink is retargeted", async () => {
+  const proj = tmpProject();
+  const first = join(proj, "first-skills");
+  const second = join(proj, "second-skills");
+  const alias = join(proj, ".hara", "skills");
+  try {
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(join(proj, ".hara"), { recursive: true });
+    symlinkSync(first, alias);
+
+    const pending = getTool("skill_create").run({
+      name: "parent-retarget",
+      description: "a safe reusable procedure",
+      body: "perform the safe procedure",
+      scope: "project",
+    }, { cwd: proj });
+    unlinkSync(alias);
+    symlinkSync(second, alias);
+    const result = await pending;
+
+    assert.match(result, /^Saved project skill/);
+    assert.match(readFileSync(join(first, "parent-retarget", "SKILL.md"), "utf8"), /perform the safe procedure/);
+    assert.equal(existsSync(join(second, "parent-retarget", "SKILL.md")), false, "retargeted parent receives no write");
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("skills: scaffold stays bound to the original parent when a skills symlink is retargeted", async () => {
+  const proj = tmpProject();
+  const first = join(proj, "first-skills");
+  const second = join(proj, "second-skills");
+  const alias = join(proj, ".hara", "skills");
+  try {
+    mkdirSync(first);
+    mkdirSync(second);
+    mkdirSync(join(proj, ".hara"), { recursive: true });
+    symlinkSync(first, alias);
+
+    const pending = scaffoldSkills(proj);
+    unlinkSync(alias);
+    symlinkSync(second, alias);
+    await pending;
+
+    assert.match(readFileSync(join(first, "verify-change", "SKILL.md"), "utf8"), /name: verify-change/);
+    assert.equal(existsSync(join(second, "verify-change", "SKILL.md")), false, "retargeted parent receives no write");
   } finally {
     rmSync(proj, { recursive: true, force: true });
     invalidateSkillsCache();

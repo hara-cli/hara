@@ -46,6 +46,10 @@ export interface Tool {
   /** read | edit | exec | computer — drives the approval gate (read never prompts; computer always asks
    *  once per session for a grant, even in full-auto) */
   kind?: "read" | "edit" | "exec" | "computer";
+  /** Opaque host process (MCP/external coding agent). It sits outside Hara's in-process file boundary,
+   *  therefore always needs an interactive grant and is disabled in headless/full-auto unless the user
+   *  opted in before launch with HARA_ALLOW_TRUSTED_EXTENSIONS=1. */
+  trustBoundary?: "external";
   run(input: any, ctx: ToolContext): Promise<string>;
 }
 

@@ -1,9 +1,12 @@
 import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import type { SandboxMode } from "./sandbox.js";
 import type { HooksConfig } from "./hooks.js";
 import type { NotifyMode } from "./notify.js";
+import { ensurePrivateHaraState } from "./security/private-state.js";
+import { readVerifiedRegularFileSnapshotSync } from "./fs-read.js";
+import { projectRepositoryTrustedAtStartup } from "./security/project-trust.js";
 
 export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai" | "glm" | "deepseek" | "openrouter" | "hara-gateway";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
@@ -124,6 +127,68 @@ export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = [
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
+const MAX_PROJECT_CONFIG_BYTES = 256 * 1024;
+const KNOWN_CONFIG_KEYS = new Set<string>([
+  ...CONFIG_KEYS,
+  "hooks", "mcpServers", "modelVision", "overlays", "profiles",
+]);
+/** Deliberately narrow: these keys change presentation/model preference, but cannot redirect credentials,
+ * execute code, grant tools more authority, or disable a safety layer. Everything else requires a launch-
+ * time trust decision so cloning/chdir into a repository never silently changes the process trust boundary. */
+const SAFE_PROJECT_CONFIG_KEYS = new Set(["model", "theme", "vimMode", "autoCompact", "reasoningEffort"]);
+const projectConfigWarnings = new Set<string>();
+
+function printableConfigKeys(keys: string[]): string {
+  // A repository controls JSON property names too. Only schema names are safe diagnostics; an unknown key
+  // may itself contain a copied token and must never be treated as printable metadata.
+  const safe = [...new Set(keys.map((key) => (
+    KNOWN_CONFIG_KEYS.has(key) ? key : "<unknown-key>"
+  )))].sort();
+  const shown = safe.slice(0, 32);
+  return `${shown.join(", ")}${safe.length > shown.length ? `, … (+${safe.length - shown.length})` : ""}`;
+}
+
+function warnProjectConfig(kind: string, message: string): void {
+  if (projectConfigWarnings.has(kind)) return;
+  projectConfigWarnings.add(kind);
+  try { process.stderr.write(`hara: ${message}\n`); } catch { /* best effort */ }
+}
+
+function validSafeProjectValue(key: string, value: unknown): boolean {
+  if (key === "model") return typeof value === "string" && value.trim().length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value);
+  if (key === "theme") return value === "dark" || value === "light";
+  if (key === "reasoningEffort") return REASONING_EFFORTS.includes(value as NonNullable<HaraConfig["reasoningEffort"]>);
+  if (key === "vimMode" || key === "autoCompact") return typeof value === "boolean" || value === "true" || value === "false";
+  return false;
+}
+
+function filterProjectConfig(input: Record<string, any>): Record<string, any> {
+  const blocked = Object.keys(input).filter((key) => !SAFE_PROJECT_CONFIG_KEYS.has(key));
+  if (projectRepositoryTrustedAtStartup()) {
+    if (blocked.length) {
+      const names = printableConfigKeys(blocked);
+      warnProjectConfig(`trusted:${names}`, `trusted project config enabled for privileged key(s): ${names}.`);
+    }
+    return input;
+  }
+  if (blocked.length) {
+    const names = printableConfigKeys(blocked);
+    warnProjectConfig(
+      `ignored:${names}`,
+      `ignored untrusted project config key(s): ${names}. Set HARA_TRUST_PROJECT_CONFIG=1 before starting hara only for a repository you trust.`,
+    );
+  }
+  const invalid = Object.entries(input)
+    .filter(([key, value]) => SAFE_PROJECT_CONFIG_KEYS.has(key) && !validSafeProjectValue(key, value))
+    .map(([key]) => key);
+  if (invalid.length) {
+    const names = printableConfigKeys(invalid);
+    warnProjectConfig(`invalid-safe:${names}`, `ignored invalid project config value(s) for key(s): ${names}.`);
+  }
+  return Object.fromEntries(Object.entries(input).filter(([key, value]) => (
+    SAFE_PROJECT_CONFIG_KEYS.has(key) && validSafeProjectValue(key, value)
+  )));
+}
 
 export function configPath(): string {
   return join(homedir(), ".hara", "config.json");
@@ -134,6 +199,7 @@ function configRecord(value: unknown): Record<string, any> {
 }
 
 export function readRawConfig(): Record<string, any> {
+  ensurePrivateHaraState();
   const p = configPath();
   if (!existsSync(p)) return {};
   try {
@@ -172,16 +238,68 @@ function nonBlankEnv(value: string | undefined): string | undefined {
   return trimmed || undefined;
 }
 
-/** Nearest project override `.hara/config.json`, searching cwd up to the repo root. */
+function projectConfigReadFailure(kind: string): Record<string, any> {
+  warnProjectConfig(`unsafe-file:${kind}`, `ignored an unsafe project .hara/config.json (${kind}); no project values were loaded.`);
+  return {};
+}
+
+/** Nearest project override `.hara/config.json`, searching a canonical cwd up to the repo root. Project
+ * configuration is repository input, not private Hara state: its `.hara` parent and final entry must remain
+ * ordinary single-link filesystem objects while a bounded O_NOFOLLOW descriptor is read. */
 function readProjectConfig(cwd: string): Record<string, any> {
-  let dir = resolve(cwd);
+  let dir: string;
+  try {
+    dir = realpathSync.native(resolve(cwd));
+  } catch {
+    dir = resolve(cwd);
+  }
   for (;;) {
-    const p = join(dir, ".hara", "config.json");
-    if (existsSync(p)) {
-      try {
-        return configRecord(JSON.parse(readFileSync(p, "utf8")));
-      } catch {
-        return {};
+    const hara = join(dir, ".hara");
+    const p = join(hara, "config.json");
+    let haraInfo;
+    try {
+      haraInfo = lstatSync(hara);
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") return projectConfigReadFailure("unreadable parent");
+    }
+    if (haraInfo) {
+      if (haraInfo.isSymbolicLink()) return projectConfigReadFailure("symlink parent");
+      if (haraInfo.isDirectory()) {
+        let fileInfo;
+        try {
+          const canonicalParent = realpathSync.native(hara);
+          if (canonicalParent !== hara) return projectConfigReadFailure("non-canonical parent");
+          fileInfo = lstatSync(p);
+        } catch (error: any) {
+          if (error?.code !== "ENOENT") return projectConfigReadFailure("unreadable file");
+        }
+        if (fileInfo) {
+          if (fileInfo.isSymbolicLink()) return projectConfigReadFailure("symlink file");
+          if (!fileInfo.isFile()) return projectConfigReadFailure("non-regular file");
+          try {
+            const snapshot = readVerifiedRegularFileSnapshotSync(p, MAX_PROJECT_CONFIG_BYTES, {
+              action: "read project config",
+              protectSensitive: false,
+              rejectHardLinks: true,
+            });
+            const parentAfter = lstatSync(hara);
+            if (
+              !parentAfter.isDirectory()
+              || parentAfter.isSymbolicLink()
+              || parentAfter.dev !== haraInfo.dev
+              || parentAfter.ino !== haraInfo.ino
+              || realpathSync.native(hara) !== hara
+            ) return projectConfigReadFailure("changed parent");
+            return filterProjectConfig(configRecord(JSON.parse(snapshot.text)));
+          } catch (error: any) {
+            if (error?.code === "HARA_HARD_LINKED_FILE") return projectConfigReadFailure("hard-linked file");
+            if (error?.code === "HARA_FILE_TOO_LARGE") return projectConfigReadFailure("oversized file");
+            if (/changed while (?:opening|reading)|File changed/i.test(error?.message ?? "")) {
+              return projectConfigReadFailure("changed file");
+            }
+            return projectConfigReadFailure("invalid file");
+          }
+        }
       }
     }
     if (PROJECT_ROOT_MARKERS.some((m) => existsSync(join(dir, m)))) break; // stop at repo root
@@ -194,7 +312,9 @@ function readProjectConfig(cwd: string): Record<string, any> {
 
 /** Write the config 0600 (it can hold `apiKey`) + tighten an existing file. */
 function persistConfig(p: string, cfg: Record<string, unknown>): void {
-  mkdirSync(dirname(p), { recursive: true });
+  ensurePrivateHaraState();
+  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+  try { chmodSync(dirname(p), 0o700); } catch { /* best effort */ }
   writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
   try {
     chmodSync(p, 0o600);
@@ -222,7 +342,7 @@ export function setModelVisionOverride(model: string, cap: "yes" | "no" | null):
 }
 
 /**
- * Effective config. Precedence (high→low): env vars > project `.hara/config.json` >
+ * Effective config. Precedence (high→low): env vars > allowed/trusted project `.hara/config.json` >
  * named overlay (`overlays.<name>` in global config) > global `~/.hara/config.json`
  * > provider defaults.
  *

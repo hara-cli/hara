@@ -47,9 +47,17 @@ function listenModel(reply) {
   });
 }
 
-function runCli(args, cwd, home) {
+function runCli(args, cwd, home, extraEnv = {}) {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env, HOME: home, HARA_QUIET: "1", HARA_UPDATE_CHECK: "0", HARA_GUARDIAN: "0", NO_COLOR: "1" };
+    const env = {
+      ...process.env,
+      HOME: home,
+      HARA_QUIET: "1",
+      HARA_UPDATE_CHECK: "0",
+      HARA_GUARDIAN: "0",
+      HARA_TRUST_PROJECT_CONFIG: "1", // fixture project routing/MCP is intentionally trusted in this test
+      NO_COLOR: "1",
+    };
     for (const key of [
       "HARA_PROVIDER",
       "HARA_MODEL",
@@ -61,7 +69,9 @@ function runCli(args, cwd, home) {
       "HARA_ROUTE_MODEL",
       "HARA_ROUTE_BASE_URL",
       "HARA_ROUTE_API_KEY",
+      "HARA_ALLOW_TRUSTED_EXTENSIONS",
     ]) delete env[key];
+    Object.assign(env, extraEnv);
     const child = spawn(process.execPath, [join(process.cwd(), "dist", "index.js"), ...args], {
       cwd,
       env,
@@ -166,8 +176,19 @@ test("headless project:name builds provider/persona at the registered home and r
     const writable = await runCli(["-p", "use the writable persona", "--role", "target:writer"], launcher, home);
     assert.equal(writable.code, 0, writable.stderr);
     assert.match(writable.stdout, /TARGET_HOME_OK/);
-    assert.equal(existsSync(userMcpMarker), true, "non-read-only headless roles retain user MCP support");
-    assert.equal(existsSync(pluginMcpMarker), true, "non-read-only headless roles retain plugin MCP support");
+    assert.equal(existsSync(userMcpMarker), false, "headless roles skip user MCP subprocesses by default");
+    assert.equal(existsSync(pluginMcpMarker), false, "headless roles skip plugin MCP subprocesses by default");
+
+    const trusted = await runCli(
+      ["-p", "use trusted extensions", "--role", "target:writer"],
+      launcher,
+      home,
+      { HARA_ALLOW_TRUSTED_EXTENSIONS: "1" },
+    );
+    assert.equal(trusted.code, 0, trusted.stderr);
+    assert.match(trusted.stdout, /TARGET_HOME_OK/);
+    assert.equal(existsSync(userMcpMarker), true, "launch-time trusted-extension opt-in enables user MCP subprocesses");
+    assert.equal(existsSync(pluginMcpMarker), true, "launch-time trusted-extension opt-in enables plugin MCP subprocesses");
 
     const foreignId = "foreign-session";
     writeFileSync(
@@ -188,7 +209,7 @@ test("headless project:name builds provider/persona at the registered home and r
     const rejected = await runCli(["-p", "do not run", "--role", "target:auditor", "--resume", foreignId], launcher, home);
     assert.equal(rejected.code, 2);
     assert.match(rejected.stderr, /belongs to .*foreign.*refusing to resume/i);
-    assert.equal(targetApi.requests.length, 2, "foreign history is rejected before any model request");
+    assert.equal(targetApi.requests.length, 3, "foreign history is rejected before any model request");
 
     const crossHome = await runCli(["-p", "do not run", "--resume", foreignId], launcher, home);
     assert.equal(crossHome.code, 2);

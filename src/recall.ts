@@ -3,9 +3,12 @@
 // Phase-C v0: lexical-first (no embeddings); reuses the shared filesystem walker.
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readFileSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { walkFiles } from "./fs-walk.js";
 import { skillsDirs } from "./skills/skills.js";
+import { readModelContextFileSync } from "./fs-read.js";
+
+const MAX_RECALL_SOURCE_BYTES = 256 * 1024;
 
 export function assetsDir(): string {
   return process.env.HARA_ASSETS || join(homedir(), ".hara", "code-assets");
@@ -65,7 +68,7 @@ export function searchAssets(query: string, limit = 5, roots?: string[]): Recall
     for (const rel of walkFiles(dir).filter((f) => f.endsWith(".md"))) {
       let text: string;
       try {
-        text = readFileSync(join(dir, rel), "utf8");
+        text = readModelContextFileSync(join(dir, rel), MAX_RECALL_SOURCE_BYTES);
       } catch {
         continue;
       }

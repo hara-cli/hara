@@ -1,14 +1,15 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.122.0",
+  "version": "0.122.1",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
-    "hara": "dist/index.js"
+    "hara": "runtime-bootstrap.cjs"
   },
   "type": "module",
   "files": [
     "dist",
     "!dist/bin",
+    "runtime-bootstrap.cjs",
     "README.md",
     "CHANGELOG.md",
     "SECURITY.md",
@@ -35,16 +36,16 @@
     "url": "git+https://github.com/hara-cli/hara.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "tsc",
-    "prepare": "tsc",
-    "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
-    "test": "tsc && node --test test/*.test.mjs",
-    "build:binary": "tsc && bun scripts/build-binary.ts dist/bin/hara",
-    "build:binaries": "tsc && bun scripts/build-binary.ts dist/bin/hara-darwin-arm64 bun-darwin-arm64 && bun scripts/build-binary.ts dist/bin/hara-darwin-x64 bun-darwin-x64 && bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64 && bun scripts/build-binary.ts dist/bin/hara-linux-arm64 bun-linux-arm64"
+    "build": "tsc && node scripts/normalize-dist-modes.mjs",
+    "prepare": "npm run build",
+    "dev": "tsx src/cli.ts",
+    "start": "node runtime-bootstrap.cjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "build:binary": "npm run build && bun scripts/build-binary.ts dist/bin/hara",
+    "build:binaries": "npm run build && bun scripts/build-binary.ts dist/bin/hara-darwin-arm64 bun-darwin-arm64 && bun scripts/build-binary.ts dist/bin/hara-darwin-x64 bun-darwin-x64 && bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64 && bun scripts/build-binary.ts dist/bin/hara-linux-arm64 bun-linux-arm64"
   },
   "publishConfig": {
     "access": "public"

@@ -1,4 +1,6 @@
-// OS sandboxing for the bash tool — WRITE CONFINEMENT, not a security jail. macOS = Seatbelt
+// OS sandboxing for the bash tool. macOS Seatbelt provides write confinement plus a narrow protected-file
+// read mask. Other reads, network, and process exec are not generally confined; non-macOS shells have only
+// Hara's command preflight and must not be described as a kernel-enforced read sandbox.
 // (sandbox-exec) restricting `file-write*` to the workspace (workspace-write) or to nothing outside
 // temp (read-only). Reads, network, and process exec are NOT restricted, and /private/tmp +
 // /private/var/folders stay writable in every mode — so this stops a stray `rm`/overwrite escaping the
@@ -6,9 +8,13 @@
 // emitted from runShell so every entry point — REPL, -p, org, cron — surfaces it). Only the `bash`
 // shell is sandboxed; hara's own file tools are in-process, explicit, and gated by the approval flow.
 import { spawn, spawnSync } from "node:child_process";
-import { writeFileSync, mkdtempSync } from "node:fs";
-import { tmpdir, platform } from "node:os";
-import { join } from "node:path";
+import { platform } from "node:os";
+import {
+  existingSensitiveSeatbeltMasks,
+  sensitiveFilesAllowed,
+  sensitiveShellCommandReason,
+} from "./security/sensitive-files.js";
+import { terminateSubprocessTree, toolSubprocessEnv } from "./security/subprocess-env.js";
 
 export type SandboxMode = "off" | "workspace-write" | "read-only";
 
@@ -38,9 +44,16 @@ export function resolveShellArgv(command: string, plat: string, bash: string | n
   return { cmd: "/bin/sh", args: ["-c", command] };
 }
 
-const sbQuote = (s: string) => '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+const MAX_INLINE_SEATBELT_PROFILE_BYTES = 96 * 1024;
+const sbQuote = (s: string): string => {
+  if (/[\u0000-\u001f\u007f]/u.test(s)) {
+    throw new Error("cannot safely encode a protected path containing control characters in a Seatbelt profile");
+  }
+  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+};
 
 function seatbeltProfile(cwd: string, mode: SandboxMode): string {
+  const rules = ["(version 1)", "(allow default)"];
   const writable = [
     '(literal "/dev/null")',
     '(literal "/dev/stdout")',
@@ -50,8 +63,39 @@ function seatbeltProfile(cwd: string, mode: SandboxMode): string {
     '(subpath "/private/tmp")',
     '(subpath "/private/var/folders")',
   ];
-  if (mode === "workspace-write") writable.push(`(subpath ${sbQuote(cwd)})`);
-  return `(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n  ${writable.join("\n  ")})\n`;
+  if (mode !== "off") {
+    if (mode === "workspace-write") writable.push(`(subpath ${sbQuote(cwd)})`);
+    rules.push(`(deny file-write*)\n(allow file-write*\n  ${writable.join("\n  ")})`);
+  }
+  const masks = existingSensitiveSeatbeltMasks(cwd);
+  const unreadable = masks.files;
+  if (unreadable.length) {
+    const literals = unreadable.map((path) => `(literal ${sbQuote(path)})`).join("\n  ");
+    rules.push(`(deny file-read*\n  ${literals})`);
+    // Protect metadata mutations too: unlink/rename/link/chmod all sit under file-write* in Seatbelt.
+    // This remains active in sandbox=off; the opt-out is the explicit launch-time secret-file waiver.
+    rules.push(`(deny file-write*\n  ${literals})`);
+  }
+  const unreadableDirs = masks.directories;
+  if (unreadableDirs.length) {
+    // `subpath` masks descendants; the paired `literal` masks rename/unlink of the directory entry itself.
+    const subpaths = unreadableDirs
+      .flatMap((path) => [`(literal ${sbQuote(path)})`, `(subpath ${sbQuote(path)})`])
+      .join("\n  ");
+    rules.push(`(deny file-read*\n  ${subpaths})`);
+    rules.push(`(deny file-write*\n  ${subpaths})`);
+  }
+  const writeContainers = masks.writeContainers;
+  if (writeContainers.length) {
+    rules.push(`(deny file-write*\n  ${writeContainers.map((path) => `(literal ${sbQuote(path)})`).join("\n  ")})`);
+  }
+  const profile = rules.join("\n") + "\n";
+  if (Buffer.byteLength(profile) > MAX_INLINE_SEATBELT_PROFILE_BYTES) {
+    throw new Error(
+      `protected-file Seatbelt profile exceeds ${MAX_INLINE_SEATBELT_PROFILE_BYTES} bytes; refusing an incomplete or unlaunchable mask`,
+    );
+  }
+  return profile;
 }
 
 export function sandboxSupported(): boolean {
@@ -64,7 +108,7 @@ export interface ShellOpts {
   timeout: number;
   maxBuffer: number;
   /** stream stdout/stderr chunks live as they arrive (in addition to the buffered return) */
-  onData?: (chunk: string) => void;
+  onData?: (chunk: string, stream: "stdout" | "stderr") => void;
 }
 
 /**
@@ -75,11 +119,19 @@ export interface ShellOpts {
 /** Build the (sandboxed, when supported) argv for a shell command — shared by runShell + background jobs
  *  so the seatbelt write-confinement is identical for both. */
 export function shellCommand(command: string, cwd: string, mode: SandboxMode): { cmd: string; args: string[] } {
-  if (mode !== "off" && platform() === "darwin") {
-    const dir = mkdtempSync(join(tmpdir(), "hara-sb-"));
-    const profileFile = join(dir, "policy.sb");
-    writeFileSync(profileFile, seatbeltProfile(cwd, mode));
-    return { cmd: "sandbox-exec", args: ["-f", profileFile, "/bin/bash", "-lc", command] };
+  const protectedReason = sensitiveShellCommandReason(command, cwd);
+  if (protectedReason) {
+    throw new Error(
+      `shell command crosses Hara's protected secret boundary (${protectedReason}). ` +
+      "Restart hara with HARA_ALLOW_SENSITIVE_FILES=1 only for an intentional, user-approved exposure.",
+    );
+  }
+  // sandbox=off still retains the narrow secret-file read mask on macOS. It places no restriction on
+  // ordinary reads/writes/network and is removed only by the explicit launch-time sensitive-file opt-in.
+  if ((mode !== "off" || !sensitiveFilesAllowed()) && platform() === "darwin") {
+    // Non-login shell: inheriting the already-scrubbed PATH is sufficient, while -l would source the
+    // user's profile again and silently re-introduce credentials we deliberately removed from env.
+    return { cmd: "sandbox-exec", args: ["-p", seatbeltProfile(cwd, mode), "/bin/bash", "-c", command] };
   }
   maybeWarnUnsandboxed(mode);
   const plat = platform();
@@ -115,52 +167,109 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
     // https op against a private repo would otherwise sit silently until the timeout (observed as
     // "git hangs 5 minutes"). With prompts disabled it fails in seconds with a real auth error.
     // Users' credential helpers (keychain/GCM store) still work — only interactive PROMPTS are off.
-    const env = {
-      ...process.env,
+    const env = toolSubprocessEnv(process.env, {
       GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT ?? "0",
       GCM_INTERACTIVE: process.env.GCM_INTERACTIVE ?? "never",
-    };
-    const child = spawn(cmd, args, { cwd, env });
+    });
+    // A dedicated POSIX process group lets timeout/output-cap termination reach grandchildren (shell →
+    // node/npm → worker). Windows uses taskkill /T in terminateSubprocessTree instead.
+    const processGroup = platform() !== "win32";
+    const child = spawn(cmd, args, { cwd, env, detached: processGroup });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     let killedForSize = false;
-    const grow = (cur: string, add: string) => (cur.length < opts.maxBuffer ? cur + add : cur);
+    let done = false;
+    let receivedBytes = 0;
+    let forceIssued = false;
+    let closeBeforeForce = false;
+    let closeBeforeForceCode: number | null = null;
+    let cancelTermination: ((cancelForce?: boolean) => void) | undefined;
+    const grow = (cur: string, add: string) => {
+      const remaining = opts.maxBuffer - stdout.length - stderr.length;
+      if (remaining <= 0) return cur;
+      return cur + add.slice(0, remaining);
+    };
+    const hardSettle = (): void => {
+      // A daemon can intentionally create a new process group while retaining our pipes. We cannot signal
+      // that unknown group safely, but we can destroy our pipe ends and guarantee the API settles on time.
+      child.stdout.destroy();
+      child.stderr.destroy();
+      settle(null);
+    };
+    const stopTree = (): void => {
+      if (cancelTermination) return;
+      cancelTermination = terminateSubprocessTree(child, {
+        processGroup,
+        graceMs: 250,
+        fallbackMs: 1_000,
+        onFallback: hardSettle,
+        onForce: () => {
+          forceIssued = true;
+          // A quiet descendant can let the direct shell close after TERM while remaining alive itself.
+          // Do not claim the timed-out/capped tree is gone until the forced group kill has been issued.
+          if (closeBeforeForce) settle(closeBeforeForceCode);
+        },
+      });
+    };
+    const settle = (code: number | null, error?: Error): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      cancelTermination?.();
+      if (error) {
+        reject(Object.assign(error, { stdout, stderr }));
+        return;
+      }
+      if (killedForSize) {
+        resolve({ stdout, stderr: stderr + `\n[output truncated — exceeded ${opts.maxBuffer} bytes; process tree killed]` });
+      } else if (timedOut) {
+        reject(Object.assign(new Error(`timed out after ${opts.timeout}ms`), { stdout, stderr }));
+      } else if (code !== 0) {
+        reject(Object.assign(new Error(`exit code ${code}`), { stdout, stderr, code }));
+      } else {
+        resolve({ stdout, stderr });
+      }
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      stopTree();
     }, opts.timeout);
     // Kill a runaway command once its total output passes maxBuffer — don't let it stream GBs to the UI
     // until the timeout just because we stopped retaining the bytes.
     const checkOverflow = (): void => {
-      if (!killedForSize && stdout.length + stderr.length >= opts.maxBuffer) {
+      if (!killedForSize && receivedBytes > opts.maxBuffer) {
         killedForSize = true;
-        child.kill("SIGKILL");
+        stopTree();
       }
     };
 
     child.stdout.on("data", (d: Buffer) => {
+      if (done || timedOut || killedForSize) return;
       const s = d.toString();
+      receivedBytes += d.length;
       stdout = grow(stdout, s);
-      opts.onData?.(s);
+      if (receivedBytes <= opts.maxBuffer) opts.onData?.(s, "stdout");
       checkOverflow();
     });
     child.stderr.on("data", (d: Buffer) => {
+      if (done || timedOut || killedForSize) return;
       const s = d.toString();
+      receivedBytes += d.length;
       stderr = grow(stderr, s);
-      opts.onData?.(s);
+      if (receivedBytes <= opts.maxBuffer) opts.onData?.(s, "stderr");
       checkOverflow();
     });
     child.on("error", (e) => {
-      clearTimeout(timer);
-      reject(Object.assign(e, { stdout, stderr }));
+      settle(null, e);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      if (killedForSize) return resolve({ stdout, stderr: stderr + `\n[output truncated — exceeded ${opts.maxBuffer} bytes; process killed]` });
-      if (timedOut) return reject(Object.assign(new Error(`timed out after ${opts.timeout}ms`), { stdout, stderr }));
-      if (code !== 0) return reject(Object.assign(new Error(`exit code ${code}`), { stdout, stderr, code }));
-      resolve({ stdout, stderr });
+      if ((timedOut || killedForSize) && !forceIssued) {
+        closeBeforeForce = true;
+        closeBeforeForceCode = code;
+        return;
+      }
+      settle(code);
     });
   });
 }

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { mkdtempSync, rmSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parsePlan, topoOrder, topoWaves, runCheck, savePlan, loadPlan } from "../dist/org/planner.js";
 
@@ -83,12 +83,12 @@ test("parsePlan: captures a check command", () => {
   assert.equal(a[0].check, "npm test");
 });
 
-test("savePlan/loadPlan round-trips the SSOT (resume relies on it)", () => {
+test("savePlan/loadPlan round-trips the SSOT (resume relies on it)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-plan-"));
   try {
     const plan = { task: "t", createdAt: "now", atoms: parsePlan('{"atoms":[{"id":"a1","title":"x","deps":[]},{"id":"a2","title":"y","deps":["a1"]}]}') };
     plan.atoms[0].status = "done";
-    savePlan(dir, plan);
+    await savePlan(dir, plan);
     const back = loadPlan(dir);
     assert.ok(back);
     assert.equal(back.task, "t");
@@ -99,10 +99,40 @@ test("savePlan/loadPlan round-trips the SSOT (resume relies on it)", () => {
   }
 });
 
+test("savePlan rejects symlink and hard-link aliases without changing .env", async () => {
+  for (const kind of ["symlink", "hardlink"]) {
+    const dir = mkdtempSync(join(tmpdir(), `hara-plan-${kind}-`));
+    try {
+      const secret = join(dir, ".env");
+      const original = `PLAN_${kind.toUpperCase()}_SECRET=preserve\n`;
+      const planPath = join(dir, ".hara", "org", "plan.json");
+      writeFileSync(secret, original);
+      mkdirSync(join(dir, ".hara", "org"), { recursive: true });
+      if (kind === "symlink") symlinkSync(secret, planPath);
+      else linkSync(secret, planPath);
+
+      await assert.rejects(
+        savePlan(dir, { task: "must not write", createdAt: "now", atoms: [] }),
+        /protected|hard link|environment file/i,
+      );
+      assert.equal(readFileSync(secret, "utf8"), original);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("runCheck: exit 0 passes, nonzero fails", async () => {
-  const ok = await runCheck("echo hi", tmpdir(), "off");
-  assert.ok(ok.ok);
-  assert.match(ok.reason, /hi/);
-  const bad = await runCheck("exit 3", tmpdir(), "off");
-  assert.ok(!bad.ok);
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  process.env.HARA_ALLOW_SENSITIVE_FILES = "1"; // safe echo/exit fixtures; avoids nested sandbox-exec in CI
+  try {
+    const ok = await runCheck("echo hi", tmpdir(), "off");
+    assert.ok(ok.ok);
+    assert.match(ok.reason, /hi/);
+    const bad = await runCheck("exit 3", tmpdir(), "off");
+    assert.ok(!bad.ok);
+  } finally {
+    if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
+  }
 });

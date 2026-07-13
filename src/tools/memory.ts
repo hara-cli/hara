@@ -1,13 +1,16 @@
 // Memory tools — the agent's interface to durable memory. memory_search/get are read-only
 // (parallel-safe, never prompt); memory_write/forget are edits (gated by the approval mode).
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { isAbsolute, resolve, join } from "node:path";
+import { existsSync } from "node:fs";
+import { isAbsolute, resolve, join, relative, sep } from "node:path";
 import { registerTool } from "./registry.js";
 import { searchAssets, assetSearchRoots } from "../recall.js";
 import { searchHybrid } from "../search/hybrid.js";
 import { memoryRoots, appendMemory, replaceMemory, forgetMemory, type Scope, type Target } from "../memory/store.js";
 import { scanMemory, redactSecrets, scrubLocal } from "../memory/guard.js";
 import { globalSkillsDir, skillsDir, invalidateSkillsCache } from "../skills/skills.js";
+import { sensitiveFileError } from "../security/sensitive-files.js";
+import { readModelContextFileSync, readVerifiedRegularFileSnapshot } from "../fs-read.js";
+import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
 
 const asTarget = (v: unknown): Target => (["memory", "user", "log"].includes(v as string) ? (v as Target) : "memory");
 const asScope = (v: unknown): Scope => (v === "global" ? "global" : "project");
@@ -37,10 +40,15 @@ registerTool({
   kind: "read",
   async run(input, ctx) {
     const p = isAbsolute(String(input.path)) ? String(input.path) : resolve(ctx.cwd, String(input.path));
-    if (!memoryRoots(ctx.cwd).some((r) => p.startsWith(r))) return `Error: ${input.path} is outside the memory store.`;
+    if (!memoryRoots(ctx.cwd).some((root) => {
+      const rel = relative(resolve(root), p);
+      return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+    })) return `Error: ${input.path} is outside the memory store.`;
+    const denied = sensitiveFileError(p, "read");
+    if (denied) return denied;
     if (!existsSync(p)) return `Error: no memory file at ${p}.`;
     try {
-      return readFileSync(p, "utf8").slice(0, 50_000);
+      return readModelContextFileSync(p, 64 * 1024).slice(0, 50_000);
     } catch (e: any) {
       return `Error: ${e.message}`;
     }
@@ -70,7 +78,9 @@ registerTool({
     if (!scan.ok) return `Blocked: this looks unsafe to store (${scan.hits.join(", ")}). Rephrase without secrets/injection text.`;
     const scope = asScope(input.scope);
     const target = asTarget(input.target);
-    const f = input.mode === "replace" ? replaceMemory(scope, target, content, ctx.cwd) : appendMemory(scope, target, content, ctx.cwd);
+    const f = input.mode === "replace"
+      ? await replaceMemory(scope, target, content, ctx.cwd)
+      : await appendMemory(scope, target, content, ctx.cwd);
     return `Saved to ${f}`;
   },
 });
@@ -116,8 +126,24 @@ registerTool({
     const f = join(dir, "SKILL.md");
     // dedup: surface a near-duplicate so the agent updates instead of piling up (lexical signal, not a block)
     const dups = searchAssets(`${slug} ${description}`, 3, assetSearchRoots(ctx.cwd)).filter((h) => h.path !== f && h.score >= 2);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(f, `---\nname: ${slug}\ndescription: ${description}\n---\n\n${body.trim()}\n`, "utf8");
+    const skillText = `---\nname: ${slug}\ndescription: ${description}\n---\n\n${body.trim()}\n`;
+    let boundary: ReturnType<typeof bindAtomicWritePath>;
+    let snapshot: Awaited<ReturnType<typeof readVerifiedRegularFileSnapshot>> | null = null;
+    try {
+      boundary = bindAtomicWritePath(f, "create skill");
+      try {
+        snapshot = await readVerifiedRegularFileSnapshot(boundary.target, undefined, "create skill");
+      } catch (error: any) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      await atomicWriteText(boundary.target, skillText, {
+        expected: snapshot?.text ?? null,
+        expectedIdentity: snapshot ?? undefined,
+        boundary,
+      });
+    } catch (error: any) {
+      return `Error: cannot save skill ${slug}: ${error?.message ?? String(error)} No changes written.`;
+    }
     invalidateSkillsCache();
     const notes = [
       redactions.length ? `redacted ${redactions.length} secret(s)` : "",
@@ -141,7 +167,7 @@ registerTool({
   },
   kind: "edit",
   async run(input, ctx) {
-    const n = forgetMemory(asScope(input.scope), asTarget(input.target), String(input.match ?? ""), ctx.cwd);
+    const n = await forgetMemory(asScope(input.scope), asTarget(input.target), String(input.match ?? ""), ctx.cwd);
     return n ? `Removed ${n} line(s).` : "(no matching lines)";
   },
 });

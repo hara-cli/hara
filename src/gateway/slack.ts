@@ -4,8 +4,6 @@
 // API (bot token, xoxb-). Same ChatAdapter shape as Discord/Telegram, so all cross-platform gateway plumbing
 // (send_file, in-chat system context, stuck-guard, image attach/describe) works unchanged. Two tokens are
 // required because Socket Mode (xapp-) and the Web API (xoxb-) are separate auth scopes.
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
 import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
@@ -97,15 +95,15 @@ export function slackAdapter(appToken: string, botToken: string): ChatAdapter {
         await slackApi("chat.postMessage", botToken, { channel: chatId, text: part });
       }
     },
-    async sendFile(chatId, filePath) {
+    async sendFile(chatId, file) {
       // 3-step external-upload flow (getUploadURLExternal → PUT bytes → completeUploadExternal): the current,
       // non-deprecated path that works with just files:write (the old files.upload can 404/missing_scope).
       try {
-        const bytes = readFileSync(filePath);
-        const name = basename(filePath);
+        const bytes = file.bytes;
+        const name = file.safeName;
         const url = await slackApi("files.getUploadURLExternal", botToken, { filename: name, length: bytes.length });
         if (!url?.ok || !url.upload_url || !url.file_id) return;
-        const up = await fetch(url.upload_url, { method: "POST", body: new Blob([bytes]) }); // presigned URL: no auth header
+        const up = await fetch(url.upload_url, { method: "POST", body: new Blob([new Uint8Array(bytes)]) }); // presigned URL: no auth header
         if (!up.ok) return;
         await slackApi("files.completeUploadExternal", botToken, { files: [{ id: url.file_id, title: name }], channel_id: String(chatId) });
       } catch {

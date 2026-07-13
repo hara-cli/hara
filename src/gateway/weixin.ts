@@ -6,9 +6,9 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
-import { basename } from "node:path";
 import { randomBytes, randomUUID, createHash, createCipheriv, createDecipheriv } from "node:crypto";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
+import type { OutboundFilePayload } from "./outbound-files.js";
 import {
   INBOUND_MEDIA_MAX_BYTES,
   INBOUND_MEDIA_TIMEOUT_MS,
@@ -221,8 +221,10 @@ export function loadWeixinCreds(): WeixinCreds | null {
   }
 }
 function saveWeixinCreds(c: WeixinCreds): void {
-  mkdirSync(weixinDir(), { recursive: true });
+  mkdirSync(weixinDir(), { recursive: true, mode: 0o700 });
+  try { chmodSync(weixinDir(), 0o700); } catch { /* best effort */ }
   writeFileSync(credsFile(), JSON.stringify(c, null, 2), { mode: 0o600 });
+  try { chmodSync(credsFile(), 0o600); } catch { /* best effort */ }
 }
 
 // get_updates_buf cursor — persisted so a restart resumes the message stream where it left off.
@@ -236,8 +238,11 @@ function loadCursor(accountId: string): string {
 }
 function saveCursor(accountId: string, buf: string): void {
   try {
-    mkdirSync(weixinDir(), { recursive: true });
-    writeFileSync(join(weixinDir(), `${accountId}.cursor`), buf);
+    mkdirSync(weixinDir(), { recursive: true, mode: 0o700 });
+    chmodSync(weixinDir(), 0o700);
+    const file = join(weixinDir(), `${accountId}.cursor`);
+    writeFileSync(file, buf, { mode: 0o600 });
+    chmodSync(file, 0o600);
   } catch {
     /* best-effort */
   }
@@ -513,14 +518,14 @@ async function cdnUpload(uploadUrl: string, ciphertext: Buffer): Promise<string>
   return ep;
 }
 
-/** Send a local file to a peer. Images go inline (image_item); everything else (audio/zip/pdf/doc/…) goes as a
+/** Send already-verified bytes to a peer. Images go inline (image_item); everything else (audio/zip/pdf/doc/…) goes as a
  *  file attachment (file_item) carrying the filename. Ported byte-exact from iLink's media protocol:
  *  getuploadurl → AES-128-ECB encrypt → CDN POST → sendmessage(item). */
-export async function sendMediaFile(creds: WeixinCreds, tokenStore: TokenStore, peer: string, filePath: string): Promise<boolean> {
+export async function sendMediaFile(creds: WeixinCreds, tokenStore: TokenStore, peer: string, file: OutboundFilePayload): Promise<boolean> {
   try {
-    const plaintext = readFileSync(filePath);
+    const plaintext = file.bytes;
     const rawsize = plaintext.length;
-    const isImage = IMAGE_EXTS.has((filePath.split(".").pop() || "").toLowerCase());
+    const isImage = IMAGE_EXTS.has((file.safeName.split(".").pop() || "").toLowerCase());
     const rawfilemd5 = createHash("md5").update(plaintext).digest("hex");
     const filekey = randomBytes(16).toString("hex");
     const key = randomBytes(16);
@@ -535,7 +540,7 @@ export async function sendMediaFile(creds: WeixinCreds, tokenStore: TokenStore, 
     const encryptedParam = await cdnUpload(uploadUrl, ciphertext);
     const item = isImage
       ? imageInlineItem(encryptedParam, apiAesKey(keyHex), ciphertext.length)
-      : audioFileItem(encryptedParam, apiAesKey(keyHex), rawsize, basename(filePath));
+      : audioFileItem(encryptedParam, apiAesKey(keyHex), rawsize, file.safeName);
     const clientId = `hara-weixin-${randomUUID().replace(/-/g, "")}`; // reused across the -14 retry for dedup
     const send = (ctx: string | undefined): Promise<any> => {
       const msg: Record<string, unknown> = { from_user_id: "", to_user_id: peer, client_id: clientId, message_type: MSG_TYPE_BOT, message_state: MSG_STATE_FINISH, item_list: [item] };
@@ -628,8 +633,8 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
       const peer = String(chatId);
       for (const part of chunkText(text || "(empty)")) await sendChunk(creds, tokenStore, peer, part);
     },
-    async sendFile(chatId, filePath) {
-      if (!(await sendMediaFile(creds, tokenStore, String(chatId), filePath))) throw new Error(`weixin file delivery failed: ${filePath}`);
+    async sendFile(chatId, file) {
+      if (!(await sendMediaFile(creds, tokenStore, String(chatId), file))) throw new Error(`weixin file delivery failed: ${file.safeName}`);
     },
     async start(onMessage, signal, shouldDownload) {
       let buf = loadCursor(creds.account_id);

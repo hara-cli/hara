@@ -1,9 +1,17 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { linkSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadConfig } from "../dist/config.js";
+
+const originalTrustProjectConfig = process.env.HARA_TRUST_PROJECT_CONFIG;
+delete process.env.HARA_TRUST_PROJECT_CONFIG;
+const { loadConfig } = await import("../dist/config.js");
+after(() => {
+  if (originalTrustProjectConfig === undefined) delete process.env.HARA_TRUST_PROJECT_CONFIG;
+  else process.env.HARA_TRUST_PROJECT_CONFIG = originalTrustProjectConfig;
+});
 
 test("loadConfig: blank env/project routing values do not hide global credentials", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-config-live-"));
@@ -114,7 +122,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
   }
 });
 
-test("loadConfig: a project override wins a selected global overlay", () => {
+test("loadConfig: safe project keys override an overlay while privileged keys are ignored without value leaks", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-config-precedence-"));
   const home = join(root, "home");
   const project = join(root, "project");
@@ -122,13 +130,37 @@ test("loadConfig: a project override wins a selected global overlay", () => {
   mkdirSync(join(project, ".hara"), { recursive: true });
   writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({
     provider: "openai",
+    apiKey: "global-key",
     model: "global",
+    baseURL: "https://global.example/v1",
+    approval: "suggest",
+    sandbox: "read-only",
+    guardian: "on",
+    evolve: "off",
+    assetCapture: "off",
+    computerUse: "off",
+    fileCheckpoints: true,
+    updateCheck: true,
+    notify: "off",
     overlays: { work: { model: "overlay", mcpServers: { shared: { command: "overlay" } } } },
   }));
   writeFileSync(join(project, "package.json"), "{}");
   writeFileSync(join(project, ".hara", "config.json"), JSON.stringify({
     model: "project",
-    mcpServers: { shared: { command: "project" } },
+    mcpServers: { shared: { command: "PROJECT_COMMAND_SECRET" } },
+    apiKey: "PROJECT_API_SECRET",
+    baseURL: "https://project-secret.invalid/v1",
+    approval: "full-auto",
+    sandbox: "off",
+    guardian: "off",
+    evolve: "proactive",
+    assetCapture: "auto",
+    computerUse: "full",
+    computerApps: ["Terminal"],
+    fileCheckpoints: false,
+    updateCheck: false,
+    notify: "system",
+    "sk-UNKNOWN_KEY_SECRET_123456789": "ignored",
   }));
   const saved = { HOME: process.env.HOME, cwd: process.cwd(), HARA_OVERLAY: process.env.HARA_OVERLAY, HARA_MODEL: process.env.HARA_MODEL };
   try {
@@ -136,9 +168,30 @@ test("loadConfig: a project override wins a selected global overlay", () => {
     process.env.HARA_OVERLAY = "work";
     delete process.env.HARA_MODEL;
     process.chdir(project);
-    const cfg = loadConfig();
+    let warning = "";
+    const originalWrite = process.stderr.write;
+    process.stderr.write = (chunk) => { warning += String(chunk); return true; };
+    let cfg;
+    try {
+      cfg = loadConfig();
+    } finally {
+      process.stderr.write = originalWrite;
+    }
     assert.equal(cfg.model, "project");
-    assert.equal(cfg.mcpServers.shared.command, "project");
+    assert.equal(cfg.mcpServers.shared.command, "overlay");
+    assert.equal(cfg.apiKey, "global-key");
+    assert.equal(cfg.baseURL, "https://global.example/v1");
+    assert.equal(cfg.approval, "suggest");
+    assert.equal(cfg.sandbox, "read-only");
+    assert.equal(cfg.guardian, "on");
+    assert.equal(cfg.evolve, "off");
+    assert.equal(cfg.assetCapture, "off");
+    assert.equal(cfg.computerUse, "off");
+    assert.equal(cfg.fileCheckpoints, true);
+    assert.equal(cfg.updateCheck, true);
+    assert.equal(cfg.notify, "off");
+    assert.match(warning, /apiKey|baseURL|mcpServers|approval|sandbox|guardian|<unknown-key>/);
+    assert.doesNotMatch(warning, /PROJECT_(?:COMMAND|API)_SECRET|project-secret\.invalid|UNKNOWN_KEY_SECRET/);
   } finally {
     process.chdir(saved.cwd);
     for (const [key, value] of Object.entries(saved)) {
@@ -146,6 +199,103 @@ test("loadConfig: a project override wins a selected global overlay", () => {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: launch-time HARA_TRUST_PROJECT_CONFIG=1 explicitly enables privileged project keys", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-trusted-project-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  mkdirSync(join(project, ".hara"), { recursive: true });
+  writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({
+    provider: "openai",
+    apiKey: "global-key",
+    model: "global-model",
+  }));
+  writeFileSync(join(project, "package.json"), "{}");
+  writeFileSync(join(project, ".hara", "config.json"), JSON.stringify({
+    provider: "deepseek",
+    apiKey: "TRUSTED_PROJECT_API_VALUE",
+    model: "trusted-project-model",
+    baseURL: "https://trusted-project.invalid/v1",
+    approval: "full-auto",
+    sandbox: "off",
+    guardian: "off",
+    hooks: { PreToolUse: [{ command: "TRUSTED_HOOK_VALUE" }] },
+    mcpServers: { project: { command: "TRUSTED_MCP_VALUE" } },
+  }));
+  try {
+    const moduleUrl = new URL("../dist/config.js", import.meta.url).href;
+    const script = `
+      const { loadConfig } = await import(${JSON.stringify(moduleUrl)});
+      const c = loadConfig({ cwd: ${JSON.stringify(project)} });
+      process.stdout.write(JSON.stringify({
+        provider: c.provider, apiKey: c.apiKey, model: c.model, baseURL: c.baseURL,
+        approval: c.approval, sandbox: c.sandbox, guardian: c.guardian,
+        hook: c.hooks.PreToolUse?.[0]?.command, mcp: c.mcpServers.project?.command,
+      }));
+    `;
+    const childEnv = {
+      ...process.env,
+      HOME: home,
+      HARA_TRUST_PROJECT_CONFIG: "1",
+      HARA_API_KEY: "",
+      DEEPSEEK_API_KEY: "",
+      HARA_PROVIDER: "",
+      HARA_MODEL: "",
+      HARA_BASE_URL: "",
+    };
+    delete childEnv.HARA_APPROVAL;
+    delete childEnv.HARA_SANDBOX;
+    delete childEnv.HARA_GUARDIAN;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: project,
+      encoding: "utf8",
+      env: childEnv,
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), {
+      provider: "deepseek",
+      apiKey: "TRUSTED_PROJECT_API_VALUE",
+      model: "trusted-project-model",
+      baseURL: "https://trusted-project.invalid/v1",
+      approval: "full-auto",
+      sandbox: "off",
+      guardian: "off",
+      hook: "TRUSTED_HOOK_VALUE",
+      mcp: "TRUSTED_MCP_VALUE",
+    });
+    assert.match(child.stderr, /apiKey|baseURL|hooks|mcpServers|approval|sandbox|guardian/);
+    assert.doesNotMatch(child.stderr, /TRUSTED_(?:PROJECT_API|HOOK|MCP)_VALUE|trusted-project\.invalid/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: changing HARA_TRUST_PROJECT_CONFIG after module startup cannot widen trust", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-late-trust-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  mkdirSync(join(project, ".hara"), { recursive: true });
+  writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({ provider: "openai", model: "global" }));
+  writeFileSync(join(project, "package.json"), "{}");
+  writeFileSync(join(project, ".hara", "config.json"), JSON.stringify({ provider: "deepseek", model: "project-safe" }));
+  const savedHome = process.env.HOME;
+  const savedTrust = process.env.HARA_TRUST_PROJECT_CONFIG;
+  try {
+    process.env.HOME = home;
+    process.env.HARA_TRUST_PROJECT_CONFIG = "1";
+    const cfg = loadConfig({ cwd: project });
+    assert.equal(cfg.provider, "openai", "the privileged provider key remains ignored");
+    assert.equal(cfg.model, "project-safe", "safe keys still load normally");
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedTrust === undefined) delete process.env.HARA_TRUST_PROJECT_CONFIG;
+    else process.env.HARA_TRUST_PROJECT_CONFIG = savedTrust;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -176,6 +326,67 @@ test("loadConfig: explicit cwd loads that project's route without changing proce
     else process.env.HARA_MODEL = savedModel;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("loadConfig: project config rejects .hara/final symlinks, hard links, and oversized files", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-file-boundary-"));
+  const home = join(root, "home");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({ provider: "openai", model: "global-safe" }));
+  const makeProject = (name) => {
+    const project = join(root, name);
+    mkdirSync(project);
+    writeFileSync(join(project, "package.json"), "{}");
+    return project;
+  };
+  const parentLinkProject = makeProject("parent-link");
+  const linkedHara = join(root, "linked-hara");
+  mkdirSync(linkedHara);
+  writeFileSync(join(linkedHara, "config.json"), JSON.stringify({ model: "PARENT_LINK_SECRET_MODEL" }));
+  symlinkSync(linkedHara, join(parentLinkProject, ".hara"));
+
+  const finalLinkProject = makeProject("final-link");
+  mkdirSync(join(finalLinkProject, ".hara"));
+  const finalLinkSource = join(finalLinkProject, ".env");
+  writeFileSync(finalLinkSource, JSON.stringify({ model: "FINAL_LINK_SECRET_MODEL" }));
+  symlinkSync(finalLinkSource, join(finalLinkProject, ".hara", "config.json"));
+
+  const hardLinkProject = makeProject("hard-link");
+  mkdirSync(join(hardLinkProject, ".hara"));
+  const hardLinkSource = join(hardLinkProject, ".env");
+  const hardLinkOriginal = JSON.stringify({ model: "HARD_LINK_SECRET_MODEL" });
+  writeFileSync(hardLinkSource, hardLinkOriginal);
+  linkSync(hardLinkSource, join(hardLinkProject, ".hara", "config.json"));
+
+  const oversizedProject = makeProject("oversized");
+  mkdirSync(join(oversizedProject, ".hara"));
+  writeFileSync(
+    join(oversizedProject, ".hara", "config.json"),
+    JSON.stringify({ model: "OVERSIZED_SECRET_MODEL", padding: "x".repeat(300 * 1024) }),
+  );
+
+  const savedHome = process.env.HOME;
+  const savedModel = process.env.HARA_MODEL;
+  let warning = "";
+  const originalWrite = process.stderr.write;
+  try {
+    process.env.HOME = home;
+    delete process.env.HARA_MODEL;
+    process.stderr.write = (chunk) => { warning += String(chunk); return true; };
+    for (const project of [parentLinkProject, finalLinkProject, hardLinkProject, oversizedProject]) {
+      assert.equal(loadConfig({ cwd: project }).model, "global-safe");
+    }
+    assert.equal(readFileSync(hardLinkSource, "utf8"), hardLinkOriginal);
+  } finally {
+    process.stderr.write = originalWrite;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedModel === undefined) delete process.env.HARA_MODEL;
+    else process.env.HARA_MODEL = savedModel;
+    rmSync(root, { recursive: true, force: true });
+  }
+  assert.match(warning, /symlink parent|symlink file|hard-linked file|oversized file/);
+  assert.doesNotMatch(warning, /(?:PARENT|FINAL|HARD)_LINK_SECRET_MODEL|OVERSIZED_SECRET_MODEL/);
 });
 
 test("loadConfig: non-object config roots and blank overlay env fail soft", () => {

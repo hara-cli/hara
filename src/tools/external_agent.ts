@@ -7,10 +7,17 @@
 // privileged tool — and because fan-out sub-agents only get the read-only allow-list (READONLY_TOOLS), they
 // never see this tool. Trust tiers (off|gated|full) gate the dangerous bypass/full-access sub-modes.
 import { spawn, execFileSync } from "node:child_process";
+import { platform } from "node:os";
 import { registerTool, type ToolContext } from "./registry.js";
 import { capHeadTail } from "./builtin.js";
 import { loadConfig } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
+import {
+  createToolOutputLineRedactor,
+  redactToolSubprocessOutput,
+  terminateSubprocessTree,
+  toolSubprocessEnv,
+} from "../security/subprocess-env.js";
 
 export type Trust = "off" | "gated" | "full";
 
@@ -36,6 +43,19 @@ export function buildExternalArgv(backend: string, task: string, o: ExternalArgv
 }
 
 const BUILTIN_BACKENDS = ["claude", "codex"];
+const EXTERNAL_CAPTURE_PER_STREAM = 2 * 1024 * 1024;
+const EXTERNAL_OUTPUT_KILL_LIMIT = 4 * 1024 * 1024;
+
+export function appendBoundedExternalOutput(current: string, chunk: string, limit = EXTERNAL_CAPTURE_PER_STREAM): string {
+  if (!Number.isSafeInteger(limit) || limit < 1) return "";
+  const combined = current + chunk;
+  if (combined.length <= limit) return combined;
+  const marker = "\n…[external output truncated]…\n";
+  const retained = Math.max(0, limit - marker.length);
+  const head = Math.floor(retained / 4);
+  const tail = retained - head;
+  return combined.slice(0, head) + marker.slice(0, limit - head - tail) + (tail ? combined.slice(-tail) : "");
+}
 
 /** Probe a CLI's availability via `<bin> --version` (cached per process). */
 const availCache = new Map<string, boolean>();
@@ -43,7 +63,7 @@ function available(bin: string): boolean {
   if (availCache.has(bin)) return availCache.get(bin)!;
   let ok = false;
   try {
-    execFileSync(bin, ["--version"], { stdio: "ignore", timeout: 5000 });
+    execFileSync(bin, ["--version"], { stdio: "ignore", timeout: 5000, env: toolSubprocessEnv() });
     ok = true;
   } catch {
     ok = false;
@@ -66,6 +86,7 @@ registerTool({
     "another agent to own end-to-end. It can read/write/run on the host, so it's gated by approval. " +
     "Args: task (required), backend (claude|codex; default = first installed), model (optional).",
   kind: "exec", // → approval gate; never exposed to read-only fan-out sub-agents
+  trustBoundary: "external",
   input_schema: {
     type: "object",
     properties: {
@@ -77,6 +98,12 @@ registerTool({
     required: ["task"],
   },
   async run(input: any, ctx: ToolContext): Promise<string> {
+    if (!ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
+      return (
+        "Blocked: external_agent runs another host coding agent outside Hara's protected-file boundary. " +
+        "Use it interactively after approval, or restart with HARA_ALLOW_TRUSTED_EXTENSIONS=1 only after reviewing that agent."
+      );
+    }
     const trust = resolveTrust();
     if (trust === "off") return "external_agent is disabled (set externalAgentTrust to gated|full, or HARA_EXTERNAL_AGENT_TRUST).";
     const task = typeof input.task === "string" ? input.task.trim() : "";
@@ -92,35 +119,104 @@ registerTool({
     const timeout = Math.min(Math.max(30_000, Number(input.timeout_ms) || 600_000), 1_800_000);
 
     return await new Promise<string>((resolve) => {
-      const child = spawn(built.cmd, built.args, { cwd: ctx.cwd, env: process.env });
+      const processGroup = platform() !== "win32";
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(built.cmd, built.args, {
+          cwd: ctx.cwd,
+          env: toolSubprocessEnv(),
+          detached: processGroup,
+        });
+      } catch (error) {
+        resolve(redactToolSubprocessOutput(`[${backend}] failed to start: ${error instanceof Error ? error.message : String(error)}`));
+        return;
+      }
       let out = "";
       let err = "";
+      let outputBytes = 0;
       let done = false;
+      let stoppingReason: string | null = null;
+      let forceIssued = false;
+      let closeBeforeForce = false;
+      let cancelTermination: ((cancelForce?: boolean) => void) | undefined;
+      const liveOut = ctx.ui ? createToolOutputLineRedactor((line) => ctx.ui!.notice(line.replace(/\r?\n$/, ""))) : null;
+      const liveErr = ctx.ui ? createToolOutputLineRedactor((line) => ctx.ui!.notice(line.replace(/\r?\n$/, ""))) : null;
       const finish = (s: string): void => {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        resolve(capHeadTail(s));
+        // A stopped tree must still receive its scheduled group KILL even if the direct shell closed first.
+        // The default cancellation removes only the wall-clock fallback, not the force timer.
+        cancelTermination?.();
+        liveOut?.flush();
+        liveErr?.flush();
+        resolve(capHeadTail(redactToolSubprocessOutput(s)));
+      };
+      const stoppedText = (): string => {
+        const text = out.trim() || "(external agent produced no output)";
+        return `${stoppingReason}\n${text}${err ? `\n[stderr]\n${err.trim()}` : ""}`;
+      };
+      const stopTree = (reason: string): void => {
+        if (done || stoppingReason) return;
+        stoppingReason = reason;
+        cancelTermination = terminateSubprocessTree(child, {
+          processGroup,
+          graceMs: 2_000,
+          fallbackMs: 3_000,
+          onForce: () => {
+            forceIssued = true;
+            if (closeBeforeForce) finish(stoppedText());
+          },
+          onFallback: () => {
+            // A deliberately daemonized descendant may retain the pipes after escaping the owned group.
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            finish(stoppedText());
+          },
+        });
       };
       const timer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
-        finish(`[${backend}] timed out after ${timeout}ms\n${out}`);
+        stopTree(`[${backend}] timed out after ${timeout}ms`);
       }, timeout);
-      child.stdin.end(); // task is passed via argv
-      child.stdout.on("data", (d) => {
-        out += d.toString();
-        ctx.ui?.notice?.(d.toString().trimEnd());
+      child.stdin?.on("error", () => { /* a backend may exit before stdin.end(); close/error settles it */ });
+      child.stdin?.end(); // task is passed via argv
+      child.stdout?.on("data", (d: Buffer) => {
+        if (done || stoppingReason) return;
+        const text = d.toString();
+        outputBytes += d.length;
+        out = appendBoundedExternalOutput(out, text);
+        liveOut?.push(text);
+        if (outputBytes > EXTERNAL_OUTPUT_KILL_LIMIT) {
+          stopTree(`[${backend}] stopped after exceeding ${EXTERNAL_OUTPUT_KILL_LIMIT} output bytes`);
+        }
       });
-      child.stderr.on("data", (d) => {
-        err += d.toString();
+      child.stderr?.on("data", (d: Buffer) => {
+        if (done || stoppingReason) return;
+        const text = d.toString();
+        outputBytes += d.length;
+        err = appendBoundedExternalOutput(err, text);
+        liveErr?.push(text);
+        if (outputBytes > EXTERNAL_OUTPUT_KILL_LIMIT) {
+          stopTree(`[${backend}] stopped after exceeding ${EXTERNAL_OUTPUT_KILL_LIMIT} output bytes`);
+        }
       });
-      child.on("error", (e) => finish(`[${backend}] failed to start: ${e.message} (is it installed?)`));
+      child.on("error", (e) => {
+        if (stoppingReason && !forceIssued) {
+          closeBeforeForce = true;
+          return;
+        }
+        finish(stoppingReason ? stoppedText() : `[${backend}] failed to start: ${e.message} (is it installed?)`);
+      });
       child.on("close", (code) => {
         const text = out.trim() || "(external agent produced no output)";
+        if (stoppingReason) {
+          if (!forceIssued) {
+            closeBeforeForce = true;
+            return;
+          }
+          finish(stoppedText());
+          return;
+        }
         finish(code === 0 ? text : `[${backend} exit ${code}]\n${text}${err ? `\n[stderr]\n${err.trim()}` : ""}`);
       });
     });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadAgentsMd, hasAgentsMd, findProjectRoot } from "../dist/context/agents-md.js";
@@ -47,6 +47,44 @@ test("agents-md: no file → empty string + hasAgentsMd false", () => {
     assert.equal(hasAgentsMd(dir), false);
     assert.equal(loadAgentsMd(dir), "");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agents-md: an oversized instruction file keeps a verified prefix within the 32 KiB total budget", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-ctx-large-"));
+  try {
+    mkdirSync(join(dir, ".git"));
+    writeFileSync(join(dir, "AGENTS.md"), `# KEEP-THIS-PREFIX\n${"规则🙂".repeat(20_000)}\nDROP-THIS-TAIL`);
+    const ctx = loadAgentsMd(dir);
+    assert.match(ctx, /KEEP-THIS-PREFIX/);
+    assert.match(ctx, /truncated to project-context budget/);
+    assert.doesNotMatch(ctx, /DROP-THIS-TAIL/);
+    assert.ok(Buffer.byteLength(ctx, "utf8") <= 32 * 1024, "headers, content, and marker share one byte budget");
+    assert.doesNotMatch(ctx, /�$/, "the prefix never ends with a split UTF-8 code point");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agents-md: a symlink or hard-link alias cannot inject .env into project context", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-ctx-protected-"));
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+  try {
+    mkdirSync(join(dir, ".git"));
+    const secret = join(dir, ".env");
+    writeFileSync(secret, "MODEL_CONTEXT_SECRET=must-not-leak\n");
+
+    symlinkSync(secret, join(dir, "AGENTS.md"));
+    assert.doesNotMatch(loadAgentsMd(dir), /must-not-leak/);
+    rmSync(join(dir, "AGENTS.md"));
+
+    linkSync(secret, join(dir, "AGENTS.md"));
+    assert.doesNotMatch(loadAgentsMd(dir), /must-not-leak/);
+  } finally {
+    if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
     rmSync(dir, { recursive: true, force: true });
   }
 });

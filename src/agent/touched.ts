@@ -2,6 +2,8 @@
 // The loop records every file the MAIN conversation reads/edits; when the history is compacted to a
 // summary, the top-N most-recent files get their CURRENT on-disk content re-attached — so the model
 // doesn't lose the very files it was working on and re-read them all next turn.
+import { isSensitiveFilePath } from "../security/sensitive-files.js";
+
 const DEFAULT_SCOPE = "default";
 const touchedByScope = new Map<string, Map<string, number>>(); // scope → absolute path → last-touch timestamp
 
@@ -13,6 +15,7 @@ function scopedTouched(scope?: string): Map<string, number> {
 }
 
 export function recordTouch(path: string, scope?: string): void {
+  if (isSensitiveFilePath(path)) return;
   const touched = scopedTouched(scope);
   touched.delete(path);
   touched.set(path, Date.now());
@@ -22,6 +25,7 @@ export function recordTouch(path: string, scope?: string): void {
 /** Most-recently-touched first. */
 export function recentTouched(n = 5, scope?: string): string[] {
   return [...scopedTouched(scope).entries()]
+    .filter(([path]) => !isSensitiveFilePath(path))
     .sort((a, b) => b[1] - a[1])
     .slice(0, n)
     .map(([p]) => p);

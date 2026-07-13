@@ -7,8 +7,6 @@
 // LIMITATION (v1): NO end-to-end encryption. Encrypted rooms (m.room.encrypted events) are skipped — only
 // plaintext rooms work. E2EE would need libolm + a crypto store (see hermes' matrix-nio adapter), which breaks
 // the zero-dep constraint. Invite this bot into UNENCRYPTED rooms only.
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
 import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
@@ -174,15 +172,15 @@ export function matrixAdapter(homeserver: string, token: string, selfUserId: str
         }).catch(() => {});
       }
     },
-    async sendFile(chatId, filePath) {
-      const name = basename(filePath);
+    async sendFile(chatId, file) {
+      const name = file.safeName;
       const mime = mimeFromExt(name);
       try {
         // 1) upload bytes → content_uri (mxc://)
         const up = await fetch(`${base}/_matrix/media/v3/upload?filename=${encodeURIComponent(name)}`, {
           method: "POST",
           headers: { ...auth, "content-type": mime },
-          body: readFileSync(filePath),
+          body: new Uint8Array(file.bytes),
         });
         if (!up.ok) return;
         const j = (await up.json()) as { content_uri?: string };

@@ -72,7 +72,20 @@ import { formatContextReport } from "./agent/context-report.js";
 import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
 import { checkpoint, listCheckpoints, restoreCheckpoint } from "./checkpoints.js";
 import { mapLimit, maxParallel } from "./concurrency.js";
-import { parseVerdict, captureChanges, reviewPrompt, fixPrompt, REVIEWER_SYSTEM, isTreeClean, stripCommitFence } from "./org/review-chain.js";
+import {
+  parseVerdict,
+  captureChanges,
+  reviewPrompt,
+  fixPrompt,
+  REVIEWER_SYSTEM,
+  isTreeClean,
+  stripCommitFence,
+  commitMessageInput,
+  protectedStagedPaths,
+  protectedTrackedWorkingTreePaths,
+  protectedWorkingTreePaths,
+  type CapturedChanges,
+} from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun, validTz } from "./cron/schedule.js";
 import { parseDeliver } from "./cron/deliver.js";
 import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
@@ -88,6 +101,8 @@ import { resolvePlatform } from "./providers/registry.js";
 import { levelsFor } from "./tui/model-picker.js";
 import { listModels } from "./providers/models.js";
 import { listJobs, tailJob, killJob } from "./exec/jobs.js";
+import { readModelContextFileSync } from "./fs-read.js";
+import { MIN_NODE_VERSION, unsupportedNodeMessage } from "./runtime.js";
 
 /** Render the background-job list for /jobs (user-facing view of what the agent has running in the
  *  background — dev servers, watchers, long tasks). Mirrors codex/Claude-Code process visibility. */
@@ -467,21 +482,27 @@ interface OrgOpts {
 /** Stage everything and commit with an AI-written message. Returns a one-line summary or "error: …".
  *  Used by `hara org --commit`; the caller guards on a clean start tree so this only captures the run's work. */
 async function autoCommit(provider: Provider, cwd: string): Promise<string> {
+  const before = protectedWorkingTreePaths(cwd);
+  if (before.length) return `error: refusing to stage protected path(s): ${before.map((p) => JSON.stringify(p)).join(", ")}`;
   try {
     await runShell("git add -A", cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
   } catch {
     /* fall through — empty diff is reported below */
   }
-  let diff = "";
-  try {
-    diff = (await runShell("git diff --staged", cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout;
-  } catch (e) {
-    return `error: git diff failed (${e instanceof Error ? e.message : String(e)})`;
+  const protectedAfterStage = protectedStagedPaths(cwd);
+  if (protectedAfterStage.length) {
+    return `error: refusing to inspect or commit protected staged path(s): ${protectedAfterStage.map((p) => JSON.stringify(p)).join(", ")}`;
   }
-  if (!diff.trim()) return "nothing to commit";
+  const staged = captureChanges(cwd, 120_000, { staged: true, includeUntracked: false });
+  if (staged.error) return `error: git diff failed closed (${staged.error})`;
+  if (staged.skippedFiles.length) {
+    return `error: refusing to inspect or commit protected staged path(s): ${staged.skippedFiles.map((p) => JSON.stringify(p)).join(", ")}`;
+  }
+  const changeInput = commitMessageInput(staged);
+  if (!changeInput.trim()) return "nothing to commit";
   const r = await provider.turn({
     system: COMMIT_SYSTEM,
-    history: [{ role: "user", content: `Write a commit message for these staged changes:\n\n\`\`\`diff\n${diff.slice(0, 120_000)}\n\`\`\`` }],
+    history: [{ role: "user", content: `Write a commit message for these staged changes:\n\n${changeInput.slice(0, 120_000)}` }],
     tools: [],
     onText: () => {},
   });
@@ -490,6 +511,10 @@ async function autoCommit(provider: Provider, cwd: string): Promise<string> {
   const tmp = join(tmpdir(), `hara-org-commit-${process.pid}.txt`);
   writeFileSync(tmp, msg + "\n", "utf8");
   try {
+    const protectedBeforeCommit = protectedStagedPaths(cwd);
+    if (protectedBeforeCommit.length) {
+      return `error: staged paths changed while writing the message; protected path(s) will not be committed: ${protectedBeforeCommit.map((p) => JSON.stringify(p)).join(", ")}`;
+    }
     const res = await runShell(`git commit -F ${JSON.stringify(tmp)}`, cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
     return (res.stdout || "").trim().split("\n")[0] || "committed";
   } catch (e) {
@@ -595,7 +620,12 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   const maxRounds = Math.max(1, o.rounds ?? 3);
   for (let round = 1; round <= maxRounds; round++) {
     const changes = captureChanges(o.cwd);
-    if (!changes.diff && !changes.newFiles.length) {
+    if (changes.error) {
+      out(c.red(`(review change capture failed closed: ${changes.error})\n`));
+      await doCommit(false);
+      return { status: "halted", error: `review change capture failed: ${changes.error}` };
+    }
+    if (!changes.diff && !changes.newFiles.length && !changes.skippedFiles.length && !changes.omittedDeletions.length) {
       out(c.dim("(no changes to review)\n"));
       return implementerOutcome;
     }
@@ -644,7 +674,7 @@ function lastAssistantText(history: NeutralMsg[]): string {
 /** Run one atom (routed to its role if any), then gate it (its `check` command, else an LLM verify). */
 async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], o: OrgOpts): Promise<boolean> {
   atom.status = "running";
-  savePlan(o.cwd, plan);
+  await savePlan(o.cwd, plan);
   const role = atom.role ? roles.find((r) => r.id === atom.role) : undefined;
   const __atomModel = effectiveRoleModel(role?.model, o.cfg.model);
   const roleProvider = __atomModel ? ((await buildProvider({ ...o.cfg, model: __atomModel })) ?? o.baseProvider) : o.baseProvider;
@@ -668,21 +698,21 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
     if (failure) {
       atom.status = "failed";
       atom.note = failure;
-      savePlan(o.cwd, plan);
+      await savePlan(o.cwd, plan);
       out(c.red(`  ✗ ${atom.id} agent ${outcome.status}: ${failure}\n`));
       return false;
     }
   } catch (e: any) {
     atom.status = "failed";
     atom.note = e.message;
-    savePlan(o.cwd, plan);
+    await savePlan(o.cwd, plan);
     out(c.red(`  ✗ ${atom.id} errored: ${e.message}\n`));
     return false;
   }
   const v = atom.check ? await runCheck(atom.check, o.cwd, o.sandbox) : await verify(o.baseProvider, atom, lastAssistantText(history));
   atom.status = v.ok ? "done" : "failed";
   atom.note = v.reason;
-  savePlan(o.cwd, plan);
+  await savePlan(o.cwd, plan);
   out(v.ok ? c.green(`  ✓ ${atom.id} verified\n`) : c.yellow(`  ⚠ ${atom.id}: ${v.reason}\n`));
   return v.ok;
 }
@@ -774,7 +804,7 @@ async function runPlan(task: string, o: OrgOpts): Promise<RunOutcome> {
       return { status: "halted", error: "plan execution was cancelled" };
     }
   }
-  savePlan(o.cwd, plan);
+  await savePlan(o.cwd, plan);
   return executePlan(plan, roles, o);
 }
 
@@ -801,18 +831,37 @@ async function runResume(o: OrgOpts): Promise<RunOutcome> {
     }
   }
   for (const a of plan.atoms) if (a.status === "failed" || a.status === "running") a.status = "pending"; // retry interrupted
-  savePlan(o.cwd, plan);
+  await savePlan(o.cwd, plan);
   return executePlan(plan, roles, o);
 }
 
 const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write"]);
 const REVIEW_SYSTEM =
-  "You are a senior code reviewer. Review the git diff the user provides for: correctness bugs, security " +
+  "You are a senior code reviewer. Review the safe Git status metadata the user provides for: correctness bugs, security " +
   "issues, missing error handling, unclear naming, and missing/weak tests. You may read files (read-only) " +
-  "for context. Be concise and specific — cite file:line and the concrete fix. Group findings by severity: " +
+  "to inspect their current contents; historical patch lines are intentionally unavailable. Be concise and specific — cite file:line and the concrete fix. Group findings by severity: " +
   "**Blocker**, **Should-fix**, **Nit**. If nothing material is wrong, say the diff looks good. Never edit files.";
+
+function standaloneReviewPrompt(changes: CapturedChanges): string {
+  const parts = ["Review these changes:"];
+  if (changes.diff) parts.push(`Change metadata only (status + path; no historical patch contents):\n\`\`\`text\n${changes.diff}\n\`\`\``);
+  if (changes.newFiles.length) parts.push(`New files (inspect with read_file): ${changes.newFiles.map((p) => JSON.stringify(p)).join(", ")}`);
+  if (changes.skippedFiles.length) {
+    parts.push(
+      "Protected paths were omitted and MUST NOT be opened during this review: " +
+      changes.skippedFiles.map((p) => JSON.stringify(p)).join(", "),
+    );
+  }
+  if (changes.omittedDeletions.length) {
+    parts.push(
+      "Tracked deletions were detected; their historical contents were omitted because old filesystem " +
+      "identity cannot be verified safely: " + changes.omittedDeletions.map((p) => JSON.stringify(p)).join(", "),
+    );
+  }
+  return parts.join("\n\n");
+}
 const COMMIT_SYSTEM =
-  "Write a git commit message for the staged diff. A concise imperative subject (≤72 chars; an optional " +
+  "Write a git commit message for the staged change metadata. A concise imperative subject (≤72 chars; an optional " +
   "conventional-commits prefix like feat:/fix:/refactor:/docs:/test:/chore: is welcome). If the change is " +
   "non-trivial, add a blank line then a short body (a few bullets or sentences) on what changed and why. " +
   "Output ONLY the commit message — no code fences, no preamble, no surrounding quotes.";
@@ -892,7 +941,7 @@ async function compactConversation(provider: Provider, history: NeutralMsg[], me
   // most recently touched files (current on-disk state, byte-capped) so work continues without re-reads.
   const restore = buildFileRestore(recentTouched(5), (p) => {
     try {
-      return readFileSync(p, "utf8");
+      return readModelContextFileSync(p, 32 * 1024);
     } catch {
       return null;
     }
@@ -1001,7 +1050,7 @@ async function runSubagent(
 function runDoctor(cfg: HaraConfig): string {
   const ok = (b: boolean): string => (b ? c.green("✓") : c.red("✗"));
   const dot = c.dim("·");
-  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  const nodeSupported = unsupportedNodeMessage() === null;
   const hasKey = !!(cfg.apiKey || process.env[providerEnvKey(cfg.provider)] || process.env.HARA_API_KEY);
   const oauthOk = cfg.provider === "qwen-oauth" && existsSync(join(homedir(), ".hara", "qwen-oauth.json"));
   const authed = hasKey || oauthOk;
@@ -1011,7 +1060,7 @@ function runDoctor(cfg: HaraConfig): string {
   const vdesc = vcap === "vision" ? c.dim("sees images (inline)") : vcap === "text" ? c.dim("text-only") : c.yellow("capability unknown — asks on first image");
   const lines = [
     c.bold("hara doctor"),
-    `${ok(nodeMajor >= 20)} node ${process.versions.node} ${c.dim("(need ≥20)")}`,
+    `${ok(nodeSupported)} node ${process.versions.node} ${c.dim(`(need ≥${MIN_NODE_VERSION})`)}`,
     `${dot} provider ${c.bold(cfg.provider)} · model ${c.bold(cfg.model)}${cfg.baseURL ? c.dim(" · " + cfg.baseURL) : ""}`,
     `${ok(authed)} auth ${authed ? c.dim("configured") : c.yellow("missing — " + authHint(cfg))}`,
     `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
@@ -1621,14 +1670,14 @@ profileCmd
 profileCmd
   .command("pin [id]")
   .description("write `.hara-profile` in this dir to lock the active profile here (omit id = pin current active)")
-  .action((id?: string) => {
+  .action(async (id?: string) => {
     const target = (id && id.trim()) || activeId();
     if (!getProfile(target)) {
       out(c.red(`No profile '${target}'.\n`) + c.dim("List: `hara profile list`\n"));
       process.exit(1);
     }
     try {
-      const { file } = writePin(process.cwd(), target);
+      const { file } = await writePin(process.cwd(), target);
       out(c.green(`✓ pinned ${target} to ${relPath(file)}\n`));
       // .hara-profile carries personal identity (which org you're as), unlike .nvmrc which
       // is project-level. Nudge user toward GLOBAL gitignore so they don't accidentally
@@ -1958,7 +2007,7 @@ program
 
 program
   .command("review")
-  .description("review your uncommitted changes (git diff) for bugs, security, and missing tests")
+  .description("review your uncommitted changes for bugs, security, and missing tests")
   .option("--staged", "review only staged changes")
   .option("--base <ref>", "review against a base ref (e.g. main) instead of just the working tree")
   .action(async (opts: { staged?: boolean; base?: string }) => {
@@ -1968,17 +2017,21 @@ program
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
       process.exit(1);
     }
-    const cmd = opts.base ? `git diff ${opts.base}` : opts.staged ? "git diff --staged" : "git diff HEAD";
-    let diff = "";
-    try {
-      diff = (await runShell(cmd, cfg.cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout;
-    } catch (e) {
-      return void out(c.red(`\`${cmd}\` failed: ${e instanceof Error ? e.message : String(e)}\n`) + c.dim("(is this a git repo?)\n"));
+    const changes = captureChanges(cfg.cwd, 120_000, {
+      staged: opts.staged,
+      base: opts.base,
+      includeUntracked: !opts.staged && !opts.base,
+    });
+    if (changes.error) return void out(c.red(`Git change capture failed closed: ${changes.error}\n`) + c.dim("(is this a git repo / valid base ref?)\n"));
+    if (!changes.diff && !changes.newFiles.length && !changes.skippedFiles.length && !changes.omittedDeletions.length) {
+      return void out(c.dim("No changes to review.\n"));
     }
-    if (!diff.trim()) return void out(c.dim(`No changes to review (${cmd}).\n`));
-    out(c.dim(`Reviewing \`${cmd}\` (${diff.split("\n").length} diff lines)…\n\n`));
+    if (changes.skippedFiles.length) {
+      out(c.yellow(`Protected paths omitted: ${changes.skippedFiles.map((p) => JSON.stringify(p)).join(", ")}\n`));
+    }
+    out(c.dim(`Reviewing ${changes.diff ? changes.diff.split("\n").length : 0} safe change entries…\n\n`));
     const stats = { input: 0, output: 0, lastInput: 0 };
-    await runAgent([{ role: "user", content: `Review this diff:\n\n\`\`\`diff\n${diff.slice(0, 120_000)}\n\`\`\`` }], {
+    await runAgent([{ role: "user", content: standaloneReviewPrompt(changes) }], {
       provider,
       ctx: { cwd: cfg.cwd, sandbox: cfg.sandbox },
       approval: "full-auto",
@@ -2006,23 +2059,31 @@ program
       process.exit(1);
     }
     if (opts.all) {
+      const protectedTracked = protectedTrackedWorkingTreePaths(cfg.cwd);
+      if (protectedTracked.length) {
+        return void out(c.red(`Refusing to stage protected path(s): ${protectedTracked.map((p) => JSON.stringify(p)).join(", ")}\n`));
+      }
       try {
         await runShell("git add -u", cfg.cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
       } catch {
         /* report below if nothing is staged */
       }
     }
-    let diff = "";
-    try {
-      diff = (await runShell("git diff --staged", cfg.cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout;
-    } catch (e) {
-      return void out(c.red(`git diff failed: ${e instanceof Error ? e.message : String(e)}\n`) + c.dim("(is this a git repo?)\n"));
+    const protectedStaged = protectedStagedPaths(cfg.cwd);
+    if (protectedStaged.length) {
+      return void out(c.red(`Refusing to inspect or commit protected staged path(s): ${protectedStaged.map((p) => JSON.stringify(p)).join(", ")}\n`));
     }
-    if (!diff.trim()) return void out(c.dim("Nothing staged. Stage changes with `git add`, or use `hara commit -a`.\n"));
+    const staged = captureChanges(cfg.cwd, 120_000, { staged: true, includeUntracked: false });
+    if (staged.error) return void out(c.red(`git diff failed closed: ${staged.error}\n`) + c.dim("(is this a git repo?)\n"));
+    if (staged.skippedFiles.length) {
+      return void out(c.red(`Refusing to inspect or commit protected staged path(s): ${staged.skippedFiles.map((p) => JSON.stringify(p)).join(", ")}\n`));
+    }
+    const changeInput = commitMessageInput(staged);
+    if (!changeInput.trim()) return void out(c.dim("Nothing staged. Stage changes with `git add`, or use `hara commit -a`.\n"));
     out(c.dim("Writing a commit message…\n"));
     const r = await provider.turn({
       system: COMMIT_SYSTEM,
-      history: [{ role: "user", content: `Write a commit message for these staged changes:\n\n\`\`\`diff\n${diff.slice(0, 120_000)}\n\`\`\`` }],
+      history: [{ role: "user", content: `Write a commit message for these staged changes:\n\n${changeInput.slice(0, 120_000)}` }],
       tools: [],
       onText: () => {},
     });
@@ -2039,6 +2100,10 @@ program
     const tmp = join(tmpdir(), `hara-commit-${process.pid}.txt`);
     writeFileSync(tmp, msg + "\n", "utf8");
     try {
+      const protectedBeforeCommit = protectedStagedPaths(cfg.cwd);
+      if (protectedBeforeCommit.length) {
+        return void out(c.red(`Staged paths changed; refusing to commit protected path(s): ${protectedBeforeCommit.map((p) => JSON.stringify(p)).join(", ")}\n`));
+      }
       const res = await runShell(`git commit -F ${JSON.stringify(tmp)}`, cfg.cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
       out(c.green("✓ committed ") + c.dim(((res.stdout || "").trim().split("\n")[0] || "").slice(0, 100)) + "\n");
     } catch (e) {
@@ -2174,8 +2239,8 @@ memoryCmd.command("show").description("print the memory digest injected at sessi
   const d = memoryDigest(process.cwd());
   out(d ? d + "\n" : c.dim("(memory is empty — `hara memory init`, or let the agent write via memory_write)\n"));
 });
-memoryCmd.command("init").description("scaffold the memory dirs + seed files (global + project)").action(() => {
-  const w = scaffoldMemory(process.cwd());
+memoryCmd.command("init").description("scaffold the memory dirs + seed files (global + project)").action(async () => {
+  const w = await scaffoldMemory(process.cwd());
   out(w.length ? c.green(`Scaffolded: ${w.join(", ")}\n`) : c.dim("Memory already scaffolded.\n"));
 });
 memoryCmd
@@ -2364,8 +2429,8 @@ const skillsCmd = program.command("skills").description("manage skills (.hara/sk
 skillsCmd
   .command("init")
   .description("scaffold an example skill")
-  .action(() => {
-    const written = scaffoldSkills(process.cwd());
+  .action(async () => {
+    const written = await scaffoldSkills(process.cwd());
     out(
       written.length
         ? c.green(`Created an example skill: ${written.join(", ")}\n`)
@@ -2631,13 +2696,39 @@ program.action(async (opts) => {
   }
   const stats = { input: 0, output: 0, lastInput: 0 };
 
-  // A read-only role has a process-side-effect-free tool surface: even connecting to an MCP server runs an
-  // arbitrary configured command before a tool is selected. Interactive sessions and non-read-only roles keep
-  // the existing MCP behavior unchanged.
-  if (!requestedHeadlessRole?.readOnly) {
-    const mcpAll = { ...pluginMcpServers(), ...cfg.mcpServers }; // user config wins over plugin-contributed servers
-    if (Object.keys(mcpAll).length) {
-      await connectMcpServers(mcpAll, (m) => machineOutput ? process.stderr.write(m + "\n") : out(c.dim(m + "\n")));
+  // Connecting to MCP executes configured external commands before an MCP tool is selected, so the ordinary
+  // per-tool confirmation is too late. Obtain one explicit startup grant for the named server set. askConfirm
+  // uses a short-lived Ink prompt and restores stdin, making it safe before either the main TUI or readline REPL
+  // owns the terminal. Non-interactive runs remain closed unless the user opted in before process launch.
+  const mcpAll = { ...pluginMcpServers(), ...cfg.mcpServers }; // user config wins over plugin-contributed servers
+  const mcpNames = Object.keys(mcpAll);
+  if (!requestedHeadlessRole?.readOnly && mcpNames.length) {
+    const trustedOptIn = process.env.HARA_ALLOW_TRUSTED_EXTENSIONS === "1";
+    const interactiveTerminal = !opts.print && !!stdin.isTTY && !!stdout.isTTY;
+    const approved =
+      trustedOptIn ||
+      (interactiveTerminal &&
+        (await askConfirm(
+          `Start configured MCP server${mcpNames.length === 1 ? "" : "s"} ${mcpNames
+            .slice(0, 8)
+            .map((name) => `'${name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 80)}'`)
+            .join(", ")}${mcpNames.length > 8 ? ` and ${mcpNames.length - 8} more` : ""}? ` +
+            "They execute external code outside Hara's protected-file boundary.",
+          false,
+        )));
+    if (approved) {
+      await connectMcpServers(
+        mcpAll,
+        (m) => machineOutput ? process.stderr.write(m + "\n") : out(c.dim(m + "\n")),
+        { approved: true },
+      );
+    } else {
+      const message = interactiveTerminal
+        ? "hara: MCP server startup declined; no configured MCP command was executed.\n"
+        : "hara: MCP servers skipped because this run has no interactive startup approval. " +
+          "Set HARA_ALLOW_TRUSTED_EXTENSIONS=1 before launch only for reviewed servers.\n";
+      if (machineOutput || !interactiveTerminal) process.stderr.write(message);
+      else out(c.dim(message));
     }
   }
 
@@ -2767,7 +2858,17 @@ program.action(async (opts) => {
     let schemaObj: object | null = null;
     if (opts.schema) {
       const rawArg = String(opts.schema);
-      const raw = existsSync(rawArg) ? readFileSync(rawArg, "utf8") : rawArg;
+      let raw = rawArg;
+      if (existsSync(rawArg)) {
+        try {
+          raw = readModelContextFileSync(rawArg, 1024 * 1024);
+        } catch (error) {
+          process.stderr.write(`hara: refusing unsafe schema file: ${error instanceof Error ? error.message : String(error)}\n`);
+          process.exitCode = 2;
+          await closeMcp();
+          return;
+        }
+      }
       const parsed = parseSchemaArg(raw);
       if ("error" in parsed) {
         process.stderr.write(`hara: ${parsed.error}\n`);
@@ -3680,17 +3781,18 @@ program.action(async (opts) => {
             return void h.sink.notice(r.startsWith("error:") ? `✗ ${r}` : r === "nothing to commit" ? "(nothing to commit — make or stage changes first)" : `✓ committed · ${r.slice(0, 100)}`);
           }
           if (nm === "review") {
-            let diff = "";
-            try {
-              diff = (await runShell("git diff HEAD", cwd, "off", { timeout: 30_000, maxBuffer: 8_000_000 })).stdout;
-            } catch {
-              /* not a git repo → empty */
+            const changes = captureChanges(cwd, 120_000, { includeUntracked: true });
+            if (changes.error) return void h.sink.notice(`(review capture failed closed: ${changes.error})`);
+            if (!changes.diff && !changes.newFiles.length && !changes.skippedFiles.length && !changes.omittedDeletions.length) {
+              return void h.sink.notice("(nothing to review — no changes vs HEAD)");
             }
-            if (!diff.trim()) return void h.sink.notice("(nothing to review — no changes vs HEAD)");
+            if (changes.skippedFiles.length) {
+              h.sink.notice(`Protected paths omitted: ${changes.skippedFiles.map((p) => JSON.stringify(p)).join(", ")}`);
+            }
             const rui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
             const xin = stats.input;
             const xout = stats.output;
-            await runAgent([{ role: "user", content: `Review this diff:\n\n\`\`\`diff\n${diff.slice(0, 120_000)}\n\`\`\`` }], {
+            await runAgent([{ role: "user", content: standaloneReviewPrompt(changes) }], {
               provider,
               ctx: { cwd, sandbox, ui: rui },
               approval: "full-auto", // read-only via the tool filter, so nothing prompts

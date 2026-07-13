@@ -2,9 +2,11 @@
 // File-backed Markdown (git-versionable, human-readable), two scopes: global ~/.hara/memory and
 // project <root>/.hara/memory. Lexical search reuses recall.ts; no embeddings (local-first).
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { existsSync, readdirSync } from "node:fs";
 import { findProjectRoot } from "../context/agents-md.js";
+import { readModelContextFileSync, readVerifiedRegularFileSnapshot, type RegularFileSnapshot } from "../fs-read.js";
+import { atomicWriteText, bindAtomicWritePath, type AtomicWriteBoundary } from "../fs-write.js";
 
 export type Scope = "global" | "project";
 export type Target = "memory" | "user" | "log";
@@ -14,6 +16,7 @@ export type Target = "memory" | "user" | "log";
 // boundary, never mid-entry. Anything beyond these is still reachable via memory_search. (hermes-style
 // per-file budgets; both PAI and hermes confirm lexical injection + capped snapshot beats a vector store.)
 const SOURCE_CAP: Record<Target, number> = { memory: 2000, user: 1200, log: 0 };
+const MAX_MEMORY_SOURCE_BYTES = 256 * 1024;
 
 /** Truncate at a line boundary at/under `cap` (never mid-entry), with a pointer to search for the rest. */
 function capAtLine(text: string, cap: number): string {
@@ -44,25 +47,62 @@ function targetFile(scope: Scope, target: Target, cwd: string): string {
   return join(dir, "MEMORY.md");
 }
 
-export function appendMemory(scope: Scope, target: Target, content: string, cwd: string): string {
+async function inspectMemoryWrite(
+  path: string,
+  action: string,
+): Promise<{ boundary: AtomicWriteBoundary; snapshot: RegularFileSnapshot | null }> {
+  const boundary = bindAtomicWritePath(path, action);
+  try {
+    return {
+      boundary,
+      snapshot: await readVerifiedRegularFileSnapshot(boundary.target, MAX_MEMORY_SOURCE_BYTES, action),
+    };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return { boundary, snapshot: null };
+    throw error;
+  }
+}
+
+async function commitMemoryText(path: string, text: string, action: string): Promise<void> {
+  const { boundary, snapshot } = await inspectMemoryWrite(path, action);
+  await atomicWriteText(boundary.target, text, {
+    expected: snapshot?.text ?? null,
+    expectedIdentity: snapshot ?? undefined,
+    boundary,
+  });
+}
+
+export async function appendMemory(scope: Scope, target: Target, content: string, cwd: string): Promise<string> {
   const f = targetFile(scope, target, cwd);
-  mkdirSync(dirname(f), { recursive: true });
-  appendFileSync(f, (existsSync(f) ? "\n" : "") + content.trim() + "\n", "utf8");
+  const { boundary, snapshot } = await inspectMemoryWrite(f, "append memory");
+  const text = (snapshot ? `${snapshot.text}\n` : "") + content.trim() + "\n";
+  await atomicWriteText(boundary.target, text, {
+    expected: snapshot?.text ?? null,
+    expectedIdentity: snapshot ?? undefined,
+    boundary,
+  });
   return f;
 }
-export function replaceMemory(scope: Scope, target: Target, content: string, cwd: string): string {
+export async function replaceMemory(scope: Scope, target: Target, content: string, cwd: string): Promise<string> {
   const f = targetFile(scope, target, cwd);
-  mkdirSync(dirname(f), { recursive: true });
-  writeFileSync(f, content.trim() + "\n", "utf8");
+  await commitMemoryText(f, content.trim() + "\n", "replace memory");
   return f;
 }
-export function forgetMemory(scope: Scope, target: Target, match: string, cwd: string): number {
+export async function forgetMemory(scope: Scope, target: Target, match: string, cwd: string): Promise<number> {
   const f = targetFile(scope, target, cwd);
-  if (!existsSync(f) || !match) return 0;
-  const lines = readFileSync(f, "utf8").split("\n");
+  if (!match) return 0;
+  const { boundary, snapshot } = await inspectMemoryWrite(f, "forget memory");
+  if (!snapshot) return 0;
+  const lines = snapshot.text.split("\n");
   const kept = lines.filter((l) => !l.includes(match));
-  writeFileSync(f, kept.join("\n"), "utf8");
-  return lines.length - kept.length;
+  const removed = lines.length - kept.length;
+  if (!removed) return 0;
+  await atomicWriteText(boundary.target, kept.join("\n"), {
+    expected: snapshot.text,
+    expectedIdentity: snapshot,
+    boundary,
+  });
+  return removed;
 }
 
 /** MEMORY + USER digest (project + global) for frozen-snapshot injection at session start. Each source is
@@ -79,7 +119,7 @@ export function memoryDigest(cwd: string): string {
     const f = targetFile(scope, target, cwd);
     if (!existsSync(f)) continue;
     try {
-      const t = readFileSync(f, "utf8").trim();
+      const t = readModelContextFileSync(f, MAX_MEMORY_SOURCE_BYTES).trim();
       if (t) parts.push(`## ${label}\n${capAtLine(t, SOURCE_CAP[target])}`);
     } catch {
       /* skip unreadable */
@@ -100,7 +140,7 @@ export function readRecentLogs(scope: Scope, cwd: string, days: number): string 
     const m = /^(\d{4})-(\d{2})-(\d{2})\.md$/.exec(f);
     if (m && new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() < cutoff) continue;
     try {
-      const t = readFileSync(join(dir, f), "utf8").trim();
+      const t = readModelContextFileSync(join(dir, f), MAX_MEMORY_SOURCE_BYTES).trim();
       if (t) out.push(`### ${f}\n${t}`);
     } catch {
       /* skip unreadable */
@@ -109,20 +149,27 @@ export function readRecentLogs(scope: Scope, cwd: string, days: number): string 
   return out.join("\n\n");
 }
 
-/** Create memory dirs + seed files (global + project). Returns files written. */
-export function scaffoldMemory(cwd: string): string[] {
+/** Seed the memory files (their parents are created by the atomic writer; log is created on first append). */
+export async function scaffoldMemory(cwd: string): Promise<string[]> {
   const written: string[] = [];
   for (const scope of ["global", "project"] as Scope[]) {
-    mkdirSync(join(memoryDir(scope, cwd), "log"), { recursive: true });
     const mem = join(memoryDir(scope, cwd), "MEMORY.md");
-    if (!existsSync(mem)) {
-      writeFileSync(mem, `# hara ${scope} memory\n\nDurable facts & decisions hara records and recalls across sessions. Git-versionable — edit freely.\n`, "utf8");
+    const { boundary, snapshot } = await inspectMemoryWrite(mem, "scaffold memory");
+    if (!snapshot) {
+      await atomicWriteText(boundary.target, `# hara ${scope} memory\n\nDurable facts & decisions hara records and recalls across sessions. Git-versionable — edit freely.\n`, {
+        expected: null,
+        boundary,
+      });
       written.push(mem);
     }
   }
   const user = join(memoryDir("global", cwd), "USER.md");
-  if (!existsSync(user)) {
-    writeFileSync(user, "# User preferences\n\nHow you like hara to work — voice, conventions, do/don't.\n", "utf8");
+  const { boundary, snapshot } = await inspectMemoryWrite(user, "scaffold memory");
+  if (!snapshot) {
+    await atomicWriteText(boundary.target, "# User preferences\n\nHow you like hara to work — voice, conventions, do/don't.\n", {
+      expected: null,
+      boundary,
+    });
     written.push(user);
   }
   return written;

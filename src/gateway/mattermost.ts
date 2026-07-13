@@ -4,8 +4,6 @@
 // allow users via HARA_GATEWAY_ALLOWED (Mattermost user ids). Same ChatAdapter shape as Telegram/Discord, so all
 // the cross-platform gateway plumbing (send_file, in-chat system context, stuck-guard, image attach/describe)
 // works unchanged. Auth is a WS "authentication_challenge" rather than an HTTP header.
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
 import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 
@@ -94,11 +92,11 @@ export function mattermostAdapter(serverUrl: string, token: string): ChatAdapter
         }).catch(() => {});
       }
     },
-    async sendFile(chatId, filePath) {
+    async sendFile(chatId, file) {
       // upload the file (multipart) → get a file_id, then create a post referencing it
       const form = new FormData();
       form.append("channel_id", String(chatId));
-      form.append("files", new Blob([readFileSync(filePath)]), basename(filePath));
+      form.append("files", new Blob([new Uint8Array(file.bytes)]), file.safeName);
       const up = await fetch(`${api}/files`, { method: "POST", headers: auth, body: form }).catch(() => null);
       if (!up || !up.ok) return;
       const j = (await up.json().catch(() => null)) as { file_infos?: { id?: string }[] } | null;
