@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## Unreleased — planned 0.122.0 — structured runs, durable work, and a fail-closed gateway
+## 0.122.0 — 2026-07-13 — structured runs, durable work, and a fail-closed gateway
 
 - **Machine-safe headless runs.** `hara -p … --schema <json|file>` installs a run-scoped
   `structured_output` contract, validates the value against JSON Schema, and writes exactly one JSON value to
