@@ -20,13 +20,25 @@ jobs:
       - run: npm audit --omit=dev --registry https://registry.npmjs.org/
       - run: npm test
       - run: npm run build:binaries
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
+      # GitHub-hosted runners already provide gh. Using it directly avoids a third-party action whose
+      # deprecated Node runtime is forced forward by the runner, and makes a rerun explicitly idempotent.
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets=(
             dist/bin/hara-darwin-arm64
             dist/bin/hara-darwin-x64
             dist/bin/hara-linux-x64
             dist/bin/hara-linux-arm64
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
 
   # Build + push the container image so `docker run ghcr.io/hara-cli/hara` works after a release.
   image:
