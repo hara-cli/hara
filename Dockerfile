@@ -17,6 +17,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
+COPY runtime-bootstrap.cjs ./
 COPY scripts/normalize-dist-modes.mjs ./scripts/normalize-dist-modes.mjs
 RUN npm run build
 

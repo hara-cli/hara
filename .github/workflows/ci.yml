@@ -33,3 +33,12 @@ jobs:
           ! node runtime-bootstrap.cjs --version 2>legacy-runtime.err
           grep -q 'requires Node.js 22.12.0 or newer' legacy-runtime.err
           grep -q 'nvm install 22' legacy-runtime.err
+
+  docker-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the complete runtime image
+        run: docker build --tag hara-ci .
+      - name: Start the guarded entry point
+        run: docker run --rm hara-ci --version

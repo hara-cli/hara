@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.122.2 — 2026-07-14 — reproducible container release
+
+- **The Docker build now includes the guarded runtime entry before normalizing package modes.** This fixes the
+  `runtime-bootstrap.cjs` `ENOENT` that affected only the `v0.122.1` GHCR image job; its npm package and
+  standalone binaries were already published and remain valid. CI now builds and starts the complete runtime
+  image before a tag can be released, while old Node installations continue to receive the explicit 22.12+
+  upgrade instruction.
+
 ## 0.122.1 — 2026-07-14 — protected files and explicit extension trust
 
 - **The npm CLI now requires Node.js 22.12+.** Node 20 is end-of-life, so Hara no longer makes a security or
