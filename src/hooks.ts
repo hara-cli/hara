@@ -74,7 +74,10 @@ export function runHooks(
       }
       continue;
     }
-    if (event === "PreToolUse" && (r.status !== 0 || !!r.signal || !!r.error)) {
+    // A hook is allowed to ignore stdin. On Linux, a command that exits successfully before Node finishes
+    // writing `input` can report EPIPE in r.error *alongside status=0*. The wait status is authoritative in
+    // that case; true launch/write failures still have status=null, while timeouts/signals remain blocked.
+    if (event === "PreToolUse" && (r.status !== 0 || !!r.signal)) {
       const output = (String(r.stdout ?? "") + String(r.stderr ?? "")).trim();
       const failure = r.error?.message || (r.signal ? `terminated by ${r.signal}` : `exit ${r.status ?? "unknown"}`);
       return { block: true, message: `⛔ blocked by a PreToolUse hook${output ? `: ${output}` : ` (${failure})`}` };

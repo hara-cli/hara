@@ -34,7 +34,10 @@ test("PreToolUse: a non-zero exit blocks the call + surfaces the hook's output",
 
 test("PreToolUse: exit 0 does not block", () => {
   withProject({ PreToolUse: [{ matcher: "*", command: "exit 0" }] }, () => {
-    assert.equal(runHooks("PreToolUse", "bash", {}, process.cwd()).block, false);
+    // A payload larger than the pipe buffer makes Linux reliably surface the benign status=0 + EPIPE
+    // combination when the hook exits without reading stdin.
+    const payload = { ignored: "x".repeat(1024 * 1024) };
+    assert.equal(runHooks("PreToolUse", "bash", payload, process.cwd()).block, false);
   });
 });
 

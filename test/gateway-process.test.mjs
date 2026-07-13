@@ -1,10 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gatewayRunTimeoutMs, runHara } from "../dist/gateway/serve.js";
 import { approvedOrgTimeoutMs, runApprovedOrgProcess } from "../dist/gateway/flows-pending.js";
+
+async function waitForPath(path, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for child readiness: ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 function withChild(mode, options = {}) {
   const cwd = mkdtempSync(join(tmpdir(), "hara-gateway-child-"));
@@ -53,26 +61,32 @@ test("approved org subprocesses have a hard ceiling and die with gateway shutdow
 
   const cwd = mkdtempSync(join(tmpdir(), "hara-approved-org-child-"));
   const helper = join(cwd, "org-child.mjs");
+  const ready = join(cwd, "ready");
   writeFileSync(helper, `
-console.log("pid:" + process.pid);
+import { writeFileSync } from "node:fs";
+process.stdout.write("pid:" + process.pid + "\\n", () => writeFileSync(${JSON.stringify(ready)}, ""));
 process.on("SIGTERM", () => {});
 setInterval(() => {}, 1000);
 `);
   const controller = new AbortController();
-  const started = Date.now();
+  let running;
   try {
-    const running = runApprovedOrgProcess(process.execPath, [helper], {
+    running = runApprovedOrgProcess(process.execPath, [helper], {
       cwd,
       signal: controller.signal,
       timeoutMs: 5_000,
       killGraceMs: 50,
     });
-    setTimeout(() => controller.abort(), 80);
+    await waitForPath(ready);
+    const started = Date.now();
+    controller.abort();
     const result = await running;
     assert.equal(result.stopReason, "shutdown");
     assert.match(result.output, /pid:\d+/);
     assert.ok(Date.now() - started < 1_500, "a TERM-ignoring approved delegation cannot pin daemon shutdown");
   } finally {
+    controller.abort();
+    await running;
     rmSync(cwd, { recursive: true, force: true });
   }
 });
