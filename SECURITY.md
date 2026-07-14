@@ -37,6 +37,10 @@ local user (who already has your shell).
   execution cannot approve those built-in paths past the check. `HARA_ALLOW_SENSITIVE_FILES=1` is an explicit
   launch-time exposure switch for one process: it removes the built-in denies and that process's shell
   protected-read preflight/Seatbelt mask.
+- **Standalone launch configuration is closed.** Released Bun-compiled binaries explicitly disable runtime
+  loading of the working directory's `.env`, `bunfig.toml`, `package.json`, and `tsconfig.json`. This prevents
+  a project preload or ambient environment file from running/injecting values before Hara's own boundaries.
+  Native CI executes each release binary from a hostile fixture directory and fails if either path activates.
 - **Shell guardrails differ by platform.** With the protected-file policy enabled, shell admission statically
   rejects literal protected paths and environment-dump commands on every OS. On macOS, Hara additionally
   applies a Seatbelt read mask to existing

@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.122.5 — 2026-07-15 — standalone ambient-config security boundary
+
+- **Standalone binaries no longer trust the directory they are launched from.** Bun's runtime `.env` and
+  `bunfig.toml` autoloading is now explicitly disabled, together with the already-default-off project
+  `package.json` and `tsconfig.json` loaders. A repository can no longer run a `bunfig` preload before Hara's
+  permission checks or inject project `.env` values into the standalone/desktop-sidecar process. Users of the
+  `0.122.4` standalone binary should upgrade promptly; the npm/Node runtime was not affected by Bun's compiled
+  executable autoload path.
+- **The release gate exercises the real boundary.** Native standalone CI and tag publication launch the actual
+  binary from a hostile fixture directory containing both a marker-writing preload and a model-changing test
+  `.env`; the build fails if either executes or loads. A source-policy regression test also requires all four
+  ambient config loaders to remain explicitly disabled and the smoke to stay wired into CI/release.
+- **x64 standalone assets use Bun's baseline CPU target.** Intel macOS, Linux, and Windows sidecar callers no
+  longer inherit the modern/AVX assumption from an unqualified x64 target, improving compatibility with older
+  Intel machines and Rosetta validation without changing ARM64 builds.
+
 ## 0.122.4 — 2026-07-14 — bounded agent lifecycle and chat delivery hardening
 
 - **An active agent can no longer renew itself forever.** Every CLI, headless, org, and Desktop/serve turn

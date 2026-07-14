@@ -65,7 +65,15 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            target: bun-linux-x64-baseline
+          - os: ubuntu-24.04-arm
+            target: bun-linux-arm64
+          - os: macos-15
+            target: bun-darwin-arm64
+          - os: macos-15-intel
+            target: bun-darwin-x64-baseline
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -81,8 +89,10 @@ jobs:
         shell: bash
         run: |
           bun --version
-          npm run build:binary
+          npm run build
+          bun scripts/build-binary.ts dist/bin/hara "${{ matrix.target }}"
           expected="$(node -p 'require("./package.json").version')"
           actual="$(./dist/bin/hara --version)"
           [[ "$actual" == "$expected" ]] || { echo "standalone version mismatch: $actual != $expected" >&2; exit 1; }
           ./dist/bin/hara --help >/dev/null
+          node scripts/standalone-boundary-smoke.mjs ./dist/bin/hara "$expected"

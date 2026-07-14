@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.122.4",
+  "version": "0.122.5",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -45,7 +45,7 @@
     "start": "node runtime-bootstrap.cjs",
     "test": "npm run build && node --test --test-timeout=120000 test/*.test.mjs",
     "build:binary": "npm run build && bun scripts/build-binary.ts dist/bin/hara",
-    "build:binaries": "npm run build && bun scripts/build-binary.ts dist/bin/hara-darwin-arm64 bun-darwin-arm64 && bun scripts/build-binary.ts dist/bin/hara-darwin-x64 bun-darwin-x64 && bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64 && bun scripts/build-binary.ts dist/bin/hara-linux-arm64 bun-linux-arm64"
+    "build:binaries": "npm run build && bun scripts/build-binary.ts dist/bin/hara-darwin-arm64 bun-darwin-arm64 && bun scripts/build-binary.ts dist/bin/hara-darwin-x64 bun-darwin-x64-baseline && bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64-baseline && bun scripts/build-binary.ts dist/bin/hara-linux-arm64 bun-linux-arm64"
   },
   "publishConfig": {
     "access": "public"

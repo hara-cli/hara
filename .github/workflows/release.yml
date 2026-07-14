@@ -36,6 +36,7 @@ jobs:
           actual="$(dist/bin/hara-linux-x64 --version)"
           [[ "$actual" == "$expected" ]] || { echo "standalone version mismatch: $actual != $expected" >&2; exit 1; }
           dist/bin/hara-linux-x64 --help >/dev/null
+          node scripts/standalone-boundary-smoke.mjs dist/bin/hara-linux-x64 "$expected"
       # GitHub-hosted runners already provide gh. Using it directly avoids a third-party action whose
       # deprecated Node runtime is forced forward by the runner, and makes a rerun explicitly idempotent.
       - name: Publish GitHub release assets
