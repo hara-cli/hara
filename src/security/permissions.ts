@@ -28,6 +28,7 @@ import {
 import { psArgumentsExposeEnvironment } from "./sensitive-files.js";
 import { projectRepositoryTrustedAtStartup } from "./project-trust.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
+import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
 
 export type Decision = "allow" | "ask" | "deny";
 export interface PermissionRules {
@@ -248,6 +249,9 @@ function readProjectRules(cwd: string): Partial<PermissionRules> {
   let dir: string;
   try { dir = realpathSync.native(resolve(cwd)); } catch { dir = resolve(cwd); }
   for (;;) {
+    // ~/.hara/permissions.json is global policy, not a project policy file. Stopping before Home also
+    // prevents an unmarked child workspace from inheriting a repository marker above the user's home.
+    if (isHomeWorkspace(dir)) break;
     const hara = join(dir, ".hara");
     const file = join(hara, "permissions.json");
     let parentInfo;
@@ -307,6 +311,7 @@ export function globalPermissionsPath(): string {
 export function projectPermissionsPath(cwd: string): string | null {
   let dir = resolve(cwd);
   for (;;) {
+    if (isHomeWorkspace(dir)) break;
     const p = join(dir, ".hara", "permissions.json");
     if (existsSync(p)) return p;
     if (PROJECT_ROOT_MARKERS.some((m) => existsSync(join(dir, m)))) break;
@@ -391,6 +396,9 @@ function existingScaffoldTarget(path: string): boolean {
 /** Create project permissions without following `.hara` or replacing any existing directory entry. */
 function scaffoldProjectPermissions(cwd: string): string | null {
   const project = realpathSync.native(resolve(cwd));
+  // Project scaffolding at ~/ would target the same ~/.hara/permissions.json used by global policy and
+  // silently promote repository starter rules to every Hara session. Reject before creating `.hara`.
+  if (isHomeWorkspace(project)) throw new Error(homeWorkspaceActionError("create project permissions"));
   const projectIdentity = verifiedDirectory(project);
   const parent = join(project, ".hara");
   try {

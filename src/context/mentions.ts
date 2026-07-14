@@ -2,11 +2,12 @@
 // and provide fuzzy file candidates for REPL tab-completion.
 import { existsSync, lstatSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import { listProjectFiles, dirPrefixes, walkFiles } from "../fs-walk.js";
+import { listProjectFiles, dirPrefixes, walkFiles, walkFilesAsync, type FileWalkOptions } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
 import { mediaTypeFor } from "../images.js";
 import { readModelContextPrefixSync } from "../fs-read.js";
 import { sensitiveFileError } from "../security/sensitive-files.js";
+import { recursiveRootContainsHome, recursiveHomeSearchError } from "./workspace-scope.js";
 
 const MAX_FILE = 50_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
@@ -46,6 +47,85 @@ export function expandMentions(input: string, cwd: string): string {
   });
 }
 
+/**
+ * Interruptible production variant. In particular, `@dir` uses the streaming async walker so mention
+ * expansion cannot block the event loop before an agent run's own deadline starts.
+ */
+export async function expandMentionsAsync(
+  input: string,
+  cwd: string,
+  options: FileWalkOptions = {},
+): Promise<string> {
+  const seen = new Set<string>();
+  const mentionRe = new RegExp(MENTION_RE.source, MENTION_RE.flags);
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, Math.floor(options.timeoutMs!)) : 2_000;
+  const startedAt = Date.now();
+  let output = "";
+  let copiedThrough = 0;
+  let match: RegExpExecArray | null;
+  while ((match = mentionRe.exec(input)) !== null) {
+    if (options.signal?.aborted) {
+      throw options.signal.reason instanceof Error ? options.signal.reason : new Error("mention expansion cancelled");
+    }
+    output += input.slice(copiedThrough, match.index);
+    copiedThrough = match.index + match[0].length;
+    const whole = match[0];
+    const ref = match[1];
+    const prefix = whole.slice(0, whole.length - ref.length - 1);
+    if (seen.has(ref)) {
+      output += whole;
+      continue;
+    }
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) {
+      output += `${prefix}\nReferenced \`${ref}\` was not inserted because the ${timeoutMs}ms attachment budget was exhausted.\n`;
+      continue;
+    }
+    const block = await expandRefAsync(ref, cwd, {
+      ...options,
+      timeoutMs: remainingMs,
+      maxFiles: Math.min(options.maxFiles ?? 300, 300),
+    });
+    if (block === null) output += whole;
+    else {
+      seen.add(ref);
+      output += `${prefix}${block}`;
+    }
+  }
+  return output + input.slice(copiedThrough);
+}
+
+async function expandRefAsync(ref: string, cwd: string, options: FileWalkOptions): Promise<string | null> {
+  const abs = isAbsolute(ref) ? ref : resolve(cwd, ref);
+  const denied = sensitiveFileError(abs, "attach");
+  if (denied) return `\nProtected file \`${ref}\` was not inserted into model context. ${denied}\n`;
+  try {
+    const st = lstatSync(abs);
+    if (st.isSymbolicLink()) return `Referenced \`${ref}\` is a symbolic link — it was not inserted into model context.`;
+    if (st.isFile()) {
+      if (mediaTypeFor(abs)) return `Referenced \`${ref}\` is an image — paste it with Ctrl+V to attach it visually.`;
+      const prefix = readModelContextPrefixSync(abs, MAX_FILE);
+      if (prefix.binary) return `Referenced \`${ref}\` appears to be binary — it was not inserted into the model context.`;
+      const txt = prefix.text + (prefix.truncated ? "\n…[truncated]" : "");
+      return `\nReferenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\`\n`;
+    }
+    if (st.isDirectory()) {
+      if (recursiveRootContainsHome(abs)) return recursiveHomeSearchError("directory attachment");
+      const inventory = await walkFilesAsync(abs, options);
+      const bounded = inventory.truncated
+        ? `; listing stopped at its ${inventory.reason?.replace("_", " ") ?? "safety limit"}`
+        : "";
+      return `\nReferenced directory \`${ref}\` (${inventory.files.length} files${bounded}):\n\`\`\`\n${inventory.files.join("\n") || "(empty)"}\n\`\`\`\n`;
+    }
+  } catch (error) {
+    if (options.signal?.aborted) {
+      throw options.signal.reason instanceof Error ? options.signal.reason : new Error("mention expansion cancelled");
+    }
+    /* ignore unreadable mention */
+  }
+  return null;
+}
+
 /** Render one mention as an inline block, or null if it isn't a readable file/dir. */
 function expandRef(ref: string, cwd: string): string | null {
   const abs = isAbsolute(ref) ? ref : resolve(cwd, ref);
@@ -64,6 +144,7 @@ function expandRef(ref: string, cwd: string): string | null {
       return `\nReferenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\`\n`;
     }
     if (st.isDirectory()) {
+      if (recursiveRootContainsHome(abs)) return recursiveHomeSearchError("directory attachment");
       // `@dir` loads a listing of the directory's files (the agent can then read specific ones)
       const files = walkFiles(abs, 300);
       return `\nReferenced directory \`${ref}\` (${files.length} files):\n\`\`\`\n${files.join("\n") || "(empty)"}\n\`\`\`\n`;

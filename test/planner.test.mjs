@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parsePlan, topoOrder, topoWaves, runCheck, savePlan, loadPlan } from "../dist/org/planner.js";
+import { decompose, verify, parsePlan, topoOrder, topoWaves, runCheck, savePlan, loadPlan } from "../dist/org/planner.js";
 
 test("parsePlan: parses fenced JSON + normalizes deps/status", () => {
   const text = '```json\n{"atoms":[{"id":"a1","title":"do x","deps":[]},{"id":"a2","title":"do y","deps":["a1"],"verify":"x works","role":"impl"}]}\n```';
@@ -81,6 +81,20 @@ test("topoWaves: detects a cycle", () => {
 test("parsePlan: captures a check command", () => {
   const a = parsePlan('{"atoms":[{"id":"a1","title":"t","deps":[],"check":"npm test"}]}');
   assert.equal(a[0].check, "npm test");
+});
+
+test("planner model calls have hard deadlines when a provider ignores abort", async () => {
+  const provider = { id: "stuck", model: "stuck", turn: () => new Promise(() => {}) };
+  const plan = await decompose(provider, "do the work", [], { timeoutMs: 25 });
+  assert.deepEqual(plan.atoms, []);
+  const verdict = await verify(
+    provider,
+    { id: "a1", title: "work", deps: [], status: "running" },
+    "claimed success",
+    { timeoutMs: 25 },
+  );
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.reason, /timed out/);
 });
 
 test("savePlan/loadPlan round-trips the SSOT (resume relies on it)", async () => {

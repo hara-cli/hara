@@ -42,6 +42,10 @@ interface SnapshotIdentity {
 const consumedSnapshotIdentities = new Map<string, SnapshotIdentity>();
 const outboundQueueLocks = new Map<string, Promise<void>>();
 
+function throwIfOutboundCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("gateway file queue cancelled before commit");
+}
+
 export function outboundSnapshotDir(outbox: string): string {
   return `${resolve(outbox)}.files`;
 }
@@ -98,7 +102,8 @@ function existingBatchUsage(dir: string): { bytes: number; files: number } {
   return { bytes, files };
 }
 
-async function appendOutbox(outbox: string, snapshot: string): Promise<void> {
+async function appendOutbox(outbox: string, snapshot: string, signal?: AbortSignal): Promise<void> {
+  throwIfOutboundCancelled(signal);
   const path = resolve(outbox);
   let before: ReturnType<typeof lstatSync> | undefined;
   try {
@@ -128,6 +133,9 @@ async function appendOutbox(outbox: string, snapshot: string): Promise<void> {
       || !ownedByProcess(path)
     ) throw new Error(`unsafe gateway outbox: ${outbox}`);
     await handle.chmod(0o600);
+    // This append makes the snapshot visible to the adapter. Re-check after all descriptor validation and
+    // immediately before that irreversible queue mutation.
+    throwIfOutboundCancelled(signal);
     await handle.writeFile(snapshot + "\n", "utf8");
     await handle.sync();
   } finally {
@@ -136,7 +144,8 @@ async function appendOutbox(outbox: string, snapshot: string): Promise<void> {
 }
 
 /** Copy a verified source fd to a private immutable snapshot, then append only that snapshot to the queue. */
-async function queueOutboundSnapshotLocked(sourcePath: string, outbox: string): Promise<string> {
+async function queueOutboundSnapshotLocked(sourcePath: string, outbox: string, signal?: AbortSignal): Promise<string> {
+  throwIfOutboundCancelled(signal);
   const source = resolve(sourcePath);
   const verified = await openVerifiedRegularFileNoFollow(source, {
     action: "send",
@@ -167,6 +176,7 @@ async function queueOutboundSnapshotLocked(sourcePath: string, outbox: string): 
     const buffer = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     while (position < verified.info.size) {
+      throwIfOutboundCancelled(signal);
       const want = Math.min(buffer.length, verified.info.size - position);
       const { bytesRead } = await verified.handle.read(buffer, 0, want, position);
       if (bytesRead <= 0) throw new Error(`source changed while snapshotting ${source}`);
@@ -197,9 +207,12 @@ async function queueOutboundSnapshotLocked(sourcePath: string, outbox: string): 
     await destination.chmod(0o600);
     await destination.close();
     destination = undefined;
+    // Publishing the private snapshot is reversible until appendOutbox succeeds; cancellation after this
+    // check is caught below and removes the published inode before returning.
+    throwIfOutboundCancelled(signal);
     renameSync(temporary, snapshot);
     published = true;
-    await appendOutbox(outbox, snapshot);
+    await appendOutbox(outbox, snapshot, signal);
     return snapshot;
   } catch (error) {
     if (published && snapshot) {
@@ -216,16 +229,17 @@ async function queueOutboundSnapshotLocked(sourcePath: string, outbox: string): 
 }
 
 /** Serialize admissions for one outbox so parallel send_file calls cannot race past the aggregate budget. */
-export async function queueOutboundSnapshot(sourcePath: string, outbox: string): Promise<string> {
+export async function queueOutboundSnapshot(sourcePath: string, outbox: string, signal?: AbortSignal): Promise<string> {
   const key = resolve(outbox);
   const previous = outboundQueueLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((resolveGate) => { release = resolveGate; });
   const current = previous.then(() => gate, () => gate);
   outboundQueueLocks.set(key, current);
-  await previous.catch(() => {});
   try {
-    return await queueOutboundSnapshotLocked(sourcePath, outbox);
+    await previous.catch(() => {});
+    throwIfOutboundCancelled(signal);
+    return await queueOutboundSnapshotLocked(sourcePath, outbox, signal);
   } finally {
     release();
     if (outboundQueueLocks.get(key) === current) outboundQueueLocks.delete(key);

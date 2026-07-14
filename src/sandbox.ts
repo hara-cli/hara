@@ -8,13 +8,16 @@
 // emitted from runShell so every entry point — REPL, -p, org, cron — surfaces it). Only the `bash`
 // shell is sandboxed; hara's own file tools are in-process, explicit, and gated by the approval flow.
 import { spawn, spawnSync } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
 import { platform } from "node:os";
+import { win32 as winPath } from "node:path";
 import {
   existingSensitiveSeatbeltMasks,
   sensitiveFilesAllowed,
   sensitiveShellCommandReason,
 } from "./security/sensitive-files.js";
 import { terminateSubprocessTree, toolSubprocessEnv } from "./security/subprocess-env.js";
+import { homeWorkspaceActionError, isHomeWorkspace } from "./context/workspace-scope.js";
 
 export type SandboxMode = "off" | "workspace-write" | "read-only";
 
@@ -22,6 +25,28 @@ export type SandboxMode = "off" | "workspace-write" | "read-only";
 // `cat`, pipes, `&&`. So on Windows we PREFER a real bash (Git Bash or WSL, which most Windows devs
 // have) and only fall back to cmd.exe when none is found. Memoized: the PATH probe runs at most once.
 let _winBash: string | null | undefined;
+/** Conventional Git-for-Windows installations are not always added to PATH (the installer makes that
+ *  an explicit choice). Keep candidate construction pure so non-Windows CI can cover it. */
+export function windowsBashCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+  const roots = [
+    env.ProgramFiles,
+    env["ProgramFiles(x86)"],
+    env.LocalAppData ? winPath.join(env.LocalAppData, "Programs") : undefined,
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+  ].filter((value): value is string => !!value?.trim());
+  return [...new Set(roots.map((root) => winPath.join(root, "Git", "bin", "bash.exe")))];
+}
+
+export function firstInstalledWindowsBash(
+  candidates: readonly string[],
+  isFile: (path: string) => boolean,
+): string | null {
+  return candidates.find((path) => {
+    try { return isFile(path); } catch { return false; }
+  }) ?? null;
+}
+
 function findWindowsBash(): string | null {
   if (_winBash !== undefined) return _winBash;
   // `where bash` finds Git Bash / WSL bash on PATH; also probe the default Git-for-Windows location.
@@ -29,7 +54,9 @@ function findWindowsBash(): string | null {
   // (a huge PATH, a dead network drive on PATH) hangs hara at startup with nothing able to interrupt it.
   const onPath = spawnSync("where", ["bash"], { encoding: "utf8", timeout: 3000 });
   const hit = onPath.status === 0 ? String(onPath.stdout).split(/\r?\n/).find((l) => l.trim()) : "";
-  _winBash = (hit && hit.trim()) || null;
+  _winBash = (hit && hit.trim()) || firstInstalledWindowsBash(windowsBashCandidates(), (path) => (
+    existsSync(path) && statSync(path).isFile()
+  ));
   return _winBash;
 }
 
@@ -107,8 +134,14 @@ let warnedUnsandboxed = false; // emit the "macOS-only" notice at most once per 
 export interface ShellOpts {
   timeout: number;
   maxBuffer: number;
+  /** Parent agent-run cancellation. Aborting kills the owned process tree just like a timeout. */
+  signal?: AbortSignal;
   /** stream stdout/stderr chunks live as they arrive (in addition to the buffered return) */
   onData?: (chunk: string, stream: "stdout" | "stderr") => void;
+  /** Optional stdin payload for non-interactive helpers such as lifecycle hooks. */
+  input?: string | Buffer;
+  /** Deliberate, narrowly-scoped environment additions applied after inherited-secret scrubbing. */
+  env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
 }
 
 /**
@@ -119,6 +152,9 @@ export interface ShellOpts {
 /** Build the (sandboxed, when supported) argv for a shell command — shared by runShell + background jobs
  *  so the seatbelt write-confinement is identical for both. */
 export function shellCommand(command: string, cwd: string, mode: SandboxMode): { cmd: string; args: string[] } {
+  // Shell syntax can recursively traverse arbitrary paths, so unlike explicit read/write tools it is not
+  // safe at the Home root. Check before protected-file mask discovery, which itself would have to walk ~/.
+  if (isHomeWorkspace(cwd)) throw new Error(homeWorkspaceActionError("run shell commands"));
   const protectedReason = sensitiveShellCommandReason(command, cwd);
   if (protectedReason) {
     throw new Error(
@@ -160,6 +196,7 @@ export function maybeWarnUnsandboxed(mode: SandboxMode): void {
 }
 
 export function runShell(command: string, cwd: string, mode: SandboxMode, opts: ShellOpts): Promise<{ stdout: string; stderr: string }> {
+  if (opts.signal?.aborted) return Promise.reject(new Error("interrupted before command start"));
   const { cmd, args } = shellCommand(command, cwd, mode);
 
   return new Promise((resolve, reject) => {
@@ -170,6 +207,7 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
     const env = toolSubprocessEnv(process.env, {
       GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT ?? "0",
       GCM_INTERACTIVE: process.env.GCM_INTERACTIVE ?? "never",
+      ...(opts.env ?? {}),
     });
     // A dedicated POSIX process group lets timeout/output-cap termination reach grandchildren (shell →
     // node/npm → worker). Windows uses taskkill /T in terminateSubprocessTree instead.
@@ -178,6 +216,7 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
     let killedForSize = false;
     let done = false;
     let receivedBytes = 0;
@@ -216,6 +255,7 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
       if (done) return;
       done = true;
       clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", abortRun);
       cancelTermination?.();
       if (error) {
         reject(Object.assign(error, { stdout, stderr }));
@@ -225,6 +265,8 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
         resolve({ stdout, stderr: stderr + `\n[output truncated — exceeded ${opts.maxBuffer} bytes; process tree killed]` });
       } else if (timedOut) {
         reject(Object.assign(new Error(`timed out after ${opts.timeout}ms`), { stdout, stderr }));
+      } else if (aborted) {
+        reject(Object.assign(new Error("interrupted by agent run deadline or cancellation"), { stdout, stderr }));
       } else if (code !== 0) {
         reject(Object.assign(new Error(`exit code ${code}`), { stdout, stderr, code }));
       } else {
@@ -235,6 +277,17 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
       timedOut = true;
       stopTree();
     }, opts.timeout);
+    const abortRun = (): void => {
+      if (done || timedOut || killedForSize || aborted) return;
+      aborted = true;
+      stopTree();
+    };
+    opts.signal?.addEventListener("abort", abortRun, { once: true });
+    if (opts.signal?.aborted) abortRun();
+    // A hook may exit successfully without reading stdin. Swallow the resulting benign EPIPE and let the
+    // child's authoritative close status settle the operation, matching spawnSync's historical behavior.
+    child.stdin.on("error", () => {});
+    child.stdin.end(opts.input);
     // Kill a runaway command once its total output passes maxBuffer — don't let it stream GBs to the UI
     // until the timeout just because we stopped retaining the bytes.
     const checkOverflow = (): void => {
@@ -245,7 +298,7 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
     };
 
     child.stdout.on("data", (d: Buffer) => {
-      if (done || timedOut || killedForSize) return;
+      if (done || timedOut || killedForSize || aborted) return;
       const s = d.toString();
       receivedBytes += d.length;
       stdout = grow(stdout, s);
@@ -253,7 +306,7 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
       checkOverflow();
     });
     child.stderr.on("data", (d: Buffer) => {
-      if (done || timedOut || killedForSize) return;
+      if (done || timedOut || killedForSize || aborted) return;
       const s = d.toString();
       receivedBytes += d.length;
       stderr = grow(stderr, s);
@@ -264,7 +317,7 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
       settle(null, e);
     });
     child.on("close", (code) => {
-      if ((timedOut || killedForSize) && !forceIssued) {
+      if ((timedOut || killedForSize || aborted) && !forceIssued) {
         closeBeforeForce = true;
         closeBeforeForceCode = code;
         return;

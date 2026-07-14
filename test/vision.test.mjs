@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describeImages, DESCRIBE_SYSTEM, SCREENSHOT_SYSTEM, classifyVision, parseLocate } from "../dist/vision.js";
+import { describeImages, locateImage, DESCRIBE_SYSTEM, SCREENSHOT_SYSTEM, classifyVision, parseLocate } from "../dist/vision.js";
 
 test("parseLocate: grounding coords (per-mille / percent / fraction) → 0..1 fractions", () => {
   assert.deepEqual(parseLocate('{"x": 500, "y": 250}'), { x: 0.5, y: 0.25 }); // per-mille
@@ -94,6 +94,13 @@ test("describeImages forwards images to the vision provider and returns its (tri
 test("describeImages throws on a provider error", async () => {
   const { provider } = fakeProvider({ text: "", toolUses: [], stop: "error", errorMsg: "boom" });
   await assert.rejects(() => describeImages(provider, [{ path: "/tmp/x.png", mediaType: "image/png" }]), /boom/);
+});
+
+test("vision calls hard-stop a provider that ignores cancellation", async () => {
+  const provider = { id: "stuck", model: "stuck-vl", turn: () => new Promise(() => {}) };
+  const image = { path: "/tmp/x.png", mediaType: "image/png" };
+  await assert.rejects(() => describeImages(provider, [image], { timeoutMs: 25 }), /image description timed out/);
+  assert.equal(await locateImage(provider, image, "Login", { timeoutMs: 25 }), null);
 });
 
 test("DESCRIBE_SYSTEM instructs verbatim transcription (OCR for text-only models)", () => {

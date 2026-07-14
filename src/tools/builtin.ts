@@ -4,7 +4,7 @@ import { resolve, isAbsolute } from "node:path";
 import { stdout as procOut } from "node:process";
 import { registerTool } from "./registry.js";
 import { runShell } from "../sandbox.js";
-import { nearestPaths } from "../fs-walk.js";
+import { nearestPathsAsync } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
 import { atomicWriteText, bindAtomicWritePath, type AtomicWriteBoundary } from "../fs-write.js";
@@ -151,7 +151,7 @@ registerTool({
       }));
     } catch (e: any) {
       if (e instanceof BinaryFileError) return `Error: cannot read ${input.path}: file appears binary; use an image/media-specific tool or inspect it with \`file\`.`;
-      const near = nearestPaths(ctx.cwd, input.path);
+      const near = await nearestPathsAsync(ctx.cwd, input.path, 3, { timeoutMs: 1_000, signal: ctx.signal });
       return `Error: cannot read ${input.path}: ${e.message ?? e.code}.` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
     }
   },
@@ -191,6 +191,7 @@ registerTool({
         expected: prev,
         expectedIdentity: prevSnapshot ?? undefined,
         boundary,
+        signal: ctx.signal,
       });
     } catch (error: any) {
       return `Error: cannot write ${input.path}: ${error?.message ?? String(error)} No changes written.`;
@@ -215,6 +216,7 @@ registerTool({
     required: ["command"],
   },
   kind: "exec",
+  requiresProjectWorkspace: true,
   async run(input, ctx) {
     const protectedReason = sensitiveShellCommandReason(String(input.command ?? ""), ctx.cwd);
     if (protectedReason) {
@@ -268,6 +270,7 @@ registerTool({
         timeout,
         maxBuffer: 10 * 1024 * 1024,
         onData: live,
+        signal: ctx.signal,
       });
       flushLive();
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");

@@ -31,18 +31,18 @@ import { analyzeContext } from "../agent/context-report.js";
 import { clearTouched, recentTouched } from "../agent/touched.js";
 import { resetRepeatGuard } from "../agent/repeat-guard.js";
 import { contextWindow, ctxPctFor } from "../statusbar.js";
-import { listProjectFiles } from "../fs-walk.js";
+import { listProjectFilesAsync } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
 import type { Provider, NeutralMsg } from "../providers/types.js";
 import type { UiSink } from "../tools/registry.js";
 import type { ApprovalMode } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
-import { loadAgentsMd } from "../context/agents-md.js";
-import { expandMentions } from "../context/mentions.js";
+import { loadAgentContext } from "../context/agents-md.js";
+import { expandMentionsAsync } from "../context/mentions.js";
 import { memoryDigest } from "../memory/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled, panelsForProject } from "../plugins/plugins.js";
 import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
-import { loadJobs, saveJobs, addJob } from "../cron/store.js";
+import { loadJobs, addJob, removeJob, setEnabled } from "../cron/store.js";
 import { parseSchedule, describeSchedule } from "../cron/schedule.js";
 import { loadTasks } from "../tools/task.js";
 import { listPending, resolvePending } from "../gateway/flows-pending.js";
@@ -66,7 +66,9 @@ export interface ServeDeps {
   effortLevels?: string[];
   /** Live defaults advertised to persistent clients after config/profile edits. */
   runtimeInfo?: (cwd?: string) => { providerId: string; model: string; effortLevels?: string[] };
-  spawnSubagent: (provider: Provider, cwd: string, projectContext: string | undefined, stats: { input: number; output: number; lastInput?: number }, task: string, role?: string) => Promise<string>;
+  /** Per-project lifecycle limits, read at turn start so persistent Desktop sessions pick up config edits. */
+  runLimits?: (cwd?: string) => { timeoutMs: number; maxRounds: number };
+  spawnSubagent: (provider: Provider, cwd: string, projectContext: string | undefined, stats: { input: number; output: number; lastInput?: number }, task: string, role?: string, signal?: AbortSignal) => Promise<string>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
   buildGuardian?: (cwd?: string) => Promise<{ provider?: Provider | null; enabled?: boolean } | undefined>;
   sandbox: SandboxMode;
@@ -368,7 +370,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       diff: (t) => broadcast("event.diff", { sessionId, text: t }),
       notice: (t) => broadcast("event.notice", { sessionId, text: t }),
     };
-    const confirm = (q: string): Promise<boolean | "always"> =>
+    const confirm = (q: string, signal: AbortSignal = turnAbort.signal): Promise<boolean | "always"> =>
       new Promise((resolve) => {
         const approvalId = randomUUID();
         let settled = false;
@@ -378,15 +380,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           settled = true;
           clearTimeout(timer);
           pendingApprovals.delete(approvalId);
-          turnAbort.signal.removeEventListener("abort", onAbort);
+          signal.removeEventListener("abort", onAbort);
           resolve(v);
         };
         const onAbort = (): void => finish(false);
         timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS); // unanswered → deny, turn continues
         pendingApprovals.set(approvalId, finish);
-        if (turnAbort.signal.aborted) finish(false);
+        if (signal.aborted) finish(false);
         else {
-          turnAbort.signal.addEventListener("abort", onAbort, { once: true });
+          // `signal` is runAgent's combined Esc + total-deadline signal. Listening only to turnAbort would
+          // leave the approval map and Desktop prompt stale when the internal lifecycle deadline fires.
+          signal.addEventListener("abort", onAbort, { once: true });
           broadcast("approval.request", { sessionId, approvalId, question: q });
         }
       });
@@ -410,14 +414,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       }
       // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works).
       // Pasted images ride along as NeutralMsg.images — a vision-capable model sees them inline.
-      s.history.push({ role: "user", content: expandMentions(content, s.meta.cwd), ...(images && images.length ? { images } : {}) });
+      s.history.push({ role: "user", content: await expandMentionsAsync(content, s.meta.cwd, { signal: turnAbort.signal }), ...(images && images.length ? { images } : {}) });
       const outcome = await runAgent(s.history, {
         provider: s.provider,
         ctx: {
           cwd: s.meta.cwd,
           sandbox: deps.sandbox,
           todoScope: sessionId,
-          spawn: (t, role) => deps.spawnSubagent(s.provider, s.meta.cwd, s.projectContext, s.stats, t, role),
+          spawn: (t, role, signal) => deps.spawnSubagent(s.provider, s.meta.cwd, s.projectContext, s.stats, t, role, signal),
           ui: sink,
         },
         approval: s.approval,
@@ -435,7 +439,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           };
           void turn.then(settled, settled);
         },
+        onToolRun: (toolRun) => {
+          s.pendingToolRuns += 1;
+          const settled = (): void => {
+            s.pendingToolRuns = Math.max(0, s.pendingToolRuns - 1);
+            // `abort === null` means the logical turn already returned. Keep the session busy/locked until
+            // every late side-effect-capable Promise has physically stopped.
+            if (s.pendingToolRuns === 0 && s.abort === null) s.busy = false;
+            if (closing) hub.releaseIdle();
+          };
+          void toolRun.then(settled, settled);
+        },
         guardian: turnGuardian,
+        ...(deps.runLimits?.(s.meta.cwd) ?? {}),
       });
       s.meta.todos = serializeTodos(sessionId);
       hub.save(s);
@@ -444,11 +460,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       // clients render a meter without an extra round-trip.
       const ctx = ctxOf(s);
       if (outcome.status !== "completed") {
-        const failure = outcome.status === "error"
-          ? (outcome.error ?? "agent turn failed")
-          : outcome.status === "empty"
-            ? "the model returned an empty response after retrying"
-            : "agent turn halted by the safety circuit-breaker";
+        const failure = outcome.error ?? (outcome.status === "empty"
+          ? "the model returned an empty response after retrying"
+          : outcome.status === "halted"
+            ? "agent turn halted by a safety control"
+            : "agent turn failed");
         broadcast("event.turn_end", { sessionId, reply: "", error: failure, status: outcome.status, usage, ctx });
         throw new Error(failure);
       }
@@ -458,8 +474,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       broadcast("event.turn_end", { sessionId, reply, usage, ctx });
       return { reply, usage, ctx };
     } finally {
-      s.busy = false;
       s.abort = null;
+      s.busy = s.pendingToolRuns > 0;
     }
   };
 
@@ -494,34 +510,42 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       controller.signal.addEventListener("abort", onAbort, { once: true });
       if (controller.signal.aborted) return onAbort();
       // Promise.resolve protects this boundary even if a non-conforming provider throws synchronously.
-      void Promise.resolve().then(() => s.provider.turn({
-        system: COMPACT_SYSTEM,
-        history: [...s.history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
-        tools: [],
-        onText: () => {},
-        signal: controller.signal,
-      })).then(
+      void Promise.resolve().then(() => {
+        // The abort can fire after scheduling this microtask but before it runs. Gate the provider call at
+        // the actual invocation boundary so an interrupted/expired compact cannot start a late request.
+        if (controller.signal.aborted) throw new Error(timedOut ? "compaction timed out" : "compaction interrupted");
+        return s.provider.turn({
+          system: COMPACT_SYSTEM,
+          history: [...s.history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
+          tools: [],
+          onText: () => {},
+          signal: controller.signal,
+        });
+      }).then(
         (result) => finish(() => resolve(result)),
         (error) => finish(() => reject(error)),
       );
     });
-    if (r.stop === "error") return null;
+    if (controller.signal.aborted || r.stop === "error") return null;
     const summary = r.text.trim();
     if (!summary) return null;
-    s.meta.workingSet = workingSetFromSummary(summary);
-    s.history.length = 0;
-    s.history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
+    const workingSet = workingSetFromSummary(summary);
     const touched = recentTouched(20, s.meta.id).filter((file) => {
       const rel = relative(s.meta.cwd, file);
       return !!rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
     }).slice(0, 5);
     const restore = buildFileRestore(touched, (f) => {
+      if (controller.signal.aborted) return null;
       try {
         return readModelContextFileSync(f, 32 * 1024);
       } catch {
         return null;
       }
     });
+    if (controller.signal.aborted) return null;
+    s.meta.workingSet = workingSet;
+    s.history.length = 0;
+    s.history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
     if (restore) s.history.push({ role: "user", content: restore });
     s.stats.input += r.usage?.input ?? 0;
     s.stats.output += r.usage?.output ?? 0;
@@ -575,7 +599,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const approval = (["suggest", "auto-edit", "full-auto"] as ApprovalMode[]).includes(p.approval) ? (p.approval as ApprovalMode) : deps.approval;
-            const s = hub.create({ cwd, provider, providerId: provider.id, model: provider.model, approval, projectContext: loadAgentsMd(cwd) || undefined });
+            const s = hub.create({ cwd, provider, providerId: provider.id, model: provider.model, approval, projectContext: loadAgentContext(cwd) || undefined });
             return reply(rpcResult(id!, { sessionId: s.meta.id, model: s.meta.model }));
           }
           case "session.resume": {
@@ -603,7 +627,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               hub.detach(r.session.meta.id);
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
-            r.session.projectContext = loadAgentsMd(r.session.meta.cwd) || undefined;
+            r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
             return reply(rpcResult(id!, { sessionId: r.session.meta.id, model: r.session.meta.model, history: historyForClient(r.session.history) }));
           }
           case "session.send": {
@@ -677,7 +701,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               hub.delete(r.session.meta.id);
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
-            r.session.projectContext = loadAgentsMd(r.session.meta.cwd) || undefined;
+            r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
             return reply(rpcResult(id!, { sessionId: r.session.meta.id, title: r.session.meta.title, model: r.session.meta.model, history: historyForClient(r.session.history) }));
           }
           case "session.delete": {
@@ -774,18 +798,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }
           case "automation.toggle": {
             if (typeof p.id !== "string" || typeof p.enabled !== "boolean") return reply(rpcError(id, ERR.PARAMS, "id + enabled required"));
-            const jobs = loadJobs();
-            const job = jobs.find((j) => j.id === p.id);
-            if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
-            job.enabled = p.enabled;
-            saveJobs(jobs);
-            return reply(rpcResult(id!, { id: job.id, enabled: job.enabled }));
+            if (!setEnabled(p.id, p.enabled)) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            return reply(rpcResult(id!, { id: p.id, enabled: p.enabled }));
           }
           case "automation.delete": {
             if (typeof p.id !== "string") return reply(rpcError(id, ERR.PARAMS, "id required"));
-            const jobs = loadJobs();
-            if (!jobs.some((j) => j.id === p.id)) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
-            saveJobs(jobs.filter((j) => j.id !== p.id));
+            if (!removeJob(p.id)) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
             return reply(rpcResult(id!, { id: p.id, deleted: true }));
           }
           case "skills.list": {
@@ -806,10 +824,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const sess = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : (sess?.meta.cwd ?? opts.cwd);
             const limit = Math.min(Math.max(Math.trunc(Number(p.limit) || 20), 1), 50);
-            const all = listProjectFiles(cwd);
+            const inventory = await listProjectFilesAsync(cwd, {
+              maxFiles: 8_000,
+              maxDirectories: 20_000,
+              maxEntries: 100_000,
+              timeoutMs: 1_000,
+              yieldEvery: 64,
+            });
+            const all = inventory.files;
             const query = typeof p.query === "string" ? p.query : "";
             const files = query ? fuzzyRank(query, all, (f) => f).slice(0, limit).map((r) => r.item) : all.slice(0, limit);
-            return reply(rpcResult(id!, { files, cwd }));
+            return reply(rpcResult(id!, { files, cwd, truncated: inventory.truncated, reason: inventory.reason }));
           }
           case "session.context": {
             // context-spend breakdown + watermark on demand (codex thread/tokenUsage + /context).
@@ -920,7 +945,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
       let quiet = false;
       while (Date.now() < deadline) {
-        if (inFlightRequests.size === 0 && hub.active().every((session) => !session.busy && !session.configuring && session.pendingProviderTurns === 0)) {
+        if (inFlightRequests.size === 0 && hub.active().every((session) => !session.busy && !session.configuring && session.pendingProviderTurns === 0 && session.pendingToolRuns === 0)) {
           quiet = true;
           break;
         }

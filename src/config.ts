@@ -4,9 +4,11 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync
 import type { SandboxMode } from "./sandbox.js";
 import type { HooksConfig } from "./hooks.js";
 import type { NotifyMode } from "./notify.js";
+import { agentMaxRounds, agentRunTimeoutMs } from "./agent/limits.js";
 import { ensurePrivateHaraState } from "./security/private-state.js";
 import { readVerifiedRegularFileSnapshotSync } from "./fs-read.js";
 import { projectRepositoryTrustedAtStartup } from "./security/project-trust.js";
+import { isHomeWorkspace } from "./context/workspace-scope.js";
 
 export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai" | "glm" | "deepseek" | "openrouter" | "hara-gateway";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
@@ -86,6 +88,10 @@ export interface HaraConfig {
   guardian: "on" | "off";
   /** ping when a (non-trivial) turn finishes: off | bell (terminal BEL) | system (OS notification + bell) */
   notify: NotifyMode;
+  /** hard wall-clock ceiling for one agent run; activity cannot renew it forever (default 30 minutes). */
+  runTimeoutMs: number;
+  /** hard provider/tool-round ceiling for one agent run (default 64). */
+  maxAgentRounds: number;
   /** modal (vim) keybindings in the TUI input box (opt-in) */
   vimMode: boolean;
   mcpServers: Record<string, McpServerConfig>;
@@ -122,7 +128,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   "hara-gateway": { model: "", envKey: "HARA_GATEWAY_TOKEN" }, // B-end: enrolled device → token in ~/.hara/org.json, routed by the gateway
 };
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = ["off", "low", "medium", "high", "max"];
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
@@ -254,6 +260,9 @@ function readProjectConfig(cwd: string): Record<string, any> {
     dir = resolve(cwd);
   }
   for (;;) {
+    // ~/.hara/config.json is the global control-plane file already loaded by loadConfig(). Never read it
+    // a second time as repository input, and never climb through Home into a parent repository.
+    if (isHomeWorkspace(dir)) break;
     const hara = join(dir, ".hara");
     const p = join(hara, "config.json");
     let haraInfo;
@@ -402,6 +411,8 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   const guardianRaw = process.env.HARA_GUARDIAN ?? merged.guardian;
   const guardian: "on" | "off" = guardianRaw === "0" || guardianRaw === "off" || guardianRaw === "false" ? "off" : "on";
   const notify = (process.env.HARA_NOTIFY ?? merged.notify ?? "off") as NotifyMode;
+  const runTimeoutMs = agentRunTimeoutMs(process.env.HARA_RUN_TIMEOUT_MS ?? merged.runTimeoutMs);
+  const maxAgentRounds = agentMaxRounds(process.env.HARA_MAX_AGENT_ROUNDS ?? merged.maxAgentRounds);
   const vimMode = process.env.HARA_VIM === "1" || merged.vimMode === true || merged.vimMode === "true";
   const autoCompact = !(process.env.HARA_AUTO_COMPACT === "0" || merged.autoCompact === false || merged.autoCompact === "false"); // default ON
   const fileCheckpoints = !(process.env.HARA_CHECKPOINTS === "0" || merged.fileCheckpoints === false || merged.fileCheckpoints === "false"); // default ON
@@ -415,7 +426,7 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     ? (reasoningRaw as "off" | "low" | "medium" | "high" | "max")
     : undefined;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, vimMode, autoCompact, fileCheckpoints, updateCheck, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, vimMode, autoCompact, fileCheckpoints, updateCheck, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

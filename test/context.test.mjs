@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { loadAgentsMd, hasAgentsMd, findProjectRoot } from "../dist/context/agents-md.js";
-import { expandMentions } from "../dist/context/mentions.js";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { loadAgentContext, loadAgentsMd, hasAgentsMd, findProjectRoot } from "../dist/context/agents-md.js";
+import { canonicalWorkspacePath, isHomeWorkspace } from "../dist/context/workspace-scope.js";
+import { expandMentions, expandMentionsAsync } from "../dist/context/mentions.js";
 import { needsConfirm } from "../dist/agent/loop.js";
 import "../dist/tools/edit.js";
 import { getTool } from "../dist/tools/registry.js";
@@ -48,6 +49,45 @@ test("agents-md: no file → empty string + hasAgentsMd false", () => {
     assert.equal(loadAgentsMd(dir), "");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("workspace scope: canonical home and its symlink alias get guidance; a real project does not", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-home-scope-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  const project = join(home, "project");
+  mkdirSync(project, { recursive: true });
+  mkdirSync(join(root, ".git"));
+  writeFileSync(join(root, "AGENTS.md"), "PARENT_CONTEXT_MUST_NOT_REACH_HOME\n");
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  try {
+    assert.equal(canonicalWorkspacePath(alias), canonicalWorkspacePath(home));
+    assert.equal(isHomeWorkspace(home, home), true);
+    assert.equal(isHomeWorkspace(alias, home), true, "realpath closes a symlink alias bypass");
+    assert.equal(isHomeWorkspace(project, home), false);
+
+    const previousHome = process.env.HOME;
+    const previousUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    try {
+      assert.match(loadAgentContext(alias), /Home-directory workspace boundary/);
+      assert.match(loadAgentContext(alias), /cd \/path\/to\/project/);
+      assert.doesNotMatch(loadAgentContext(alias), /PARENT_CONTEXT_MUST_NOT_REACH_HOME/);
+      assert.equal(findProjectRoot(home), home, "Home cannot inherit a marker above it");
+      assert.equal(findProjectRoot(alias), alias, "a canonical Home alias cannot inherit a parent marker");
+      assert.equal(loadAgentContext(project), "", "normal child project context is unchanged without AGENTS.md");
+      writeFileSync(join(home, "package.json"), "{}");
+      assert.equal(findProjectRoot(project), project, "a marker at Home never widens an explicit child into a Home-sized project");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = previousUserProfile;
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -119,6 +159,13 @@ test("mentions: binary files are described but never injected as text", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("mentions: Home ancestors report the recursive workspace boundary instead of pretending to be empty", async () => {
+  const ancestor = dirname(homedir());
+  const input = `inspect @${ancestor}`;
+  assert.match(expandMentions(input, process.cwd()), /will not recursively scan the home directory/i);
+  assert.match(await expandMentionsAsync(input, process.cwd()), /will not recursively scan the home directory/i);
 });
 
 test("edit_file: single unique replacement", async () => {

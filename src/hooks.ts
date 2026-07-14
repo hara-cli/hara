@@ -2,12 +2,11 @@
 // PreToolUse runs BEFORE a tool: non-zero, timeout, signal, or launch failure BLOCKS the call.
 // PostToolUse runs AFTER: observe-only (format, log, notify). Configured in config.json `hooks` + contributed
 // by plugins. The command receives {tool, payload} as JSON on stdin + HARA_TOOL_NAME in the env.
-import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { loadConfig } from "./config.js";
 import { pluginHooks } from "./plugins/plugins.js";
-import { redactToolSubprocessOutput, toolSubprocessEnv } from "./security/subprocess-env.js";
-import { shellCommand } from "./sandbox.js";
+import { redactToolSubprocessOutput } from "./security/subprocess-env.js";
+import { runShell } from "./sandbox.js";
 
 export type HookEvent = "PreToolUse" | "PostToolUse";
 export interface HookEntry {
@@ -49,46 +48,46 @@ export function hasHooks(cwd = process.cwd()): boolean {
 }
 
 /** Run hooks for an event matching `toolName`. Any abnormal PreToolUse termination fails closed;
- *  PostToolUse remains observe-only. Sync (hooks are short, opt-in); 30s timeout each. */
-export function runHooks(
+ *  PostToolUse remains observe-only. Every child owns a cancellable process group; no hook may hold the
+ *  event loop past the parent run deadline, and an aborted batch never starts its next command. */
+export async function runHooks(
   event: HookEvent,
   toolName: string,
   payload: unknown,
   cwd: string,
   timeoutMs = 30_000,
-): { block: boolean; message: string } {
+  signal?: AbortSignal,
+): Promise<{ block: boolean; message: string }> {
   for (const h of merged(cwd)[event] ?? []) {
+    if (signal?.aborted) {
+      return event === "PreToolUse"
+        ? { block: true, message: "⛔ blocked because the agent run was cancelled before the PreToolUse hook completed" }
+        : { block: false, message: "" };
+    }
     if (!matches(h.matcher, toolName)) continue;
-    let r: ReturnType<typeof spawnSync>;
     try {
       // Hooks are user/plugin-configured external code. Route them through the same command preflight and
       // macOS protected-read mask as Bash, even though hooks remain observe-only after a tool has run.
-      const shell = shellCommand(h.command, cwd, "off");
-      r = spawnSync(shell.cmd, shell.args, {
-        cwd,
-        input: JSON.stringify({ tool: toolName, payload }),
-        encoding: "utf8",
+      await runShell(h.command, cwd, "off", {
+        signal,
         timeout: timeoutMs,
-        env: toolSubprocessEnv(process.env, { HARA_TOOL_NAME: toolName }),
+        maxBuffer: 256 * 1024,
+        input: JSON.stringify({ tool: toolName, payload }),
+        env: { HARA_TOOL_NAME: toolName },
       });
     } catch (error) {
       if (event === "PreToolUse") {
-        const detail = redactToolSubprocessOutput(error instanceof Error ? error.message : String(error));
-        return { block: true, message: `⛔ blocked because a PreToolUse hook could not start${detail ? `: ${detail}` : ""}` };
+        const failure = error as Error & { stdout?: string; stderr?: string; code?: number };
+        const output = redactToolSubprocessOutput(`${failure.stdout ?? ""}${failure.stderr ?? ""}`.trim());
+        const detail = redactToolSubprocessOutput(failure.message || String(error));
+        return {
+          block: true,
+          message: `⛔ blocked by a PreToolUse hook${output ? `: ${output}` : detail ? ` (${detail})` : ""}`,
+        };
       }
       // PostToolUse is best-effort: a policy-blocked or broken observer must never rewrite the result of a
       // tool that already completed. In particular, do not retry it through an unsandboxed fallback shell.
       continue;
-    }
-    // A hook is allowed to ignore stdin. On Linux, a command that exits successfully before Node finishes
-    // writing `input` can report EPIPE in r.error *alongside status=0*. The wait status is authoritative in
-    // that case; true launch/write failures still have status=null, while timeouts/signals remain blocked.
-    if (event === "PreToolUse" && (r.status !== 0 || !!r.signal)) {
-      const output = redactToolSubprocessOutput((String(r.stdout ?? "") + String(r.stderr ?? "")).trim());
-      const failure = redactToolSubprocessOutput(
-        r.error?.message || (r.signal ? `terminated by ${r.signal}` : `exit ${r.status ?? "unknown"}`),
-      );
-      return { block: true, message: `⛔ blocked by a PreToolUse hook${output ? `: ${output}` : ` (${failure})`}` };
     }
   }
   return { block: false, message: "" };

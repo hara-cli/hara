@@ -9,7 +9,6 @@ import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir, readRecentLogs, scaffoldMemory, type Scope } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
-import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -32,6 +31,13 @@ import {
   type ProviderId,
 } from "./config.js";
 import { runAgent, type RunOutcome } from "./agent/loop.js";
+import {
+  formatAgentDuration,
+  parseAgentRunTimeoutMs,
+  MIN_AGENT_RUN_TIMEOUT_MS,
+  MAX_AGENT_RUN_TIMEOUT_MS,
+  MAX_AGENT_MAX_ROUNDS,
+} from "./agent/limits.js";
 import { parseSchemaArg, structuredOutputTool, STRUCTURED_INSTRUCTION, STRUCTURED_NUDGE } from "./agent/structured.js";
 import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
@@ -88,8 +94,8 @@ import {
 } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun, validTz } from "./cron/schedule.js";
 import { parseDeliver } from "./cron/deliver.js";
-import { addJob, removeJob, setEnabled, resolveJob, loadJobs, recordRun, logPath, type CronJob } from "./cron/store.js";
-import { runTick, runJobOnce, selfArgv } from "./cron/runner.js";
+import { addJob, removeJob, setEnabled, resolveJob, loadJobs, logPath, type CronJob } from "./cron/store.js";
+import { runTick, runJobTracked, runSelfAttached, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools, type Tool } from "./tools/registry.js";
 import { resetReachability } from "./tools/net-reachability.js";
@@ -98,6 +104,7 @@ import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
 import { resolvePlatform } from "./providers/registry.js";
+import { boundedProviderTurn } from "./providers/bounded-turn.js";
 import { levelsFor } from "./tui/model-picker.js";
 import { listModels } from "./providers/models.js";
 import { listJobs, tailJob, killJob } from "./exec/jobs.js";
@@ -118,11 +125,12 @@ function renderBgJobs(): string {
   return `Background jobs — /jobs tail <id> · /jobs kill <id>:\n${rows.join("\n")}`;
 }
 import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
-import { loadAgentsMd, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
+import { loadAgentContext, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
+import { homeWorkspaceActionError, isHomeWorkspace } from "./context/workspace-scope.js";
 import { getEmbedder } from "./search/embed.js";
-import { collectRepoChunks, collectDirChunks, buildIndex, indexPath, indexExists, type Chunk } from "./search/semindex.js";
+import { collectRepoChunksAsync, collectDirChunksAsync, buildIndex, indexPath, indexExists, type Chunk, type ChunkCollectionResult } from "./search/semindex.js";
 import { searchHybrid } from "./search/hybrid.js";
-import { expandMentions, fileCandidates, isSlashCommand, inlineLeadingPath } from "./context/mentions.js";
+import { expandMentionsAsync, fileCandidates, isSlashCommand, inlineLeadingPath } from "./context/mentions.js";
 import {
   newSessionId,
   shortId,
@@ -370,21 +378,16 @@ async function pingProvider(args: { provider: ProviderId; apiKey: string; model:
     provider === "anthropic"
       ? createAnthropicProvider({ apiKey, model, baseURL })
       : createOpenAIProvider({ apiKey, model, baseURL, label: provider });
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12_000);
   try {
-    const r = await prov.turn({
+    const r = await boundedProviderTurn(prov, {
       system: "Reply with the single word: ok",
       history: [{ role: "user", content: "ping" }],
       tools: [],
       onText: () => {},
-      signal: ctrl.signal,
-    });
+    }, { timeoutMs: 12_000, label: "provider connectivity check" });
     return r.stop !== "error";
   } catch {
     return false;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -458,9 +461,14 @@ async function runSetup(): Promise<void> {
   }
 }
 
-async function runInit(provider: Provider, cwd: string, sandbox: SandboxMode = "off"): Promise<void> {
+function agentRunLimits(cfg: Pick<HaraConfig, "runTimeoutMs" | "maxAgentRounds">): { timeoutMs: number; maxRounds: number } {
+  return { timeoutMs: cfg.runTimeoutMs, maxRounds: cfg.maxAgentRounds };
+}
+
+async function runInit(provider: Provider, cwd: string, sandbox: SandboxMode = "off", cfg?: HaraConfig): Promise<void> {
+  if (isHomeWorkspace(cwd)) throw new Error(homeWorkspaceActionError("initialize AGENTS.md"));
   const history: NeutralMsg[] = [{ role: "user", content: INIT_PROMPT }];
-  await runAgent(history, { provider, ctx: { cwd, sandbox }, approval: "full-auto", confirm: async () => true });
+  await runAgent(history, { provider, ctx: { cwd, sandbox }, approval: "full-auto", confirm: async () => true, ...(cfg ? agentRunLimits(cfg) : {}) });
 }
 
 interface OrgOpts {
@@ -481,15 +489,17 @@ interface OrgOpts {
 
 /** Stage everything and commit with an AI-written message. Returns a one-line summary or "error: …".
  *  Used by `hara org --commit`; the caller guards on a clean start tree so this only captures the run's work. */
-async function autoCommit(provider: Provider, cwd: string): Promise<string> {
+async function autoCommit(provider: Provider, cwd: string, signal?: AbortSignal): Promise<string> {
+  if (signal?.aborted) return "error: commit interrupted before staging";
   const before = protectedWorkingTreePaths(cwd);
   if (before.length) return `error: refusing to stage protected path(s): ${before.map((p) => JSON.stringify(p)).join(", ")}`;
   try {
-    await runShell("git add -A", cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
+    await runShell("git add -A", cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000, signal });
   } catch {
     /* fall through — empty diff is reported below */
   }
   const protectedAfterStage = protectedStagedPaths(cwd);
+  if (signal?.aborted) return "error: commit interrupted after staging; nothing was committed";
   if (protectedAfterStage.length) {
     return `error: refusing to inspect or commit protected staged path(s): ${protectedAfterStage.map((p) => JSON.stringify(p)).join(", ")}`;
   }
@@ -500,22 +510,25 @@ async function autoCommit(provider: Provider, cwd: string): Promise<string> {
   }
   const changeInput = commitMessageInput(staged);
   if (!changeInput.trim()) return "nothing to commit";
-  const r = await provider.turn({
+  const r = await boundedProviderTurn(provider, {
     system: COMMIT_SYSTEM,
     history: [{ role: "user", content: `Write a commit message for these staged changes:\n\n${changeInput.slice(0, 120_000)}` }],
     tools: [],
     onText: () => {},
-  });
+  }, { timeoutMs: 30_000, label: "commit message generation", signal });
+  if (signal?.aborted) return "error: commit interrupted; nothing was committed";
+  if (r.stop === "error") return `error: commit message generation failed (${r.errorMsg ?? "provider error"})`;
   const msg = stripCommitFence(r.text);
   if (!msg) return "error: no commit message produced";
   const tmp = join(tmpdir(), `hara-org-commit-${process.pid}.txt`);
   writeFileSync(tmp, msg + "\n", "utf8");
   try {
     const protectedBeforeCommit = protectedStagedPaths(cwd);
+    if (signal?.aborted) return "error: commit interrupted; nothing was committed";
     if (protectedBeforeCommit.length) {
       return `error: staged paths changed while writing the message; protected path(s) will not be committed: ${protectedBeforeCommit.map((p) => JSON.stringify(p)).join(", ")}`;
     }
-    const res = await runShell(`git commit -F ${JSON.stringify(tmp)}`, cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
+    const res = await runShell(`git commit -F ${JSON.stringify(tmp)}`, cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000, signal });
     return (res.stdout || "").trim().split("\n")[0] || "committed";
   } catch (e) {
     return `error: git commit failed (${e instanceof Error ? e.message : String(e)})`;
@@ -529,8 +542,9 @@ async function autoCommit(provider: Provider, cwd: string): Promise<string> {
 }
 
 /** Format an autoCommit result + emit it. */
-async function commitStep(provider: Provider, cwd: string): Promise<void> {
-  const r = await autoCommit(provider, cwd);
+async function commitStep(provider: Provider, cwd: string, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+  const r = await autoCommit(provider, cwd, signal);
   if (r.startsWith("error:")) out(c.red(`✗ ${r}\n`));
   else if (r === "nothing to commit") out(c.dim("(nothing to commit)\n"));
   else out(c.green(`✓ committed · ${r.slice(0, 100)}\n`));
@@ -563,12 +577,13 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
     if (kw) {
       role = kw.role;
     } else {
-      const r = await o.baseProvider.turn({
+      const r = await boundedProviderTurn(o.baseProvider, {
         system: "You are a task dispatcher. Reply with only a role id.",
         history: [{ role: "user", content: buildDispatchPrompt(task, roles) }],
         tools: [],
         onText: () => {},
-      });
+      }, { timeoutMs: 20_000, label: "role dispatch" });
+      if (r.stop === "error") out(c.yellow(`(role dispatch unavailable — using ${roles[0].id})\n`));
       role = parseRoleId(r.text, roles) ?? roles[0];
     }
   }
@@ -581,7 +596,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
     : o.baseProvider;
   const toolFilter = roleToolFilter(role);
 
-  const history: NeutralMsg[] = [{ role: "user", content: expandMentions(task, o.cwd) }];
+  const history: NeutralMsg[] = [{ role: "user", content: await expandMentionsAsync(task, o.cwd) }];
   const runImplementer = async (): Promise<RunOutcome> => {
     return runAgent(history, {
       provider: roleProvider,
@@ -593,6 +608,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
       stats: o.stats,
       systemOverride: role.system,
       toolFilter,
+      ...agentRunLimits(o.cfg),
       ...(role.readOnly ? { hooks: false } : {}),
     });
   };
@@ -642,6 +658,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
       systemOverride: revSystem,
       toolFilter: revTools,
       hooks: false,
+      ...agentRunLimits(o.cfg),
     });
     if (reviewerOutcome.status !== "completed") return reviewerOutcome;
     const verdict = parseVerdict(lastAssistantText(rHist));
@@ -693,6 +710,7 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
       toolFilter,
       ...(role?.readOnly ? { hooks: false } : {}),
       quiet: o.parallel, // concurrent atoms would otherwise interleave their streamed output
+      ...agentRunLimits(o.cfg),
     });
     const failure = runFailureDetail(outcome);
     if (failure) {
@@ -872,7 +890,7 @@ const SESSION_NAME_SYSTEM =
 
 /** One short model call → a 2–4 word English kebab-case session name summarizing the work.
  *  Always ASCII (translates non-English gist). Falls back to the lexical title on any failure. */
-async function nameSession(provider: Provider, history: NeutralMsg[]): Promise<string> {
+async function nameSession(provider: Provider, history: NeutralMsg[], signal?: AbortSignal): Promise<string> {
   const text = (m: NeutralMsg | undefined): string => {
     if (!m) return "";
     if (m.role === "assistant") return typeof m.text === "string" ? m.text : "";
@@ -882,11 +900,18 @@ async function nameSession(provider: Provider, history: NeutralMsg[]): Promise<s
   const basis =
     `User: ${text(history.find((m) => m.role === "user")).slice(0, 800)}\n` +
     `Assistant: ${text(history.find((m) => m.role === "assistant")).slice(0, 800)}`;
+  const fallback = titleFrom(history);
+  if (signal?.aborted) return fallback;
   try {
-    const r = await provider.turn({ system: SESSION_NAME_SYSTEM, history: [{ role: "user", content: basis }], tools: [], onText: () => {} });
-    return slugify(r.text) || titleFrom(history);
+    const r = await boundedProviderTurn(
+      provider,
+      { system: SESSION_NAME_SYSTEM, history: [{ role: "user", content: basis }], tools: [], onText: () => {} },
+      { timeoutMs: 10_000, label: "session naming", signal },
+    );
+    if (signal?.aborted || r.stop === "error") return fallback;
+    return slugify(r.text) || fallback;
   } catch {
-    return titleFrom(history);
+    return fallback;
   }
 }
 /** Render a proposed plan as a bordered block for the transcript (codex ProposedPlanCell-style).
@@ -923,29 +948,33 @@ const MEMORY_DISTILL_SYSTEM =
 
 /** Summarize the conversation and replace history with the summary (keeping working-memory notes). Shared by
  *  /compact (manual) and auto-compaction. Returns the summary, or null on failure / nothing to do. */
-async function compactConversation(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }): Promise<string | null> {
-  if (history.length < 2) return null;
-  const r = await provider.turn({
+async function compactConversation(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, signal?: AbortSignal): Promise<string | null> {
+  if (history.length < 2 || signal?.aborted) return null;
+  const r = await boundedProviderTurn(provider, {
     system: COMPACT_SYSTEM,
     history: [...history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
     tools: [],
     onText: () => {},
-  });
-  if (r.stop === "error") return null;
+  }, { timeoutMs: 60_000, label: "conversation compaction", signal });
+  if (signal?.aborted || r.stop === "error") return null;
   const summary = r.text.trim();
   if (!summary) return null;
-  meta.workingSet = workingSetFromSummary(summary); // survives the history wipe + injects into the next turns
-  history.length = 0;
-  history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
+  const workingSet = workingSetFromSummary(summary);
   // TW5-style file restore: the summary alone loses the working set's ACTUAL content — re-attach the
   // most recently touched files (current on-disk state, byte-capped) so work continues without re-reads.
   const restore = buildFileRestore(recentTouched(5), (p) => {
+    if (signal?.aborted) return null;
     try {
       return readModelContextFileSync(p, 32 * 1024);
     } catch {
       return null;
     }
   });
+  // Cancellation during the file snapshot must leave the original conversation untouched.
+  if (signal?.aborted) return null;
+  meta.workingSet = workingSet; // survives the history wipe + injects into the next turns
+  history.length = 0;
+  history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
   if (restore) history.push({ role: "user", content: restore });
   stats.input += r.usage?.input ?? 0;
   stats.output += r.usage?.output ?? 0;
@@ -957,7 +986,8 @@ async function compactConversation(provider: Provider, history: NeutralMsg[], me
 /** Auto-compact (à la Claude Code) when the last turn filled the context past the threshold, so the NEXT turn
  *  doesn't overflow. Opt-out via `autoCompact: false` / `HARA_AUTO_COMPACT=0`. Best-effort; `notify` surfaces
  *  a one-line status. Returns true if it compacted. */
-async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, cfg: HaraConfig, notify: (m: string) => void): Promise<boolean> {
+async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, cfg: HaraConfig, notify: (m: string) => void, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return false;
   const lastInput = stats.lastInput ?? 0;
   const pct = bar.ctxPctFor(cfg.model, lastInput);
   // Two triggers, whichever hits first: % of window (small-window models) OR an absolute token cap
@@ -966,8 +996,10 @@ async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta:
   const overPct = shouldAutoCompact(pct, history.length, cfg.autoCompact);
   const overCap = shouldAutoCompactTokens(lastInput, history.length, cfg.autoCompact, cap);
   if (!overPct && !overCap) return false;
+  if (signal?.aborted) return false;
   notify(`✻ Auto-compacting conversation (context ${pct}% full, ~${Math.round(lastInput / 1000)}k tok)…`);
-  const summary = await compactConversation(provider, history, meta, stats);
+  const summary = await compactConversation(provider, history, meta, stats, signal);
+  if (signal?.aborted) return false;
   notify(summary ? `(auto-compacted — context replaced with a summary; ${meta.workingSet?.length ?? 0} notes kept)` : "(auto-compact failed — use /compact or /clear)");
   return !!summary;
 }
@@ -982,6 +1014,7 @@ async function runSubagent(
   stats: { input: number; output: number; lastInput?: number },
   task: string,
   roleId?: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   const roles = loadRoles(cwd);
   const roleRef = roleId?.trim();
@@ -1019,8 +1052,9 @@ async function runSubagent(
   const toolFilter = subagentToolFilter(role, (n: string) => READONLY_TOOLS.has(n));
   const subHistory: NeutralMsg[] = [{ role: "user", content: task }];
   const todoScope = `subagent:${randomUUID()}`;
+  let outcome: RunOutcome;
   try {
-    await runAgent(subHistory, {
+    outcome = await runAgent(subHistory, {
       provider,
       ctx: { cwd, sandbox, todoScope }, // isolated checklist; no spawn → no recursion
       approval: "full-auto", // read-only tools, so no prompts (can't prompt in parallel)
@@ -1032,12 +1066,24 @@ async function runSubagent(
       toolFilter,
       hooks: false,
       quiet: true,
+      signal,
+      timeoutMs: Math.min(cfg.runTimeoutMs, 8 * 60_000),
+      maxRounds: Math.min(cfg.maxAgentRounds, 24),
     });
   } finally {
     disposeTodoScope(todoScope);
     disposeReminderScope(todoScope);
     resetRepeatGuard(todoScope);
     clearTouched(todoScope);
+  }
+  if (outcome.status !== "completed") {
+    const reason = outcome.error?.trim()
+      || (outcome.status === "empty"
+        ? "the model returned an empty response"
+        : outcome.stopReason
+          ? `the run stopped (${outcome.stopReason})`
+          : `the run ended with status ${outcome.status}`);
+    return `Error: sub-agent ${reason}`;
   }
   for (let i = subHistory.length - 1; i >= 0; i--) {
     const m = subHistory[i] as { role: string; text?: string };
@@ -1074,8 +1120,9 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
     `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
     `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (cfg.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (cfg.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
+    `${dot} run-limits ${c.bold(formatAgentDuration(cfg.runTimeoutMs))}${c.dim(" total · ")}${c.bold(String(cfg.maxAgentRounds))}${c.dim(" rounds · sub-agents ≤8m/24")}`,
     `${dot} notify ${cfg.notify === "off" ? c.dim("off — hara config set notify bell|system") : c.bold(cfg.notify)}`,
-    `${dot} cron ${(() => { const n = loadJobs().length; return n ? `${n} job(s) · ${isInstalled() ? c.green("scheduler installed") : c.yellow("scheduler off — hara cron install")}` : c.dim("no jobs — hara cron add"); })()}`,
+    `${dot} cron ${(() => { try { const n = loadJobs().length; return n ? `${n} job(s) · ${isInstalled() ? c.green("scheduler installed") : c.yellow("scheduler off — hara cron install")}` : c.dim("no jobs — hara cron add"); } catch { return c.red("job store invalid — run hara cron list"); } })()}`,
     `${dot} input ${cfg.vimMode ? c.bold("vim") + c.dim(" (modal)") : c.dim("default — hara config set vimMode true for vim keys")}`,
   ];
   return lines.join("\n");
@@ -1137,13 +1184,18 @@ program
   .description("analyze the project and (re)generate AGENTS.md")
   .action(async () => {
     const cfg = loadConfig();
+    if (isHomeWorkspace(cfg.cwd)) {
+      out(c.red(homeWorkspaceActionError("initialize AGENTS.md")) + "\n");
+      process.exitCode = 2;
+      return;
+    }
     const provider = await buildProvider(cfg);
     if (!provider) {
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
       process.exit(1);
     }
     out(c.dim("Analyzing project to generate AGENTS.md…\n"));
-    await runInit(provider, cfg.cwd, cfg.sandbox);
+    await runInit(provider, cfg.cwd, cfg.sandbox, cfg);
   });
 
 program
@@ -1164,7 +1216,7 @@ program
 program
   .command("resume [id]")
   .description("resume a session — no id resumes the most recent here (list ids with `hara sessions`)")
-  .action((id?: string) => {
+  .action(async (id?: string) => {
     let full: string | undefined;
     if (id) {
       full = resolveSessionId(id) ?? undefined;
@@ -1181,8 +1233,20 @@ program
       full = latest.meta.id;
     }
     out(c.dim(`↩ resuming ${shortId(full)}…\n`));
-    // reuse the existing --resume path exactly (one engine), inheriting this terminal
-    execFileSync(process.execPath, [process.argv[1], "--resume", full], { stdio: "inherit" });
+    // Reuse the existing --resume path exactly (one engine), inheriting this terminal. selfArgv() inside
+    // runSelfAttached distinguishes node+entry from a Bun-compiled binary (whose argv[1] is a user arg).
+    try {
+      const result = await runSelfAttached(["--resume", full]);
+      if (result.signal) {
+        out(c.yellow(`Resumed Hara process stopped by ${result.signal}.\n`));
+        process.exitCode = 1;
+      } else if (result.code) {
+        process.exitCode = result.code;
+      }
+    } catch (error) {
+      out(c.red(`Could not start the resumed Hara process: ${error instanceof Error ? error.message : String(error)}\n`));
+      process.exitCode = 1;
+    }
   });
 
 program
@@ -1241,7 +1305,7 @@ program
       sandbox: cfg.sandbox,
       approval: "full-auto",
       confirm: async () => true,
-      projectContext: loadAgentsMd(orgCwd) || undefined,
+      projectContext: loadAgentContext(orgCwd) || undefined,
       stats,
       forceRole,
       review: opts2.review,
@@ -1305,7 +1369,7 @@ program
       sandbox: cfg.sandbox,
       approval: "full-auto",
       confirm: async () => true,
-      projectContext: loadAgentsMd(cfg.cwd) || undefined,
+      projectContext: loadAgentContext(cfg.cwd) || undefined,
       stats,
       parallel: opts.parallel,
     };
@@ -1349,6 +1413,18 @@ program
   .option("--all", "index everything")
   .action(async (opts: { repo?: boolean; assets?: boolean; all?: boolean }) => {
     const cfg = loadConfig();
+    const cwd = process.cwd();
+    let doRepo = !!(opts.all || opts.repo || (!opts.assets && !opts.all));
+    const doAssets = !!(opts.all || opts.assets);
+    if (doRepo && isHomeWorkspace(cwd)) {
+      if (!doAssets) {
+        out(c.red(homeWorkspaceActionError("build a repository index")) + "\n");
+        process.exitCode = 2;
+        return;
+      }
+      out(c.yellow(homeWorkspaceActionError("build the repository part of --all")) + c.dim(" Global assets/memory will still be indexed.\n"));
+      doRepo = false;
+    }
     const embed = getEmbedder(cfg);
     if (!embed) {
       out(c.yellow("Semantic search is off — search stays lexical (which still works).\n"));
@@ -1357,10 +1433,7 @@ program
       out(c.dim("  hara config set embedProvider qwen     # DashScope text-embedding-v3 (uses your key)\n"));
       return;
     }
-    const cwd = process.cwd();
     const model = `${cfg.embedProvider}:${cfg.embedModel ?? "default"}`;
-    const doRepo = opts.all || opts.repo || (!opts.assets && !opts.all);
-    const doAssets = opts.all || opts.assets;
     const build = async (name: string, chunks: Chunk[], blurb: string): Promise<void> => {
       if (!chunks.length) return void out(c.dim(`Nothing to index for ${name}.\n`));
       out(c.dim(`Indexing ${chunks.length} ${name} chunks with ${cfg.embedProvider}…\n`));
@@ -1373,10 +1446,36 @@ program
         out(c.dim("Check the embedding endpoint/key; search still works lexically.\n"));
       }
     };
-    if (doRepo) await build("repo", collectRepoChunks(findProjectRoot(cwd)), "codebase_search");
+    const collectionOptions = {
+      maxFiles: 50_000,
+      maxDirectories: 100_000,
+      maxEntries: 500_000,
+      timeoutMs: 60_000,
+      yieldEvery: 128,
+    };
+    const noteTruncation = (name: string, collection: ChunkCollectionResult): void => {
+      if (collection.truncated) {
+        out(c.yellow(`Index collection for ${name} stopped at its ${collection.reason?.replace("_", " ") ?? "safety limit"}; the partial index is not being published.\n`));
+      }
+    };
+    if (doRepo) {
+      const repo = await collectRepoChunksAsync(findProjectRoot(cwd), collectionOptions);
+      noteTruncation("repo", repo);
+      if (!repo.truncated) await build("repo", repo.chunks, "codebase_search");
+    }
     if (doAssets) {
-      await build("assets", [...collectDirChunks(assetsDir(), "code-assets"), ...collectDirChunks(globalSkillsDir(), "skills")], "recall");
-      await build("memory", collectDirChunks(memoryDir("global", cwd), "memory"), "memory_search");
+      const [assets, skills, memory] = await Promise.all([
+        collectDirChunksAsync(assetsDir(), "code-assets", collectionOptions),
+        collectDirChunksAsync(globalSkillsDir(), "skills", collectionOptions),
+        collectDirChunksAsync(memoryDir("global", cwd), "memory", collectionOptions),
+      ]);
+      noteTruncation("assets", assets);
+      noteTruncation("skills", skills);
+      noteTruncation("memory", memory);
+      if (!assets.truncated && !skills.truncated) {
+        await build("assets", [...assets.chunks, ...skills.chunks], "recall");
+      }
+      if (!memory.truncated) await build("memory", memory.chunks, "memory_search");
     }
   });
 
@@ -1818,12 +1917,33 @@ program
 
 program
   .command("gateway")
-  .description("run a chat gateway (Telegram or WeChat) so you can drive your local hara from your phone — opt-in daemon")
+  .description("run a supported chat gateway so you can drive your local hara from your phone — opt-in daemon")
   .option("--platform <name>", "chat platform: telegram | weixin | discord | feishu | slack | mattermost | matrix | dingtalk | wecom | signal", "telegram")
   .option("--login", "(weixin) scan a QR to log in and save credentials, then exit")
+  .option("--recover-outcome <message-id>", "recover exactly one interrupted/terminal run marker by its original platform message id")
+  .option("--confirm-recovery <action:message-id>", "required exact confirmation: terminalize:<id> or delete-terminal:<id>")
   .option("--cwd <dir>", "directory hara operates in per message (default: ~/.hara/workspace)")
   .action(async (opts) => {
     const mod = await import("./gateway/serve.js");
+    if (opts.recoverOutcome !== undefined || opts.confirmRecovery !== undefined) {
+      if (typeof opts.recoverOutcome !== "string" || typeof opts.confirmRecovery !== "string") {
+        throw new Error("gateway outcome recovery requires both --recover-outcome <message-id> and --confirm-recovery <action:message-id>");
+      }
+      const result = await mod.recoverGatewayRunOutcome({
+        platform: opts.platform,
+        messageId: opts.recoverOutcome,
+        confirmation: opts.confirmRecovery,
+      });
+      if (result === "missing") out(c.yellow("No outcome marker exists for that message id and gateway credential.\n"));
+      else if (result === "terminalized") {
+        out(c.green("✓ interrupted marker converted to terminal; one active slot is free and coding remains blocked from rerun.\n"));
+      } else if (result === "already-terminal") {
+        out(c.yellow("Marker is already terminal. Delete it only after platform redelivery is impossible, using delete-terminal:<same-message-id>.\n"));
+      } else {
+        out(c.yellow("✓ terminal marker removed. This message id is no longer protected if the platform redelivers it later.\n"));
+      }
+      return;
+    }
     if (opts.platform === "weixin" && opts.login) {
       await mod.weixinLogin();
       return;
@@ -1885,9 +2005,10 @@ program
             effortLevels: levelsFor(resolvePlatform(live.provider, live.baseURL ?? providerDefaultBaseURL(live.provider)).reasoning).filter((e): e is NonNullable<typeof e> => !!e),
           };
         },
-        spawnSubagent: (provider, scwd, projectContext, stats, task, role) => {
+        runLimits: (targetCwd) => agentRunLimits(loadConfig({ cwd: targetCwd ?? cwd })),
+        spawnSubagent: (provider, scwd, projectContext, stats, task, role, signal) => {
           const live = loadConfig({ cwd: scwd });
-          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role);
+          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role, signal);
         },
         guardian: guardianOpt,
         buildGuardian: async (targetCwd) => {
@@ -2039,9 +2160,10 @@ program
       systemOverride: REVIEW_SYSTEM,
       toolFilter: (n) => READONLY_TOOLS.has(n), // read-only: the reviewer can inspect, never edit
       hooks: false,
-      projectContext: loadAgentsMd(cfg.cwd) || undefined,
+      projectContext: loadAgentContext(cfg.cwd) || undefined,
       memory: memoryDigest(cfg.cwd),
       stats,
+      ...agentRunLimits(cfg),
     });
     if (stats.input || stats.output) out("\n" + statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
@@ -2081,12 +2203,12 @@ program
     const changeInput = commitMessageInput(staged);
     if (!changeInput.trim()) return void out(c.dim("Nothing staged. Stage changes with `git add`, or use `hara commit -a`.\n"));
     out(c.dim("Writing a commit message…\n"));
-    const r = await provider.turn({
+    const r = await boundedProviderTurn(provider, {
       system: COMMIT_SYSTEM,
       history: [{ role: "user", content: `Write a commit message for these staged changes:\n\n${changeInput.slice(0, 120_000)}` }],
       tools: [],
       onText: () => {},
-    });
+    }, { timeoutMs: 30_000, label: "commit message generation" });
     if (r.stop === "error") return void out(c.red(`message generation failed: ${r.errorMsg ?? "provider error"}\n`));
     const msg = r.text.trim().replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
     if (!msg) return void out(c.red("No commit message produced — commit manually or retry.\n"));
@@ -2118,14 +2240,29 @@ program
   });
 
 function renderCronJobs(): string {
-  const jobs = loadJobs();
   const head = isInstalled() ? c.green("scheduler: installed") : c.yellow("scheduler: NOT installed — run `hara cron install`");
+  let jobs: CronJob[];
+  try {
+    jobs = loadJobs();
+  } catch (error) {
+    return head + "\n" + c.red(`${error instanceof Error ? error.message : String(error)}\n`);
+  }
   if (!jobs.length) return head + "\n" + c.dim('No jobs. Add one:  hara cron add "every 1h" "<task>"\n');
   const now = Date.now();
   const lines = jobs.map((j) => {
     const nxt = nextRun(j, now);
-    const status = j.lastStatus ? (j.lastStatus === "ok" ? c.green("ok") : c.red("err")) : c.dim("—");
-    return `${c.bold(j.id)} ${describeSchedule(j.schedule)} ${c.dim(`· ${j.mode} · next ${nxt ? new Date(nxt).toLocaleString() : "—"} · last ${status}`)}${j.enabled ? "" : c.dim(" [disabled]")}\n   ${c.dim(j.name)}`;
+    const nextLabel = nxt !== null && nxt <= now ? "due now" : nxt !== null ? new Date(nxt).toLocaleString() : "—";
+    const elapsed = j.lastDurationMs === undefined ? "" : ` after ${formatAgentDuration(j.lastDurationMs)}`;
+    const status = j.lastStatus === "running"
+      ? c.yellow(`running since ${new Date(j.runningSince ?? j.lastRunAt ?? now).toLocaleString()}`)
+      : j.lastStatus === "timed_out"
+        ? c.red(`timed out${elapsed}`)
+        : j.lastStatus === "ok"
+          ? c.green(`ok${elapsed}`)
+          : j.lastStatus === "error"
+            ? c.red(`err${elapsed}`)
+            : c.dim("—");
+    return `${c.bold(j.id)} ${describeSchedule(j.schedule)} ${c.dim(`· ${j.mode} · next ${nextLabel} · last ${status}`)}${j.enabled ? "" : c.dim(" [disabled]")}\n   ${c.dim(j.name)}`;
   });
   return head + "\n" + lines.join("\n") + "\n";
 }
@@ -2139,7 +2276,8 @@ cronCmd
   .option("--command", "run the task as a plain SHELL COMMAND — deterministic, no agent, no tokens")
   .option("--tz <zone>", 'IANA timezone for cron exprs (e.g. "Asia/Shanghai"); default = local time')
   .option("--deliver <spec>", "push each run's result: telegram:<chatId> | feishu:<chatId> | webhook:<url>")
-  .action((schedule: string, taskParts: string[], opts: { name?: string; org?: boolean; command?: boolean; tz?: string; deliver?: string }) => {
+  .option("--alert-after <n>", "send a 🚨 after N consecutive failures (1..1000; default 3)")
+  .action((schedule: string, taskParts: string[], opts: { name?: string; org?: boolean; command?: boolean; tz?: string; deliver?: string; alertAfter?: string }) => {
     const task = taskParts.join(" ");
     if (opts.org && opts.command) return void out(c.red("--org and --command are mutually exclusive\n"));
     const sched = parseSchedule(schedule, Date.now());
@@ -2150,26 +2288,64 @@ cronCmd
       const d = parseDeliver(opts.deliver);
       if ("error" in d) return void out(c.red(d.error + "\n"));
     }
+    const alertAfter = opts.alertAfter === undefined ? undefined : Number(opts.alertAfter);
+    if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
+      return void out(c.red("--alert-after must be an integer from 1 to 1000\n"));
+    }
     const mode = opts.command ? ("command" as const) : opts.org ? ("org" as const) : ("print" as const);
-    const job = addJob({
-      name: opts.name || task.slice(0, 48),
-      schedule: sched,
-      task,
-      mode,
-      cwd: process.cwd(),
-      ...(opts.tz ? { tz: opts.tz } : {}),
-      ...(opts.deliver ? { deliver: opts.deliver } : {}),
-      createdAt: Date.now(),
-    });
-    out(c.green(`✓ scheduled ${job.id}`) + c.dim(` · ${describeSchedule(sched)}${opts.tz ? ` @ ${opts.tz}` : ""} · ${job.mode}${opts.deliver ? ` · → ${opts.deliver}` : ""} · cwd ${job.cwd}\n`));
+    let job: CronJob;
+    try {
+      job = addJob({
+        name: opts.name || task.slice(0, 48),
+        schedule: sched,
+        task,
+        mode,
+        cwd: process.cwd(),
+        ...(opts.tz ? { tz: opts.tz } : {}),
+        ...(opts.deliver ? { deliver: opts.deliver } : {}),
+        ...(alertAfter !== undefined ? { alertAfter } : {}),
+        createdAt: Date.now(),
+      });
+    } catch (error) {
+      return void out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
+    }
+    out(c.green(`✓ scheduled ${job.id}`) + c.dim(` · ${describeSchedule(sched)}${opts.tz ? ` @ ${opts.tz}` : ""} · ${job.mode}${opts.deliver ? ` · → ${opts.deliver}` : ""}${alertAfter !== undefined ? ` · alert ≥${alertAfter}` : ""} · cwd ${job.cwd}\n`));
     if (!isInstalled()) out(c.yellow("⚠ scheduler not installed yet — run `hara cron install` so jobs actually fire.\n"));
   });
 // Resolve an id/prefix to one job, printing a clear error for none / ambiguous (never act on a guess).
 const cronResolve = (id: string): CronJob | null => {
-  const r = resolveJob(id);
+  let r: ReturnType<typeof resolveJob>;
+  try {
+    r = resolveJob(id);
+  } catch (error) {
+    out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
+    return null;
+  }
   if (r === "ambiguous") return void out(c.red(`ambiguous id "${id}" — matches multiple jobs; type more characters\n`)), null;
   if (!r) return void out(c.red(`no such job: ${id}\n`)), null;
   return r;
+};
+/** Commander actions otherwise inherit Node's default SIGTERM/SIGINT exit, which kills only the tick parent
+ * and can orphan its detached job process group. Convert the signal into cooperative cancellation, await
+ * tree cleanup + lock release, then retain the conventional shell exit status. */
+const withCronCliSignal = async <T>(run: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+  const controller = new AbortController();
+  let interrupted: NodeJS.Signals | undefined;
+  const stop = (signal: NodeJS.Signals): void => {
+    interrupted ??= signal;
+    if (!controller.signal.aborted) controller.abort(new Error(`cron command interrupted by ${signal}`));
+  };
+  const onInt = (): void => stop("SIGINT");
+  const onTerm = (): void => stop("SIGTERM");
+  process.once("SIGINT", onInt);
+  process.once("SIGTERM", onTerm);
+  try {
+    return await run(controller.signal);
+  } finally {
+    process.removeListener("SIGINT", onInt);
+    process.removeListener("SIGTERM", onTerm);
+    if (interrupted) process.exitCode = interrupted === "SIGINT" ? 130 : 143;
+  }
 };
 cronCmd.command("list").alias("ls").description("list scheduled jobs").action(() => out(renderCronJobs()));
 cronCmd
@@ -2201,16 +2377,16 @@ cronCmd
     const job = cronResolve(id);
     if (!job) return;
     out(c.dim(`running ${job.id} (${job.name})…\n`));
-    const r = await runJobOnce(job);
-    recordRun(job.id, Date.now(), r.ok ? "ok" : "error", r.error);
+    const r = await withCronCliSignal((signal) => runJobTracked(job, { signal }));
     out((r.ok ? c.green("✓ done") : c.red(`✗ ${r.error}`)) + c.dim(` · log: ${logPath(job.id)}\n`));
   });
 cronCmd
   .command("tick")
   .description("run all due jobs now (your OS scheduler calls this every minute)")
   .action(async () => {
-    const r = await runTick(Date.now());
+    const r = await withCronCliSignal((signal) => runTick(Date.now(), undefined, { signal }));
     if (r.skipped) return void out(c.dim(`(skipped — ${r.skipped})\n`));
+    if (r.stopped) return void out(c.yellow(`(stopped — ${r.stopped}; ran ${r.ran.length} job(s): ${r.ran.join(", ") || "none"})\n`));
     out(c.dim(r.ran.length ? `ran ${r.ran.length} job(s): ${r.ran.join(", ")}\n` : "(no jobs due)\n"));
   });
 cronCmd
@@ -2273,6 +2449,7 @@ memoryCmd
       toolFilter: (n) => n === "memory_write" || READONLY_TOOLS.has(n),
       systemOverride: MEMORY_DISTILL_SYSTEM,
       stats,
+      ...agentRunLimits(cfg),
     });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
@@ -2545,6 +2722,20 @@ config
       out(c.red(`Invalid reasoning effort. One of: ${REASONING_EFFORTS.join(", ")}.\n`));
       process.exit(1);
     }
+    if (key === "runTimeoutMs") {
+      const parsed = parseAgentRunTimeoutMs(value);
+      if (parsed === undefined || parsed < MIN_AGENT_RUN_TIMEOUT_MS || parsed > MAX_AGENT_RUN_TIMEOUT_MS) {
+        out(c.red("Invalid runTimeoutMs. Use 1s..2h, for example `30m`, `90s`, or milliseconds.\n"));
+        process.exit(1);
+      }
+    }
+    if (key === "maxAgentRounds") {
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_AGENT_MAX_ROUNDS) {
+        out(c.red(`Invalid maxAgentRounds. Use an integer from 1 to ${MAX_AGENT_MAX_ROUNDS}.\n`));
+        process.exit(1);
+      }
+    }
     writeConfigValue(key, value);
     out(c.green(`Set ${key} → ${configPath()}\n`));
   });
@@ -2563,6 +2754,8 @@ config
           `baseURL:  ${raw.baseURL ?? "(provider default)"}\n` +
           `approval: ${raw.approval ?? "(default suggest)"}\n` +
           `sandbox:  ${raw.sandbox ?? "(default off)"}\n` +
+          `timeout:  ${raw.runTimeoutMs ?? "(default 30m)"}\n` +
+          `rounds:   ${raw.maxAgentRounds ?? "(default 64)"}\n` +
           `apiKey:   ${maskKey(raw.apiKey)}\n`,
       );
     }
@@ -2604,6 +2797,7 @@ program.action(async (opts) => {
   }
   const cfg = loadConfig({ overlay: opts.overlay, ...(requestedHeadlessAgent?.home ? { cwd: requestedHeadlessAgent.home } : {}) });
   const cwd = cfg.cwd;
+  const homeWorkspace = isHomeWorkspace(cwd);
   // Resolve the concrete role before constructing any user/plugin MCP transport. MCP servers are arbitrary
   // stdio subprocesses, so a read-only persona must not start them merely by launching a turn. Reusing this
   // object later also closes the resolve→connect→re-resolve race where a role could disappear or change policy.
@@ -2735,12 +2929,18 @@ program.action(async (opts) => {
   // one-shot
   if (opts.print) {
     let headlessLockId: string | null = null;
+    const pendingHeadlessOperations = new Set<Promise<unknown>>();
+    const trackHeadlessOperation = (operation: Promise<unknown>): void => {
+      pendingHeadlessOperations.add(operation);
+      const settled = (): void => { pendingHeadlessOperations.delete(operation); };
+      void operation.then(settled, settled);
+    };
     try {
-    const projectContext = loadAgentsMd(cwd) || undefined;
+    const projectContext = loadAgentContext(cwd) || undefined;
     // Vision sidecar for headless runs (gateway/cron): without it the computer tool's screenshots come back
     // "configure a vision model" even when one is set, leaving a headless agent blind. Mirrors the interactive
     // describeScreenshot — a configured visionModel, else the main model if it's vision-capable.
-    const describeImage = async (path: string, hint?: string): Promise<string> => {
+    const describeImage = async (path: string, hint?: string, signal?: AbortSignal): Promise<string> => {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
       const vp = cfg.visionModel
         ? ((await buildProvider({ ...cfg, model: cfg.visionModel, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey })) ?? null)
@@ -2749,7 +2949,7 @@ program.action(async (opts) => {
           : null;
       if (!vp) return "";
       try {
-        return await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint });
+        return await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
       } catch {
         return "";
       }
@@ -2881,7 +3081,7 @@ program.action(async (opts) => {
     // Inbound images (gateway): the platform downloaded the user's photo(s) and passed their paths via env.
     // Let the agent actually SEE them — attached inline for a vision-capable main model, else described via the
     // visionModel sidecar and folded into the message (text-only models can't take image blocks).
-    const userText = expandMentions(String(opts.print), cwd) + (schemaObj ? STRUCTURED_INSTRUCTION : "");
+    const userText = await expandMentionsAsync(String(opts.print), cwd) + (schemaObj ? STRUCTURED_INSTRUCTION : "");
     const inboundImgs = (process.env.HARA_GATEWAY_IMAGES ?? "")
       .split("\n")
       .map((s) => s.trim())
@@ -2932,7 +3132,7 @@ program.action(async (opts) => {
     let structuredSet = false;
     const printRunOpts = {
       provider: headlessProvider,
-      ctx: { cwd, sandbox, spawn: (t: string, role?: string) => runSubagent(cfg, headlessProvider, cwd, sandbox, projectContext, stats, t, role), describeImage },
+      ctx: { cwd, sandbox, spawn: (t: string, role?: string, signal?: AbortSignal) => runSubagent(cfg, headlessProvider, cwd, sandbox, projectContext, stats, t, role, signal), describeImage },
       approval: "full-auto" as const,
       confirm: async () => true,
       projectContext,
@@ -2942,6 +3142,9 @@ program.action(async (opts) => {
       hooks: headlessHooks,
       stats,
       guardian: guardianOpt, // safety layer stays on in headless -p (fail-open; breaker aborts, never hangs)
+      onProviderTurn: trackHeadlessOperation,
+      onToolRun: trackHeadlessOperation,
+      ...agentRunLimits(cfg),
       ...(schemaObj
         ? {
             extraTools: [structuredOutputTool(schemaObj, (v: unknown) => ((structured = v), (structuredSet = true)))],
@@ -2978,14 +3181,27 @@ program.action(async (opts) => {
     if (meta) {
       // Long-session safety: auto-compact before saving so a long chat/cron thread never overflows context.
       // Silent (no-op notify) in headless mode so nothing leaks into a captured -p reply. Opt-out via config.
-      await maybeAutoCompact(headlessProvider, history, meta, stats, cfg, () => {});
+      if (runOutcome.status === "completed") {
+        await maybeAutoCompact(headlessProvider, history, meta, stats, cfg, () => {});
+      }
       saveSession(meta, history); // persist when resuming/continuing; plain -p stays stateless
     }
     if (!schemaObj && runOutcome.status === "completed" && (stats.input || stats.output)) out(statusLine(headlessProvider.model, stats.input, stats.output) + "\n");
     await closeMcp();
     return;
     } finally {
-      if (headlessLockId) releaseSessionLock(headlessLockId);
+      if (headlessLockId) {
+        const lockId = headlessLockId;
+        if (pendingHeadlessOperations.size) {
+          // Do not await here: the logical deadline stays hard. A late operation with active handles keeps
+          // this process (and therefore its cross-process session lease) alive until physical settlement.
+          // A truly inert never-settling Promise has no side effect/handle, so normal process exit makes the
+          // PID-backed lease safely reclaimable.
+          void Promise.allSettled([...pendingHeadlessOperations]).then(() => releaseSessionLock(lockId));
+        } else {
+          releaseSessionLock(lockId);
+        }
+      }
       await closeMcp();
     }
   }
@@ -2993,6 +3209,9 @@ program.action(async (opts) => {
   // interactive REPL — ink TUI by default on a real terminal; HARA_TUI=0 forces the classic readline path
   const useTui = stdin.isTTY && stdout.isTTY && process.env.HARA_TUI !== "0";
   out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}${sandbox !== "off" ? `  ·  sandbox:${sandbox}` : ""}  ·  ${cwd}\n`));
+  if (homeWorkspace) {
+    out(c.yellow("⚠ Home directory is not treated as a project workspace. Run `cd /path/to/project`; recursive project scans are disabled here.\n"));
+  }
   // Startup update notice — cache-driven (a previous session's background probe), so it costs zero
   // latency; today's probe (if due) fires in the background for the NEXT launch. TTY sessions only.
   if (cfg.updateCheck && stdout.isTTY) {
@@ -3011,16 +3230,21 @@ program.action(async (opts) => {
       return mentionCompleter(line, cwd);
     },
   });
-  const confirm = async (q: string) => (await rl.question(`${q} ${c.dim("[y/N]")} `)).trim().toLowerCase().startsWith("y");
+  const confirm = async (q: string, signal?: AbortSignal) => {
+    const prompt = `${q} ${c.dim("[y/N]")} `;
+    const answer = signal ? await rl.question(prompt, { signal }) : await rl.question(prompt);
+    return answer.trim().toLowerCase().startsWith("y");
+  };
   // ask_user (classic REPL): print the question + a numbered menu (matching the setup menu look) and read the
   // answer through the SAME rl.question channel confirm uses. A bare option number selects it; any other text
   // is taken as a free-text answer — so the user can always type their own response.
-  const askUser = async (q: string, options?: string[]): Promise<string> => {
+  const askUser = async (q: string, options?: string[], signal?: AbortSignal): Promise<string> => {
     out(c.bold("\n? ") + q + "\n");
     const opts = (options ?? []).map((o) => o.trim()).filter(Boolean);
     opts.forEach((o, i) => out(`  ${c.bold(String(i + 1))}) ${o}\n`));
     const hint = opts.length ? c.dim(`(1-${opts.length} to pick, or type your own answer) `) : c.dim("(type your answer) ");
-    const raw = (await rl.question(`${c.cyan("›")} ${hint}`)).trim();
+    const prompt = `${c.cyan("›")} ${hint}`;
+    const raw = (signal ? await rl.question(prompt, { signal }) : await rl.question(prompt)).trim();
     if (opts.length) {
       const n = Number.parseInt(raw, 10);
       if (Number.isInteger(n) && n >= 1 && n <= opts.length) return opts[n - 1];
@@ -3048,19 +3272,19 @@ program.action(async (opts) => {
   // First-run AGENTS.md offer — classic REPL only. In TUI mode we must NOT call rl.question before ink
   // mounts: a readline question puts stdin in a state ink can't read from, leaving the input box dead
   // (the TUI shows a `/init` tip instead, below). See the `tip` in the runTui header.
-  if (!hasAgentsMd(cwd) && !useTui) {
+  if (!homeWorkspace && !hasAgentsMd(cwd) && !useTui) {
     const ans = (await rl.question(`${c.dim("No AGENTS.md here — analyze this project and create one?")} ${c.dim("[Y/n]")} `)).trim().toLowerCase();
     if (ans === "" || ans.startsWith("y")) {
       out(c.dim("Analyzing project…\n"));
       try {
-        await runInit(provider, cwd, sandbox);
+        await runInit(provider, cwd, sandbox, cfg);
       } catch (e: any) {
         out(c.red(`[init error] ${e.message}\n`));
       }
     }
   }
-  let projectContext = loadAgentsMd(cwd) || undefined;
-  const spawn = (t: string, role?: string) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role);
+  let projectContext = loadAgentContext(cwd) || undefined;
+  const spawn = (t: string, role?: string, signal?: AbortSignal) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role, signal);
 
   // session: --resume <id> / --continue (latest in this cwd) / new
   let resumeId: string | null = null;
@@ -3188,8 +3412,8 @@ program.action(async (opts) => {
       run: async () => {
         out(c.dim("Analyzing project…\n"));
         try {
-          await runInit(provider, cwd, sandbox);
-          projectContext = loadAgentsMd(cwd) || undefined;
+          await runInit(provider, cwd, sandbox, cfg);
+          projectContext = loadAgentContext(cwd) || undefined;
           out(c.green("AGENTS.md updated.\n"));
         } catch (e: any) {
           out(c.red(`[init error] ${e.message}\n`));
@@ -3382,7 +3606,14 @@ program.action(async (opts) => {
       desc: "summarize the conversation so far to free up context",
       run: async () => {
         out(c.dim("Compacting…\n"));
-        const summary = await compactConversation(provider, history, meta, stats);
+        const compactTurn = new AbortController();
+        currentTurn = compactTurn;
+        let summary: string | null = null;
+        try {
+          summary = await compactConversation(provider, history, meta, stats, compactTurn.signal);
+        } finally {
+          if (currentTurn === compactTurn) currentTurn = null;
+        }
         out(summary ? c.green(`(compacted — ${summary.length} chars; context replaced with the summary)\n`) : c.dim("(nothing to compact / compact failed)\n"));
       },
     },
@@ -3438,15 +3669,15 @@ program.action(async (opts) => {
     // First-run AGENTS.md offer — via a tiny ink prompt, NOT readline. A readline question before the
     // main TUI leaves stdin unreadable by ink (dead input box); ink cleans up on unmount, so the TUI
     // mounted right after gets working input. Runs before mount, like the classic path.
-    if (!hasAgentsMd(cwd)) {
+    if (!homeWorkspace && !hasAgentsMd(cwd)) {
       if (await askConfirm("No AGENTS.md here — analyze this project and create one?")) {
         out(c.dim("Analyzing project…\n"));
         try {
-          await runInit(provider, cwd, sandbox);
+          await runInit(provider, cwd, sandbox, cfg);
         } catch (e: any) {
           out(c.red(`[init error] ${e.message}\n`));
         }
-        projectContext = loadAgentsMd(cwd) || undefined;
+        projectContext = loadAgentContext(cwd) || undefined;
       }
     }
     setTheme(cfg.theme);
@@ -3461,24 +3692,24 @@ program.action(async (opts) => {
     // lets the computer tool return a screenshot as text (describe via the vision sidecar / a vision main model).
     // Uses the screenshot-tuned prompt (actionable UI elements + positions) + an optional focus hint, so a
     // text-only main model gets something it can click on rather than a generic transcription.
-    const describeScreenshot = async (path: string, hint?: string): Promise<string> => {
+    const describeScreenshot = async (path: string, hint?: string, signal?: AbortSignal): Promise<string> => {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
       const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
       if (!vp) return "";
       try {
-        return await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint });
+        return await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
       } catch {
         return "";
       }
     };
     // grounding for accurate RPA: ask the vision model WHERE an element is (0..1 fractions) so the computer
     // tool can click it precisely instead of guessing pixels from a text description.
-    const locateScreenshot = async (path: string, target: string): Promise<{ x: number; y: number } | null> => {
+    const locateScreenshot = async (path: string, target: string, signal?: AbortSignal): Promise<{ x: number; y: number } | null> => {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
       const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
       if (!vp) return null;
       try {
-        return await locateImage(vp, { path, mediaType: "image/png" }, target);
+        return await locateImage(vp, { path, mediaType: "image/png" }, target, { signal });
       } catch {
         return null;
       }
@@ -3565,7 +3796,7 @@ program.action(async (opts) => {
         version: pkg.version,
         modelLabel: `${cfg.provider}:${cfg.model}`,
         cwd,
-        agentsMdLoaded: !!projectContext,
+        agentsMdLoaded: hasAgentsMd(cwd),
         session: meta.id,
         kind: __activeP.kind === "gateway" ? "org" : "personal",
         profileId: __activeP.kind === "gateway" || __activeP.id === PERSONAL_ID ? undefined : __activeP.id,
@@ -3577,6 +3808,9 @@ program.action(async (opts) => {
         // the pre-mount stdout notice (line ~2497) doesn't survive ink taking the screen — TUI users
         // never saw update notices and versions silently went stale (field report: stuck on 0.112.5)
         updateNotice: cfg.updateCheck ? (checkForUpdate(pkg.version) ?? undefined) : undefined,
+        workspaceNotice: homeWorkspace
+          ? "Home is not a project workspace · cd /path/to/project (recursive scans disabled here)"
+          : undefined,
       },
       visionNotice: __visionNotice,
       cycleApproval: (m) => cycleMode(m),
@@ -3602,6 +3836,7 @@ program.action(async (opts) => {
                   memory: buildMemory(),
                   stats,
                   signal: h.signal,
+                  ...agentRunLimits(cfg),
                 });
                 saveSession(meta, history);
               } catch {
@@ -3709,9 +3944,10 @@ program.action(async (opts) => {
             if (history.length < 2) return void h.sink.notice("(nothing to compact)");
             h.sink.notice("✻ compacting…");
             const cui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
+            let distillOutcome: RunOutcome | undefined;
             if (cfg.evolve !== "off") {
               try {
-                await runAgent(history, {
+                distillOutcome = await runAgent(history, {
                   provider,
                   ctx: { cwd, sandbox, spawn, ui: cui },
                   approval: cfg.assetCapture === "auto" ? "full-auto" : "suggest", // ask → prompt before each save; auto → silent
@@ -3721,12 +3957,16 @@ program.action(async (opts) => {
                   memory: buildMemory(),
                   stats,
                   signal: h.signal,
+                  ...agentRunLimits(cfg),
                 });
               } catch {
-                /* flush is best-effort */
+                return void h.sink.notice("(compact cancelled — memory distillation did not complete)");
               }
             }
-            const summary = await compactConversation(provider, history, meta, stats);
+            if (h.signal.aborted || (distillOutcome && distillOutcome.status !== "completed")) {
+              return void h.sink.notice("(compact cancelled — memory distillation was interrupted)");
+            }
+            const summary = await compactConversation(provider, history, meta, stats, h.signal);
             return void h.sink.notice(summary ? `(compacted — kept ${meta.workingSet?.length ?? 0} working-memory notes)` : "(nothing to compact / compact failed)");
           }
           if (nm === "sessions") {
@@ -3777,7 +4017,7 @@ program.action(async (opts) => {
           }
           if (nm === "commit") {
             h.sink.notice("✻ writing a commit message…");
-            const r = await autoCommit(provider, cwd); // stages all + commits with an AI message
+            const r = await autoCommit(provider, cwd, h.signal); // stages all + commits with an AI message
             return void h.sink.notice(r.startsWith("error:") ? `✗ ${r}` : r === "nothing to commit" ? "(nothing to commit — make or stage changes first)" : `✓ committed · ${r.slice(0, 100)}`);
           }
           if (nm === "review") {
@@ -3803,6 +4043,7 @@ program.action(async (opts) => {
               memory: buildMemory(),
               stats,
               signal: h.signal,
+              ...agentRunLimits(cfg),
             });
             h.sink.usage(stats.input - xin, stats.output - xout);
             return;
@@ -3825,13 +4066,14 @@ program.action(async (opts) => {
               // ApprovalMode (no "plan"). Inside a /<skill> kickoff "plan" wouldn't make sense anyway —
               // fall back to "suggest" so we keep the user's confirm gate without crashing the type check.
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
+              let skillOutcome: RunOutcome | undefined;
               try {
-                await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
-              if (!meta.title) {
-                meta.title = await nameSession(provider, history);
+              if (!meta.title && skillOutcome?.status === "completed" && !h.signal.aborted) {
+                meta.title = await nameSession(provider, history, h.signal);
                 h.sink.session(meta.title);
               }
               h.sink.usage(stats.input - skin, stats.output - skout);
@@ -3854,7 +4096,7 @@ program.action(async (opts) => {
           const out: NeutralMsg[] = [];
           for (const it of h.drainQueue()) {
             const r2 = await resolveImages(it.images, h);
-            const body = expandMentions(it.line, cwd) + (r2.skip ? "" : (r2.extraText ?? ""));
+            const body = await expandMentionsAsync(it.line, cwd, { signal: h.signal }) + (r2.skip ? "" : (r2.extraText ?? ""));
             const attach = !r2.skip && r2.attach?.length ? r2.attach : undefined;
             if (!body.trim() && !attach) continue; // image-only message whose image was skipped → nothing to add
             out.push({ role: "user", content: `${INTERJECT_PREFIX}\n\n${body}`, ...(attach ? { images: attach } : {}) });
@@ -3868,7 +4110,7 @@ program.action(async (opts) => {
           // investigation / Q&A end back at the input, still in plan mode, with no nagging.
           const planImg = await resolveImages(images, h);
           if (planImg.skip) return;
-          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + (planImg.extraText ?? ""), ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
+          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (planImg.extraText ?? ""), ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
           recalledContext = "";
           const pin = stats.input;
           const pout = stats.output;
@@ -3888,7 +4130,7 @@ program.action(async (opts) => {
               return "Plan submitted to the user for approval. Stop now and wait for their decision — do not keep working.";
             },
           };
-          await runAgent(history, {
+          let planOutcome = await runAgent(history, {
             provider,
             ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
             approval: "suggest",
@@ -3902,16 +4144,28 @@ program.action(async (opts) => {
             stats,
             signal: h.signal,
             pendingInput,
+            ...agentRunLimits(cfg),
           });
-          if (!meta.title) {
-            meta.title = await nameSession(provider, history);
+          if (!meta.title && planOutcome.status === "completed" && !h.signal.aborted) {
+            meta.title = await nameSession(provider, history, h.signal);
             h.sink.session(meta.title);
           }
           h.sink.usage(stats.input - pin, stats.output - pout);
           saveSession(meta, history);
+          if (planOutcome.status !== "completed" || h.signal.aborted) {
+            notifyDone(cfg.notify, {
+              message: planOutcome.error ?? "plan turn did not complete",
+              elapsedMs: Date.now() - turnStart,
+              minMs: 0,
+            });
+            return;
+          }
           if (!proposedPlan) {
             // No exit_plan this turn — the model was investigating or answering. Stay in plan mode quietly.
-            notifyDone(cfg.notify, { message: meta.title || "plan turn complete", elapsedMs: Date.now() - turnStart });
+            notifyDone(cfg.notify, {
+              message: meta.title || "plan turn complete",
+              elapsedMs: Date.now() - turnStart,
+            });
             return;
           }
           const choice = await h.select("hara has a plan — proceed?", [
@@ -3924,7 +4178,7 @@ program.action(async (opts) => {
             history.push({ role: "user", content: "Proceed: execute the plan above." });
             const xin = stats.input;
             const xout = stats.output;
-            await runAgent(history, {
+            planOutcome = await runAgent(history, {
               provider,
               ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
               approval: choice as ApprovalMode,
@@ -3936,22 +4190,27 @@ program.action(async (opts) => {
               signal: h.signal,
               pendingInput,
               guardian: guardianOpt,
+              ...agentRunLimits(cfg),
             });
             h.sink.usage(stats.input - xin, stats.output - xout);
             saveSession(meta, history);
           }
-          notifyDone(cfg.notify, { message: meta.title || "plan turn complete", elapsedMs: Date.now() - turnStart });
+          notifyDone(cfg.notify, {
+            message: planOutcome.status === "halted" ? (planOutcome.error ?? "agent run halted") : (meta.title || "plan turn complete"),
+            elapsedMs: Date.now() - turnStart,
+            minMs: planOutcome.status === "halted" ? 0 : undefined,
+          });
           return;
         }
         const ri = await resolveImages(images, h);
         if (ri.skip) return;
-        const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd) + (ri.extraText ?? "");
+        const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (ri.extraText ?? "");
         recalledContext = "";
         history.push({ role: "user", content: userContent, ...(ri.attach?.length ? { images: ri.attach } : {}) });
         if (cfg.fileCheckpoints) checkpoint(cwd, line.slice(0, 80)); // shadow-git snapshot before the turn mutates
         const beforeIn = stats.input;
         const beforeOut = stats.output;
-        await runAgent(history, {
+        const turnOutcome = await runAgent(history, {
           provider,
           ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
           approval: appr,
@@ -3964,15 +4223,22 @@ program.action(async (opts) => {
           pendingInput,
           fallback: fbOpt,
           guardian: guardianOpt,
+          ...agentRunLimits(cfg),
         });
-        if (!meta.title) {
-          meta.title = await nameSession(provider, history);
+        if (!meta.title && turnOutcome.status === "completed" && !h.signal.aborted) {
+          meta.title = await nameSession(provider, history, h.signal);
           h.sink.session(meta.title);
         }
         h.sink.usage(stats.input - beforeIn, stats.output - beforeOut);
-        notifyDone(cfg.notify, { message: meta.title || "turn complete", elapsedMs: Date.now() - turnStart });
+        notifyDone(cfg.notify, {
+          message: turnOutcome.status === "halted" ? (turnOutcome.error ?? "agent run halted") : (meta.title || "turn complete"),
+          elapsedMs: Date.now() - turnStart,
+          minMs: turnOutcome.status === "halted" ? 0 : undefined,
+        });
         saveSession(meta, history);
-        await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => h.sink.notice(m));
+        if (turnOutcome.status === "completed" && !h.signal.aborted) {
+          await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => h.sink.notice(m), h.signal);
+        }
       },
     });
     // Only claim "saved · resume" if a turn actually persisted the session. A zero-turn session (opened,
@@ -3984,7 +4250,7 @@ program.action(async (opts) => {
     process.exit(0); // TUI done — exit cleanly (ink can leave stdin referenced)
   }
 
-  out(c.dim(`Type a task. /help · @path attaches a file · shift+tab cycles mode · Esc interrupts · /exit to quit.${projectContext ? "  (AGENTS.md loaded)" : ""}\n\n`));
+  out(c.dim(`Type a task. /help · @path attaches a file · shift+tab cycles mode · Esc interrupts · /exit to quit.${hasAgentsMd(cwd) ? "  (AGENTS.md loaded)" : ""}\n\n`));
 
   bar.install({ sessionName: meta.title || shortId(meta.id), model: cfg.model, approval, input: stats.input, output: stats.output, profileId: __activeP.id, profileKind: __activeP.kind });
   process.on("exit", () => {
@@ -4019,16 +4285,22 @@ program.action(async (opts) => {
             role: "user",
             content: `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest.length ? ` — request: ${rest.join(" ")}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`,
           });
-          currentTurn = new AbortController();
+          const skillTurn = new AbortController();
+          currentTurn = skillTurn;
+          let skillOutcome: RunOutcome | undefined;
           try {
-            await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt, guardian: guardianOpt });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
-          } finally {
-            currentTurn = null;
           }
-          if (!meta.title) meta.title = await nameSession(provider, history);
-          saveSession(meta, history);
+          try {
+            if (!meta.title && skillOutcome?.status === "completed" && !skillTurn.signal.aborted) {
+              meta.title = await nameSession(provider, history, skillTurn.signal);
+            }
+            saveSession(meta, history);
+          } finally {
+            if (currentTurn === skillTurn) currentTurn = null;
+          }
           continue;
         }
         const near = nearest(name, [...byName.keys()]);
@@ -4041,35 +4313,48 @@ program.action(async (opts) => {
       continue;
     }
     line = inlineLeadingPath(line, existsSync); // leading dropped file path → @-mention so it's read in
-    const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + expandMentions(line, cwd);
+    const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd);
     recalledContext = "";
     history.push({ role: "user", content: userContent });
     if (cfg.fileCheckpoints) checkpoint(cwd, userContent.slice(0, 80)); // shadow-git snapshot before the turn mutates
-    currentTurn = new AbortController();
+    const turnController = new AbortController();
+    currentTurn = turnController;
     const t0 = Date.now();
+    let turnOutcome: RunOutcome | undefined;
     try {
-      await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: currentTurn.signal, fallback: fbOpt, guardian: guardianOpt });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
+    }
+    notifyDone(cfg.notify, {
+      message: turnOutcome?.status === "halted" ? (turnOutcome.error ?? "agent run halted") : (meta.title || "turn complete"),
+      elapsedMs: Date.now() - t0,
+      minMs: turnOutcome?.status === "halted" ? 0 : undefined,
+    });
+    try {
+      if (!meta.title && turnOutcome?.status === "completed" && !turnController.signal.aborted) {
+        meta.title = await nameSession(provider, history, turnController.signal);
+      }
+      if (bar.isActive()) {
+        bar.update({
+          sessionName: meta.title,
+          input: stats.input,
+          output: stats.output,
+          ctxPct: bar.ctxPctFor(cfg.model, stats.lastInput ?? 0),
+        });
+      } else {
+        out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
+      }
+      saveSession(meta, history);
+      const compacted = turnOutcome?.status === "completed" && !turnController.signal.aborted
+        ? await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => out(c.dim(`${m}\n`)), turnController.signal)
+        : false;
+      if (!compacted) {
+        const ctxPct = bar.ctxPctFor(cfg.model, stats.lastInput ?? 0);
+        if (ctxPct >= 80) out(c.yellow(`  ⚠ context ${ctxPct}% full — /compact to summarize, or /clear to reset\n`));
+      }
     } finally {
-      currentTurn = null;
-    }
-    notifyDone(cfg.notify, { message: meta.title || "turn complete", elapsedMs: Date.now() - t0 });
-    if (!meta.title) meta.title = await nameSession(provider, history);
-    if (bar.isActive()) {
-      bar.update({
-        sessionName: meta.title,
-        input: stats.input,
-        output: stats.output,
-        ctxPct: bar.ctxPctFor(cfg.model, stats.lastInput ?? 0),
-      });
-    } else {
-      out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
-    }
-    saveSession(meta, history);
-    if (!(await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => out(c.dim(`${m}\n`))))) {
-      const ctxPct = bar.ctxPctFor(cfg.model, stats.lastInput ?? 0);
-      if (ctxPct >= 80) out(c.yellow(`  ⚠ context ${ctxPct}% full — /compact to summarize, or /clear to reset\n`));
+      if (currentTurn === turnController) currentTurn = null;
     }
   }
   bar.uninstall();

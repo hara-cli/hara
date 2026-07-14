@@ -356,23 +356,36 @@ export function looksLikeJsRenderedShell(html: string, readable: string): boolea
   return (hasRoot && scripts > 0) || (scripts >= 2 && readable.trim().length < 40) || shellText;
 }
 
-async function searchFetch(url: string, init: RequestInit): Promise<Response> {
-  return fetch(url, { ...init, signal: AbortSignal.timeout(SEARCH_ATTEMPT_MS) });
+function interrupted(label: string): Error {
+  const error = new Error(`${label} interrupted by agent run deadline or cancellation`);
+  error.name = "AbortError";
+  return error;
+}
+
+async function searchFetch(url: string, init: RequestInit, parentSignal?: AbortSignal): Promise<Response> {
+  if (parentSignal?.aborted) throw interrupted("web search");
+  const attemptSignal = AbortSignal.timeout(SEARCH_ATTEMPT_MS);
+  const signal = parentSignal ? AbortSignal.any([parentSignal, attemptSignal]) : attemptSignal;
+  return fetch(url, { ...init, signal });
 }
 
 async function firstSuccessfulSearch(
   attempts: { name: string; run: () => Promise<SearchResult[]> }[],
   failures: string[],
+  signal?: AbortSignal,
 ): Promise<SearchResult[] | null> {
   // Try one provider at a time. Search terms can be sensitive; a successful request must not be mirrored
   // to unrelated providers merely to save a few seconds, and sequential fallback also avoids leaving
   // losing requests running after the tool has already returned.
   for (const attempt of attempts) {
+    if (signal?.aborted) throw interrupted("web search");
     try {
       const results = await attempt.run();
+      if (signal?.aborted) throw interrupted("web search");
       if (results.length) return results;
       failures.push(`${attempt.name} no results`);
     } catch (e: any) {
+      if (signal?.aborted) throw interrupted("web search");
       const reason = e?.name === "TimeoutError" || e?.name === "AbortError" ? "timeout" : (e?.message ?? String(e));
       failures.push(`${attempt.name} ${reason}`);
     }
@@ -395,7 +408,8 @@ registerTool({
     required: ["query"],
   },
   kind: "read",
-  async run(input) {
+  async run(input, ctx) {
+    if (ctx.signal?.aborted) throw interrupted("web search");
     const q = String(input.query ?? "").trim();
     if (!q) return "(empty query)";
     const limit = Math.min(Math.max(1, Number(input.limit) || 6), 10);
@@ -414,7 +428,7 @@ registerTool({
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ api_key: key, query: q, max_results: limit }),
-        });
+        }, ctx.signal);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const j = (await res.json()) as { results?: { title?: string; url?: string; content?: string }[] };
           return (j.results ?? []).map((x) => ({ title: String(x.title ?? x.url ?? ""), url: String(x.url ?? ""), snippet: String(x.content ?? "").slice(0, 200) }));
@@ -428,12 +442,12 @@ registerTool({
           method: "GET",
           redirect: "follow",
           headers: { "user-agent": SEARCH_UA, accept: "text/html" },
-        });
+        }, ctx.signal);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return parseBingSearchResults(await res.text(), limit);
       },
     });
-    const primary = await firstSuccessfulSearch(primaryAttempts, failures);
+    const primary = await firstSuccessfulSearch(primaryAttempts, failures, ctx.signal);
     if (primary) return wrapUntrusted(fmt(primary), `web_search: ${q}`);
 
     // Secondary sources are ordered fallbacks. Google is included where reachable, but is never the sole
@@ -447,7 +461,7 @@ registerTool({
               method: "GET",
               redirect: "follow",
               headers: { "user-agent": SEARCH_UA, accept: "text/html" },
-            });
+            }, ctx.signal);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return parseBaiduSearchResults(await res.text(), limit);
           },
@@ -459,7 +473,7 @@ registerTool({
               method: "GET",
               redirect: "follow",
               headers: { "user-agent": SEARCH_UA, accept: "text/html" },
-            });
+            }, ctx.signal);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return parseGoogleSearchResults(await res.text(), limit);
           },
@@ -472,13 +486,14 @@ registerTool({
               redirect: "follow",
               headers: { "user-agent": SEARCH_UA, "content-type": "application/x-www-form-urlencoded", accept: "text/html" },
               body: `q=${encodeURIComponent(q)}`,
-            });
+            }, ctx.signal);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return parseSearchResults(await res.text(), limit);
           },
         },
       ],
       failures,
+      ctx.signal,
     );
     if (secondary) return wrapUntrusted(fmt(secondary), `web_search: ${q}`);
     return `Search failed across available providers (${failures.join("; ")}). Check connectivity/proxy, configure HARA_SEARCH_API_KEY, or web_fetch a known URL.`;
@@ -499,7 +514,8 @@ registerTool({
     required: ["url"],
   },
   kind: "read",
-  async run(input) {
+  async run(input, ctx) {
+    if (ctx.signal?.aborted) throw interrupted("web fetch");
     let url: URL;
     try {
       url = new URL(input.url);
@@ -510,13 +526,16 @@ registerTool({
     const cap = Math.min(Math.max(1000, input.max_chars ?? MAX), 200_000);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 30_000);
+    const signal = ctx.signal ? AbortSignal.any([ctx.signal, ctrl.signal]) : ctrl.signal;
     try {
       // Follow redirects manually so the SSRF guard runs on EVERY hop (a public URL can 30x to 169.254…).
       let current = url;
       let res: PinnedResponse;
       for (let hop = 0; ; hop++) {
+        if (ctx.signal?.aborted) throw interrupted("web fetch");
         const pinned = await resolvePublicHost(current.hostname);
-        res = await requestPinned(current, pinned, ctrl.signal);
+        if (ctx.signal?.aborted) throw interrupted("web fetch");
+        res = await requestPinned(current, pinned, signal);
         const loc = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
         if (!loc || hop >= 5) break;
         const next = new URL(loc, current);
@@ -527,10 +546,12 @@ registerTool({
         // We never consume redirect bodies. Destroy the socket before following the next pinned hop so a
         // server cannot accumulate idle response streams across a redirect chain.
         res.body.destroy();
+        if (ctx.signal?.aborted) throw interrupted("web fetch");
         current = next;
       }
       const ct = res.headers.get("content-type") ?? "";
       const raw = await readPinnedCapped(res.body, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
+      if (ctx.signal?.aborted) throw interrupted("web fetch");
       let text = /html/i.test(ct) ? htmlToText(raw) : raw;
       if (text.length > cap) text = text.slice(0, cap) + `\n…[truncated ${text.length - cap} chars]`;
       if (/html/i.test(ct) && looksLikeJsRenderedShell(raw, text)) {
@@ -541,6 +562,7 @@ registerTool({
       }
       return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(text || "(empty body)", current.href)}`;
     } catch (e: any) {
+      if (ctx.signal?.aborted) throw interrupted("web fetch");
       return `Error fetching ${url.href}: ${e?.name === "AbortError" ? "timed out (30s)" : (e?.message ?? e)}`;
     } finally {
       clearTimeout(timer);

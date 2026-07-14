@@ -143,6 +143,7 @@ export function parseSchedule(input: string, nowMs: number): Schedule | { error:
   if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s)) {
     const t = Date.parse(s);
     if (Number.isNaN(t)) return { error: `bad timestamp: ${s}` };
+    if (t <= nowMs) return { error: `timestamp is in the past: ${s}` };
     return { kind: "once", runAt: t, display: `once, at ${s}` };
   }
   if (parseCron(s)) return { kind: "cron", expr: s };
@@ -157,6 +158,8 @@ interface JobTiming {
   schedule: Schedule;
   createdAt: number;
   lastRunAt?: number;
+  /** Explicit one-shot catch-up for a cron job created after this minute's OS tick. */
+  pendingDueAt?: number;
   tz?: string;
 }
 
@@ -165,8 +168,18 @@ interface JobTiming {
 export function isDue(job: JobTiming, nowMs: number): boolean {
   const s = job.schedule;
   if (s.kind === "cron") {
-    if (!cronMatches(s.expr, new Date(nowMs), job.tz)) return false;
-    return job.lastRunAt === undefined || Math.floor(job.lastRunAt / 60_000) < Math.floor(nowMs / 60_000);
+    // This marker is persisted only for an enabled job created during a matching minute. It survives the
+    // 09:00:00 -> 09:00:37 creation race, but unlike inferring from `createdAt` it can be cleared on disable
+    // and therefore cannot make a job execute a months-old occurrence after it is re-enabled.
+    if (
+      job.pendingDueAt !== undefined
+      && job.pendingDueAt <= nowMs
+      && (job.lastRunAt === undefined || job.lastRunAt < job.pendingDueAt)
+    ) return true;
+    if (cronMatches(s.expr, new Date(nowMs), job.tz)) {
+      return job.lastRunAt === undefined || Math.floor(job.lastRunAt / 60_000) < Math.floor(nowMs / 60_000);
+    }
+    return false;
   }
   // interval: fire once per grid slot of width everyMs — a tick landing slightly early still counts the
   // slot (a plain `now >= last+everyMs` deadline loses ~half the fires of `every 1m` at 60s tick granularity).
@@ -174,14 +187,19 @@ export function isDue(job: JobTiming, nowMs: number): boolean {
   return job.lastRunAt === undefined && nowMs >= s.runAt; // once
 }
 
-/** Next fire time at/after `fromMs` (for display). Cron scans minute-by-minute up to a year; null if none
- *  (e.g. a one-shot already past). */
+/** Next actionable fire time at/after `fromMs` (for display). A currently-due cron or overdue persisted
+ *  one-shot returns `fromMs` instead of lying with tomorrow/a past timestamp. Cron scans minute-by-minute
+ *  up to a year; null means the job has already completed or has no match in the scan window. */
 export function nextRun(job: JobTiming, fromMs: number): number | null {
   const s = job.schedule;
   if (s.kind === "every") return (Math.floor(fromMs / s.everyMs) + 1) * s.everyMs; // next grid boundary (always > fromMs)
-  if (s.kind === "once") return job.lastRunAt === undefined ? s.runAt : null;
+  if (s.kind === "once") {
+    if (job.lastRunAt !== undefined) return null;
+    return s.runAt <= fromMs ? fromMs : s.runAt;
+  }
   const p = parseCron(s.expr);
   if (!p) return null;
+  if (isDue(job, fromMs)) return fromMs;
   const start = Math.floor(fromMs / 60_000) * 60_000 + 60_000; // next minute boundary
   for (let t = start, i = 0; i < 366 * 24 * 60; t += 60_000, i++) {
     if (cronMatches(s.expr, new Date(t), job.tz)) return t;

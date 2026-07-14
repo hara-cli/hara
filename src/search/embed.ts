@@ -9,6 +9,11 @@ const DEFAULT_MODEL: Record<string, string> = {
   qwen: "text-embedding-v3",
   openai: "text-embedding-3-small",
 };
+const EMBED_TIMEOUT_MS = 30_000;
+const embedSignal = (parent?: AbortSignal): AbortSignal => {
+  const timeout = AbortSignal.timeout(EMBED_TIMEOUT_MS);
+  return parent ? AbortSignal.any([parent, timeout]) : timeout;
+};
 
 /** Build an Embedder from config, or null if embeddings are off/unconfigured (→ lexical fallback). */
 export function getEmbedder(cfg: HaraConfig): Embedder | null {
@@ -18,13 +23,15 @@ export function getEmbedder(cfg: HaraConfig): Embedder | null {
 
   if (provider === "ollama") {
     const base = (cfg.embedBaseURL || "http://localhost:11434").replace(/\/$/, "");
-    return async (texts) => {
+    return async (texts, signal) => {
       const out: number[][] = [];
       for (const input of texts) {
+        if (signal?.aborted) throw new Error("embedding request interrupted");
         const r = await fetch(`${base}/api/embeddings`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ model, prompt: input }),
+          signal: embedSignal(signal),
         });
         if (!r.ok) throw new Error(`ollama embeddings ${r.status}`);
         out.push((await r.json()).embedding);
@@ -36,11 +43,13 @@ export function getEmbedder(cfg: HaraConfig): Embedder | null {
   // qwen (DashScope compatible-mode) + any OpenAI-compatible endpoint: POST /embeddings { model, input[] }
   const base = (cfg.embedBaseURL || (provider === "qwen" ? "https://dashscope.aliyuncs.com/compatible-mode/v1" : cfg.baseURL || "https://api.openai.com/v1")).replace(/\/$/, "");
   const key = cfg.embedApiKey || cfg.apiKey || "";
-  return async (texts) => {
+  return async (texts, signal) => {
+    if (signal?.aborted) throw new Error("embedding request interrupted");
     const r = await fetch(`${base}/embeddings`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
       body: JSON.stringify({ model, input: texts }),
+      signal: embedSignal(signal),
     });
     if (!r.ok) throw new Error(`embeddings ${r.status}`);
     return ((await r.json()).data || []).map((d: { embedding: number[] }) => d.embedding);

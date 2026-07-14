@@ -22,7 +22,7 @@ after(() => {
 });
 
 // Each case runs in a throwaway project dir whose .hara/config.json carries the hooks under test.
-function withProject(hooks, fn) {
+async function withProject(hooks, fn) {
   const dir = mkdtempSync(join(tmpdir(), "hara-hooks-"));
   mkdirSync(join(dir, ".hara"), { recursive: true });
   writeFileSync(join(dir, ".hara", "config.json"), JSON.stringify({ hooks }), "utf8");
@@ -30,7 +30,7 @@ function withProject(hooks, fn) {
   process.chdir(dir);
   resetHooksCache();
   try {
-    return fn(dir);
+    return await fn(dir);
   } finally {
     process.chdir(prev);
     resetHooksCache();
@@ -38,76 +38,76 @@ function withProject(hooks, fn) {
   }
 }
 
-test("PreToolUse: a non-zero exit blocks the call + surfaces the hook's output", () => {
-  withProject({ PreToolUse: [{ matcher: "bash", command: "echo 'no bash here' >&2; exit 1" }] }, () => {
-    const r = runHooks("PreToolUse", "bash", { command: "ls" }, process.cwd());
+test("PreToolUse: a non-zero exit blocks the call + surfaces the hook's output", async () => {
+  await withProject({ PreToolUse: [{ matcher: "bash", command: "echo 'no bash here' >&2; exit 1" }] }, async () => {
+    const r = await runHooks("PreToolUse", "bash", { command: "ls" }, process.cwd());
     assert.equal(r.block, true);
     assert.match(r.message, /no bash here/);
   });
 });
 
-test("PreToolUse: exit 0 does not block", () => {
-  withProject({ PreToolUse: [{ matcher: "*", command: "exit 0" }] }, () => {
+test("PreToolUse: exit 0 does not block", async () => {
+  await withProject({ PreToolUse: [{ matcher: "*", command: "exit 0" }] }, async () => {
     // A payload larger than the pipe buffer makes Linux reliably surface the benign status=0 + EPIPE
     // combination when the hook exits without reading stdin.
     const payload = { ignored: "x".repeat(1024 * 1024) };
-    assert.equal(runHooks("PreToolUse", "bash", payload, process.cwd()).block, false);
+    assert.equal((await runHooks("PreToolUse", "bash", payload, process.cwd())).block, false);
   });
 });
 
-test("PreToolUse fails closed when its policy hook is killed or times out", { skip: process.platform === "win32" }, () => {
-  withProject({ PreToolUse: [{ matcher: "bash", command: "kill -TERM $$" }] }, () => {
-    const killed = runHooks("PreToolUse", "bash", {}, process.cwd());
+test("PreToolUse fails closed when its policy hook is killed or times out", { skip: process.platform === "win32" }, async () => {
+  await withProject({ PreToolUse: [{ matcher: "bash", command: "kill -TERM $$" }] }, async () => {
+    const killed = await runHooks("PreToolUse", "bash", {}, process.cwd());
     assert.equal(killed.block, true);
     assert.match(killed.message, /SIGTERM|could not start|PreToolUse/i);
   });
   const child = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => {}, 1000)")}`;
-  withProject({ PreToolUse: [{ matcher: "bash", command: child }] }, () => {
-    const timedOut = runHooks("PreToolUse", "bash", {}, process.cwd(), 25);
+  await withProject({ PreToolUse: [{ matcher: "bash", command: child }] }, async () => {
+    const timedOut = await runHooks("PreToolUse", "bash", {}, process.cwd(), 25);
     assert.equal(timedOut.block, true);
     assert.match(timedOut.message, /timed out|SIGTERM|PreToolUse/i);
   });
 });
 
-test("matcher: a non-matching tool name is skipped; a matching one fires", () => {
-  withProject({ PreToolUse: [{ matcher: "^edit_file$", command: "exit 1" }] }, () => {
-    assert.equal(runHooks("PreToolUse", "read_file", {}, process.cwd()).block, false, "read_file ≠ ^edit_file$");
-    assert.equal(runHooks("PreToolUse", "edit_file", {}, process.cwd()).block, true, "edit_file matches");
+test("matcher: a non-matching tool name is skipped; a matching one fires", async () => {
+  await withProject({ PreToolUse: [{ matcher: "^edit_file$", command: "exit 1" }] }, async () => {
+    assert.equal((await runHooks("PreToolUse", "read_file", {}, process.cwd())).block, false, "read_file ≠ ^edit_file$");
+    assert.equal((await runHooks("PreToolUse", "edit_file", {}, process.cwd())).block, true, "edit_file matches");
   });
 });
 
-test("PostToolUse: runs the command (observe) and never blocks", () => {
-  withProject({ PostToolUse: [{ matcher: "*", command: "echo done > post-marker.txt" }] }, (dir) => {
-    const r = runHooks("PostToolUse", "write_file", { input: {}, result: "ok" }, process.cwd());
+test("PostToolUse: runs the command (observe) and never blocks", async () => {
+  await withProject({ PostToolUse: [{ matcher: "*", command: "echo done > post-marker.txt" }] }, async (dir) => {
+    const r = await runHooks("PostToolUse", "write_file", { input: {}, result: "ok" }, process.cwd());
     assert.equal(r.block, false);
     assert.ok(existsSync(join(dir, "post-marker.txt")), "PostToolUse side effect happened");
   });
 });
 
-test("no hooks configured → fast no-op, never blocks", () => {
-  withProject({}, () => {
-    assert.equal(runHooks("PreToolUse", "bash", {}, process.cwd()).block, false);
+test("no hooks configured → fast no-op, never blocks", async () => {
+  await withProject({}, async () => {
+    assert.equal((await runHooks("PreToolUse", "bash", {}, process.cwd())).block, false);
   });
 });
 
-test("the hook receives {tool, payload} as JSON on stdin", () => {
-  withProject({ PreToolUse: [{ matcher: "bash", command: "cat > stdin.json" }] }, (dir) => {
-    runHooks("PreToolUse", "bash", { command: "ls -la" }, process.cwd());
+test("the hook receives {tool, payload} as JSON on stdin", async () => {
+  await withProject({ PreToolUse: [{ matcher: "bash", command: "cat > stdin.json" }] }, async (dir) => {
+    await runHooks("PreToolUse", "bash", { command: "ls -la" }, process.cwd());
     const seen = JSON.parse(readFileSync(join(dir, "stdin.json"), "utf8"));
     assert.equal(seen.tool, "bash");
     assert.equal(seen.payload.command, "ls -la");
   });
 });
 
-test("hooks inherit the subprocess secret scrubber", { skip: process.platform === "win32" }, () => {
+test("hooks inherit the subprocess secret scrubber", { skip: process.platform === "win32" }, async () => {
   const name = "HARA_HOOK_TEST_TOKEN";
   const previous = process.env[name];
   process.env[name] = "must-not-reach-hook";
   try {
-    withProject(
+    await withProject(
       { PreToolUse: [{ matcher: "bash", command: `printf '%s' "\${${name}:-missing}" > hook-env.txt` }] },
-      (dir) => {
-        assert.equal(runHooks("PreToolUse", "bash", {}, dir).block, false);
+      async (dir) => {
+        assert.equal((await runHooks("PreToolUse", "bash", {}, dir)).block, false);
         assert.equal(readFileSync(join(dir, "hook-env.txt"), "utf8"), "missing");
       },
     );
@@ -117,24 +117,24 @@ test("hooks inherit the subprocess secret scrubber", { skip: process.platform ==
   }
 });
 
-test("PreToolUse fails closed and PostToolUse skips when a hook names a protected file", () => {
+test("PreToolUse fails closed and PostToolUse skips when a hook names a protected file", async () => {
   const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
   delete process.env.HARA_ALLOW_SENSITIVE_FILES;
   try {
-    withProject(
+    await withProject(
       {
         PreToolUse: [{ matcher: "read_file", command: "cat .env >/dev/null; echo ran > pre-marker.txt" }],
         PostToolUse: [{ matcher: "read_file", command: "cat .env > post-leak.txt" }],
       },
-      (dir) => {
+      async (dir) => {
         writeFileSync(join(dir, ".env"), "API_KEY=must-not-leak\n");
 
-        const pre = runHooks("PreToolUse", "read_file", {}, dir);
+        const pre = await runHooks("PreToolUse", "read_file", {}, dir);
         assert.equal(pre.block, true);
         assert.match(pre.message, /protected secret boundary|environment file/i);
         assert.equal(existsSync(join(dir, "pre-marker.txt")), false, "blocked PreToolUse was never launched");
 
-        const post = runHooks("PostToolUse", "read_file", {}, dir);
+        const post = await runHooks("PostToolUse", "read_file", {}, dir);
         assert.equal(post.block, false, "PostToolUse remains observe-only");
         assert.equal(existsSync(join(dir, "post-leak.txt")), false, "policy-blocked PostToolUse was not retried unsafely");
       },
@@ -145,7 +145,7 @@ test("PreToolUse fails closed and PostToolUse skips when a hook names a protecte
   }
 });
 
-test("hook config is selected by the tool cwd instead of process.cwd or the first cached project", () => {
+test("hook config is selected by the tool cwd instead of process.cwd or the first cached project", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-hooks-cwd-"));
   const blocked = join(root, "blocked");
   const allowed = join(root, "allowed");
@@ -154,8 +154,8 @@ test("hook config is selected by the tool cwd instead of process.cwd or the firs
     writeFileSync(join(blocked, ".hara", "config.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "read_file", command: "echo target-home >&2; exit 1" }] } }));
     writeFileSync(join(allowed, ".hara", "config.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "read_file", command: "exit 0" }] } }));
     resetHooksCache();
-    assert.match(runHooks("PreToolUse", "read_file", {}, blocked).message, /target-home/);
-    assert.equal(runHooks("PreToolUse", "read_file", {}, allowed).block, false, "a second home does not reuse the first home's cached hooks");
+    assert.match((await runHooks("PreToolUse", "read_file", {}, blocked)).message, /target-home/);
+    assert.equal((await runHooks("PreToolUse", "read_file", {}, allowed)).block, false, "a second home does not reuse the first home's cached hooks");
   } finally {
     resetHooksCache();
     rmSync(root, { recursive: true, force: true });
@@ -250,5 +250,63 @@ test("ordinary runs load and execute both hook phases from ctx.cwd", async () =>
   } finally {
     resetHooksCache();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agent deadline cancels a hanging hook promptly and kills the hook process", { skip: process.platform === "win32", timeout: 8_000 }, async () => {
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  process.env.HARA_ALLOW_SENSITIVE_FILES = "1";
+  let pid;
+  try {
+    await withProject({}, async (dir) => {
+      const pidFile = join(dir, "hook.pid");
+      const script = `require("node:fs").writeFileSync(${JSON.stringify(pidFile)},String(process.pid));setInterval(()=>{},1000)`;
+      writeFileSync(
+        join(dir, ".hara", "config.json"),
+        JSON.stringify({ hooks: { PreToolUse: [{ matcher: "wait_tool", command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}` }] } }),
+      );
+      resetHooksCache();
+      let round = 0;
+      const provider = {
+        id: "hook-deadline",
+        model: "hook-deadline",
+        async turn() {
+          round += 1;
+          return round === 1
+            ? { text: "", toolUses: [{ id: "h1", name: "wait_tool", input: {} }], stop: "tool_use" }
+            : { text: "wrong", toolUses: [], stop: "end" };
+        },
+      };
+      const started = Date.now();
+      const outcome = await runAgent([{ role: "user", content: "wait" }], {
+        provider,
+        ctx: { cwd: dir },
+        approval: "full-auto",
+        confirm: async () => true,
+        timeoutMs: 1_000,
+        quiet: true,
+        extraTools: [{
+          name: "wait_tool",
+          description: "fixture",
+          input_schema: { type: "object", properties: {} },
+          kind: "read",
+          async run() { return "ran"; },
+        }],
+      });
+      assert.equal(outcome.stopReason, "deadline");
+      assert.ok(Date.now() - started < 2_000, "hook cannot hold the event loop until its own timeout");
+      assert.ok(existsSync(pidFile), "hook child started before the deadline");
+      pid = Number(readFileSync(pidFile, "utf8"));
+      const deadline = Date.now() + 1_000;
+      for (;;) {
+        try { process.kill(pid, 0); } catch (error) { if (error?.code === "ESRCH") break; throw error; }
+        if (Date.now() >= deadline) assert.fail(`hook process ${pid} survived cancellation`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    });
+  } finally {
+    if (pid) try { process.kill(pid, "SIGKILL"); } catch {}
+    if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
   }
 });

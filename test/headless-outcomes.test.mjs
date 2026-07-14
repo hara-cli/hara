@@ -196,6 +196,30 @@ test("structured_output is not printed when a later provider turn fails", async 
   }
 });
 
+test("sub-agent non-completion is returned to the parent as a concrete Error", async () => {
+  const api = await listenModel([
+    { type: "tool", name: "agent", arguments: { task: "inspect the failure" } },
+    { type: "empty" },
+    { type: "empty" },
+    { type: "text", text: "parent handled the sub-agent failure" },
+  ]);
+  const fx = fixture(api.baseURL);
+  try {
+    const result = await runCli(["-p", "delegate"], fx.project, fx.home);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /parent handled the sub-agent failure/);
+    assert.equal(api.requests.length, 4);
+    assert.match(
+      JSON.stringify(api.requests[3]?.messages),
+      /Error: sub-agent the model returned an empty response/,
+      "the parent receives the reason instead of a misleading no-output placeholder",
+    );
+  } finally {
+    await new Promise((resolve) => api.server.close(resolve));
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
 test("hara org propagates implementer failure, skips --commit, and exits 2", async () => {
   const api = await listenModel([{ type: "empty" }]);
   const fx = fixture(api.baseURL, { git: true });

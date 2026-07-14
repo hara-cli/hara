@@ -24,11 +24,15 @@ test("ask_user: routes the question (with options) through ctx.ask and returns t
   const t = ask_user();
   let seenQ = null;
   let seenOpts = null;
+  let seenSignal = null;
+  const controller = new AbortController();
   const ctx = {
     cwd: process.cwd(),
-    ask: async (q, opts) => {
+    signal: controller.signal,
+    ask: async (q, opts, signal) => {
       seenQ = q;
       seenOpts = opts;
+      seenSignal = signal;
       return "Postgres"; // user picked an option
     },
   };
@@ -37,6 +41,7 @@ test("ask_user: routes the question (with options) through ctx.ask and returns t
   assert.match(seenQ, /Which database\?/, "question reaches ctx.ask");
   assert.match(seenQ, /\[DB\]/, "header is prepended");
   assert.deepEqual(seenOpts, ["SQLite", "Postgres"], "options pass through");
+  assert.equal(seenSignal, controller.signal, "the run cancellation signal reaches the interactive surface");
 });
 
 test("ask_user: free-text answer (no options) is returned verbatim", async () => {
@@ -66,4 +71,18 @@ test("ask_user: a failing ctx.ask degrades gracefully (no throw)", async () => {
   const res = await t.run({ question: "anything?" }, ctx);
   assert.match(res, /best judgment/);
   assert.match(res, /boom/);
+});
+
+test("ask_user: cancellation is rethrown so the agent loop can stop instead of continuing", async () => {
+  const t = ask_user();
+  const controller = new AbortController();
+  const ctx = {
+    cwd: process.cwd(),
+    signal: controller.signal,
+    ask: async (_question, _options, signal) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      queueMicrotask(() => controller.abort(new Error("turn deadline")));
+    }),
+  };
+  await assert.rejects(t.run({ question: "anything?" }, ctx), /turn deadline/);
 });

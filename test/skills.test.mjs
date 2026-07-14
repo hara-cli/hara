@@ -7,6 +7,7 @@ import { loadSkillIndex, loadSkillBody, scaffoldSkills, skillsDigest, invalidate
 import { searchAssets, assetSearchRoots } from "../dist/recall.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/memory.js";
+import "../dist/tools/skill.js";
 
 function tmpProject() {
   const dir = join(tmpdir(), "hara-skills-" + Math.random().toString(36).slice(2));
@@ -39,6 +40,29 @@ test("loadSkillIndex: agentskills <name>/SKILL.md, hyphenated frontmatter, body 
     assert.equal(sk.modelInvocable, true);
     assert.equal(sk.source, "project");
     assert.match(loadSkillBody(sk), /step one/); // body read on demand, not in the index entry
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("fork skill propagates the parent cancellation signal to its sub-agent", async () => {
+  const proj = tmpProject();
+  try {
+    writeSkill(proj, "forked", "name: forked\ndescription: delegated skill\ncontext: fork", "Follow the delegated steps.");
+    invalidateSkillsCache();
+    const controller = new AbortController();
+    let received;
+    const result = await getTool("skill").run({ id: "forked" }, {
+      cwd: proj,
+      signal: controller.signal,
+      spawn: async (_task, _role, signal) => {
+        received = signal;
+        return "delegated";
+      },
+    });
+    assert.equal(result, "delegated");
+    assert.equal(received, controller.signal);
   } finally {
     rmSync(proj, { recursive: true, force: true });
     invalidateSkillsCache();
@@ -159,6 +183,27 @@ test("skills: skill_create stays bound to the original parent when a skills syml
     assert.match(result, /^Saved project skill/);
     assert.match(readFileSync(join(first, "parent-retarget", "SKILL.md"), "utf8"), /perform the safe procedure/);
     assert.equal(existsSync(join(second, "parent-retarget", "SKILL.md")), false, "retargeted parent receives no write");
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("skills: skill_create cancellation after preflight cannot publish SKILL.md", async () => {
+  const proj = tmpProject();
+  try {
+    const controller = new AbortController();
+    const pending = getTool("skill_create").run({
+      name: "cancelled-skill",
+      description: "a safe reusable procedure",
+      body: "perform the safe procedure",
+      scope: "project",
+    }, { cwd: proj, signal: controller.signal });
+    controller.abort();
+    const result = await pending;
+
+    assert.match(result, /cancelled before commit.*No changes written/i);
+    assert.equal(existsSync(join(proj, ".hara", "skills", "cancelled-skill", "SKILL.md")), false);
   } finally {
     rmSync(proj, { recursive: true, force: true });
     invalidateSkillsCache();

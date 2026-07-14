@@ -175,6 +175,11 @@ hara --profile work        # use a named profile from ~/.hara/config.json
 hara -m glm-5              # pick a model
 ```
 
+Run Hara from a project directory. When the current directory resolves to your Home root, Hara does not treat
+the whole Home tree as a repository: project init/index and default recursive grep/glob/codebase inventory are
+disabled with a `cd /path/to/project` hint. Non-recursive `ls`, explicitly named files, and explicitly selected
+child directories still work.
+
 For automation, `--schema` accepts inline JSON Schema or a schema file. The model must return through the
 validated `structured_output` tool; on success stdout contains only the JSON value, while diagnostics go to
 stderr and missing/invalid output exits non-zero. `--role reviewer` resolves locally, `--role global:reviewer`
@@ -234,16 +239,24 @@ only changed files re-embed (a full repo rebuild that takes ~a minute re-runs in
 `hara config set computerUse read|click|full` and allowlist apps with `hara config set computerApps "App, …"`. Guarded
 by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and a once-per-session grant. Screenshots are read via your
 vision model into **actionable** output — interactive elements + positions (pass `focus` to target what you're after) — so even a text-only main model can click.
-**Sessions**: conversations are saved automatically — `-c` / `--resume <id>` to continue, `hara sessions` to list, `hara export [id] [--out file]` to render one as a Markdown transcript.
+**Sessions**: conversations are saved automatically — `-c` / `--resume <id>` or `hara resume <id>` to continue, `hara sessions` to list, `hara export [id] [--out file]` to render one as a Markdown transcript. The `hara resume` launcher preserves terminal input in both npm/Node and standalone-binary installs.
 **MCP**: add an `mcpServers` map to global config (a reviewed project config additionally needs `HARA_TRUST_PROJECT_CONFIG=1` at launch); their tools appear to the agent as `mcp__<server>__<tool>`. Configured MCP servers, like `external_agent`, are trusted host extensions outside Hara's protected-file boundary. Every interactive tool call requires confirmation (even in `full-auto`), and non-interactive runs disable them by default; reviewed automation can explicitly opt in before launch with `HARA_ALLOW_TRUSTED_EXTENSIONS=1`. hara can also **be** an MCP server — `hara mcp` exposes its read/search tools (esp. **`codebase_search`**) over stdio so other clients (Claude Desktop, Cursor, another hara) can use them; read-only by default (`HARA_MCP_TOOLS` to override).
 **Vim mode**: `hara config set vimMode true` makes the prompt modal — Esc → normal, `i/a/A/I` insert, `h l 0 $ w b e` motions, `x D C dd cw p` edits. Off by default.
-**Scheduled tasks**: `hara cron add "0 9 * * 1-5" "<task>"` (or `"every 30m"`, `"in 2h"`) runs a task on a schedule — each run is a fresh hara session. `hara cron install` wires a per-minute tick into launchd/crontab (no daemon); `--org` routes through the role org. Manage with `hara cron list/run/enable/disable/remove/logs`.
+**Scheduled tasks**: `hara cron add "0 9 * * 1-5" "<task>"` (or `"every 30m"`, `"in 2h"`) runs a task on a schedule — each run is a fresh hara session. `hara cron install` wires a per-minute tick into launchd/crontab (no daemon); `--org` routes through the role org. Manage with `hara cron list/run/enable/disable/remove/logs`. Every job has a 30-minute deadline and the whole sequential tick has a non-renewable 60-minute watchdog: a job timeout kills its process tree, records `timed out` + duration/error, then continues with the next due job; a tick timeout stops the remainder and releases the global lock. Add `--deliver feishu:<chatId>` (or Telegram/webhook) for outcomes and `--alert-after N` for the consecutive-failure 🚨 threshold (default 3). Delivery intent is durable before transport, uses a stable idempotency key, and retries with bounded backoff on later ticks until confirmed. A failed channel cannot grow `jobs.json` forever: each job keeps at most 64 pending effects, reserves outcome/alert room before launch, and disables itself with a visible backlog error when full; restore delivery, let the queue drain, then re-enable it. Tune milliseconds with `HARA_CRON_JOB_TIMEOUT_MS` (hard max 24h) and `HARA_CRON_TICK_TIMEOUT_MS` (hard max 5h); scheduled jobs are also capped by the tick. After upgrading from a version whose tick is already stuck, terminate that specific legacy `hara cron tick` process tree once (or reboot); the next scheduler minute marks over-age state interrupted/disabled and recovers the lock without replaying a possibly orphaned task.
 **Work coordination**: `todo_write` is the agent's short, session-scoped checklist; it persists with that
 session and is isolated between simultaneous sub-agents and serve sessions. `task` is the durable project pool
 for work that outlives a conversation: add/update/list/remove items with `pending|in_progress|done`, an optional
 owner, and `blockedBy` dependencies. The private, atomic store is shared by concurrent hara processes for the
 same project and rejects missing/self/cyclic dependencies.
 **Notifications**: `hara config set notify bell` (terminal bell) or `notify system` (OS notification) pings you when a turn finishes — handy for long runs you've stepped away from. Gated on elapsed time so quick turns stay quiet; off by default.
+**Run limits and loop alarms**: every agent turn has a non-renewable 30-minute total deadline and a 64-round
+model/tool cap. Hara warns after five minutes or at 75% of the round budget, stops the third identical failing
+tool call, and surfaces the final reason in CLI, Desktop, or gateway output. Tune intentional long work with
+`hara config set runTimeoutMs 45m` (1s..2h) and `hara config set maxAgentRounds 96` (1..256), or
+`HARA_RUN_TIMEOUT_MS` / `HARA_MAX_AGENT_ROUNDS`; neither boundary can be disabled. Sub-agents are capped at
+8 minutes/24 rounds and inherit the parent's cancellation. Auxiliary model work (planning, verification,
+compaction, naming, commit messages, the guardian, and vision) has its own short hard deadline as well, so a
+provider that ignores cancellation cannot strand the CLI outside the main loop.
 **Hooks**: run your own shell commands around tool calls via a `"hooks"` map in global config; hooks from a reviewed project config require the launch-time `HARA_TRUST_PROJECT_CONFIG=1` opt-in. A **`PreToolUse`** hook can **veto** a call (non-zero exit blocks it; its output becomes the reason the model sees) — gate `bash`, forbid edits outside a path, require a clean tree. A **`PostToolUse`** hook observes (format/lint a file the agent just wrote, log, notify). Each has a `matcher` (regex/literal on the tool name, `*` = all) and gets `{tool, payload}` on stdin + `HARA_TOOL_NAME` in env. Plugins can contribute hooks too.
 Reviewer/read-only/plan runs and parallel read-only sub-agents suppress both hook phases: PreToolUse and
 PostToolUse commands are arbitrary shell, so either could otherwise bypass their read-only contract indirectly.

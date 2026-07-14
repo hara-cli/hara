@@ -7,12 +7,31 @@
 import { registerTool } from "./registry.js";
 import { addJob, loadJobs, resolveJob, removeJob, setEnabled } from "../cron/store.js";
 import { parseSchedule, describeSchedule, nextRun, validTz } from "../cron/schedule.js";
-import { runJobOnce } from "../cron/runner.js";
+import { runJobTracked } from "../cron/runner.js";
 import { parseDeliver } from "../cron/deliver.js";
 import { isInstalled } from "../cron/install.js";
 import { sensitiveShellCommandReason } from "../security/sensitive-files.js";
+import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
 
 const fmt = (ms: number | null): string => (ms ? new Date(ms).toLocaleString() : "—");
+const fmtNext = (ms: number | null, now: number): string => (
+  ms !== null && ms <= now ? "due now" : fmt(ms)
+);
+const duration = (ms: number | undefined): string => {
+  if (ms === undefined) return "";
+  if (ms >= 3_600_000) return ` after ${Math.round(ms / 360_000) / 10}h`;
+  if (ms >= 60_000) return ` after ${Math.round(ms / 6_000) / 10}m`;
+  if (ms >= 1_000) return ` after ${Math.round(ms / 1_000)}s`;
+  return ` after ${ms}ms`;
+};
+
+const status = (j: ReturnType<typeof loadJobs>[number]): string => {
+  if (j.lastStatus === "running") return `running since ${fmt(j.runningSince ?? j.lastRunAt ?? null)}`;
+  if (j.lastStatus === "timed_out") return `timed out${duration(j.lastDurationMs)}`;
+  if (j.lastStatus === "error") return `error${duration(j.lastDurationMs)}`;
+  if (j.lastStatus === "ok") return `ok${duration(j.lastDurationMs)}`;
+  return "—";
+};
 
 registerTool({
   name: "cronjob",
@@ -22,7 +41,8 @@ registerTool({
     "and `task`. Optional: `name`; `mode` — \"print\" (default: run task as a hara prompt), \"org\" (role-routed), or " +
     "\"command\" (run task as a plain SHELL COMMAND — deterministic, no agent, no tokens; prefer it for fixed scripts); " +
     "`tz` (IANA, e.g. Asia/Shanghai, for cron exprs); `deliver` (push each run's result: telegram:<chatId> | " +
-    "feishu:<chatId> | webhook:<url>). Other actions: list · remove · enable · disable · run (fire now), with `id`. " +
+    "feishu:<chatId> | webhook:<url>); `alertAfter` (1..1000 consecutive failures, default 3). Other actions: " +
+    "list · remove · enable · disable · run (fire now), with `id`. " +
     "Jobs fire via the OS scheduler even when hara isn't running.",
   input_schema: {
     type: "object",
@@ -34,6 +54,7 @@ registerTool({
       mode: { type: "string", enum: ["print", "org", "command"] },
       tz: { type: "string", description: "IANA timezone for cron exprs" },
       deliver: { type: "string", description: "telegram:<chatId> | feishu:<chatId> | webhook:<url>" },
+      alertAfter: { type: "integer", minimum: 1, maximum: 1000, description: "consecutive failures before 🚨 (default 3)" },
       id: { type: "string", description: "job id (or unique prefix) for remove/enable/disable/run" },
     },
     required: ["action"],
@@ -43,16 +64,21 @@ registerTool({
     if (process.env.HARA_CRON === "1") return "Error: cron-run sessions cannot manage cron jobs (recursion guard — a scheduled task must not schedule more tasks).";
     const action = String(input.action ?? "");
     if (action === "list") {
-      const jobs = loadJobs();
+      let jobs: ReturnType<typeof loadJobs>;
+      try { jobs = loadJobs(); } catch (error) { return `Error: ${error instanceof Error ? error.message : String(error)}`; }
       if (!jobs.length) return "No scheduled jobs.";
       return jobs
         .map((j) => {
-          const next = nextRun(j, Date.now());
-          return `${j.id} · ${j.enabled ? "on " : "OFF"} · ${j.name} · ${describeSchedule(j.schedule)}${j.tz ? ` @ ${j.tz}` : ""} · mode ${j.mode}${j.deliver ? ` · → ${j.deliver}` : ""} · next ${fmt(next)} · last ${j.lastStatus ?? "—"}${j.consecutiveErrors ? ` (${j.consecutiveErrors}✗)` : ""}`;
+          const now = Date.now();
+          const next = nextRun(j, now);
+          return `${j.id} · ${j.enabled ? "on " : "OFF"} · ${j.name} · ${describeSchedule(j.schedule)}${j.tz ? ` @ ${j.tz}` : ""} · mode ${j.mode}${j.deliver ? ` · → ${j.deliver}` : ""} · next ${fmtNext(next, now)} · last ${status(j)}${j.consecutiveErrors ? ` (${j.consecutiveErrors}✗)` : ""}`;
         })
         .join("\n");
     }
     if (action === "add") {
+      // Every new job persists ctx.cwd and later treats it as its implicit agent/shell workspace. Management
+      // of existing jobs remains available at Home, but creating a Home-root job would bypass project scope.
+      if (isHomeWorkspace(ctx.cwd)) return `Error: ${homeWorkspaceActionError("schedule a job")}`;
       const scheduleStr = String(input.schedule ?? "").trim();
       const task = String(input.task ?? "").trim();
       if (!scheduleStr || !task) return "Error: add needs `schedule` and `task`.";
@@ -66,28 +92,39 @@ registerTool({
         const d = parseDeliver(deliver);
         if ("error" in d) return `Error: ${d.error}`;
       }
+      const alertAfter = input.alertAfter === undefined ? undefined : Number(input.alertAfter);
+      if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
+        return "Error: `alertAfter` must be an integer from 1 to 1000.";
+      }
       const mode = input.mode === "org" || input.mode === "command" ? input.mode : "print";
       if (mode === "command") {
         const denied = sensitiveShellCommandReason(task, ctx.cwd);
         if (denied) return `Error: scheduled shell command crosses Hara's protected secret boundary (${denied}).`;
       }
-      const job = addJob({
-        name: input.name ? String(input.name) : task.slice(0, 48),
-        schedule: sched,
-        task,
-        mode,
-        cwd: ctx.cwd,
-        ...(tz ? { tz } : {}),
-        ...(deliver ? { deliver } : {}),
-        createdAt: Date.now(),
-      });
+      let job: ReturnType<typeof addJob>;
+      try {
+        job = addJob({
+          name: input.name ? String(input.name) : task.slice(0, 48),
+          schedule: sched,
+          task,
+          mode,
+          cwd: ctx.cwd,
+          ...(tz ? { tz } : {}),
+          ...(deliver ? { deliver } : {}),
+          ...(alertAfter !== undefined ? { alertAfter } : {}),
+          createdAt: Date.now(),
+        });
+      } catch (error) {
+        return `Error: ${error instanceof Error ? error.message : String(error)}`;
+      }
       const warn = isInstalled() ? "" : "\n⚠ The OS scheduler isn't installed yet — tell the user to run `hara cron install` once, or jobs won't fire.";
-      return `✓ scheduled ${job.id} · ${describeSchedule(sched)}${tz ? ` @ ${tz}` : ""} · mode ${mode}${deliver ? ` · → ${deliver}` : ""} · next ${fmt(nextRun(job, Date.now()))}${warn}`;
+      return `✓ scheduled ${job.id} · ${describeSchedule(sched)}${tz ? ` @ ${tz}` : ""} · mode ${mode}${deliver ? ` · → ${deliver}` : ""}${alertAfter !== undefined ? ` · alert ≥${alertAfter}` : ""} · next ${fmt(nextRun(job, Date.now()))}${warn}`;
     }
     // id-based actions
     const idArg = String(input.id ?? "").trim();
     if (!idArg) return `Error: ${action} needs \`id\`.`;
-    const j = resolveJob(idArg);
+    let j: ReturnType<typeof resolveJob>;
+    try { j = resolveJob(idArg); } catch (error) { return `Error: ${error instanceof Error ? error.message : String(error)}`; }
     if (j === "ambiguous") return `Error: id "${idArg}" matches multiple jobs — use more characters.`;
     if (!j) return `Error: no job matching "${idArg}".`;
     if (action === "remove") return removeJob(j.id) ? `✓ removed ${j.id} (${j.name})` : "Error: remove failed.";
@@ -96,7 +133,7 @@ registerTool({
       return `✓ ${j.id} ${action}d`;
     }
     if (action === "run") {
-      const r = await runJobOnce(j);
+      const r = await runJobTracked(j, { signal: ctx.signal });
       return r.ok ? `✓ ran ${j.id} — ok\n${(r.output ?? "").trim().slice(-800)}` : `✗ ${j.id} failed: ${r.error}\n${(r.output ?? "").trim().slice(-800)}`;
     }
     return `Error: unknown action "${action}".`;

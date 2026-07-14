@@ -26,7 +26,7 @@ registerTool({
     const located = `Skill directory (absolute): ${dirname(sk.file)}\nRead any sibling files this skill mentions (e.g. references/…, assets/…) from under that directory.\n\n${body}`;
     if (sk.context === "fork" && ctx.spawn) {
       // fork: run the skill as a delegated sub-agent rather than inlining it into this turn
-      return await ctx.spawn(`Follow this skill to complete the current task:\n\n${located}`);
+      return await ctx.spawn(`Follow this skill to complete the current task:\n\n${located}`, undefined, ctx.signal);
     }
     return located; // inline (default): the body enters the conversation as this tool's result
   },

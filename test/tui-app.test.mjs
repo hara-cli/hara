@@ -248,6 +248,31 @@ test("App confirm is a selectable list: ↓ then Enter picks 'don't ask again' �
   unmount();
 });
 
+test("App Esc aborts the turn and actively removes a pending confirmation", async () => {
+  let interrupted = false;
+  const onSubmit = async (_line, h) => {
+    try {
+      await h.confirm("approval must disappear on Esc");
+    } catch {
+      interrupted = h.signal.aborted;
+    }
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("approval must disappear on Esc"));
+  stdin.write("\x1b");
+  await tick(100);
+  assert.equal(interrupted, true, "Esc aborts the owning turn signal");
+  assert.ok(!strip(lastFrame()).includes("approval must disappear on Esc"), "the stale confirmation is removed");
+  unmount();
+});
+
 test("App select (plan-proceed): ↓↓ + Enter picks the third option", async () => {
   let choice = null;
   const onSubmit = async (line, h) => {
@@ -342,6 +367,31 @@ test("App ask_user (h.ask) free-text: no options → input box captures the type
   stdin.write("\r");
   await tick(80);
   assert.equal(answer, "db/migrations", "the typed answer is returned as the tool's result");
+  unmount();
+});
+
+test("App Esc aborts the turn and removes a pending free-text ask", async () => {
+  let interrupted = false;
+  const onSubmit = async (_line, h) => {
+    try {
+      await h.ask("question must disappear on Esc");
+    } catch {
+      interrupted = h.signal.aborted;
+    }
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("go");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("question must disappear on Esc"));
+  stdin.write("\x1b");
+  await tick(100);
+  assert.equal(interrupted, true, "Esc aborts the question's turn signal");
+  assert.ok(!strip(lastFrame()).includes("question must disappear on Esc"), "the stale free-text prompt is removed");
   unmount();
 });
 
@@ -558,6 +608,69 @@ test("App type-ahead: Esc while working clears the queue (stop means stop)", asy
   release(); // turn 1 ends
   await tick(150);
   assert.ok(!seen.includes("queued one"), "queued message dropped after Esc — stop means stop");
+  unmount();
+});
+
+test("App type-ahead: queued message is dropped when a later approval prompt is cancelled", async () => {
+  const seen = [];
+  let openPrompt;
+  const promptGate = new Promise((resolve) => { openPrompt = resolve; });
+  const onSubmit = async (line, h) => {
+    seen.push(line);
+    if (line !== "first") return;
+    await promptGate;
+    await h.confirm("cancel this prompt");
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("first");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("must not auto-submit");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.equal(seen.length, 1, "message is pooled while the first turn works");
+  openPrompt();
+  await tick(100);
+  assert.ok(strip(lastFrame()).includes("cancel this prompt"));
+  stdin.write("\x1b");
+  await tick(200);
+  assert.deepEqual(seen, ["first"], "Esc clears type-ahead even from the prompt branch");
+  unmount();
+});
+
+test("App type-ahead: queued message is dropped when a later free-text ask is cancelled", async () => {
+  const seen = [];
+  let openAsk;
+  const askGate = new Promise((resolve) => { openAsk = resolve; });
+  const onSubmit = async (line, h) => {
+    seen.push(line);
+    if (line !== "first") return;
+    await askGate;
+    await h.ask("cancel this free-text ask");
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("first");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("also must not auto-submit");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  openAsk();
+  await tick(100);
+  assert.ok(strip(lastFrame()).includes("cancel this free-text ask"));
+  stdin.write("\x1b");
+  await tick(200);
+  assert.deepEqual(seen, ["first"], "Esc clears type-ahead from the ask branch too");
   unmount();
 });
 

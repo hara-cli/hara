@@ -40,6 +40,8 @@ test("loadConfig: blank env/project routing values do not hide global credential
       routeApiKey: "route-key",
       routeModel: "route-model",
       routeBaseURL: "https://route.example/v1",
+      runTimeoutMs: "45m",
+      maxAgentRounds: "96",
     }),
   );
   writeFileSync(join(project, "package.json"), "{}");
@@ -70,6 +72,8 @@ test("loadConfig: blank env/project routing values do not hide global credential
     HARA_ROUTE_API_KEY: process.env.HARA_ROUTE_API_KEY,
     HARA_ROUTE_MODEL: process.env.HARA_ROUTE_MODEL,
     HARA_ROUTE_BASE_URL: process.env.HARA_ROUTE_BASE_URL,
+    HARA_RUN_TIMEOUT_MS: process.env.HARA_RUN_TIMEOUT_MS,
+    HARA_MAX_AGENT_ROUNDS: process.env.HARA_MAX_AGENT_ROUNDS,
   };
   try {
     process.env.HOME = home;
@@ -93,6 +97,8 @@ test("loadConfig: blank env/project routing values do not hide global credential
     process.env.HARA_ROUTE_API_KEY = "";
     process.env.HARA_ROUTE_MODEL = " ";
     process.env.HARA_ROUTE_BASE_URL = "";
+    delete process.env.HARA_RUN_TIMEOUT_MS;
+    delete process.env.HARA_MAX_AGENT_ROUNDS;
     const cfg = loadConfig();
     assert.equal(cfg.apiKey, "configured-key");
     assert.equal(cfg.model, "configured-model");
@@ -111,10 +117,56 @@ test("loadConfig: blank env/project routing values do not hide global credential
     assert.equal(cfg.routeApiKey, "route-key");
     assert.equal(cfg.routeModel, "route-model");
     assert.equal(cfg.routeBaseURL, "https://route.example/v1");
+    assert.equal(cfg.runTimeoutMs, 45 * 60_000);
+    assert.equal(cfg.maxAgentRounds, 96);
   } finally {
     process.chdir(saved.cwd);
     for (const [key, value] of Object.entries(saved)) {
       if (key === "cwd") continue;
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: Home control-plane config is never re-read as project input or inherited from above Home", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-home-boundary-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  const unmarked = join(home, "scratch");
+  const project = join(home, "project");
+  mkdirSync(join(root, ".git"), { recursive: true });
+  mkdirSync(join(root, ".hara"), { recursive: true });
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  mkdirSync(unmarked, { recursive: true });
+  mkdirSync(join(project, ".hara"), { recursive: true });
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  writeFileSync(join(root, ".hara", "config.json"), JSON.stringify({ model: "parent-must-not-load" }));
+  writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({
+    provider: "openai",
+    model: "global",
+    overlays: { work: { model: "overlay" } },
+  }));
+  writeFileSync(join(project, "package.json"), "{}");
+  writeFileSync(join(project, ".hara", "config.json"), JSON.stringify({ model: "project" }));
+  const saved = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    HARA_MODEL: process.env.HARA_MODEL,
+    HARA_OVERLAY: process.env.HARA_OVERLAY,
+  };
+  try {
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    delete process.env.HARA_MODEL;
+    delete process.env.HARA_OVERLAY;
+    assert.equal(loadConfig({ cwd: home, overlay: "work" }).model, "overlay");
+    assert.equal(loadConfig({ cwd: alias, overlay: "work" }).model, "overlay", "a Home alias cannot bypass the boundary");
+    assert.equal(loadConfig({ cwd: unmarked, overlay: "work" }).model, "overlay", "a child stops before Home and its parent");
+    assert.equal(loadConfig({ cwd: project, overlay: "work" }).model, "project", "an explicit child project keeps its override");
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
@@ -142,6 +194,8 @@ test("loadConfig: safe project keys override an overlay while privileged keys ar
     fileCheckpoints: true,
     updateCheck: true,
     notify: "off",
+    runTimeoutMs: "30m",
+    maxAgentRounds: 64,
     overlays: { work: { model: "overlay", mcpServers: { shared: { command: "overlay" } } } },
   }));
   writeFileSync(join(project, "package.json"), "{}");
@@ -160,6 +214,8 @@ test("loadConfig: safe project keys override an overlay while privileged keys ar
     fileCheckpoints: false,
     updateCheck: false,
     notify: "system",
+    runTimeoutMs: "2h",
+    maxAgentRounds: 256,
     "sk-UNKNOWN_KEY_SECRET_123456789": "ignored",
   }));
   const saved = { HOME: process.env.HOME, cwd: process.cwd(), HARA_OVERLAY: process.env.HARA_OVERLAY, HARA_MODEL: process.env.HARA_MODEL };
@@ -190,7 +246,9 @@ test("loadConfig: safe project keys override an overlay while privileged keys ar
     assert.equal(cfg.fileCheckpoints, true);
     assert.equal(cfg.updateCheck, true);
     assert.equal(cfg.notify, "off");
-    assert.match(warning, /apiKey|baseURL|mcpServers|approval|sandbox|guardian|<unknown-key>/);
+    assert.equal(cfg.runTimeoutMs, 30 * 60_000);
+    assert.equal(cfg.maxAgentRounds, 64);
+    assert.match(warning, /apiKey|baseURL|mcpServers|approval|sandbox|guardian|runTimeoutMs|maxAgentRounds|<unknown-key>/);
     assert.doesNotMatch(warning, /PROJECT_(?:COMMAND|API)_SECRET|project-secret\.invalid|UNKNOWN_KEY_SECRET/);
   } finally {
     process.chdir(saved.cwd);

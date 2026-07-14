@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { walkFiles, dirPrefixes, listProjectFiles } from "../dist/fs-walk.js";
+import { walkFiles, walkFilesAsync, dirPrefixes, listProjectFiles, listProjectFilesAsync } from "../dist/fs-walk.js";
 import { fileCandidates } from "../dist/context/mentions.js";
 import { activity } from "../dist/activity.js";
 import { borderTop, borderBottom, ctxPctFor, nextMode } from "../dist/statusbar.js";
@@ -34,6 +34,84 @@ test("fs-walk: recurses subdirs, skips node_modules", () => {
     assert.ok(dirs.includes("src/"), "derives dir prefix");
     assert.ok(dirs.includes("src/deep/"), "derives nested dir prefix");
     assert.ok(listProjectFiles(dir).includes("src/app.ts"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fs-walk async: directory and Dirent limits bound empty forests and wide directories", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-walk-limits-"));
+  try {
+    for (let i = 0; i < 24; i++) mkdirSync(join(dir, `empty-${i}`));
+    const directories = await walkFilesAsync(dir, {
+      maxDirectories: 4,
+      maxEntries: 1_000,
+      timeoutMs: 5_000,
+      yieldEvery: 1,
+    });
+    assert.equal(directories.reason, "directory_limit");
+    assert.equal(directories.directoriesVisited, 4);
+
+    for (let i = 0; i < 24; i++) writeFileSync(join(dir, `wide-${i}.txt`), "x\n");
+    const entries = await walkFilesAsync(dir, {
+      maxDirectories: 1_000,
+      maxEntries: 5,
+      timeoutMs: 5_000,
+      yieldEvery: 1,
+    });
+    assert.equal(entries.reason, "entry_limit");
+    assert.equal(entries.entriesVisited, 5);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fs-walk async: timer-driven cancellation interrupts a cached empty-directory forest", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-walk-abort-"));
+  try {
+    // This is the shape that previously took seconds at 80k directories while starving the agent timer.
+    // A small fixture is deterministic because yieldEvery:1 gives the abort timer a turn immediately.
+    for (let i = 0; i < 512; i++) mkdirSync(join(dir, `empty-${String(i).padStart(4, "0")}`));
+    const controller = new AbortController();
+    const deadline = new Error("test agent deadline");
+    const timer = setTimeout(() => controller.abort(deadline), 0);
+    const startedAt = Date.now();
+    await assert.rejects(
+      walkFilesAsync(dir, { signal: controller.signal, timeoutMs: 10_000, yieldEvery: 1 }),
+      (error) => error === deadline,
+    );
+    clearTimeout(timer);
+    assert.ok(Date.now() - startedAt < 1_000, "cancellation is observed without finishing the forest");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fs-walk async: total wall budget starts at API entry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-walk-time-"));
+  try {
+    for (let i = 0; i < 512; i++) mkdirSync(join(dir, `empty-${String(i).padStart(4, "0")}`));
+    let timerRan = false;
+    const timer = setTimeout(() => { timerRan = true; }, 0);
+    const walked = await walkFilesAsync(dir, { timeoutMs: 5, yieldEvery: 1 });
+    clearTimeout(timer);
+    assert.equal(walked.reason, "time_limit");
+    assert.equal(timerRan, true, "the wall-budget scan yields to deadline timers");
+    assert.ok(walked.directoriesVisited < 513, "the scan stopped before consuming the forest");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listProjectFilesAsync: an authoritative empty git inventory does not leak ignored files via fallback", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-walk-empty-git-"));
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    writeFileSync(join(dir, ".git", "info", "exclude"), "ignored.txt\n");
+    writeFileSync(join(dir, "ignored.txt"), "must stay ignored\n");
+    const inventory = await listProjectFilesAsync(dir, { timeoutMs: 5_000 });
+    assert.deepEqual(inventory.files, []);
+    assert.equal(inventory.truncated, false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -190,6 +268,61 @@ test("glob tool: ** matches nested, ls lists a dir", async () => {
     assert.match(l, /app\.ts/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("glob tool: agent cancellation interrupts discovery before matching", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-glob-abort-"));
+  try {
+    for (let i = 0; i < 1_024; i++) mkdirSync(join(dir, `empty-${String(i).padStart(4, "0")}`));
+    const controller = new AbortController();
+    const deadline = new Error("glob agent deadline");
+    const timer = setTimeout(() => controller.abort(deadline), 0);
+    await assert.rejects(
+      getTool("glob").run({ pattern: "**/*.ts" }, { cwd: dir, signal: controller.signal }),
+      (error) => error === deadline,
+    );
+    clearTimeout(timer);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("home scope blocks recursive grep/glob aliases but keeps ls, explicit files, and child directories usable", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-search-home-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  const project = join(home, "project");
+  mkdirSync(project, { recursive: true });
+  writeFileSync(join(home, "root-note.txt"), "HOME_SCOPE_NEEDLE\n");
+  writeFileSync(join(project, "project-note.txt"), "HOME_SCOPE_NEEDLE\n");
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const grep = getTool("grep");
+    const glob = getTool("glob");
+    const ls = getTool("ls");
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE" }, { cwd: home }), /will not recursively scan the home directory/i);
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE" }, { cwd: alias }), /will not recursively scan the home directory/i);
+    assert.match(await glob.run({ pattern: "**\/*.txt" }, { cwd: alias }), /will not recursively scan the home directory/i);
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE", path: ".." }, { cwd: home }), /will not recursively scan the home directory/i);
+    assert.match(await glob.run({ pattern: "**\/*.txt", path: ".." }, { cwd: home }), /will not recursively scan the home directory/i);
+
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE", path: "root-note.txt" }, { cwd: home }), /root-note\.txt:1:/);
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE", path: "project" }, { cwd: home }), /project-note\.txt:1:/);
+    assert.match(await glob.run({ pattern: "**\/*.txt", path: "project" }, { cwd: home }), /project-note\.txt/);
+    assert.match(await ls.run({}, { cwd: home }), /project\//, "non-recursive home listing remains available");
+    assert.deepEqual(walkFiles(home), [], "the shared inventory helper also fails closed at the home root");
+    assert.deepEqual(walkFiles(root), [], "an ancestor inventory cannot descend back into Home");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

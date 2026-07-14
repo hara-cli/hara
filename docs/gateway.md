@@ -56,6 +56,37 @@ it runs fine on your laptop behind NAT.
   minutes). Shutdown first sends `SIGTERM`, then escalates to `SIGKILL` after a short grace period. The daemon
   runs at most 4 DM children concurrently and keeps bounded per-thread/global backlogs, so rotating chat ids
   cannot create an unbounded number of processes.
+- **`HARA_TTS_TIMEOUT_MS`** bounds the entire speech operation (default 60 seconds, hard maximum 120 seconds).
+  Shutdown aborts remote TTS requests and terminates the full process tree for local `say`/custom commands.
+  For stable-id events, default voice bytes are cached with the coding result, so a failed audio upload retries
+  transport with those same bytes rather than rerunning coding or synthesis.
+- Telegram and Feishu outbound text/file transfers have a real cancellation signal and a hard transport
+  ceiling (30 seconds for text, 120 seconds for files). Within one live Hara process, sends to one
+  credential-scoped chat stay FIFO even when the daemon, a flow, and one-shot delivery use different adapter
+  instances. The caller settles at its deadline; an ambiguous underlying transfer remains at the head of that
+  process-local lane until it settles, preventing a later admitted send from overtaking it.
+- Before an identified Telegram/Feishu DM can execute coding or tools, the gateway atomically writes a private
+  credential-scoped `0600` started marker. It stores the completed reply and verified attachment bytes before
+  delivery, then removes that record only after Telegram confirms the advanced offset or Feishu removes the
+  durable event. Redelivery therefore resends cached output, never reruns coding. If the daemon was interrupted
+  after execution began, it sends an explicit recovery warning and requires a new instruction instead of
+  guessing that side effects are safe to repeat. The cache is capped at 32 records, 64 KiB of reply text and
+  four files/20 MiB per record; cached payload bytes expire after 24 hours but downgrade to a small terminal
+  marker rather than deleting the evidence that execution started.
+- Operators can recover a known marker by its original platform message id while that credential's gateway is
+  stopped. Recovery is deliberately single-record and two-stage: `hara gateway --platform <name>
+  --recover-outcome <id> --confirm-recovery terminalize:<id>` converts an ambiguous running record into a
+  compact no-rerun marker; only `--confirm-recovery delete-terminal:<id>` can delete an already-terminal marker
+  after platform redelivery is known to be impossible. Completed-but-unacknowledged outcomes are never deleted.
+- The same boundary covers tmux reply injection and the stateful `/new`, `/voice`, `/say`, and `/send`
+  commands. `/voice` records one target state instead of toggling again; speech and files are snapshotted once.
+  A durably completed reply/upload receipt is skipped on redelivery, while the cached outcome prevents another
+  thread, tmux injection, synthesis, or source-file read. Remote acceptance and local receipt commit are not one
+  atomic operation: after a crash in that gap, a transport without server-side idempotency can deliver the same
+  cached payload again, but Hara still does not rerun the local coding or file/TTS side effect.
+- One inbound event is attempted at most three times. Exhaustion emits one credential-free alert and is
+  dead-lettered/acknowledged so a poison message cannot keep launching the coding agent forever; shutdown
+  cancellation does not consume this retry budget.
 
 The full coding agent is a **direct-message driver only** and each authorized DM run uses
 `--approval full-auto`, so set `--cwd` deliberately. Group/room traffic never falls through to that driver; it is ignored
@@ -145,6 +176,11 @@ serve's approvals inbox (`approvals.list` / `approvals.resolve`) for desktop cli
   discarded rather than creating an action that can never execute.
 - Pending actions and chat routing are private, atomic, cross-process stores. Approval resolution uses a
   compare-and-set claim, so a desktop click and chat reply cannot execute the same action twice.
+- Automatic replies, owner notifications, and each delivery target use private credential-scoped effect
+  receipts. A redelivered platform event skips effects whose local completion receipt is already durable, and
+  stable opaque idempotency keys are forwarded where the destination supports them. Delivery remains
+  at-least-once across the narrow crash gap between remote acceptance and local receipt commit on transports
+  without server-side deduplication; the corresponding pending approval still keeps one stable opaque identity.
 - Flow runs are capped at four concurrently, 5/minute per sender, 10/minute and 60/hour per
   rule/platform/chat, and 20/minute and 120/hour across the process. Bucket/key counts are bounded; saturation
   drops the trigger. Logs are redacted, mode `0600`, and rotate at 1 MB to `~/.hara/flows-log.jsonl.1`.
@@ -202,7 +238,12 @@ HARA_FEISHU_APP_ID=cli_… HARA_FEISHU_APP_SECRET=… HARA_GATEWAY_ALLOWED=<your
 ```
 
 Direct messages drive the full coding session. Group events and @mentions are surfaced only to matching flow
-rules; they never fall through to the full coding agent.
+rules; they never fall through to the full coding agent. The long-connection callback first writes each event
+to a private bounded durable spool and returns within Feishu's three-second ACK window; four workers process it
+afterward. The spool survives restart, holds at most 128 events/2 MiB (128 KiB each), retries with exponential
+backoff at most five times, and emits one terminal alert when attempts are exhausted. A completed item is
+removed before its execution marker is cleaned up, preventing a crash between agent completion and ACK from
+causing a second full-auto run.
 
 ## Slack
 

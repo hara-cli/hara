@@ -1,5 +1,5 @@
 // Compile hara into a single self-contained executable with `bun build --compile`, so it can be
-// installed without Node. Run AFTER `tsc` (it bundles dist/index.js).
+// installed without Node. Run AFTER `tsc` (the guarded CLI entry then loads dist/index.js).
 //   bun scripts/build-binary.ts [outfile] [bun-target]
 // e.g.  bun scripts/build-binary.ts dist/bin/hara
 //       bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64   (cross-compile)
@@ -14,7 +14,7 @@ const target = process.argv[3]; // optional cross-compile target, e.g. bun-linux
 const version = JSON.parse(await Bun.file("package.json").text()).version as string;
 
 const result = await Bun.build({
-  entrypoints: ["dist/index.js"],
+  entrypoints: ["dist/cli.js"],
   // @ts-expect-error — `compile` is a valid Bun.build option (produces a standalone executable)
   compile: { outfile, ...(target ? { target } : {}) },
   define: { "process.env.HARA_BUILD_VERSION": JSON.stringify(version) },

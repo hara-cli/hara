@@ -1,14 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseTelegramUpdate, chunkText, photoFileId, telegramAdapter } from "../dist/gateway/telegram.js";
 import { parseDiscordMessage } from "../dist/gateway/discord.js";
-import { parseFeishuContent, flattenPost } from "../dist/gateway/feishu.js";
+import { dispatchFeishuInbound, feishuAdapter, parseFeishuContent, flattenPost, feishuTimestampMs } from "../dist/gateway/feishu.js";
 import { parseSlackEvent } from "../dist/gateway/slack.js";
 import { parseMattermostPost } from "../dist/gateway/mattermost.js";
 import { matrixChatType, matrixDirectRoomsFromSync, parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
@@ -16,14 +16,15 @@ import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
 import { parseSignalMessage, signalAdapter } from "../dist/gateway/signal.js";
 import { parseWecomMessage } from "../dist/gateway/wecom.js";
 import { pickRoute, outputDelta } from "../dist/gateway/tmux-routes.js";
-import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
+import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, gatewayAdmissionKey, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
-import { ttsConfigFromEnv, ttsCleanText } from "../dist/gateway/tts.js";
+import { synthesize, ttsConfigFromEnv, ttsCleanText, ttsTimeoutMs } from "../dist/gateway/tts.js";
+import { deliverResult } from "../dist/cron/deliver.js";
 
 test("parseTelegramUpdate: text message → InboundMsg; non-text → null", () => {
   const m = parseTelegramUpdate({ update_id: 5, message: { text: "hi", chat: { id: 42 }, from: { id: 7, username: "jeff" } } });
-  assert.deepEqual(m, { chatId: 42, userId: 7, userName: "jeff", text: "hi" });
+  assert.deepEqual(m, { chatId: 42, userId: 7, userName: "jeff", text: "hi", messageId: "5" });
   assert.equal(parseTelegramUpdate({ update_id: 6, message: { photo: [], chat: { id: 1 } } }), null); // empty photo array
   assert.equal(parseTelegramUpdate({}), null);
   assert.equal(parseTelegramUpdate({ message: { text: "dm", chat: { id: 1, type: "private" }, from: { id: 1 } } }).chatType, "p2p");
@@ -66,20 +67,336 @@ test("telegram media preflight still dispatches metadata but never fetches rejec
 test("telegramAdapter surfaces send failures instead of reporting false success", async () => {
   const savedFetch = globalThis.fetch;
   try {
+    const adapter = telegramAdapter("test-token");
     globalThis.fetch = async () => new Response(JSON.stringify({ ok: false, description: "chat not found" }), {
       status: 400,
       headers: { "content-type": "application/json" },
     });
-    await assert.rejects(telegramAdapter("test-token").send("missing", "hello"), /chat not found/);
+    await assert.rejects(adapter.send("same-chat", "hello"), /chat not found/);
 
     globalThis.fetch = async () => new Response(JSON.stringify({ ok: true, result: {} }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
-    await telegramAdapter("test-token").send("chat", "hello");
+    await telegramAdapter("test-token").send("same-chat", "hello"); // cross-instance failure cannot poison the lane
   } finally {
     globalThis.fetch = savedFetch;
   }
+});
+
+test("telegramAdapter keeps every chunk of one chat message in a FIFO outbound lane", async () => {
+  const savedFetch = globalThis.fetch;
+  const sent = [];
+  try {
+    globalThis.fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      sent.push(body.text);
+      await new Promise((resolve) => setImmediate(resolve));
+      return new Response(JSON.stringify({ ok: true, result: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const adapter = telegramAdapter("test-token");
+    const first = "A".repeat(12_000);
+    const second = "B".repeat(12_000);
+    await Promise.all([adapter.send("same-chat", first), adapter.send("same-chat", second)]);
+    const labels = sent.map((part) => part[0]);
+    const firstCount = labels.filter((label) => label === "A").length;
+    const secondCount = labels.filter((label) => label === "B").length;
+    assert.ok(firstCount > 1 && secondCount > 1, "fixture produces multi-part messages");
+    assert.deepEqual(labels, [...Array(firstCount).fill("A"), ...Array(secondCount).fill("B")]);
+    assert.equal(sent.filter((part) => part.includes("A")).join(""), first);
+    assert.equal(sent.filter((part) => part.includes("B")).join(""), second);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("credential-scoped outbound lanes quarantine a timed-out transport and recover without late interleaving", async () => {
+  const savedFetch = globalThis.fetch;
+  const savedTimeout = process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS;
+  const sent = [];
+  try {
+    process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS = "50";
+    let wedgeFirst = true;
+    let releaseWedged;
+    globalThis.fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      sent.push(body.text);
+      if (wedgeFirst) {
+        wedgeFirst = false;
+        return new Promise((resolve) => { releaseWedged = resolve; }); // deliberately ignores AbortSignal
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+      return new Response(JSON.stringify({ ok: true, result: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const first = telegramAdapter("shared-token");
+    const second = telegramAdapter("shared-token");
+    await assert.rejects(first.send("same-chat", "wedged"), /timed out after 50ms/);
+    await assert.rejects(second.send("same-chat", "must-not-overtake"), /timed out after 50ms/);
+    assert.deepEqual(sent, ["wedged"], "a queued request never starts while the ambiguous first request is alive");
+
+    releaseWedged(new Response(JSON.stringify({ ok: true, result: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const a = "A".repeat(12_000);
+    const b = "B".repeat(12_000);
+    await Promise.all([first.send("same-chat", a), second.send("same-chat", b)]);
+    const labels = sent.slice(1).map((part) => part[0]);
+    const aCount = labels.filter((label) => label === "A").length;
+    const bCount = labels.filter((label) => label === "B").length;
+    assert.deepEqual(labels, [...Array(aCount).fill("A"), ...Array(bCount).fill("B")]);
+    assert.equal(sent.slice(1).filter((part) => part.startsWith("A")).join(""), a);
+    assert.equal(sent.slice(1).filter((part) => part.startsWith("B")).join(""), b);
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedTimeout === undefined) delete process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS;
+    else process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS = savedTimeout;
+  }
+});
+
+test("deliverResult is cancelled promptly even when a transport ignores AbortSignal", async () => {
+  const savedFetch = globalThis.fetch;
+  const controller = new AbortController();
+  try {
+    let transportSignal;
+    globalThis.fetch = async (_url, init) => {
+      transportSignal = init?.signal;
+      return new Promise(() => {});
+    };
+    const pending = deliverResult("webhook:https://example.invalid/hook", "hello", controller.signal);
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    const result = await pending;
+    assert.match(result, /delivery failed: Gateway delivery cancelled/);
+    assert.equal(transportSignal?.aborted, true, "caller cancellation reaches the active transport");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("deliverResult never reflects credential-bearing target URLs in failures and forwards webhook idempotency", async () => {
+  const savedFetch = globalThis.fetch;
+  const secretUrl = "https://hooks.example.invalid/run?token=super-secret-query";
+  try {
+    globalThis.fetch = async () => {
+      throw new Error(`request to ${secretUrl} failed with Authorization=secret`);
+    };
+    const failed = await deliverResult(`webhook:${secretUrl}`, "hello");
+    assert.equal(failed, "delivery failed: transport request failed");
+    assert.doesNotMatch(failed, /super-secret|hooks\.example|Authorization/);
+
+    let headers;
+    globalThis.fetch = async (_url, init) => {
+      headers = init?.headers;
+      return new Response("", { status: 200 });
+    };
+    assert.equal(await deliverResult(`webhook:${secretUrl}`, "hello", undefined, "opaque-effect-key"), null);
+    assert.equal(headers["Idempotency-Key"], "opaque-effect-key");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("Feishu outbound send and upload propagate cancellation through native fetch and retain a hard deadline", async () => {
+  const savedFetch = globalThis.fetch;
+  const savedTimeout = process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS;
+  try {
+    process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS = "50";
+    const controller = new AbortController();
+    let activeSignal;
+    let authCalls = 0;
+    let releaseSend;
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes("tenant_access_token")) {
+        authCalls++;
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: "short-lived-test-token", expire: 3600 }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      activeSignal = init?.signal;
+      if (String(url).includes("/messages?")) {
+        return new Promise((resolve) => { releaseSend = resolve; }); // deliberately ignores AbortSignal
+      }
+      return new Promise(() => {}); // upload deliberately ignores AbortSignal; the hard race must still settle
+    };
+    const adapter = feishuAdapter("app-id", "app-secret");
+    const sending = adapter.send("chat", "hello", controller.signal);
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await assert.rejects(sending, /Feishu send cancelled/);
+    assert.equal(activeSignal?.aborted, true);
+
+    releaseSend(new Response(JSON.stringify({ code: 0, data: { message_id: "late" } }), {
+      headers: { "content-type": "application/json" },
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    activeSignal = undefined;
+    await assert.rejects(
+      adapter.sendFile("chat", { safeName: "note.txt", bytes: Buffer.from("hello"), snapshotPath: "/unused" }),
+      /Feishu upload timed out after 50ms/,
+    );
+    assert.equal(activeSignal?.aborted, true);
+    assert.equal(authCalls, 1, "a valid tenant token is reused without persisting it");
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedTimeout === undefined) delete process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS;
+    else process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS = savedTimeout;
+  }
+});
+
+test("Feishu message create hashes a stable flow effect key into a repeatable idempotency UUID", async () => {
+  const savedFetch = globalThis.fetch;
+  const payloads = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes("tenant_access_token")) {
+        return new Response(JSON.stringify({ code: 0, tenant_access_token: "test-token", expire: 3600 }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      payloads.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ code: 0, data: { message_id: `m-${payloads.length}` } }), {
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const adapter = feishuAdapter("idempotent-app", "secret");
+    await adapter.send("chat", "same effect", undefined, "opaque-flow-effect-key");
+    await adapter.send("chat", "same effect", undefined, "opaque-flow-effect-key");
+    assert.equal(payloads.length, 2);
+    assert.match(payloads[0].uuid, /^[a-f0-9]{32}$/);
+    assert.equal(payloads[1].uuid, payloads[0].uuid);
+    assert.doesNotMatch(payloads[0].uuid, /opaque|flow|effect/);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test("telegramAdapter retries a failed update before advancing its polling offset", async () => {
+  const savedFetch = globalThis.fetch;
+  const savedSetTimeout = globalThis.setTimeout;
+  const savedError = console.error;
+  const controller = new AbortController();
+  const offsets = [];
+  const handled = [];
+  const acknowledged = [];
+  let poll = 0;
+  try {
+    // Make the adapter's retry backoff immediate without changing production timing.
+    globalThis.setTimeout = (callback, ms, ...args) => {
+      if (ms === 2_000) {
+        queueMicrotask(() => callback(...args));
+        return 0;
+      }
+      return savedSetTimeout(callback, ms, ...args);
+    };
+    console.error = () => {};
+    globalThis.fetch = async (url) => {
+      const parsed = new URL(String(url));
+      offsets.push(parsed.searchParams.get("offset"));
+      poll++;
+      const updateId = poll < 3 ? 10 : 11;
+      const text = updateId === 10 ? "retry" : "next";
+      return new Response(JSON.stringify({
+        result: [{ update_id: updateId, message: { text, chat: { id: 1, type: "private" }, from: { id: 1 } } }],
+      }), { headers: { "content-type": "application/json" } });
+    };
+    let failedOnce = false;
+    await telegramAdapter("test-token").start(async (message) => {
+      handled.push(message.text);
+      if (!failedOnce) {
+        failedOnce = true;
+        throw new Error("transient handler failure");
+      }
+      if (message.text === "next") controller.abort();
+      return async () => { acknowledged.push(message.text); };
+    }, controller.signal);
+  } finally {
+    globalThis.fetch = savedFetch;
+    globalThis.setTimeout = savedSetTimeout;
+    console.error = savedError;
+  }
+  assert.deepEqual(handled, ["retry", "retry", "next"]);
+  assert.deepEqual(offsets, ["0", "0", "11"], "failure is re-polled; success advances to update_id + 1");
+  assert.deepEqual(acknowledged, ["retry"], "cleanup waits for a later offset-bearing poll; unacked final work is retained");
+});
+
+test("telegramAdapter bounds a half-open polling body and does not leak credential URLs from transport errors", async () => {
+  const savedFetch = globalThis.fetch;
+  const savedSetTimeout = globalThis.setTimeout;
+  const savedError = console.error;
+  const errors = [];
+  try {
+    console.error = (...args) => errors.push(args.map(String).join(" "));
+
+    const bodyController = new AbortController();
+    globalThis.setTimeout = (callback, ms, ...args) => {
+      if (ms === 40_000) return savedSetTimeout(callback, 5, ...args);
+      if (ms === 2_000) {
+        bodyController.abort();
+        queueMicrotask(() => callback(...args));
+        return 0;
+      }
+      return savedSetTimeout(callback, ms, ...args);
+    };
+    globalThis.fetch = async () => new Response(new ReadableStream({ start() {} }), {
+      headers: { "content-type": "application/json" },
+    });
+    await telegramAdapter("body-timeout-token").start(async () => {}, bodyController.signal);
+    assert.ok(errors.some((line) => line.includes("Telegram poll timed out")), "body consumption shares the poll deadline");
+
+    errors.length = 0;
+    const transportController = new AbortController();
+    globalThis.setTimeout = (callback, ms, ...args) => {
+      if (ms === 2_000) {
+        transportController.abort();
+        queueMicrotask(() => callback(...args));
+        return 0;
+      }
+      return savedSetTimeout(callback, ms, ...args);
+    };
+    globalThis.fetch = async () => {
+      throw new Error("request failed https://api.telegram.org/botcredential-must-not-leak/getUpdates");
+    };
+    await telegramAdapter("credential-must-not-leak").start(async () => {}, transportController.signal);
+    assert.ok(errors.some((line) => line.includes("Telegram getUpdates transport failed")));
+    assert.ok(errors.every((line) => !line.includes("credential-must-not-leak")));
+  } finally {
+    globalThis.fetch = savedFetch;
+    globalThis.setTimeout = savedSetTimeout;
+    console.error = savedError;
+  }
+});
+
+test("Feishu inbound callback errors are rethrown for platform redelivery", async () => {
+  const savedError = console.error;
+  const errors = [];
+  console.error = (...args) => errors.push(args.join(" "));
+  try {
+    await assert.rejects(
+      dispatchFeishuInbound(async () => { throw new Error("handler failed"); }, {
+        chatId: "chat",
+        userId: "user",
+        userName: "user",
+        text: "hello",
+      }),
+      /handler failed/,
+    );
+  } finally {
+    console.error = savedError;
+  }
+  assert.ok(errors.some((line) => line.includes("message handling failed")));
 });
 
 test("parseTelegramUpdate: photo message → caption (or [图片]) text; photoFileId picks the largest", () => {
@@ -127,6 +444,12 @@ test("flattenPost: rich-text post → joined text runs", () => {
   assert.equal(flattenPost(post), "hi link line2");
   assert.equal(flattenPost({ zh_cn: { content: [[{ tag: "text", text: "中文" }]] } }), "中文"); // locale-wrapped
   assert.equal(flattenPost({}), "");
+});
+
+test("feishuTimestampMs: accepts millisecond and second transport timestamps", () => {
+  assert.equal(feishuTimestampMs("1800000000123"), 1_800_000_000_123);
+  assert.equal(feishuTimestampMs("1800000000"), 1_800_000_000_000);
+  assert.equal(feishuTimestampMs("bad"), undefined);
 });
 
 test("parseSlackEvent: filters non-messages/bots/subtypes, parses text + image file_share", () => {
@@ -251,12 +574,50 @@ test("outputDelta: append/unchanged/scroll-anchor/tail", () => {
   assert.equal(outputDelta("gone\nvanished", big).split("\n").length, 20); // can't anchor → last 20 lines
 });
 
-test("chunkText: splits at the Telegram limit", () => {
+test("chunkText: preserves content, prefers natural boundaries, and never tears Unicode", () => {
   assert.deepEqual(chunkText("short"), ["short"]);
   const big = "x".repeat(9000);
   const parts = chunkText(big, 4000);
   assert.equal(parts.length, 3);
   assert.equal(parts.join(""), big);
+
+  assert.deepEqual(chunkText("first line\nsecond line\nthird", 18), ["first line\n", "second line\nthird"]);
+  const unicode = "中文🙂abc ".repeat(20);
+  const unicodeParts = chunkText(unicode, 13);
+  assert.equal(unicodeParts.join(""), unicode);
+  assert.ok(unicodeParts.every((part) => part.length <= 13));
+  assert.ok(unicodeParts.every((part) => !part.includes("�")));
+
+  const clusters = ["👨‍👩‍👧‍👦", "e\u0301", "🇨🇳", "\r\n"];
+  const delicate = `1234${clusters.join("ABCD")}tail`;
+  const delicateParts = chunkText(delicate, 16);
+  assert.equal(delicateParts.join(""), delicate);
+  assert.ok(delicateParts.every((part) => part.length <= 16));
+  for (const cluster of clusters) {
+    assert.equal(delicateParts.filter((part) => part.includes(cluster)).length, 1, `${JSON.stringify(cluster)} stays intact`);
+  }
+
+  // Platform limits are measured like JavaScript String.length, not Unicode code points.
+  const emojiParts = chunkText("🙂".repeat(8), 8);
+  assert.equal(emojiParts.join(""), "🙂".repeat(8));
+  assert.ok(emojiParts.every((part) => part.length <= 8));
+  assert.deepEqual(emojiParts.map((part) => part.length), [8, 8]);
+
+  // An individual grapheme may itself exceed the bound. Split it finitely, but preserve code points whenever
+  // the configured limit can hold one (including ZWJ emoji and long combining-mark sequences).
+  const oversized = `👨‍👩‍👧‍👦${"\u0301".repeat(20)}`;
+  const oversizedParts = chunkText(oversized, 6);
+  assert.equal(oversizedParts.join(""), oversized);
+  assert.ok(oversizedParts.every((part) => part.length <= 6));
+  assert.ok(oversizedParts.every((part) => !/[\uD800-\uDBFF]$/.test(part)));
+  assert.ok(oversizedParts.every((part) => !/^[\uDC00-\uDFFF]/.test(part)));
+
+  const crlfParts = chunkText("a\r\nb\r\nc\r\nd", 3);
+  assert.equal(crlfParts.join(""), "a\r\nb\r\nc\r\nd");
+  assert.ok(crlfParts.every((part) => part.length <= 3));
+  assert.ok(crlfParts.every((part) => !part.endsWith("\r")));
+  assert.ok(crlfParts.every((part) => !part.startsWith("\n")));
+  assert.throws(() => chunkText("x", 0), /positive integer/);
 });
 
 test("parseCommand: leading /word → {cmd,arg}; else null", () => {
@@ -338,6 +699,38 @@ test("KeyedSerialQueue serializes one session, runs separate sessions concurrent
   assert.deepEqual(events, ["a1:start", "b:start", "a1:end", "a2:start"]);
   assert.equal(queue.pending("session-a"), 0);
   assert.equal(queue.size, 0, "settled session keys do not accumulate");
+});
+
+test("gateway admission keeps context mutation, commands, and coding in one same-chat FIFO", async () => {
+  const queue = new KeyedSerialQueue(4);
+  const firstMessage = { chatId: "chat-7", userId: "owner", chatType: "p2p" };
+  const secondMessage = { chatId: "chat-7", userId: "owner", chatType: "p2p" };
+  const key = gatewayAdmissionKey("credential-scope", firstMessage);
+  assert.equal(key, gatewayAdmissionKey("credential-scope", secondMessage));
+  assert.notEqual(
+    gatewayAdmissionKey("credential-scope", { chatId: "room", userId: "alice", chatType: "group" }),
+    gatewayAdmissionKey("credential-scope", { chatId: "room", userId: "bob", chatType: "group" }),
+    "group actors keep independent context lanes",
+  );
+
+  let releaseFirst;
+  const gate = new Promise((resolve) => (releaseFirst = resolve));
+  const context = { session: "old", voice: false };
+  const observed = [];
+  const first = queue.run(key, async () => {
+    observed.push(`first:${context.session}`);
+    await gate;
+    context.session = "new"; // models /new completing before the next message resolves chatContext
+    context.voice = true;
+  });
+  const second = queue.run(gatewayAdmissionKey("credential-scope", secondMessage), async () => {
+    observed.push(`second:${context.session}:${context.voice}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(observed, ["first:old"]);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(observed, ["first:old", "second:new:true"]);
 });
 
 test("KeyedSerialQueue bounds backlog and a rejected task cannot poison its session", async () => {
@@ -733,7 +1126,89 @@ test("weixin inboundMediaRefs: image aeskey hex-hack re-encodes to base64(ascii(
 test("tts: ttsConfigFromEnv defaults + ttsCleanText (collapse ws, strip fences, cap)", () => {
   assert.equal(ttsConfigFromEnv({}).provider, "say"); // default provider
   assert.equal(ttsConfigFromEnv({ HARA_TTS_PROVIDER: "openai", HARA_TTS_VOICE: "alloy" }).voice, "alloy");
+  assert.equal(ttsTimeoutMs("0"), 60_000, "deadlines cannot be disabled");
+  assert.equal(ttsTimeoutMs("999999"), 120_000, "deadlines have a hard upper bound");
   assert.equal(ttsCleanText("  hello\n\nworld  "), "hello world");
   assert.match(ttsCleanText("a ```code\nblock``` b"), /code omitted/);
   assert.ok(ttsCleanText("x".repeat(5000)).length <= 1200);
+});
+
+test("TTS hard timeout settles a wedged custom provider", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX custom-command fixture");
+  const startedAt = Date.now();
+  const output = await Promise.race([
+    synthesize("timeout fixture", {
+      provider: "cmd",
+      voice: "",
+      model: "",
+      baseURL: "",
+      apiKey: "",
+      cmd: "trap '' TERM; sleep 30",
+      timeoutMs: 60,
+    }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("TTS timeout did not settle")), 2_000)),
+  ]);
+  assert.equal(output, null);
+  assert.ok(Date.now() - startedAt < 2_000);
+});
+
+test("TTS custom provider keeps the legacy config argument and returns only a private non-empty file", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX custom-command fixture");
+  const output = await synthesize("private speech", {
+    provider: "cmd",
+    voice: "",
+    model: "",
+    baseURL: "",
+    apiKey: "",
+    cmd: "cat > {out}",
+    timeoutMs: 2_000,
+  });
+  assert.ok(output);
+  try {
+    assert.equal(readFileSync(output, "utf8"), "private speech");
+    assert.equal(statSync(output).mode & 0o777, 0o600);
+  } finally {
+    rmSync(output, { force: true });
+  }
+});
+
+test("gateway shutdown aborts TTS and kills its custom-command descendant tree", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX process-group assertion");
+  const dir = mkdtempSync(join(tmpdir(), "hara-tts-abort-"));
+  const pidFile = join(dir, "descendant.pid");
+  const controller = new AbortController();
+  let descendantPid;
+  try {
+    const pending = synthesize("shutdown fixture", controller.signal, {
+      provider: "cmd",
+      voice: "",
+      model: "",
+      baseURL: "",
+      apiKey: "",
+      cmd: `trap '' TERM; sleep 30 & echo $! > '${pidFile}'; wait`,
+      timeoutMs: 30_000,
+    });
+    for (let attempt = 0; attempt < 100 && !existsSync(pidFile); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(existsSync(pidFile), true, "custom provider started its descendant");
+    descendantPid = Number(readFileSync(pidFile, "utf8").trim());
+    assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 1);
+    controller.abort(new Error("gateway shutdown"));
+    await assert.rejects(
+      Promise.race([
+        pending,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("shutdown did not cancel TTS")), 2_000)),
+      ]),
+      /gateway shutdown/,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.throws(() => process.kill(descendantPid, 0), (error) => error?.code === "ESRCH");
+  } finally {
+    controller.abort(new Error("test cleanup"));
+    if (descendantPid) {
+      try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

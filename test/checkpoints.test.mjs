@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkpoint, listCheckpoints, restoreCheckpoint } from "../dist/checkpoints.js";
@@ -83,6 +83,37 @@ test("listCheckpoints: empty for a project with no checkpoints yet", () => {
     else process.env.HOME = prev;
     rmSync(home, { recursive: true, force: true });
     rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("checkpoints refuse canonical Home aliases without creating shadow state, while a child project works", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-ckpt-home-boundary-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  const project = join(home, "project");
+  mkdirSync(project, { recursive: true });
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    writeFileSync(join(home, "personal.txt"), "must not be snapshotted\n");
+    assert.equal(checkpoint(home, "home snapshot"), null);
+    assert.equal(checkpoint(alias, "alias snapshot"), null);
+    assert.deepEqual(listCheckpoints(alias), []);
+    assert.equal(restoreCheckpoint(home, "deadbeef"), null);
+    assert.equal(existsSync(join(home, ".hara", "checkpoints")), false, "rejection happens before state creation");
+
+    writeFileSync(join(project, "package.json"), "{}");
+    writeFileSync(join(project, "app.js"), "project scoped\n");
+    assert.match(checkpoint(project, "child project snapshot") ?? "", /^[0-9a-f]{7,}$/);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

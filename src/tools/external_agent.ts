@@ -6,7 +6,7 @@
 // Safety: kind:"exec" → inherits the loop's approval gate. It can read/write/run on the host, so it is the most
 // privileged tool — and because fan-out sub-agents only get the read-only allow-list (READONLY_TOOLS), they
 // never see this tool. Trust tiers (off|gated|full) gate the dangerous bypass/full-access sub-modes.
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { platform } from "node:os";
 import { registerTool, type ToolContext } from "./registry.js";
 import { capHeadTail } from "./builtin.js";
@@ -59,15 +59,49 @@ export function appendBoundedExternalOutput(current: string, chunk: string, limi
 
 /** Probe a CLI's availability via `<bin> --version` (cached per process). */
 const availCache = new Map<string, boolean>();
-function available(bin: string): boolean {
+async function available(bin: string, signal?: AbortSignal): Promise<boolean> {
   if (availCache.has(bin)) return availCache.get(bin)!;
-  let ok = false;
-  try {
-    execFileSync(bin, ["--version"], { stdio: "ignore", timeout: 5000, env: toolSubprocessEnv() });
-    ok = true;
-  } catch {
-    ok = false;
-  }
+  if (signal?.aborted) throw new Error("external agent interrupted before availability probe");
+  const ok = await new Promise<boolean>((resolve, reject) => {
+    const processGroup = platform() !== "win32";
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(bin, ["--version"], {
+        stdio: "ignore",
+        env: toolSubprocessEnv(),
+        detached: processGroup,
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    let done = false;
+    let aborted = false;
+    let stopping = false;
+    let fallback: NodeJS.Timeout | undefined;
+    const settle = (value: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (fallback) clearTimeout(fallback);
+      signal?.removeEventListener("abort", abortProbe);
+      if (aborted) reject(new Error("external agent interrupted during availability probe"));
+      else resolve(value);
+    };
+    const stop = (fromAbort: boolean): void => {
+      if (done || stopping) return;
+      stopping = true;
+      aborted = fromAbort;
+      terminateSubprocessTree(child, { force: true, processGroup });
+      fallback = setTimeout(() => settle(false), 750);
+    };
+    const abortProbe = (): void => stop(true);
+    const timer = setTimeout(() => stop(false), 5_000);
+    signal?.addEventListener("abort", abortProbe, { once: true });
+    if (signal?.aborted) abortProbe();
+    child.once("error", () => settle(false));
+    child.once("close", (code) => settle(code === 0));
+  });
   availCache.set(bin, ok);
   return ok;
 }
@@ -86,6 +120,7 @@ registerTool({
     "another agent to own end-to-end. It can read/write/run on the host, so it's gated by approval. " +
     "Args: task (required), backend (claude|codex; default = first installed), model (optional).",
   kind: "exec", // → approval gate; never exposed to read-only fan-out sub-agents
+  requiresProjectWorkspace: true,
   trustBoundary: "external",
   input_schema: {
     type: "object",
@@ -98,6 +133,7 @@ registerTool({
     required: ["task"],
   },
   async run(input: any, ctx: ToolContext): Promise<string> {
+    if (ctx.signal?.aborted) return "[external agent] interrupted before start by agent run deadline or cancellation";
     if (!ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
       return (
         "Blocked: external_agent runs another host coding agent outside Hara's protected-file boundary. " +
@@ -109,10 +145,13 @@ registerTool({
     const task = typeof input.task === "string" ? input.task.trim() : "";
     if (!task) return "external_agent needs a non-empty `task`.";
 
-    const installed = BUILTIN_BACKENDS.filter((b) => available(b));
+    const availability = await Promise.all(BUILTIN_BACKENDS.map((candidate) => available(candidate, ctx.signal)));
+    if (ctx.signal?.aborted) return "[external agent] interrupted before start by agent run deadline or cancellation";
+    const installed = BUILTIN_BACKENDS.filter((_candidate, index) => availability[index]);
     const backend = String(input.backend ?? "").trim() || installed[0] || "";
     if (!BUILTIN_BACKENDS.includes(backend)) return `Unknown backend '${backend || "(none)"}'. Supported: ${BUILTIN_BACKENDS.join(", ")}.`;
-    if (!available(backend)) return `'${backend}' CLI not found on PATH. Installed external agents: ${installed.join(", ") || "none"}.`;
+    if (!(await available(backend, ctx.signal))) return `'${backend}' CLI not found on PATH. Installed external agents: ${installed.join(", ") || "none"}.`;
+    if (ctx.signal?.aborted) return "[external agent] interrupted before start by agent run deadline or cancellation";
 
     const built = buildExternalArgv(backend, task, { cwd: ctx.cwd, model: input.model ? String(input.model) : undefined, sandbox: ctx.sandbox ?? "off", trust });
     if (!built) return `Unknown backend '${backend}'.`;
@@ -145,6 +184,7 @@ registerTool({
         if (done) return;
         done = true;
         clearTimeout(timer);
+        ctx.signal?.removeEventListener("abort", abortRun);
         // A stopped tree must still receive its scheduled group KILL even if the direct shell closed first.
         // The default cancellation removes only the wall-clock fallback, not the force timer.
         cancelTermination?.();
@@ -178,6 +218,9 @@ registerTool({
       const timer = setTimeout(() => {
         stopTree(`[${backend}] timed out after ${timeout}ms`);
       }, timeout);
+      const abortRun = (): void => stopTree(`[${backend}] interrupted by agent run deadline or cancellation`);
+      ctx.signal?.addEventListener("abort", abortRun, { once: true });
+      if (ctx.signal?.aborted) abortRun();
       child.stdin?.on("error", () => { /* a backend may exit before stdin.end(); close/error settles it */ });
       child.stdin?.end(); // task is passed via argv
       child.stdout?.on("data", (d: Buffer) => {

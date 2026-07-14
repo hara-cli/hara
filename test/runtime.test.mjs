@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { MIN_NODE_MAJOR, MIN_NODE_VERSION, unsupportedNodeMessage } from "../dist/runtime.js";
+import { applyPortableHomeEnv, MIN_NODE_MAJOR, MIN_NODE_VERSION, normalizePortableWindowsHome, unsupportedNodeMessage } from "../dist/runtime.js";
 
 const rootFile = (path) => fileURLToPath(new URL(`../${path}`, import.meta.url));
 const require = createRequire(import.meta.url);
@@ -38,6 +38,22 @@ test("runtime boundary: legacy CJS bootstrap stays exactly aligned with the ESM 
     { node: "22.22.3" },
     { node: "20.10.0", bun: "1.3.0" },
   ]) assert.equal(bootstrap.unsupportedNodeMessage(versions), unsupportedNodeMessage(versions));
+});
+
+test("Windows portable/Git Bash HOME overrides USERPROFILE before Hara state is loaded", () => {
+  const esmEnv = { HOME: "D:\\portable\\home", USERPROFILE: "C:\\Users\\real" };
+  const cjsEnv = { ...esmEnv };
+  assert.equal(applyPortableHomeEnv(esmEnv, "win32"), true);
+  assert.equal(bootstrap.applyPortableHomeEnv(cjsEnv, "win32"), true);
+  assert.equal(esmEnv.USERPROFILE, esmEnv.HOME);
+  assert.deepEqual(cjsEnv, esmEnv);
+  assert.equal(applyPortableHomeEnv({ HOME: "/tmp/unchanged", USERPROFILE: "real" }, "linux"), false);
+  assert.equal(normalizePortableWindowsHome("/c/Users/hara"), "C:\\Users\\hara");
+  assert.equal(normalizePortableWindowsHome("//server/share/hara"), "\\\\server\\share\\hara");
+  const msysEnv = { HOME: "/d/portable/hara", USERPROFILE: "C:\\Users\\real" };
+  applyPortableHomeEnv(msysEnv, "win32");
+  assert.equal(msysEnv.USERPROFILE, "D:\\portable\\hara");
+  assert.equal(bootstrap.normalizePortableWindowsHome("/d/portable/hara"), msysEnv.USERPROFILE);
 });
 
 test("runtime packaging: manifests, executable bin, scripts, and Docker use the guarded entry", () => {

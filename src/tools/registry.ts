@@ -1,6 +1,7 @@
 import type { ToolSpec } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
 import { limitToolResult } from "./result-limit.js";
+import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
 
 /** Where agent-side output goes. In the TUI it drives ink state; in plain mode it's absent and
  *  the loop/tools fall back to writing the terminal directly. */
@@ -15,10 +16,12 @@ export interface UiSink {
 export interface ToolContext {
   cwd: string;
   sandbox?: SandboxMode;
+  /** One-run cancellation boundary. Built-in tools must stop owned subprocesses/work promptly when fired. */
+  signal?: AbortSignal;
   /** Isolate the in-memory todo_write checklist for concurrent agent runs (serve sessions/sub-agents). */
   todoScope?: string;
   /** spawn a sub-agent for a sub-task (set by the REPL/-p; absent inside sub-agents) */
-  spawn?: (task: string, role?: string) => Promise<string>;
+  spawn?: (task: string, role?: string, signal?: AbortSignal) => Promise<string>;
   /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */
   ui?: UiSink;
   /** Ask the user a structured question mid-turn and await their answer (drives the `ask_user` tool).
@@ -27,12 +30,12 @@ export interface ToolContext {
    *  must treat `ask === undefined` as "no interactive user available" and not block. When `options` are
    *  given they are offered as a numbered list; the user may also type a free-text answer. Returns the chosen
    *  option text or the free text. */
-  ask?: (question: string, options?: string[]) => Promise<string>;
+  ask?: (question: string, options?: string[], signal?: AbortSignal) => Promise<string>;
   /** describe an image file via the vision sidecar (lets the computer tool return a screenshot as text);
    *  `hint` focuses the description on a goal (e.g. "the Login button") for actionable RPA output */
-  describeImage?: (path: string, hint?: string) => Promise<string>;
+  describeImage?: (path: string, hint?: string, signal?: AbortSignal) => Promise<string>;
   /** locate a UI element in a screenshot via a grounding vision model → center as 0..1 fractions (for RPA clicks) */
-  locate?: (path: string, target: string) => Promise<{ x: number; y: number } | null>;
+  locate?: (path: string, target: string, signal?: AbortSignal) => Promise<{ x: number; y: number } | null>;
 }
 
 export interface Tool {
@@ -46,6 +49,10 @@ export interface Tool {
   /** read | edit | exec | computer — drives the approval gate (read never prompts; computer always asks
    *  once per session for a grant, even in full-auto) */
   kind?: "read" | "edit" | "exec" | "computer";
+  /** This tool hands the whole cwd to an executable/project-aware process and therefore cannot run with
+   *  Home as its implicit workspace. `kind:"exec"` alone is only an approval class: explicit sends and
+   *  cron-management actions remain valid at Home. */
+  requiresProjectWorkspace?: boolean;
   /** Opaque host process (MCP/external coding agent). It sits outside Hara's in-process file boundary,
    *  therefore always needs an interactive grant and is disabled in headless/full-auto unless the user
    *  opted in before launch with HARA_ALLOW_TRUSTED_EXTENSIONS=1. */
@@ -73,7 +80,21 @@ export function registerTool(t: Tool): void {
     ...t,
     // Apply the context boundary at registration so every caller (main loop, tests, embedders) gets
     // identical behavior instead of relying on one orchestration path to remember the cap.
-    run: async (input, ctx) => limitToolResult(await run(input, ctx)),
+    run: async (input, ctx) => {
+      // A tool reference can be retained by a non-cooperative wrapper and invoked after runAgent has already
+      // returned its deadline outcome. Gate at the registered call boundary (not just in the agent loop) so
+      // delayed getTool(...).run(...) calls never start fresh work after cancellation.
+      if (ctx.signal?.aborted) {
+        return `Error: ${t.name} cancelled before execution because the agent run has ended.`;
+      }
+      // Only explicitly project-scoped executable tools are blocked. `kind:"exec"` is also used for safe
+      // management/delivery side effects, so it must not itself imply a project workspace requirement.
+      // Canonical comparison closes Home symlink aliases.
+      if (t.requiresProjectWorkspace && isHomeWorkspace(ctx.cwd)) {
+        return `Error: ${homeWorkspaceActionError(`run ${t.name}`)}`;
+      }
+      return limitToolResult(await run(input, ctx));
+    },
   });
   specsCache = null;
 }

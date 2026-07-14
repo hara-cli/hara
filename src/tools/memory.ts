@@ -3,7 +3,7 @@
 import { existsSync } from "node:fs";
 import { isAbsolute, resolve, join, relative, sep } from "node:path";
 import { registerTool } from "./registry.js";
-import { searchAssets, assetSearchRoots } from "../recall.js";
+import { searchAssetsAsync, assetSearchRoots } from "../recall.js";
 import { searchHybrid } from "../search/hybrid.js";
 import { memoryRoots, appendMemory, replaceMemory, forgetMemory, type Scope, type Target } from "../memory/store.js";
 import { scanMemory, redactSecrets, scrubLocal } from "../memory/guard.js";
@@ -27,7 +27,7 @@ registerTool({
   },
   kind: "read",
   async run(input, ctx) {
-    const hits = await searchHybrid(String(input.query ?? ""), ctx.cwd, { indexName: "memory", roots: memoryRoots(ctx.cwd), limit: Math.min(Number(input.limit) || 5, 10) });
+    const hits = await searchHybrid(String(input.query ?? ""), ctx.cwd, { indexName: "memory", roots: memoryRoots(ctx.cwd), limit: Math.min(Number(input.limit) || 5, 10), signal: ctx.signal });
     if (!hits.length) return "(no memory matches)";
     return hits.map((h) => `${h.path} — ${h.title}\n${h.snippet}`).join("\n\n");
   },
@@ -79,8 +79,8 @@ registerTool({
     const scope = asScope(input.scope);
     const target = asTarget(input.target);
     const f = input.mode === "replace"
-      ? await replaceMemory(scope, target, content, ctx.cwd)
-      : await appendMemory(scope, target, content, ctx.cwd);
+      ? await replaceMemory(scope, target, content, ctx.cwd, ctx.signal)
+      : await appendMemory(scope, target, content, ctx.cwd, ctx.signal);
     return `Saved to ${f}`;
   },
 });
@@ -124,13 +124,28 @@ registerTool({
     const scope = input.scope === "project" ? "project" : "personal";
     const dir = join(scope === "project" ? skillsDir(ctx.cwd) : globalSkillsDir(), slug);
     const f = join(dir, "SKILL.md");
-    // dedup: surface a near-duplicate so the agent updates instead of piling up (lexical signal, not a block)
-    const dups = searchAssets(`${slug} ${description}`, 3, assetSearchRoots(ctx.cwd)).filter((h) => h.path !== f && h.score >= 2);
     const skillText = `---\nname: ${slug}\ndescription: ${description}\n---\n\n${body.trim()}\n`;
     let boundary: ReturnType<typeof bindAtomicWritePath>;
     let snapshot: Awaited<ReturnType<typeof readVerifiedRegularFileSnapshot>> | null = null;
+    // Bind the destination before the first await. A project skills symlink can otherwise be retargeted
+    // while the asynchronous duplicate scan yields, changing where this write lands.
     try {
       boundary = bindAtomicWritePath(f, "create skill");
+    } catch (error: any) {
+      return `Error: cannot save skill ${slug}: ${error?.message ?? String(error)} No changes written.`;
+    }
+    let dups: Awaited<ReturnType<typeof searchAssetsAsync>> = [];
+    try {
+      // dedup: surface a near-duplicate so the agent updates instead of piling up (lexical signal, not a block)
+      dups = (await searchAssetsAsync(`${slug} ${description}`, 3, assetSearchRoots(ctx.cwd), { signal: ctx.signal }))
+        .filter((h) => h.path !== f && h.score >= 2);
+    } catch (error: any) {
+      if (ctx.signal?.aborted) {
+        return `Error: cannot save skill ${slug}: cancelled before commit. No changes written.`;
+      }
+      // Duplicate detection is advisory; an unreadable optional asset root must not prevent a safe write.
+    }
+    try {
       try {
         snapshot = await readVerifiedRegularFileSnapshot(boundary.target, undefined, "create skill");
       } catch (error: any) {
@@ -140,6 +155,7 @@ registerTool({
         expected: snapshot?.text ?? null,
         expectedIdentity: snapshot ?? undefined,
         boundary,
+        signal: ctx.signal,
       });
     } catch (error: any) {
       return `Error: cannot save skill ${slug}: ${error?.message ?? String(error)} No changes written.`;
@@ -167,7 +183,7 @@ registerTool({
   },
   kind: "edit",
   async run(input, ctx) {
-    const n = await forgetMemory(asScope(input.scope), asTarget(input.target), String(input.match ?? ""), ctx.cwd);
+    const n = await forgetMemory(asScope(input.scope), asTarget(input.target), String(input.match ?? ""), ctx.cwd, ctx.signal);
     return n ? `Removed ${n} line(s).` : "(no matching lines)";
   },
 });

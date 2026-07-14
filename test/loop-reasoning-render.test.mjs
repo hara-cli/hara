@@ -7,6 +7,9 @@
 // then ends the turn. We capture every stdout chunk and inspect the sequence.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runAgent } from "../dist/agent/loop.js";
 
 // Strip ANSI to make the assertion robust against the dim() formatting.
@@ -31,6 +34,23 @@ function withCapturedStdout(fn) {
     .then(() => chunks);
 }
 
+async function withTemporaryHome(fn) {
+  const home = mkdtempSync(join(tmpdir(), "hara-loop-render-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    return await fn();
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
 test("non-TUI reasoning: each delta lands on its own dim '│ '-prefixed line, not the spinner row", async () => {
   // Fake provider: emit two reasoning deltas (the second contains a newline mid-string), then end.
   const provider = {
@@ -43,14 +63,14 @@ test("non-TUI reasoning: each delta lands on its own dim '│ '-prefixed line, n
     },
   };
 
-  const chunks = await withCapturedStdout(() =>
+  const chunks = await withTemporaryHome(() => withCapturedStdout(() =>
     runAgent([{ role: "user", content: "hi" }], {
       provider,
       ctx: { cwd: process.cwd() },
       approval: "full-auto",
       confirm: async () => true,
     }),
-  );
+  ));
 
   const stripped = chunks.map(stripAnsi).join("");
   // The reasoning content should appear on its own line(s), prefixed by '│ '.
@@ -61,4 +81,27 @@ test("non-TUI reasoning: each delta lands on its own dim '│ '-prefixed line, n
   // i.e. the reasoning output comes AFTER any spinner clears, never the other way round.
   const reasoningIdx = stripped.indexOf("│ thinking");
   assert.ok(reasoningIdx >= 0, "reasoning ordering recoverable");
+});
+
+test("non-TUI reasoning: a synchronous provider failure clears the TTY spinner and settles", async () => {
+  const provider = {
+    id: "sync-throw",
+    model: "fake-model",
+    turn() {
+      throw new Error("synchronous provider fixture failure");
+    },
+  };
+  let outcome;
+  const chunks = await withTemporaryHome(() => withCapturedStdout(async () => {
+    outcome = await runAgent([{ role: "user", content: "hi" }], {
+      provider,
+      ctx: { cwd: process.cwd() },
+      approval: "full-auto",
+      confirm: async () => true,
+    });
+  }));
+
+  assert.equal(outcome?.status, "error");
+  assert.match(outcome?.error ?? "", /synchronous provider fixture failure/);
+  assert.match(chunks.join(""), /synchronous provider fixture failure/);
 });

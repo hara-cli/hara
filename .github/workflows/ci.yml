@@ -9,6 +9,7 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
         node: ["22.12.0", "24"]
@@ -23,6 +24,7 @@ jobs:
 
   legacy-runtime-message:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -34,8 +36,24 @@ jobs:
           grep -q 'requires Node.js 22.12.0 or newer' legacy-runtime.err
           grep -q 'nvm install 22' legacy-runtime.err
 
+  windows-runtime:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22.12.0"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # Keep this lane focused on the Windows contracts that differ from POSIX: portable/Git-Bash HOME
+      # selection and deterministic shell discovery outside PATH. The complete suite remains in build-test.
+      - run: node --test --test-timeout=120000 test/runtime.test.mjs test/windows-shell.test.mjs
+
   docker-runtime:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Build the complete runtime image
@@ -44,6 +62,7 @@ jobs:
         run: docker run --rm hara-ci --version
 
   standalone-runtime:
+    timeout-minutes: 20
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]

@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { linkSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalize, isReadOnlyCommand, splitCompound, matchesPattern, decideCommand, loadPermissionRules, scaffoldPermissions } from "../dist/security/permissions.js";
+import { canonicalize, isReadOnlyCommand, splitCompound, matchesPattern, decideCommand, loadPermissionRules, projectPermissionsPath, scaffoldPermissions } from "../dist/security/permissions.js";
 
 test("canonicalize: unwrap bash -lc, strip env assignments + benign wrappers", () => {
   assert.equal(canonicalize(`bash -lc "npm test"`), "npm test");
@@ -162,6 +162,76 @@ test("loadPermissionRules: untrusted project can add deny and disable readonly a
     else process.env.HOME = prev;
     rmSync(home, { recursive: true, force: true });
     rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test("Home permissions remain global-only, stop parent inheritance, and still compose in child projects", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-perm-home-boundary-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  const unmarked = join(home, "scratch");
+  const project = join(home, "project");
+  mkdirSync(join(root, ".git"), { recursive: true });
+  mkdirSync(join(root, ".hara"), { recursive: true });
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  mkdirSync(unmarked, { recursive: true });
+  mkdirSync(join(project, ".hara"), { recursive: true });
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  writeFileSync(join(root, ".hara", "permissions.json"), JSON.stringify({ deny: ["parent-must-not-load"] }));
+  writeFileSync(join(home, ".hara", "permissions.json"), JSON.stringify({
+    allow: ["npm test"],
+    deny: ["sudo"],
+    readonlyAutorun: false,
+  }));
+  writeFileSync(join(project, "package.json"), "{}");
+  writeFileSync(join(project, ".hara", "permissions.json"), JSON.stringify({ deny: ["git push"] }));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    assert.deepEqual(loadPermissionRules(home), { allow: ["npm test"], deny: ["sudo"], readonlyAutorun: false });
+    assert.deepEqual(loadPermissionRules(alias), { allow: ["npm test"], deny: ["sudo"], readonlyAutorun: false });
+    assert.deepEqual(loadPermissionRules(unmarked), { allow: ["npm test"], deny: ["sudo"], readonlyAutorun: false });
+    assert.deepEqual(loadPermissionRules(project), {
+      allow: ["npm test"],
+      deny: ["sudo", "git push"],
+      readonlyAutorun: false,
+    });
+    assert.equal(projectPermissionsPath(home), null);
+    assert.equal(projectPermissionsPath(alias), null);
+    assert.equal(projectPermissionsPath(unmarked), null);
+    assert.equal(projectPermissionsPath(project), join(project, ".hara", "permissions.json"));
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("project permission scaffold refuses canonical Home aliases before creating or changing global state", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-perm-scaffold-home-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  mkdirSync(home);
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    assert.throws(() => scaffoldPermissions(home, "project"), /Refusing.*home directory.*cd \/path\/to\/project/i);
+    assert.throws(() => scaffoldPermissions(alias, "project"), /Refusing.*home directory.*cd \/path\/to\/project/i);
+    assert.equal(projectPermissionsPath(home), null);
+    assert.equal(existsSync(join(home, ".hara")), false, "rejection occurs before project/global state creation");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

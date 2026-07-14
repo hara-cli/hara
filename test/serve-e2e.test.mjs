@@ -711,3 +711,42 @@ test("serve e2e: interrupt settles a pending approval immediately and leaves val
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("serve e2e: run deadline dismisses its approval and leaves no executable stale prompt", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-deadline-approval-"));
+  const store = memStore();
+  const deps = {
+    ...baseDeps(toolProvider(), store, "suggest"),
+    runLimits: () => ({ timeoutMs: 1_000, maxRounds: 10 }),
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  let sending;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    sending = c.call("session.send", { sessionId: result.sessionId, text: "wait forever for approval" });
+    const approval = await c.waitEvent("approval.request");
+    const failed = await Promise.race([
+      sending,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("run deadline did not settle approval")), 2_500)),
+    ]);
+    assert.equal(failed.error.code, -32603);
+    assert.match(failed.error.message, /total deadline 1s reached/);
+    assert.equal(existsSync(join(dir, "approved.txt")), false);
+
+    const saved = store.saved.get(result.sessionId);
+    assert.deepEqual(saved.history.slice(-2).map((message) => message.role), ["assistant", "tool"]);
+    assert.match(saved.history.at(-1).results[0].content, /run deadline 1s reached/);
+
+    // A late UI reply is idempotent and cannot resurrect the abandoned call after its map entry was removed.
+    assert.deepEqual((await c.call("approval.reply", { approvalId: approval.params.approvalId, allow: true })).result, {});
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(existsSync(join(dir, "approved.txt")), false);
+  } finally {
+    if (sending) await sending.catch(() => {});
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

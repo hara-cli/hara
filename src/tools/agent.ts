@@ -36,6 +36,6 @@ registerTool({
   async run(input, ctx) {
     if (!ctx.spawn) return "Error: sub-agents are not available in this context.";
     if (typeof input.task !== "string" || !input.task.trim()) return "Error: agent needs a `task`.";
-    return await ctx.spawn(input.task, input.role ? String(input.role) : undefined);
+    return await ctx.spawn(input.task, input.role ? String(input.role) : undefined, ctx.signal);
   },
 });

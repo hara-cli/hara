@@ -57,10 +57,13 @@ registerTool({
     const prompt = [header ? `[${header}] ` : "", context ? `${context}\n` : "", question].join("");
 
     try {
-      const answer = await ctx.ask(prompt, options && options.length ? options : undefined);
+      const answer = await ctx.ask(prompt, options && options.length ? options : undefined, ctx.signal);
       const text = typeof answer === "string" ? answer.trim() : "";
       return text || "(the user gave an empty answer)";
     } catch (e: any) {
+      // Cancellation is authoritative. Let the agent loop close the open tool round as interrupted/deadline;
+      // converting it into an ordinary "no user" result would let the model continue after Esc.
+      if (ctx.signal?.aborted) throw e;
       // If the interactive prompt fails for any reason, degrade gracefully rather than crash the turn.
       return `${NO_INTERACTIVE_USER} (ask failed: ${e?.message ?? e})`;
     }

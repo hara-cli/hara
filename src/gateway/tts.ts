@@ -11,8 +11,12 @@
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { terminateSubprocessTree } from "../security/subprocess-env.js";
+
+const DEFAULT_TTS_TIMEOUT_MS = 60_000;
+const MAX_TTS_TIMEOUT_MS = 120_000;
 
 export interface TtsConfig {
   provider: string;
@@ -21,6 +25,15 @@ export interface TtsConfig {
   baseURL: string;
   apiKey: string;
   cmd: string;
+  timeoutMs?: number;
+}
+
+/** TTS cannot opt out of a deadline. Small values remain available for deterministic health checks/tests. */
+export function ttsTimeoutMs(value: number | string | undefined = process.env.HARA_TTS_TIMEOUT_MS): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.max(50, Math.min(Math.floor(parsed), MAX_TTS_TIMEOUT_MS))
+    : DEFAULT_TTS_TIMEOUT_MS;
 }
 
 /** Read TTS settings from the environment (fully configurable — nothing hardcoded). */
@@ -32,6 +45,8 @@ export function ttsConfigFromEnv(env: NodeJS.ProcessEnv = process.env): TtsConfi
     baseURL: (env.HARA_TTS_BASE_URL || "").trim(),
     apiKey: (env.HARA_TTS_API_KEY || "").trim(),
     cmd: (env.HARA_TTS_CMD || "").trim(),
+    // Passing an explicit fixture env must not accidentally fall back to the live process environment.
+    timeoutMs: ttsTimeoutMs(env.HARA_TTS_TIMEOUT_MS ?? Number.NaN),
   };
 }
 
@@ -44,65 +59,194 @@ export function ttsCleanText(text: string, max = 1200): string {
     .slice(0, max);
 }
 
-function run(cmd: string, args: string[], stdin?: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const c = spawn(cmd, args, { stdio: [stdin != null ? "pipe" : "ignore", "ignore", "ignore"] });
-    c.on("error", () => resolve(false));
-    c.on("close", (code) => resolve(code === 0));
-    if (stdin != null) c.stdin?.end(stdin);
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("TTS cancelled");
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw abortReason(signal);
+}
+
+/** Race even an API implementation that ignores AbortSignal, while still passing the signal to its fetch. */
+function withAbort<T>(task: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const onAbort = (): void => finish(() => reject(abortReason(signal)));
+    signal.addEventListener("abort", onAbort, { once: true });
+    task.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+/** Run local TTS in its own process group. Cancellation escalates TERM→KILL for the whole descendant tree. */
+function run(cmd: string, args: string[], signal: AbortSignal, stdin?: string): Promise<boolean> {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const processGroup = process.platform !== "win32";
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        stdio: [stdin != null ? "pipe" : "ignore", "ignore", "ignore"],
+        detached: processGroup,
+        windowsHide: true,
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    let stopping = false;
+    let cancelTermination: ((cancelForce?: boolean) => void) | undefined;
+    const settle = (ok: boolean, error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", stop);
+      // Cancel only the API fallback. If TERM closed the direct child while a descendant survived, the helper's
+      // referenced force timer still kills the owned process group after the grace period.
+      cancelTermination?.();
+      child.stdin?.destroy();
+      if (error) reject(error);
+      else resolve(ok);
+    };
+    const stop = (): void => {
+      if (settled || stopping) return;
+      stopping = true;
+      cancelTermination = terminateSubprocessTree(child, {
+        processGroup,
+        graceMs: 250,
+        fallbackMs: 250,
+        onFallback: () => settle(false, abortReason(signal)),
+      });
+    };
+    child.once("error", () => settle(false, stopping ? abortReason(signal) : undefined));
+    child.once("close", (code) => settle(code === 0, stopping ? abortReason(signal) : undefined));
+    child.stdin?.on("error", () => { /* close races are reported by the child itself */ });
+    signal.addEventListener("abort", stop, { once: true });
+    if (signal.aborted) stop();
+    if (stdin != null && !stopping) child.stdin?.end(stdin);
   });
 }
 
 // local: macOS `say` → m4a (AAC). Zero config; HARA_TTS_VOICE picks the voice (default Tingting / zh).
-async function sayTts(text: string, out: string, cfg: TtsConfig): Promise<boolean> {
-  return run("say", ["-v", cfg.voice || "Tingting", "-o", out, "--file-format", "m4af", "--data-format", "aac", text]);
+async function sayTts(text: string, out: string, cfg: TtsConfig, signal: AbortSignal): Promise<boolean> {
+  return run("say", ["-v", cfg.voice || "Tingting", "-o", out, "--file-format", "m4af", "--data-format", "aac", text], signal);
 }
 
 // API: OpenAI-compatible /audio/speech. Works against OpenAI, Aliyun DashScope (compatible-mode), or a local
 // server exposing the same shape — set HARA_TTS_BASE_URL + HARA_TTS_API_KEY + HARA_TTS_MODEL + HARA_TTS_VOICE.
-async function openaiTts(text: string, out: string, cfg: TtsConfig): Promise<boolean> {
+async function openaiTts(text: string, out: string, cfg: TtsConfig, signal: AbortSignal): Promise<boolean> {
   if (!cfg.apiKey && !cfg.baseURL) return false; // not configured → unavailable
-  const { default: OpenAI } = (await import("openai")) as any;
-  const client = new OpenAI({ baseURL: cfg.baseURL || undefined, apiKey: cfg.apiKey || "x" });
-  const res = await client.audio.speech.create({ model: cfg.model || "tts-1", voice: cfg.voice || "alloy", input: text });
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (!buf.length) return false;
-  writeFileSync(out, buf);
-  return true;
+  return withAbort((async () => {
+    const { default: OpenAI } = (await import("openai")) as any;
+    throwIfAborted(signal);
+    const client = new OpenAI({ baseURL: cfg.baseURL || undefined, apiKey: cfg.apiKey || "x" });
+    const res = await client.audio.speech.create(
+      { model: cfg.model || "tts-1", voice: cfg.voice || "alloy", input: text },
+      { signal },
+    );
+    const buf = Buffer.from(await res.arrayBuffer());
+    throwIfAborted(signal);
+    if (!buf.length) return false;
+    writeFileSync(out, buf, { flag: "wx", mode: 0o600 });
+    return true;
+  })(), signal);
 }
 
 // local: a configurable command (e.g. VoxCPM). `{out}` → output path; the text is piped on stdin.
-async function cmdTts(text: string, out: string, cfg: TtsConfig): Promise<boolean> {
+async function cmdTts(text: string, out: string, cfg: TtsConfig, signal: AbortSignal): Promise<boolean> {
   if (!cfg.cmd) return false;
-  return run("sh", ["-c", cfg.cmd.replace(/\{out\}/g, out)], text);
+  return run("sh", ["-c", cfg.cmd.replace(/\{out\}/g, out)], signal, text);
 }
 
-const PROVIDERS: Record<string, (text: string, out: string, cfg: TtsConfig) => Promise<boolean>> = {
+const PROVIDERS: Record<string, (text: string, out: string, cfg: TtsConfig, signal: AbortSignal) => Promise<boolean>> = {
   say: sayTts,
   openai: openaiTts,
   cmd: cmdTts,
 };
 const EXT: Record<string, string> = { say: "m4a", openai: "mp3", cmd: "wav" };
 
-/** Synthesize `text` to a temp audio file; returns its path, or null on failure. Falls back to local `say`
- *  if a configured provider fails (so a misconfigured API never silently kills voice replies). */
-export async function synthesize(text: string, cfg: TtsConfig = ttsConfigFromEnv()): Promise<string | null> {
+function isAbortSignal(value: AbortSignal | TtsConfig | undefined): value is AbortSignal {
+  return Boolean(value && typeof (value as AbortSignal).addEventListener === "function" && typeof (value as AbortSignal).aborted === "boolean");
+}
+
+function safeProviderError(error: unknown, cfg: TtsConfig): string {
+  let message = error instanceof Error ? error.message : String(error);
+  for (const [secret, replacement] of [[cfg.apiKey, "[redacted]"], [cfg.baseURL, "[redacted-url]"]] as const) {
+    if (secret) message = message.split(secret).join(replacement);
+  }
+  return message;
+}
+
+function secureCompletedAudio(path: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size <= 0) return false;
+    chmodSync(path, 0o600);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Synthesize `text` to a temp audio file; returns its path, or null on provider/deadline failure. The legacy
+ * `synthesize(text, config)` form remains valid; gateway callers use `synthesize(text, signal, config?)`. */
+export async function synthesize(
+  text: string,
+  signalOrConfig?: AbortSignal | TtsConfig,
+  explicitConfig?: TtsConfig,
+): Promise<string | null> {
+  const parentSignal = isAbortSignal(signalOrConfig) ? signalOrConfig : undefined;
+  if (parentSignal?.aborted) throw abortReason(parentSignal);
   const clean = ttsCleanText(text);
   if (!clean) return null;
+  const cfg = isAbortSignal(signalOrConfig)
+    ? (explicitConfig ?? ttsConfigFromEnv())
+    : (explicitConfig ?? signalOrConfig ?? ttsConfigFromEnv());
+  const deadline = new AbortController();
+  const timeoutMs = ttsTimeoutMs(cfg.timeoutMs);
+  const timeoutError = new Error(`TTS timed out after ${timeoutMs}ms`);
+  const timeout = setTimeout(() => deadline.abort(timeoutError), timeoutMs);
+  const cancel = (): void => deadline.abort(parentSignal?.reason instanceof Error ? parentSignal.reason : new Error("TTS cancelled"));
+  parentSignal?.addEventListener("abort", cancel, { once: true });
   const provider = PROVIDERS[cfg.provider] ? cfg.provider : "say";
-  const out = join(tmpdir(), `hara-tts-${randomUUID().slice(0, 8)}.${EXT[provider] || "wav"}`);
+  const out = join(tmpdir(), `hara-tts-${randomUUID()}.${EXT[provider] || "wav"}`);
   try {
-    if (await PROVIDERS[provider](clean, out, cfg)) return out;
-  } catch (e) {
-    console.error(`tts(${provider}): ${(e as Error)?.message ?? e}`);
-  }
-  if (provider !== "say") {
     try {
-      const o2 = join(tmpdir(), `hara-tts-${randomUUID().slice(0, 8)}.m4a`);
-      if (await sayTts(clean, o2, cfg)) return o2; // graceful fallback to local
-    } catch {
-      /* give up */
+      if (await PROVIDERS[provider](clean, out, cfg, deadline.signal) && secureCompletedAudio(out)) return out;
+    } catch (error) {
+      if (parentSignal?.aborted) throw abortReason(parentSignal);
+      if (deadline.signal.aborted) {
+        console.error(`tts(${provider}): ${timeoutError.message}`);
+        return null;
+      }
+      console.error(`tts(${provider}): ${safeProviderError(error, cfg)}`);
     }
+    rmSync(out, { force: true });
+    if (provider !== "say" && !deadline.signal.aborted) {
+      const fallback = join(tmpdir(), `hara-tts-${randomUUID()}.m4a`);
+      try {
+        if (await sayTts(clean, fallback, cfg, deadline.signal) && secureCompletedAudio(fallback)) return fallback; // graceful local fallback
+      } catch (error) {
+        if (parentSignal?.aborted) throw abortReason(parentSignal);
+        if (deadline.signal.aborted) console.error(`tts(say): ${timeoutError.message}`);
+        else console.error(`tts(say): ${safeProviderError(error, cfg)}`);
+      }
+      rmSync(fallback, { force: true });
+    }
+    return null;
+  } finally {
+    clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", cancel);
+    // Returned paths are owned by the caller. Every other partial/late provider output is removed here.
+    if (deadline.signal.aborted) rmSync(out, { force: true });
   }
-  return null;
 }

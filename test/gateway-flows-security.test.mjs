@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { addPending, approvalPolicy, handleOwnerReply, latestPending, listPending, parseApprovalCommand, resolvePending, runNoToolTurn } from "../dist/gateway/flows-pending.js";
 import { appendFlowLog, dispatchFlows, loadFlows, parseAgentResult, resetFlowRateStateForTests } from "../dist/gateway/flows.js";
 import { isPrivateApprovalMessage, resolveAllowlist, resolveApprovalOwner } from "../dist/gateway/serve.js";
+import { gatewayRuntimeScope, GatewayFlowRunStore, GatewayMessageDeduper } from "../dist/gateway/runtime-state.js";
 
 async function withTempHome(fn) {
   const home = mkdtempSync(join(tmpdir(), "hara-flow-security-"));
@@ -66,6 +67,23 @@ test("runNoToolTurn settles immediately on gateway shutdown even when a provider
   assert.equal(await running, "");
   assert.equal(providerSignal.aborted, true, "shutdown reaches the provider's request signal");
   assert.ok(Date.now() - started < 500, "a non-cooperative provider promise cannot delay gateway shutdown");
+});
+
+test("runNoToolTurn does not start a provider cancelled before its invocation microtask", async () => {
+  const controller = new AbortController();
+  let turns = 0;
+  const provider = {
+    id: "must-not-start",
+    model: "must-not-start",
+    async turn() {
+      turns += 1;
+      return { text: "late", toolUses: [], stop: "end" };
+    },
+  };
+  const running = runNoToolTurn(provider, "cancel", { signal: controller.signal, timeoutMs: 500 });
+  controller.abort();
+  assert.equal(await running, "");
+  assert.equal(turns, 0);
 });
 
 test("flow result parsing drops model values with unsafe shapes", () => {
@@ -251,6 +269,463 @@ test("flow actions that need approval are dropped when no unique owner exists", 
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(replies, ["auto?"], "replyOn is the explicit auto-send capability");
     assert.equal(listPending().length, 2);
+  });
+});
+
+test("dispatchFlows waits for delivery completion and propagates failure to the inbound claim", async () => {
+  await withTempHome(async (home) => {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    writeFileSync(
+      join(home, ".hara", "flows.json"),
+      JSON.stringify([{
+        name: "tracked-reply",
+        on: { platform: "feishu", chatType: "group", keyword: "help" },
+        do: "triage",
+        replyOn: ["reply"],
+        log: false,
+      }]),
+    );
+    const modelResult = JSON.stringify({
+      disposition: "reply",
+      briefing: "ready",
+      draft: "answer",
+      route: { replyInChat: true },
+    });
+    const message = { chatId: "oc_group", userId: "member", chatType: "group", text: "help" };
+    let releaseDelivery;
+    const delivery = new Promise((resolve) => { releaseDelivery = resolve; });
+    let settled = false;
+    const running = dispatchFlows(message, "feishu", async () => modelResult, async () => delivery)
+      .then((handled) => {
+        settled = true;
+        return handled;
+      });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "dispatch remains tracked while outbound delivery is pending");
+    releaseDelivery();
+    assert.equal(await running, true);
+
+    await assert.rejects(
+      dispatchFlows(message, "feishu", async () => modelResult, async () => { throw new Error("send failed"); }),
+      /send failed/,
+      "a failed flow bubbles up so the persistent message claim is released",
+    );
+  });
+});
+
+test("persistent flow effect receipts resume a partial multi-target delivery without duplicate replies", async () => {
+  await withTempHome(async (home) => {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    const firstTarget = "https://notify.invalid/first?token=target-secret-one";
+    const secondTarget = "https://notify.invalid/second?token=target-secret-two";
+    const receiptRule = {
+      name: "receipt-resume",
+      on: { platform: "feishu", chatType: "group", keyword: "help" },
+      do: "triage",
+      replyOn: ["reply"],
+      deliver: [`webhook:${firstTarget}`, `webhook:${secondTarget}`],
+      log: false,
+    };
+    writeFileSync(
+      join(home, ".hara", "flows.json"),
+      JSON.stringify([receiptRule]),
+    );
+    const modelResult = JSON.stringify({
+      disposition: "reply",
+      briefing: "owner briefing",
+      draft: "one external answer",
+      route: { replyInChat: true, notifyOwner: true },
+    });
+    const message = {
+      chatId: "oc_group",
+      userId: "member",
+      chatType: "group",
+      text: "help",
+      messageId: "evt-sensitive-123",
+    };
+    const runtimeScope = gatewayRuntimeScope("feishu", "app-id-that-must-not-be-stored");
+    const receiptScope = gatewayRuntimeScope("flow-effects", runtimeScope);
+    const runScope = gatewayRuntimeScope("flow-runs", runtimeScope);
+    const replies = [];
+    const calls = [];
+    const savedFetch = globalThis.fetch;
+    const savedNow = Date.now;
+    let now = savedNow();
+    let secondAttempts = 0;
+    let modelCalls = 0;
+    try {
+      Date.now = () => now;
+      globalThis.fetch = async (url) => {
+        calls.push(String(url));
+        if (String(url).includes("/second")) {
+          secondAttempts++;
+          return new Response("", { status: secondAttempts === 1 ? 503 : 200 });
+        }
+        return new Response("", { status: 200 });
+      };
+      const firstReceipts = await GatewayMessageDeduper.open(receiptScope, { home });
+      const firstRuns = await GatewayFlowRunStore.open(runScope, { home, now: () => now });
+      await assert.rejects(
+        dispatchFlows(
+          message,
+          "feishu",
+          async () => {
+            modelCalls++;
+            return modelResult;
+          },
+          async (text) => { replies.push(text); },
+          "feishu:boss",
+          undefined,
+          { scope: runtimeScope, receipts: firstReceipts, runs: firstRuns },
+        ),
+        /webhook 503/,
+      );
+      now += 3_000; // pass the bounded retry backoff without slowing the suite
+      resetFlowRateStateForTests();
+
+      // Hot-reloading an unrelated rule before this one must not change any receipt key.
+      writeFileSync(
+        join(home, ".hara", "flows.json"),
+        JSON.stringify([
+          { name: "unrelated", on: { platform: "telegram", keyword: "other" }, do: "ignore", log: false },
+          receiptRule,
+        ]),
+      );
+
+      // Reopen the store to prove this is a cross-instance/restart receipt, not merely an in-memory guard.
+      const restartedReceipts = await GatewayMessageDeduper.open(receiptScope, { home });
+      const restartedRuns = await GatewayFlowRunStore.open(runScope, { home, now: () => now });
+      assert.equal(
+        await dispatchFlows(
+          message,
+          "feishu",
+          async () => {
+            modelCalls++;
+            return JSON.stringify({
+              disposition: "reply",
+              briefing: "changed owner briefing",
+              draft: "different external answer",
+              route: { replyInChat: true, notifyOwner: true },
+            });
+          },
+          async (text) => { replies.push(text); },
+          "feishu:boss",
+          undefined,
+          { scope: runtimeScope, receipts: restartedReceipts, runs: restartedRuns },
+        ),
+        true,
+      );
+    } finally {
+      globalThis.fetch = savedFetch;
+      Date.now = savedNow;
+    }
+    assert.equal(modelCalls, 1, "all targets resume from one persisted model decision");
+    assert.deepEqual(replies, ["one external answer"], "the successful in-chat effect is not repeated");
+    assert.equal(calls.filter((url) => url.includes("/first")).length, 1, "the first successful target is not repeated");
+    assert.equal(calls.filter((url) => url.includes("/second")).length, 2, "only the failed target resumes");
+
+    const gatewayDir = join(home, ".hara", "gateway");
+    const receiptFile = readdirSync(gatewayDir).find((name) => name.includes(receiptScope));
+    assert.ok(receiptFile);
+    const persisted = readFileSync(join(gatewayDir, receiptFile), "utf8");
+    assert.doesNotMatch(persisted, /evt-sensitive|target-secret|app-id-that-must-not-be-stored|one external answer/);
+    const parsed = JSON.parse(persisted);
+    assert.ok(parsed.messages.every((entry) => /^[a-f0-9]{64}$/.test(entry.id)));
+  });
+});
+
+test("flow retries reuse one durable model decision and resume at the failed chat chunk", async () => {
+  await withTempHome(async (home) => {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    writeFileSync(
+      join(home, ".hara", "flows.json"),
+      JSON.stringify([{
+        name: "chunk-resume",
+        on: { platform: "feishu", keyword: "long" },
+        do: "answer",
+        replyOn: ["reply"],
+        log: false,
+      }]),
+    );
+    const draft = "A".repeat(7_200);
+    const modelResult = JSON.stringify({
+      disposition: "reply",
+      briefing: "long reply",
+      draft,
+      route: { replyInChat: true },
+    });
+    const message = { chatId: "chunk-chat", userId: "member", text: "long", messageId: "chunk-event" };
+    const runtimeScope = gatewayRuntimeScope("feishu", "chunk-app");
+    const receiptScope = gatewayRuntimeScope("flow-effects", runtimeScope);
+    const savedNow = Date.now;
+    let now = savedNow();
+    let modelCalls = 0;
+    const sends = [];
+    const reply = async (part, idempotencyKey) => {
+      sends.push({ part, idempotencyKey });
+      if (sends.length === 2) throw new Error("second chunk failed");
+    };
+    try {
+      Date.now = () => now;
+      const firstReceipts = await GatewayMessageDeduper.open(receiptScope, { home });
+      const firstRuns = await GatewayFlowRunStore.open(gatewayRuntimeScope("flow-runs", runtimeScope), { home, now: () => now });
+      await assert.rejects(
+        dispatchFlows(
+          message,
+          "feishu",
+          async () => {
+            modelCalls++;
+            return modelResult;
+          },
+          reply,
+          "feishu:boss",
+          undefined,
+          { scope: runtimeScope, receipts: firstReceipts, runs: firstRuns },
+        ),
+        /second chunk failed/,
+      );
+      now += 3_000;
+      resetFlowRateStateForTests(); // model a fresh gateway process, not merely a reopened receipt object
+      const restartedReceipts = await GatewayMessageDeduper.open(receiptScope, { home });
+      const restartedRuns = await GatewayFlowRunStore.open(gatewayRuntimeScope("flow-runs", runtimeScope), { home, now: () => now });
+      assert.equal(await dispatchFlows(
+        message,
+        "feishu",
+        async () => {
+          modelCalls++;
+          return JSON.stringify({
+            disposition: "reply",
+            briefing: "different retry",
+            draft: "B".repeat(7_200),
+            route: { replyInChat: true },
+          });
+        },
+        reply,
+        "feishu:boss",
+        undefined,
+        { scope: runtimeScope, receipts: restartedReceipts, runs: restartedRuns },
+      ), true);
+    } finally {
+      Date.now = savedNow;
+    }
+    assert.equal(modelCalls, 1, "restart reuses the exact persisted decision instead of asking the model again");
+    assert.deepEqual(sends.map(({ part }) => part.length), [3_500, 3_500, 3_500, 200]);
+    assert.notEqual(sends[0].idempotencyKey, sends[1].idempotencyKey);
+    assert.equal(sends[1].idempotencyKey, sends[2].idempotencyKey, "the failed chunk retries with the same key");
+    assert.ok(sends.every(({ idempotencyKey }) => /^[a-f0-9]{64}$/.test(idempotencyKey)));
+  });
+});
+
+test("replayed multi-flow approvals reuse stable opaque pending source keys", async () => {
+  await withTempHome(async (home) => {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    const approvalRules = [
+      { name: "approval-a", on: { platform: "feishu", keyword: "review" }, do: "triage", log: false },
+      { name: "approval-b", on: { platform: "feishu", keyword: "review" }, do: "triage", log: false },
+    ];
+    writeFileSync(
+      join(home, ".hara", "flows.json"),
+      JSON.stringify(approvalRules),
+    );
+    const result = JSON.stringify({
+      disposition: "handle",
+      briefing: "review requested",
+      draft: "draft with ordinary message content",
+      route: { needsApproval: true },
+    });
+    const message = {
+      chatId: "oc_group",
+      userId: "member",
+      text: "review source-message-secret",
+      messageId: "source-message-id-secret",
+    };
+    const runtimeScope = gatewayRuntimeScope("feishu", "credential-secret");
+    const receipts = await GatewayMessageDeduper.open(gatewayRuntimeScope("flow-effects", runtimeScope), { home });
+    const args = [
+      message,
+      "feishu",
+      async () => result,
+      undefined,
+      "feishu:boss",
+      undefined,
+      { scope: runtimeScope, receipts },
+    ];
+    assert.equal(await dispatchFlows(...args), true);
+    const first = listPending();
+    assert.equal(first.length, 2);
+    assert.equal(new Set(first.map((action) => action.sourceKey)).size, 2, "each flow stage gets its own key");
+    assert.ok(first.every((action) => /^[a-f0-9]{64}$/.test(action.sourceKey)));
+
+    writeFileSync(join(home, ".hara", "flows.json"), JSON.stringify(approvalRules.toReversed()));
+    assert.equal(await dispatchFlows(...args), true);
+    const replayed = listPending();
+    assert.deepEqual(replayed.map((action) => action.id).sort(), first.map((action) => action.id).sort());
+    assert.equal(replayed.length, 2, "a redelivered source does not create duplicate approvals");
+    const stored = readFileSync(join(home, ".hara", "flows-pending.json"), "utf8");
+    const storedKeys = JSON.parse(stored).map((action) => action.sourceKey);
+    assert.ok(storedKeys.every((key) => /^[a-f0-9]{64}$/.test(key)));
+    assert.doesNotMatch(storedKeys.join("\n"), /source-message|credential-secret|oc_group/);
+  });
+});
+
+test("one poison flow source keeps its decision and bounded retry budget across gateway restarts", async () => {
+  await withTempHome(async (home) => {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    writeFileSync(
+      join(home, ".hara", "flows.json"),
+      JSON.stringify([{
+        name: "bounded-poison",
+        on: { platform: "feishu", keyword: "poison" },
+        do: "triage",
+        replyOn: ["reply"],
+        log: false,
+      }]),
+    );
+    const result = JSON.stringify({
+      disposition: "reply",
+      briefing: "will fail",
+      draft: "downstream reply",
+      route: { replyInChat: true },
+    });
+    const message = {
+      chatId: "poison-chat",
+      userId: "member",
+      text: "poison",
+      messageId: "poison-event-id",
+    };
+    const runtimeScope = gatewayRuntimeScope("feishu", "bounded-poison-app");
+    const receiptScope = gatewayRuntimeScope("flow-effects", runtimeScope);
+    const runScope = gatewayRuntimeScope("flow-runs", runtimeScope);
+    const savedNow = Date.now;
+    const savedError = console.error;
+    let now = savedNow();
+    let receipts = await GatewayMessageDeduper.open(receiptScope, { home });
+    let runs = await GatewayFlowRunStore.open(runScope, { home, now: () => now });
+    let modelRuns = 0;
+    let replyAttempts = 0;
+    const errors = [];
+    const run = () => dispatchFlows(
+      message,
+      "feishu",
+      async () => {
+        modelRuns++;
+        return result;
+      },
+      async () => {
+        replyAttempts++;
+        throw new Error("permanent downstream failure");
+      },
+      "feishu:boss",
+      undefined,
+      { scope: runtimeScope, receipts, runs },
+    );
+    const restartGatewayState = async () => {
+      resetFlowRateStateForTests();
+      receipts = await GatewayMessageDeduper.open(receiptScope, { home });
+      runs = await GatewayFlowRunStore.open(runScope, { home, now: () => now });
+    };
+    try {
+      resetFlowRateStateForTests();
+      Date.now = () => now;
+      console.error = (...args) => errors.push(args.map(String).join(" "));
+
+      await assert.rejects(run(), /permanent downstream failure/); // attempt 1
+      await restartGatewayState();
+      await assert.rejects(run(), /previously admitted flow retry is deferred/);
+      assert.equal(modelRuns, 1, "redelivery during backoff does not call the model again");
+
+      now += 2_100;
+      await restartGatewayState();
+      await assert.rejects(run(), /permanent downstream failure/); // attempt 2
+      now += 4_100;
+      await restartGatewayState();
+      assert.equal(await run(), true, "attempt 3 is exhausted and acknowledged instead of opening a fourth loop");
+
+      await restartGatewayState();
+      assert.equal(await run(), true, "the next redelivery is acknowledged after the bounded attempts");
+      assert.equal(await run(), true, "an accidental duplicate stays acknowledged without reopening work");
+      assert.equal(modelRuns, 1, "all attempts reuse the exact persisted model decision");
+      assert.equal(replyAttempts, 3);
+      assert.equal(errors.filter((line) => line.includes('ALERT "bounded-poison"')).length, 1, "exhaustion alarms once");
+      assert.match(readFileSync(join(home, ".hara", "flows-log.jsonl"), "utf8"), /"event":"retry-exhausted"/);
+    } finally {
+      Date.now = savedNow;
+      console.error = savedError;
+      resetFlowRateStateForTests();
+    }
+  });
+});
+
+test("an admitted source retry defers instead of being acknowledged when flow concurrency is full", async () => {
+  await withTempHome(async (home) => {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    writeFileSync(
+      join(home, ".hara", "flows.json"),
+      JSON.stringify([{
+        name: "retry-capacity",
+        on: { platform: "feishu", keyword: "work" },
+        do: "triage",
+        replyOn: ["reply"],
+        log: false,
+      }]),
+    );
+    const result = JSON.stringify({ disposition: "reply", draft: "answer", route: { replyInChat: true } });
+    const runtimeScope = gatewayRuntimeScope("feishu", "retry-capacity-app");
+    const receipts = await GatewayMessageDeduper.open(gatewayRuntimeScope("flow-effects", runtimeScope), { home });
+    const source = { chatId: "source", userId: "member", text: "work", messageId: "retry-source" };
+    const savedNow = Date.now;
+    let now = savedNow();
+    let releaseBlockers;
+    const blocker = new Promise((resolve) => { releaseBlockers = resolve; });
+    let blockedRuns = [];
+    try {
+      resetFlowRateStateForTests();
+      Date.now = () => now;
+      await assert.rejects(
+        dispatchFlows(
+          source,
+          "feishu",
+          async () => result,
+          async () => { throw new Error("first delivery fails"); },
+          "feishu:boss",
+          undefined,
+          { scope: runtimeScope, receipts },
+        ),
+        /first delivery fails/,
+      );
+      now += 2_100;
+
+      blockedRuns = Array.from({ length: 4 }, (_, index) => dispatchFlows(
+        { chatId: `block-${index}`, userId: `user-${index}`, text: "work" },
+        "feishu",
+        async () => blocker,
+      ));
+      await new Promise((resolve) => setImmediate(resolve));
+      let retryModelRuns = 0;
+      await assert.rejects(
+        dispatchFlows(
+          source,
+          "feishu",
+          async () => {
+            retryModelRuns++;
+            return result;
+          },
+          async () => {},
+          "feishu:boss",
+          undefined,
+          { scope: runtimeScope, receipts },
+        ),
+        /previously admitted flow retry is deferred by backoff or capacity/,
+      );
+      assert.equal(retryModelRuns, 0, "capacity deferral does not rerun the model or consume a retry attempt");
+      releaseBlockers("");
+      assert.deepEqual(await Promise.all(blockedRuns), [true, true, true, true]);
+    } finally {
+      releaseBlockers("");
+      await Promise.allSettled(blockedRuns);
+      Date.now = savedNow;
+      resetFlowRateStateForTests();
+    }
   });
 });
 

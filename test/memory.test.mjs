@@ -162,6 +162,34 @@ test("memory: parent symlink retarget after preflight stays bound to the origina
   }
 });
 
+test("memory: cancellation after preflight blocks append, replace, and forget commits", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-mem-cancel-"));
+  const store = join(root, "store");
+  const cwd = join(root, "project");
+  mkdirSync(store);
+  mkdirSync(cwd);
+  process.env.HARA_MEMORY = store;
+  try {
+    const target = join(store, "MEMORY.md");
+    await appendMemory("global", "memory", "original fact", cwd);
+    const original = readFileSync(target, "utf8");
+    for (const mutate of [
+      (signal) => appendMemory("global", "memory", "late append", cwd, signal),
+      (signal) => replaceMemory("global", "memory", "late replacement", cwd, signal),
+      (signal) => forgetMemory("global", "memory", "original", cwd, signal),
+    ]) {
+      const controller = new AbortController();
+      const pending = mutate(controller.signal);
+      controller.abort();
+      await assert.rejects(pending, /cancelled before commit/i);
+      assert.equal(readFileSync(target, "utf8"), original);
+    }
+  } finally {
+    delete process.env.HARA_MEMORY;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("memory: replace overwrites; scaffold seeds files", async () => {
   const d = mkdtempSync(join(tmpdir(), "hara-mem2-"));
   process.env.HARA_MEMORY = d;

@@ -1,6 +1,6 @@
 import { isAbsolute, resolve } from "node:path";
 import { registerTool } from "./registry.js";
-import { nearestPaths } from "../fs-walk.js";
+import { nearestPathsAsync } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
 import { recordEdit } from "../undo.js";
@@ -57,7 +57,7 @@ registerTool({
       boundary = bindAtomicWritePath(p, "edit");
       snapshot = await readVerifiedRegularFileSnapshot(boundary.target, undefined, "edit");
     } catch (error: any) {
-      const near = nearestPaths(ctx.cwd, input.path);
+      const near = await nearestPathsAsync(ctx.cwd, input.path, 3, { timeoutMs: 1_000, signal: ctx.signal });
       return `Error: cannot read ${input.path}: ${error?.message ?? "unknown error"} (use write_file to create a new file).` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
     }
     const text = snapshot.text;
@@ -70,6 +70,7 @@ registerTool({
         expected: text,
         expectedIdentity: snapshot,
         boundary,
+        signal: ctx.signal,
       });
     } catch (error: any) {
       return `Error: cannot edit ${input.path}: ${error?.message ?? String(error)} No changes written.`;

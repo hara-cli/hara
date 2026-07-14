@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expandMentions, fileCandidates } from "../dist/context/mentions.js";
+import { expandMentions, expandMentionsAsync, fileCandidates } from "../dist/context/mentions.js";
 
 function fx() {
   const dir = mkdtempSync(join(tmpdir(), "hara-atdir-"));
@@ -21,6 +21,41 @@ test("@dir loads a directory listing", () => {
     assert.match(out, /Referenced directory `src`/);
     assert.match(out, /app\.ts/);
     assert.match(out, /deep\/util\.ts/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("async @dir expansion preserves inline order, deduplicates, and reports truncation", async () => {
+  const dir = fx();
+  try {
+    const out = await expandMentionsAsync("before @src between @src after", dir, {
+      maxDirectories: 1,
+      timeoutMs: 5_000,
+      yieldEvery: 1,
+    });
+    assert.ok(out.startsWith("before "));
+    assert.ok(out.indexOf("Referenced directory `src`") < out.indexOf("between"));
+    assert.equal((out.match(/Referenced directory `src`/g) ?? []).length, 1, "a repeated ref is inlined once");
+    assert.match(out, /between @src after$/, "the repeated token remains unchanged");
+    assert.match(out, /directory limit/i, "partial listings explain why they stopped");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("async @dir expansion propagates timer-driven cancellation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-atdir-abort-"));
+  try {
+    for (let i = 0; i < 512; i++) mkdirSync(join(dir, `empty-${String(i).padStart(4, "0")}`));
+    const controller = new AbortController();
+    const reason = new Error("mention deadline");
+    const timer = setTimeout(() => controller.abort(reason), 0);
+    await assert.rejects(
+      expandMentionsAsync("inspect @.", dir, { signal: controller.signal, timeoutMs: 10_000, yieldEvery: 1 }),
+      (error) => error === reason,
+    );
+    clearTimeout(timer);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

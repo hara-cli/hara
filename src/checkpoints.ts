@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { findProjectRoot } from "./context/agents-md.js";
+import { isHomeWorkspace } from "./context/workspace-scope.js";
 import { toolSubprocessEnv } from "./security/subprocess-env.js";
 import { sensitiveFileReason } from "./security/sensitive-files.js";
 import { redactSensitiveText } from "./security/secrets.js";
@@ -93,6 +94,9 @@ function dropSensitiveIndexEntries(root: string, gitDir: string): number {
 
 /** Snapshot the current working tree into the shadow repo. Returns the short sha, or null on failure. */
 export function checkpoint(cwd: string, label: string): string | null {
+  // A shadow `git add -A` at ~/ would traverse the user's entire personal/control-data scope. Home is
+  // deliberately not an implicit project, including when reached through a symlink alias.
+  if (isHomeWorkspace(cwd)) return null;
   const root = findProjectRoot(cwd);
   const gitDir = shadowGitDir(root);
   if (!ensureRepo(root, gitDir)) return null;
@@ -126,6 +130,7 @@ export interface Checkpoint {
 
 /** Recent checkpoints, newest first. */
 export function listCheckpoints(cwd: string, n = 15): Checkpoint[] {
+  if (isHomeWorkspace(cwd)) return [];
   const root = findProjectRoot(cwd);
   const gitDir = shadowGitDir(root);
   if (!ensureRepo(root, gitDir) || !existsSync(join(gitDir, "HEAD"))) return [];
@@ -146,6 +151,7 @@ export function listCheckpoints(cwd: string, n = 15): Checkpoint[] {
  *  files restored, or null on failure. */
 export function restoreCheckpoint(cwd: string, ref: string): number | null {
   if (!/^[0-9a-f]{4,64}$/i.test(ref)) return null; // checkpoint refs are hashes; reject option/ref injection
+  if (isHomeWorkspace(cwd)) return null;
   const root = findProjectRoot(cwd);
   const gitDir = shadowGitDir(root);
   if (!ensureRepo(root, gitDir) || !existsSync(join(gitDir, "HEAD"))) return null;

@@ -148,17 +148,17 @@ test("watchdog: a real user interrupt stays an interrupt (no timeout rewrite, no
   delete process.env.HARA_STALL_TIMEOUT;
 });
 
-test("interrupt boundary: a pre-aborted run passes an already-aborted attempt signal", async () => {
+test("interrupt boundary: a pre-aborted run never starts a provider request", async () => {
   const ctrl = new AbortController();
   ctrl.abort();
-  let sawAborted = false;
+  let providerCalls = 0;
   let fallbackCalls = 0;
   const provider = {
     id: "late",
     model: "late",
-    async turn({ signal }) {
-      sawAborted = signal?.aborted === true;
-      throw new Error("provider observed cancellation");
+    async turn() {
+      providerCalls++;
+      throw new Error("provider must not start after cancellation");
     },
   };
   const history = [{ role: "user", content: "do not start" }];
@@ -171,7 +171,7 @@ test("interrupt boundary: a pre-aborted run passes an already-aborted attempt si
     signal: ctrl.signal,
     fallback: { provider: { id: "fallback", model: "fallback", async turn() { fallbackCalls++; return { text: "wrong", toolUses: [], stop: "end" }; } } },
   });
-  assert.equal(sawAborted, true, "late AbortSignal listeners are not the only propagation mechanism");
+  assert.equal(providerCalls, 0, "cancellation prevents both the request and its cost/side effects");
   assert.deepEqual(outcome, { status: "error", error: "(interrupted)" });
   assert.equal(fallbackCalls, 0, "user interruption never triggers failover");
   assert.deepEqual(history, [{ role: "user", content: "do not start" }], "no late assistant response entered history");

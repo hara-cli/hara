@@ -4,7 +4,7 @@ import { lstatSync, readdirSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, resolve, join, relative, sep } from "node:path";
 import { registerTool } from "./registry.js";
-import { IGNORE_DIRS, walkFiles } from "../fs-walk.js";
+import { IGNORE_DIRS, walkFilesAsync } from "../fs-walk.js";
 import {
   isSensitiveFilePath,
   sensitiveFileError,
@@ -12,6 +12,7 @@ import {
   SENSITIVE_SEARCH_GLOBS,
 } from "../security/sensitive-files.js";
 import { toolSubprocessEnv } from "../security/subprocess-env.js";
+import { recursiveRootContainsHome, recursiveHomeSearchError } from "../context/workspace-scope.js";
 
 const MAX_OUT = 60_000;
 const MAX_MATCHES = 300;
@@ -19,6 +20,7 @@ const MAX_FILE_BYTES = 2 * 1024 * 1024;
 const GREP_TIMEOUT_MS = 5_000;
 const MAX_PATTERN_CHARS = 4_096;
 const MAX_GLOB_CHARS = 256;
+const GLOB_SCAN_BUDGET_MS = 1_000;
 const GLOB_MATCH_BUDGET_MS = 250;
 const toPosix = (p: string): string => (sep === "/" ? p : p.split(sep).join("/"));
 const absOf = (p: string | undefined, cwd: string): string => (p ? (isAbsolute(p) ? p : resolve(cwd, p)) : cwd);
@@ -369,19 +371,37 @@ function normalizeGrepWorkerResult(parsed: any): GrepResult {
   };
 }
 
-function runNodeGrep(
+async function runNodeGrep(
   pattern: string,
   root: string,
   isFile: boolean,
   cwd: string,
   glob: string | undefined,
   ignoreCase: boolean,
+  signal?: AbortSignal,
 ): Promise<GrepResult> {
   const allowSensitive = sensitiveFilesAllowed();
-  const discovered = isFile ? [root] : walkFiles(root, 8_001).map((path) => join(root, path));
-  const candidatesTruncated = !isFile && discovered.length > 8_000;
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("grep cancelled");
+  const inventory = isFile
+    ? undefined
+    : await walkFilesAsync(root, {
+        maxFiles: 8_001,
+        maxDirectories: 20_000,
+        maxEntries: 100_000,
+        timeoutMs: GREP_TIMEOUT_MS,
+        signal,
+        yieldEvery: 64,
+      });
+  const discovered = isFile ? [root] : inventory!.files.map((path) => join(root, path));
+  const candidatesTruncated = !isFile && (inventory!.truncated || discovered.length > 8_000);
   const files: { path: string; dev: string; ino: string }[] = [];
+  let candidateIndex = 0;
   for (const path of discovered.slice(0, 8_000)) {
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("grep cancelled");
+    if (candidateIndex++ > 0 && candidateIndex % 64 === 0) {
+      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+      if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("grep cancelled");
+    }
     // Broad searches intentionally omit every .env variant, including safe templates. Explicitly searching
     // one safe template remains supported, matching the ripgrep branch.
     const securityBase = basename(path).replace(/:.*$/u, "").replace(/[. ]+$/u, "").toLowerCase();
@@ -414,7 +434,7 @@ function runNodeGrep(
   if (Buffer.byteLength(payload, "utf8") > 16 * 1024 * 1024) {
     return Promise.resolve({ kind: "error", lines: [], matches: 0, scanned: 0, truncated: false, error: "grep input exceeds its safety limit" });
   }
-  return new Promise((resolveResult) => {
+  return new Promise((resolveResult, rejectResult) => {
     const isBun = typeof (process.versions as Record<string, string | undefined>).bun === "string";
     const args = isBun ? ["-e", NODE_GREP_SOURCE] : ["--max-old-space-size=128", "-e", NODE_GREP_SOURCE];
     // In a Bun --compile build process.execPath is the hara executable. BUN_BE_BUN makes that embedded
@@ -426,12 +446,22 @@ function runNodeGrep(
     let settled = false;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => {
+      child.kill("SIGKILL");
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      rejectResult(signal?.reason instanceof Error ? signal.reason : new Error("grep cancelled"));
+    };
     const finish = (result: GrepResult): void => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       resolveResult(result);
     };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) return onAbort();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
@@ -498,6 +528,7 @@ registerTool({
     } catch {
       return `Error: no such path: ${input.path ?? "."}`;
     }
+    if (!isFile && recursiveRootContainsHome(root)) return recursiveHomeSearchError("grep");
     const searchArgs = [
       pattern,
       root,
@@ -512,14 +543,14 @@ registerTool({
     // opt back into only with the explicit one-process sensitive-file waiver.
     const primary = sensitiveFilesAllowed()
       ? await runRipgrep(...searchArgs)
-      : await runNodeGrep(...searchArgs);
+      : await runNodeGrep(...searchArgs, ctx.signal);
     if (primary.kind === "timeout") return `Error: grep exceeded its ${GREP_TIMEOUT_MS}ms safety timeout and was stopped.`;
     if (primary.kind === "invalid") return `Error: invalid regex: ${primary.error ?? "invalid pattern"}`;
 
     let { lines, matches, scanned } = primary;
     let truncated = primary.truncated;
     if (sensitiveFilesAllowed() && (primary.kind === "missing" || primary.kind === "error")) {
-      const fallback = await runNodeGrep(pattern, root, isFile, ctx.cwd, typeof input.glob === "string" ? input.glob : undefined, input.ignore_case === true);
+      const fallback = await runNodeGrep(pattern, root, isFile, ctx.cwd, typeof input.glob === "string" ? input.glob : undefined, input.ignore_case === true, ctx.signal);
       if (fallback.kind === "timeout") return `Error: grep exceeded its ${GREP_TIMEOUT_MS}ms safety timeout and was stopped.`;
       if (fallback.kind === "invalid") return `Error: invalid regex: ${fallback.error ?? "invalid pattern"}`;
       if (fallback.kind !== "ok") {
@@ -557,14 +588,27 @@ registerTool({
     const root = absOf(input.path, ctx.cwd);
     const denied = sensitiveFileError(root, "search");
     if (denied) return denied;
+    if (recursiveRootContainsHome(root)) return recursiveHomeSearchError("glob");
     const pattern = typeof input.pattern === "string" ? input.pattern : "";
     if (pattern.length > MAX_GLOB_CHARS) return `Error: glob pattern exceeds ${MAX_GLOB_CHARS} characters.`;
-    const files = walkFiles(root);
+    const inventory = await walkFilesAsync(root, {
+      maxFiles: 8_000,
+      maxDirectories: 20_000,
+      maxEntries: 100_000,
+      timeoutMs: GLOB_SCAN_BUDGET_MS,
+      signal: ctx.signal,
+      yieldEvery: 64,
+    });
+    const files = inventory.files;
     const hits: string[] = [];
     const started = Date.now();
     let examined = 0;
     let budgetReached = false;
     for (const file of files) {
+      if ((examined & 31) === 0) {
+        await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+        if (ctx.signal?.aborted) throw ctx.signal.reason instanceof Error ? ctx.signal.reason : new Error("glob cancelled");
+      }
       if ((examined & 31) === 0 && Date.now() - started >= GLOB_MATCH_BUDGET_MS) {
         budgetReached = true;
         break;
@@ -572,7 +616,11 @@ registerTool({
       examined++;
       if (matchesGlob(pattern, file)) hits.push(file);
     }
+    const scanNote = inventory.truncated
+      ? `scan stopped at its ${inventory.reason?.replace("_", " ") ?? "safety limit"}`
+      : "";
     if (!hits.length) {
+      if (scanNote) return `No files matched ${pattern}; ${scanNote}. Narrow \`path\` and retry.`;
       return budgetReached
         ? `No files matched ${pattern} before the ${GLOB_MATCH_BUDGET_MS}ms safety budget; narrow \`path\` or simplify the glob.`
         : `No files match ${pattern}.`;
@@ -580,7 +628,9 @@ registerTool({
     const shown = hits.slice(0, 400);
     const head = budgetReached
       ? `(showing ${shown.length} matches found before the ${GLOB_MATCH_BUDGET_MS}ms safety budget; examined ${examined}/${files.length} files)\n`
-      : hits.length > shown.length ? `(${hits.length} matches, showing 400)\n` : "";
+      : scanNote
+        ? `(showing ${shown.length} matches; ${scanNote})\n`
+        : hits.length > shown.length ? `(${hits.length} matches, showing 400)\n` : "";
     return head + shown.join("\n");
   },
 });

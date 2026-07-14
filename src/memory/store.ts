@@ -63,16 +63,17 @@ async function inspectMemoryWrite(
   }
 }
 
-async function commitMemoryText(path: string, text: string, action: string): Promise<void> {
+async function commitMemoryText(path: string, text: string, action: string, signal?: AbortSignal): Promise<void> {
   const { boundary, snapshot } = await inspectMemoryWrite(path, action);
   await atomicWriteText(boundary.target, text, {
     expected: snapshot?.text ?? null,
     expectedIdentity: snapshot ?? undefined,
     boundary,
+    signal,
   });
 }
 
-export async function appendMemory(scope: Scope, target: Target, content: string, cwd: string): Promise<string> {
+export async function appendMemory(scope: Scope, target: Target, content: string, cwd: string, signal?: AbortSignal): Promise<string> {
   const f = targetFile(scope, target, cwd);
   const { boundary, snapshot } = await inspectMemoryWrite(f, "append memory");
   const text = (snapshot ? `${snapshot.text}\n` : "") + content.trim() + "\n";
@@ -80,15 +81,16 @@ export async function appendMemory(scope: Scope, target: Target, content: string
     expected: snapshot?.text ?? null,
     expectedIdentity: snapshot ?? undefined,
     boundary,
+    signal,
   });
   return f;
 }
-export async function replaceMemory(scope: Scope, target: Target, content: string, cwd: string): Promise<string> {
+export async function replaceMemory(scope: Scope, target: Target, content: string, cwd: string, signal?: AbortSignal): Promise<string> {
   const f = targetFile(scope, target, cwd);
-  await commitMemoryText(f, content.trim() + "\n", "replace memory");
+  await commitMemoryText(f, content.trim() + "\n", "replace memory", signal);
   return f;
 }
-export async function forgetMemory(scope: Scope, target: Target, match: string, cwd: string): Promise<number> {
+export async function forgetMemory(scope: Scope, target: Target, match: string, cwd: string, signal?: AbortSignal): Promise<number> {
   const f = targetFile(scope, target, cwd);
   if (!match) return 0;
   const { boundary, snapshot } = await inspectMemoryWrite(f, "forget memory");
@@ -101,6 +103,7 @@ export async function forgetMemory(scope: Scope, target: Target, match: string, 
     expected: snapshot.text,
     expectedIdentity: snapshot,
     boundary,
+    signal,
   });
   return removed;
 }

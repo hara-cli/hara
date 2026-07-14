@@ -37,6 +37,25 @@ function unsupportedNodeMessage(versions) {
   ].join("\n");
 }
 
+function normalizePortableWindowsHome(value) {
+  var home = String(value || "").trim();
+  var drive = /^\/([a-zA-Z])(?:\/(.*))?$/.exec(home);
+  if (drive) return drive[1].toUpperCase() + ":\\" + String(drive[2] || "").replace(/\//g, "\\");
+  if (/^\/\/[^/]/.test(home)) return "\\\\" + home.slice(2).replace(/\//g, "\\");
+  if (/^[a-zA-Z]:[\\/]/.test(home)) return home.charAt(0).toUpperCase() + home.slice(1).replace(/\//g, "\\");
+  return home;
+}
+
+function applyPortableHomeEnv(env, runtimePlatform) {
+  env = env || process.env;
+  runtimePlatform = runtimePlatform || process.platform;
+  if (runtimePlatform !== "win32") return false;
+  var home = normalizePortableWindowsHome(env.HOME || "");
+  if (!home || env.USERPROFILE === home) return false;
+  env.USERPROFILE = home;
+  return true;
+}
+
 function failStart(error) {
   var message = error && error.message ? error.message : String(error);
   process.stderr.write("hara: failed to start: " + message + "\n");
@@ -52,6 +71,7 @@ function main() {
   }
 
   try {
+    applyPortableHomeEnv(process.env, process.platform);
     // Keeping import() inside a string prevents legacy parsers from seeing unsupported ESM syntax. This
     // branch is reached only on the supported Node floor (or Bun when used as a script runtime).
     var load = Function("specifier", "return import(specifier)");
@@ -67,6 +87,8 @@ module.exports = {
   MIN_NODE_VERSION: MIN_NODE_VERSION,
   supportedNodeVersion: supportedNodeVersion,
   unsupportedNodeMessage: unsupportedNodeMessage,
+  applyPortableHomeEnv: applyPortableHomeEnv,
+  normalizePortableWindowsHome: normalizePortableWindowsHome,
 };
 
 if (require.main === module) main();

@@ -3,6 +3,7 @@
 // model can act on. Provider-agnostic: it takes a pre-built Provider, so it reuses the normal image
 // encoding path (base64 blocks for Anthropic, image_url data-URLs for OpenAI-compatible endpoints).
 import type { ImageAttachment, Provider } from "./providers/types.js";
+import { boundedProviderTurn } from "./providers/bounded-turn.js";
 
 export type VisionCap = "vision" | "text" | "unknown";
 
@@ -107,14 +108,18 @@ export function parseLocate(text: string): { x: number; y: number } | null {
 }
 
 /** Send a screenshot to a (grounding-capable) vision model and get the target's center as 0..1 fractions. */
-export async function locateImage(provider: Provider, image: ImageAttachment, target: string, opts: { signal?: AbortSignal } = {}): Promise<{ x: number; y: number } | null> {
-  const r = await provider.turn({
+export async function locateImage(
+  provider: Provider,
+  image: ImageAttachment,
+  target: string,
+  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<{ x: number; y: number } | null> {
+  const r = await boundedProviderTurn(provider, {
     system: LOCATE_SYSTEM,
     history: [{ role: "user", content: `Locate this element: ${target}`, images: [image] }],
     tools: [],
     onText: () => {},
-    signal: opts.signal,
-  });
+  }, { timeoutMs: opts.timeoutMs ?? 30_000, signal: opts.signal, label: "image element location" });
   if (r.stop === "error") return null;
   return parseLocate(r.text);
 }
@@ -126,16 +131,15 @@ const PROMPT = "Describe the attached image(s) per your instructions.";
 export async function describeImages(
   provider: Provider,
   images: ImageAttachment[],
-  opts: { signal?: AbortSignal; system?: string; hint?: string } = {},
+  opts: { signal?: AbortSignal; timeoutMs?: number; system?: string; hint?: string } = {},
 ): Promise<string> {
   const content = opts.hint ? `${PROMPT}\nFocus especially on: ${opts.hint}` : PROMPT;
-  const r = await provider.turn({
+  const r = await boundedProviderTurn(provider, {
     system: opts.system ?? DESCRIBE_SYSTEM,
     history: [{ role: "user", content, images }],
     tools: [],
     onText: () => {},
-    signal: opts.signal,
-  });
+  }, { timeoutMs: opts.timeoutMs ?? 90_000, signal: opts.signal, label: "image description" });
   if (r.stop === "error") throw new Error(r.errorMsg || "vision provider error");
   return r.text.trim();
 }

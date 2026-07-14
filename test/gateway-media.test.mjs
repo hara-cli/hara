@@ -321,7 +321,7 @@ test("inbound-media adapters route downloads through the bounded private helper"
   const expectations = {
     telegram: "savePrivateResponse",
     discord: "savePrivateResponse",
-    feishu: "savePrivateMedia",
+    feishu: "savePrivateResponse",
     slack: "savePrivateResponse",
     mattermost: "savePrivateResponse",
     matrix: "savePrivateResponse",

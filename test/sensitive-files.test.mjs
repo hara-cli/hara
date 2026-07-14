@@ -78,7 +78,9 @@ test("sensitive path policy denies real secret files and symlink aliases but per
 test("sensitive path policy covers Hara control-plane state, NTFS aliases, and nested safe templates", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-private-policy-"));
   const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     const state = join(home, ".hara");
     const protectedPaths = [
@@ -156,6 +158,8 @@ test("sensitive path policy covers Hara control-plane state, NTFS aliases, and n
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -528,6 +532,40 @@ test("runShell applies the protected-file preflight for every shell entry point"
     assert.throws(() => startJob("cat .env", dir, "off"), /protected secret boundary.*environment file/i);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("canonical Home rejects executable tools before recursive mask discovery; child projects retain secret masks", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-shell-home-boundary-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  const project = join(home, "project");
+  mkdirSync(project, { recursive: true });
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  writeFileSync(join(project, ".env"), `API_KEY=${SECRET}\n`);
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    assert.throws(() => shellCommand("printf safe", alias, "off"), /Refusing.*home directory.*cd \/path\/to\/project/i);
+    assert.match(
+      await getTool("bash").run({ command: "printf safe" }, { cwd: home, sandbox: "off" }),
+      /Refusing.*home directory.*cd \/path\/to\/project/i,
+      "the shared exec-tool boundary rejects before bash can inspect Home",
+    );
+    assert.doesNotThrow(() => shellCommand("printf safe", project, "off"), "an explicit child project remains executable");
+    assert.throws(
+      () => shellCommand("cat .env", project, "off"),
+      /protected secret boundary.*environment file/i,
+      "moving into a child project does not weaken protected-file masks",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

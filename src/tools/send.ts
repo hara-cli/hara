@@ -28,7 +28,7 @@ if (process.env.HARA_GATEWAY) {
       if (!outbox) return "send_file only works inside `hara gateway` — there is no chat to send to here.";
       const p = resolve(ctx.cwd, String(input.path ?? ""));
       try {
-        await queueOutboundSnapshot(p, outbox);
+        await queueOutboundSnapshot(p, outbox, ctx.signal);
         return `Queued a private snapshot for delivery to the user in this chat: ${p}`;
       } catch (error: any) {
         if (error?.code === "ENOENT") {

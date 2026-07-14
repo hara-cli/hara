@@ -146,6 +146,15 @@ test("guardianVeto: fail-open on error, throw, timeout, and no-provider", async 
   const v = await guardianVeto(hangP, { tool: "bash", detail: "x", classifierReason: "x" }, [], { timeoutMs: 50 });
   assert.equal(v.decision, "allow");
   assert.ok(Date.now() - t0 < 2000, "timed out fast, did not wait for the hang");
+
+  // A provider that completely ignores AbortSignal must still honor the advertised fail-open deadline.
+  const nonCooperative = { id: "stuck", model: "stuck", turn: () => new Promise(() => {}) };
+  const stuckAt = Date.now();
+  assert.equal(
+    (await guardianVeto(nonCooperative, { tool: "bash", detail: "x", classifierReason: "x" }, [], { timeoutMs: 25 })).decision,
+    "allow",
+  );
+  assert.ok(Date.now() - stuckAt < 500, "guardian has a hard boundary even when abort is ignored");
 });
 
 // ── (e) circuit-breaker trips after N blocks ────────────────────────────────────────────────────────────

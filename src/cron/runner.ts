@@ -7,11 +7,26 @@ import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, lstatSync,
 import { randomUUID } from "node:crypto";
 import { platform } from "node:os";
 import { join } from "node:path";
-import { loadJobs, recordRun, recordAlert, findJob, cronDir, logPath, type CronJob } from "./store.js";
+import {
+  loadJobs,
+  recordRun,
+  recordRunStart,
+  recoverInterruptedRuns,
+  enqueueOutcomeNotifications,
+  listPendingNotifications,
+  acknowledgePendingNotification,
+  deferPendingNotification,
+  findJob,
+  cronDir,
+  logPath,
+  type CronJob,
+  type CronDeliveryOutcome,
+} from "./store.js";
 import { isDue } from "./schedule.js";
 import { shellCommand } from "../sandbox.js";
 import { sensitiveShellCommandReason } from "../security/sensitive-files.js";
 import { createToolOutputLineRedactor, redactToolSubprocessOutput, terminateSubprocessTree, toolSubprocessEnv } from "../security/subprocess-env.js";
+import { compareProcessIdentity, defaultProcessIdentity } from "../process-identity.js";
 
 /** Jobs that are enabled AND due at `nowMs` (pure — for the tick and for testing). */
 export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
@@ -21,24 +36,92 @@ export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
 /** How to invoke hara again. Under node, argv[1] is the entry to hand back to node — either `dist/index.js`
  *  OR the installed `hara` bin symlink (node runs both); as a compiled single-binary, execPath itself IS hara
  *  (argv[1] is a user arg), so re-invoke the binary directly. Used by the cron tick + the chat gateway.
- *  Discriminator is whether execPath is node — NOT argv[1]'s extension (the bin symlink has no `.js`). */
-export function selfArgv(): string[] {
-  const exec = process.execPath;
+ *  Node and ordinary Bun scripts retain argv[1] (the bin symlink need not end in `.js`); only Bun's
+ *  `/$bunfs/…` compile-time virtual entry is omitted because execPath is already the standalone Hara. */
+export function selfArgvFor(exec: string, entry: string | undefined, versions: NodeJS.ProcessVersions): string[] {
   const underNode = /(^|[\\/])node(\.exe)?$/i.test(exec);
-  return underNode && process.argv[1] ? [exec, process.argv[1]] : [exec];
+  const bunScript = typeof versions.bun === "string" && !!entry && !entry.replace(/\\/g, "/").startsWith("/$bunfs/");
+  return entry && (underNode || bunScript) ? [exec, entry] : [exec];
+}
+
+export function selfArgv(): string[] {
+  return selfArgvFor(process.execPath, process.argv[1], process.versions);
+}
+
+export interface SelfInvocation {
+  command: string;
+  args: string[];
+}
+
+/** Add user-facing arguments to the runtime-aware self command. Exported separately so Node and compiled
+ *  argv construction can be unit-tested without launching a second CLI. */
+export function selfInvocation(args: readonly string[]): SelfInvocation {
+  const [command, ...entryArgs] = selfArgv();
+  return { command, args: [...entryArgs, ...args] };
+}
+
+/** Re-enter Hara as an attached foreground child without blocking this process's event loop. Inheriting all
+ *  stdio keeps readline/Ink attached to the real terminal; this is required by `hara resume <id>`. */
+export function runSelfAttached(args: readonly string[], cwd = process.cwd()): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  const invocation = selfInvocation(args);
+  return new Promise((resolveRun, rejectRun) => {
+    let settled = false;
+    const child = spawn(invocation.command, invocation.args, {
+      cwd,
+      env: process.env,
+      stdio: "inherit",
+    });
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      rejectRun(error);
+    });
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      resolveRun({ code, signal });
+    });
+  });
 }
 
 const lockPath = (): string => join(cronDir(), ".tick.lock");
 const takeoverPath = (): string => join(cronDir(), ".tick.lock.takeover");
-// Generous: a live-PID owner is respected this long (so a genuinely long job isn't double-fired); past it
-// we assume PID reuse and take over. A *dead* owner is taken over within one tick regardless (see below).
-const LOCK_STALE_MS = 6 * 60 * 60_000;
-// A takeover/release guard protects only synchronous filesystem operations and should live for milliseconds.
-// Five minutes tolerates long host pauses while still recovering a guard left by a crash or PID reuse.
-const TAKEOVER_GUARD_STALE_MS = 5 * 60_000;
-const DEFAULT_JOB_TIMEOUT_MS = 30 * 60_000;
+// Malformed records have no process identity to verify. Keep a long poison window for the primary and a
+// shorter one for the synchronous transition guard; valid live/legacy records are never reclaimed by age.
+const MALFORMED_LOCK_POISON_MS = 6 * 60 * 60_000;
+const MALFORMED_GUARD_POISON_MS = 5 * 60_000;
+export const DEFAULT_CRON_JOB_TIMEOUT_MS = 30 * 60_000;
+export const DEFAULT_CRON_TICK_TIMEOUT_MS = 60 * 60_000;
+export const MAX_CRON_JOB_TIMEOUT_MS = 24 * 60 * 60_000;
+// Keep normal scheduler ownership bounded even though a valid live owner is never reclaimed by wall-clock age.
+export const MAX_CRON_TICK_TIMEOUT_MS = 5 * 60 * 60_000;
 const DEFAULT_RUN_LOG_BYTES = 1_000_000;
 const TERMINATE_GRACE_MS = 2_000;
+const ABORT_SETTLE_MS = 750;
+const FINAL_DELIVERY_TIMEOUT_MS = 5_000;
+
+function configuredTimeoutMs(
+  explicit: number | undefined,
+  envName: string,
+  fallback: number,
+  maximum: number,
+): number {
+  const envValue = process.env[envName]?.trim();
+  const candidate = explicit ?? (envValue ? Number(envValue) : fallback);
+  return Number.isFinite(candidate)
+    ? Math.min(Math.max(100, Math.trunc(candidate)), maximum)
+    : fallback;
+}
+
+/** Public for diagnostics/tests; scheduler deployments can override with HARA_CRON_JOB_TIMEOUT_MS. */
+export function cronJobTimeoutMs(explicit?: number): number {
+  return configuredTimeoutMs(explicit, "HARA_CRON_JOB_TIMEOUT_MS", DEFAULT_CRON_JOB_TIMEOUT_MS, MAX_CRON_JOB_TIMEOUT_MS);
+}
+
+/** Total scheduler-tick watchdog; configurable in milliseconds and hard-capped to bound normal ownership. */
+export function cronTickTimeoutMs(explicit?: number): number {
+  return configuredTimeoutMs(explicit, "HARA_CRON_TICK_TIMEOUT_MS", DEFAULT_CRON_TICK_TIMEOUT_MS, MAX_CRON_TICK_TIMEOUT_MS);
+}
 
 interface TickLockFileSnapshot {
   /** null means a stable but oversized record; it remains malformed without being materialized. */
@@ -53,9 +136,14 @@ interface TickLockFileSnapshot {
 interface TickLockSnapshot extends TickLockFileSnapshot {
   raw: string;
   pid: number;
+  token: string;
+  /** OS process birth identity. Missing means a legacy/unknown owner and therefore fails closed while live. */
+  birthIdentity?: string;
 }
 
 const MAX_LOCK_RECORD_BYTES = 512;
+const TICK_LOCK_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const CURRENT_PROCESS_BIRTH_IDENTITY = defaultProcessIdentity(process.pid);
 
 function processIsAlive(pid: number): boolean {
   try {
@@ -88,10 +176,35 @@ function readTickLockFileSnapshot(path: string): TickLockFileSnapshot | null {
 
 function parseTickLockSnapshot(file: TickLockFileSnapshot | null): TickLockSnapshot | null {
   if (!file?.raw) return null;
-  const match = /^(\d+):([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/iu.exec(file.raw);
-  const pid = Number(match?.[1]);
-  if (!match || !Number.isSafeInteger(pid) || pid <= 0) return null;
-  return { ...file, raw: file.raw, pid };
+  try {
+    const parsed = JSON.parse(file.raw) as Record<string, unknown>;
+    if (
+      !parsed
+      || typeof parsed !== "object"
+      || !Number.isSafeInteger(parsed.pid)
+      || (parsed.pid as number) <= 0
+      || typeof parsed.token !== "string"
+      || !TICK_LOCK_UUID.test(parsed.token)
+      || (
+        parsed.birthIdentity !== undefined
+        && (typeof parsed.birthIdentity !== "string" || !/^[\x20-\x7e]{1,256}$/.test(parsed.birthIdentity))
+      )
+    ) return null;
+    return {
+      ...file,
+      raw: file.raw,
+      pid: parsed.pid as number,
+      token: parsed.token,
+      ...(typeof parsed.birthIdentity === "string" ? { birthIdentity: parsed.birthIdentity } : {}),
+    };
+  } catch {
+    // Backward compatibility for the unpublished identity-less lock format. A live legacy PID is unknown,
+    // never stale evidence; a proven-dead PID remains safe to reclaim.
+    const match = /^(\d+):([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/iu.exec(file.raw);
+    const pid = Number(match?.[1]);
+    if (!match || !Number.isSafeInteger(pid) || pid <= 0) return null;
+    return { ...file, raw: file.raw, pid, token: match[2] };
+  }
 }
 
 function readTickLockSnapshot(path: string): TickLockSnapshot | null {
@@ -112,24 +225,37 @@ function sameTickLock(left: TickLockSnapshot, right: TickLockSnapshot | null): b
   return sameTickLockFile(left, right) && left.pid === right?.pid;
 }
 
-function staleTickLock(snapshot: TickLockSnapshot, nowMs: number): boolean {
-  return nowMs - snapshot.mtimeMs >= LOCK_STALE_MS || !processIsAlive(snapshot.pid);
+/** Only proof may retire a valid owner: dead PID, or same identity scheme with a different birth value.
+ * A live same/unknown/legacy owner fails closed even after host sleep or event-loop suspension. */
+function reclaimableTickLock(snapshot: TickLockSnapshot): boolean {
+  if (!processIsAlive(snapshot.pid)) return true;
+  if (!snapshot.birthIdentity) return false;
+  const current = snapshot.pid === process.pid
+    ? CURRENT_PROCESS_BIRTH_IDENTITY
+    : defaultProcessIdentity(snapshot.pid);
+  return compareProcessIdentity(snapshot.birthIdentity, current) === "different";
+}
+
+function newTickLockToken(): string {
+  return JSON.stringify({
+    pid: process.pid,
+    token: randomUUID(),
+    ...(CURRENT_PROCESS_BIRTH_IDENTITY ? { birthIdentity: CURRENT_PROCESS_BIRTH_IDENTITY } : {}),
+  });
 }
 
 type TakeoverGuardState = "clear" | "active" | "recovered";
 
-/** Recover only a complete, stable guard whose owner is proven dead or whose tiny synchronous lease is
- * far past its lifetime. Recovery deliberately ends this tick: a later invocation acquires a fresh guard,
- * keeping stale-guard deletion and new-guard creation out of the same contender's race window. */
+/** Recover only a complete, stable guard whose owner is proven dead/reused. Age applies only to malformed
+ * poison, never to a valid live/legacy record. Recovery deliberately ends this tick. */
 function prepareTakeoverGuard(path: string, nowMs: number): TakeoverGuardState {
   if (!existsSync(path)) return "clear";
   const observedFile = readTickLockFileSnapshot(path);
   if (!observedFile) return "active"; // unreadable/non-regular/unstable is not evidence that deletion is safe
   const observed = parseTickLockSnapshot(observedFile);
-  const staleRecord = (snapshot: TickLockSnapshot): boolean =>
-    nowMs - snapshot.mtimeMs >= TAKEOVER_GUARD_STALE_MS || !processIsAlive(snapshot.pid);
+  const staleRecord = (snapshot: TickLockSnapshot): boolean => reclaimableTickLock(snapshot);
   const staleMalformed = (snapshot: TickLockFileSnapshot): boolean =>
-    nowMs - snapshot.mtimeMs >= TAKEOVER_GUARD_STALE_MS;
+    nowMs - snapshot.mtimeMs >= MALFORMED_GUARD_POISON_MS;
   if (observed ? !staleRecord(observed) : !staleMalformed(observedFile)) return "active";
 
   const currentFile = readTickLockFileSnapshot(path);
@@ -174,10 +300,10 @@ function removeOwnedLock(path: string, token: string): void {
   try { if (readTickLockSnapshot(path)?.raw === token) rmSync(path); } catch { /* best effort */ }
 }
 
-/** Release the primary lock under the same guard used for stale takeover. Without this, a >6h owner could
+/** Release the primary lock under the same guard used for stale takeover. Without this, a paused owner could
  * read its token, get descheduled while a reaper installs a successor, then unlink that successor by name. */
 function releasePrimaryTickLock(lock: string, takeover: string, token: string): void {
-  const releaseToken = `${process.pid}:${randomUUID()}`;
+  const releaseToken = newTickLockToken();
   if (!writeExclusive(takeover, releaseToken)) return; // an active reaper owns the transition
   try {
     const current = readTickLockSnapshot(lock);
@@ -192,6 +318,36 @@ function releasePrimaryTickLock(lock: string, takeover: string, token: string): 
 export interface CronRunOptions {
   timeoutMs?: number;
   maxLogBytes?: number;
+  /** Parent interactive agent deadline/cancellation for manual `cronjob run`. Scheduler ticks omit it. */
+  signal?: AbortSignal;
+}
+
+export interface CronRunResult {
+  ok: boolean;
+  error?: string;
+  output?: string;
+  /** A real job deadline or tick watchdog fired (not merely a non-zero exit). */
+  timedOut?: boolean;
+  /** The caller cancelled this run before its own timeout. */
+  interrupted?: boolean;
+}
+
+export interface CronTickOptions {
+  /** Per-job deadline; defaults to HARA_CRON_JOB_TIMEOUT_MS or 30 minutes. */
+  jobTimeoutMs?: number;
+  /** Total wall-clock deadline; defaults to HARA_CRON_TICK_TIMEOUT_MS or 60 minutes. */
+  tickTimeoutMs?: number;
+  /** Optional owner cancellation (primarily for embedding/tests). */
+  signal?: AbortSignal;
+  /** Injectable durable transport (tests/embedders); production uses deliverResult. */
+  deliver?: CronDeliver;
+}
+
+export interface CronTickResult {
+  ran: string[];
+  skipped?: string;
+  /** A tick that acquired the lock but stopped early due to its watchdog/caller. */
+  stopped?: string;
 }
 
 /** Keep a per-job log from growing forever: once over ~1MB, retain only the last ~256KB. */
@@ -207,9 +363,12 @@ function capLog(log: string): void {
 
 /** Run one job's task in a fresh hara process (full-auto, no prompts), appending output to its log.
  *  Exported so `hara cron run <id>` can fire a job on demand, ignoring its schedule. */
-export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<{ ok: boolean; error?: string; output?: string }> {
+export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<CronRunResult> {
+  if (options.signal?.aborted) {
+    return Promise.resolve({ ok: false, error: "interrupted before cron job start by agent run deadline or cancellation", output: "", interrupted: true });
+  }
   return new Promise((resolve) => {
-    const timeoutMs = Math.min(Math.max(100, options.timeoutMs ?? DEFAULT_JOB_TIMEOUT_MS), 24 * 60 * 60_000);
+    const timeoutMs = cronJobTimeoutMs(options.timeoutMs);
     const maxLogBytes = Math.min(Math.max(4_096, options.maxLogBytes ?? DEFAULT_RUN_LOG_BYTES), 16 * 1024 * 1024);
     mkdirSync(join(cronDir(), "logs"), { recursive: true, mode: 0o700 });
     try { chmodSync(cronDir(), 0o700); chmodSync(join(cronDir(), "logs"), 0o700); } catch { /* best effort */ }
@@ -253,6 +412,10 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
       ? toolSubprocessEnv(process.env, { HARA_CRON: "1" })
       : { ...process.env, HARA_CRON: "1", HARA_CRON_NAME: job.name };
     const processGroup = platform() !== "win32";
+    if (options.signal?.aborted) {
+      resolve({ ok: false, error: "interrupted before cron job start by agent run deadline or cancellation", output: "", interrupted: true });
+      return;
+    }
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(cmd, argv as string[], { cwd: job.cwd, env, detached: processGroup });
@@ -265,6 +428,8 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
     let logCapped = false;
     let done = false;
     let timedOut = false;
+    let aborted = false;
+    let abortFallback: NodeJS.Timeout | undefined;
     let forceIssued = false;
     let closeBeforeForce = false;
     let cancelTermination: ((cancelForce?: boolean) => void) | undefined;
@@ -291,10 +456,12 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
     const stdout = createToolOutputLineRedactor(appendSafe);
     const stderr = createToolOutputLineRedactor(appendSafe);
     const flush = (): void => { stdout.flush(); stderr.flush(); };
-    const settle = (result: { ok: boolean; error?: string; output?: string }): void => {
+    const settle = (result: CronRunResult): void => {
       if (done) return;
       done = true;
       clearTimeout(timeoutTimer);
+      if (abortFallback) clearTimeout(abortFallback);
+      options.signal?.removeEventListener("abort", abortRun);
       // Keep a timeout-triggered group KILL scheduled even if the direct child closed on TERM. The default
       // cancellation removes only the hard-settle fallback; it deliberately does not cancel escalation.
       cancelTermination?.();
@@ -306,6 +473,18 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
         output: tail,
       });
     };
+    const abortRun = (): void => {
+      if (done || timedOut || aborted) return;
+      aborted = true;
+      // A parent run deadline is already the hard boundary: kill immediately rather than adding the normal
+      // cron timeout grace. The owned process group includes shell/node descendants.
+      terminateSubprocessTree(child, { force: true, processGroup });
+      abortFallback = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        settle({ ok: false, error: "interrupted by agent run deadline or cancellation", output: tail, interrupted: true });
+      }, 750);
+    };
     const timeoutTimer = setTimeout(() => {
       if (done) return;
       timedOut = true;
@@ -315,77 +494,286 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
         fallbackMs: 3_000,
         onForce: () => {
           forceIssued = true;
-          if (closeBeforeForce) settle({ ok: false, error: `timed out after ${timeoutMs}ms`, output: tail });
+          if (closeBeforeForce) settle({ ok: false, error: `timed out after ${timeoutMs}ms`, output: tail, timedOut: true });
         },
         onFallback: () => {
           child.stdout?.destroy();
           child.stderr?.destroy();
-          settle({ ok: false, error: `timed out after ${timeoutMs}ms`, output: tail });
+          settle({ ok: false, error: `timed out after ${timeoutMs}ms`, output: tail, timedOut: true });
         },
       });
     }, timeoutMs);
-    child.stdout?.on("data", (d: Buffer) => { if (!done && !timedOut) stdout.push(d.toString()); });
-    child.stderr?.on("data", (d: Buffer) => { if (!done && !timedOut) stderr.push(d.toString()); });
+    options.signal?.addEventListener("abort", abortRun, { once: true });
+    if (options.signal?.aborted) abortRun();
+    child.stdout?.on("data", (d: Buffer) => { if (!done && !timedOut && !aborted) stdout.push(d.toString()); });
+    child.stderr?.on("data", (d: Buffer) => { if (!done && !timedOut && !aborted) stderr.push(d.toString()); });
     child.on("error", (e) => {
+      if (aborted) {
+        settle({ ok: false, error: "interrupted by agent run deadline or cancellation", output: tail, interrupted: true });
+        return;
+      }
       if (timedOut && !forceIssued) {
         closeBeforeForce = true;
         return;
       }
       settle(timedOut
-        ? { ok: false, error: `timed out after ${timeoutMs}ms`, output: tail }
+        ? { ok: false, error: `timed out after ${timeoutMs}ms`, output: tail, timedOut: true }
         : { ok: false, error: String(e?.message ?? e), output: tail });
     });
     child.on("close", (code) => {
+      if (aborted) {
+        settle({ ok: false, error: "interrupted by agent run deadline or cancellation", output: tail, interrupted: true });
+        return;
+      }
       if (timedOut && !forceIssued) {
         closeBeforeForce = true;
         return;
       }
-      if (timedOut) settle({ ok: false, error: `timed out after ${timeoutMs}ms`, output: tail });
+      if (timedOut) settle({ ok: false, error: `timed out after ${timeoutMs}ms`, output: tail, timedOut: true });
       else settle(code === 0 ? { ok: true, output: tail } : { ok: false, error: `exited ${code}`, output: tail });
     });
   });
 }
 
-/** After a run: push the outcome to the job's deliver channel, and — on repeated failures — a 🚨 alert
- *  (threshold `alertAfter` (default 3), 6h cooldown). Best-effort: a delivery error only hits the log.
- *  `deliver` + `nowMs` injectable for tests. */
+function terminalStatus(result: CronRunResult): "ok" | "error" | "timed_out" {
+  return result.ok ? "ok" : result.timedOut ? "timed_out" : "error";
+}
+
+function safeRunFailure(error: unknown): CronRunResult {
+  return {
+    ok: false,
+    error: redactToolSubprocessOutput(error instanceof Error ? error.message : String(error)),
+    output: "",
+  };
+}
+
+/** Manual-run lifecycle wrapper: persistence happens before the child starts and is always closed out. */
+export async function runJobTracked(job: CronJob, options: CronRunOptions = {}): Promise<CronRunResult> {
+  const startedAt = Date.now();
+  let runningToken: string | null;
+  try {
+    runningToken = recordRunStart(job.id, startedAt);
+  } catch (error) {
+    return { ok: false, error: `failed to persist cron running state: ${safeRunFailure(error).error}` };
+  }
+  if (!runningToken) {
+    let current: CronJob | undefined;
+    try {
+      current = findJob(job.id);
+      if (current?.lastStatus === "running") {
+        // A dead parent may still have a detached child. Persist the same fail-closed recovery used by ticks,
+        // but do not continue into a new run: the operator must inspect and retry explicitly.
+        const recovered = recoverInterruptedRuns(startedAt, job.id).find((entry) => entry.job.id === job.id);
+        if (recovered) {
+          return {
+            ok: false,
+            error: `previous cron attempt was interrupted and the job was disabled; Hara refused to overlap a possible orphaned child. Inspect the process/workspace, then run \`hara cron run ${job.id}\` again explicitly`,
+            output: "",
+          };
+        }
+        current = findJob(job.id);
+        if (current?.lastStatus === "running") {
+          const pid = current.runningPid ? ` (owner pid ${current.runningPid})` : "";
+          return {
+            ok: false,
+            error: `cron job already has an unresolved running attempt${pid}; Hara refused to overlap it. Wait for it to finish or stop/recover that owner before retrying`,
+            output: "",
+          };
+        }
+      }
+    } catch (error) {
+      return { ok: false, error: `failed to inspect/recover cron running state: ${safeRunFailure(error).error}`, output: "" };
+    }
+    return {
+      ok: false,
+      error: current?.lastError
+        ? `cron job could not start: ${current.lastError}`
+        : "cron job could not start because it no longer exists or its state changed concurrently",
+      output: "",
+    };
+  }
+  let result: CronRunResult;
+  try {
+    result = await runJobOnce(job, options);
+  } catch (error) {
+    result = safeRunFailure(error);
+  }
+  const finishedAt = Date.now();
+  recordRun(job.id, finishedAt, terminalStatus(result), result.error, finishedAt - startedAt, runningToken);
+  return result;
+}
+
+type CronDeliver = (
+  spec: string,
+  text: string,
+  signal?: AbortSignal,
+  idempotencyKey?: string,
+) => Promise<string | null>;
+
+interface PendingDeliveryOptions {
+  limit?: number;
+  jobId?: string;
+  ids?: ReadonlySet<string>;
+}
+
+/** Attempt a bounded slice of the durable queue. Transport failure updates backoff but never removes the
+ * effect; confirmed success atomically acknowledges it (and starts alert cooldown). */
+export async function deliverPendingNotifications(
+  deliver: CronDeliver = deliverResult,
+  nowMs = Date.now(),
+  signal?: AbortSignal,
+  options: PendingDeliveryOptions = {},
+): Promise<number> {
+  const pending = listPendingNotifications(nowMs, options.limit ?? 8, options.jobId)
+    .filter((notification) => !options.ids || options.ids.has(notification.id));
+  let acknowledged = 0;
+  for (const notification of pending) {
+    if (signal?.aborted) break;
+    let error: string | null;
+    try {
+      error = await deliver(notification.target, notification.text, signal, notification.id);
+    } catch (cause) {
+      error = `delivery failed: ${safeRunFailure(cause).error ?? "transport request failed"}`;
+    }
+    if (!error) {
+      acknowledgePendingNotification(notification.jobId, notification.id, Date.now());
+      acknowledged++;
+      continue;
+    }
+    deferPendingNotification(notification.jobId, notification.id, error, Date.now());
+    try {
+      appendFileSync(logPath(notification.jobId), `\n[${notification.kind === "alert" ? "alert" : "deliver"}] ${error}\n`);
+    } catch {
+      /* the durable queue is authoritative; the human-readable log is best effort */
+    }
+  }
+  return acknowledged;
+}
+
+/** Public one-off wrapper retained for embedders/tests. Unlike the old best-effort implementation, intent is
+ * persisted before transport and keeps the same idempotency key until confirmed. Production ticks enqueue
+ * atomically inside recordRun and call `deliverPendingNotifications` directly. */
 export async function deliverOutcome(
   job: CronJob,
-  r: { ok: boolean; error?: string; output?: string },
-  deliver: (spec: string, text: string) => Promise<string | null> = deliverResult,
+  r: CronDeliveryOutcome,
+  deliver: CronDeliver = deliverResult,
   nowMs: number = Date.now(),
+  signal?: AbortSignal,
 ): Promise<void> {
-  if (!job.deliver) return;
-  const snippet = (r.output ?? "").trim().slice(-1_500);
-  const head = r.ok ? `⏰ ${job.name} ✓` : `⏰ ${job.name} ✗ ${r.error ?? "failed"}`;
-  const err = await deliver(job.deliver, snippet ? `${head}\n${snippet}` : head);
-  if (err) {
-    try {
-      appendFileSync(logPath(job.id), `\n[deliver] ${err}\n`);
-    } catch {
-      /* best-effort */
-    }
+  const ids = enqueueOutcomeNotifications(job.id, r, nowMs);
+  if (!ids.length) return;
+  await deliverPendingNotifications(deliver, nowMs, signal, {
+    limit: Math.min(64, ids.length),
+    jobId: job.id,
+    ids: new Set(ids),
+  });
+}
+
+export type CronJobRunner = (job: CronJob, options?: CronRunOptions) => Promise<CronRunResult>;
+
+interface BoundedJobOutcome {
+  result: CronRunResult;
+  stopTick?: "watchdog" | "cancelled";
+}
+
+/** Hard-race a runner as well as passing it a signal. The race is intentional: a buggy/custom runner that
+ * ignores AbortSignal must not retain the global tick lock forever. The production runner owns a detached
+ * process group and force-kills it synchronously when this controller aborts. */
+async function runOneWithinTick(
+  job: CronJob,
+  run: CronJobRunner,
+  jobTimeoutMs: number,
+  tickTimeoutMs: number,
+  tickSignal: AbortSignal,
+  tickWatchdogSignal: AbortSignal,
+): Promise<BoundedJobOutcome> {
+  const jobDeadline = new AbortController();
+  const signal = AbortSignal.any([tickSignal, jobDeadline.signal]);
+  let jobTimer: NodeJS.Timeout | undefined;
+  let settleTimer: NodeJS.Timeout | undefined;
+  let onTickAbort: (() => void) | undefined;
+  let jobTimedOut = false;
+  const boundary = new Promise<BoundedJobOutcome>((resolve) => {
+    let settled = false;
+    const finish = (outcome: BoundedJobOutcome): void => {
+      if (settled) return;
+      settled = true;
+      resolve(outcome);
+    };
+    jobTimer = setTimeout(() => {
+      const error = `timed out after ${jobTimeoutMs}ms`;
+      jobTimedOut = true;
+      jobDeadline.abort(new Error(error));
+      // Production runJobOnce force-kills its owned process group synchronously, then settles on close. Give
+      // that cleanup a short bounded window before starting the next due job; a runner that ignores both the
+      // signal and the hard race still cannot retain the tick forever.
+      settleTimer = setTimeout(() => {
+        finish({ result: { ok: false, error, output: "", timedOut: true } });
+      }, ABORT_SETTLE_MS);
+    }, jobTimeoutMs);
+    onTickAbort = () => {
+      const watchdog = tickWatchdogSignal.aborted;
+      const error = watchdog ? `tick watchdog timed out after ${tickTimeoutMs}ms` : "tick cancelled by caller";
+      finish({
+        result: {
+          ok: false,
+          error,
+          output: "",
+          ...(watchdog ? { timedOut: true } : { interrupted: true }),
+        },
+        stopTick: watchdog ? "watchdog" : "cancelled",
+      });
+    };
+    tickSignal.addEventListener("abort", onTickAbort, { once: true });
+    if (tickSignal.aborted) onTickAbort();
+  });
+  const execution = Promise.resolve()
+    .then(() => run(job, { timeoutMs: jobTimeoutMs, signal }))
+    .then(
+      (result): BoundedJobOutcome => jobTimedOut && !tickSignal.aborted
+        ? { result: { ...result, ok: false, error: `timed out after ${jobTimeoutMs}ms`, timedOut: true, interrupted: undefined } }
+        : { result },
+      (error): BoundedJobOutcome => jobTimedOut && !tickSignal.aborted
+        ? { result: { ok: false, error: `timed out after ${jobTimeoutMs}ms`, output: "", timedOut: true } }
+        : { result: safeRunFailure(error) },
+    );
+  const outcome = await Promise.race([execution, boundary]);
+  if (jobTimer) clearTimeout(jobTimer);
+  if (settleTimer) clearTimeout(settleTimer);
+  if (onTickAbort) tickSignal.removeEventListener("abort", onTickAbort);
+  return outcome;
+}
+
+/** Await auxiliary work without allowing a non-cooperative delivery adapter to outlive the tick lock. */
+async function completesBeforeTick(work: Promise<unknown>, tickSignal: AbortSignal): Promise<boolean> {
+  const completed = Promise.resolve(work).then(() => true, () => true);
+  if (tickSignal.aborted) {
+    void completed;
+    return false;
   }
-  if (!r.ok) {
-    const fresh = findJob(job.id); // recordRun already bumped consecutiveErrors
-    const count = fresh?.consecutiveErrors ?? 0;
-    const threshold = job.alertAfter ?? 3;
-    const cooled = !fresh?.lastAlertAt || nowMs - fresh.lastAlertAt > 6 * 3_600_000;
-    if (count >= threshold && cooled) {
-      await deliver(job.deliver, `🚨 ${job.name} has failed ${count}× in a row — latest: ${r.error ?? "unknown"}. Log: ${logPath(job.id)}`);
-      recordAlert(job.id, nowMs);
-    }
-  }
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<boolean>((resolve) => {
+    onAbort = () => resolve(false);
+    tickSignal.addEventListener("abort", onAbort, { once: true });
+    if (tickSignal.aborted) onAbort();
+  });
+  const result = await Promise.race([completed, aborted]);
+  if (onAbort) tickSignal.removeEventListener("abort", onAbort);
+  return result;
 }
 
 /** One scheduler tick: run every due job (sequentially), recording each outcome. Lock-guarded so an
  *  overlapping tick (launchd fires every 60s; a job may run longer) skips instead of double-firing.
  *  `run` is injectable for tests. Returns the job ids that ran. */
-export async function runTick(nowMs: number, run: (job: CronJob) => Promise<{ ok: boolean; error?: string }> = runJobOnce): Promise<{ ran: string[]; skipped?: string }> {
+export async function runTick(
+  nowMs: number,
+  run: CronJobRunner = runJobOnce,
+  options: CronTickOptions = {},
+): Promise<CronTickResult> {
   mkdirSync(cronDir(), { recursive: true, mode: 0o700 });
   try { chmodSync(cronDir(), 0o700); } catch { /* best effort */ }
   const lock = lockPath();
-  const token = `${process.pid}:${randomUUID()}`;
+  const token = newTickLockToken();
   const takeover = takeoverPath();
   let acquired = false;
 
@@ -406,12 +794,12 @@ export async function runTick(nowMs: number, run: (job: CronJob) => Promise<{ ok
     const observedFile = readTickLockFileSnapshot(lock);
     if (!observedFile) return { ran: [], skipped: "another tick is in progress" };
     const observed = parseTickLockSnapshot(observedFile);
-    const malformedStale = (snapshot: TickLockFileSnapshot): boolean => nowMs - snapshot.mtimeMs >= LOCK_STALE_MS;
-    if (observed ? !staleTickLock(observed, nowMs) : !malformedStale(observedFile)) {
+    const malformedStale = (snapshot: TickLockFileSnapshot): boolean => nowMs - snapshot.mtimeMs >= MALFORMED_LOCK_POISON_MS;
+    if (observed ? !reclaimableTickLock(observed) : !malformedStale(observedFile)) {
       return { ran: [], skipped: "another tick is in progress" };
     }
 
-    const takeoverToken = `${process.pid}:${randomUUID()}`;
+    const takeoverToken = newTickLockToken();
     if (!writeExclusive(takeover, takeoverToken)) return { ran: [], skipped: "another tick is taking over a stale lock" };
     try {
       // Re-read under the exclusive guard and require the exact content/inode/size/mtime/ctime diagnosed.
@@ -424,7 +812,7 @@ export async function runTick(nowMs: number, run: (job: CronJob) => Promise<{ ok
         }
         const current = parseTickLockSnapshot(currentFile);
         if (observed) {
-          if (!sameTickLock(observed, current) || !current || !staleTickLock(current, nowMs)) {
+          if (!sameTickLock(observed, current) || !current || !reclaimableTickLock(current)) {
             return { ran: [], skipped: "the tick lock changed during stale takeover" };
           }
         } else if (current || !malformedStale(currentFile)) {
@@ -439,17 +827,82 @@ export async function runTick(nowMs: number, run: (job: CronJob) => Promise<{ ok
   }
   if (!acquired) return { ran: [], skipped: "another tick is acquiring the lock" };
   try { chmodSync(lock, 0o600); } catch { /* best effort */ }
+  const tickTimeoutMs = cronTickTimeoutMs(options.tickTimeoutMs);
+  const jobTimeoutMs = Math.min(cronJobTimeoutMs(options.jobTimeoutMs), tickTimeoutMs);
+  const deliver = options.deliver ?? deliverResult;
+  const tickDeadline = new AbortController();
+  const tickTimer = setTimeout(() => {
+    tickDeadline.abort(new Error(`tick watchdog timed out after ${tickTimeoutMs}ms`));
+  }, tickTimeoutMs);
+  const tickSignal = options.signal ? AbortSignal.any([options.signal, tickDeadline.signal]) : tickDeadline.signal;
   try {
-    const due = dueJobs(loadJobs(), nowMs);
-    const ran: string[] = [];
-    for (const job of due) {
-      const r = await run(job);
-      recordRun(job.id, nowMs, r.ok ? "ok" : "error", r.error);
-      await deliverOutcome(job, r);
-      ran.push(job.id);
+    // A prior scheduler/manual process may have died after persisting `running`. Recovery atomically records
+    // terminal state + durable notifications before selecting due work. Live, non-expired owners are preserved.
+    let due: CronJob[];
+    try {
+      recoverInterruptedRuns(nowMs);
+      due = dueJobs(loadJobs(), nowMs);
+    } catch (error) {
+      return { ran: [], stopped: `cron store unavailable: ${safeRunFailure(error).error}` };
     }
-    return { ran };
+    // Every OS tick retries a bounded alert-first slice, including disabled/orphaned/one-shot jobs which may
+    // never run again. A transport failure remains queued with backoff instead of disappearing into a log.
+    const drained = await completesBeforeTick(
+      deliverPendingNotifications(deliver, nowMs, tickSignal, { limit: 8 }),
+      tickSignal,
+    );
+    if (!drained || tickSignal.aborted) {
+      return {
+        ran: [],
+        stopped: tickDeadline.signal.aborted
+          ? `tick watchdog timed out after ${tickTimeoutMs}ms`
+          : "tick cancelled by caller",
+      };
+    }
+    const ran: string[] = [];
+    let stopped: string | undefined;
+    for (const job of due) {
+      if (tickSignal.aborted) {
+        stopped = tickDeadline.signal.aborted
+          ? `tick watchdog timed out after ${tickTimeoutMs}ms`
+          : "tick cancelled by caller";
+        break;
+      }
+      const startedAt = Date.now();
+      let runningToken: string | null;
+      try {
+        // Re-check enabled/existence under the store mutex. A disable/remove racing the earlier due snapshot
+        // wins cleanly and is never overwritten by this tick.
+        runningToken = recordRunStart(job.id, startedAt, true);
+      } catch (error) {
+        stopped = `could not persist running state for ${job.id}: ${safeRunFailure(error).error}`;
+        break; // fail closed: never launch a job whose running state was not durably recorded
+      }
+      if (!runningToken) continue;
+      const bounded = await runOneWithinTick(job, run, jobTimeoutMs, tickTimeoutMs, tickSignal, tickDeadline.signal);
+      const r = bounded.result;
+      const finishedAt = Date.now();
+      const recorded = recordRun(job.id, finishedAt, terminalStatus(r), r.error, finishedAt - startedAt, runningToken, r);
+      ran.push(job.id);
+      // Even the total watchdog/caller cancellation must produce the promised visible failure alert. Give
+      // that final delivery its own small hard boundary instead of skipping it or extending the tick forever.
+      const deliverySignal = tickSignal.aborted ? AbortSignal.timeout(FINAL_DELIVERY_TIMEOUT_MS) : tickSignal;
+      const delivered = !recorded
+        ? true // a newer attempt/removal owns state now; do not send this stale attempt's outcome
+        : await completesBeforeTick(
+            deliverPendingNotifications(deliver, finishedAt, deliverySignal, { limit: 8, jobId: job.id }),
+            deliverySignal,
+          );
+      if (bounded.stopTick || !delivered || tickSignal.aborted) {
+        stopped = tickDeadline.signal.aborted
+          ? `tick watchdog timed out after ${tickTimeoutMs}ms`
+          : "tick cancelled by caller";
+        break;
+      }
+    }
+    return { ran, ...(stopped ? { stopped } : {}) };
   } finally {
+    clearTimeout(tickTimer);
     // Remove only the lock instance we created; never unlink a successor after a stale-lock takeover.
     releasePrimaryTickLock(lock, takeover, token);
   }

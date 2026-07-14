@@ -5,6 +5,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Provider } from "../providers/types.js";
+import { boundedProviderTurn } from "../providers/bounded-turn.js";
 import type { Role } from "./roles.js";
 import { runShell, type SandboxMode } from "../sandbox.js";
 import { readModelContextFileSync, readVerifiedRegularFileSnapshot } from "../fs-read.js";
@@ -37,14 +38,20 @@ Return ONLY a JSON object, no prose:
 Rules: short ids (a1,a2,…); deps reference earlier ids only; typically 3-8 atoms; each atom small and verifiable. Prefer a concrete 'check' command (e.g. "npm test", "tsc --noEmit", "test -f src/x.ts") so a step is verified objectively; omit 'check' if none fits.`;
 
 /** Ask the model to decompose `task` into an atomized, sequenced plan. */
-export async function decompose(provider: Provider, task: string, roles: Role[]): Promise<Plan> {
+export async function decompose(
+  provider: Provider,
+  task: string,
+  roles: Role[],
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<Plan> {
   const roleHint = roles.length ? `\nAvailable roles for the optional "role" field: ${roles.map((r) => r.id).join(", ")}.` : "";
-  const r = await provider.turn({
+  const r = await boundedProviderTurn(provider, {
     system: PLAN_SYSTEM + roleHint,
     history: [{ role: "user", content: `Task: ${task}\n\nReturn the JSON plan.` }],
     tools: [],
     onText: () => {},
-  });
+  }, { timeoutMs: opts.timeoutMs ?? 60_000, signal: opts.signal, label: "plan decomposition" });
+  if (r.stop === "error") return { task, atoms: [], createdAt: new Date().toISOString() };
   return { task, atoms: parsePlan(r.text), createdAt: new Date().toISOString() };
 }
 
@@ -143,8 +150,13 @@ export function atomPrompt(atom: Atom, plan: Plan, done: Atom[]): string {
 }
 
 /** Soft verification gate: ask the model whether the atom met its done-criteria. */
-export async function verify(provider: Provider, atom: Atom, transcriptTail: string): Promise<{ ok: boolean; reason: string }> {
-  const r = await provider.turn({
+export async function verify(
+  provider: Provider,
+  atom: Atom,
+  transcriptTail: string,
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<{ ok: boolean; reason: string }> {
+  const r = await boundedProviderTurn(provider, {
     system:
       "You verify whether a coding step met its done-criteria. " +
       "Reply EXACTLY 'DONE' if met, or 'NEEDSWORK: <short reason>' if not. No other text.",
@@ -156,7 +168,8 @@ export async function verify(provider: Provider, atom: Atom, transcriptTail: str
     ],
     tools: [],
     onText: () => {},
-  });
+  }, { timeoutMs: opts.timeoutMs ?? 30_000, signal: opts.signal, label: "plan verification" });
+  if (r.stop === "error") return { ok: false, reason: r.errorMsg?.slice(0, 200) || "plan verification failed" };
   const t = r.text.trim();
   if (/^done\b/i.test(t)) return { ok: true, reason: "verified" };
   return { ok: false, reason: t.replace(/^needswork:?\s*/i, "").slice(0, 200) || "did not meet criteria" };

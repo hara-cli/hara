@@ -123,7 +123,7 @@ async function rollbackWrittenPlan(plan: Plan): Promise<void> {
   discardClaimedPath(quarantine, plan.committed);
 }
 
-async function quarantineExpectedDelete(plan: Plan): Promise<void> {
+async function quarantineExpectedDelete(plan: Plan, signal?: AbortSignal): Promise<void> {
   if (!plan.beforeIdentity || !plan.beforePathIdentity || plan.beforeMode === undefined) throw new Error(`missing preflight identity for ${plan.path}`);
   if (!plan.writeBoundary) throw new Error(`missing parent boundary for ${plan.path}`);
   // Keep the initially moved path private until it has been verified. A directory watcher must not be able
@@ -131,6 +131,7 @@ async function quarantineExpectedDelete(plan: Plan): Promise<void> {
   // phases. Recording it immediately also lets the outer rollback recover (or accurately report) a failure
   // that happens after rename but before verification completes.
   const staging = join(dirname(plan.abs), `.hara-stage-delete-${process.pid}-${randomUUID()}.tmp`);
+  if (signal?.aborted) throw new Error("apply_patch delete cancelled before commit");
   verifyAtomicWriteBoundary(plan.writeBoundary);
   renameSync(plan.abs, staging);
   plan.quarantine = staging;
@@ -146,6 +147,7 @@ async function quarantineExpectedDelete(plan: Plan): Promise<void> {
     throw new FileChangedError(plan.path);
   }
   const quarantine = join(dirname(plan.abs), `.hara-delete-${process.pid}-${randomUUID()}.tmp`);
+  if (signal?.aborted) throw new Error("apply_patch delete cancelled during verification");
   verifyAtomicWriteBoundary(plan.writeBoundary);
   renameSync(staging, quarantine);
   plan.quarantine = quarantine;
@@ -330,18 +332,21 @@ registerTool({
     const applied: typeof plans = [];
     try {
       for (const pl of plans) {
+        if (ctx.signal?.aborted) throw new Error("apply_patch cancelled before commit");
         if (pl.type === "delete") {
           // Atomic move-then-inspect: a replacement inode is moved aside and restored, never unlinked.
           // The expected inode remains quarantined until every other patch step has committed.
-          await quarantineExpectedDelete(pl);
+          await quarantineExpectedDelete(pl, ctx.signal);
         } else {
           pl.committed = await atomicWriteText(pl.abs, pl.after as string, {
             expected: pl.existed ? pl.before : null,
             expectedIdentity: pl.existed ? pl.beforeIdentity : undefined,
             boundary: pl.writeBoundary,
+            signal: ctx.signal,
           });
         }
         applied.push(pl);
+        if (ctx.signal?.aborted) throw new Error("apply_patch cancelled during commit; rolling back");
       }
     } catch (e) {
       const rollbackFailures: string[] = [];

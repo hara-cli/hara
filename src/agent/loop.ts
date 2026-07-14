@@ -10,7 +10,8 @@ import { mapLimit, maxParallel } from "../concurrency.js";
 import type { ApprovalMode } from "../config.js";
 import { decideCommand, loadPermissionRules } from "../security/permissions.js";
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
-import { recordCall } from "./repeat-guard.js";
+import { keyOf, looksFailed, recordCall } from "./repeat-guard.js";
+import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
@@ -149,7 +150,9 @@ export interface RunOpts {
   provider: Provider;
   ctx: ToolContext;
   approval: ApprovalMode;
-  confirm: (q: string) => Promise<boolean | "always">;
+  /** Interactive approval channel. Implementations should actively dismiss their prompt when `signal`
+   *  aborts; the loop still races the Promise as a hard boundary for non-cooperative embedders. */
+  confirm: (q: string, signal?: AbortSignal) => Promise<boolean | "always">;
   /** tool names auto-approved for the rest of the session (chosen via "don't ask again") */
   autoApprove?: Set<string>;
   projectContext?: string;
@@ -169,10 +172,19 @@ export interface RunOpts {
   extraTools?: Tool[];
   /** abort the in-flight LLM request (user interrupt) */
   signal?: AbortSignal;
+  /** Total wall-clock ceiling for this run. Activity cannot renew it. Defaults to 30m, hard max 2h. */
+  timeoutMs?: number | string;
+  /** Maximum provider/tool rounds for this run. Defaults to 64, hard max 256. */
+  maxRounds?: number | string;
+  /** One-shot observer for a hard lifecycle stop. Messages contain metadata only, never prompts/tool args. */
+  onLimit?: (event: RunLimitEvent) => void;
   /** Observe each provider Promise's physical lifetime. The agent loop races cancellation against providers
    *  that ignore AbortSignal, but serve keeps its cross-process session lock until the abandoned Promise
    *  actually settles. Observers must attach both fulfillment and rejection handlers. */
   onProviderTurn?: (turn: Promise<unknown>) => void;
+  /** Observe each tool Promise's physical lifetime. A lifecycle deadline stops logical progress immediately,
+   * while persistent hosts retain the session lease until a non-cooperative tool actually settles. */
+  onToolRun?: (run: Promise<unknown>, tool: { name: string; kind: Tool["kind"] }) => void;
   /** suppress streaming/tool output (sub-agents running in parallel) */
   quiet?: boolean;
   /** Type-ahead steering (TUI): pull messages the user submitted *while this turn was running* and
@@ -192,11 +204,145 @@ export interface RunOpts {
 export interface RunOutcome {
   status: "completed" | "error" | "empty" | "halted";
   error?: string;
+  stopReason?: RunStopReason;
+}
+
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop";
+
+export interface RunLimitEvent {
+  kind: RunStopReason;
+  message: string;
+  elapsedMs: number;
+  rounds: number;
+  timeoutMs: number;
+  maxRounds: number;
+}
+
+const RUN_STOPPED = Symbol("agent-run-stopped");
+const REPEATED_FAILURE_LIMIT = 3;
+
+interface RunLifecycle {
+  signal: AbortSignal;
+  timeoutController: AbortController;
+  timeoutTimer: ReturnType<typeof setTimeout>;
+  warningTimer: ReturnType<typeof setTimeout>;
+  stopPromise: Promise<typeof RUN_STOPPED>;
+  removeStopListener: () => void;
+  startedAt: number;
+  timeoutMs: number;
+  maxRounds: number;
+  rounds: number;
+  timedOut: boolean;
+  warned: boolean;
+  limitAnnounced: boolean;
+  disposed: boolean;
+  failedCalls: Map<string, number>;
+}
+
+function showRunNotice(opts: RunOpts, message: string, critical = false): void {
+  if (opts.quiet) return;
+  if (opts.ctx.ui) opts.ctx.ui.notice(message);
+  else {
+    try {
+      const rendered = process.stderr.isTTY ? (critical ? c.red(message) : c.yellow(message)) : message;
+      process.stderr.write(rendered + "\n");
+    } catch {
+      /* diagnostics must never break lifecycle enforcement */
+    }
+  }
+}
+
+function warnRun(opts: RunOpts, life: RunLifecycle): void {
+  if (life.disposed || life.warned || life.signal.aborted) return;
+  life.warned = true;
+  showRunNotice(
+    opts,
+    `⚠ agent still running: ${formatAgentDuration(Date.now() - life.startedAt)} elapsed, round ${life.rounds}/${life.maxRounds}; hard stop at ${formatAgentDuration(life.timeoutMs)}.`,
+  );
+}
+
+function createRunLifecycle(opts: RunOpts): RunLifecycle {
+  const timeoutMs = agentRunTimeoutMs(opts.timeoutMs);
+  const maxRounds = agentMaxRounds(opts.maxRounds);
+  const timeoutController = new AbortController();
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeoutController.signal]) : timeoutController.signal;
+  const startedAt = Date.now();
+  const life = {} as RunLifecycle;
+  const timeoutTimer = setTimeout(() => {
+    if (life.disposed || signal.aborted) return;
+    life.timedOut = true;
+    timeoutController.abort(new Error("agent run deadline reached"));
+  }, timeoutMs);
+  // This timer is the hard boundary for a provider/tool Promise that owns no event-loop handles. Keep it
+  // referenced while the run is active; unref would let headless Node exit with the run still unresolved.
+  // Long legitimate work gets an in-band heads-up; a fast active loop gets the same warning at 75% rounds.
+  const warningDelay = Math.min(5 * 60_000, Math.max(250, Math.floor(timeoutMs * 0.8)));
+  const warningTimer = setTimeout(() => warnRun(opts, life), warningDelay);
+  warningTimer.unref?.();
+  let removeStopListener = (): void => {};
+  const stopPromise = new Promise<typeof RUN_STOPPED>((resolveStopped) => {
+    const stopped = (): void => resolveStopped(RUN_STOPPED);
+    removeStopListener = () => signal.removeEventListener("abort", stopped);
+    if (signal.aborted) stopped();
+    else signal.addEventListener("abort", stopped, { once: true });
+  });
+  Object.assign(life, {
+    signal,
+    timeoutController,
+    timeoutTimer,
+    warningTimer,
+    stopPromise,
+    removeStopListener,
+    startedAt,
+    timeoutMs,
+    maxRounds,
+    rounds: 0,
+    timedOut: false,
+    warned: false,
+    limitAnnounced: false,
+    disposed: false,
+    failedCalls: new Map<string, number>(),
+  });
+  return life;
+}
+
+function disposeRunLifecycle(life: RunLifecycle): void {
+  life.disposed = true;
+  clearTimeout(life.timeoutTimer);
+  clearTimeout(life.warningTimer);
+  life.removeStopListener();
+}
+
+function hardStop(opts: RunOpts, life: RunLifecycle, kind: RunStopReason, detail?: { tool?: string; count?: number }): RunOutcome {
+  const elapsedMs = Date.now() - life.startedAt;
+  const message = kind === "deadline"
+    ? `⛔ agent run stopped: total deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). No further model or tool calls will start. Increase it with \`hara config set runTimeoutMs 45m\` (maximum 2h) only for intentional long work.`
+    : kind === "max_rounds"
+      ? `⛔ agent run stopped: ${life.maxRounds}-round safety limit reached after ${formatAgentDuration(elapsedMs)}. This usually means the model is looping. Increase it with \`hara config set maxAgentRounds <n>\` (maximum 256) only if the extra rounds are intentional.`
+      : `⛔ agent run stopped: the same failing ${detail?.tool ?? "tool"} call repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
+  const event: RunLimitEvent = { kind, message, elapsedMs, rounds: life.rounds, timeoutMs: life.timeoutMs, maxRounds: life.maxRounds };
+  if (!life.limitAnnounced) {
+    life.limitAnnounced = true;
+    showRunNotice(opts, message, true);
+    try { opts.onLimit?.(event); } catch { /* observers cannot weaken the hard stop */ }
+  }
+  return { status: "halted", error: message, stopReason: kind };
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
 export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<RunOutcome> {
+  const life = createRunLifecycle(opts);
+  try {
+    return await runAgentInner(history, opts, life);
+  } finally {
+    disposeRunLifecycle(life);
+  }
+}
+
+async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLifecycle): Promise<RunOutcome> {
   const { provider, ctx } = opts;
+  const runSignal = life.signal;
+  const toolCtx: ToolContext = { ...ctx, signal: runSignal };
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
   let triedFallback = false;
@@ -208,6 +354,20 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
       else out(c.dim(`\n${msg}\n`));
     }
     return { status: "error", error: msg };
+  };
+  const stoppedOutcome = (): RunOutcome => life.timedOut
+    ? hardStop(opts, life, "deadline")
+    : interruptedOutcome();
+  const bounded = <T>(promise: Promise<T>): Promise<T | typeof RUN_STOPPED> => {
+    if (runSignal.aborted) return Promise.resolve(RUN_STOPPED);
+    return Promise.race([promise, life.stopPromise]);
+  };
+  const interactionFailure = (label: string, error: unknown): RunOutcome => {
+    const raw = error instanceof Error ? error.message : String(error ?? "unknown error");
+    const detail = redactSensitiveText(raw).text.trim().slice(0, 500) || "unknown error";
+    const message = `Interactive ${label} failed: ${detail}`;
+    showRunNotice(opts, message, true);
+    return { status: "error", error: message };
   };
 
   // Warn at the interaction boundary without echoing the value. Headless/gateway stdout is the response
@@ -238,10 +398,26 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
   // unfinished items exist. Main loop only — quiet (sub-agent) runs share the global list and must not nag.
   let todoIdleRounds = 0;
   for (;;) {
+    // A cancellation that already happened is authoritative: do not start pending-input work, a provider
+    // request, or any later tool round merely to give it an already-aborted signal.
+    if (runSignal.aborted) return stoppedOutcome();
+    if (life.rounds >= life.maxRounds) return hardStop(opts, life, "max_rounds");
+    life.rounds += 1;
+    if (life.rounds >= Math.ceil(life.maxRounds * 0.75)) warnRun(opts, life);
     // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
     // reaches the model on this next call (drained after the last tool round; empty on the 1st pass).
-    if (opts.pendingInput) {
-      for (const m of await opts.pendingInput()) history.push(m);
+    if (opts.pendingInput && !runSignal.aborted) {
+      let pending: NeutralMsg[] | typeof RUN_STOPPED;
+      try {
+        // Defer the callback by one microtask so a synchronous throw follows the same explicit error path
+        // as a rejected Promise instead of escaping runAgent and leaving the caller to guess what failed.
+        pending = await bounded(Promise.resolve().then(() => opts.pendingInput!()));
+      } catch (error) {
+        if (runSignal.aborted) return stoppedOutcome();
+        return interactionFailure("pending-input channel", error);
+      }
+      if (pending === RUN_STOPPED) return stoppedOutcome();
+      for (const m of pending) history.push(m);
     }
     // system-reminder injection: event-driven context queued since the last call (todo staleness today)
     // lands as ONE wrapped user message the UI never renders. Quiet runs don't drain — a parallel
@@ -287,15 +463,15 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
       }, 100);
     }
     // Stall watchdog: any stream event resets the clock; STALL_MS of silence aborts THIS attempt via
-    // its own controller (the user's opts.signal chains into it, so Esc still interrupts). The abort
+    // its own controller (the combined run signal chains into it, so Esc/deadline both interrupt). The abort
     // is then rewritten from "interrupted" to a timeout-class error so failover can take over.
     const STALL_MS = stallMs();
     const attempt = new AbortController();
-    const onUserAbort = (): void => attempt.abort();
+    const onRunAbort = (): void => attempt.abort();
     // AbortSignal does not replay an already-fired event to a late listener. A serve shutdown can cancel
     // while provider routing is still refreshing, so inherit that state synchronously before the call.
-    if (opts.signal?.aborted) attempt.abort();
-    else opts.signal?.addEventListener("abort", onUserAbort, { once: true });
+    if (runSignal.aborted) attempt.abort();
+    else runSignal.addEventListener("abort", onRunAbort, { once: true });
     let lastEvent = Date.now();
     let stalled = false;
     const stallTimer = setInterval(() => {
@@ -321,10 +497,17 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
         if (attempt.signal.aborted) onAttemptStop();
         else attempt.signal.addEventListener("abort", onAttemptStop, { once: true });
       });
-      const providerTurn = activeProvider.turn({
-      system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
-      history,
-      tools: specs,
+      // Enter through a microtask so a cancellation/deadline that lands during routing/setup is observed
+      // immediately before the provider side effect starts. Promise.resolve(activeProvider.turn(...)) is
+      // insufficient here: a custom provider can throw synchronously before Promise.resolve ever sees it.
+      const providerTurn = Promise.resolve().then(() => {
+        if (attempt.signal.aborted || runSignal.aborted) {
+          return { text: "", toolUses: [], stop: "error" as const, errorMsg: "interrupted" };
+        }
+        return activeProvider.turn({
+          system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
+          history,
+          tools: specs,
       // Any stream chunk keeps the connection considered alive — even suppressed reasoning_content, so a
       // reasoning model thinking for a long while before its first `content` token can't be false-timed-out.
       onActivity: () => {
@@ -375,27 +558,38 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
           : () => {
               if (!attempt.signal.aborted) alive();
             }, // quiet runs still feed the watchdog (reasoning-only stretches are progress)
-      signal: attempt.signal,
+          signal: attempt.signal,
+        });
       });
       opts.onProviderTurn?.(providerTurn);
       r = await Promise.race([providerTurn, attemptStopped]);
     } catch (error) {
-      if (!opts.signal?.aborted) throw error;
-      r = { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
+      // Provider launch/stream failures are turn results, not uncaught loop exceptions. This preserves the
+      // normal classifyError → fallback path for both synchronous throws and rejected provider promises.
+      r = runSignal.aborted
+        ? { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" }
+        : {
+            text: "",
+            toolUses: [],
+            stop: "error",
+            errorMsg: error instanceof Error ? error.message : String(error),
+          };
     } finally {
       clearInterval(stallTimer);
       removeAttemptStop();
-      opts.signal?.removeEventListener("abort", onUserAbort);
+      runSignal.removeEventListener("abort", onRunAbort);
+      // Every exit path (sync throw, rejected promise, watchdog, Esc, deadline) owns the same terminal
+      // teardown. Leaving any of these after the try makes a failed provider strand the spinner/markdown.
+      stopSpin();
+      flushReasoningTail();
+      md?.end();
+      if (!opts.quiet && !sink) out("\n");
     }
     // A watchdog abort surfaces from the provider as "interrupted" — rewrite it to a timeout-class
     // error (unless the USER really did interrupt) so classifyError → failover/fallback handles it.
-    if (stalled && r.stop === "error" && !opts.signal?.aborted) {
+    if (stalled && r.stop === "error" && !runSignal.aborted) {
       r = { ...r, errorMsg: `model stream timeout — no output for ${Math.round(STALL_MS / 1000)}s (stalled connection?)` };
     }
-    stopSpin();
-    flushReasoningTail();
-    md?.end();
-    if (!opts.quiet && !sink) out("\n");
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;
       opts.stats.output += r.usage.output;
@@ -403,7 +597,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
     }
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
-    if (opts.signal?.aborted) return interruptedOutcome();
+    if (runSignal.aborted) return stoppedOutcome();
     history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
 
     if (r.stop === "error") {
@@ -472,19 +666,55 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
     // while planning, approving, or executing, so finalize the round with real results for work that already
     // completed and explicit interruption errors for everything else before persisting the session.
     const results: ToolResult[] = new Array(r.toolUses.length);
-    const finalizeInterruptedToolRound = (): RunOutcome => {
+    const finalizeStoppedToolRound = (): RunOutcome => {
+      const pendingMessage = life.timedOut
+        ? `Error: agent run deadline ${formatAgentDuration(life.timeoutMs)} reached before this tool call completed.`
+        : "Error: interrupted before this tool call completed.";
       history.push({
         role: "tool",
         results: r.toolUses.map((tu, idx) => results[idx] ?? ({
           id: tu.id,
           name: tu.name,
-          content: "Error: interrupted before this tool call completed.",
+          content: pendingMessage,
           isError: true,
         })),
       });
-      return interruptedOutcome();
+      return stoppedOutcome();
     };
-    if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+    const finalizeInteractionError = (label: string, error: unknown): RunOutcome => {
+      const outcome = interactionFailure(label, error);
+      const pendingMessage = `Error: ${outcome.error}. This tool call was not executed.`;
+      history.push({
+        role: "tool",
+        results: r.toolUses.map((tu, idx) => results[idx] ?? ({
+          id: tu.id,
+          name: tu.name,
+          content: pendingMessage,
+          isError: true,
+        })),
+      });
+      return outcome;
+    };
+    if (runSignal.aborted) return finalizeStoppedToolRound();
+    let repeatHalt: { tool: string; count: number } | null = null;
+    const noteCall = (name: string, input: unknown, content: string, isError = false): string => {
+      const note = recordCall(name, input, content, isError, ctx.todoScope);
+      const key = keyOf(name, input);
+      if (isError || looksFailed(content, name)) {
+        const count = (life.failedCalls.get(key) ?? 0) + 1;
+        // This is a *consecutive no-progress* streak, not a lifetime counter for the call. A different
+        // failure is a changed attempt; keep only that new streak instead of letting an old failure
+        // silently accumulate across intervening work.
+        life.failedCalls.clear();
+        life.failedCalls.set(key, count);
+        if (count >= REPEATED_FAILURE_LIMIT && !repeatHalt) repeatHalt = { tool: name, count };
+      } else {
+        // Any successful action is progress (in particular edit/exec calls that may have fixed the
+        // underlying cause), so a later retry starts a fresh failure streak.
+        life.failedCalls.clear();
+      }
+      return note;
+    };
 
     // Resolve + gate each call first (confirmations must be sequential — can't prompt in parallel).
     interface Plan {
@@ -496,7 +726,7 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
     // Extra (per-run) tools win over the registry so a run-scoped tool can't be shadowed by a global one.
     const resolveTool = (name: string): Tool | undefined => opts.extraTools?.find((t) => t.name === name) ?? getTool(name);
     for (const tu of r.toolUses) {
-      if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+      if (runSignal.aborted) return finalizeStoppedToolRound();
       if (breakerHalt) {
         // Circuit-breaker halted the run: refuse every remaining call in this round with a clear message
         // (no hang, no further tools) so the model + user get a definitive stop.
@@ -545,13 +775,20 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
           const detail = redactToolSubprocessOutput(
             String(input.command ?? input.path ?? "").replace(/\s+/g, " ").trim().slice(0, 400),
           );
-          const verdict = await guardianVeto(
-            opts.guardian!.provider,
-            { tool: tu.name, detail, classifierReason: safeRiskReason },
-            history,
-            { signal: opts.signal },
-          );
-          if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+          let verdictResult: Awaited<ReturnType<typeof guardianVeto>> | typeof RUN_STOPPED;
+          try {
+            verdictResult = await bounded(Promise.resolve().then(() => guardianVeto(
+              opts.guardian!.provider,
+              { tool: tu.name, detail, classifierReason: safeRiskReason },
+              history,
+              { signal: runSignal },
+            )));
+          } catch (error) {
+            if (runSignal.aborted) return finalizeStoppedToolRound();
+            return finalizeInteractionError("guardian check", error);
+          }
+          if (verdictResult === RUN_STOPPED) return finalizeStoppedToolRound();
+          const verdict = verdictResult;
           if (verdict.decision === "block") {
             const tripped = recordBlock(breaker); // deterministic circuit-breaker: N blocks → hard stop
             plans.push({
@@ -570,10 +807,20 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
               // (gateway/cron/-p, where `confirm` is auto-yes and there's no real user), abort SAFELY —
               // never auto-continue past the breaker, and never hang.
               const interactive = !!ctx.ask;
-              const cont = interactive
-                ? await opts.confirm(`${c.red("⛔ guardian circuit-breaker")} — ${breaker.blocks} high-risk actions blocked this turn. Continue anyway?`)
-                : false;
-              if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+              let contResult: boolean | "always" | typeof RUN_STOPPED;
+              try {
+                contResult = interactive
+                  ? await bounded(Promise.resolve().then(() => opts.confirm(
+                      `${c.red("⛔ guardian circuit-breaker")} — ${breaker.blocks} high-risk actions blocked this turn. Continue anyway?`,
+                      runSignal,
+                    )))
+                  : false;
+              } catch (error) {
+                if (runSignal.aborted) return finalizeStoppedToolRound();
+                return finalizeInteractionError("guardian confirmation", error);
+              }
+              if (contResult === RUN_STOPPED) return finalizeStoppedToolRound();
+              const cont = contResult;
               if (cont === false) {
                 breakerHalt = true;
               } else {
@@ -587,8 +834,18 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
       }
       const shouldConfirm = alwaysGate || (cmdDecision !== "allow" && needsConfirm(tool.kind, opts.approval) && !opts.autoApprove?.has(tu.name));
       if (shouldConfirm) {
-        const reply = await opts.confirm(`${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`);
-        if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+        let replyResult: boolean | "always" | typeof RUN_STOPPED;
+        try {
+          replyResult = await bounded(Promise.resolve().then(() => opts.confirm(
+            `${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`,
+            runSignal,
+          )));
+        } catch (error) {
+          if (runSignal.aborted) return finalizeStoppedToolRound();
+          return finalizeInteractionError("approval prompt", error);
+        }
+        if (replyResult === RUN_STOPPED) return finalizeStoppedToolRound();
+        const reply = replyResult;
         if (reply === false) {
           plans.push({ tu, tool, denied: "User denied this action." });
           continue;
@@ -604,11 +861,20 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
     }
 
     // Execute: read-only tools run concurrently; edit/exec run alone, in order.
-    if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+    if (runSignal.aborted) return finalizeStoppedToolRound();
     const runOne = async (idx: number, p: Plan): Promise<void> => {
-      if (opts.signal?.aborted) return;
+      if (runSignal.aborted) return;
+      if (repeatHalt) {
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: "Error: not executed because the repeated-failure circuit-breaker stopped this run.", isError: true };
+        return;
+      }
       if (p.denied !== undefined) {
-        results[idx] = { id: p.tu.id, name: p.tu.name, content: p.denied, isError: true };
+        results[idx] = {
+          id: p.tu.id,
+          name: p.tu.name,
+          content: p.denied + noteCall(p.tu.name, p.tu.input, p.denied, true),
+          isError: true,
+        };
         return;
       }
       activity.inc();
@@ -621,37 +887,52 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
           const msg =
             `Error: tool call NOT executed — missing required parameter${missing.length > 1 ? "s" : ""}: ` +
             `${missing.join(", ")}. Send the call again with ALL required parameters (${(p.tool!.input_schema.required ?? []).join(", ")}) present and complete.`;
-          results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + recordCall(p.tu.name, p.tu.input, msg, true, ctx.todoScope), isError: true };
+          results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + noteCall(p.tu.name, p.tu.input, msg, true), isError: true };
           return;
         }
-        if (opts.signal?.aborted) return;
+        if (runSignal.aborted) return;
         const pre = opts.hooks === false
           ? { block: false, message: "" }
-          : runHooks("PreToolUse", p.tu.name, p.tu.input, ctx.cwd); // a hook may veto the call
+          : await runHooks("PreToolUse", p.tu.name, p.tu.input, ctx.cwd, 30_000, runSignal); // a hook may veto the call
         if (pre.block) {
-          results[idx] = { id: p.tu.id, name: p.tu.name, content: pre.message, isError: true };
+          results[idx] = { id: p.tu.id, name: p.tu.name, content: pre.message + noteCall(p.tu.name, p.tu.input, pre.message, true), isError: true };
           return;
         }
-        if (opts.signal?.aborted) return;
+        if (runSignal.aborted) return;
         // Track the MAIN conversation's working files for post-compaction restore (quiet fan-out
         // sub-agents read broadly — their files aren't "what the user was working on").
         if (!opts.quiet && FILE_TOUCH_TOOLS.has(p.tu.name) && typeof (p.tu.input as { path?: unknown })?.path === "string") {
           recordTouch(resolvePath(ctx.cwd, String((p.tu.input as { path: string }).path)), ctx.todoScope);
         }
-        const res = await p.tool!.run(p.tu.input, ctx);
+        // If a tool completes a side effect and aborts the parent synchronously, preserve that real result.
+        // A plain Promise.race can let the abort branch win the same microtask turn and falsely report the
+        // completed action as not run. Non-cooperative pending tools still lose to the hard stop immediately.
+        let settled: { ok: true; value: string } | { ok: false; error: unknown } | undefined;
+        const observedTool = p.tool!.run(p.tu.input, toolCtx).then(
+          (value) => { settled = { ok: true, value }; return value; },
+          (error) => { settled = { ok: false, error }; throw error; },
+        );
+        try { opts.onToolRun?.(observedTool, { name: p.tool!.name, kind: p.tool!.kind }); } catch { /* observers cannot affect execution */ }
+        const toolResult = await bounded(observedTool);
+        if (toolResult === RUN_STOPPED) {
+          await Promise.resolve(); // allow an already-completed async tool's fulfillment handler to publish
+          if (!settled) return;
+          if (!settled.ok) throw settled.error;
+        }
+        const res = toolResult === RUN_STOPPED ? (settled as { ok: true; value: string }).value : toolResult;
         // append any not-yet-seen subdirectory AGENTS.md/CLAUDE.md this call touched (monorepo-local conventions)
         // + the repeat-guard's anti-spinning note when this exact call keeps failing (repeat-guard.ts)
-        results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) + recordCall(p.tu.name, p.tu.input, res, false, ctx.todoScope) };
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) + noteCall(p.tu.name, p.tu.input, res) };
         // The tool may have completed a side effect and then triggered/observed cancellation. Preserve its
         // actual result in the closing tool round, but do not run any post hook or later tool afterward.
-        if (opts.signal?.aborted) return;
+        if (runSignal.aborted) return;
         if (opts.hooks !== false) {
-          runHooks("PostToolUse", p.tu.name, { input: p.tu.input, result: res }, ctx.cwd); // observe-only
+          await runHooks("PostToolUse", p.tu.name, { input: p.tu.input, result: res }, ctx.cwd, 30_000, runSignal); // observe-only
         }
       } catch (e: any) {
+        if (runSignal.aborted) return;
         const msg = `Error: ${e.message}`;
-        results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + recordCall(p.tu.name, p.tu.input, msg, true, ctx.todoScope), isError: true };
-        if (opts.signal?.aborted) return;
+        results[idx] = { id: p.tu.id, name: p.tu.name, content: msg + noteCall(p.tu.name, p.tu.input, msg, true), isError: true };
       } finally {
         activity.dec();
       }
@@ -664,20 +945,23 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
       await mapLimit(idx, maxParallel(), (i) => runOne(i, plans[i])); // bounded fan-out (e.g. 20 parallel agents → 8 at a time)
     };
     for (let i = 0; i < plans.length; i++) {
-      if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+      if (runSignal.aborted) return finalizeStoppedToolRound();
       const p = plans[i];
-      if (p.denied === undefined && p.tool?.kind === "read") {
+      // ask_user is interaction-safe but not parallel-safe: the TUI deliberately owns one prompt slot.
+      // Flush other reads and ask sequentially so two questions cannot overwrite each other and hang.
+      if (p.denied === undefined && p.tool?.kind === "read" && p.tool.name !== "ask_user") {
         batch.push(i); // safe → accumulate to run concurrently
       } else {
         await flush(); // flush pending reads before an edit/exec
-        if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+        if (runSignal.aborted) return finalizeStoppedToolRound();
         await runOne(i, p);
-        if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+        if (runSignal.aborted) return finalizeStoppedToolRound();
       }
     }
     await flush();
-    if (opts.signal?.aborted) return finalizeInterruptedToolRound();
+    if (runSignal.aborted) return finalizeStoppedToolRound();
     history.push({ role: "tool", results });
+    if (repeatHalt) return hardStop(opts, life, "repeat_loop", repeatHalt);
 
     // Synthesis nudge (CC's KN5, hara-shaped): a round that fanned out to several parallel agents just
     // produced N independent reports — remind the model to merge/reconcile them before acting, instead

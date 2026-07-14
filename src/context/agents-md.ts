@@ -3,6 +3,7 @@
 import { existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { readModelContextBytePrefixSync } from "../fs-read.js";
+import { homeWorkspaceGuidance, isHomeWorkspace } from "./workspace-scope.js";
 
 const FILENAMES = ["AGENTS.override.md", "AGENTS.md"];
 const ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
@@ -34,11 +35,19 @@ function markBudgetTruncation(value: string): string {
 }
 
 export function findProjectRoot(cwd: string): string {
-  let dir = resolve(cwd);
+  const start = resolve(cwd);
+  // Home is a control/personal-data scope even when it happens to contain a package.json/.git marker.
+  // Resolve this before the marker check so `hara` launched at ~/ cannot inherit a parent repository
+  // through a symlinked/nested HOME used by managed development environments.
+  if (isHomeWorkspace(start)) return start;
+  let dir = start;
   for (;;) {
+    // A marker accidentally placed at ~/ (for example a personal package.json) must not make every
+    // unmarked child directory inherit the entire home as its project root. Explicit child scope stays local.
+    if (dir !== start && isHomeWorkspace(dir)) return start;
     if (ROOT_MARKERS.some((m) => existsSync(join(dir, m)))) return dir;
     const parent = dirname(dir);
-    if (parent === dir) return resolve(cwd); // no marker found → treat cwd as root
+    if (parent === dir) return start; // no marker found → treat cwd as root
     dir = parent;
   }
 }
@@ -83,6 +92,15 @@ export function loadAgentsMd(cwd: string): string {
     }
   }
   return combined;
+}
+
+/** Model context is project AGENTS.md plus a built-in scope note when cwd is the user's home. Keeping the
+ *  built-in note separate from loadAgentsMd() preserves that function's file-loading semantics and lets the
+ *  UI accurately say whether an AGENTS.md file was actually loaded. */
+export function loadAgentContext(cwd: string): string {
+  const guidance = homeWorkspaceGuidance(cwd);
+  const agents = loadAgentsMd(cwd);
+  return [guidance, agents].filter(Boolean).join("\n\n--- workspace-context ---\n\n");
 }
 
 export function hasAgentsMd(cwd: string): boolean {

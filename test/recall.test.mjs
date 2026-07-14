@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { searchAssets, scaffoldAssets, assetsDir } from "../dist/recall.js";
+import { searchAssets, searchAssetsAsync, scaffoldAssets, assetsDir } from "../dist/recall.js";
 
 test("recall: searchAssets ranks by query-word matches", () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-assets-"));
@@ -38,6 +38,27 @@ test("recall: a frontmatter tag/title match outranks a body-only match at equal 
     assert.equal(hits[0].score, hits[1].score, "same base relevance score (one 'retry' each) — the boost broke the tie");
   } finally {
     delete process.env.HARA_ASSETS;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recall: async asset search preserves ranking and propagates cancellation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-assets-async-"));
+  try {
+    mkdirSync(join(dir, "snippets"), { recursive: true });
+    writeFileSync(join(dir, "snippets", "ranked.md"), "---\ntitle: Retry backoff\ntags: [retry]\n---\nHTTP helper\n");
+    writeFileSync(join(dir, "snippets", "body.md"), "# Notes\nretry appears only in the body\n");
+    const hits = await searchAssetsAsync("retry", 5, [dir], { timeoutMs: 5_000 });
+    assert.equal(hits[0].path, join(dir, "snippets", "ranked.md"));
+
+    const controller = new AbortController();
+    const reason = new Error("recall deadline");
+    controller.abort(reason);
+    await assert.rejects(
+      searchAssetsAsync("retry", 5, [dir], { signal: controller.signal }),
+      (error) => error === reason,
+    );
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

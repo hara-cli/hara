@@ -4,12 +4,13 @@
 // frontmost-window check before any pointer/keyboard action) + dangerous-key blocklist + a once-per-session
 // grant (tool kind "computer" always confirms once, even in full-auto). Screenshots are read via the vision
 // sidecar (ctx.describeImage) so a text main model can still "see" them.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerTool } from "./registry.js";
 import { loadConfig } from "../config.js";
+import { terminateSubprocessTree, toolSubprocessEnv } from "../security/subprocess-env.js";
 
 // ── RPA gotchas (hard-won; read before changing this file) ───────────────────────────────────────────
 // 0. TWO macOS PERMISSIONS, separately: Screen Recording (for `screencapture`) AND Accessibility (for
@@ -73,26 +74,101 @@ function fail(msg: string): string {
   return `Failed: ${msg}  [${consecFails}/${FAIL_LIMIT} before I stop]`;
 }
 
-function run(cmd: string, args: string[]): { ok: boolean; out: string } {
+/** Doctor runs outside an agent turn and may retain a small bounded synchronous availability probe. */
+function runProbeSync(cmd: string, args: string[]): { ok: boolean; out: string } {
   try {
-    const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 15000 });
+    const r = spawnSync(cmd, args, { encoding: "utf8", timeout: 3_000, env: toolSubprocessEnv() });
     return { ok: r.status === 0, out: ((r.stdout || "") + (r.stderr || "")).trim() };
   } catch (e: any) {
     return { ok: false, out: e?.message || "spawn failed" };
   }
 }
-function has(cmd: string): boolean {
-  return (process.platform === "win32" ? run("where", [cmd]) : run("which", [cmd])).ok;
+function hasProbeSync(cmd: string): boolean {
+  return (process.platform === "win32" ? runProbeSync("where", [cmd]) : runProbeSync("which", [cmd])).ok;
 }
-const ps = (script: string) => run("powershell", ["-NoProfile", "-Command", script]);
+
+class ComputerInterruptedError extends Error {
+  constructor() {
+    super("computer action interrupted by agent run deadline or cancellation");
+  }
+}
+
+/** Async, signal-aware command primitive for every agent-driven screen action. It owns a process group so
+ *  Esc/deadline kills descendants as well as the direct launcher, and it rechecks the signal before spawn. */
+async function run(
+  cmd: string,
+  args: string[],
+  signal?: AbortSignal,
+  input?: string,
+  timeoutMs = 15_000,
+): Promise<{ ok: boolean; out: string }> {
+  if (signal?.aborted) throw new ComputerInterruptedError();
+  return await new Promise((resolve, reject) => {
+    const processGroup = process.platform !== "win32";
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(cmd, args, { detached: processGroup, env: toolSubprocessEnv() });
+    } catch (error) {
+      resolve({ ok: false, out: error instanceof Error ? error.message : "spawn failed" });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    let timedOut = false;
+    let aborted = false;
+    let fallback: NodeJS.Timeout | undefined;
+    const append = (current: string, chunk: Buffer): string =>
+      current.length >= 256 * 1024 ? current : current + chunk.toString().slice(0, 256 * 1024 - current.length);
+    const settle = (code: number | null, launchError?: Error): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (fallback) clearTimeout(fallback);
+      signal?.removeEventListener("abort", abortRun);
+      const out = (stdout + stderr).trim();
+      if (aborted) reject(new ComputerInterruptedError());
+      else if (launchError) resolve({ ok: false, out: launchError.message });
+      else if (timedOut) resolve({ ok: false, out: `timed out after ${timeoutMs}ms${out ? `: ${out}` : ""}` });
+      else resolve({ ok: code === 0, out });
+    };
+    const stop = (fromAbort: boolean): void => {
+      if (done || aborted || timedOut) return;
+      aborted = fromAbort;
+      timedOut = !fromAbort;
+      terminateSubprocessTree(child, { force: true, processGroup });
+      // A daemon can escape while retaining pipes. Destroy our ends so the API still settles promptly.
+      fallback = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        settle(null);
+      }, 750);
+    };
+    const abortRun = (): void => stop(true);
+    const timer = setTimeout(() => stop(false), timeoutMs);
+    signal?.addEventListener("abort", abortRun, { once: true });
+    if (signal?.aborted) {
+      abortRun();
+    }
+    child.stdout?.on("data", (chunk: Buffer) => { if (!done) stdout = append(stdout, chunk); });
+    child.stderr?.on("data", (chunk: Buffer) => { if (!done) stderr = append(stderr, chunk); });
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(input);
+    child.once("error", (error) => settle(null, error));
+    child.once("close", (code) => settle(code));
+  });
+}
+const has = async (cmd: string, signal?: AbortSignal): Promise<boolean> =>
+  (await (process.platform === "win32" ? run("where", [cmd], signal) : run("which", [cmd], signal))).ok;
+const ps = (script: string, signal?: AbortSignal) => run("powershell", ["-NoProfile", "-Command", script], signal);
 
 /** Put text on the OS clipboard (so `type` can paste it — IME-safe + Unicode-safe, unlike keystroke injection). */
-function setClipboard(text: string): boolean {
+async function setClipboard(text: string, signal?: AbortSignal): Promise<boolean> {
   try {
-    if (process.platform === "darwin") return spawnSync("pbcopy", [], { input: text, timeout: 5000 }).status === 0;
-    if (process.platform === "win32") return spawnSync("clip", [], { input: text, timeout: 5000 }).status === 0;
-    if (has("wl-copy")) return spawnSync("wl-copy", [], { input: text, timeout: 5000 }).status === 0;
-    if (has("xclip")) return spawnSync("xclip", ["-selection", "clipboard"], { input: text, timeout: 5000 }).status === 0;
+    if (process.platform === "darwin") return (await run("pbcopy", [], signal, text, 5_000)).ok;
+    if (process.platform === "win32") return (await run("clip", [], signal, text, 5_000)).ok;
+    if (await has("wl-copy", signal)) return (await run("wl-copy", [], signal, text, 5_000)).ok;
+    if (await has("xclip", signal)) return (await run("xclip", ["-selection", "clipboard"], signal, text, 5_000)).ok;
   } catch {
     /* fall through */
   }
@@ -105,18 +181,18 @@ function tmpShot(): string {
   return join(tmpdir(), `hara-screen-${process.pid}-${Date.now()}-${seq}.png`);
 }
 
-function screenshot(): { path?: string; error?: string } {
+async function screenshot(signal?: AbortSignal): Promise<{ path?: string; error?: string }> {
   const out = tmpShot();
   if (process.platform === "darwin") {
-    if (!run("screencapture", ["-x", out]).ok) return { error: "screencapture failed (grant Screen Recording permission)" };
+    if (!(await run("screencapture", ["-x", out], signal)).ok) return { error: "screencapture failed (grant Screen Recording permission)" };
   } else if (process.platform === "linux") {
-    if (has("scrot")) run("scrot", ["-o", out]);
-    else if (has("import")) run("import", ["-window", "root", out]);
-    else if (has("grim")) run("grim", [out]);
+    if (await has("scrot", signal)) await run("scrot", ["-o", out], signal);
+    else if (await has("import", signal)) await run("import", ["-window", "root", out], signal);
+    else if (await has("grim", signal)) await run("grim", [out], signal);
     else return { error: "no screenshot tool — install scrot / imagemagick / grim" };
   } else if (process.platform === "win32") {
     const script = `Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bmp=New-Object System.Drawing.Bitmap($b.Width,$b.Height); $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bmp.Save(${JSON.stringify(out)})`;
-    if (!ps(script).ok) return { error: "PowerShell screenshot failed" };
+    if (!(await ps(script, signal)).ok) return { error: "PowerShell screenshot failed" };
   } else {
     return { error: `unsupported platform ${process.platform}` };
   }
@@ -129,18 +205,20 @@ function screenshot(): { path?: string; error?: string } {
 }
 
 /** Bring an app to the foreground so screenshots/clicks land on IT, not the terminal hara runs in. */
-function activateApp(app: string): { ok: boolean; msg: string } {
+async function activateApp(app: string, signal?: AbortSignal): Promise<{ ok: boolean; msg: string }> {
   if (process.platform === "darwin") {
     // `open -a` reliably launches+foregrounds; `osascript … activate` often leaves another window on top.
-    const r = run("open", ["-a", app]);
+    const r = await run("open", ["-a", app], signal);
     return { ok: r.ok, msg: r.ok ? `activated ${app}` : r.out || `couldn't activate ${app}` };
   }
   if (process.platform === "win32") {
-    const r = ps(`(New-Object -ComObject WScript.Shell).AppActivate(${JSON.stringify(app)})`);
+    const r = await ps(`(New-Object -ComObject WScript.Shell).AppActivate(${JSON.stringify(app)})`, signal);
     return { ok: r.ok, msg: r.ok ? `activated ${app}` : r.out || `couldn't activate ${app}` };
   }
   if (process.platform === "linux") {
-    const r = has("wmctrl") ? run("wmctrl", ["-a", app]) : run("xdotool", ["search", "--name", app, "windowactivate"]);
+    const r = await (await has("wmctrl", signal)
+      ? run("wmctrl", ["-a", app], signal)
+      : run("xdotool", ["search", "--name", app, "windowactivate"], signal));
     return { ok: r.ok, msg: r.ok ? `activated ${app}` : r.out || `couldn't activate ${app} (need wmctrl/xdotool)` };
   }
   return { ok: false, msg: `activate unsupported on ${process.platform}` };
@@ -148,17 +226,17 @@ function activateApp(app: string): { ok: boolean; msg: string } {
 
 /** Logical screen size in the coordinate space the click backends use (points on mac, pixels on win/linux).
  *  Grounding returns 0..1 fractions, so click = fraction × this. null if undetectable. */
-function screenSize(): { w: number; h: number } | null {
+async function screenSize(signal?: AbortSignal): Promise<{ w: number; h: number } | null> {
   try {
     if (process.platform === "darwin") {
-      const r = run("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
+      const r = await run("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop'], signal);
       const n = r.out.match(/-?\d+/g);
       if (n && n.length >= 4) return { w: Number(n[2]), h: Number(n[3]) };
     } else if (process.platform === "linux") {
-      const [w, h] = run("xdotool", ["getdisplaygeometry"]).out.trim().split(/\s+/).map(Number);
+      const [w, h] = (await run("xdotool", ["getdisplaygeometry"], signal)).out.trim().split(/\s+/).map(Number);
       if (w && h) return { w, h };
     } else if (process.platform === "win32") {
-      const [w, h] = ps('Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "$($b.Width) $($b.Height)"').out.trim().split(/\s+/).map(Number);
+      const [w, h] = (await ps('Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "$($b.Width) $($b.Height)"', signal)).out.trim().split(/\s+/).map(Number);
       if (w && h) return { w, h };
     }
   } catch {
@@ -168,26 +246,26 @@ function screenSize(): { w: number; h: number } | null {
 }
 
 /** Name of the frontmost application/window (for the allowlist check). "" if undetectable. */
-function frontmostApp(): string {
+async function frontmostApp(signal?: AbortSignal): Promise<string> {
   if (process.platform === "darwin") {
-    const r = run("osascript", ["-e", 'tell application "System Events" to get name of first application process whose frontmost is true']);
+    const r = await run("osascript", ["-e", 'tell application "System Events" to get name of first application process whose frontmost is true'], signal);
     return r.ok ? r.out : "";
   }
   if (process.platform === "linux") {
-    const r = run("xdotool", ["getactivewindow", "getwindowclassname"]);
+    const r = await run("xdotool", ["getactivewindow", "getwindowclassname"], signal);
     return r.ok ? r.out : "";
   }
   if (process.platform === "win32") {
     const script = `Add-Type @"
 using System;using System.Runtime.InteropServices;public class Hw{[DllImport("user32.dll")]public static extern IntPtr GetForegroundWindow();[DllImport("user32.dll")]public static extern int GetWindowThreadProcessId(IntPtr h,out int p);}
 "@; $p=0;[void][Hw]::GetWindowThreadProcessId([Hw]::GetForegroundWindow(),[ref]$p);(Get-Process -Id $p).ProcessName`;
-    const r = ps(script);
+    const r = await ps(script, signal);
     return r.ok ? r.out : "";
   }
   return "";
 }
 
-function pointerOrKeyboard(action: string, input: any): { ok: boolean; msg: string } {
+async function pointerOrKeyboard(action: string, input: any, signal?: AbortSignal): Promise<{ ok: boolean; msg: string }> {
   const x = Math.round(Number(input.x));
   const y = Math.round(Number(input.y));
   const mac = process.platform === "darwin";
@@ -197,22 +275,22 @@ function pointerOrKeyboard(action: string, input: any): { ok: boolean; msg: stri
   if (action === "click" || action === "move") {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false, msg: `${action} needs x,y` };
     if (mac) {
-      if (!has("cliclick")) return { ok: false, msg: "cliclick not found — install with `brew install cliclick`" };
-      const r = run("cliclick", [`${action === "click" ? "c" : "m"}:${x},${y}`]);
+      if (!(await has("cliclick", signal))) return { ok: false, msg: "cliclick not found — install with `brew install cliclick`" };
+      const r = await run("cliclick", [`${action === "click" ? "c" : "m"}:${x},${y}`], signal);
       return { ok: r.ok, msg: r.ok ? `${action} at ${x},${y}` : r.out };
     }
     if (lin) {
-      if (!has("xdotool")) return { ok: false, msg: "xdotool not found" };
-      const r = run("xdotool", action === "click" ? ["mousemove", `${x}`, `${y}`, "click", "1"] : ["mousemove", `${x}`, `${y}`]);
+      if (!(await has("xdotool", signal))) return { ok: false, msg: "xdotool not found" };
+      const r = await run("xdotool", action === "click" ? ["mousemove", `${x}`, `${y}`, "click", "1"] : ["mousemove", `${x}`, `${y}`], signal);
       return { ok: r.ok, msg: r.ok ? `${action} at ${x},${y}` : r.out };
     }
     if (win) {
       const move = `Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.Cursor]::Position=New-Object System.Drawing.Point(${x},${y})`;
-      const m1 = ps(`Add-Type -AssemblyName System.Drawing;${move}`);
+      const m1 = await ps(`Add-Type -AssemblyName System.Drawing;${move}`, signal);
       if (action === "click" && m1.ok) {
-        ps(`Add-Type @"
+        await ps(`Add-Type @"
 using System;using System.Runtime.InteropServices;public class Ms{[DllImport("user32.dll")]public static extern void mouse_event(int f,int x,int y,int d,int e);}
-"@; [Ms]::mouse_event(0x2,0,0,0,0);[Ms]::mouse_event(0x4,0,0,0,0)`);
+"@; [Ms]::mouse_event(0x2,0,0,0,0);[Ms]::mouse_event(0x4,0,0,0,0)`, signal);
       }
       return { ok: m1.ok, msg: m1.ok ? `${action} at ${x},${y}` : m1.out };
     }
@@ -222,31 +300,31 @@ using System;using System.Runtime.InteropServices;public class Ms{[DllImport("us
     if (!text) return { ok: false, msg: "type needs text" };
     // IME-safe path: set the clipboard and paste. Keystroke injection (below) is intercepted/garbled by a
     // CJK input method and can't enter Chinese/emoji reliably; pasting is immune and Unicode-safe.
-    if (setClipboard(text)) {
-      if (mac && has("cliclick")) {
-        const r = run("cliclick", ["kd:cmd", "t:v", "ku:cmd"]); // Cmd+V
+    if (await setClipboard(text, signal)) {
+      if (mac && await has("cliclick", signal)) {
+        const r = await run("cliclick", ["kd:cmd", "t:v", "ku:cmd"], signal); // Cmd+V
         if (r.ok) return { ok: true, msg: `pasted ${text.length} chars` };
-      } else if (lin && has("xdotool")) {
-        const r = run("xdotool", ["key", "ctrl+v"]);
+      } else if (lin && await has("xdotool", signal)) {
+        const r = await run("xdotool", ["key", "ctrl+v"], signal);
         if (r.ok) return { ok: true, msg: `pasted ${text.length} chars` };
       } else if (win) {
-        const r = ps("Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('^v')");
+        const r = await ps("Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait('^v')", signal);
         if (r.ok) return { ok: true, msg: `pasted ${text.length} chars` };
       }
     }
     // Fallback: keystroke injection (fine for ASCII when no IME is active).
     if (mac) {
-      if (!has("cliclick")) return { ok: false, msg: "cliclick not found — install with `brew install cliclick`" };
-      const r = run("cliclick", [`t:${text}`]);
+      if (!(await has("cliclick", signal))) return { ok: false, msg: "cliclick not found — install with `brew install cliclick`" };
+      const r = await run("cliclick", [`t:${text}`], signal);
       return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars (keystroke)` : r.out };
     }
     if (lin) {
-      if (!has("xdotool")) return { ok: false, msg: "xdotool not found" };
-      const r = run("xdotool", ["type", "--clearmodifiers", text]);
+      if (!(await has("xdotool", signal))) return { ok: false, msg: "xdotool not found" };
+      const r = await run("xdotool", ["type", "--clearmodifiers", text], signal);
       return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars (keystroke)` : r.out };
     }
     if (win) {
-      const r = ps(`Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait(${JSON.stringify(text)})`);
+      const r = await ps(`Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait(${JSON.stringify(text)})`, signal);
       return { ok: r.ok, msg: r.ok ? `typed ${text.length} chars (keystroke)` : r.out };
     }
   }
@@ -255,17 +333,17 @@ using System;using System.Runtime.InteropServices;public class Ms{[DllImport("us
     if (!keys) return { ok: false, msg: "key needs a key/combo" };
     if (keyIsBlocked(keys)) return { ok: false, msg: `refused dangerous key combo: ${keys}` };
     if (mac) {
-      if (!has("cliclick")) return { ok: false, msg: "cliclick not found — install with `brew install cliclick`" };
-      const r = run("cliclick", [`kp:${keys}`]);
+      if (!(await has("cliclick", signal))) return { ok: false, msg: "cliclick not found — install with `brew install cliclick`" };
+      const r = await run("cliclick", [`kp:${keys}`], signal);
       return { ok: r.ok, msg: r.ok ? `pressed ${keys}` : r.out };
     }
     if (lin) {
-      if (!has("xdotool")) return { ok: false, msg: "xdotool not found" };
-      const r = run("xdotool", ["key", keys]);
+      if (!(await has("xdotool", signal))) return { ok: false, msg: "xdotool not found" };
+      const r = await run("xdotool", ["key", keys], signal);
       return { ok: r.ok, msg: r.ok ? `pressed ${keys}` : r.out };
     }
     if (win) {
-      const r = ps(`Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait(${JSON.stringify(keys)})`);
+      const r = await ps(`Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait(${JSON.stringify(keys)})`, signal);
       return { ok: r.ok, msg: r.ok ? `pressed ${keys}` : r.out };
     }
   }
@@ -274,8 +352,8 @@ using System;using System.Runtime.InteropServices;public class Ms{[DllImport("us
 
 /** Per-OS backend availability — for `hara doctor`. */
 export function computerBackends(): string {
-  if (process.platform === "darwin") return `screencapture ✓ · cliclick ${has("cliclick") ? "✓" : "✗ (brew install cliclick)"}`;
-  if (process.platform === "linux") return `scrot ${has("scrot") ? "✓" : "✗"} · xdotool ${has("xdotool") ? "✓" : "✗"}`;
+  if (process.platform === "darwin") return `screencapture ✓ · cliclick ${hasProbeSync("cliclick") ? "✓" : "✗ (brew install cliclick)"}`;
+  if (process.platform === "linux") return `scrot ${hasProbeSync("scrot") ? "✓" : "✗"} · xdotool ${hasProbeSync("xdotool") ? "✓" : "✗"}`;
   if (process.platform === "win32") return "PowerShell (built-in)";
   return `unsupported (${process.platform})`;
 }
@@ -310,6 +388,7 @@ registerTool({
   },
   kind: "computer",
   async run(input, ctx) {
+    if (ctx.signal?.aborted) throw new ComputerInterruptedError();
     const cfg = loadConfig();
     const tier = cfg.computerUse as Tier;
     if (tier === "off") return "Screen control is off. Enable it: `hara config set computerUse read|click|full` (and `hara config set computerApps \"App Name, …\"` for the click/type allowlist).";
@@ -322,24 +401,24 @@ registerTool({
       if (!app) return "activate needs an `app` name (e.g. 'WeChat').";
       if (!cfg.computerApps.some((a) => a.toLowerCase() === app.toLowerCase()))
         return `Refused: "${app}" isn't in your allowlist (${cfg.computerApps.join(", ") || "empty"}). Add it: \`hara config set computerApps "${app}"\`.`;
-      const r = activateApp(app);
+      const r = await activateApp(app, ctx.signal);
       return r.ok ? ok(`✓ ${r.msg} — now screenshot/find/click to act on it`) : fail(r.msg);
     }
 
     if (action !== "screenshot" && action !== "find") {
       // per-app allowlist: only act when an allowlisted app is frontmost (the key guard against wrong-window clicks)
       if (!cfg.computerApps.length) return "No apps allowlisted — set `hara config set computerApps \"App Name, …\"` before clicking/typing.";
-      const app = frontmostApp();
+      const app = await frontmostApp(ctx.signal);
       const allowed = cfg.computerApps.some((a) => a.toLowerCase() === app.toLowerCase());
       if (!allowed) return `Refused: frontmost app "${app || "unknown"}" isn't in your allowlist (${cfg.computerApps.join(", ")}). Switch to an allowed app or update computerApps.`;
     }
 
     if (action === "screenshot") {
-      const s = screenshot();
+      const s = await screenshot(ctx.signal);
       if (s.error) return fail(`screenshot — ${s.error}`);
       if (ctx.describeImage) {
         try {
-          const desc = await ctx.describeImage(s.path!, input.focus ? String(input.focus) : undefined);
+          const desc = await ctx.describeImage(s.path!, input.focus ? String(input.focus) : undefined, ctx.signal);
           if (desc) return ok(`Screenshot (read via vision):\n${desc}`);
         } catch {
           /* fall through to path */
@@ -355,11 +434,11 @@ registerTool({
       const target = String(input.target ?? "");
       if (!target) return action === "find" ? "find needs a `target` (what to locate)." : "click/move needs `x,y` or a `target`.";
       if (!ctx.locate) return "Grounding needs a vision model that can see images — set one: `hara config set visionModel <model>`.";
-      const s = screenshot();
+      const s = await screenshot(ctx.signal);
       if (s.error) return fail(`screenshot — ${s.error}`);
-      const loc = await ctx.locate(s.path!, target);
+      const loc = await ctx.locate(s.path!, target, ctx.signal);
       if (!loc) return fail(`couldn't locate "${target}" on screen — try a screenshot first, or rephrase the target`);
-      const size = screenSize();
+      const size = await screenSize(ctx.signal);
       if (!size) return fail(`located "${target}" but couldn't read the screen size to convert coordinates`);
       const gx = Math.round(loc.x * size.w);
       const gy = Math.round(loc.y * size.h);
@@ -368,7 +447,7 @@ registerTool({
       input.y = gy;
     }
 
-    const r = pointerOrKeyboard(action, input);
+    const r = await pointerOrKeyboard(action, input, ctx.signal);
     return r.ok ? ok(`✓ ${r.msg}${needsLocate ? ` (located "${input.target}")` : ""}`) : fail(r.msg);
   },
 });

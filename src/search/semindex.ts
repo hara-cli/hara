@@ -7,10 +7,18 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join, isAbsolute, resolve } from "node:path";
 import { findProjectRoot } from "../context/agents-md.js";
-import { listProjectFiles, walkFiles } from "../fs-walk.js";
+import {
+  listProjectFiles,
+  listProjectFilesAsync,
+  walkFiles,
+  walkFilesAsync,
+  type FileWalkLimitReason,
+  type FileWalkOptions,
+} from "../fs-walk.js";
 import { zvecBuild, zvecQueryIds, zvecRemove } from "./zvec-store.js";
 import { isSensitiveFilePath } from "../security/sensitive-files.js";
 import { readModelContextFileSync } from "../fs-read.js";
+import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
 import {
   ensurePrivateStateSubdirectory,
   readPrivateStateFileSnapshot,
@@ -27,7 +35,7 @@ import {
 // Same code/text extensions codebase_search ranks lexically — keep the two walks in sync.
 const CODE_RE = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|c|h|cc|cpp|hpp|cs|swift|scala|sh|bash|sql|md|mdx|json|ya?ml|toml|html|css|scss|less|vue|svelte|astro|tf|proto|graphql|gql|gradle|txt)$/i;
 
-export type Embedder = (texts: string[]) => Promise<number[][]>;
+export type Embedder = (texts: string[], signal?: AbortSignal) => Promise<number[][]>;
 export interface Chunk {
   id: string;
   text: string;
@@ -99,6 +107,7 @@ async function ensurePrivateIndexState(name: string, cwd: string): Promise<Priva
 
 function existingPrivateIndexPath(name: string, cwd: string): string | null {
   try {
+    if (name === "repo" && isHomeWorkspace(cwd)) return null;
     const requested = indexPath(name, cwd);
     const base = realpathSync.native(indexBase(name, cwd));
     const hara = join(base, ".hara");
@@ -173,7 +182,9 @@ async function rotateLegacyIndex(name: string, cwd: string, state: PrivateIndexS
 /** Build/refresh the index. **Incremental**: files whose content hash is unchanged keep their existing
  *  vectors (no re-embed); only new/changed files are embedded, and deleted files drop out. A changed
  *  embedding model forces a full rebuild (old vectors aren't comparable). Returns counts. */
-export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder, cwd: string, model = "embed"): Promise<{ total: number; embedded: number; reused: number }> {
+export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder, cwd: string, model = "embed", signal?: AbortSignal): Promise<{ total: number; embedded: number; reused: number }> {
+  if (signal?.aborted) throw new Error("semantic index build interrupted");
+  if (name === "repo" && isHomeWorkspace(cwd)) throw new Error(homeWorkspaceActionError("build a repository index"));
   const state = await ensurePrivateIndexState(name, cwd);
   const p = state.path;
 
@@ -212,6 +223,7 @@ export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder,
   const toEmbed: Array<Chunk & { contentHash: string }> = [];
   let reused = 0;
   for (const [file, fchunks] of byFile) {
+    if (signal?.aborted) throw new Error("semantic index build interrupted");
     const currentHash = contentHash(fchunks);
     const prev = prevByFile.get(file);
     if (
@@ -228,12 +240,15 @@ export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder,
 
   const B = 64;
   for (let i = 0; i < toEmbed.length; i += B) {
+    if (signal?.aborted) throw new Error("semantic index build interrupted");
     const batch = toEmbed.slice(i, i + B);
-    const vecs = await embed(batch.map((c) => c.text));
+    const vecs = await embed(batch.map((c) => c.text), signal);
+    if (signal?.aborted) throw new Error("semantic index build interrupted");
     batch.forEach((c, j) => vecs[j] && items.push({ ...c, vec: vecs[j] }));
   }
 
   // The index is derived + rebuildable (and may embed file contents) — never let it be committed.
+  if (signal?.aborted) throw new Error("semantic index build interrupted");
   if (!state.ignoreSnapshot || state.ignoreSnapshot.text !== "*\n") {
     await atomicWriteText(state.ignoreBoundary.target, "*\n", {
       expected: state.ignoreSnapshot?.text ?? null,
@@ -286,6 +301,7 @@ export function collectDirChunks(dir: string, source: string): Chunk[] {
 
 /** Walk the repo (respecting .gitignore) and chunk every code/text file — the corpus `hara index` embeds. */
 export function collectRepoChunks(root: string): Chunk[] {
+  if (isHomeWorkspace(root)) throw new Error(homeWorkspaceActionError("scan the home directory for a repository index"));
   const chunks: Chunk[] = [];
   for (const rel of listProjectFiles(root)) {
     if (!CODE_RE.test(rel) || looksSecret(rel)) continue;
@@ -301,8 +317,97 @@ export function collectRepoChunks(root: string): Chunk[] {
   return chunks;
 }
 
+export interface ChunkCollectionResult {
+  chunks: Chunk[];
+  truncated: boolean;
+  reason?: FileWalkLimitReason;
+}
+
+async function chunksFromInventory(
+  root: string,
+  files: string[],
+  source: string,
+  absolutePaths: boolean,
+  startedAt: number,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<ChunkCollectionResult> {
+  const chunks: Chunk[] = [];
+  let fileIndex = 0;
+  for (const rel of files) {
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("index collection cancelled");
+    if (Date.now() - startedAt >= timeoutMs) return { chunks, truncated: true, reason: "time_limit" };
+    if (fileIndex++ > 0 && fileIndex % 32 === 0) {
+      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+      if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("index collection cancelled");
+    }
+    if (!CODE_RE.test(rel) || looksSecret(rel)) continue;
+    const abs = join(root, rel);
+    let text: string;
+    try {
+      text = readModelContextFileSync(abs, 200_000);
+    } catch {
+      continue;
+    }
+    chunks.push(...chunkText(text, absolutePaths ? abs : rel, source, statMtime(abs)));
+  }
+  return { chunks, truncated: false };
+}
+
+/** Interruptible knowledge-directory collection for the explicit index command and background callers. */
+export async function collectDirChunksAsync(
+  dir: string,
+  source: string,
+  options: FileWalkOptions = {},
+): Promise<ChunkCollectionResult> {
+  if (!existsSync(dir)) return { chunks: [], truncated: false };
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, Math.floor(options.timeoutMs!)) : 30_000;
+  const startedAt = Date.now();
+  const inventory = await walkFilesAsync(dir, { ...options, timeoutMs });
+  const collected = await chunksFromInventory(
+    dir,
+    inventory.files,
+    source,
+    true,
+    startedAt,
+    timeoutMs,
+    options.signal,
+  );
+  return collected.truncated ? collected : {
+    chunks: collected.chunks,
+    truncated: inventory.truncated,
+    reason: inventory.reason,
+  };
+}
+
+/** Interruptible repository collection. Git discovery and file reads share one total wall budget. */
+export async function collectRepoChunksAsync(
+  root: string,
+  options: FileWalkOptions = {},
+): Promise<ChunkCollectionResult> {
+  if (isHomeWorkspace(root)) throw new Error(homeWorkspaceActionError("scan the home directory for a repository index"));
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, Math.floor(options.timeoutMs!)) : 30_000;
+  const startedAt = Date.now();
+  const inventory = await listProjectFilesAsync(root, { ...options, timeoutMs });
+  const collected = await chunksFromInventory(
+    root,
+    inventory.files,
+    "repo",
+    false,
+    startedAt,
+    timeoutMs,
+    options.signal,
+  );
+  return collected.truncated ? collected : {
+    chunks: collected.chunks,
+    truncated: inventory.truncated,
+    reason: inventory.reason,
+  };
+}
+
 /** Cosine-rank the index against the query embedding. Returns top-k hits (empty if no index). */
-export async function queryIndex(name: string, query: string, embed: Embedder, cwd: string, k = 6): Promise<SemHit[]> {
+export async function queryIndex(name: string, query: string, embed: Embedder, cwd: string, k = 6, signal?: AbortSignal): Promise<SemHit[]> {
+  if (signal?.aborted) throw new Error("semantic query interrupted");
   if (!existingPrivateIndexPath(name, cwd)) return [];
   let state: PrivateIndexState;
   try {
@@ -331,7 +436,8 @@ export async function queryIndex(name: string, query: string, embed: Embedder, c
     return !looksSecret(item.file) && !isSensitiveFilePath(path);
   });
   if (!safeItems.length) return [];
-  const [qv] = await embed([query]);
+  const [qv] = await embed([query], signal);
+  if (signal?.aborted) throw new Error("semantic query interrupted");
   if (!qv) return [];
 
   // A format marker proves which writer created the cache, not that its source still has the same bytes.
@@ -360,6 +466,7 @@ export async function queryIndex(name: string, query: string, embed: Embedder, c
       .sort((a, b) => b.score - a.score);
     const hits: SemHit[] = [];
     for (const { item, score } of ranked) {
+      if (signal?.aborted) break;
       if (!isFresh(item)) continue;
       hits.push({ file: item.file, source: item.source, text: item.text, score });
       if (hits.length >= k) break;
@@ -370,7 +477,9 @@ export async function queryIndex(name: string, query: string, embed: Embedder, c
   // Prefer the zvec ANN index for candidate retrieval; re-rank candidates by EXACT cosine from the JSON
   // store (identical score semantics to the brute-force path). Fall back to full brute-force if zvec is
   // unavailable / has no index / errors.
+  if (signal?.aborted) throw new Error("semantic query interrupted");
   const ids = await zvecQueryIds(name, qv, cwd, k);
+  if (signal?.aborted) throw new Error("semantic query interrupted");
   if (ids?.length) {
     const byId = new Map(safeItems.map((it) => [it.id, it]));
     const candidates = ids

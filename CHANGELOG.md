@@ -5,6 +5,104 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.122.4 — 2026-07-14 — bounded agent lifecycle and chat delivery hardening
+
+- **An active agent can no longer renew itself forever.** Every CLI, headless, org, and Desktop/serve turn
+  now has a 30-minute total wall-clock deadline and a 64 model/tool-round ceiling, independent of streaming
+  activity and per-tool timeouts. A visible warning fires after five minutes or at 75% of the round budget;
+  reaching either hard boundary returns an actionable `halted` outcome to the terminal, Desktop protocol, or
+  gateway reply. `runTimeoutMs` (friendly `30m`/`90s` values; hard max 2h) and `maxAgentRounds` (hard max 256)
+  can raise/lower the bounds but cannot disable them.
+- **Repeated failures now trip a real circuit-breaker.** The third identical failing tool call closes its
+  protocol round and stops the run instead of merely asking the model not to repeat itself. A final round cap
+  still catches alternating or superficially changing loops.
+- **Cancellation reaches owned work.** Tools receive the combined user/deadline signal; foreground shell and
+  external-agent process trees terminate on it, and read-only sub-agents inherit the parent's cancellation
+  with tighter 8-minute/24-round limits. Providers/tools that ignore `AbortSignal` are raced at the core, so
+  Hara itself still settles on time and never executes a late next tool call. File, memory, skill, and gateway
+  outbox writes re-check cancellation immediately before commit, while session ownership remains held until an
+  uncooperative tool physically settles, preventing a timed-out write from racing the next turn.
+- **One-shot model helpers are hard-bounded too.** Setup checks, role routing, plan decomposition and
+  verification, commit-message generation, session naming, conversation compaction, vision analysis, and the
+  security guardian now combine cooperative abort with a hard Promise deadline. A custom provider that ignores
+  cancellation can no longer strand the CLI before or after the main agent loop.
+- **Cron can no longer hold its global tick lock forever.** Scheduled jobs keep their 30-minute per-job
+  deadline and the whole tick now has a non-renewable 60-minute wall-clock watchdog. Timeout cancellation
+  force-stops the owned process tree, always releases the tick lock, records `running`/`timed_out`, duration and
+  last error durably, counts timeouts toward `alertAfter`, and lets later due jobs run after an individual job
+  timeout (a total-tick timeout stops the remainder). `HARA_CRON_JOB_TIMEOUT_MS` and
+  `HARA_CRON_TICK_TIMEOUT_MS` tune the millisecond bounds, with hard maxima of 24 hours and 5 hours; a scheduled
+  job is additionally capped by its tick. `hara cron list` now makes active and timed-out work explicit.
+- **Cron timeout notifications survive transport outages and restarts.** Each outcome/threshold alarm is
+  committed with terminal state before delivery, keeps one stable idempotency key across bounded per-tick
+  retries, and is removed (with alert cooldown recorded) only after confirmed transport success. Each job's
+  queue is capped at 64: launches reserve room for outcome + alert, disable before overflow, and recovery may
+  compact only an old outcome while marking that loss explicitly; jobs.json also has schema/count/byte limits.
+  Configure the failure threshold with `--alert-after 1..1000` or the cron tool's `alertAfter` field.
+- **Cron recovery no longer mistakes PID reuse for a live owner forever.** The tick and synchronous jobs-store
+  locks use Linux/macOS process-birth identity; store commits additionally use a conservative renewable lease,
+  snapshot CAS, and a token fence.
+  Unknown identity formats and live legacy identity-less commit guards fail closed instead of being age-stolen.
+  A `running` record beyond the 24-hour hard job maximum plus grace is marked interrupted and disabled even if
+  its PID is alive. Recovery never kills or replays the possibly orphaned task; it persists the failure
+  notification for operator verification. Manual runs also refuse every unresolved `running` marker; if its
+  parent is dead, Hara records an interrupted/disabled state and requires operator inspection before retrying.
+- **Creation-minute cron jobs now use an explicit one-shot due marker.** A job added just after that minute's
+  OS tick runs once on the next tick, while disabling it clears the marker so a later enable cannot replay a
+  days- or months-old occurrence. Absolute one-shot schedules already in the past are rejected instead of being
+  displayed forever as a misleading next run.
+- **`hara resume <id>` now re-enters the correct runtime without blocking terminal input.** The launcher uses
+  the same runtime-aware self command as cron/gateway and waits asynchronously with inherited stdio: npm/Node
+  keeps its script entry, while a Bun-compiled standalone re-executes only the binary instead of treating its
+  virtual/user `argv[1]` as JavaScript. This removes the standalone resume hang/high-CPU/dead-input failure.
+- **The home directory is no longer an implicit repository.** Canonical/real-path checks suppress first-run
+  AGENTS generation and reject `hara init`, repo indexing, codebase search, and recursive grep/glob/inventory at
+  the Home root (including symlink aliases). Hara shows a `cd /path/to/project` hint; non-recursive `ls`, explicit
+  file reads, and explicitly selected child directories remain usable.
+- **Recursive project discovery is streaming and interruptible.** Glob/grep fallback, codebase search, semantic
+  indexing, recall, Desktop file lookup, did-you-mean, and `@dir` expansion share file, directory, Dirent, and
+  wall-clock bounds from the start of discovery. Cached empty-directory forests and a single extremely wide
+  directory can no longer block the event loop past the agent deadline; truncated indexes are never published.
+- **Windows shell and portable-home discovery are deterministic.** Hara probes the conventional Git Bash
+  installation paths before falling back to `cmd.exe`, understands MSYS drive paths and UNC paths, and honors an
+  explicit `HOME` ahead of `USERPROFILE` so portable/Git-Bash sessions do not silently load another profile.
+
+- **Long chat replies now split on natural line/word boundaries without tearing Unicode.** Feishu and
+  Telegram bubbles preserve the exact reply while keeping emoji ZWJ sequences, flags, combining marks, CRLF,
+  and surrogate pairs intact whenever the platform limit permits.
+- **Only one Hara gateway process may own a configured bot connection at a time.** A credential-scoped,
+  crash-safe private lease refuses a second live Feishu/Telegram/etc. connection and reclaims only a
+  proven-dead owner, preventing multiple WebSockets from replying to the same event.
+- **Stable inbound message ids are deduplicated across restarts.** Successfully handled Feishu and Telegram
+  ids are persisted for one hour in a byte- and count-bounded owner-only store; failures remain retryable,
+  concurrent duplicates and startup replays older than 30 seconds are ignored, and different bot credentials
+  use isolated stores. State contains ids/timestamps and a one-way connection namespace only—never message
+  text, user data, or credentials.
+- **Outbound chat transport is bounded and ordered across adapter instances.** Telegram and Feishu text/file
+  requests use real `AbortSignal` cancellation plus a hard 30s/120s ceiling; a credential-scoped, process-wide
+  per-chat lane prevents long multipart replies from interleaving with one-shot or flow delivery. A failed or
+  timed-out call settles for its caller without freezing shutdown or the inbound retry claim; an ambiguous
+  underlying transfer remains quarantined in that live process's lane until it actually settles.
+- **Flow side effects resume from durable receipts.** Each reply, notification target, and pending approval has
+  a stable, credential-scoped receipt. Redelivery skips locally completed receipts, pending actions reuse their
+  stable opaque id, and idempotency keys are forwarded where supported. A crash after remote acceptance but
+  before the local receipt commit can still cause at-least-once delivery on transports without server-side
+  deduplication. No-tool model decisions, bounded failure attempts, and partial target/chunk progress also
+  survive restarts, so a retry cannot mix a newly generated answer into an older partially delivered flow.
+- **Stable-id gateway events do not re-execute coding or stateful commands on delivery retry.** A private
+  started marker is durable before coding, tmux injection, `/new`, `/voice`, `/say`, or `/send`; completed
+  reply/file/default-voice bytes are durable before transport. Default voice retries therefore reuse the same
+  synthesized bytes instead of rerunning coding or TTS. Speech now has a 60-second default/120-second hard
+  deadline, propagates shutdown cancellation to remote requests, and terminates the full local
+  `say`/custom-command process tree.
+- **Interrupted gateway outcome markers have an explicit fail-closed recovery path.** A credential-scoped,
+  single-instance `hara gateway --recover-outcome ... --confirm-recovery terminalize:<id>` command releases one
+  abandoned active slot without rerunning its side effect; a separate exact confirmation can later delete only
+  an already-terminal tombstone. Running or unacknowledged completed records cannot be silently erased.
+- Feishu outbound REST now uses native abortable requests with an in-memory, early-refresh tenant-token cache;
+  the official SDK remains responsible for the inbound WebSocket/resource surface. Hara resolves mentions
+  from event metadata and drains tracked callbacks before releasing the single-instance lease on shutdown.
+
 ## 0.122.3 — 2026-07-14 — standalone runtime recovery
 
 - **Bun-compiled standalone binaries no longer assume `SharedArrayBuffer` exists at module startup.**

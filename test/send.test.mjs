@@ -8,6 +8,10 @@ import { join } from "node:path";
 process.env.HARA_GATEWAY = "test";
 const dir = mkdtempSync(join(tmpdir(), "hara-send-"));
 const outbox = join(dir, "outbox.txt");
+// send_file is an explicit-path delivery action, not a project-recursive executable. Keep the whole suite at
+// canonical Home so a future `kind:"exec"` blanket guard cannot accidentally disable it again.
+process.env.HOME = dir;
+process.env.USERPROFILE = dir;
 process.env.HARA_GATEWAY_OUTBOX = outbox;
 
 const { getTool } = await import("../dist/tools/registry.js");
@@ -162,6 +166,27 @@ test("send_file: parallel admissions cannot race past the batch budget", async (
   const payloads = await consumeOutboundSnapshots(outbox);
   assert.equal(payloads.length, OUTBOUND_BATCH_MAX_FILES);
   for (const payload of payloads) cleanupOutboundSnapshot(payload.snapshotPath);
+  cleanupOutboundSnapshots(outbox);
+});
+
+test("send_file: cancellation while queued cannot publish a later snapshot or outbox entry", async () => {
+  cleanupOutboundSnapshots(outbox);
+  const firstPath = join(dir, "cancel-queue-first.txt");
+  const cancelledPath = join(dir, "cancel-queue-late.txt");
+  writeFileSync(firstPath, "first");
+  writeFileSync(cancelledPath, "must not queue");
+  const tool = getTool("send_file");
+  const first = tool.run({ path: firstPath }, { cwd: dir });
+  const controller = new AbortController();
+  const cancelled = tool.run({ path: cancelledPath }, { cwd: dir, signal: controller.signal });
+  controller.abort();
+
+  assert.match(await first, /Queued/);
+  assert.match(await cancelled, /cancelled before commit/i);
+  const payloads = await consumeOutboundSnapshots(outbox);
+  assert.equal(payloads.length, 1);
+  assert.equal(payloads[0].bytes.toString(), "first");
+  cleanupOutboundSnapshot(payloads[0].snapshotPath);
   cleanupOutboundSnapshots(outbox);
 });
 

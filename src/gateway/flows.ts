@@ -7,12 +7,14 @@
 // Platform-agnostic: matching only reads the generic InboundMsg fields each adapter populates (chatType,
 // mentions), so a flow works on whatever platform surfaces the data it asks for.
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { InboundMsg } from "./telegram.js";
+import { chunkText, type InboundMsg } from "./telegram.js";
 import { deliverResult, parseDeliver } from "../cron/deliver.js";
 import { addPending } from "./flows-pending.js";
 import { redactSensitiveValue } from "../security/secrets.js";
+import type { GatewayFlowRunClaim, GatewayFlowRunStore, GatewayMessageDeduper } from "./runtime-state.js";
 
 export interface FlowRule {
   name: string;
@@ -44,6 +46,110 @@ export interface FlowRule {
 }
 
 const asArray = (v?: string | string[]): string[] => (v == null ? [] : Array.isArray(v) ? v : [v]);
+
+function deliveryLabel(spec: string): string {
+  const parsed = parseDeliver(spec);
+  return "error" in parsed ? "invalid-target" : parsed.platform;
+}
+
+export interface FlowEffectContext {
+  /** Already credential-hashed gateway runtime namespace. It is hashed again into opaque effect keys. */
+  scope: string;
+  /** Persistent bounded claim store dedicated to successful external flow effects. */
+  receipts: GatewayMessageDeduper;
+  /** Persistent no-tool model decisions and source/rule failure budgets. */
+  runs?: GatewayFlowRunStore;
+}
+
+function hashFlowKey(...parts: unknown[]): string {
+  const hash = createHash("sha256");
+  for (const part of parts) {
+    const value = String(part ?? "");
+    hash.update(String(Buffer.byteLength(value, "utf8"))).update(":").update(value).update(";");
+  }
+  return hash.digest("hex");
+}
+
+function canonicalFlowValue(value: unknown, depth = 0): string {
+  if (depth > 64) return '"<depth-limit>"';
+  if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalFlowValue(item, depth + 1)).join(",")}]`;
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalFlowValue(record[key], depth + 1)}`).join(",")}}`;
+  }
+  return '"<unsupported>"';
+}
+
+/** Stable only when the adapter provides a true platform event id. Falling back to message text/time could
+ * suppress two legitimate identical messages, so adapters without ids retain at-least-once behavior. */
+export function flowSourceKey(
+  context: Pick<FlowEffectContext, "scope"> | undefined,
+  platform: string,
+  messageId: string | undefined,
+): string | undefined {
+  const id = messageId?.trim();
+  return context && id ? hashFlowKey("hara-flow-source-v1", context.scope, platform, id) : undefined;
+}
+
+async function runFlowEffect(
+  receipts: GatewayMessageDeduper | undefined,
+  key: string | undefined,
+  effect: () => Promise<void>,
+): Promise<void> {
+  if (!receipts || !key) return effect();
+  const claim = await receipts.claim(key);
+  if (!claim) return; // already completed in this process or before a restart
+  try {
+    await effect();
+    await claim.complete();
+  } catch (error) {
+    // Releasing a receipt is cleanup. A store I/O failure must not hide the transport/model error that made
+    // this source event retry in the first place.
+    try {
+      await claim.release();
+    } catch {
+      /* best-effort; the bounded in-flight lease can be reclaimed after restart */
+    }
+    throw error;
+  }
+}
+
+/** Persist each chat-sized piece separately. A later piece can fail without making a retry resend pieces whose
+ * external send and local receipt both completed. Including a hash of content avoids joining a changed model
+ * answer to receipts from an older answer, while the persisted key remains opaque. */
+async function runFlowTextEffect(
+  receipts: GatewayMessageDeduper | undefined,
+  key: string | undefined,
+  text: string,
+  effect: (part: string, idempotencyKey: string | undefined) => Promise<void>,
+): Promise<void> {
+  for (const [index, part] of chunkText(text || "(empty)", 3_500).entries()) {
+    const partKey = key ? hashFlowKey("hara-flow-effect-part-v1", key, index, part) : undefined;
+    await runFlowEffect(receipts, partKey, () => effect(part, partKey));
+  }
+}
+
+async function runFlowDeliveryEffect(
+  receipts: GatewayMessageDeduper | undefined,
+  key: string | undefined,
+  spec: string,
+  text: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const target = parseDeliver(spec);
+  const deliver = async (part: string, idempotencyKey?: string): Promise<void> => {
+    const error = await deliverResult(spec, part, signal, idempotencyKey);
+    if (error) throw new Error(`deliver(${deliveryLabel(spec)}) failed — ${error}`);
+  };
+  if (!("error" in target) && target.platform !== "webhook") {
+    await runFlowTextEffect(receipts, key, text, deliver);
+  } else {
+    await runFlowEffect(receipts, key, () => deliver(text, key));
+  }
+}
 
 function isStrings(value: unknown): value is string | string[] {
   return typeof value === "string" || (Array.isArray(value) && value.every((item) => typeof item === "string"));
@@ -154,6 +260,18 @@ const MAX_SENDER_RATE_BUCKETS = 1_024;
 const MAX_CHAT_RATE_BUCKETS = 1_024;
 const MAX_RATE_KEY_PART_CHARS = 160;
 const RATE_SWEEP_INTERVAL = 64;
+const FLOW_SOURCE_RETRY_TTL_MS = 60 * 60_000;
+const MAX_FLOW_SOURCE_RETRIES = 4_096;
+const MAX_FLOW_SOURCE_ATTEMPTS = 3;
+const FLOW_RETRY_BASE_DELAY_MS = 2_000;
+interface FlowSourceRetryState {
+  attempts: number;
+  /** Absolute lifetime: repeated failures cannot keep a poison event alive by refreshing its TTL. */
+  expiresAt: number;
+  nextAttemptAt: number;
+  alarmed: boolean;
+}
+const admittedFlowSources = new Map<string, FlowSourceRetryState>();
 let claimsUntilRateSweep = RATE_SWEEP_INTERVAL;
 
 function boundedRateKey(...parts: unknown[]): string {
@@ -219,18 +337,99 @@ export function resetFlowRateStateForTests(): void {
   chatFlowRate.clear();
   globalFlowRate = [];
   activeFlowRuns = 0;
+  admittedFlowSources.clear();
   claimsUntilRateSweep = RATE_SWEEP_INTERVAL;
 }
 
-function claimFlowRun(rule: FlowRule, m: InboundMsg, platform: string): boolean {
+interface FlowRunAdmission {
+  claimed: boolean;
+  /** This exact stable source/rule was admitted before, so dropping it now would lose a retry. */
+  retry: boolean;
+  /** The same source/rule already consumed its bounded attempts and must now be acknowledged. */
+  exhausted?: boolean;
+  /** A retry exists but its exponential backoff has not elapsed yet. */
+  retryAfterMs?: number;
+  /** Emit the high-signal exhaustion alarm only once while other matching rules finish. */
+  alarm?: boolean;
+}
+
+function flowRetryState(sourceRunKey: string | undefined, now: number): FlowSourceRetryState | undefined {
+  if (!sourceRunKey) return undefined;
+  const state = admittedFlowSources.get(sourceRunKey);
+  if (!state) return undefined;
+  if (now >= state.expiresAt) {
+    admittedFlowSources.delete(sourceRunKey);
+    return undefined;
+  }
+  admittedFlowSources.delete(sourceRunKey);
+  admittedFlowSources.set(sourceRunKey, state); // bounded LRU refresh; expiry deliberately stays fixed
+  return state;
+}
+
+function rememberFlowSource(sourceRunKey: string | undefined, now: number): void {
+  if (!sourceRunKey) return;
+  for (const [key, state] of admittedFlowSources) {
+    if (now >= state.expiresAt) admittedFlowSources.delete(key);
+  }
+  while (admittedFlowSources.size >= MAX_FLOW_SOURCE_RETRIES) {
+    const oldest = admittedFlowSources.keys().next().value as string | undefined;
+    if (!oldest) break;
+    admittedFlowSources.delete(oldest);
+  }
+  admittedFlowSources.set(sourceRunKey, {
+    attempts: 1,
+    expiresAt: now + FLOW_SOURCE_RETRY_TTL_MS,
+    nextAttemptAt: now,
+    alarmed: false,
+  });
+}
+
+function markFlowRunFailed(sourceRunKey: string | undefined, now: number): void {
+  if (!sourceRunKey) return;
+  const state = admittedFlowSources.get(sourceRunKey);
+  if (!state) return;
+  const exponent = Math.max(0, state.attempts - 1);
+  state.nextAttemptAt = now + Math.min(30_000, FLOW_RETRY_BASE_DELAY_MS * (2 ** exponent));
+}
+
+function forgetFlowSource(sourceRunKey: string | undefined): void {
+  if (sourceRunKey) admittedFlowSources.delete(sourceRunKey);
+}
+
+function claimFlowRun(
+  rule: FlowRule,
+  m: InboundMsg,
+  platform: string,
+  sourceRunKey?: string,
+  durableRetry?: boolean,
+): FlowRunAdmission {
   const now = Date.now();
+  const retryState = durableRetry === undefined ? flowRetryState(sourceRunKey, now) : undefined;
+  const retry = durableRetry ?? (retryState !== undefined);
   if (--claimsUntilRateSweep <= 0) {
     sweepRateMap(senderFlowRate, now, RATE_MINUTE_MS, MAX_SENDER_RUNS_PER_MINUTE);
     sweepRateMap(chatFlowRate, now, RATE_HOUR_MS, MAX_CHAT_RUNS_PER_HOUR);
     claimsUntilRateSweep = RATE_SWEEP_INTERVAL;
   }
   globalFlowRate = pruneRateTimes(globalFlowRate, now, RATE_HOUR_MS, MAX_GLOBAL_RUNS_PER_HOUR);
-  if (activeFlowRuns >= MAX_ACTIVE_FLOW_RUNS) return false;
+  if (activeFlowRuns >= MAX_ACTIVE_FLOW_RUNS) return { claimed: false, retry };
+  if (retryState) {
+    if (retryState.attempts >= MAX_FLOW_SOURCE_ATTEMPTS) {
+      const alarm = !retryState.alarmed;
+      retryState.alarmed = true;
+      return { claimed: false, retry: true, exhausted: true, alarm };
+    }
+    if (now < retryState.nextAttemptAt) {
+      return { claimed: false, retry: true, retryAfterMs: retryState.nextAttemptAt - now };
+    }
+    retryState.attempts++;
+    activeFlowRuns++;
+    return { claimed: true, retry: true };
+  }
+  if (durableRetry) {
+    activeFlowRuns++;
+    return { claimed: true, retry: true };
+  }
 
   const senderKey = boundedRateKey(rule.name, platform, m.chatId, m.userId);
   const chatKey = boundedRateKey(rule.name, platform, m.chatId);
@@ -245,7 +444,7 @@ function claimFlowRun(rule: FlowRule, m: InboundMsg, platform: string): boolean 
   const chatHour = prepareRateBucket(chatFlowRate, chatKey, now, RATE_HOUR_MS, MAX_CHAT_RATE_BUCKETS, MAX_CHAT_RUNS_PER_HOUR);
   // A full identity table is itself an abuse signal. Reject new identities instead of evicting a live
   // bucket and letting an attacker cycle through unbounded sender/chat ids.
-  if (!senderMinute || !chatHour) return false;
+  if (!senderMinute || !chatHour) return { claimed: false, retry: false };
   if (
     senderMinute.length >= MAX_SENDER_RUNS_PER_MINUTE ||
     countRateTimes(chatHour, now, RATE_MINUTE_MS) >= MAX_CHAT_RUNS_PER_MINUTE ||
@@ -253,7 +452,7 @@ function claimFlowRun(rule: FlowRule, m: InboundMsg, platform: string): boolean 
     countRateTimes(globalFlowRate, now, RATE_MINUTE_MS) >= MAX_GLOBAL_RUNS_PER_MINUTE ||
     globalFlowRate.length >= MAX_GLOBAL_RUNS_PER_HOUR
   ) {
-    return false;
+    return { claimed: false, retry: false };
   }
 
   senderMinute.push(now);
@@ -261,8 +460,25 @@ function claimFlowRun(rule: FlowRule, m: InboundMsg, platform: string): boolean 
   globalFlowRate.push(now);
   senderFlowRate.set(senderKey, senderMinute);
   chatFlowRate.set(chatKey, chatHour);
+  if (durableRetry === undefined) rememberFlowSource(sourceRunKey, now);
   activeFlowRuns++;
-  return true;
+  return { claimed: true, retry: false };
+}
+
+async function reportFlowRetryExhausted(rule: FlowRule, markAlarmed?: () => Promise<void>): Promise<void> {
+  console.error(
+    `hara flow: ALERT "${rule.name}" stopped after ${MAX_FLOW_SOURCE_ATTEMPTS} failed attempts for one source event — acknowledged to break the retry loop`,
+  );
+  appendFlowLog({
+    flow: rule.name,
+    event: "retry-exhausted",
+    severity: "error",
+    attempts: MAX_FLOW_SOURCE_ATTEMPTS,
+    outcome: "source-event-acknowledged",
+  });
+  // Mark only after both operator-visible records were emitted. A crash may duplicate an alarm, but can never
+  // make an exhausted poison event disappear silently.
+  await markAlarmed?.();
 }
 
 /** Extract the flow agent's structured result — {disposition,briefing,draft,dispatch?} — from its text
@@ -330,7 +546,7 @@ export function buildFlowPrompt(r: FlowRule, m: InboundMsg): string {
 }
 
 /** Try to handle `m` via configured flows. Returns true if ≥1 rule matched (caller should STOP default routing).
- *  The agent run + delivery are fire-and-forget so a slow LLM call never blocks the gateway's event loop.
+ *  All claimed runs settle before this resolves, so the gateway can bind delivery success to its inbound claim.
  *  `runAgent` must be the gateway's isolated no-tool provider path; `reply` (optional) sends text back to the
  *  originating chat. `approvalOwner` is a concrete platform:user identity; without one, consequential actions
  *  fail closed instead of becoming approvable by an arbitrary allowlisted DM. */
@@ -338,23 +554,73 @@ export async function dispatchFlows(
   m: InboundMsg,
   platform: string,
   runAgent: (prompt: string, cwd?: string, schema?: object, signal?: AbortSignal) => Promise<string>,
-  reply?: (text: string) => Promise<void>,
+  reply?: (text: string, idempotencyKey?: string) => Promise<void>,
   approvalOwner?: string,
   signal?: AbortSignal,
+  effects?: FlowEffectContext,
 ): Promise<boolean> {
-  const matched = loadFlows().filter((r) => matchFlow(r, m, platform)).slice(0, 4);
+  const flowOccurrences = new Map<string, number>();
+  const matched = loadFlows()
+    .map((rule) => {
+      const baseIdentity = hashFlowKey("hara-flow-rule-v1", canonicalFlowValue(rule));
+      const occurrence = flowOccurrences.get(baseIdentity) ?? 0;
+      flowOccurrences.set(baseIdentity, occurrence + 1);
+      return { rule, flowIdentity: hashFlowKey(baseIdentity, occurrence) };
+    })
+    .filter(({ rule }) => matchFlow(rule, m, platform))
+    .slice(0, 4);
   if (!matched.length) return false;
   if (signal?.aborted) return true;
-  for (const r of matched) {
+  const sourceKey = flowSourceKey(effects, platform, m.messageId);
+  const jobs: Promise<void>[] = [];
+  let deferredRetry = false;
+  for (const { rule: r, flowIdentity } of matched) {
     console.error(`hara flow: "${r.name}" matched · ${platform} ${m.chatType ?? "?"} ${m.chatId}`);
-    if (!claimFlowRun(r, m, platform)) {
-      console.error(`hara flow: "${r.name}" rate/concurrency limit reached — trigger dropped`);
+    const sourceRunKey = sourceKey ? hashFlowKey("hara-flow-run-v1", sourceKey, flowIdentity) : undefined;
+    let durableClaim: GatewayFlowRunClaim | undefined;
+    if (sourceRunKey && sourceKey && effects?.runs) {
+      const durableAdmission = await effects.runs.claim(sourceRunKey, sourceKey);
+      if (durableAdmission.kind === "complete") continue;
+      if (durableAdmission.kind === "exhausted") {
+        if (durableAdmission.alarm) {
+          await reportFlowRetryExhausted(r, () => effects.runs!.markAlarmed(sourceRunKey));
+        }
+        continue;
+      }
+      if (durableAdmission.kind === "backoff") {
+        console.error(`hara flow: "${r.name}" retry deferred — backoff has ${Math.ceil(durableAdmission.retryAfterMs / 1_000)}s left`);
+        deferredRetry = true;
+        continue;
+      }
+      durableClaim = durableAdmission.claim;
+    }
+    const admission = claimFlowRun(r, m, platform, sourceRunKey, durableClaim?.retry);
+    if (!admission.claimed) {
+      await durableClaim?.release();
+      if (admission.exhausted) {
+        if (admission.alarm) await reportFlowRetryExhausted(r);
+      } else if (admission.retry) {
+        const wait = admission.retryAfterMs === undefined ? "capacity is full" : `backoff has ${Math.ceil(admission.retryAfterMs / 1_000)}s left`;
+        console.error(`hara flow: "${r.name}" retry deferred — ${wait}`);
+        deferredRetry = true;
+      } else {
+        console.error(`hara flow: "${r.name}" rate/concurrency limit reached — trigger dropped`);
+      }
       continue;
     }
     const home = r.cwd ? (r.cwd === "~" ? homedir() : r.cwd.replace(/^~\//, homedir() + "/")) : undefined;
-    void (async () => {
+    jobs.push((async () => {
+      let failed = false;
+      let durableSettled = false;
       try {
-        const output = (await runAgent(buildFlowPrompt(r, m), home, r.schema, signal)).trim();
+        const effectKey = (stage: string, target = "", targetIndex = 0): string | undefined => sourceKey
+          ? hashFlowKey("hara-flow-effect-v1", sourceKey, flowIdentity, stage, targetIndex, target)
+          : undefined;
+        let output = durableClaim?.output;
+        if (output === undefined) {
+          output = (await runAgent(buildFlowPrompt(r, m), home, r.schema, signal)).trim();
+          if (!signal?.aborted) await durableClaim?.saveOutput(output);
+        }
         if (signal?.aborted) return;
         if (!output) return;
         const parsed = parseAgentResult(output);
@@ -415,23 +681,44 @@ export async function dispatchFlows(
               context: `派单 ${parsed.dispatch!.agent}: ${parsed.dispatch!.task!.slice(0, 30)}`,
               notify: r.deliver,
               origin: `${platform}:${m.chatId}`,
+              sourceKey: effectKey("pending-org", `${platform}:${m.chatId}\0${parsed.dispatch!.agent!}`),
             });
             if (pendingDispatch) briefing += `\n\n[${pendingDispatch.id}] 拟派单：${parsed.dispatch!.agent} ← ${parsed.dispatch!.task}\n—— /approve ${pendingDispatch.id} 派出 · /reject ${pendingDispatch.id} 取消`;
           }
           if (draft && (route.needsApproval || route.replyInChat) && (!canAutoReply || route.needsApproval || wantsDispatch)) {
-            const pendingSend = park({ kind: "send", target: `${platform}:${m.chatId}`, draft, context: (parsed.briefing || parsed.draft!).slice(0, 40), notify: r.deliver });
+            const pendingTarget = `${platform}:${m.chatId}`;
+            const pendingSend = park({
+              kind: "send",
+              target: pendingTarget,
+              draft,
+              context: (parsed.briefing || parsed.draft!).slice(0, 40),
+              notify: r.deliver,
+              sourceKey: effectKey("pending-send", pendingTarget),
+            });
             if (pendingSend) {
               briefing += `\n\n[${pendingSend.id}] 拟发到群：${draft}\n—— /approve ${pendingSend.id} 发出 · /edit ${pendingSend.id} <内容> · /reject ${pendingSend.id}`;
             }
           } else if (route.replyInChat && canAutoReply && reply) {
-            if (!signal?.aborted) await reply(draft!).catch(() => {});
+            if (!signal?.aborted) {
+              await runFlowTextEffect(
+                effects?.receipts,
+                effectKey("reply-in-chat", `${platform}:${m.chatId}`),
+                draft!,
+                reply,
+              );
+            }
             console.error(`hara flow "${r.name}": answered in-chat (route)`);
           }
           if (route.notifyOwner || route.needsApproval || wantsDispatch || (route.replyInChat && !canAutoReply)) {
-            for (const d of asArray(r.deliver)) {
+            for (const [targetIndex, d] of asArray(r.deliver).entries()) {
               if (signal?.aborted) return;
-              const err = await deliverResult(d, briefing);
-              if (err) console.error(`hara flow "${r.name}": deliver(${d}) failed — ${err}`);
+              await runFlowDeliveryEffect(
+                effects?.receipts,
+                effectKey("notify-owner", d, targetIndex),
+                d,
+                briefing,
+                signal,
+              );
             }
           } else console.error(`hara flow "${r.name}": routed silently (no owner notify)`);
           return;
@@ -439,7 +726,14 @@ export async function dispatchFlows(
         // Auto-answer lane (replyOn): safe Q&A goes straight back to the origin chat — no owner round-trip.
         // Runs BEFORE the noise gate so an answered question needs no WeChat push at all.
         if (r.replyOn?.length && dispo && r.replyOn.includes(dispo) && parsed?.draft?.trim() && reply) {
-          if (!signal?.aborted) await reply(parsed.draft.trim()).catch(() => {});
+          if (!signal?.aborted) {
+            await runFlowTextEffect(
+              effects?.receipts,
+              effectKey("reply-in-chat", `${platform}:${m.chatId}`),
+              parsed.draft!.trim(),
+              reply,
+            );
+          }
           console.error(`hara flow "${r.name}": ${dispo} — answered in-chat (replyOn)`);
           if (!r.notifyOn?.length || !r.notifyOn.includes(dispo)) return; // answered; only ALSO brief the owner if asked to
         }
@@ -451,7 +745,15 @@ export async function dispatchFlows(
         }
         // Drafted reply → park for approval; approved = posted back to the ORIGIN chat.
         if (parsed?.draft?.trim() && (dispo === "reply" || dispo === "handle")) {
-          const pendingSend = park({ kind: "send", target: `${platform}:${m.chatId}`, draft: parsed.draft.trim(), context: (parsed.briefing || parsed.draft).slice(0, 40), notify: r.deliver });
+          const pendingTarget = `${platform}:${m.chatId}`;
+          const pendingSend = park({
+            kind: "send",
+            target: pendingTarget,
+            draft: parsed.draft.trim(),
+            context: (parsed.briefing || parsed.draft).slice(0, 40),
+            notify: r.deliver,
+            sourceKey: effectKey("pending-send", pendingTarget),
+          });
           if (pendingSend) {
             briefing += `\n\n[${pendingSend.id}] 拟发到群：${parsed.draft.trim()}\n—— /approve ${pendingSend.id} 发出 · /edit ${pendingSend.id} <内容> · /reject ${pendingSend.id}`;
           }
@@ -466,21 +768,63 @@ export async function dispatchFlows(
             context: `派单 ${parsed.dispatch.agent}: ${parsed.dispatch.task.slice(0, 30)}`,
             notify: r.deliver,
             origin: `${platform}:${m.chatId}`, // the asker's chat — an approved task's result goes back here
+            sourceKey: effectKey("pending-org", `${platform}:${m.chatId}\0${parsed.dispatch.agent}`),
           });
           if (pendingDispatch) briefing += `\n\n[${pendingDispatch.id}] 拟派单：${parsed.dispatch.agent} ← ${parsed.dispatch.task}\n—— /approve ${pendingDispatch.id} 派出 · /reject ${pendingDispatch.id} 取消`;
         }
-        for (const d of asArray(r.deliver)) {
+        for (const [targetIndex, d] of asArray(r.deliver).entries()) {
           if (signal?.aborted) return;
-          const err = await deliverResult(d, briefing);
-          if (err) console.error(`hara flow "${r.name}": deliver(${d}) failed — ${err}`);
+          await runFlowDeliveryEffect(
+            effects?.receipts,
+            effectKey("notify-owner", d, targetIndex),
+            d,
+            briefing,
+            signal,
+          );
         }
-        if (r.reply && reply && !signal?.aborted) await reply(briefing).catch(() => {});
+        if (r.reply && reply && !signal?.aborted) {
+          await runFlowTextEffect(
+            effects?.receipts,
+            effectKey("reply-briefing", `${platform}:${m.chatId}`),
+            briefing,
+            reply,
+          );
+        }
       } catch (e) {
+        failed = true;
         console.error(`hara flow "${r.name}": ${e instanceof Error ? e.message : String(e)}`);
+        if (durableClaim) {
+          if (signal?.aborted) {
+            await durableClaim.release();
+            durableSettled = true;
+          } else {
+            const failure = await durableClaim.fail();
+            durableSettled = true;
+            if (failure.exhausted) {
+              if (failure.alarm) await reportFlowRetryExhausted(r, () => durableClaim!.markAlarmed());
+              return;
+            }
+          }
+        } else {
+          markFlowRunFailed(sourceRunKey, Date.now());
+        }
+        throw e;
       } finally {
-        activeFlowRuns = Math.max(0, activeFlowRuns - 1);
+        try {
+          if (durableClaim && !durableSettled) {
+            if (signal?.aborted) await durableClaim.release();
+            else if (!failed) await durableClaim.complete();
+          }
+          if (!durableClaim && !failed && !signal?.aborted) forgetFlowSource(sourceRunKey);
+        } finally {
+          activeFlowRuns = Math.max(0, activeFlowRuns - 1);
+        }
       }
-    })();
+    })());
   }
+  const outcomes = await Promise.allSettled(jobs);
+  const failed = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+  if (failed) throw failed.reason;
+  if (deferredRetry) throw new Error("a previously admitted flow retry is deferred by backoff or capacity; retry the source event");
   return true;
 }

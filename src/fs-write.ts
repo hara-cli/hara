@@ -29,6 +29,8 @@ export interface AtomicWriteOptions {
   mode?: number;
   /** Canonical target + existing-ancestor identity captured by a coding tool during preflight. */
   boundary?: AtomicWriteBoundary;
+  /** Agent lifecycle boundary. Checked immediately before every visible namespace commit. */
+  signal?: AbortSignal;
 }
 
 export interface AtomicWriteBoundary {
@@ -348,6 +350,10 @@ async function syncDirectory(path: string): Promise<void> {
 
 /** Atomically replace/create a UTF-8 file, optionally refusing to overwrite a newer disk version. */
 export async function atomicWriteText(path: string, content: string, options: AtomicWriteOptions = {}): Promise<AtomicWriteResult> {
+  const throwIfCancelled = (): void => {
+    if (options.signal?.aborted) throw new Error(`write cancelled before commit: ${path}`);
+  };
+  throwIfCancelled();
   if (options.boundary) {
     if (resolve(path) !== resolve(options.boundary.target)) throw new FileChangedError(path);
     verifyAtomicWriteBoundary(options.boundary);
@@ -422,6 +428,7 @@ export async function atomicWriteText(path: string, content: string, options: At
       try {
         // Keep the final parent-identity check and namespace mutation in one JS turn. Node has no portable
         // openat/linkat API; synchronous link is the narrowest available commit boundary.
+        throwIfCancelled();
         verifyCommitParent();
         linkSync(temp, target);
       } catch (error: any) {
@@ -435,6 +442,7 @@ export async function atomicWriteText(path: string, content: string, options: At
       // path leaves a verify→commit race; a concurrent replacement can otherwise be silently destroyed.
       const claimed = join(dir, `.hara-claim-${process.pid}-${randomUUID()}.tmp`);
       try {
+        throwIfCancelled();
         verifyCommitParent();
         renameSync(target, claimed);
       } catch (error: any) {
@@ -485,6 +493,7 @@ export async function atomicWriteText(path: string, content: string, options: At
       if (!claimedIdentity) throw new Error(`Failed to identify claimed file for ${path}`);
 
       try {
+        throwIfCancelled();
         verifyCommitParent();
         linkSync(temp, target); // atomic create-if-absent: never overwrites an entry created after claim.
       } catch (error: any) {
@@ -507,6 +516,7 @@ export async function atomicWriteText(path: string, content: string, options: At
         warnings.push(`old entry cleanup was refused: ${error?.message ?? String(error)}`);
       }
     } else {
+      throwIfCancelled();
       verifyCommitParent();
       renameSync(temp, target);
       staged = false;

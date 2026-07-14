@@ -18,6 +18,7 @@
 // stuck-guard nudge, and one that aborts safely (never hangs) when there's no interactive user.
 import { resolve, isAbsolute } from "node:path";
 import type { Provider, NeutralMsg } from "../providers/types.js";
+import { boundedProviderTurn } from "../providers/bounded-turn.js";
 import { canonicalize, splitCompound } from "./permissions.js";
 
 export type RiskLevel = "low" | "high";
@@ -219,27 +220,17 @@ export async function guardianVeto(
     `tool: ${action.tool}\n${action.detail}\n\n` +
     `Allow or block this action? Reply with only the JSON verdict.`;
 
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  // Chain the caller's interrupt signal so Esc also aborts the guardian call.
-  if (opts.signal) {
-    if (opts.signal.aborted) ac.abort();
-    else opts.signal.addEventListener("abort", () => ac.abort(), { once: true });
-  }
   try {
-    const r = await provider.turn({
+    const r = await boundedProviderTurn(provider, {
       system: GUARDIAN_SYSTEM,
       history: [{ role: "user", content: prompt }],
       tools: [],
       onText: () => {},
-      signal: ac.signal,
-    });
+    }, { timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, signal: opts.signal, label: "security guardian" });
     if (r.stop === "error") return { decision: "allow", reason: "" }; // fail-open on model error
     return parseVerdict(r.text);
   } catch {
     return { decision: "allow", reason: "" }; // fail-open on timeout/abort/throw
-  } finally {
-    clearTimeout(timer);
   }
 }
 

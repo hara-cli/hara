@@ -15,7 +15,16 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chunkText, buildIndex, queryIndex, indexExists, collectRepoChunks, collectDirChunks } from "../dist/search/semindex.js";
+import {
+  chunkText,
+  buildIndex,
+  queryIndex,
+  indexExists,
+  collectRepoChunks,
+  collectRepoChunksAsync,
+  collectDirChunks,
+  collectDirChunksAsync,
+} from "../dist/search/semindex.js";
 import { getEmbedder } from "../dist/search/embed.js";
 import { searchHybrid } from "../dist/search/hybrid.js";
 
@@ -238,6 +247,30 @@ test("queryIndex returns empty when no index exists", async () => {
   }
 });
 
+test("queryIndex forwards parent cancellation into the embedding request", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-sem-abort-"));
+  try {
+    const text = "auth login token ordinary source";
+    writeFileSync(join(dir, "auth.ts"), text);
+    await buildIndex("repo", chunkText(text, "auth.ts", "repo"), mockEmbed, dir);
+    const controller = new AbortController();
+    let sawSignal = false;
+    const hangingEmbed = async (_texts, signal) => {
+      sawSignal = signal === controller.signal;
+      return await new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("embedding stopped")), { once: true });
+      });
+    };
+    const running = queryIndex("repo", "auth", hangingEmbed, dir, 3, controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    await assert.rejects(running, /embedding stopped|semantic query interrupted/);
+    assert.equal(sawSignal, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("queryIndex rotates a versionless legacy cache instead of returning historical text", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-sem-legacy-"));
   const indexDir = join(dir, ".hara", "index");
@@ -272,6 +305,74 @@ test("collectRepoChunks walks code + markdown in a project root", () => {
     assert.ok(chunks.every((ch) => ch.source === "repo"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("async chunk collectors expose inventory truncation and propagate cancellation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-repo-async-"));
+  try {
+    writeFileSync(join(dir, "package.json"), "{}");
+    writeFileSync(join(dir, "main.ts"), "export function auth() { return 1 }\n");
+    writeFileSync(join(dir, "notes.md"), "# Title\nsome notes worth indexing\n");
+
+    const complete = await collectRepoChunksAsync(dir, { timeoutMs: 5_000 });
+    assert.equal(complete.truncated, false);
+    assert.ok(complete.chunks.some((chunk) => chunk.file === "main.ts"));
+
+    const truncated = await collectDirChunksAsync(dir, "assets", {
+      maxEntries: 1,
+      timeoutMs: 5_000,
+      yieldEvery: 1,
+    });
+    assert.equal(truncated.truncated, true);
+    assert.equal(truncated.reason, "entry_limit");
+
+    const controller = new AbortController();
+    const reason = new Error("index collection deadline");
+    controller.abort(reason);
+    await assert.rejects(
+      collectRepoChunksAsync(dir, { signal: controller.signal }),
+      (error) => error === reason,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("repo indexing refuses the canonical home root before walking or embedding", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-index-home-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "large.ts"), "export const shouldNotBeIndexed = true;\n");
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  let embedCalls = 0;
+  try {
+    assert.throws(() => collectRepoChunks(alias), /home directory/i, "a symlink alias cannot bypass the corpus boundary");
+    await assert.rejects(
+      collectRepoChunksAsync(alias),
+      /home directory/i,
+      "the async corpus collector enforces the same canonical-home boundary",
+    );
+    await assert.rejects(
+      buildIndex("repo", [{ id: "x#0", text: "ordinary source text", file: "x.ts", source: "repo" }], async () => {
+        embedCalls++;
+        return [[1]];
+      }, alias),
+      /home directory/i,
+    );
+    assert.equal(embedCalls, 0, "the boundary fires before content reaches an embedding provider");
+    assert.equal(indexExists("repo", alias), false);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -354,4 +455,26 @@ test("getEmbedder is off-by-default and pluggable", () => {
   assert.equal(getEmbedder({}), null, "unset → null");
   assert.equal(typeof getEmbedder({ embedProvider: "ollama" }), "function");
   assert.equal(typeof getEmbedder({ embedProvider: "qwen", apiKey: "k" }), "function");
+});
+
+test("getEmbedder combines its hard timeout with the parent signal", async () => {
+  const savedFetch = globalThis.fetch;
+  const controller = new AbortController();
+  let requestSignal;
+  try {
+    globalThis.fetch = async (_url, init) => {
+      requestSignal = init.signal;
+      return await new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true });
+      });
+    };
+    const embed = getEmbedder({ embedProvider: "openai", embedBaseURL: "https://embed.invalid/v1", embedApiKey: "test" });
+    const running = embed(["hello"], controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    await assert.rejects(running, /aborted/i);
+    assert.equal(requestSignal.aborted, true, "the in-flight fetch observes parent cancellation");
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 });

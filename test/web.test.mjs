@@ -97,6 +97,32 @@ test("web_search: a successful configured provider does not broadcast the query"
   }
 });
 
+test("web_search: parent cancellation aborts the active provider and never starts a fallback", async () => {
+  const savedFetch = globalThis.fetch;
+  const savedKey = process.env.HARA_SEARCH_API_KEY;
+  const calls = [];
+  const controller = new AbortController();
+  try {
+    process.env.HARA_SEARCH_API_KEY = "test-key";
+    globalThis.fetch = async (url, init) => {
+      calls.push(String(url));
+      return await new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true });
+      });
+    };
+    const running = getTool("web_search").run({ query: "private query", limit: 3 }, { cwd: ".", signal: controller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    await assert.rejects(running, /interrupted by agent run deadline or cancellation/);
+    assert.equal(calls.length, 1, "Bing/Baidu/Google/DDG are not started after the parent abort");
+    assert.match(calls[0], /tavily/);
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedKey === undefined) delete process.env.HARA_SEARCH_API_KEY;
+    else process.env.HARA_SEARCH_API_KEY = savedKey;
+  }
+});
+
 test("looksLikeJsRenderedShell: catches an empty SPA shell, not real article text", () => {
   assert.equal(looksLikeJsRenderedShell('<div id="root"></div><script src="app.js"></script>', ""), true);
   assert.equal(looksLikeJsRenderedShell('<main id="app"></main><script>boot()</script>', "Loading…"), true);

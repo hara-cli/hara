@@ -33,11 +33,11 @@ export interface Sink {
 }
 export interface Helpers {
   sink: Sink;
-  confirm: (q: string) => Promise<boolean | "always">;
+  confirm: (q: string, signal?: AbortSignal) => Promise<boolean | "always">;
   select: (title: string, options: { label: string; value: string }[]) => Promise<string>;
   /** ask_user: pose a question (optionally with likely answers) and resolve to the user's answer (chosen
    *  option or free text). Routes through the same prompt/input channel as confirm/select. */
-  ask: (question: string, options?: string[]) => Promise<string>;
+  ask: (question: string, options?: string[], signal?: AbortSignal) => Promise<string>;
   /** /model picker: ↑↓ a model + ←→ its thinking level; resolves to the chosen {model, effort}, or null on esc. */
   pickModel: (o: { models: string[]; style: ReasoningStyle; current?: string; effort: Effort }) => Promise<{ model: string; effort: Effort } | null>;
   setApproval: (m: Approval) => void;
@@ -85,6 +85,8 @@ export interface HeaderInfo {
    *  the pre-mount stdout print never survives ink taking over the screen, which is why TUI users
    *  reported the update check as "completely dead" while stuck versions piled up. */
   updateNotice?: string;
+  /** Home-root safety notice. Unlike a pre-mount stdout line, this remains visible after Ink paints. */
+  workspaceNotice?: string;
 }
 
 export interface AppProps {
@@ -116,6 +118,13 @@ interface Item {
 let _id = 0;
 const nid = (): number => ++_id;
 const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+function promptAbortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const error = new Error("interactive prompt cancelled");
+  error.name = "AbortError";
+  return error;
+}
 
 /** Prepare a finalized turn item for the append-only `<Static>` scrollback. A completed reasoning
  *  block collapses to a single-line "✻ thought · N lines" notice (its full text preserved in `full`
@@ -394,6 +403,7 @@ function HeaderCard(props: HeaderInfo) {
       </Box>
       {/* Tip block — moved OUT of the card (顾雅 spec). Dim discoverability line below the card. */}
       <Text dimColor>{"  Tip: @ attach file · ctrl+t transcript · ctrl+r reasoning · shift+tab approval · esc interrupt"}</Text>
+      {props.workspaceNotice ? <Text color="yellow">{`  ⚠ ${props.workspaceNotice}`}</Text> : null}
       {props.updateNotice ? <Text color="yellow">{`  ⬆ ${props.updateNotice}`}</Text> : null}
     </Box>
   );
@@ -541,11 +551,17 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   const [current, setCurrent] = useState<Item[]>([]);
   const [working, setWorking] = useState(false);
   const [status, setStatus] = useState<Status>({ ...initialStatus, agents: 0 });
-  const [prompt, setPrompt] = useState<{ title: string; options: { label: string; value: unknown; key?: string }[]; resolve: (v: unknown) => void } | null>(null);
+  const [prompt, setPrompt] = useState<{
+    token: symbol;
+    title: string;
+    options: { label: string; value: unknown; key?: string }[];
+    resolve: (v: unknown) => void;
+    abortTurnOnEscape: boolean;
+  } | null>(null);
   const [promptSel, setPromptSel] = useState(0);
   // Free-text question prompt (ask_user with no/declined options): re-enables the InputBox to capture one
   // line, then resolves the awaiting tool with that text. Separate from `prompt` (the select-only path).
-  const [askText, setAskText] = useState<{ title: string; resolve: (v: string) => void } | null>(null);
+  const [askText, setAskText] = useState<{ token: symbol; title: string; resolve: (v: string) => void } | null>(null);
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false); // Ctrl+T full-transcript overlay
   const [picker, setPicker] = useState<{ models: string[]; style: ReasoningStyle; current?: string; effort: Effort; resolve: (v: { model: string; effort: Effort } | null) => void } | null>(null); // /model picker overlay
@@ -578,6 +594,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   useEffect(() => () => {
     if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
     if (modeSelectorTimerRef.current) clearTimeout(modeSelectorTimerRef.current);
+    queueRef.current = [];
+    ctrlRef.current?.abort();
   }, []);
 
   // Subscribe to todo_write updates so the panel re-renders when the agent edits the checklist.
@@ -660,13 +678,22 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     return batch;
   }, [pushCurrent, noteVisionIfNeeded]);
 
+  // One stop primitive for every live-turn surface. A queued type-ahead belongs to the turn being stopped;
+  // retaining it while Esc dismisses an approval/ask prompt would auto-submit it as a surprise second turn.
+  const abortCurrentTurn = useCallback((): void => {
+    if (queueRef.current.length) {
+      queueRef.current = [];
+      setPool([]);
+    }
+    ctrlRef.current?.abort();
+  }, []);
+
   const handleSubmit = useCallback(
     async (line: string, images?: ImageAttachment[]): Promise<void> => {
       const t = line.trim();
       // A free-text question (ask_user) is awaiting an answer: this submission IS the answer, not a new turn.
       if (askText) {
         const r = askText.resolve;
-        setAskText(null);
         setHistory((h) => [...h, { id: nid(), kind: "user", text: t }]);
         r(t);
         return;
@@ -702,33 +729,90 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
           setStatus((s) => ({ ...s, input: s.input + input, output: s.output + output, ctxPct: ctxPctFor(model, input) })),
         session: (name) => setStatus((s) => ({ ...s, sessionName: name })),
       };
-      const openPrompt = <T,>(title: string, options: { label: string; value: T; key?: string }[]): Promise<T> =>
-        new Promise((resolve) => {
+      const openPrompt = <T,>(
+        title: string,
+        options: { label: string; value: T; key?: string }[],
+        signal: AbortSignal = ctrl.signal,
+        abortTurnOnEscape = false,
+      ): Promise<T> =>
+        new Promise((resolve, reject) => {
+          if (signal.aborted) {
+            reject(promptAbortReason(signal));
+            return;
+          }
+          const token = Symbol("prompt");
+          let settled = false;
+          const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+          const finish = (value: T): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            setPrompt((current) => current?.token === token ? null : current);
+            resolve(value);
+          };
+          const onAbort = (): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            setPrompt((current) => current?.token === token ? null : current);
+            reject(promptAbortReason(signal));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
           setPromptSel(0);
-          setPrompt({ title, options: options as { label: string; value: unknown; key?: string }[], resolve: resolve as (v: unknown) => void });
+          setPrompt({
+            token,
+            title,
+            options: options as { label: string; value: unknown; key?: string }[],
+            resolve: finish as (v: unknown) => void,
+            abortTurnOnEscape,
+          });
         });
-      const confirmFn = (q: string): Promise<boolean | "always"> =>
+      const confirmFn = (q: string, signal: AbortSignal = ctrl.signal): Promise<boolean | "always"> =>
         openPrompt<boolean | "always">(q, [
           { label: "Yes", value: true, key: "y" },
           { label: "Yes, and don't ask again this session", value: "always", key: "a" },
           { label: "No  (esc)", value: false, key: "n" },
-        ]);
+        ], signal, true);
       const selectFn = (title: string, options: { label: string; value: string }[]): Promise<string> => openPrompt(title, options);
       // Free-text question: re-enable the InputBox to read one line (resolves via handleSubmit's askText branch).
-      const askTextFn = (title: string): Promise<string> =>
-        new Promise((resolve) => setAskText({ title, resolve }));
+      const askTextFn = (title: string, signal: AbortSignal = ctrl.signal): Promise<string> =>
+        new Promise((resolve, reject) => {
+          if (signal.aborted) {
+            reject(promptAbortReason(signal));
+            return;
+          }
+          const token = Symbol("ask-text");
+          let settled = false;
+          const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+          const finish = (value: string): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            setAskText((current) => current?.token === token ? null : current);
+            resolve(value);
+          };
+          const onAbort = (): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            setAskText((current) => current?.token === token ? null : current);
+            reject(promptAbortReason(signal));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          setAskText({ token, title, resolve: finish });
+        });
       // ask_user: when options are given, offer them as a select + a "type my own" escape hatch; otherwise (or
       // when the user chooses to type their own) capture a free-text line. Returns the chosen/typed answer.
       const OTHER = "\\0__ask_other__"; // escaped sentinel keeps this TypeScript file text-only
-      const askFn = async (question: string, options?: string[]): Promise<string> => {
+      const askFn = async (question: string, options?: string[], signal: AbortSignal = ctrl.signal): Promise<string> => {
         if (options && options.length) {
           const choice = await openPrompt<string>(question, [
             ...options.map((o) => ({ label: o, value: o })),
             { label: "✎ Type my own answer", value: OTHER },
-          ]);
+          ], signal, true);
           if (choice !== OTHER) return choice;
         }
-        return askTextFn(question);
+        return askTextFn(question, signal);
       };
       const setApprovalFn = (m: Approval): void => setStatus((s) => ({ ...s, approval: m }));
       const pickModelFn = (o: { models: string[]; style: ReasoningStyle; current?: string; effort: Effort }): Promise<{ model: string; effort: Effort } | null> =>
@@ -781,12 +865,11 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     if (key.ctrl && input === "t") return setShowTranscript((x) => !x); // open/close the full-transcript overlay
     if (showTranscript) return; // while open, the overlay's own useInput owns every key (scroll / esc)
     if (picker) return; // the /model picker overlay owns input (↑↓ model, ←→ thinking, ⏎, esc) while open
-    // Free-text question awaiting an answer: Esc cancels (empty answer); all other keys belong to the InputBox.
+    // Free-text question awaiting an answer: Esc aborts the owning turn; all other keys belong to InputBox.
     if (askText) {
       if (key.escape) {
-        const r = askText.resolve;
-        setAskText(null);
-        r("");
+        if (working && ctrlRef.current) abortCurrentTurn();
+        else askText.resolve("");
       }
       return;
     }
@@ -796,30 +879,22 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       else if (key.downArrow) setPromptSel((s) => (s + 1) % opts.length);
       else if (key.return) {
         prompt.resolve(opts[Math.min(promptSel, opts.length - 1)].value);
-        setPrompt(null);
       } else if (key.escape) {
-        prompt.resolve(opts[opts.length - 1].value); // last option = cancel/no
-        setPrompt(null);
+        if (prompt.abortTurnOnEscape && working && ctrlRef.current) abortCurrentTurn();
+        else prompt.resolve(opts[opts.length - 1].value); // select-only prompt: last option = cancel/no
       } else if (/^[1-9]$/.test(input) && Number(input) <= opts.length) {
         prompt.resolve(opts[Number(input) - 1].value); // type a number to pick directly
-        setPrompt(null);
       } else if (input) {
         const hit = opts.find((o) => o.key && o.key === input.toLowerCase());
         if (hit) {
           prompt.resolve(hit.value);
-          setPrompt(null);
         }
       }
       return;
     }
     if (key.ctrl && input === "r") return setReasoningOpen((x) => !x);
     if (key.escape && working) {
-      // Esc = stop everything: abort the turn AND drop any type-ahead (a stopped turn shouldn't fire queued msgs)
-      if (queueRef.current.length) {
-        queueRef.current = [];
-        setPool([]);
-      }
-      ctrlRef.current?.abort();
+      abortCurrentTurn();
     }
     else if (key.tab && key.shift && cycleApproval) {
       setStatus((s) => ({ ...s, approval: cycleApproval(s.approval) }));
