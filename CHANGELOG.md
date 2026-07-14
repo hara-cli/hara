@@ -20,6 +20,9 @@ All notable changes to `@nanhara/hara`.
 - **x64 standalone assets use Bun's baseline CPU target.** Intel macOS, Linux, and Windows sidecar callers no
   longer inherit the modern/AVX assumption from an unqualified x64 target, improving compatibility with older
   Intel machines and Rosetta validation without changing ARM64 builds.
+- **Optional native search stays optional at build time.** TypeScript now has an explicit ambient contract for
+  `@zvec/zvec`, so npm can omit the unsupported macOS Intel binding without breaking `npm ci`; runtime loading
+  still falls back to the durable JSON search path when the native module is unavailable.
 
 ## 0.122.4 — 2026-07-14 — bounded agent lifecycle and chat delivery hardening
 
