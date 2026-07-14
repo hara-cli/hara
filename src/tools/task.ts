@@ -18,6 +18,7 @@ import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { registerTool } from "./registry.js";
+import { sleepSync } from "../sync-sleep.js";
 
 export type TaskStatus = "pending" | "in_progress" | "done";
 export interface TaskItem {
@@ -32,7 +33,6 @@ export interface TaskItem {
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const TASK_STATUSES = new Set<TaskStatus>(["pending", "in_progress", "done"]);
-const sleepCell = new Int32Array(new SharedArrayBuffer(4));
 const LOCK_ATTEMPTS = 500;
 const LOCK_WAIT_MS = 10;
 
@@ -142,7 +142,7 @@ function withTaskLock<T>(cwd: string, fn: () => T): T {
           continue;
         }
       }
-      Atomics.wait(sleepCell, 0, 0, LOCK_WAIT_MS);
+      sleepSync(LOCK_WAIT_MS);
       continue;
     }
     const candidate = { pid: process.pid, token: randomUUID() };
@@ -168,7 +168,7 @@ function withTaskLock<T>(cwd: string, fn: () => T): T {
         if (currentGuard?.pid === process.pid && currentGuard.token === guard.token) rmSync(reclaim, { force: true });
       }
     }
-    Atomics.wait(sleepCell, 0, 0, LOCK_WAIT_MS);
+    sleepSync(LOCK_WAIT_MS);
   }
 
   if (!claim) throw new Error("task store is busy; retry the operation");

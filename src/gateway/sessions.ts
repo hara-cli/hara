@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { sleepSync } from "../sync-sleep.js";
 
 interface ChatThread {
   sessionId: string;
@@ -58,7 +59,6 @@ const dir = (): string => join(haraDir(), "gateway");
 const file = (): string => join(dir(), "chats.json");
 const lockFile = (): string => `${file()}.lock`;
 const reclaimFile = (): string => `${lockFile()}.reclaim`;
-const waitCell = new Int32Array(new SharedArrayBuffer(4));
 const LOCK_WAIT_MS = 5_000;
 
 interface LockRecord {
@@ -146,7 +146,7 @@ function acquireLock(): () => void {
         }
       }
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for gateway session store lock: ${lockFile()}`);
-      Atomics.wait(waitCell, 0, 0, 10);
+      sleepSync(10);
       continue;
     }
     try {
@@ -183,7 +183,7 @@ function acquireLock(): () => void {
       if (Date.now() >= deadline) {
         throw new Error(`Timed out waiting for gateway session store lock: ${lockFile()}`);
       }
-      Atomics.wait(waitCell, 0, 0, 10);
+      sleepSync(10);
     }
   }
 }

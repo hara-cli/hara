@@ -24,6 +24,12 @@ jobs:
         with:
           node-version: "22"
           registry-url: https://registry.npmjs.org/
+      - name: Verify tag matches the package version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          expected="v$(node -p 'require("./package.json").version')"
+          [[ "$GITHUB_REF_NAME" == "$expected" ]] || { echo "npm tag mismatch: $GITHUB_REF_NAME != $expected" >&2; exit 1; }
       - run: npm ci
       - run: npm audit --omit=dev --registry https://registry.npmjs.org/
       - run: npm test

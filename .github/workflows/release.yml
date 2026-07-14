@@ -13,13 +13,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
+      - name: Verify tag matches the package version
+        shell: bash
+        run: |
+          expected="v$(node -p 'require("./package.json").version')"
+          [[ "$GITHUB_REF_NAME" == "$expected" ]] || { echo "release tag mismatch: $GITHUB_REF_NAME != $expected" >&2; exit 1; }
+          bun --version
       - run: npm ci
       - run: npm audit --omit=dev --registry https://registry.npmjs.org/
       - run: npm test
       - run: npm run build:binaries
+      - name: Execute the native release asset before publishing
+        shell: bash
+        run: |
+          expected="$(node -p 'require("./package.json").version')"
+          actual="$(dist/bin/hara-linux-x64 --version)"
+          [[ "$actual" == "$expected" ]] || { echo "standalone version mismatch: $actual != $expected" >&2; exit 1; }
+          dist/bin/hara-linux-x64 --help >/dev/null
       # GitHub-hosted runners already provide gh. Using it directly avoids a third-party action whose
       # deprecated Node runtime is forced forward by the runner, and makes a rerun explicitly idempotent.
       - name: Publish GitHub release assets

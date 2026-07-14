@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.122.3 — 2026-07-14 — standalone runtime recovery
+
+- **Bun-compiled standalone binaries no longer assume `SharedArrayBuffer` exists at module startup.**
+  The short synchronous waits used by cross-process stores now prefer `Bun.sleepSync`, lazily use
+  `Atomics.wait` only on Node when its primitives exist, and retain a bounded last-resort delay. This
+  fixes the macOS arm64 `ReferenceError` that could make the 0.122.2 standalone binary exit before
+  even printing `--version`; npm/Node and GHCR users were unaffected. CI now compiles and executes a
+  native standalone binary on Linux and macOS, and the release job executes its native Linux asset
+  before publishing, so a merely successful cross-compile is no longer accepted as runtime proof.
+
 ## 0.122.2 — 2026-07-14 — reproducible container release
 
 - **The Docker build now includes the guarded runtime entry before normalizing package modes.** This fixes the

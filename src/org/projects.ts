@@ -18,6 +18,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { loadRoles, loadGlobalRoles, type Role } from "./roles.js";
+import { sleepSync } from "../sync-sleep.js";
 
 export interface RegisteredProject {
   name: string;
@@ -32,7 +33,6 @@ export interface AgentIndexEntry {
 }
 
 const PROJECT_NAME = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/;
-const sleepCell = new Int32Array(new SharedArrayBuffer(4));
 const LOCK_ATTEMPTS = 500;
 const LOCK_WAIT_MS = 10;
 
@@ -130,7 +130,7 @@ function withProjectsLock<T>(fn: () => T): T {
           continue;
         }
       }
-      Atomics.wait(sleepCell, 0, 0, LOCK_WAIT_MS);
+      sleepSync(LOCK_WAIT_MS);
       continue;
     }
     const candidate = { pid: process.pid, token: randomUUID() };
@@ -156,7 +156,7 @@ function withProjectsLock<T>(fn: () => T): T {
         if (currentGuard?.pid === process.pid && currentGuard.token === guard.token) rmSync(reclaim, { force: true });
       }
     }
-    Atomics.wait(sleepCell, 0, 0, LOCK_WAIT_MS);
+    sleepSync(LOCK_WAIT_MS);
   }
 
   if (!claim) throw new Error("projects registry is busy; retry the operation");

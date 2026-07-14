@@ -42,3 +42,28 @@ jobs:
         run: docker build --tag hara-ci .
       - name: Start the guarded entry point
         run: docker run --rm hara-ci --version
+
+  standalone-runtime:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22.12.0"
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+      - run: npm ci
+      - name: Compile and execute the native standalone binary
+        shell: bash
+        run: |
+          bun --version
+          npm run build:binary
+          expected="$(node -p 'require("./package.json").version')"
+          actual="$(./dist/bin/hara --version)"
+          [[ "$actual" == "$expected" ]] || { echo "standalone version mismatch: $actual != $expected" >&2; exit 1; }
+          ./dist/bin/hara --help >/dev/null

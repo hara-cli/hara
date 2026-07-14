@@ -35,6 +35,7 @@ import { resolvePlatform } from "../providers/registry.js";
 import type { Provider, TurnResult } from "../providers/types.js";
 import { validateAgainstSchema } from "../agent/structured.js";
 import { terminateSubprocessTree } from "../security/subprocess-env.js";
+import { sleepSync } from "../sync-sleep.js";
 
 export interface PendingAction {
   id: string;
@@ -64,7 +65,6 @@ export interface PendingExecutionOptions {
 
 const FILE = (): string => join(homedir(), ".hara", "flows-pending.json");
 const LOCK = (): string => FILE() + ".lock";
-const sleepCell = new Int32Array(new SharedArrayBuffer(4));
 const STORE_LOCK_ATTEMPTS = 500;
 const STORE_LOCK_WAIT_MS = 10;
 const PENDING_STATUSES = new Set<PendingAction["status"]>(["pending", "executing", "done", "rejected", "failed", "expired"]);
@@ -193,7 +193,7 @@ function withStoreLock<T>(fn: () => T): T {
           continue;
         }
       }
-      Atomics.wait(sleepCell, 0, 0, STORE_LOCK_WAIT_MS);
+      sleepSync(STORE_LOCK_WAIT_MS);
       continue;
     }
     const candidate = { pid: process.pid, token: randomUUID() };
@@ -222,7 +222,7 @@ function withStoreLock<T>(fn: () => T): T {
         }
       }
     }
-    Atomics.wait(sleepCell, 0, 0, STORE_LOCK_WAIT_MS);
+    sleepSync(STORE_LOCK_WAIT_MS);
   }
   if (!claim) throw new Error("flows pending store is busy");
   try {
