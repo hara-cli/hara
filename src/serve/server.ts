@@ -25,7 +25,16 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { runAgent } from "../agent/loop.js";
-import { COMPACT_SYSTEM, buildFileRestore, workingSetFromSummary } from "../agent/compact.js";
+import {
+  COMPACT_SYSTEM,
+  buildFileRestore,
+  compactedConversationHistory,
+  compactedHistoryTokenEstimate,
+  compactionSourceHistory,
+  normalizeCompactionSummary,
+  recentHistoryForCompaction,
+  workingSetFromSummary,
+} from "../agent/compact.js";
 import { rewindTo } from "../agent/rewind.js";
 import { analyzeContext } from "../agent/context-report.js";
 import { clearTouched, recentTouched } from "../agent/touched.js";
@@ -52,13 +61,16 @@ import { SessionHub, realStore, type SessionStore, type ServeSession } from "./s
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import {
+  consumePendingTaskSteering,
   createTaskExecution,
   continueTaskExecution,
   finishTaskExecution,
   newSteerInteraction,
   newTurnInteraction,
   recordTaskSteering,
+  requestsTaskContinuation,
   taskExecutionContext,
+  type TaskInteraction,
 } from "../session/task.js";
 
 /** What the CLI entry injects (built in index.ts, where config/providers/guardian already live). */
@@ -360,6 +372,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     }
   }
 
+  /** Move accepted steering from the task inbox into a write-ahead transcript snapshot. The caller either
+   *  appends the returned messages to live history or returns them to runAgent for that append. A crash can
+   *  therefore recover pending inbox state or consumed transcript state, never lose an acknowledged input. */
+  const materializePendingSteering = (s: ServeSession): NeutralMsg[] => {
+    const consumed = consumePendingTaskSteering(s.task);
+    if (!consumed) return [];
+    const messages: NeutralMsg[] = consumed.entries.map((entry) => ({
+      role: "user",
+      content: `${INTERJECT_PREFIX}\n\n${entry.content}`,
+    }));
+    hub.saveSnapshot(s, [...s.history, ...messages], consumed.task);
+    s.task = consumed.task;
+    s.history.push(...messages);
+    return messages;
+  };
+
   /** Run one turn on a session, streaming events to all authed clients. */
   const runTurn = async (
     s: ServeSession,
@@ -371,24 +399,33 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     s.busy = true;
     const turnAbort = new AbortController();
     s.abort = turnAbort;
-    s.pendingInput = [];
-    const interaction = !forceNewTask && s.resumeTaskPending && s.task
-      ? newSteerInteraction(s.task.turnId)
-      : newTurnInteraction();
-    if (interaction.kind === "steer") {
-      const continued = continueTaskExecution(s.task, interaction);
-      if (!continued.ok) {
-        s.abort = null;
-        s.busy = false;
-        throw new Error(continued.reason);
+    let interaction: TaskInteraction;
+    let executionContext: string;
+    try {
+      const recoveredSteering = materializePendingSteering(s);
+      interaction = !forceNewTask && s.task && s.task.status !== "completed" &&
+        (recoveredSteering.length > 0 || requestsTaskContinuation(text))
+        ? newSteerInteraction(s.task.turnId)
+        : newTurnInteraction();
+      if (interaction.kind === "steer") {
+        const continued = continueTaskExecution(s.task, interaction);
+        if (!continued.ok) throw new Error(continued.reason);
+        s.task = continued.task;
+      } else {
+        s.task = createTaskExecution(text, interaction.turnId);
+        // Checklists belong to executions, not to the surrounding conversation thread. An unrelated task
+        // must not inherit old pending todos and be forced back into paused state after a successful turn.
+        s.meta.todos = [];
       }
-      s.task = continued.task;
-    } else {
-      s.task = createTaskExecution(text, interaction.turnId);
+      executionContext = taskExecutionContext(s.task, interaction, s.meta.todos ?? []);
+      hub.save(s); // crash-safe running identity before provider/tool side effects
+    } catch (error) {
+      // Initialization happens before the main turn try/finally. Release the session here as well so a
+      // transient snapshot/config error cannot wedge it in a permanently busy, non-interruptible state.
+      s.abort = null;
+      s.busy = false;
+      throw error;
     }
-    s.resumeTaskPending = false;
-    const executionContext = taskExecutionContext(s.task, interaction);
-    hub.save(s); // crash-safe running identity before provider/tool side effects
     broadcast("event.turn_start", { sessionId, taskId: s.task.id, turnId: s.task.turnId });
     const historyStart = s.history.length;
     const before = { input: s.stats.input, output: s.stats.output };
@@ -462,7 +499,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         memory: memoryDigest(s.meta.cwd),
         continuationSession: s.continuationSession,
         executionContext,
-        pendingInput: async () => s.pendingInput.splice(0),
+        pendingInput: async () => {
+          materializePendingSteering(s); // helper updates the shared live history after its write-ahead save
+          return [];
+        },
         stats: s.stats,
         signal: turnAbort.signal,
         onProviderTurn: (turn) => {
@@ -489,14 +529,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         });
         // A steer may land after the agent's final in-loop drain but before the logical turn returns. Keep
         // it in the same task/run instead of making the client retry it as an unrelated session.send.
-        const trailing = s.pendingInput.splice(0);
+        const trailing = materializePendingSteering(s);
         if (!trailing.length || turnAbort.signal.aborted || outcome.status !== "completed") break;
-        s.history.push(...trailing);
-        hub.save(s);
       } while (true);
       s.meta.todos = serializeTodos(sessionId);
       s.task = finishTaskExecution(s.task, outcome, s.meta.todos, turnAbort.signal.aborted);
-      s.resumeTaskPending = Boolean(s.task && s.task.status !== "completed");
       hub.save(s);
       const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
       // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
@@ -524,7 +561,6 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           s.meta.todos ?? [],
           turnAbort.signal.aborted,
         );
-        s.resumeTaskPending = Boolean(s.task && s.task.status !== "completed");
         hub.save(s);
       }
       throw error;
@@ -545,6 +581,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
    *  cwd because serve is multi-session (recentTouched is process-wide and must not leak across projects). */
   const compactSession = async (s: ServeSession, controller: AbortController): Promise<string | null> => {
     const timeoutMs = Math.max(1, Math.min(deps.compactTimeoutMs ?? COMPACT_TIMEOUT_MS, COMPACT_TIMEOUT_MS));
+    const recent = recentHistoryForCompaction(s.history);
     const r = await new Promise<Awaited<ReturnType<Provider["turn"]>>>((resolve, reject) => {
       let settled = false;
       let timedOut = false;
@@ -571,7 +608,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         if (controller.signal.aborted) throw new Error(timedOut ? "compaction timed out" : "compaction interrupted");
         return s.provider.turn({
           system: COMPACT_SYSTEM,
-          history: [...s.history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
+          history: [...compactionSourceHistory(s.history), { role: "user", content: "Create the bounded execution checkpoint now." }],
           tools: [],
           onText: () => {},
           signal: controller.signal,
@@ -582,8 +619,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       );
     });
     if (controller.signal.aborted || r.stop === "error") return null;
-    const summary = r.text.trim();
-    if (!summary) return null;
+    const rawSummary = r.text.trim();
+    if (!rawSummary) return null;
+    const summary = normalizeCompactionSummary(rawSummary);
     const workingSet = workingSetFromSummary(summary);
     const touched = recentTouched(20, s.meta.id).filter((file) => {
       const rel = relative(s.meta.cwd, file);
@@ -599,12 +637,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     });
     if (controller.signal.aborted) return null;
     s.meta.workingSet = workingSet;
+    const compacted = compactedConversationHistory(summary, recent, restore);
     s.history.length = 0;
-    s.history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
-    if (restore) s.history.push({ role: "user", content: restore });
+    s.history.push(...compacted);
     s.stats.input += r.usage?.input ?? 0;
     s.stats.output += r.usage?.output ?? 0;
-    s.stats.lastInput = r.usage?.input ?? 0; // ctx% now reflects the (small) summary
+    s.stats.lastInput = compactedHistoryTokenEstimate(compacted);
     hub.save(s);
     return summary;
   };
@@ -718,8 +756,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const recorded = recordTaskSteering(s.task, p.expectedTurnId, expanded);
             if (!recorded.ok) return reply(rpcError(id, ERR.BUSY, recorded.reason));
             s.task = recorded.task;
-            s.pendingInput.push({ role: "user", content: `${INTERJECT_PREFIX}\n\n${expanded}` });
-            hub.save(s); // task audit is durable even before the running loop reaches its next drain
+            hub.save(s); // executable inbox entry is durable before ACK
             return reply(rpcResult(id!, { accepted: true, taskId: s.task.id, turnId: s.task.turnId }));
           }
           case "session.interrupt": {
@@ -962,8 +999,6 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             s.history.length = 0;
             s.history.push(...next);
             s.task = undefined;
-            s.resumeTaskPending = false;
-            s.pendingInput = [];
             hub.save(s);
             return reply(rpcResult(id!, { sessionId: s.meta.id, history: historyForClient(s.history) }));
           }

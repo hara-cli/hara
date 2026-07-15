@@ -449,6 +449,35 @@ test("App type-ahead: typing while working queues, then sends after the turn", a
   unmount();
 });
 
+test("App /next: queues a separate task instead of steering the active turn", async () => {
+  const seen = [];
+  const interactions = [];
+  let release;
+  const onSubmit = async (line, _helpers, _images, interaction) => {
+    seen.push(line);
+    interactions.push(interaction);
+    if (line === "first") await new Promise((resolve) => { release = resolve; });
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("first");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("/next inspect the other project");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("next: inspect the other project"), "queue barrier is visible");
+  release();
+  await tick(180);
+  assert.deepEqual(seen, ["first", "inspect the other project"]);
+  assert.equal(interactions[1].kind, "turn", "explicit next input starts a new task identity");
+  unmount();
+});
+
 test("App type-ahead: multiple pooled messages coalesce into one turn", async () => {
   const seen = [];
   let release;
@@ -778,6 +807,11 @@ test("App todo fold-on-submit: previous checklist folds to a one-line summary wh
   const after1 = strip(lastFrame());
   assert.ok(after1.includes("step A"), "panel stays visible after the turn (no 30s yank)");
   assert.ok(!after1.includes("✓ Todos:"), "not folded yet");
+  stdin.write("/help");
+  await tick();
+  stdin.write("\r");
+  await tick(150);
+  assert.equal(currentTodos().length, 2, "a control command does not silently erase the active task checkpoint");
   stdin.write("task two");
   await tick();
   stdin.write("\r");

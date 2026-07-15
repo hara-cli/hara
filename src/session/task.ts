@@ -4,7 +4,7 @@ import type { Todo } from "../tools/todo.js";
 
 export const TASK_SCHEMA_VERSION = 1;
 export const MAX_TASK_OBJECTIVE_CHARS = 4096;
-export const MAX_TASK_STEERING_CHARS = 4096;
+export const MAX_TASK_STEERING_CHARS = 24_000;
 export const MAX_TASK_STEERING_ENTRIES = 24;
 
 export type TaskExecutionStatus = "running" | "paused" | "completed" | "blocked";
@@ -17,6 +17,10 @@ export interface TaskSteering {
   turnId: string;
   content: string;
   createdAt: string;
+  /** New entries are a durable inbox until copied into conversation history. Missing means a legacy
+   *  audit-only entry from before delivery tracking existed, so old sessions are never replayed. */
+  deliveryState?: "pending" | "consumed";
+  consumedAt?: string;
 }
 
 /** Durable execution state. It intentionally lives beside, not inside, conversation history. */
@@ -111,12 +115,63 @@ export function recordTaskSteering(
   if (task.turnId !== expectedTurnId) {
     return { ok: false, reason: `stale steer for turn ${expectedTurnId}; active turn is ${task.turnId}` };
   }
+  const normalized = content.replace(/\r\n?/g, "\n").trim() || "(image-only steering)";
+  if (normalized.length > MAX_TASK_STEERING_CHARS) {
+    return { ok: false, reason: `steering input is too large (${normalized.length} chars; maximum ${MAX_TASK_STEERING_CHARS})` };
+  }
   const now = iso(at);
-  const steering = [
+  const steering: TaskSteering[] = [
     ...(task.steering ?? []),
-    { id: randomUUID(), turnId: expectedTurnId, content: boundedText(content, MAX_TASK_STEERING_CHARS), createdAt: now },
-  ].slice(-MAX_TASK_STEERING_ENTRIES);
+    {
+      id: randomUUID(),
+      turnId: expectedTurnId,
+      content: normalized,
+      createdAt: now,
+      deliveryState: "pending",
+    },
+  ];
+  // Never silently evict accepted-but-undelivered input. Prefer dropping the oldest consumed/legacy audit
+  // entry; if all slots are pending, apply backpressure and let the caller surface a retryable queue-full
+  // error instead of acknowledging data that cannot be retained.
+  if (steering.length > MAX_TASK_STEERING_ENTRIES) {
+    const removable = steering.findIndex((entry) => entry.deliveryState !== "pending");
+    if (removable < 0) return { ok: false, reason: `task steering inbox is full (${MAX_TASK_STEERING_ENTRIES}); wait for the running turn to consume it` };
+    steering.splice(removable, 1);
+  }
   return { ok: true, task: { ...task, steering, updatedAt: now } };
+}
+
+export interface ConsumedTaskSteering {
+  task: TaskExecution;
+  entries: TaskSteering[];
+}
+
+/** Mark every accepted inbox entry consumed in one immutable transition. Callers persist the projected
+ *  transcript plus this returned task before exposing the messages to the agent loop, making delivery
+ *  crash-safe and exactly-once. Legacy entries without deliveryState remain audit-only. */
+export function consumePendingTaskSteering(
+  task: TaskExecution | undefined,
+  at: Date | string = new Date(),
+): ConsumedTaskSteering | null {
+  if (!task?.steering?.some((entry) => entry.deliveryState === "pending")) return null;
+  const now = iso(at);
+  const entries = task.steering.filter((entry) => entry.deliveryState === "pending").map((entry) => ({ ...entry }));
+  const steering = task.steering.map((entry) => entry.deliveryState === "pending"
+    ? { ...entry, deliveryState: "consumed" as const, consumedAt: now }
+    : entry);
+  return { task: { ...task, steering, updatedAt: now }, entries };
+}
+
+export function hasPendingTaskSteering(task: TaskExecution | undefined): boolean {
+  return !!task?.steering?.some((entry) => entry.deliveryState === "pending");
+}
+
+/** Idle messages start a new task by default. Only an explicit continuation phrase resumes an unfinished
+ *  execution, matching Codex's separation between steering an active turn and starting the next task. */
+export function requestsTaskContinuation(text: string): boolean {
+  const value = text.trim().toLocaleLowerCase();
+  if (!value) return false;
+  return /^(?:\/(?:continue|resume)(?:\s|$)|(?:continue|resume|go\s+on)(?:[\s,.:;!?，。：；！？]|$)|(?:继续|接着|接着做|继续处理)(?:[\s,.:;!?，。：；！？]|$))/.test(value);
 }
 
 export function finishTaskExecution(
@@ -160,15 +215,19 @@ export function forkTaskExecution(task: TaskExecution | undefined, at: Date | st
     startedAt: now,
     endedAt: now,
     lastOutcome: "interrupted",
-    steering: task.steering?.slice(-MAX_TASK_STEERING_ENTRIES).map((entry) => ({ ...entry })),
+    // A fork copies audit context, never ownership of an executable inbox item. Pending steering remains
+    // pending only in the source session; replaying it in both branches would violate exactly-once delivery.
+    steering: task.steering?.slice(-MAX_TASK_STEERING_ENTRIES).map((entry) => entry.deliveryState === "pending"
+      ? { ...entry, deliveryState: "consumed", consumedAt: now }
+      : { ...entry }),
   };
 }
 
-export function taskExecutionContext(task: TaskExecution, interaction: TaskInteraction): string {
+export function taskExecutionContext(task: TaskExecution, interaction: TaskInteraction, todos: Todo[] = []): string {
   const steeringNote = interaction.kind === "steer"
     ? "This interaction steers the existing task. Refine execution without replacing its objective."
     : "This interaction created a new task.";
-  return [
+  const lines = [
     "# Task execution (authoritative; separate from conversation history)",
     `Task ID: ${task.id}`,
     `Turn ID: ${task.turnId}`,
@@ -176,7 +235,19 @@ export function taskExecutionContext(task: TaskExecution, interaction: TaskInter
     `Interaction: ${interaction.kind}`,
     steeringNote,
     "Conversation messages provide evidence and refinements, but the task objective above remains authoritative until an explicit new task starts.",
-  ].join("\n");
+  ];
+  if (todos.length) {
+    lines.push(
+      "## Persisted execution checkpoint",
+      ...todos.slice(0, 24).map((todo) => {
+        const mark = todo.status === "done" ? "done" : todo.status === "in_progress" ? "in progress" : "pending";
+        return `- [${mark}] ${todo.text.replace(/\s+/g, " ").trim().slice(0, 240)}`;
+      }),
+    );
+    if (todos.length > 24) lines.push(`- … ${todos.length - 24} additional item(s) omitted; call todo_write to inspect/update the full list.`);
+    lines.push("Treat this checklist as the recovery cursor: continue from the first unfinished item, verify current workspace state, and update it as work changes.");
+  }
+  return lines.join("\n");
 }
 
 export function formatTaskExecution(task: TaskExecution | undefined): string {
@@ -207,8 +278,13 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
   return task.steering.every((entry) => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
     const steering = entry as Record<string, unknown>;
+    const deliveryValid = steering.deliveryState === undefined
+      ? steering.consumedAt === undefined
+      : steering.deliveryState === "pending"
+        ? steering.consumedAt === undefined
+        : steering.deliveryState === "consumed" && validTimestamp(steering.consumedAt);
     return validId(steering.id) && validId(steering.turnId) &&
       typeof steering.content === "string" && steering.content.length > 0 && steering.content.length <= MAX_TASK_STEERING_CHARS &&
-      validTimestamp(steering.createdAt);
+      validTimestamp(steering.createdAt) && deliveryValid;
   });
 }

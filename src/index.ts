@@ -70,7 +70,19 @@ import {
 } from "./profile/profile.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
-import { shouldAutoCompact, shouldAutoCompactTokens, AUTO_COMPACT_TOKEN_CAP, COMPACT_SYSTEM, buildFileRestore, workingSetFromSummary } from "./agent/compact.js";
+import {
+  shouldAutoCompact,
+  shouldAutoCompactTokens,
+  AUTO_COMPACT_TOKEN_CAP,
+  COMPACT_SYSTEM,
+  buildFileRestore,
+  compactedConversationHistory,
+  compactedHistoryTokenEstimate,
+  compactionSourceHistory,
+  normalizeCompactionSummary,
+  recentHistoryForCompaction,
+  workingSetFromSummary,
+} from "./agent/compact.js";
 import { recentTouched, clearTouched } from "./agent/touched.js";
 import { INTERJECT_PREFIX, disposeReminderScope } from "./agent/reminders.js";
 import { checkForUpdate } from "./update-check.js";
@@ -97,9 +109,10 @@ import { parseDeliver } from "./cron/deliver.js";
 import { addJob, removeJob, setEnabled, resolveJob, loadJobs, logPath, type CronJob } from "./cron/store.js";
 import { runTick, runJobTracked, runSelfAttached, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
-import { getTools, type Tool } from "./tools/registry.js";
+import { getTools, type Tool, type ToolContext } from "./tools/registry.js";
 import { resetReachability } from "./tools/net-reachability.js";
 import { resetRepeatGuard } from "./agent/repeat-guard.js";
+import { allowsEvolutionTool, EVOLUTION_SYSTEM, evolutionStatus, shouldAutoEvolve } from "./agent/evolution.js";
 import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import { createAnthropicProvider } from "./providers/anthropic.js";
 import { createOpenAIProvider } from "./providers/openai.js";
@@ -151,14 +164,17 @@ import {
   type SessionData,
 } from "./session/store.js";
 import {
+  consumePendingTaskSteering,
   continueTaskExecution,
   createTaskExecution,
   finishTaskExecution,
   formatTaskExecution,
+  hasPendingTaskSteering,
   newSteerInteraction,
   newTurnInteraction,
   recordTaskSteering,
   recoverTaskExecution,
+  requestsTaskContinuation,
   taskExecutionContext,
   type TaskExecution,
   type TaskInteraction,
@@ -947,31 +963,65 @@ const PLAN_SYSTEM =
   "When (and only when) you have a complete, actionable plan, call the `exit_plan` tool with the full plan " +
   "(concise markdown, short numbered steps), then stop and wait for the user's decision. " +
   "If the user is asking a question, or the plan isn't ready yet, just answer normally WITHOUT calling exit_plan.";
-const DISTILL_SYSTEM =
-  "The session is ending. Reflect and persist only durable, reusable learnings: memory_write for facts / " +
-  "conventions / the user's preferences, skill_create for reusable how-tos. Be selective — skip the trivial. Then reply DONE.";
 const MEMORY_DISTILL_SYSTEM =
   "You consolidate an agent's short-term daily memory logs into its durable long-term memory. You're given " +
   "the current durable memory and recent daily logs. Extract ONLY durable, reusable facts / decisions / " +
   "conventions / user preferences from the logs that are NOT already captured, and persist each with " +
   "memory_write (target=memory, or target=user for preferences; pick the right scope=project|global). " +
   "Skip the ephemeral, the one-off, and anything already known. Be terse and de-duplicated. Then reply DONE.";
-// COMPACT_SYSTEM (the 8-section brief) + workingSetFromSummary live in agent/compact.ts so tests can
-// pin their structure and serve's session.compact shares the exact same distillation.
+
+async function curateSessionLearning(
+  provider: Provider,
+  history: NeutralMsg[],
+  cfg: HaraConfig,
+  options: {
+    cwd: string;
+    sandbox: SandboxMode;
+    spawn?: ToolContext["spawn"];
+    ui?: ToolContext["ui"];
+    confirm: (question: string, signal?: AbortSignal) => Promise<boolean | "always">;
+    memory: string;
+    stats: { input: number; output: number; lastInput?: number };
+    signal?: AbortSignal;
+  },
+): Promise<RunOutcome> {
+  // Curation gets a private transcript branch: its DONE/tool chatter must not become task conversation or
+  // create assistant→assistant role adjacency. Memory/skill writes remain the only durable side effects.
+  const curationHistory: NeutralMsg[] = [
+    ...history,
+    { role: "user", content: "Run the evidence-gated self-evolution curation now. If nothing qualifies, write nothing." },
+  ];
+  return runAgent(curationHistory, {
+    provider,
+    ctx: { cwd: options.cwd, sandbox: options.sandbox, spawn: options.spawn, ui: options.ui },
+    approval: cfg.assetCapture === "auto" ? "full-auto" : "suggest",
+    confirm: options.confirm,
+    toolFilter: (name) => allowsEvolutionTool(name, cfg.assetCapture),
+    systemOverride: EVOLUTION_SYSTEM,
+    memory: options.memory,
+    stats: options.stats,
+    signal: options.signal,
+    ...agentRunLimits(cfg),
+  });
+}
+// The bounded checkpoint contract + recent-turn preservation live in agent/compact.ts so CLI and serve
+// cannot drift into different context semantics.
 
 /** Summarize the conversation and replace history with the summary (keeping working-memory notes). Shared by
  *  /compact (manual) and auto-compaction. Returns the summary, or null on failure / nothing to do. */
 async function compactConversation(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, signal?: AbortSignal, task?: TaskExecution): Promise<string | null> {
   if (history.length < 2 || signal?.aborted) return null;
+  const recent = recentHistoryForCompaction(history);
   const r = await boundedProviderTurn(provider, {
     system: COMPACT_SYSTEM,
-    history: [...history, { role: "user", content: "Summarize our conversation so far per the instructions." }],
+    history: [...compactionSourceHistory(history), { role: "user", content: "Create the bounded execution checkpoint now." }],
     tools: [],
     onText: () => {},
   }, { timeoutMs: 60_000, label: "conversation compaction", signal });
   if (signal?.aborted || r.stop === "error") return null;
-  const summary = r.text.trim();
-  if (!summary) return null;
+  const rawSummary = r.text.trim();
+  if (!rawSummary) return null;
+  const summary = normalizeCompactionSummary(rawSummary);
   const workingSet = workingSetFromSummary(summary);
   // TW5-style file restore: the summary alone loses the working set's ACTUAL content — re-attach the
   // most recently touched files (current on-disk state, byte-capped) so work continues without re-reads.
@@ -986,12 +1036,12 @@ async function compactConversation(provider: Provider, history: NeutralMsg[], me
   // Cancellation during the file snapshot must leave the original conversation untouched.
   if (signal?.aborted) return null;
   meta.workingSet = workingSet; // survives the history wipe + injects into the next turns
+  const compacted = compactedConversationHistory(summary, recent, restore);
   history.length = 0;
-  history.push({ role: "user", content: `Summary of our conversation so far (continue from here):\n\n${summary}` });
-  if (restore) history.push({ role: "user", content: restore });
+  history.push(...compacted);
   stats.input += r.usage?.input ?? 0;
   stats.output += r.usage?.output ?? 0;
-  stats.lastInput = r.usage?.input ?? 0; // ctx% now reflects the (small) summary, not the old full turn
+  stats.lastInput = compactedHistoryTokenEstimate(compacted); // reflect replacement, not the large summarizer request
   saveSession(meta, history, task);
   return summary;
 }
@@ -2471,7 +2521,7 @@ memoryCmd
       ctx: { cwd: cfg.cwd, sandbox: cfg.sandbox },
       approval: "full-auto",
       confirm: async () => true,
-      toolFilter: (n) => n === "memory_write" || READONLY_TOOLS.has(n),
+      toolFilter: (n) => allowsEvolutionTool(n, "off"),
       systemOverride: MEMORY_DISTILL_SYSTEM,
       stats,
       ...agentRunLimits(cfg),
@@ -3107,6 +3157,16 @@ program.action(async (opts) => {
       }
       schemaObj = parsed;
     }
+    // Recover any steering that was acknowledged by serve before a crash but had not yet reached a model
+    // round. The next session write commits its transcript copy and consumed marker atomically.
+    const recoveredHeadlessSteering = consumePendingTaskSteering(task);
+    if (recoveredHeadlessSteering) {
+      task = recoveredHeadlessSteering.task;
+      history.push(...recoveredHeadlessSteering.entries.map((entry): NeutralMsg => ({
+        role: "user",
+        content: `${INTERJECT_PREFIX}\n\n${entry.content}`,
+      })));
+    }
     // Inbound images (gateway): the platform downloaded the user's photo(s) and passed their paths via env.
     // Let the agent actually SEE them — attached inline for a vision-capable main model, else described via the
     // visionModel sidecar and folded into the message (text-only models can't take image blocks).
@@ -3137,7 +3197,8 @@ program.action(async (opts) => {
     // A resumed unfinished task keeps its objective; this prompt is a new turn that steers it. A completed
     // task (or a stateless -p run) starts a fresh execution identity. Persist before provider side effects so
     // a crash is recoverable as paused rather than looking like a completed turn.
-    const headlessInteraction: TaskInteraction = task && task.status !== "completed"
+    const headlessInteraction: TaskInteraction = task && task.status !== "completed" &&
+      (recoveredHeadlessSteering !== null || requestsTaskContinuation(String(opts.print)))
       ? newSteerInteraction(task.turnId)
       : newTurnInteraction();
     if (headlessInteraction.kind === "steer") {
@@ -3145,6 +3206,8 @@ program.action(async (opts) => {
       task = continued.ok ? continued.task : createTaskExecution(String(opts.print), headlessInteraction.turnId);
     } else {
       task = createTaskExecution(String(opts.print), headlessInteraction.turnId);
+      clearTodos();
+      if (meta) meta.todos = [];
     }
     if (meta) saveSession(meta, history, task);
     // --role: run this headless turn AS an org role/agent persona (the gateway's /agent switch lands here).
@@ -3180,7 +3243,7 @@ program.action(async (opts) => {
       projectContext,
       memory: memoryDigest(cwd),
       continuationSession,
-      executionContext: taskExecutionContext(task, headlessInteraction),
+      executionContext: taskExecutionContext(task, headlessInteraction, meta?.todos ?? []),
       ...(roleOverride ? { systemOverride: roleOverride } : {}),
       ...(headlessToolFilter ? { toolFilter: headlessToolFilter } : {}),
       hooks: headlessHooks,
@@ -3461,6 +3524,14 @@ program.action(async (opts) => {
   const commands: Slash[] = [
     { name: "help", desc: "show this help", run: () => void out(helpText(commands)) },
     {
+      name: "continue",
+      aliases: ["resume"],
+      desc: "resume the unfinished task: /continue [instruction]",
+      // Interactive loops translate this command into an ordinary model turn before slash dispatch. This
+      // fallback only protects future callers that invoke the command table directly.
+      run: () => void out(c.dim("(type /continue [instruction] in an interactive session)\n")),
+    },
+    {
       name: "init",
       desc: "analyze project & regenerate AGENTS.md",
       run: async () => {
@@ -3637,6 +3708,18 @@ program.action(async (opts) => {
       },
     },
     {
+      name: "new",
+      desc: "start a new task while keeping conversation context",
+      run: () => {
+        task = undefined;
+        resumeTaskPending = false;
+        clearTodos();
+        meta.todos = [];
+        persistSession();
+        out(c.dim("(new task boundary; conversation kept — type the new objective)\n"));
+      },
+    },
+    {
       name: "rewind",
       desc: "fork the conversation back to an earlier turn: /rewind (list) · /rewind <n> (files unchanged)",
       run: (a) => {
@@ -3671,6 +3754,28 @@ program.action(async (opts) => {
       },
     },
     {
+      name: "evolve",
+      desc: "show or run auditable self-evolution: /evolve [status|now]",
+      run: async (a) => {
+        const action = (a ?? "").trim() || "status";
+        if (action === "status") return void out(evolutionStatus(cfg) + "\n");
+        if (action !== "now") return void out(c.dim("usage: /evolve [status|now]\n"));
+        if (cfg.evolve === "off") return void out(c.dim("(self-evolution is off — set `hara config set evolve light|proactive` first)\n"));
+        if (history.length < 2) return void out(c.dim("(not enough session evidence to curate)\n"));
+        out(c.dim("Curating evidence-backed memories and reusable skills…\n"));
+        const outcome = await curateSessionLearning(provider, history, cfg, {
+          cwd,
+          sandbox,
+          spawn,
+          confirm,
+          memory: buildMemory(),
+          stats,
+        });
+        persistSession();
+        out(outcome.status === "completed" ? c.green("(self-evolution curation complete)\n") : c.yellow(`(self-evolution stopped: ${outcome.error ?? outcome.status})\n`));
+      },
+    },
+    {
       name: "compact",
       desc: "summarize the conversation so far to free up context",
       run: async () => {
@@ -3679,6 +3784,21 @@ program.action(async (opts) => {
         currentTurn = compactTurn;
         let summary: string | null = null;
         try {
+          if (cfg.evolve !== "off") {
+            const distill = await curateSessionLearning(provider, history, cfg, {
+              cwd,
+              sandbox,
+              spawn,
+              confirm,
+              memory: buildMemory(),
+              stats,
+              signal: compactTurn.signal,
+            });
+            if (distill.status !== "completed") {
+              out(c.yellow(`(compact cancelled — self-evolution stopped: ${distill.error ?? distill.status})\n`));
+              return;
+            }
+          }
           summary = await compactConversation(provider, history, meta, stats, compactTurn.signal, task);
         } finally {
           if (currentTurn === compactTurn) currentTurn = null;
@@ -3727,7 +3847,23 @@ program.action(async (opts) => {
         out(c.dim("(context cleared)\n"));
       },
     },
-    { name: "exit", aliases: ["quit"], desc: "leave", run: () => "exit" },
+    {
+      name: "exit",
+      aliases: ["quit"],
+      desc: "leave",
+      run: async () => {
+        if (shouldAutoEvolve(cfg.evolve, history.length)) {
+          out(c.dim("Distilling session learnings…\n"));
+          try {
+            await curateSessionLearning(provider, history, cfg, { cwd, sandbox, spawn, confirm, memory: buildMemory(), stats });
+            persistSession();
+          } catch {
+            /* exiting remains available if optional curation fails */
+          }
+        }
+        return "exit";
+      },
+    },
   ];
   const byName = new Map<string, Slash>();
   for (const cmd of commands) {
@@ -3888,26 +4024,36 @@ program.action(async (opts) => {
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
       onSubmit: async (line, h, images, interaction) => {
+        // `/continue` is a task interaction, not a control-only command: turn it into a model message before
+        // slash dispatch, preserving the submitted turn id while explicitly targeting the unfinished task.
+        const continueCommand = /^\/(?:continue|resume)(?:\s+([\s\S]+))?$/i.exec(line.trim());
+        if (continueCommand) {
+          if (!task || task.status === "completed") return void h.sink.notice("(there is no unfinished task to continue)");
+          line = continueCommand[1]?.trim() || "continue";
+          interaction = {
+            kind: "steer",
+            expectedTurnId: task.turnId,
+            turnId: interaction?.turnId ?? newTurnInteraction().turnId,
+          };
+        }
         // A dropped/pasted file path (`/Users/…/doc.md`, maybe trailing text/images) starts with '/' but
         // is NOT a command — treat it as a file to read, not "Unknown command" (see isSlashCommand).
         if (isSlashCommand(line)) {
           const [nm, ...rest] = line.slice(1).split(/\s+/);
           const arg = rest.join(" ").trim();
           if (nm === "exit" || nm === "quit") {
-            if (cfg.evolve === "proactive" && history.length >= 4) {
+            if (shouldAutoEvolve(cfg.evolve, history.length)) {
               h.sink.notice("✻ distilling session learnings…");
               try {
-                await runAgent(history, {
-                  provider,
-                  ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice } },
-                  approval: cfg.assetCapture === "auto" ? "full-auto" : "suggest", // ask → prompt before each save; auto → silent
+                await curateSessionLearning(provider, history, cfg, {
+                  cwd,
+                  sandbox,
+                  spawn,
+                  ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice },
                   confirm: h.confirm,
-                  toolFilter: (n) => n === "memory_write" || (cfg.assetCapture !== "off" && n === "skill_create") || READONLY_TOOLS.has(n),
-                  systemOverride: DISTILL_SYSTEM,
                   memory: buildMemory(),
                   stats,
                   signal: h.signal,
-                  ...agentRunLimits(cfg),
                 });
                 persistSession();
               } catch {
@@ -3919,6 +4065,25 @@ program.action(async (opts) => {
           if (nm === "help") return void h.sink.notice(commands.map((x) => `/${x.name} — ${x.desc}`).join("\n"));
           if (nm === "tools")
             return void h.sink.notice(getTools().map((t) => `${t.name}${t.kind !== "read" ? " *" : ""} — ${t.description}`).join("\n"));
+          if (nm === "evolve") {
+            if (!arg || arg === "status") return void h.sink.notice(evolutionStatus(cfg));
+            if (arg !== "now") return void h.sink.notice("usage: /evolve [status|now]");
+            if (cfg.evolve === "off") return void h.sink.notice("(self-evolution is off — set `hara config set evolve light|proactive` first)");
+            if (history.length < 2) return void h.sink.notice("(not enough session evidence to curate)");
+            h.sink.notice("✻ curating evidence-backed memories and reusable skills…");
+            const outcome = await curateSessionLearning(provider, history, cfg, {
+              cwd,
+              sandbox,
+              spawn,
+              ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice },
+              confirm: h.confirm,
+              memory: buildMemory(),
+              stats,
+              signal: h.signal,
+            });
+            persistSession();
+            return void h.sink.notice(outcome.status === "completed" ? "(self-evolution curation complete)" : `(self-evolution stopped: ${outcome.error ?? outcome.status})`);
+          }
           if (nm === "reset" || nm === "clear") {
             history.length = 0;
             task = undefined;
@@ -4000,6 +4165,14 @@ program.action(async (opts) => {
             }
             return void h.sink.notice(formatTaskExecution(task));
           }
+          if (nm === "new") {
+            task = undefined;
+            resumeTaskPending = false;
+            clearTodos();
+            meta.todos = [];
+            persistSession();
+            return void h.sink.notice("(new task boundary; conversation kept — type the new objective)");
+          }
           if (nm === "rewind") {
             if (!arg) {
               const turns = userTurnPreviews(history);
@@ -4032,17 +4205,15 @@ program.action(async (opts) => {
             let distillOutcome: RunOutcome | undefined;
             if (cfg.evolve !== "off") {
               try {
-                distillOutcome = await runAgent(history, {
-                  provider,
-                  ctx: { cwd, sandbox, spawn, ui: cui },
-                  approval: cfg.assetCapture === "auto" ? "full-auto" : "suggest", // ask → prompt before each save; auto → silent
+                distillOutcome = await curateSessionLearning(provider, history, cfg, {
+                  cwd,
+                  sandbox,
+                  spawn,
+                  ui: cui,
                   confirm: h.confirm,
-                  toolFilter: (n) => n === "memory_write" || (cfg.assetCapture !== "off" && n === "skill_create") || READONLY_TOOLS.has(n),
-                  systemOverride: DISTILL_SYSTEM,
                   memory: buildMemory(),
                   stats,
                   signal: h.signal,
-                  ...agentRunLimits(cfg),
                 });
               } catch {
                 return void h.sink.notice("(compact cancelled — memory distillation did not complete)");
@@ -4142,6 +4313,8 @@ program.action(async (opts) => {
             if (sk) {
               h.sink.notice(`↗ entering ${sk.id}…`);
               resumeTaskPending = false; // an explicit skill entry starts its own task
+              clearTodos();
+              meta.todos = [];
               const skillContent = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${arg ? ` — request: ${arg}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
               const skillInteraction = interaction ?? newTurnInteraction();
               if (skillInteraction.kind === "steer") {
@@ -4186,7 +4359,8 @@ program.action(async (opts) => {
         const ui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
         const appr = h.approval;
         let submittedInteraction: TaskInteraction = interaction ?? newTurnInteraction();
-        if (resumeTaskPending && task && submittedInteraction.kind === "turn") {
+        if (resumeTaskPending && task && submittedInteraction.kind === "turn" &&
+          (hasPendingTaskSteering(task) || requestsTaskContinuation(line))) {
           submittedInteraction = { kind: "steer", expectedTurnId: task.turnId, turnId: submittedInteraction.turnId };
         }
         const beginExecution = (objective: string): string | null => {
@@ -4199,15 +4373,17 @@ program.action(async (opts) => {
             task = continued.task;
           } else {
             task = createTaskExecution(objective, submittedInteraction.turnId);
+            clearTodos();
+            meta.todos = [];
           }
           resumeTaskPending = false;
-          return taskExecutionContext(task, submittedInteraction);
+          return taskExecutionContext(task, submittedInteraction, meta.todos ?? []);
         };
         // Type-ahead steering: fold messages typed mid-turn into the next model call (codex-style) so a
         // clarification/addition course-corrects the live task, rather than waiting for a fresh turn.
         // Shared by every turn below (plan investigate, plan execute, and the regular turn).
         const pendingInput = async (): Promise<NeutralMsg[]> => {
-          const out: NeutralMsg[] = [];
+          const freshMessages = new Map<string, NeutralMsg>();
           for (const it of h.drainQueue()) {
             const r2 = await resolveImages(it.images, h);
             const body = await expandMentionsAsync(it.line, cwd, { signal: h.signal }) + (r2.skip ? "" : (r2.extraText ?? ""));
@@ -4219,12 +4395,24 @@ program.action(async (opts) => {
               continue;
             }
             task = recorded.task;
-            out.push({ role: "user", content: `${INTERJECT_PREFIX}\n\n${body}`, ...(attach ? { images: attach } : {}) });
+            const accepted = task.steering?.at(-1);
+            if (accepted?.deliveryState === "pending") {
+              freshMessages.set(accepted.id, { role: "user", content: `${INTERJECT_PREFIX}\n\n${body}`, ...(attach ? { images: attach } : {}) });
+            }
           }
-          // runAgent appends these immediately after return. Persist an equivalent snapshot first so an
-          // abrupt process exit cannot lose accepted steering while retaining a running task identity.
-          if (out.length) saveSession(meta, [...history, ...out], task);
-          return out;
+          const consumed = consumePendingTaskSteering(task);
+          if (!consumed) return [];
+          const out = consumed.entries.map((entry): NeutralMsg => freshMessages.get(entry.id) ?? ({
+            role: "user",
+            content: `${INTERJECT_PREFIX}\n\n${entry.content}`,
+          }));
+          // Persist the projected transcript and consumed inbox state first, then update the same live
+          // history synchronously. Returning [] prevents runAgent from appending the messages twice;
+          // loop from appending twice; cancellation/error saves can no longer overwrite the projected input.
+          saveSession(meta, [...history, ...out], consumed.task);
+          task = consumed.task;
+          history.push(...out);
+          return [];
         };
         const turnStart = Date.now(); // for the task-done notification (gated on elapsed)
         if (appr === "plan") {
@@ -4419,6 +4607,16 @@ program.action(async (opts) => {
     }
     bar.renderBottom(); // bottom border + modes/usage
     if (!line) continue;
+    let forcedContinuation: Extract<TaskInteraction, { kind: "steer" }> | undefined;
+    const continueCommand = /^\/(?:continue|resume)(?:\s+([\s\S]+))?$/i.exec(line);
+    if (continueCommand) {
+      if (!task || task.status === "completed") {
+        out(c.dim("(there is no unfinished task to continue)\n"));
+        continue;
+      }
+      line = continueCommand[1]?.trim() || "continue";
+      forcedContinuation = newSteerInteraction(task.turnId);
+    }
     // A dropped/pasted file path starts with '/' but isn't a command — read it, don't error (see TUI path).
     if (isSlashCommand(line)) {
       const [name, ...rest] = line.slice(1).split(/\s+/);
@@ -4432,6 +4630,8 @@ program.action(async (opts) => {
           const skillContent = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest.length ? ` — request: ${rest.join(" ")}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
           const skillInteraction = newTurnInteraction();
           resumeTaskPending = false;
+          clearTodos();
+          meta.todos = [];
           task = createTaskExecution(rest.join(" ") || `enter ${sk.id}`, skillInteraction.turnId);
           const skillExecutionContext = taskExecutionContext(task, skillInteraction);
           history.push({ role: "user", content: skillContent });
@@ -4468,8 +4668,18 @@ program.action(async (opts) => {
     line = inlineLeadingPath(line, existsSync); // leading dropped file path → @-mention so it's read in
     const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd);
     recalledContext = "";
-    let interaction: TaskInteraction = newTurnInteraction();
-    if (resumeTaskPending && task) interaction = newSteerInteraction(task.turnId);
+    const recoveredClassicSteering = consumePendingTaskSteering(task);
+    if (recoveredClassicSteering) {
+      task = recoveredClassicSteering.task;
+      history.push(...recoveredClassicSteering.entries.map((entry): NeutralMsg => ({
+        role: "user",
+        content: `${INTERJECT_PREFIX}\n\n${entry.content}`,
+      })));
+    }
+    let interaction: TaskInteraction = forcedContinuation ?? newTurnInteraction();
+    if (resumeTaskPending && task && (recoveredClassicSteering !== null || requestsTaskContinuation(line))) {
+      interaction = newSteerInteraction(task.turnId);
+    }
     if (interaction.kind === "steer") {
       const continued = continueTaskExecution(task, interaction);
       if (!continued.ok) {
@@ -4479,9 +4689,11 @@ program.action(async (opts) => {
       task = continued.task;
     } else {
       task = createTaskExecution(line, interaction.turnId);
+      clearTodos();
+      meta.todos = [];
     }
     resumeTaskPending = false;
-    const executionContext = taskExecutionContext(task, interaction);
+    const executionContext = taskExecutionContext(task, interaction, meta.todos ?? []);
     history.push({ role: "user", content: userContent });
     persistSession();
     if (cfg.fileCheckpoints) checkpoint(cwd, userContent.slice(0, 80)); // shadow-git snapshot before the turn mutates

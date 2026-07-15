@@ -370,6 +370,9 @@ test("serve e2e: session.steer targets the live turn and stays in the same task"
     });
     assert.equal(steered.result.accepted, true);
     assert.equal(steered.result.taskId, started.params.taskId, "steering does not replace task identity");
+    const acceptedSnapshot = store.saved.get(result.sessionId);
+    assert.equal(acceptedSnapshot.task.steering[0].deliveryState, "pending", "ACK happens only after executable input is durable");
+    assert.ok(!acceptedSnapshot.history.some((message) => message.role === "user" && message.content.includes("also cover the edge case")), "write-ahead inbox has not pretended the model consumed it yet");
 
     releaseFirst();
     const sent = await sending;
@@ -380,6 +383,7 @@ test("serve e2e: session.steer targets the live turn and stays in the same task"
     const saved = store.saved.get(result.sessionId);
     assert.equal(saved.task.objective, "primary objective", "original objective remains authoritative");
     assert.equal(saved.task.steering.length, 1, "accepted steer has a bounded durable audit entry");
+    assert.equal(saved.task.steering[0].deliveryState, "consumed", "transcript delivery commits exactly once");
   } finally {
     releaseFirst?.();
     if (sending) await sending.catch(() => {});
@@ -389,7 +393,57 @@ test("serve e2e: session.steer targets the live turn and stays in the same task"
   }
 });
 
-test("serve e2e: the first send resumes an unfinished task unless newTask is explicit", { timeout: 20000 }, async () => {
+test("serve e2e: interrupt after steer cannot overwrite the write-ahead transcript", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-steer-interrupt-"));
+  const store = memStore();
+  let releaseFirst;
+  let calls = 0;
+  const providerHistories = [];
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ history, onText }) {
+      calls++;
+      providerHistories.push(structuredClone(history));
+      if (calls === 1) {
+        await new Promise((resolve) => { releaseFirst = resolve; }); // deliberately ignores AbortSignal
+        return { text: "late", toolUses: [], stop: "end" };
+      }
+      onText("recovered");
+      return { text: "recovered", toolUses: [], stop: "end" };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  let sending;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    sending = c.call("session.send", { sessionId: result.sessionId, text: "primary" });
+    const started = await c.waitEvent("event.turn_start");
+    const steer = await c.call("session.steer", { sessionId: result.sessionId, text: "must survive interrupt", expectedTurnId: started.params.turnId });
+    assert.equal(steer.result.accepted, true);
+    await c.call("session.interrupt", { sessionId: result.sessionId });
+    const interrupted = await sending;
+    assert.ok(interrupted.error, "owning send ends as interrupted");
+
+    const afterInterrupt = store.saved.get(result.sessionId);
+    assert.equal(afterInterrupt.task.steering[0].deliveryState, "consumed");
+    assert.equal(afterInterrupt.history.filter((message) => message.role === "user" && message.content.includes("must survive interrupt")).length, 1);
+
+    const resumed = await c.call("session.send", { sessionId: result.sessionId, text: "继续" });
+    assert.equal(resumed.result.reply, "recovered");
+    assert.equal(providerHistories[1].filter((message) => message.role === "user" && message.content.includes("must survive interrupt")).length, 1, "recovery sees the accepted steer exactly once");
+  } finally {
+    releaseFirst?.();
+    if (sending) await sending.catch(() => {});
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: only an explicit continuation resumes an unfinished task", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-resume-task-"));
   const store = memStore();
   const sessionId = randomUUID();
@@ -428,12 +482,12 @@ test("serve e2e: the first send resumes an unfinished task unless newTask is exp
     assert.equal(resumed.result.task.id, paused.id);
 
     const continued = await c.call("session.send", { sessionId, text: "continue and verify" });
-    assert.equal(continued.result.taskId, paused.id, "ordinary first send keeps the recovered task identity");
+    assert.equal(continued.result.taskId, paused.id, "an explicit continuation keeps the recovered task identity");
     assert.match(systems[0], /Objective: finish the original migration/);
     assert.doesNotMatch(systems[0], /Objective: continue and verify/);
 
-    const fresh = await c.call("session.send", { sessionId, text: "start a separate audit", newTask: true });
-    assert.notEqual(fresh.result.taskId, paused.id, "newTask explicitly starts another task");
+    const fresh = await c.call("session.send", { sessionId, text: "start a separate audit" });
+    assert.notEqual(fresh.result.taskId, paused.id, "an ordinary idle message starts a separate task by default");
     assert.match(systems[1], /Objective: start a separate audit/);
   } finally {
     c.close();
@@ -710,14 +764,15 @@ test("serve e2e: files.search + session.context + compact + rewind (codex deskto
     const oor = await c.call("session.rewind", { sessionId: sid, n: 99 });
     assert.equal(oor.error.code, -32602, "out-of-range n → params error");
 
-    // session.compact: history replaced with a summary (fake provider's "hello"), notes kept
+    // session.compact: bounded checkpoint + recent turn anchor (fake provider's weak "hello" is normalized)
     const comp = await c.call("session.compact", { sessionId: sid });
-    assert.ok(comp.result.history[0].text.startsWith("Summary of our conversation"), "history replaced by summary");
+    assert.ok(comp.result.history[0].text.startsWith("Execution checkpoint"), "history begins with a structured checkpoint");
+    assert.ok(comp.result.history.some((message) => message.text === "one"), "recent exact turn survives compaction");
     assert.ok(comp.result.notes >= 1, "working notes distilled");
     assert.ok(comp.result.ctx && typeof comp.result.ctx.pct === "number", "compact returns fresh ctx");
     const notices = c.events.filter((e) => e.method === "event.notice").map((e) => e.params.text);
     assert.ok(notices.some((t) => t.includes("Compacting")), "compaction announced");
-    assert.ok(store.saved.get(sid).history.length <= 2, "compacted history persisted");
+    assert.equal(store.saved.get(sid).history.length, comp.result.history.length, "checkpoint and recent anchor persisted together");
     // compacting an (effectively) empty session refuses politely
     const { result: fresh } = await c.call("session.create", {});
     const nothing = await c.call("session.compact", { sessionId: fresh.sessionId });
@@ -726,11 +781,11 @@ test("serve e2e: files.search + session.context + compact + rewind (codex deskto
     // session.fork: duplicate history into a NEW live session; original untouched
     const fk = await c.call("session.fork", { sessionId: sid });
     assert.ok(fk.result.sessionId && fk.result.sessionId !== sid, "fork got a fresh id");
-    assert.equal(fk.result.history.length, 1, "fork copied the (compacted) history");
+    assert.equal(fk.result.history.length, comp.result.history.length, "fork copied the compacted checkpoint plus recent anchor");
     assert.ok(store.saved.has(fk.result.sessionId), "fork persisted immediately");
     const fsend = await c.call("session.send", { sessionId: fk.result.sessionId, text: "diverge" });
     assert.equal(fsend.result.reply, "hello", "fork is a working session");
-    assert.equal(store.saved.get(sid).history.length <= 2, true, "original unchanged by fork's turn");
+    assert.equal(store.saved.get(sid).history.length, comp.result.history.length, "original unchanged by fork's turn");
     const nofork = await c.call("session.fork", { sessionId: "nope" });
     assert.equal(nofork.error.code, -32003, "fork of unknown session errors");
 

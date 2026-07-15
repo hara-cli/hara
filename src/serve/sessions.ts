@@ -41,10 +41,6 @@ export interface ServeSession {
   meta: SessionMeta;
   history: NeutralMsg[];
   task?: TaskExecution;
-  /** The next ordinary send resumes this unfinished task unless the client explicitly requests a new one. */
-  resumeTaskPending: boolean;
-  /** Accepted mid-turn steering waiting for runAgent's next provider round. */
-  pendingInput: NeutralMsg[];
   provider: Provider;
   approval: ApprovalMode;
   autoApprove: Set<string>; // "don't ask again" tool names, session-scoped (runAgent mutates it)
@@ -97,7 +93,7 @@ export class SessionHub {
     };
     const lock = this.store.acquire(meta.id); // fresh UUID, but filesystem errors must still fail closed
     if (!lock.ok) throw new Error(`could not acquire session lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
-    const s: ServeSession = { meta, history: [], resumeTaskPending: false, pendingInput: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
+    const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
     try {
       this.sessions.set(meta.id, s);
       this.store.save(meta, []); // an empty newly-created thread must survive restart and appear in lists
@@ -126,7 +122,7 @@ export class SessionHub {
       // Credential/provider routing is live, while the model remains the session's explicit pin.
       prior.meta.provider = o.provider.id;
       const task = recoverTaskExecution(prior.task);
-      const s: ServeSession = { meta: prior.meta, history: [...prior.history], task, resumeTaskPending: Boolean(task && task.status !== "completed"), pendingInput: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
+      const s: ServeSession = { meta: prior.meta, history: [...prior.history], task, provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
       this.sessions.set(id, s);
       keepLock = true; // live session owns it until delete/releaseAll
       return { session: s };
@@ -166,6 +162,16 @@ export class SessionHub {
       if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
     }
     this.store.save(s.meta, s.history, s.task);
+  }
+
+  /** Persist a projected transcript/task transition without mutating the live arrays first. Steering uses
+   *  this write-ahead snapshot so an accepted inbox item is durable in history before runAgent observes it. */
+  saveSnapshot(s: ServeSession, history: NeutralMsg[], task: TaskExecution | undefined): void {
+    if (!s.meta.title) {
+      const first = history.find((m) => m.role === "user");
+      if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
+    }
+    this.store.save(s.meta, history, task);
   }
 
   /** Rename a session (live or on-disk). Returns false when the id is unknown. */
@@ -225,8 +231,6 @@ export class SessionHub {
       meta,
       history: [...src.history],
       task: forkTaskExecution(src.task),
-      resumeTaskPending: Boolean(src.task),
-      pendingInput: [],
       provider: o.provider,
       approval: o.approval,
       autoApprove: new Set(),

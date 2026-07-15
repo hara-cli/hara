@@ -2,7 +2,7 @@
 // Pins: (a) the queue/wrap contract incl. the ignore-if-irrelevant disclaimer, (b) the loop injecting
 // queued reminders as ONE user message before the next model call, (c) staleness firing after
 // TODO_STALE_ROUNDS untouched rounds and resetting on todo_write, (d) quiet (sub-agent) runs neither
-// draining nor nagging, and (e) the 8-section compaction brief keeping user messages verbatim.
+// draining nor nagging, and (e) the bounded checkpoint compaction contract.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { pushReminder, drainReminders, wrapReminders, todoStaleReminder, TODO_STALE_ROUNDS, disposeReminderScope } from "../dist/agent/reminders.js";
@@ -124,12 +124,12 @@ test("loop: quiet (sub-agent) runs neither drain reminders nor nag", async () =>
   clearTodos();
 });
 
-test("COMPACT_SYSTEM: 8 sections incl. verbatim user messages + key technical concepts", () => {
-  for (const heading of ["Goal", "Key technical concepts", "Key decisions", "Files & code", "Errors & fixes", "Current state", "All user messages", "Next step"]) {
+test("COMPACT_SYSTEM: structured checkpoint preserves exact state without copying the transcript", () => {
+  for (const heading of ["Goal and latest request", "Constraints and preferences", "Decisions and exact identifiers", "Completed and verified", "Files and artifacts", "Failures and corrections", "Current execution checkpoint", "Pending work and blockers", "Next concrete action"]) {
     assert.ok(COMPACT_SYSTEM.includes(heading), `section present: ${heading}`);
   }
-  assert.ok(/verbatim and in order/.test(COMPACT_SYSTEM), "user messages preserved verbatim (anti-drift)");
-  assert.ok(/8\./.test(COMPACT_SYSTEM), "numbered through 8");
+  assert.ok(/DO NOT copy the full transcript/.test(COMPACT_SYSTEM), "summary cannot defeat compaction by replaying every message");
+  assert.ok(/exact file paths/.test(COMPACT_SYSTEM), "exact identifiers survive the checkpoint");
 });
 
 test("synthesis nudge: a ≥3-agent fan-out round injects the merge reminder before the next call", async () => {

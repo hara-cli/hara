@@ -21,14 +21,21 @@ import { onTurnPhase, turnPhase, type TurnPhase } from "../agent/phase.js";
 import { listJobs, onJobsChange } from "../exec/jobs.js";
 import { ModelPicker } from "./model-picker.js";
 import type { ReasoningStyle, Effort } from "../providers/reasoning.js";
-import { newSteerInteraction, newTurnInteraction, type TaskInteraction } from "../session/task.js";
+import { newSteerInteraction, newTurnInteraction, requestsTaskContinuation, type TaskInteraction } from "../session/task.js";
 
-export interface QueuedInput {
+interface QueuedBase {
   line: string;
   images?: ImageAttachment[];
+}
+export interface QueuedSteerInput extends QueuedBase {
+  mode: "steer";
   /** The exact live turn this input was intended to steer. */
   expectedTurnId: string;
 }
+export interface QueuedNextInput extends QueuedBase {
+  mode: "next";
+}
+export type QueuedInput = QueuedSteerInput | QueuedNextInput;
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -54,7 +61,7 @@ export interface Helpers {
   approval: Approval;
   /** Type-ahead steering: drain messages queued while the turn ran (shows each inline), for the
    *  runner to inject before the next model call. Returns [] when nothing is queued. */
-  drainQueue: () => QueuedInput[];
+  drainQueue: () => QueuedSteerInput[];
 }
 /** Structured identity/header info — the runtime (index.ts) builds this once, the view
  *  branches on `kind` to render `personal` vs `org` differently (顾雅 spec). Keep this
@@ -473,7 +480,7 @@ function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]
   return (
     <Box marginTop={1}>
       <Text color="yellow">{frames[frame % frames.length]}</Text>
-      <Text dimColor>{` ${verb} · ⏎ steers task${queued ? ` (${queued})` : ""}`}</Text>
+      <Text dimColor>{` ${verb} · ⏎ steers · /next queues${queued ? ` (${queued})` : ""}`}</Text>
     </Box>
   );
 }
@@ -677,11 +684,13 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   // Type-ahead steering: hand the runner everything queued while the turn ran, showing each message
   // inline (as a user block) at the point it gets folded into the conversation. Drained mid-turn so an
   // addition reaches the model on its next call; whatever's still queued at turn end is the effect below.
-  const drainQueue = useCallback((): QueuedInput[] => {
+  const drainQueue = useCallback((): QueuedSteerInput[] => {
     if (!queueRef.current.length) return [];
-    const batch = queueRef.current;
-    queueRef.current = [];
-    setPool([]);
+    const barrier = queueRef.current.findIndex((item) => item.mode === "next");
+    const batch = (barrier < 0 ? queueRef.current : queueRef.current.slice(0, barrier)) as QueuedSteerInput[];
+    if (!batch.length) return [];
+    queueRef.current = barrier < 0 ? [] : queueRef.current.slice(barrier);
+    setPool(queueRef.current.map((item) => `${item.mode === "next" ? "next: " : ""}${item.line.trim() || "🖼 (image)"}`));
     if (batch.some((b) => b.images?.length)) noteVisionIfNeeded();
     for (const b of batch) pushCurrent("user", b.line.trim() || "🖼 (image)");
     return batch;
@@ -713,12 +722,22 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       }
       if ((!t && !images?.length) || prompt) return; // nothing to send, or a choice is pending
       if (working) {
-        // Bind every type-ahead message to the exact live turn. A stale message must never silently become
-        // a new task after another turn starts (Codex's expected_turn_id steering invariant).
+        // Enter steers the live turn; `/next …` creates an explicit queue barrier for a separate next task.
+        // Once such a barrier exists, later type-ahead stays behind it instead of leaking backward.
         const expectedTurnId = activeTurnRef.current;
         if (!expectedTurnId) return;
-        queueRef.current.push({ line, images, expectedTurnId });
-        setPool(queueRef.current.map((q) => q.line.trim() || "🖼 (image)"));
+        const next = /^\/(?:next|queue)(?:\s+([\s\S]+))?$/.exec(t);
+        if (next && !next[1]?.trim() && !images?.length) {
+          pushCurrent("notice", "usage: /next <message>  (queues a separate task after the current turn)");
+          return;
+        }
+        const behindBarrier = queueRef.current.some((item) => item.mode === "next");
+        if (next || behindBarrier) {
+          queueRef.current.push({ mode: "next", line: next?.[1]?.trim() || line, images });
+        } else {
+          queueRef.current.push({ mode: "steer", line, images, expectedTurnId });
+        }
+        setPool(queueRef.current.map((item) => `${item.mode === "next" ? "next: " : ""}${item.line.trim() || "🖼 (image)"}`));
         return;
       }
       const interaction: TaskInteraction = forcedInteraction ?? newTurnInteraction();
@@ -726,7 +745,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       // Fold the previous turn's checklist NOW, at the natural boundary (a new task begins). The old
       // 30s-idle timer yanked the input box UP by the panel's height while the user was reading/typing
       // (anti-bob); folding on submit means the shrink coincides with the user's own action.
-      if (interaction.kind === "turn" && currentTodos().length) {
+      const controlCommand = /^\/[a-z][\w-]*(?:\s|$)/i.test(t);
+      if (interaction.kind === "turn" && !controlCommand && !requestsTaskContinuation(t) && currentTodos().length) {
         const list = currentTodos();
         const done = list.filter((td) => td.status === "done").length;
         setHistory((h) => [...h, { id: nid(), kind: "notice", text: `  ✓ Todos: ${done}/${list.length} done` }]);
@@ -865,19 +885,29 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     [working, prompt, askText, onSubmit, pushCurrent, model, exit, drainQueue, noteVisionIfNeeded],
   );
 
-  // A message can arrive after runAgent's final pending-input drain but before the view flips to idle. Keep
-  // its original expectedTurnId and run it as a STEER continuation of that task — never as an ordinary new
-  // task inferred from queue timing.
+  // A message can arrive after runAgent's final pending-input drain but before the view flips to idle. Late
+  // steer groups retain expectedTurnId; explicit `/next` groups start ordinary task turns in FIFO order.
   useEffect(() => {
     if (working || prompt || askText || drainingRef.current || !queueRef.current.length) return;
     drainingRef.current = true;
     const batch = queueRef.current;
     queueRef.current = [];
     setPool([]);
-    const line = batch.map((b) => b.line).join("\n\n");
-    const images = batch.flatMap((b) => b.images ?? []);
-    const expectedTurnId = batch[0]!.expectedTurnId;
-    void Promise.resolve(handleSubmit(line, images.length ? images : undefined, newSteerInteraction(expectedTurnId))).finally(() => {
+    void (async () => {
+      for (let at = 0; at < batch.length;) {
+        const mode = batch[at]!.mode;
+        let end = at + 1;
+        while (end < batch.length && batch[end]!.mode === mode) end++;
+        const group = batch.slice(at, end);
+        const line = group.map((item) => item.line).join("\n\n");
+        const images = group.flatMap((item) => item.images ?? []);
+        const forced = mode === "steer"
+          ? newSteerInteraction((group[0] as QueuedSteerInput).expectedTurnId)
+          : undefined;
+        await handleSubmit(line, images.length ? images : undefined, forced);
+        at = end;
+      }
+    })().finally(() => {
       drainingRef.current = false;
     });
   }, [working, prompt, askText, handleSubmit]);

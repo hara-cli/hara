@@ -14,7 +14,7 @@
 - **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**), and `hara plan --parallel` runs independent atoms concurrently.
 - **Drive it from chat** — `hara gateway` runs your local hara from **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk · WeCom · Signal** (10 platforms), with **two-way images where the platform has a byte-upload API**, resumable per-chat sessions, project/agent roaming, bounded per-thread queues, and approval-gated group automations. Connects out — no public webhook. See **[docs/gateway.md](docs/gateway.md)**.
 - **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only investigation → the model submits its plan via `exit_plan` → approve → execute), selectable approvals with "don't ask again", windowed reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
-- **Persistent memory + self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting, **proactively saves** durable facts, and grows its own playbooks (a lexical guard screens what it writes). Inspect/consolidate it with **`hara memory show`** and **`hara memory distill`** (promote recent daily logs → durable memory). Lexical-first by design — semantic search is opt-in, never required.
+- **Persistent memory + auditable self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting and can curate evidence-backed facts/preferences plus verified reusable skills. `/evolve status|now` shows or runs the bounded curation policy; it never grants permission to rewrite product code, permissions, config, or system prompts. Inspect/consolidate with **`hara memory show`** and **`hara memory distill`**. Lexical-first by design — semantic search is opt-in, never required.
 - **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
 - **Delegate to other agents** — the **`external_agent`** tool hands a self-contained task to **Claude Code** or **Codex** running headless, and returns the result — so you pick the best engine per task. It is a trusted extension outside Hara's protected-file boundary: every interactive call requires confirmation, and non-interactive use is disabled by default.
 - **Honest under a slow network** — a live "waiting for the model… Ns" status, a stall watchdog that
@@ -195,9 +195,10 @@ stderr and missing/invalid output exits non-zero. `--role reviewer` resolves loc
 uses the portable global persona in the current project, and `--role shop:reviewer` runs at that registered
 project home. Each form enforces the role's persona, model, `allowTools`/`denyTools`, and `readOnly` policy.
 
-Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/task` `/usage`
+Inside the REPL: `/help` `/init` `/tools` `/model` `/approval` `/org` `/plan` `/roles` `/task` `/continue` `/new` `/evolve` `/usage`
 `/doctor` `/sessions` `/undo` `/compact` `/recall` `/reset` `/exit` (type `/`+Tab to complete). `/task`
-shows the active execution record; `/task clear` drops it without deleting the conversation. Type `@` + Tab
+shows the active execution record; `/task clear` drops it without deleting the conversation, and `/new` starts
+a new task while retaining useful thread context. Type `@` + Tab
 to attach a file (fuzzy, walks subdirectories).
 
 The interactive REPL is an **ink TUI**: a bordered **input box pinned at the bottom** — session name in
@@ -257,11 +258,12 @@ by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and a once-
 vision model into **actionable** output — interactive elements + positions (pass `focus` to target what you're after) — so even a text-only main model can click.
 **Sessions and task execution**: conversations are saved automatically — `-c` / `--resume <id>` or
 `hara resume <id>` to continue, `hara sessions` to list, `hara export [id] [--out file]` to render one as a
-Markdown transcript. The current task is persisted separately with stable task/turn identity and resumes as
-paused rather than being inferred from chat text; `/task` inspects it and `/task clear` leaves the transcript
-intact. Type-ahead input steers the exact live turn. Desktop/serve clients can use `session.steer` with
-`expectedTurnId`, and may pass `newTask: true` to `session.send` when an unfinished resumed task should be
-replaced explicitly. The `hara resume` launcher preserves terminal input in both npm/Node and standalone-binary
+Markdown transcript. The current task is persisted separately with stable task/turn identity and recovers as
+paused rather than being inferred from chat text. At idle, ordinary input starts a new task; an explicit
+`继续` / `continue` / `resume` / `go on` resumes the paused objective, while `/new` forces a clean task boundary.
+Type-ahead Enter steers the exact live turn; `/next <message>` queues a separate task after it. Desktop/serve
+clients use `session.steer` with `expectedTurnId` (durable before ACK) and may pass `newTask: true` to force a
+new execution. The `hara resume` launcher preserves terminal input in both npm/Node and standalone-binary
 installs.
 **MCP**: add an `mcpServers` map to global config (a reviewed project config additionally needs `HARA_TRUST_PROJECT_CONFIG=1` at launch); their tools appear to the agent as `mcp__<server>__<tool>`. Configured MCP servers, like `external_agent`, are trusted host extensions outside Hara's protected-file boundary. Every interactive tool call requires confirmation (even in `full-auto`), and non-interactive runs disable them by default; reviewed automation can explicitly opt in before launch with `HARA_ALLOW_TRUSTED_EXTENSIONS=1`. hara can also **be** an MCP server — `hara mcp` exposes its read/search tools (esp. **`codebase_search`**) over stdio so other clients (Claude Desktop, Cursor, another hara) can use them; read-only by default (`HARA_MCP_TOOLS` to override).
 **Vim mode**: `hara config set vimMode true` makes the prompt modal — Esc → normal, `i/a/A/I` insert, `h l 0 $ w b e` motions, `x D C dd cw p` edits. Off by default.
@@ -334,7 +336,8 @@ read-only **`grep`** / **`glob`** / **`ls`** / **`web_fetch`** — behind a huma
 dangerous ones unless `-y`. Read-only tools run in parallel within a turn, and edits print a
 **colored diff** of what changed. Shell output streams live; press **Esc** to interrupt a running
 turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review`**, and **`/commit`** close the change → review → commit loop without leaving the prompt.
-- **Type-ahead steering**: keep typing while hara works — your message is held, then **folded into the next model call** (not deferred to a new turn), so a clarification or "also do X" course-corrects the task already in flight (codex-style). Messages typed after the final step start a fresh turn; **Esc** drops the queue and stops.
+- **Explicit live steering vs next-task queue**: keep typing while hara works and press Enter to fold a clarification into the next model call; use `/next <message>` to queue a separate task behind the live one. Accepted Desktop steering is persisted before ACK; **Esc** drops the local queue and stops.
+- **Bounded context + checkpoint compaction**: each provider call receives a non-destructive budgeted snapshot (old tool payloads/images cannot monopolize context). Overflow retries once with a tighter snapshot; `/compact` creates a structured execution checkpoint and retains the latest three user-turn groups plus current touched-file content.
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
 - **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. `@<dir>` loads a directory listing, `@src/`+Tab drills into a folder, and mistyped tool/file paths get a "did you mean" suggestion.
 - **Explicit workspace boundary**: launching at Home does not inventory its directories or permit coding mutations. Start Hara from a concrete project, or pass `hara --cwd /path/to/project`, to enable search, `@` completion, shell/external agents, and file edits; explicitly named single-file reads remain available at Home.

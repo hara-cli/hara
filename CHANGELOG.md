@@ -5,6 +5,27 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## Unreleased — task/thread semantics, durable steering, and context resilience
+
+- **Idle conversation no longer hijacks an unfinished task.** Ordinary input starts a new execution while
+  keeping the conversation thread; explicit `继续` / `continue` / `resume` / `go on` resumes the paused task,
+  and `/new` creates a visible task boundary. While a turn is live, Enter still steers it; `/next <message>`
+  queues a separate next task.
+- **Accepted Desktop steering is crash-safe and exactly-once.** `session.steer` persists a bounded pending
+  inbox entry before ACK, writes the projected transcript before delivery, then marks it consumed. Legacy
+  audit entries are never replayed, a full pending inbox applies backpressure, and secrets remain redacted.
+- **Every model request has a total context boundary.** Oversized historical user/assistant/tool payloads,
+  tool-call arguments, and old images are normalized in a provider-only snapshot without rewriting durable
+  history. A context-overflow response gets one tighter same-model retry before configured fallback.
+- **Compaction is now a bounded execution checkpoint.** The summarizer receives a guarded source snapshot,
+  emits structured goals/constraints/decisions/verification/files/errors/checkpoint/blockers/next action,
+  and keeps the last three user-turn groups as an anti-drift anchor instead of copying every user message
+  into the summary. CLI and Serve use the same contract and restore current touched files.
+- **Self-evolution is explicit and auditable.** `/evolve status|now` exposes the mode and manual curation;
+  classic and TUI exits share proactive reflection. Candidate observations go to logs, only stable evidence-
+  backed facts/preferences enter memory, verified repeatable procedures may become skills, and autonomous
+  code/config/permission/system-prompt mutation is explicitly outside the feature.
+
 ## 0.123.1 — 2026-07-15 — restore default TUI keyboard input
 
 - **The bracketed-paste proxy now resumes the real terminal stream.** The main TUI closes its temporary

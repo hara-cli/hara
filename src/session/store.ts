@@ -417,6 +417,8 @@ function redactedSessionCopy(data: SessionData): SessionData {
         target.id = source.id;
         target.turnId = source.turnId;
         target.createdAt = source.createdAt;
+        if (source.deliveryState !== undefined) target.deliveryState = source.deliveryState;
+        if (source.consumedAt !== undefined) target.consumedAt = source.consumedAt;
       }
     }
   }

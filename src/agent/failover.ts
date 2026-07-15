@@ -1,7 +1,6 @@
 // App-level failover — what to do when a provider turn ENDS in an error (the SDK already retried transient
-// 429/5xx via maxRetries; this handles what's left). Two recoveries: a context-overflow → compact + retry,
-// and a persistent/overloaded error → retry once on a configured FALLBACK model. The decision is pure +
-// tested here; runAgent just executes it (and guards each recovery to once, so no retry loops).
+// 429/5xx via maxRetries; this handles what's left). runAgent first retries context overflow once with a
+// tighter bounded snapshot; this module then decides whether a remaining error gets one fallback-model try.
 
 export type ErrKind = "context_overflow" | "rate_limit" | "overloaded" | "auth" | "timeout" | "transient" | "interrupted" | "unknown";
 
@@ -46,7 +45,7 @@ export function errorHint(kind: ErrKind): string {
     case "overloaded":
       return " — provider overloaded; set `fallbackModel` to auto-switch on errors";
     case "context_overflow":
-      return " — context too long; `/compact` (or enable `autoCompact`)";
+      return " — context still too long after bounded retry; use `/compact` or `/new`";
     case "timeout":
       return " — network timeout; check connectivity";
     default:

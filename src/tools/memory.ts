@@ -12,6 +12,10 @@ import { sensitiveFileError } from "../security/sensitive-files.js";
 import { readModelContextFileSync, readVerifiedRegularFileSnapshot } from "../fs-read.js";
 import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
 
+export const MAX_MEMORY_ENTRY_CHARS = 4_000;
+export const MAX_SKILL_DESCRIPTION_CHARS = 500;
+export const MAX_SKILL_BODY_CHARS = 24_000;
+
 const asTarget = (v: unknown): Target => (["memory", "user", "log"].includes(v as string) ? (v as Target) : "memory");
 const asScope = (v: unknown): Scope => (v === "global" ? "global" : "project");
 
@@ -59,7 +63,8 @@ registerTool({
   name: "memory_write",
   description:
     "Persist a durable fact/decision/preference to memory so future sessions recall it. Save proactively " +
-    "when you learn something worth keeping: project conventions, the user's preferences, a tricky solution.",
+    "only with evidence: use target=log for tentative/one-off observations; promote stable verified project " +
+    "conventions/decisions to memory and explicit user preferences to user. Include a short source/evidence phrase.",
   input_schema: {
     type: "object",
     properties: {
@@ -74,6 +79,9 @@ registerTool({
   async run(input, ctx) {
     const content = String(input.content ?? "").trim();
     if (!content) return "Error: empty content.";
+    if (content.length > MAX_MEMORY_ENTRY_CHARS) {
+      return `Error: memory entry is too large (${content.length} chars; maximum ${MAX_MEMORY_ENTRY_CHARS}). Save one concise durable fact, not a transcript or dump.`;
+    }
     const scan = scanMemory(content);
     if (!scan.ok) return `Blocked: this looks unsafe to store (${scan.hits.join(", ")}). Rephrase without secrets/injection text.`;
     const scope = asScope(input.scope);
@@ -109,11 +117,19 @@ registerTool({
       .replace(/^-+|-+$/g, "")
       .slice(0, 48);
     if (!slug) return "Error: invalid name.";
-    let description = String(input.description ?? "").replace(/\s+/g, " ").trim();
+    const rawDescription = String(input.description ?? "");
+    const rawBody = String(input.body ?? "");
+    if (rawDescription.length > MAX_SKILL_DESCRIPTION_CHARS) {
+      return `Error: skill description is too large (${rawDescription.length} chars; maximum ${MAX_SKILL_DESCRIPTION_CHARS}).`;
+    }
+    if (rawBody.length > MAX_SKILL_BODY_CHARS) {
+      return `Error: skill body is too large (${rawBody.length} chars; maximum ${MAX_SKILL_BODY_CHARS}). Save a focused reusable procedure, not a transcript or file dump.`;
+    }
+    let description = rawDescription.replace(/\s+/g, " ").trim();
     if (!description) return "Error: a description is required (it's how the skill gets surfaced).";
     // sanitize on capture: generalize local paths/emails, then redact secrets; block only on residue.
     description = scrubLocal(description, ctx.cwd);
-    let body = scrubLocal(String(input.body ?? ""), ctx.cwd);
+    let body = scrubLocal(rawBody, ctx.cwd);
     const rd = redactSecrets(description);
     const rb = redactSecrets(body);
     description = rd.text;
