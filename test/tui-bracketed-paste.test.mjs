@@ -56,6 +56,33 @@ test("BracketedPasteInput keeps paste and trailing Enter as separate readable ev
   input.dispose();
 });
 
+test("BracketedPasteInput resumes stdin paused by readline before Ink mounts", async () => {
+  const source = new PassThrough();
+  source.isTTY = true;
+  source.setRawMode = () => source;
+  source.ref = () => source;
+  source.unref = () => source;
+  source.pause();
+
+  const input = new BracketedPasteInput(source);
+  input.setEncoding("utf8");
+  const chunks = [];
+  input.on("readable", () => {
+    let chunk;
+    while ((chunk = input.read()) !== null) chunks.push(chunk);
+  });
+  input.setRawMode(true);
+
+  source.write("ordinary keyboard input");
+  await tick();
+  assert.deepEqual(chunks, ["ordinary keyboard input"]);
+  assert.equal(source.isPaused(), false, "Ink raw mode resumes the wrapped terminal");
+
+  input.setRawMode(false);
+  assert.equal(source.isPaused(), true, "Ink cleanup pauses the wrapped terminal again");
+  input.dispose();
+});
+
 test("BracketedPasteInput timeout releases content when the terminal omits paste-end", async () => {
   const source = new PassThrough();
   source.isTTY = true;

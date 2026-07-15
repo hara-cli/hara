@@ -106,6 +106,8 @@ export class BracketedPasteDecoder {
 
 type RawInput = NodeJS.ReadStream & {
   setRawMode?(enabled: boolean): unknown;
+  pause?(): unknown;
+  resume?(): unknown;
   ref?(): unknown;
   unref?(): unknown;
 };
@@ -142,11 +144,16 @@ export class BracketedPasteInput extends Readable {
   private readonly incompleteTimeoutMs: number;
 
   override _read(): void {
-    // Input is pushed by the wrapped terminal stream.
+    // readline.close() explicitly pauses process.stdin before the main TUI mounts. Ink reads this
+    // proxy rather than the real terminal, so its readable demand must resume the wrapped stream.
+    // Without this hand-off the frame renders normally but every key remains stuck upstream.
+    this.source.resume?.();
   }
 
   setRawMode(enabled: boolean): this {
     this.source.setRawMode?.(enabled);
+    if (enabled) this.source.resume?.();
+    else this.source.pause?.();
     return this;
   }
 
@@ -246,6 +253,7 @@ export class BracketedPasteInput extends Readable {
     this.source.off("data", this.onData);
     this.source.off("end", this.onEnd);
     this.source.off("error", this.onError);
+    this.source.pause?.();
     this.push(null);
   }
 }
