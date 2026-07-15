@@ -39,7 +39,7 @@ test("codebase_search: empty query + no-match give friendly messages", async () 
   }
 });
 
-test("codebase_search refuses an implicit home corpus but accepts an explicit project child", async () => {
+test("codebase_search requires launching inside a project instead of promoting a Home child", async () => {
   const home = join(tmpdir(), "hara-cb-home-" + Math.random().toString(36).slice(2));
   const project = join(home, "project");
   mkdirSync(join(project, ".git"), { recursive: true });
@@ -50,17 +50,22 @@ test("codebase_search refuses an implicit home corpus but accepts an explicit pr
     const tool = getTool("codebase_search");
     assert.match(
       await tool.run({ query: "home boundary project needle" }, { cwd: home }),
-      /will not recursively scan the home directory/i,
+      /will not.*directories.*home directory/i,
     );
     assert.match(
       await tool.run({ query: "home boundary project needle", path: "project" }, { cwd: home }),
-      /auth\.ts:\d+/,
-      "an explicitly selected child project remains searchable",
+      /will not.*directories.*home directory/i,
+      "the model cannot promote a discovered Home child into an implicit project",
     );
     assert.match(
       await tool.run({ query: "home boundary project needle", path: ".." }, { cwd: home }),
-      /will not recursively scan the home directory/i,
+      /will not.*directories.*home directory/i,
       "an ancestor root must not recurse back through Home",
+    );
+    assert.match(
+      await tool.run({ query: "home boundary project needle" }, { cwd: project }),
+      /auth\.ts:\d+/,
+      "the same child is searchable after the user establishes it as cwd",
     );
   } finally {
     if (previousHome === undefined) delete process.env.HOME;

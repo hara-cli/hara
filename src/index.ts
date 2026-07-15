@@ -2958,6 +2958,7 @@ program.action(async (opts) => {
     // saves it back — so `hara -p … --resume <id>` continues a thread (used by cron, scripts, the chat gateway).
     // Plain `hara -p` stays stateless. A --resume id with no match is created WITH that id (stable per caller).
     let meta: SessionMeta | null = null;
+    let continuationSession = false;
     const history: NeutralMsg[] = [];
     if (opts.resume || opts.continue) {
       const resumeArg = opts.resume ? String(opts.resume) : undefined;
@@ -2987,6 +2988,7 @@ program.action(async (opts) => {
       // Re-read only after acquiring the single-writer lock. Loading first would leave a race window where
       // another gateway/cron process appends history that this stale snapshot later overwrites.
       const prior = loadSession(rid);
+      continuationSession = Boolean(prior?.history.length);
       if (sessionFileExists(rid) && !prior) {
         process.stderr.write(`hara: session ${shortId(rid)} exists but is unreadable or corrupt; refusing to overwrite it. Inspect ~/.hara/sessions/${rid}.json.\n`);
         process.exitCode = 2;
@@ -3137,6 +3139,7 @@ program.action(async (opts) => {
       confirm: async () => true,
       projectContext,
       memory: memoryDigest(cwd),
+      continuationSession,
       ...(roleOverride ? { systemOverride: roleOverride } : {}),
       ...(headlessToolFilter ? { toolFilter: headlessToolFilter } : {}),
       hooks: headlessHooks,
@@ -3367,6 +3370,7 @@ program.action(async (opts) => {
     }
   }
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
+  let continuationSession = Boolean(resumed?.history.length);
   const memorySnap = memoryDigest(cwd); // durable memory, read once (frozen snapshot)
   const buildMemory = (): string =>
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
@@ -3850,6 +3854,7 @@ program.action(async (opts) => {
             return void h.sink.notice(getTools().map((t) => `${t.name}${t.kind !== "read" ? " *" : ""} — ${t.description}`).join("\n"));
           if (nm === "reset" || nm === "clear") {
             history.length = 0;
+            continuationSession = false;
             recalledContext = "";
             resetReachability(); // fresh start — drop any "host unreachable" marks (network may be fixed)
             resetRepeatGuard(); // …and the repeated-failure streaks (the user may have fixed the cause)
@@ -4068,7 +4073,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -4141,6 +4146,7 @@ program.action(async (opts) => {
             systemOverride: PLAN_SYSTEM,
             memory: buildMemory(),
             projectContext,
+            continuationSession,
             stats,
             signal: h.signal,
             pendingInput,
@@ -4186,6 +4192,7 @@ program.action(async (opts) => {
               confirm: h.confirm,
               autoApprove,
               projectContext,
+              continuationSession,
               stats,
               signal: h.signal,
               pendingInput,
@@ -4218,6 +4225,7 @@ program.action(async (opts) => {
           confirm: h.confirm,
           autoApprove,
           projectContext,
+          continuationSession,
           stats,
           signal: h.signal,
           pendingInput,
@@ -4289,7 +4297,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -4322,7 +4330,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

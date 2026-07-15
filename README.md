@@ -177,8 +177,9 @@ hara -m glm-5              # pick a model
 
 Run Hara from a project directory. When the current directory resolves to your Home root, Hara does not treat
 the whole Home tree as a repository: project init/index and default recursive grep/glob/codebase inventory are
-disabled with a `cd /path/to/project` hint. Non-recursive `ls`, explicitly named files, and explicitly selected
-child directories still work.
+disabled with a `cd /path/to/project` hint. Directory listing and child-directory recursion are also refused so
+the model cannot promote a discovered Home folder into an implicit project; explicitly named single files still
+work. Resuming a session reuses its persisted conversation and must not trigger workspace rediscovery.
 
 For automation, `--schema` accepts inline JSON Schema or a schema file. The model must return through the
 validated `structured_output` tool; on success stdout contains only the JSON value, while diagnostics go to
@@ -314,6 +315,7 @@ turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review
 - **Type-ahead steering**: keep typing while hara works — your message is held, then **folded into the next model call** (not deferred to a new turn), so a clarification or "also do X" course-corrects the task already in flight (codex-style). Messages typed after the final step start a fresh turn; **Esc** drops the queue and stops.
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
 - **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. `@<dir>` loads a directory listing, `@src/`+Tab drills into a folder, and mistyped tool/file paths get a "did you mean" suggestion.
+- **Explicit workspace boundary**: launching at Home does not inventory its directories or permit coding mutations. Start Hara from a concrete project to enable search, `@` completion, shell/external agents, and file edits; explicitly named single-file reads remain available at Home.
 - **Multi-provider**: Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) — **all streamed live**.
 - **Chat gateway**: drive your local hara from **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk · WeCom · Signal**. The daemon connects out (no public webhook), with per-chat sessions, project roaming (`/cd`), agent switching (`/agent`), and **two-way images on byte-upload-capable platforms**. Setup, platform capability details, and the group-flow security model: **[docs/gateway.md](docs/gateway.md)**.
 

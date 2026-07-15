@@ -12,7 +12,12 @@ import {
   SENSITIVE_SEARCH_GLOBS,
 } from "../security/sensitive-files.js";
 import { toolSubprocessEnv } from "../security/subprocess-env.js";
-import { recursiveRootContainsHome, recursiveHomeSearchError } from "../context/workspace-scope.js";
+import {
+  homeWorkspaceDirectoryScanError,
+  isHomeWorkspace,
+  recursiveRootContainsHome,
+  recursiveHomeSearchError,
+} from "../context/workspace-scope.js";
 
 const MAX_OUT = 60_000;
 const MAX_MATCHES = 300;
@@ -528,6 +533,7 @@ registerTool({
     } catch {
       return `Error: no such path: ${input.path ?? "."}`;
     }
+    if (!isFile && isHomeWorkspace(ctx.cwd)) return homeWorkspaceDirectoryScanError("grep");
     if (!isFile && recursiveRootContainsHome(root)) return recursiveHomeSearchError("grep");
     const searchArgs = [
       pattern,
@@ -588,6 +594,7 @@ registerTool({
     const root = absOf(input.path, ctx.cwd);
     const denied = sensitiveFileError(root, "search");
     if (denied) return denied;
+    if (isHomeWorkspace(ctx.cwd)) return homeWorkspaceDirectoryScanError("glob");
     if (recursiveRootContainsHome(root)) return recursiveHomeSearchError("glob");
     const pattern = typeof input.pattern === "string" ? input.pattern : "";
     if (pattern.length > MAX_GLOB_CHARS) return `Error: glob pattern exceeds ${MAX_GLOB_CHARS} characters.`;
@@ -644,6 +651,7 @@ registerTool({
   },
   kind: "read",
   async run(input, ctx) {
+    if (isHomeWorkspace(ctx.cwd)) return homeWorkspaceDirectoryScanError("ls");
     const dir = absOf(input.path, ctx.cwd);
     const denied = sensitiveFileError(dir, "list");
     if (denied) return denied;

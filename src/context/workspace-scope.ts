@@ -39,8 +39,16 @@ export function homeWorkspaceActionError(action: string): string {
 export function recursiveHomeSearchError(tool: string): string {
   return (
     `Error: ${tool} will not recursively scan the home directory. ` +
-    "Run Hara from a project (`cd /path/to/project`) or set `path` to a specific file/subdirectory. " +
-    "Non-recursive `ls` and explicit file reads remain available."
+    "Run Hara from a project (`cd /path/to/project`). Explicit single-file reads remain available."
+  );
+}
+
+/** A model rooted at Home must not discover a child and silently promote it into the project scope. The
+ * user establishes that scope by launching Hara from the concrete project directory. */
+export function homeWorkspaceDirectoryScanError(tool: string): string {
+  return (
+    `Error: ${tool} will not enumerate or recursively scan directories while Hara is rooted at the home directory. ` +
+    "Run `cd /path/to/project` and start Hara there. Explicit single-file reads remain available."
   );
 }
 
@@ -51,9 +59,8 @@ export function homeWorkspaceGuidance(cwd: string): string {
   return (
     "# Home-directory workspace boundary\n" +
     "The working directory resolves to the user's home directory, which is not an implicit project. " +
-    "Do not initialize a project, build a repository index, run shell/external executable tools, or recursively " +
-    "grep/glob/search the home root. " +
-    "Ask the user to run `cd /path/to/project` for project work. Non-recursive `ls`, explicitly named files, " +
-    "and explicitly named child directories remain available."
+    "Do not initialize a project, create or modify files, build a repository index, run shell/external " +
+    "executable tools, enumerate directories, or grep/glob/search Home or one of its child directories. " +
+    "Ask the user to run `cd /path/to/project` for project work. Only explicitly named single-file reads remain available."
   );
 }

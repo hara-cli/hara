@@ -1,13 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadAgentContext, loadAgentsMd, hasAgentsMd, findProjectRoot } from "../dist/context/agents-md.js";
 import { canonicalWorkspacePath, isHomeWorkspace } from "../dist/context/workspace-scope.js";
-import { expandMentions, expandMentionsAsync } from "../dist/context/mentions.js";
+import { expandMentions, expandMentionsAsync, fileCandidates } from "../dist/context/mentions.js";
 import { needsConfirm } from "../dist/agent/loop.js";
 import "../dist/tools/edit.js";
+import "../dist/tools/builtin.js";
+import "../dist/tools/patch.js";
 import { getTool } from "../dist/tools/registry.js";
 
 test("approval gate: needsConfirm per mode/kind", () => {
@@ -166,6 +168,83 @@ test("mentions: Home ancestors report the recursive workspace boundary instead o
   const input = `inspect @${ancestor}`;
   assert.match(expandMentions(input, process.cwd()), /will not recursively scan the home directory/i);
   assert.match(await expandMentionsAsync(input, process.cwd()), /will not recursively scan the home directory/i);
+});
+
+test("mentions: a Home-root session cannot expand a model-selected child directory", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-ctx-home-child-"));
+  const home = join(root, "home");
+  const project = join(home, "projects", "demo");
+  mkdirSync(project, { recursive: true });
+  writeFileSync(join(project, "private-context.txt"), "must-not-be-inventoried\n");
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const input = "inspect @projects";
+    assert.match(expandMentions(input, home), /will not.*directories.*home directory/i);
+    assert.match(await expandMentionsAsync(input, home), /will not.*directories.*home directory/i);
+    assert.doesNotMatch(expandMentions(input, home), /private-context/);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Home scope: autocomplete and coding mutations cannot inventory or promote a child project", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-ctx-home-coding-"));
+  const home = join(root, "home");
+  const alias = join(root, "home-alias");
+  const project = join(home, "projects", "demo");
+  const homeFile = join(home, "home-note.txt");
+  mkdirSync(project, { recursive: true });
+  writeFileSync(homeFile, "original\n");
+  writeFileSync(join(project, "project-note.txt"), "project\n");
+  symlinkSync(home, alias, process.platform === "win32" ? "junction" : "dir");
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    assert.deepEqual(fileCandidates(home, ""), [], "bare @ cannot enumerate Home");
+    assert.deepEqual(fileCandidates(home, "project"), [], "a query cannot discover a named Home child");
+    assert.deepEqual(fileCandidates(alias, "note"), [], "a symlink alias cannot bypass the Home boundary");
+    assert.ok(fileCandidates(project, "note").includes("project-note.txt"), "an explicitly selected project keeps normal completion");
+
+    for (const name of ["write_file", "edit_file", "apply_patch"]) {
+      assert.equal(getTool(name).requiresProjectWorkspace, true, `${name} declares its project boundary`);
+    }
+    const edit = await getTool("edit_file").run(
+      { path: "home-note.txt", old_string: "original", new_string: "changed" },
+      { cwd: alias },
+    );
+    assert.match(edit, /home directory.*cd \/path\/to\/project/i);
+    assert.equal(readFileSync(homeFile, "utf8"), "original\n", "Home file stays unchanged");
+
+    const write = await getTool("write_file").run({ path: "new.txt", content: "nope" }, { cwd: home });
+    assert.match(write, /home directory.*cd \/path\/to\/project/i);
+    assert.equal(existsSync(join(home, "new.txt")), false);
+
+    const patched = await getTool("apply_patch").run(
+      { changes: [{ path: "patched.txt", type: "create", content: "nope" }] },
+      { cwd: home },
+    );
+    assert.match(patched, /home directory.*cd \/path\/to\/project/i);
+    assert.equal(existsSync(join(home, "patched.txt")), false);
+
+    const projectWrite = await getTool("write_file").run({ path: "created.txt", content: "ok" }, { cwd: project });
+    assert.match(projectWrite, /Wrote 2 chars/);
+    assert.equal(readFileSync(join(project, "created.txt"), "utf8"), "ok");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("edit_file: single unique replacement", async () => {

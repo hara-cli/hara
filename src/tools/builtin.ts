@@ -169,6 +169,7 @@ registerTool({
     required: ["path", "content"],
   },
   kind: "edit",
+  requiresProjectWorkspace: true,
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
     const denied = sensitiveFileError(p, "write");

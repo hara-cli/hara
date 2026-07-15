@@ -238,6 +238,7 @@ registerTool({
     required: ["changes"],
   },
   kind: "edit",
+  requiresProjectWorkspace: true,
   async run(input, ctx) {
     const changes: Change[] = Array.isArray(input.changes) ? input.changes : [];
     if (!changes.length) return "Error: apply_patch needs a non-empty `changes` array.";

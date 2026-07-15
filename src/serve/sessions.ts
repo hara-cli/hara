@@ -44,6 +44,8 @@ export interface ServeSession {
   autoApprove: Set<string>; // "don't ask again" tool names, session-scoped (runAgent mutates it)
   stats: { input: number; output: number; lastInput?: number };
   projectContext?: string;
+  /** This live attachment came from persisted history (resume/fork), not a fresh empty session. */
+  continuationSession: boolean;
   busy: boolean; // one turn per session at a time
   configuring: boolean; // provider/model/resume handshakes are serialized against turns/deletes
   /** Provider Promises that are still physically in flight after the agent's hard cancellation boundary. */
@@ -89,7 +91,7 @@ export class SessionHub {
     };
     const lock = this.store.acquire(meta.id); // fresh UUID, but filesystem errors must still fail closed
     if (!lock.ok) throw new Error(`could not acquire session lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
-    const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
+    const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
     try {
       this.sessions.set(meta.id, s);
       this.store.save(meta, []); // an empty newly-created thread must survive restart and appear in lists
@@ -117,7 +119,7 @@ export class SessionHub {
       if (!prior) return { missing: true };
       // Credential/provider routing is live, while the model remains the session's explicit pin.
       prior.meta.provider = o.provider.id;
-      const s: ServeSession = { meta: prior.meta, history: [...prior.history], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
+      const s: ServeSession = { meta: prior.meta, history: [...prior.history], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
       this.sessions.set(id, s);
       keepLock = true; // live session owns it until delete/releaseAll
       return { session: s };
@@ -220,6 +222,7 @@ export class SessionHub {
       autoApprove: new Set(),
       stats: { input: 0, output: 0 },
       projectContext: o.projectContext,
+      continuationSession: src.history.length > 0,
       busy: false,
       configuring: false,
       pendingProviderTurns: 0,

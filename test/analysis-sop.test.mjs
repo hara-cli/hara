@@ -29,6 +29,37 @@ test("system prompt teaches the analysis SOP: batch reads, manifest-first, fan o
   assert.ok(/role "explore"/.test(system), "points at the built-in explore persona");
 });
 
+test("a resumed session treats persisted history as context instead of rediscovering the workspace", async () => {
+  const systems = [];
+  const provider = {
+    id: "f",
+    model: "f",
+    async turn(args) {
+      systems.push(args.system);
+      return { text: "ok", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [
+    { role: "user", content: "implement the agreed change" },
+    { role: "assistant", text: "I completed the first step", toolUses: [] },
+    { role: "user", content: "continue" },
+  ];
+
+  await runAgent(history, {
+    provider,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    continuationSession: true,
+  });
+
+  assert.match(systems[0], /Existing-session continuity/);
+  assert.match(systems[0], /history is already the authoritative context/);
+  assert.match(systems[0], /do not restart the task, re-inventory the workspace/);
+  assert.match(systems[0], /Follow the latest user request/);
+});
+
 test("agent tool: when-to-use / when-NOT guidance (direct tools for narrow lookups)", async () => {
   await import("../dist/tools/agent.js");
   const t = getTool("agent");

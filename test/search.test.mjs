@@ -288,7 +288,7 @@ test("glob tool: agent cancellation interrupts discovery before matching", async
   }
 });
 
-test("home scope blocks recursive grep/glob aliases but keeps ls, explicit files, and child directories usable", async () => {
+test("home scope blocks every directory inventory until Hara starts inside a concrete project", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-search-home-"));
   const home = join(root, "home");
   const alias = join(root, "home-alias");
@@ -305,16 +305,19 @@ test("home scope blocks recursive grep/glob aliases but keeps ls, explicit files
     const grep = getTool("grep");
     const glob = getTool("glob");
     const ls = getTool("ls");
-    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE" }, { cwd: home }), /will not recursively scan the home directory/i);
-    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE" }, { cwd: alias }), /will not recursively scan the home directory/i);
-    assert.match(await glob.run({ pattern: "**\/*.txt" }, { cwd: alias }), /will not recursively scan the home directory/i);
-    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE", path: ".." }, { cwd: home }), /will not recursively scan the home directory/i);
-    assert.match(await glob.run({ pattern: "**\/*.txt", path: ".." }, { cwd: home }), /will not recursively scan the home directory/i);
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE" }, { cwd: home }), /will not.*directories.*home directory/i);
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE" }, { cwd: alias }), /will not.*directories.*home directory/i);
+    assert.match(await glob.run({ pattern: "**\/*.txt" }, { cwd: alias }), /will not.*directories.*home directory/i);
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE", path: ".." }, { cwd: home }), /will not.*directories.*home directory/i);
+    assert.match(await glob.run({ pattern: "**\/*.txt", path: ".." }, { cwd: home }), /will not.*directories.*home directory/i);
 
     assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE", path: "root-note.txt" }, { cwd: home }), /root-note\.txt:1:/);
-    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE", path: "project" }, { cwd: home }), /project-note\.txt:1:/);
-    assert.match(await glob.run({ pattern: "**\/*.txt", path: "project" }, { cwd: home }), /project-note\.txt/);
-    assert.match(await ls.run({}, { cwd: home }), /project\//, "non-recursive home listing remains available");
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE", path: "project" }, { cwd: home }), /will not.*directories.*home directory/i);
+    assert.match(await glob.run({ pattern: "**\/*.txt", path: "project" }, { cwd: home }), /will not.*directories.*home directory/i);
+    assert.match(await ls.run({}, { cwd: home }), /will not.*directories.*home directory/i);
+    assert.match(await grep.run({ pattern: "HOME_SCOPE_NEEDLE" }, { cwd: project }), /project-note\.txt:1:/);
+    assert.match(await glob.run({ pattern: "**\/*.txt" }, { cwd: project }), /project-note\.txt/);
+    assert.match(await ls.run({}, { cwd: project }), /project-note\.txt/);
     assert.deepEqual(walkFiles(home), [], "the shared inventory helper also fails closed at the home root");
     assert.deepEqual(walkFiles(root), [], "an ancestor inventory cannot descend back into Home");
   } finally {

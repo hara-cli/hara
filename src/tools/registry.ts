@@ -49,9 +49,9 @@ export interface Tool {
   /** read | edit | exec | computer — drives the approval gate (read never prompts; computer always asks
    *  once per session for a grant, even in full-auto) */
   kind?: "read" | "edit" | "exec" | "computer";
-  /** This tool hands the whole cwd to an executable/project-aware process and therefore cannot run with
-   *  Home as its implicit workspace. `kind:"exec"` alone is only an approval class: explicit sends and
-   *  cron-management actions remain valid at Home. */
+  /** This operation treats cwd as a project scope (for example a coding mutation or project-aware process)
+   *  and therefore cannot run with Home as its implicit workspace. `kind:"exec"`/`kind:"edit"` alone are
+   *  approval classes: explicit management or delivery actions remain valid at Home unless opted in here. */
   requiresProjectWorkspace?: boolean;
   /** Opaque host process (MCP/external coding agent). It sits outside Hara's in-process file boundary,
    *  therefore always needs an interactive grant and is disabled in headless/full-auto unless the user
@@ -87,8 +87,8 @@ export function registerTool(t: Tool): void {
       if (ctx.signal?.aborted) {
         return `Error: ${t.name} cancelled before execution because the agent run has ended.`;
       }
-      // Only explicitly project-scoped executable tools are blocked. `kind:"exec"` is also used for safe
-      // management/delivery side effects, so it must not itself imply a project workspace requirement.
+      // Only explicitly project-scoped operations are blocked. Tool kinds are also used for safe
+      // management/delivery side effects, so a kind must not itself imply a project workspace requirement.
       // Canonical comparison closes Home symlink aliases.
       if (t.requiresProjectWorkspace && isHomeWorkspace(ctx.cwd)) {
         return `Error: ${homeWorkspaceActionError(`run ${t.name}`)}`;

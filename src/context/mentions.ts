@@ -7,7 +7,12 @@ import { fuzzyRank } from "../fuzzy.js";
 import { mediaTypeFor } from "../images.js";
 import { readModelContextPrefixSync } from "../fs-read.js";
 import { sensitiveFileError } from "../security/sensitive-files.js";
-import { recursiveRootContainsHome, recursiveHomeSearchError } from "./workspace-scope.js";
+import {
+  homeWorkspaceDirectoryScanError,
+  isHomeWorkspace,
+  recursiveRootContainsHome,
+  recursiveHomeSearchError,
+} from "./workspace-scope.js";
 
 const MAX_FILE = 50_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
@@ -110,6 +115,7 @@ async function expandRefAsync(ref: string, cwd: string, options: FileWalkOptions
       return `\nReferenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\`\n`;
     }
     if (st.isDirectory()) {
+      if (isHomeWorkspace(cwd)) return homeWorkspaceDirectoryScanError("directory attachment");
       if (recursiveRootContainsHome(abs)) return recursiveHomeSearchError("directory attachment");
       const inventory = await walkFilesAsync(abs, options);
       const bounded = inventory.truncated
@@ -144,6 +150,7 @@ function expandRef(ref: string, cwd: string): string | null {
       return `\nReferenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\`\n`;
     }
     if (st.isDirectory()) {
+      if (isHomeWorkspace(cwd)) return homeWorkspaceDirectoryScanError("directory attachment");
       if (recursiveRootContainsHome(abs)) return recursiveHomeSearchError("directory attachment");
       // `@dir` loads a listing of the directory's files (the agent can then read specific ones)
       const files = walkFiles(abs, 300);
@@ -183,6 +190,10 @@ export function invalidateFileCandidates(cwd?: string): void {
  * ranks path-prefix and basename matches first. Directories carry a trailing `/`.
  */
 export function fileCandidates(cwd: string, query: string, limit = 25): string[] {
+  // Autocomplete is also directory discovery. Do not populate the cache or expose even top-level
+  // names when the user launched Hara at Home; the user establishes project scope by starting in a
+  // concrete child directory. Canonical comparison closes symlink aliases of Home.
+  if (isHomeWorkspace(cwd)) return [];
   const entries = projectEntries(cwd);
   if (!query) {
     // bare `@`: top-level entries, directories first

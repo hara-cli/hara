@@ -10,7 +10,12 @@ import { findProjectRoot } from "../context/agents-md.js";
 import { loadConfig } from "../config.js";
 import { getEmbedder } from "../search/embed.js";
 import { queryIndex, indexExists } from "../search/semindex.js";
-import { recursiveRootContainsHome, recursiveHomeSearchError } from "../context/workspace-scope.js";
+import {
+  homeWorkspaceDirectoryScanError,
+  isHomeWorkspace,
+  recursiveRootContainsHome,
+  recursiveHomeSearchError,
+} from "../context/workspace-scope.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 
 const MAX_FILE = 200_000; // skip very large files
@@ -24,7 +29,7 @@ registerTool({
     "Find code in THIS project relevant to a natural-language query — ranked by relevance (not exact match). " +
     "Use it to locate similar/related code while working ('where is auth handled?', 'retry logic'); use grep " +
     "for exact strings/regex. Returns the top files with their most relevant snippet (file:line). When Hara " +
-    "was started in the home directory, set path to a specific project subdirectory.",
+    "was started in the home directory, cd to a specific project before searching.",
   input_schema: {
     type: "object",
     properties: {
@@ -44,6 +49,7 @@ registerTool({
     const requestedRoot = typeof input.path === "string" && input.path.trim()
       ? (isAbsolute(input.path) ? input.path : resolve(ctx.cwd, input.path))
       : ctx.cwd;
+    if (isHomeWorkspace(ctx.cwd)) return homeWorkspaceDirectoryScanError("codebase_search");
     try {
       if (!statSync(requestedRoot).isDirectory()) return `Error: codebase_search path is not a directory: ${input.path ?? "."}`;
     } catch {

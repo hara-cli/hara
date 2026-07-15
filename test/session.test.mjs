@@ -352,6 +352,7 @@ test("SessionHub acquires before load and locks offline rename/archive mutations
   assert.deepEqual(events.slice(0, 2), ["acquire:stored", "load:stored"], "resume reads only after locking");
   assert.equal(resumed.session.meta.provider, "new-provider");
   assert.equal(resumed.session.meta.model, "old-model", "resume keeps the persisted model pin");
+  assert.equal(resumed.session.continuationSession, true, "non-empty persisted history enables continuity guidance");
 
   events.length = 0;
   resumed.session.busy = true;
@@ -380,6 +381,13 @@ test("SessionHub acquires before load and locks offline rename/archive mutations
   assert.equal(hub.setArchived("stored", true), true);
   assert.deepEqual(events, ["acquire:stored", "load:stored", "save:stored", "release:stored"]);
   assert.equal(data.meta.archived, true);
+
+  data.history = [];
+  events.length = 0;
+  const emptyResume = hub.resume("stored", { provider, approval: "suggest" });
+  assert.ok("session" in emptyResume);
+  assert.equal(emptyResume.session.continuationSession, false, "an empty session does not claim an existing task");
+  assert.equal(hub.detach("stored"), true);
 
   locked = true;
   events.length = 0;

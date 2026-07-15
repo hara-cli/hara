@@ -429,6 +429,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         autoApprove: s.autoApprove,
         projectContext: s.projectContext,
         memory: memoryDigest(s.meta.cwd),
+        continuationSession: s.continuationSession,
         stats: s.stats,
         signal: turnAbort.signal,
         onProviderTurn: (turn) => {

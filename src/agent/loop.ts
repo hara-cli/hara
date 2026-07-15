@@ -134,12 +134,26 @@ function gatewayNote(): string {
   );
 }
 
-function composeSystem(cwd: string, projectContext?: string, override?: string, memory?: string): string {
+const CONTINUATION_SYSTEM =
+  "# Existing-session continuity\n" +
+  "This turn continues a persisted conversation. Its history is already the authoritative context: do not restart the task, " +
+  "re-inventory the workspace, or summarize files merely to understand what happened before. Follow the latest user request " +
+  "and reuse prior conclusions and tool results. Inspect files only when the latest request requires it. If the working " +
+  "directory is Home, ask the user to start Hara from a concrete project instead of enumerating Home or its children.";
+
+function composeSystem(
+  cwd: string,
+  projectContext?: string,
+  override?: string,
+  memory?: string,
+  continuationSession = false,
+): string {
   const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
   const skills = skillsDigest(cwd);
   return (
     head +
     gatewayNote() +
+    (continuationSession ? `\n\n${CONTINUATION_SYSTEM}` : "") +
     (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "") +
     (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "") +
     (skills ? `\n\n# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
@@ -158,6 +172,9 @@ export interface RunOpts {
   projectContext?: string;
   /** durable memory digest injected into the system prompt (frozen snapshot) */
   memory?: string;
+  /** The process attached to persisted history. Teach the first/new provider route to continue that history
+   * instead of treating process startup as a reason to rediscover the workspace. */
+  continuationSession?: boolean;
   stats?: { input: number; output: number; lastInput?: number };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
@@ -505,7 +522,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           return { text: "", toolUses: [], stop: "error" as const, errorMsg: "interrupted" };
         }
         return activeProvider.turn({
-          system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory),
+          system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory, opts.continuationSession),
           history,
           tools: specs,
       // Any stream chunk keeps the connection considered alive — even suppressed reasoning_content, so a

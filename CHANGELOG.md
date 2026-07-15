@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.122.6 — 2026-07-15 — resumed-session continuity and Home scope
+
+- **Resume continues the persisted task instead of rediscovering the workspace.** CLI `--resume`/`-c`,
+  headless gateway/cron continuations, Desktop `session.resume`, and session forks tell the model that the
+  existing history is already authoritative context. A process restart is no longer a reason to restart the
+  task, inventory files, or answer with an unrelated workspace summary.
+- **Home cannot be promoted into a project one child directory at a time.** When Hara is rooted at the user's
+  Home, runtime guards now reject `ls`, directory `grep`, `glob`, `codebase_search`, `@directory` expansion,
+  fuzzy `@` inventory, and coding mutations even when the model supplies a named child path. Explicit
+  single-file reads remain available; launching Hara from that concrete child project restores normal project
+  search, completion, and coding behavior.
+- **The regression exercises a disobedient model, not only the prompt.** An end-to-end resumed session uses a
+  temporary Home containing a sentinel project, forces the provider to call `ls`, and verifies the tool result
+  is a bounded refusal while the persisted history and latest request reach the model without any Home entry
+  or file name.
 ## 0.122.5 — 2026-07-15 — standalone ambient-config security boundary
 
 - **Standalone binaries no longer trust the directory they are launched from.** Bun's runtime `.env` and

@@ -42,6 +42,7 @@ registerTool({
     required: ["path"],
   },
   kind: "edit",
+  requiresProjectWorkspace: true,
   async run(input, ctx) {
     const p = isAbsolute(input.path) ? input.path : resolve(ctx.cwd, input.path);
     const denied = sensitiveFileError(p, "edit");
