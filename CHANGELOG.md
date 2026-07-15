@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.123.1 — 2026-07-15 — restore default TUI keyboard input
+
+- **The bracketed-paste proxy now resumes the real terminal stream.** The main TUI closes its temporary
+  readline owner before Ink mounts, which leaves `process.stdin` explicitly paused. 0.123.0 forwarded raw-mode
+  calls through the new proxy but did not resume that wrapped stream, so the interface rendered while ordinary
+  keystrokes never reached the input box. The proxy now mirrors Ink's read/raw lifecycle by resuming on demand
+  and pausing again during cleanup.
+- **The regression starts from production's actual precondition.** A paused-stdin test verifies ordinary input,
+  raw-mode enable/disable, and cleanup instead of relying only on a naturally flowing test stream. Real PTY
+  smoke covers ordinary typing, multiline bracketed paste without auto-submit, and terminal-mode restoration.
+  Users on 0.123.0 should upgrade; `HARA_TUI=0 hara` remains a temporary classic-input workaround.
+
 ## 0.123.0 — 2026-07-15 — task-aware interaction and input/security hardening
 
 - **Conversation and execution are separate state.** Sessions now persist a bounded, redacted task record
