@@ -39,8 +39,9 @@
     "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "tsc && node scripts/normalize-dist-modes.mjs",
+    "build": "tsc && node scripts/normalize-dist-modes.mjs && node scripts/check-local-bin-link.mjs",
     "prepare": "npm run build",
+    "doctor:local-link": "node scripts/check-local-bin-link.mjs",
     "dev": "tsx src/cli.ts",
     "start": "node runtime-bootstrap.cjs",
     "test": "npm run build && node --test --test-timeout=120000 test/*.test.mjs",

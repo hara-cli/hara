@@ -59,6 +59,12 @@ npm install        # builds via the prepare script
 npm install -g .   # or: npm link
 ```
 
+If a source checkout linked before 0.122.1 later reports `zsh: permission denied: hara`, the old npm
+link is still targeting the now-internal `dist/index.js`. Activate the same Node installation that owns
+the link, run `npm link` again from this directory, then run `rehash`. `npm run build` and
+`npm run doctor:local-link` detect this stale link and print its exact owning bin directory. Do not repair
+it with `chmod`; the guarded executable entry is `runtime-bootstrap.cjs`.
+
 ## Quickstart
 
 ```bash

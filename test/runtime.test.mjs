@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { applyPortableHomeEnv, MIN_NODE_MAJOR, MIN_NODE_VERSION, normalizePortableWindowsHome, unsupportedNodeMessage } from "../dist/runtime.js";
+import { findStaleLocalHaraLinks, isLegacyLinkedTarget, staleLocalLinkWarning } from "../scripts/check-local-bin-link.mjs";
 
 const rootFile = (path) => fileURLToPath(new URL(`../${path}`, import.meta.url));
 const require = createRequire(import.meta.url);
@@ -65,6 +68,7 @@ test("runtime packaging: manifests, executable bin, scripts, and Docker use the 
   assert.equal(lock.packages[""].engines.node, pkg.engines.node);
   assert.equal(pkg.scripts.start, "node runtime-bootstrap.cjs");
   assert.match(pkg.scripts.build, /normalize-dist-modes\.mjs/);
+  assert.match(pkg.scripts.build, /check-local-bin-link\.mjs/);
 
   const cli = readFileSync(rootFile("dist/cli.js"), "utf8");
   assert.ok(cli.startsWith("#!/usr/bin/env node\n"));
@@ -79,4 +83,33 @@ test("runtime packaging: manifests, executable bin, scripts, and Docker use the 
   assert.match(docker, /COPY scripts\/normalize-dist-modes\.mjs \.\/scripts\/normalize-dist-modes\.mjs/);
   assert.match(docker, /COPY runtime-bootstrap\.cjs \.\//);
   assert.match(docker, /ENTRYPOINT \["node", "\/app\/runtime-bootstrap\.cjs"\]/);
+});
+
+test("local-link doctor detects a stale legacy bin without weakening the guarded entry", {
+  skip: process.platform === "win32",
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-local-link-"));
+  const bin = join(root, "bin");
+  const packageRoot = join(root, "package");
+  const legacy = join(packageRoot, "dist", "index.js");
+  const guarded = join(packageRoot, "runtime-bootstrap.cjs");
+  mkdirSync(join(packageRoot, "dist"), { recursive: true });
+  mkdirSync(bin);
+  writeFileSync(legacy, "#!/usr/bin/env node\n");
+  writeFileSync(guarded, "#!/usr/bin/env node\n");
+  const command = join(bin, "hara");
+  try {
+    symlinkSync(legacy, command);
+    assert.equal(isLegacyLinkedTarget(legacy, packageRoot), true);
+    const [stale] = findStaleLocalHaraLinks(bin, packageRoot);
+    assert.equal(stale.binPath, command);
+    assert.match(staleLocalLinkWarning(stale, packageRoot), /npm link/);
+    assert.match(staleLocalLinkWarning(stale, packageRoot), /Do not chmod dist\/index\.js/);
+
+    rmSync(command);
+    symlinkSync(guarded, command);
+    assert.deepEqual(findStaleLocalHaraLinks(bin, packageRoot), [], "the guarded bootstrap link is healthy");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.122.6 — 2026-07-15 — resumed-session continuity and Home scope
+## 0.122.6 — 2026-07-15 — resumed continuity and workspace/input hardening
 
 - **Resume continues the persisted task instead of rediscovering the workspace.** CLI `--resume`/`-c`,
   headless gateway/cron continuations, Desktop `session.resume`, and session forks tell the model that the
@@ -20,9 +20,12 @@ All notable changes to `@nanhara/hara`.
   temporary Home containing a sentinel project, forces the provider to call `ls`, and verifies the tool result
   is a bounded refusal while the persisted history and latest request reach the model without any Home entry
   or file name.
-
 - **Composer tabs no longer move the cursor away from the text.** Literal tabs render and wrap as one-column
   spaces while the editable and submitted prompt preserves the original tab characters.
+- **Source builds diagnose stale pre-bootstrap npm links.** If an old `npm link` still points `hara` at the
+  now-internal non-executable `dist/index.js`, builds and `npm run doctor:local-link` print the owning Node bin
+  directory and the exact relink/`rehash` repair instead of suggesting an unsafe `chmod` workaround. Clean npm
+  installs and standalone binaries are unaffected.
 
 ## 0.122.5 — 2026-07-15 — standalone ambient-config security boundary
 
