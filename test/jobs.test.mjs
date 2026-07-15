@@ -26,10 +26,16 @@ const alive = (pid) => {
     return false;
   }
 };
-async function waitForFile(path, ms = 1500) {
+async function waitForPid(path, ms = 1500) {
   const until = Date.now() + ms;
-  while (!existsSync(path) && Date.now() < until) await sleep(20);
-  assert.equal(existsSync(path), true, `expected ${path} to be created`);
+  while (Date.now() < until) {
+    if (existsSync(path)) {
+      const candidate = Number(readFileSync(path, "utf8").trim());
+      if (Number.isSafeInteger(candidate) && candidate > 0) return candidate;
+    }
+    await sleep(20);
+  }
+  assert.fail(`expected ${path} to publish a positive PID`);
 }
 async function assertProcessGone(pid, label) {
   const until = Date.now() + 2000;
@@ -59,9 +65,8 @@ function escapedPipeFixture(dir) {
   writeFileSync(
     script,
     `const { spawn } = require("node:child_process");\n` +
-      `const { writeFileSync } = require("node:fs");\n` +
-      `const escaped = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { detached: true, stdio: ["ignore", "inherit", "inherit"] });\n` +
-      `writeFileSync(process.argv[2], String(escaped.pid));\n` +
+      `const escapedCode = ${JSON.stringify('require("node:fs").writeFileSync(process.argv[1], String(process.pid)); process.on("SIGTERM",()=>{}); setInterval(()=>{},1000);')};\n` +
+      `const escaped = spawn(process.execPath, ["-e", escapedCode, process.argv[2]], { detached: true, stdio: ["ignore", "inherit", "inherit"] });\n` +
       `escaped.unref();\n`,
   );
   return script;
@@ -131,8 +136,7 @@ test("runShell timeout is wall-clock bounded and kills a SIGTERM-resistant grand
     );
     assert.ok(Date.now() - started >= 400, "runShell waits until forced tree termination is issued before settling");
     assert.ok(Date.now() - started < 2500, "descendant-held pipes cannot extend the wall-clock timeout indefinitely");
-    await waitForFile(pidFile);
-    await assertProcessGone(Number(readFileSync(pidFile, "utf8")), "runShell grandchild");
+    await assertProcessGone(await waitForPid(pidFile), "runShell grandchild");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -147,8 +151,7 @@ test("TERM escalation still kills a quiet grandchild after the direct shell has 
       runShell(nodeCommand(script, pidFile), dir, "off", { timeout: 200, maxBuffer: 64 * 1024 }),
       /timed out after 200ms/,
     );
-    await waitForFile(pidFile);
-    await assertProcessGone(Number(readFileSync(pidFile, "utf8")), "quiet grandchild after shell close");
+    await assertProcessGone(await waitForPid(pidFile), "quiet grandchild after shell close");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -168,8 +171,7 @@ test("runShell output cap kills the entire process tree and retains a bounded di
     assert.ok(result.stdout.length <= 1024, "captured stdout remains bounded");
     assert.ok(liveBytes <= 1024, "output past the cap is not streamed to the UI during termination grace");
     assert.match(result.stderr, /output truncated.*process tree killed/i);
-    await waitForFile(pidFile);
-    await assertProcessGone(Number(readFileSync(pidFile, "utf8")), "output-capped grandchild");
+    await assertProcessGone(await waitForPid(pidFile), "output-capped grandchild");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -192,19 +194,21 @@ test("runShell hard fallback settles even if a daemon escaped the owned process 
   const dir = mkdtempSync(join(tmpdir(), "hara-shell-fallback-"));
   const pidFile = join(dir, "escaped.pid");
   let escapedPid = 0;
+  let running;
   try {
     const script = escapedPipeFixture(dir);
     const started = Date.now();
-    await assert.rejects(
-      runShell(nodeCommand(script, pidFile), dir, "off", { timeout: 150, maxBuffer: 64 * 1024 }),
-      /timed out after 150ms/,
-    );
+    running = runShell(nodeCommand(script, pidFile), dir, "off", { timeout: 500, maxBuffer: 64 * 1024 })
+      .then(() => null, (error) => error);
+    escapedPid = await waitForPid(pidFile);
+    assert.equal(alive(escapedPid), true, "fixture must publish readiness from the escaped process itself");
+    const failure = await running;
+    assert.match(failure?.message ?? "", /timed out after 500ms/);
     const elapsed = Date.now() - started;
-    assert.ok(elapsed >= 1000 && elapsed < 2500, `hard fallback should settle predictably, got ${elapsed}ms`);
-    await waitForFile(pidFile);
-    escapedPid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(elapsed >= 1500 && elapsed < 3000, `hard fallback should settle predictably, got ${elapsed}ms`);
     assert.equal(alive(escapedPid), true, "fixture escaped the original group so the fallback path was exercised");
   } finally {
+    await running;
     if (escapedPid) {
       try { process.kill(-escapedPid, "SIGKILL"); } catch {
         try { process.kill(escapedPid, "SIGKILL"); } catch { /* already gone */ }
@@ -220,15 +224,15 @@ test("killJob and exit cleanup kill grandchildren, not just the direct shell", {
     const script = processTreeFixture(dir, false, false);
     const firstPidFile = join(dir, "first.pid");
     const first = startJob(nodeCommand(script, firstPidFile), dir, "off");
-    await waitForFile(firstPidFile);
+    const firstPid = await waitForPid(firstPidFile);
     assert.equal(killJob(first), true);
-    await assertProcessGone(Number(readFileSync(firstPidFile, "utf8")), "killed job grandchild");
+    await assertProcessGone(firstPid, "killed job grandchild");
 
     const exitPidFile = join(dir, "exit.pid");
     const second = startJob(nodeCommand(script, exitPidFile), dir, "off");
-    await waitForFile(exitPidFile);
+    const exitPid = await waitForPid(exitPidFile);
     killAllJobs();
-    await assertProcessGone(Number(readFileSync(exitPidFile, "utf8")), "exit-cleanup grandchild");
+    await assertProcessGone(exitPid, "exit-cleanup grandchild");
     assert.equal(listJobs().find((job) => job.id === second)?.status, "killed");
   } finally {
     killAllJobs();

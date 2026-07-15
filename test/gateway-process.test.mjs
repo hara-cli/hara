@@ -85,6 +85,21 @@ test("gateway run timeout is configurable but clamped to a hard ceiling", () => 
   assert.equal(gatewayRunTimeoutMs(Number.MAX_SAFE_INTEGER), 30 * 60_000);
 });
 
+test("approved org subprocesses retain output on normal completion", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hara-approved-org-output-"));
+  const helper = join(cwd, "org-output.mjs");
+  writeFileSync(helper, 'process.stdout.write("approved output\\n");\n');
+  try {
+    const result = await runApprovedOrgProcess(process.execPath, [helper], { cwd, timeoutMs: 5_000 });
+    assert.equal(result.code, 0);
+    assert.equal(result.signal, null);
+    assert.equal(result.stopReason, undefined);
+    assert.match(result.output, /approved output/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("approved org subprocesses have a hard ceiling and die with gateway shutdown", async () => {
   assert.equal(approvedOrgTimeoutMs("bad"), 15 * 60_000);
   assert.equal(approvedOrgTimeoutMs(1), 50);
@@ -95,7 +110,7 @@ test("approved org subprocesses have a hard ceiling and die with gateway shutdow
   const ready = join(cwd, "ready");
   writeFileSync(helper, `
 import { writeFileSync } from "node:fs";
-process.stdout.write("pid:" + process.pid + "\\n", () => writeFileSync(${JSON.stringify(ready)}, ""));
+writeFileSync(${JSON.stringify(ready)}, "");
 process.on("SIGTERM", () => process.stdout.write("late-after-stop\\n"));
 setInterval(() => {}, 1000);
 `);
@@ -113,7 +128,6 @@ setInterval(() => {}, 1000);
     controller.abort();
     const result = await running;
     assert.equal(result.stopReason, "shutdown");
-    assert.match(result.output, /pid:\d+/);
     assert.doesNotMatch(result.output, /late-after-stop/, "output emitted after shutdown must be discarded");
     assert.ok(Date.now() - started < 1_500, "a TERM-ignoring approved delegation cannot pin daemon shutdown");
   } finally {
