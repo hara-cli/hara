@@ -30,6 +30,10 @@ All notable changes to `@nanhara/hara`.
   symlink-free 0700 directories, bounded no-follow reads, hard-link rejection, 0600 fsynced staging, and
   identity-checked compare-and-swap publication. Preseeded aliases fail closed without changing external file
   bytes or permissions; legacy `org.json` archival/removal is bound to the exact verified inode.
+- **Text tools no longer rewrite undecodable bytes.** Existing-file preflight for `edit_file`, `write_file`,
+  and single/multi-file `apply_patch` uses fatal UTF-8 decoding and keeps the NUL/binary refusal. Invalid input
+  fails before the first commit with its original bytes intact, while a valid UTF-8 BOM is preserved across an
+  edit instead of being silently stripped.
 
 ## 0.123.1 — 2026-07-15 — restore default TUI keyboard input
 

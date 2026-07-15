@@ -25,6 +25,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
   FileReadLimitError,
   MAX_EDIT_READ_BYTES,
+  decodeUtf8Strict,
   openVerifiedRegularFileNoFollow,
   verifyOpenedRegularFileSync,
   type RegularFileSnapshot,
@@ -265,7 +266,7 @@ export function readPrivateStateFileSnapshotSync(
       || latest.ctimeMs !== info.ctimeMs
     ) throw new Error(`private Hara state file changed while reading: '${path}'`);
     return {
-      text: bytes.toString("utf8"),
+      text: decodeUtf8Strict(bytes, path),
       dev: latest.dev,
       ino: latest.ino,
       mode: latest.mode & 0o777,
@@ -511,7 +512,7 @@ export async function readPrivateStateFileSnapshot(
       || after.ctimeMs !== before.ctimeMs
     ) throw new Error(`private Hara state file changed while reading: '${path}'`);
     return {
-      text: Buffer.concat(chunks, total).toString("utf8"),
+      text: decodeUtf8Strict(Buffer.concat(chunks, total), path),
       dev: after.dev,
       ino: after.ino,
       mode: after.mode & 0o777,

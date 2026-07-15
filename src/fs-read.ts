@@ -22,6 +22,30 @@ export class BinaryFileError extends Error {
   }
 }
 
+export class InvalidUtf8FileError extends Error {
+  readonly code = "HARA_INVALID_UTF8";
+
+  constructor(path: string) {
+    super(
+      `${path} is not valid UTF-8; refusing a lossy text operation. ` +
+      "Use a binary-aware tool or explicitly transcode the file first",
+    );
+    this.name = "InvalidUtf8FileError";
+  }
+}
+
+/** Decode a complete text-file snapshot without replacing invalid bytes or dropping a UTF-8 BOM. */
+export function decodeUtf8Strict(bytes: Uint8Array, path: string): string {
+  if (bytes.includes(0)) throw new BinaryFileError(path);
+  try {
+    // ignoreBOM=true means the BOM is emitted as U+FEFF. A later UTF-8 rewrite therefore preserves the
+    // original bytes instead of silently stripping the marker while editing otherwise valid text.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new InvalidUtf8FileError(path);
+  }
+}
+
 export class NonRegularFileError extends Error {
   readonly code = "HARA_NOT_REGULAR_FILE";
 
@@ -195,7 +219,7 @@ export async function readVerifiedRegularFileSnapshot(
       || latest.ctimeMs !== info.ctimeMs
     ) throw new Error(`refusing to read ${path}: file changed while reading it`);
     return {
-      text: Buffer.concat(chunks, total).toString("utf8"),
+      text: decodeUtf8Strict(Buffer.concat(chunks, total), path),
       dev: info.dev,
       ino: info.ino,
       mode: info.mode & 0o777,
@@ -249,7 +273,7 @@ export function readVerifiedRegularFileSnapshotSync(
       || latest.ctimeMs !== info.ctimeMs
     ) throw new Error(`refusing to read ${path}: file changed while reading it`);
     return {
-      text: bytes.toString("utf8"),
+      text: decodeUtf8Strict(bytes, path),
       dev: info.dev,
       ino: info.ino,
       mode: info.mode & 0o777,
@@ -330,8 +354,7 @@ export function readModelContextFileSync(path: string, maxBytes: number): string
     // Read one byte past the stated size/limit so concurrent growth is never silently included or ignored.
     const bytes = readFdBytesSync(fd, Math.min(limit + 1, size + 1));
     if (bytes.length > limit) throw new FileReadLimitError(path, limit);
-    if (bytes.includes(0)) throw new BinaryFileError(path);
-    return bytes.toString("utf8");
+    return decodeUtf8Strict(bytes, path);
   });
 }
 
@@ -410,7 +433,7 @@ async function readRegularFileSnapshotWithFlags(path: string, maxBytes: number, 
       position += bytesRead;
     }
     if (total > limit) throw new FileReadLimitError(path, limit);
-    return { text: Buffer.concat(chunks, total).toString("utf8"), dev: info.dev, ino: info.ino, mode: info.mode & 0o777, nlink: info.nlink };
+    return { text: decodeUtf8Strict(Buffer.concat(chunks, total), path), dev: info.dev, ino: info.ino, mode: info.mode & 0o777, nlink: info.nlink };
   } finally {
     await handle.close().catch(() => {});
   }
