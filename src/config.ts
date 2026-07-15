@@ -1,6 +1,20 @@
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import type { SandboxMode } from "./sandbox.js";
 import type { HooksConfig } from "./hooks.js";
 import type { NotifyMode } from "./notify.js";
@@ -134,6 +148,7 @@ export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-aut
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
 const MAX_PROJECT_CONFIG_BYTES = 256 * 1024;
+const MAX_GLOBAL_CONFIG_BYTES = 1024 * 1024;
 const KNOWN_CONFIG_KEYS = new Set<string>([
   ...CONFIG_KEYS,
   "hooks", "mcpServers", "modelVision", "overlays", "profiles",
@@ -209,7 +224,12 @@ export function readRawConfig(): Record<string, any> {
   const p = configPath();
   if (!existsSync(p)) return {};
   try {
-    return configRecord(JSON.parse(readFileSync(p, "utf8")));
+    const snapshot = readVerifiedRegularFileSnapshotSync(p, MAX_GLOBAL_CONFIG_BYTES, {
+      action: "read global config",
+      protectSensitive: false,
+      rejectHardLinks: true,
+    });
+    return configRecord(JSON.parse(snapshot.text));
   } catch {
     return {};
   }
@@ -319,16 +339,61 @@ function readProjectConfig(cwd: string): Record<string, any> {
   return {};
 }
 
-/** Write the config 0600 (it can hold `apiKey`) + tighten an existing file. */
+function existingConfigIdentity(path: string): { dev: number; ino: number } | null {
+  try {
+    const info = lstatSync(path);
+    if (info.isSymbolicLink()) throw new Error(`refusing global config write: '${path}' is a symbolic link`);
+    if (!info.isFile()) throw new Error(`refusing global config write: '${path}' is not a regular file`);
+    if (info.nlink !== 1) throw new Error(`refusing global config write: '${path}' is hard-linked`);
+    return { dev: info.dev, ino: info.ino };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/** Atomically replace the global 0600 config without opening its current directory entry for write. */
 function persistConfig(p: string, cfg: Record<string, unknown>): void {
   ensurePrivateHaraState();
-  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
-  try { chmodSync(dirname(p), 0o700); } catch { /* best effort */ }
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  const parent = dirname(p);
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const parentInfo = lstatSync(parent);
+  const canonicalParent = realpathSync.native(parent);
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink()) {
+    throw new Error(`refusing global config write: '${parent}' is not a canonical directory`);
+  }
+  const existing = existingConfigIdentity(p);
+  const temp = join(parent, `.config-${process.pid}-${randomUUID()}.tmp`);
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  let fd: number | undefined;
   try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* best-effort */
+    fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
+    writeFileSync(fd, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+    fsyncSync(fd);
+    const staged = fstatSync(fd);
+    if (!staged.isFile() || staged.nlink !== 1) throw new Error("refusing global config write: unsafe staging inode");
+    closeSync(fd);
+    fd = undefined;
+
+    const parentAfter = lstatSync(parent);
+    if (
+      !parentAfter.isDirectory() || parentAfter.isSymbolicLink() ||
+      parentAfter.dev !== parentInfo.dev || parentAfter.ino !== parentInfo.ino ||
+      realpathSync.native(parent) !== canonicalParent
+    ) throw new Error(`refusing global config write: '${parent}' changed before commit`);
+    const current = existingConfigIdentity(p);
+    if ((existing === null) !== (current === null) || (existing && current && (existing.dev !== current.dev || existing.ino !== current.ino))) {
+      throw new Error(`refusing global config write: '${p}' changed before commit`);
+    }
+    // rename replaces the path entry; it never follows an alias planted after the last identity check.
+    renameSync(temp, p);
+    const committed = lstatSync(p);
+    if (!committed.isFile() || committed.isSymbolicLink() || committed.dev !== staged.dev || committed.ino !== staged.ino || committed.nlink !== 1) {
+      throw new Error(`global config changed during commit: '${p}'`);
+    }
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* preserve original error */ }
+    try { rmSync(temp, { force: true }); } catch { /* preserve original error */ }
   }
 }
 

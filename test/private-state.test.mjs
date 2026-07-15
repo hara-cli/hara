@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   chmodSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
@@ -30,6 +31,24 @@ test("private-state rejects a symlinked ~/.hara root without chmodding its targe
   try {
     assert.throws(() => tightenPrivateHaraState(home), /\.hara.*symbolic link/i);
     assert.equal(mode(target), 0o777, "the symlink target must remain untouched");
+  } finally {
+    resetPrivateHaraStateForTests();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("private-state migration does not chmod an external hard-link target", { skip: process.platform === "win32" }, () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-private-hardlink-"));
+  const state = join(home, ".hara");
+  const outside = join(home, "outside.json");
+  mkdirSync(state);
+  writeFileSync(outside, "{}\n");
+  chmodSync(outside, 0o644);
+  linkSync(outside, join(state, "config.json"));
+
+  try {
+    tightenPrivateHaraState(home);
+    assert.equal(mode(outside), 0o644, "migration leaves the external inode mode untouched");
   } finally {
     resetPrivateHaraStateForTests();
     rmSync(home, { recursive: true, force: true });

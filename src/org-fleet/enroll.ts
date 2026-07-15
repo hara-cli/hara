@@ -10,7 +10,7 @@
 //   GET  {gateway}/v1/roles       Bearer <device_token> -> {version, org_policy, roles:[…]}  (B3 digital-employee push-down)
 //   POST {gateway}/v1/chat/completions  (OpenAI-compatible; the normal agent traffic, Bearer <device_token>)
 import { homedir, hostname, platform } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmSync } from "node:fs";
 import { orgRolesDir } from "../org/roles.js";
 import { loadActiveProfile, upsertProfile, useProfile, getProfile, DEFAULT_ORG_ID } from "../profile/profile.js";
@@ -147,6 +147,25 @@ export interface RoleBundle {
   roles?: BundleRole[];
 }
 
+const SAFE_ORG_ROLE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const WINDOWS_RESERVED_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+function isSafeBundleRole(value: unknown): value is BundleRole {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const role = value as Record<string, unknown>;
+  if (
+    typeof role.name !== "string" || !SAFE_ORG_ROLE_NAME.test(role.name) || WINDOWS_RESERVED_NAME.test(role.name) ||
+    typeof role.system !== "string" || !role.system.trim()
+  ) return false;
+  for (const key of ["description", "model"] as const) {
+    if (role[key] !== undefined && typeof role[key] !== "string") return false;
+  }
+  for (const key of ["owns", "rejects", "allow_tools", "deny_tools"] as const) {
+    if (role[key] !== undefined && (!Array.isArray(role[key]) || !(role[key] as unknown[]).every((item) => typeof item === "string"))) return false;
+  }
+  return true;
+}
+
 /** Render one bundle role into the markdown frontmatter the CLI role loader expects
  *  (src/org/roles.ts parseFrontmatter): name/description/owns/rejects/model/allowTools/denyTools, body=system. */
 function renderRoleMd(r: BundleRole): string {
@@ -173,11 +192,18 @@ export async function syncOrgRoles(signal?: AbortSignal): Promise<number> {
     const res = await fetch(`${e.gatewayUrl}/v1/roles`, { signal, headers: { authorization: `Bearer ${e.deviceToken}` } });
     if (!res.ok) return 0;
     const bundle = (await res.json()) as RoleBundle;
-    const roles = Array.isArray(bundle.roles) ? bundle.roles.filter((r) => r && r.name && r.system) : [];
+    const roles = Array.isArray(bundle.roles)
+      ? [...new Map(bundle.roles.filter(isSafeBundleRole).map((role) => [role.name, role])).values()]
+      : [];
     const dir = orgRolesDir();
     rmSync(dir, { recursive: true, force: true }); // authoritative replace
     mkdirSync(dir, { recursive: true });
-    for (const r of roles) writeFileSync(join(dir, `${r.name}.md`), renderRoleMd(r), "utf8");
+    const root = resolve(dir);
+    for (const r of roles) {
+      const target = resolve(root, `${r.name}.md`);
+      if (dirname(target) !== root) continue;
+      writeFileSync(target, renderRoleMd(r), "utf8");
+    }
     // org policy sidecar (model/tool/approval floors the CLI enforces; skipped by the .md-only role loader)
     writeFileSync(join(dir, "_policy.json"), JSON.stringify({ version: bundle.version ?? 0, org_policy: bundle.org_policy ?? {} }, null, 2) + "\n", "utf8");
     return roles.length;

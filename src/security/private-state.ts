@@ -291,7 +291,9 @@ function tightenTree(root: string, budget: MigrationBudget): void {
       chmodPrivate(path, 0o700);
       const entries = readdirSync(path);
       for (const entry of entries) stack.push(join(path, entry));
-    } else if (info.isFile()) {
+    } else if (info.isFile() && info.nlink === 1) {
+      // chmod follows hard links at the inode level. An attacker-controlled alias must not let startup
+      // tighten (and thereby mutate) an unrelated file outside ~/.hara; dedicated readers reject it later.
       chmodPrivate(path, 0o600);
     }
   }

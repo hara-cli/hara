@@ -124,6 +124,47 @@ test("syncOrgRoles: pulls /v1/roles → ~/.hara/org-roles/*.md, maps snake→cam
   }
 });
 
+test("syncOrgRoles rejects traversal and Windows-special role names without writing outside org-roles", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-roles-traversal-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  const bundle = {
+    roles: [
+      { name: "../../escaped", system: "bad" },
+      { name: "..\\escaped", system: "bad" },
+      { name: "CON", system: "bad" },
+      { name: "safe-auditor", system: "good" },
+    ],
+  };
+  const server = createServer((req, res) => {
+    if (req.url === "/v1/enroll") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ device_token: "dev-r", device_id: "d-r", model: "glm-5" }));
+    } else if (req.url === "/v1/roles") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(bundle));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await enrollDevice(url, "CODE");
+    assert.equal(await syncOrgRoles(), 1);
+    assert.ok(existsSync(join(orgRolesDir(), "safe-auditor.md")));
+    assert.equal(existsSync(join(home, "escaped.md")), false);
+    assert.equal(existsSync(join(home, ".hara", "escaped.md")), false);
+    assert.equal(existsSync(join(orgRolesDir(), "CON.md")), false);
+  } finally {
+    server.close();
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("enrollDevice: a non-2xx (bad code) throws with a clear message", async () => {
   const server = createServer((req, res) => {
     res.writeHead(403);

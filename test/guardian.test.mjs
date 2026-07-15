@@ -86,6 +86,10 @@ test("isOutsideRoot + editPaths helpers", () => {
   assert.equal(isOutsideRoot("/etc/x", CWD), true);
   assert.equal(isOutsideRoot("../x", CWD), true);
   assert.equal(isOutsideRoot("/dev/null", CWD), false); // pseudo-path, in-scope
+  assert.equal(isOutsideRoot("src\\index.ts", "C:\\repo\\app"), false, "Windows child paths stay inside their root");
+  assert.equal(isOutsideRoot("C:\\repo\\app\\src\\index.ts", "C:\\repo\\app"), false);
+  assert.equal(isOutsideRoot("C:\\repo\\application\\index.ts", "C:\\repo\\app"), true, "prefix siblings stay outside");
+  assert.equal(isOutsideRoot("C:\\repo\\other\\index.ts", "C:\\repo\\app"), true);
   assert.deepEqual(editPaths("edit_file", { path: "a" }), ["a"]);
   assert.deepEqual(editPaths("apply_patch", { changes: [{ path: "a" }, { path: "b" }] }), ["a", "b"]);
 });

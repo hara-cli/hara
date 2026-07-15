@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 
 const originalTrustProjectConfig = process.env.HARA_TRUST_PROJECT_CONFIG;
 delete process.env.HARA_TRUST_PROJECT_CONFIG;
-const { loadConfig } = await import("../dist/config.js");
+const { loadConfig, readRawConfig, writeConfigValue } = await import("../dist/config.js");
 after(() => {
   if (originalTrustProjectConfig === undefined) delete process.env.HARA_TRUST_PROJECT_CONFIG;
   else process.env.HARA_TRUST_PROJECT_CONFIG = originalTrustProjectConfig;
@@ -445,6 +445,28 @@ test("loadConfig: project config rejects .hara/final symlinks, hard links, and o
   }
   assert.match(warning, /symlink parent|symlink file|hard-linked file|oversized file/);
   assert.doesNotMatch(warning, /(?:PARENT|FINAL|HARD)_LINK_SECRET_MODEL|OVERSIZED_SECRET_MODEL/);
+});
+
+test("global config refuses hard-link aliases and never rewrites their external inode", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-global-config-hardlink-"));
+  const home = join(root, "home");
+  const outside = join(root, "outside.json");
+  const config = join(home, ".hara", "config.json");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  const original = JSON.stringify({ model: "external-must-survive" });
+  writeFileSync(outside, original);
+  linkSync(outside, config);
+  const savedHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    assert.deepEqual(readRawConfig(), {}, "unsafe global aliases are not loaded into routing state");
+    assert.throws(() => writeConfigValue("model", "attacker-write"), /hard-linked/i);
+    assert.equal(readFileSync(outside, "utf8"), original, "the external hard-link target is unchanged");
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("loadConfig: non-object config roots and blank overlay env fail soft", () => {

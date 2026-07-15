@@ -16,7 +16,7 @@
 // Plus a deterministic circuit-breaker: N guardian BLOCKS in one run (or an escalating-destructive runaway)
 // trips a hard stop that requires explicit user confirmation to continue — a harder stop than the soft
 // stuck-guard nudge, and one that aborts safely (never hangs) when there's no interactive user.
-import { resolve, isAbsolute } from "node:path";
+import { resolve, isAbsolute, relative, sep, win32 } from "node:path";
 import type { Provider, NeutralMsg } from "../providers/types.js";
 import { boundedProviderTurn } from "../providers/bounded-turn.js";
 import { canonicalize, splitCompound } from "./permissions.js";
@@ -92,10 +92,18 @@ function redirectionTargets(canonical: string): string[] {
  *  pseudo-paths (/dev/null) and empties are treated as in-scope. */
 export function isOutsideRoot(p: string, cwd: string): boolean {
   if (!p || p === "/dev/null" || p === "-") return false;
-  const expanded = p.replace(/^~(?=\/|$)/, process.env.HOME ?? "~");
-  const abs = isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
-  const root = resolve(cwd);
-  return abs !== root && !abs.startsWith(root + "/");
+  // Windows uses `\\` boundaries, so concatenating `root + "/"` classifies every ordinary child as
+  // outside. `relative` expresses containment portably. Detect an explicit Windows root as well so the
+  // classifier remains testable and safe when a control-plane caller runs on another host.
+  const windowsRoot = win32.isAbsolute(cwd);
+  const pathApi = windowsRoot
+    ? { resolve: win32.resolve, isAbsolute: win32.isAbsolute, relative: win32.relative, sep: win32.sep }
+    : { resolve, isAbsolute, relative, sep };
+  const expanded = p.replace(/^~(?=[/\\]|$)/, process.env.HOME ?? process.env.USERPROFILE ?? "~");
+  const abs = pathApi.isAbsolute(expanded) ? pathApi.resolve(expanded) : pathApi.resolve(cwd, expanded);
+  const root = pathApi.resolve(cwd);
+  const rel = pathApi.relative(root, abs);
+  return rel !== "" && (rel === ".." || rel.startsWith(`..${pathApi.sep}`) || pathApi.isAbsolute(rel));
 }
 
 /** Collect the file paths an edit-kind tool would write/delete, from its tool input. */
