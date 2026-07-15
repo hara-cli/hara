@@ -32,14 +32,14 @@ export function recursiveRootContainsHome(root: string, home = homedir()): boole
 export function homeWorkspaceActionError(action: string): string {
   return (
     `Refusing to ${action} from the home directory: it is not an implicit project workspace. ` +
-    "Run `cd /path/to/project` first."
+    "Run `cd /path/to/project` first, or launch with `hara --cwd /path/to/project`."
   );
 }
 
 export function recursiveHomeSearchError(tool: string): string {
   return (
     `Error: ${tool} will not recursively scan the home directory. ` +
-    "Run Hara from a project (`cd /path/to/project`). Explicit single-file reads remain available."
+    "Run Hara from a project (`cd /path/to/project` or `hara --cwd /path/to/project`). Explicit single-file reads remain available."
   );
 }
 
@@ -48,7 +48,7 @@ export function recursiveHomeSearchError(tool: string): string {
 export function homeWorkspaceDirectoryScanError(tool: string): string {
   return (
     `Error: ${tool} will not enumerate or recursively scan directories while Hara is rooted at the home directory. ` +
-    "Run `cd /path/to/project` and start Hara there. Explicit single-file reads remain available."
+    "Run `cd /path/to/project` or relaunch with `hara --cwd /path/to/project`. Explicit single-file reads remain available."
   );
 }
 
@@ -61,6 +61,6 @@ export function homeWorkspaceGuidance(cwd: string): string {
     "The working directory resolves to the user's home directory, which is not an implicit project. " +
     "Do not initialize a project, create or modify files, build a repository index, run shell/external " +
     "executable tools, enumerate directories, or grep/glob/search Home or one of its child directories. " +
-    "Ask the user to run `cd /path/to/project` for project work. Only explicitly named single-file reads remain available."
+    "Ask the user to run `cd /path/to/project` or `hara --cwd /path/to/project` for project work. Only explicitly named single-file reads remain available."
   );
 }

@@ -9,7 +9,7 @@ import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir, readRecentLogs, scaffoldMemory, type Scope } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
-import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, realpathSync, statSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -1172,6 +1172,7 @@ program
   .option("--approval <mode>", "approval mode: suggest | auto-edit | full-auto")
   .option("--profile <id>", "use this identity profile for this run (personal / org id) — see `hara profile list`")
   .option("--overlay <name>", "apply a named config overlay from ~/.hara/config.json (legacy: --profile)")
+  .option("--cwd <dir>", "run from this explicit project directory (alternative to cd)")
   .option("-c, --continue", "resume the most recent session in this directory")
   .option("--resume <id>", "resume a specific session by id")
   .option("--sandbox <mode>", "sandbox the shell: off | workspace-write | read-only");
@@ -1183,6 +1184,17 @@ program
 // Validation: unknown id is a hard fail (don't silently fall through to default; the user
 // asked for a specific identity, surface the mistake).
 program.hook("preAction", (thisCmd) => {
+  const cwdFlag = thisCmd.opts().cwd as string | undefined;
+  if (cwdFlag) {
+    try {
+      const target = realpathSync.native(resolve(cwdFlag));
+      if (!statSync(target).isDirectory()) throw new Error("not a directory");
+      process.chdir(target);
+    } catch (error) {
+      out(c.red(`Cannot use --cwd '${cwdFlag}': ${error instanceof Error ? error.message : String(error)}.\n`));
+      process.exit(2);
+    }
+  }
   const flag = thisCmd.opts().profile as string | undefined;
   if (!flag) return;
   if (!getProfile(flag)) {
@@ -3243,7 +3255,7 @@ program.action(async (opts) => {
   const useTui = stdin.isTTY && stdout.isTTY && process.env.HARA_TUI !== "0";
   out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}${sandbox !== "off" ? `  ·  sandbox:${sandbox}` : ""}  ·  ${cwd}\n`));
   if (homeWorkspace) {
-    out(c.yellow("⚠ Home directory is not treated as a project workspace. Run `cd /path/to/project`; recursive project scans are disabled here.\n"));
+    out(c.yellow("⚠ Home directory is not treated as a project workspace. Run `cd /path/to/project` or `hara --cwd /path/to/project`; recursive project scans are disabled here.\n"));
   }
   // Startup update notice — cache-driven (a previous session's background probe), so it costs zero
   // latency; today's probe (if due) fires in the background for the NEXT launch. TTY sessions only.
@@ -3868,7 +3880,7 @@ program.action(async (opts) => {
         // never saw update notices and versions silently went stale (field report: stuck on 0.112.5)
         updateNotice: cfg.updateCheck ? (checkForUpdate(pkg.version) ?? undefined) : undefined,
         workspaceNotice: homeWorkspace
-          ? "Home is not a project workspace · cd /path/to/project (recursive scans disabled here)"
+          ? "Home is not a project workspace · cd there or use hara --cwd /path/to/project"
           : undefined,
       },
       visionNotice: __visionNotice,
