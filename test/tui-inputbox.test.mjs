@@ -351,6 +351,18 @@ test("InputBox: a SHORT multi-line paste (1-2 newlines, <600 chars) folds — do
   unmount();
 });
 
+test("InputBox: a framed paste followed immediately by Enter submits the pasted draft", async () => {
+  let submitted = null;
+  const { stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
+  // The terminal adapter deliberately delivers these as two logical events even when both arrived in
+  // one OS chunk. Do not wait for a React render between them: this pins the same-turn batching race.
+  stdin.write("alpha\nbeta");
+  stdin.write("\r");
+  await tick();
+  assert.equal(submitted, "alpha\nbeta");
+  unmount();
+});
+
 test("InputBox: a lone newline in the input stream = Enter (submits the current value)", async () => {
   let submitted = null;
   const { stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));

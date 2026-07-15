@@ -4,6 +4,7 @@
 import { render, Box, Text, useApp, useInput } from "ink";
 import { createElement } from "react";
 import { App, type AppProps } from "./App.js";
+import { BracketedPasteInput, enableBracketedPaste } from "./bracketed-paste.js";
 
 type ResizeOutput = {
   columns?: number;
@@ -35,13 +36,18 @@ export function installResizeRepaint(out: ResizeOutput, instance: { clear(): voi
 }
 
 export async function runTui(props: AppProps): Promise<void> {
-  const instance = render(createElement(App, props));
   const out = process.stdout;
-  const removeResizeRepaint = installResizeRepaint(out, instance);
+  const input = new BracketedPasteInput(process.stdin);
+  const disableBracketedPaste = enableBracketedPaste(out);
+  let removeResizeRepaint = (): void => {};
   try {
+    const instance = render(createElement(App, props), { stdin: input as unknown as NodeJS.ReadStream });
+    removeResizeRepaint = installResizeRepaint(out, instance);
     await instance.waitUntilExit();
   } finally {
     removeResizeRepaint();
+    input.dispose();
+    disableBracketedPaste();
   }
 }
 

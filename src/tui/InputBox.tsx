@@ -445,20 +445,41 @@ export function InputBox({
   const [mode, setMode] = useState<VimMode>("insert"); // vim only
   const [pending, setPending] = useState(""); // vim operator-pending (d/c/g)
   const [register, setRegister] = useState(""); // vim yank/delete register
+  // Ink may emit several logical inputs from one OS chunk (notably bracketed paste followed by Enter)
+  // inside one React batch. Refs are the authoritative event-time draft; state remains the render copy.
+  // Without this split, the second callback observes the previous render and can submit an empty draft.
+  const valueRef = useRef(value);
+  const cursorRef = useRef(cursor);
+  const imagesRef = useRef(images);
+  const pastesRef = useRef(pastes);
+  valueRef.current = value;
+  cursorRef.current = cursor;
+  imagesRef.current = images;
+  pastesRef.current = pastes;
   const historyRef = useRef<ComposerHistory<ImageAttachment> | null>(null);
   if (!historyRef.current) historyRef.current = new ComposerHistory<ImageAttachment>();
   const inputHistory = historyRef.current;
 
   const set = (v: string, c: number): void => {
     inputHistory.abandonNavigation();
+    valueRef.current = v;
+    cursorRef.current = c;
     setValue(v);
     setCursor(c);
     setSel(0);
     setDismissed(false);
   };
 
-  const snapshot = (): InputDraft<ImageAttachment> => ({ value, attachments: images, pastes });
+  const snapshot = (): InputDraft<ImageAttachment> => ({
+    value: valueRef.current,
+    attachments: imagesRef.current,
+    pastes: pastesRef.current,
+  });
   const restore = (draft: InputDraft<ImageAttachment>): void => {
+    valueRef.current = draft.value;
+    cursorRef.current = draft.value.length;
+    imagesRef.current = draft.attachments;
+    pastesRef.current = draft.pastes;
     setValue(draft.value);
     setCursor(draft.value.length);
     setImages(draft.attachments);
@@ -471,12 +492,21 @@ export function InputBox({
   // (codex / Claude-Code style). Backspace over the token removes both.
   const addImage = (img: ImageAttachment): void => {
     inputHistory.abandonNavigation();
-    const tok = `[Image #${images.length + 1}]`;
-    const before = value.slice(0, cursor);
+    const currentValue = valueRef.current;
+    const currentCursor = cursorRef.current;
+    const currentImages = imagesRef.current;
+    const tok = `[Image #${currentImages.length + 1}]`;
+    const before = currentValue.slice(0, currentCursor);
     const ins = (before && !/\s$/.test(before) ? " " : "") + tok + " ";
-    setValue(before + ins + value.slice(cursor));
-    setCursor((before + ins).length);
-    setImages((xs) => [...xs, img]);
+    const nextValue = before + ins + currentValue.slice(currentCursor);
+    const nextCursor = (before + ins).length;
+    const nextImages = [...currentImages, img];
+    valueRef.current = nextValue;
+    cursorRef.current = nextCursor;
+    imagesRef.current = nextImages;
+    setValue(nextValue);
+    setCursor(nextCursor);
+    setImages(nextImages);
     setSel(0);
     setDismissed(false);
   };
@@ -486,24 +516,37 @@ export function InputBox({
   // can no longer fire the newline-submit path mid-paste. Expanded back to the full text on submit.
   const addPaste = (text: string): void => {
     inputHistory.abandonNavigation();
+    const currentValue = valueRef.current;
+    const currentCursor = cursorRef.current;
+    const currentPastes = pastesRef.current;
     const lines = text.split("\n").length;
-    const tok = `[Paste #${pastes.length + 1} +${lines} lines]`;
-    const before = value.slice(0, cursor);
+    const tok = `[Paste #${currentPastes.length + 1} +${lines} lines]`;
+    const before = currentValue.slice(0, currentCursor);
     const ins = (before && !/\s$/.test(before) ? " " : "") + tok + " ";
-    setValue(before + ins + value.slice(cursor));
-    setCursor((before + ins).length);
-    setPastes((xs) => [...xs, text]);
+    const nextValue = before + ins + currentValue.slice(currentCursor);
+    const nextCursor = (before + ins).length;
+    const nextPastes = [...currentPastes, text];
+    valueRef.current = nextValue;
+    cursorRef.current = nextCursor;
+    pastesRef.current = nextPastes;
+    setValue(nextValue);
+    setCursor(nextCursor);
+    setPastes(nextPastes);
     setSel(0);
     setDismissed(false);
   };
   const expandPastes = (text: string): string =>
-    text.replace(/\[Paste #(\d+) \+\d+ lines\]/g, (m, d) => pastes[Number(d) - 1] ?? m);
+    text.replace(/\[Paste #(\d+) \+\d+ lines\]/g, (m, d) => pastesRef.current[Number(d) - 1] ?? m);
 
-  const submit = (text: string): void => {
-    if (!text.trim() && images.length === 0) return; // nothing to send
+  const submit = (): void => {
+    const text = valueRef.current;
+    const currentImages = imagesRef.current;
+    if (!text.trim() && currentImages.length === 0) return; // nothing to send
     inputHistory.record(snapshot());
-    onSubmit?.(expandPastes(text), images.length ? images : undefined);
+    onSubmit?.(expandPastes(text), currentImages.length ? currentImages : undefined);
     set("", 0);
+    imagesRef.current = [];
+    pastesRef.current = [];
     setImages([]);
     setPastes([]);
     setMode("insert"); // a fresh prompt starts in insert
@@ -557,7 +600,7 @@ export function InputBox({
       }
       // vim NORMAL mode: printable keys are commands, not text (Enter/arrows/backspace still navigate/submit)
       if (vim && mode === "normal") {
-        if (key.return) return submit(value);
+        if (key.return) return submit();
         if (key.leftArrow) return setCursor((c) => Math.max(0, c - 1));
         if (key.rightArrow) return setCursor((c) => Math.min(value.length, c + 1));
         if (key.backspace || key.delete) return setCursor((c) => Math.max(0, c - 1));
@@ -599,7 +642,7 @@ export function InputBox({
           set(value.slice(0, cursor) + "\n" + value.slice(cursor), cursor + 1);
           return;
         }
-        submit(value);
+        submit();
         return;
       }
       if (key.leftArrow) return setCursor((c) => previousGraphemeIndex(value, c));
@@ -656,7 +699,7 @@ export function InputBox({
         // A lone newline delivered through `input` (some terminals send Enter this way instead of
         // setting key.return) = the user pressed Enter → submit.
         if (/^[\r\n]+$/.test(input)) {
-          submit(value);
+          submit();
           return;
         }
         // A PASTE containing newlines inserts as REAL MULTI-LINE TEXT (normalize CRLF/CR → LF) — the
