@@ -74,9 +74,14 @@ test("computer child is cancelled promptly and does not survive the parent deadl
     // Full-suite process contention can delay fixture scheduling; cancellation latency starts only after the
     // child has positively started and remains the behavior under test.
     const deadline = Date.now() + 10_000;
-    while (!existsSync(pidFile) && !earlySettlement && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.ok(existsSync(pidFile), `fake screen-control child started${earlySettlement ? ` (${earlySettlement})` : ""}`);
-    pid = Number(readFileSync(pidFile, "utf8"));
+    while (!pid && !earlySettlement && Date.now() < deadline) {
+      if (existsSync(pidFile)) {
+        const candidate = Number(readFileSync(pidFile, "utf8").trim());
+        if (Number.isSafeInteger(candidate) && candidate > 0) pid = candidate;
+      }
+      if (!pid) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(pid, `fake screen-control child published a valid pid${earlySettlement ? ` (${earlySettlement})` : ""}`);
     const abortStarted = Date.now();
     controller.abort();
     await assert.rejects(running, /computer action interrupted/);

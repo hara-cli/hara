@@ -178,9 +178,14 @@ test("manual cron run cancellation settles promptly and kills its owned process 
     const started = Date.now();
     const running = runJobOnce(job, { timeoutMs: 30_000, signal: controller.signal });
     const startDeadline = Date.now() + 2_000;
-    while (!existsSync(pidFile) && Date.now() < startDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.ok(existsSync(pidFile), "fixture child started");
-    pid = Number(readFileSync(pidFile, "utf8"));
+    while (!pid && Date.now() < startDeadline) {
+      if (existsSync(pidFile)) {
+        const candidate = Number(readFileSync(pidFile, "utf8").trim());
+        if (Number.isSafeInteger(candidate) && candidate > 0) pid = candidate;
+      }
+      if (!pid) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(pid, "fixture child published a valid pid");
     controller.abort();
     const result = await running;
     assert.equal(result.ok, false);
