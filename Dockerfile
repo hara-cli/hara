@@ -19,6 +19,7 @@ COPY tsconfig.json ./
 COPY src ./src
 COPY runtime-bootstrap.cjs ./
 COPY scripts/normalize-dist-modes.mjs ./scripts/normalize-dist-modes.mjs
+COPY scripts/check-local-bin-link.mjs ./scripts/check-local-bin-link.mjs
 RUN npm run build
 
 # ── deps: production-only node_modules ──────────────────────────────────────

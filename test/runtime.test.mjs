@@ -80,7 +80,20 @@ test("runtime packaging: manifests, executable bin, scripts, and Docker use the 
 
   const docker = readFileSync(rootFile("Dockerfile"), "utf8");
   assert.equal((docker.match(/^FROM node:22-slim AS /gm) ?? []).length, 3);
-  assert.match(docker, /COPY scripts\/normalize-dist-modes\.mjs \.\/scripts\/normalize-dist-modes\.mjs/);
+  const buildStageStart = docker.indexOf("FROM node:22-slim AS build");
+  const buildRun = docker.indexOf("RUN npm run build", buildStageStart);
+  assert.ok(buildStageStart >= 0 && buildRun > buildStageStart, "Docker build stage runs the package build");
+  const buildStageBeforeRun = docker.slice(buildStageStart, buildRun);
+  const buildScriptFiles = [...pkg.scripts.build.matchAll(/\bnode\s+(scripts\/[\w./-]+)/g)].map((match) => match[1]);
+  assert.ok(buildScriptFiles.length > 0, "the package build declares its script dependencies");
+  for (const script of buildScriptFiles) {
+    const escaped = script.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    assert.match(
+      buildStageBeforeRun,
+      new RegExp(`^COPY ${escaped} \\.\\/${escaped}$`, "m"),
+      `Docker build stage copies package build dependency ${script} before npm run build`,
+    );
+  }
   assert.match(docker, /COPY runtime-bootstrap\.cjs \.\//);
   assert.match(docker, /ENTRYPOINT \["node", "\/app\/runtime-bootstrap\.cjs"\]/);
 });

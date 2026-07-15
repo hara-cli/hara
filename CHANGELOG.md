@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.122.7 — 2026-07-15 — isolated build-context parity
+
+- **Docker builds carry every package-build dependency.** The image build stage now copies the local-link
+  diagnostic script before `npm run build`, fixing the `MODULE_NOT_FOUND` failure that blocked the 0.122.6
+  Docker CI and GHCR multi-architecture image while npm and native standalone lanes succeeded.
+- **The gate follows the build graph instead of one remembered filename.** Runtime packaging tests parse every
+  `node scripts/...` dependency from the package build command and require a matching Dockerfile `COPY`, so a
+  future build helper cannot pass host-only gates while disappearing from an isolated container context.
+- `v0.122.6` remains immutable and is treated as a partial release; 0.122.7 supersedes it after npm, native
+  binaries, GitHub Release, and both GHCR architectures are independently verified.
+
 ## 0.122.6 — 2026-07-15 — resumed continuity and workspace/input hardening
 
 - **Resume continues the persisted task instead of rediscovering the workspace.** CLI `--resume`/`-c`,
