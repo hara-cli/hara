@@ -52,12 +52,22 @@ test("a resumed session treats persisted history as context instead of rediscove
     confirm: async () => true,
     quiet: true,
     continuationSession: true,
+    executionContext: [
+      "# Task execution (authoritative; separate from conversation history)",
+      "Task ID: task-1",
+      "Turn ID: turn-2",
+      "Objective: implement the agreed change",
+      "Interaction: steer",
+    ].join("\n"),
   });
 
   assert.match(systems[0], /Existing-session continuity/);
   assert.match(systems[0], /history is already the authoritative context/);
   assert.match(systems[0], /do not restart the task, re-inventory the workspace/);
   assert.match(systems[0], /Follow the latest user request/);
+  assert.match(systems[0], /Task execution \(authoritative; separate from conversation history\)/);
+  assert.match(systems[0], /Objective: implement the agreed change/);
+  assert.match(systems[0], /Interaction: steer/);
 });
 
 test("agent tool: when-to-use / when-NOT guidance (direct tools for narrow lookups)", async () => {

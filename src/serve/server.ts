@@ -47,10 +47,19 @@ import { parseSchedule, describeSchedule } from "../cron/schedule.js";
 import { loadTasks } from "../tools/task.js";
 import { listPending, resolvePending } from "../gateway/flows-pending.js";
 import { disposeTodoScope, restoreTodos, serializeTodos } from "../tools/todo.js";
-import { disposeReminderScope } from "../agent/reminders.js";
+import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 import { readModelContextFileSync } from "../fs-read.js";
+import {
+  createTaskExecution,
+  continueTaskExecution,
+  finishTaskExecution,
+  newSteerInteraction,
+  newTurnInteraction,
+  recordTaskSteering,
+  taskExecutionContext,
+} from "../session/task.js";
 
 /** What the CLI entry injects (built in index.ts, where config/providers/guardian already live). */
 export interface ServeDeps {
@@ -356,11 +365,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     s: ServeSession,
     text: string,
     images?: { path: string; mediaType: string }[],
-  ): Promise<{ reply: string; usage: { input: number; output: number }; ctx: { lastInput: number; window: number; pct: number } }> => {
+    forceNewTask = false,
+  ): Promise<{ reply: string; usage: { input: number; output: number }; ctx: { lastInput: number; window: number; pct: number }; taskId: string; turnId: string }> => {
     const sessionId = s.meta.id;
     s.busy = true;
     const turnAbort = new AbortController();
     s.abort = turnAbort;
+    s.pendingInput = [];
+    const interaction = !forceNewTask && s.resumeTaskPending && s.task
+      ? newSteerInteraction(s.task.turnId)
+      : newTurnInteraction();
+    if (interaction.kind === "steer") {
+      const continued = continueTaskExecution(s.task, interaction);
+      if (!continued.ok) {
+        s.abort = null;
+        s.busy = false;
+        throw new Error(continued.reason);
+      }
+      s.task = continued.task;
+    } else {
+      s.task = createTaskExecution(text, interaction.turnId);
+    }
+    s.resumeTaskPending = false;
+    const executionContext = taskExecutionContext(s.task, interaction);
+    hub.save(s); // crash-safe running identity before provider/tool side effects
+    broadcast("event.turn_start", { sessionId, taskId: s.task.id, turnId: s.task.turnId });
     const historyStart = s.history.length;
     const before = { input: s.stats.input, output: s.stats.output };
     const sink: UiSink = {
@@ -415,7 +444,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works).
       // Pasted images ride along as NeutralMsg.images — a vision-capable model sees them inline.
       s.history.push({ role: "user", content: await expandMentionsAsync(content, s.meta.cwd, { signal: turnAbort.signal }), ...(images && images.length ? { images } : {}) });
-      const outcome = await runAgent(s.history, {
+      let outcome;
+      do {
+        outcome = await runAgent(s.history, {
         provider: s.provider,
         ctx: {
           cwd: s.meta.cwd,
@@ -430,6 +461,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         projectContext: s.projectContext,
         memory: memoryDigest(s.meta.cwd),
         continuationSession: s.continuationSession,
+        executionContext,
+        pendingInput: async () => s.pendingInput.splice(0),
         stats: s.stats,
         signal: turnAbort.signal,
         onProviderTurn: (turn) => {
@@ -453,8 +486,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         },
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
-      });
+        });
+        // A steer may land after the agent's final in-loop drain but before the logical turn returns. Keep
+        // it in the same task/run instead of making the client retry it as an unrelated session.send.
+        const trailing = s.pendingInput.splice(0);
+        if (!trailing.length || turnAbort.signal.aborted || outcome.status !== "completed") break;
+        s.history.push(...trailing);
+        hub.save(s);
+      } while (true);
       s.meta.todos = serializeTodos(sessionId);
+      s.task = finishTaskExecution(s.task, outcome, s.meta.todos, turnAbort.signal.aborted);
+      s.resumeTaskPending = Boolean(s.task && s.task.status !== "completed");
       hub.save(s);
       const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
       // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
@@ -466,14 +508,26 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           : outcome.status === "halted"
             ? "agent turn halted by a safety control"
             : "agent turn failed");
-        broadcast("event.turn_end", { sessionId, reply: "", error: failure, status: outcome.status, usage, ctx });
+        broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply: "", error: failure, status: outcome.status, usage, ctx });
         throw new Error(failure);
       }
       // A persistent session may already contain many assistant messages. Only messages appended by THIS
       // request are eligible for its reply; a failed/empty turn must never replay a previous success.
       const reply = lastAssistantText(s.history.slice(historyStart));
-      broadcast("event.turn_end", { sessionId, reply, usage, ctx });
-      return { reply, usage, ctx };
+      broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply, usage, ctx });
+      return { reply, usage, ctx, taskId: s.task!.id, turnId: s.task!.turnId };
+    } catch (error) {
+      if (s.task?.status === "running") {
+        s.task = finishTaskExecution(
+          s.task,
+          { status: "error", error: error instanceof Error ? error.message : String(error) },
+          s.meta.todos ?? [],
+          turnAbort.signal.aborted,
+        );
+        s.resumeTaskPending = Boolean(s.task && s.task.status !== "completed");
+        hub.save(s);
+      }
+      throw error;
     } finally {
       s.abort = null;
       s.busy = s.pendingToolRuns > 0;
@@ -580,7 +634,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // clients feature-detect up front instead of probing for -32601 per call. `p.capabilities`
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
-            "session.list", "session.create", "session.resume", "session.send", "session.interrupt", "session.set-model",
+            "session.list", "session.create", "session.resume", "session.send", "session.steer", "session.interrupt", "session.set-model",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
@@ -629,7 +683,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
-            return reply(rpcResult(id!, { sessionId: r.session.meta.id, model: r.session.meta.model, history: historyForClient(r.session.history) }));
+            return reply(rpcResult(id!, {
+              sessionId: r.session.meta.id,
+              model: r.session.meta.model,
+              history: historyForClient(r.session.history),
+              task: r.session.task ? {
+                id: r.session.task.id,
+                objective: r.session.task.objective,
+                status: r.session.task.status,
+                turnId: r.session.task.turnId,
+                updatedAt: r.session.task.updatedAt,
+              } : undefined,
+            }));
           }
           case "session.send": {
             if (typeof p.sessionId !== "string" || typeof p.text !== "string" || !p.text) return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
@@ -639,8 +704,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const images = Array.isArray(p.images)
               ? p.images.filter((im: any) => im && typeof im.path === "string").map((im: any) => ({ path: im.path, mediaType: typeof im.mediaType === "string" ? im.mediaType : "image/png" }))
               : undefined;
-            const r = await runTurn(s, p.text, images);
+            const r = await runTurn(s, p.text, images, p.newTask === true);
             return reply(rpcResult(id!, r));
+          }
+          case "session.steer": {
+            if (typeof p.sessionId !== "string" || typeof p.text !== "string" || !p.text || typeof p.expectedTurnId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId + text + expectedTurnId required"));
+            }
+            const s = hub.get(p.sessionId);
+            if (!s) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
+            if (!s.busy || !s.abort || s.configuring) return reply(rpcError(id, ERR.BUSY, "there is no steerable running turn"));
+            const expanded = await expandMentionsAsync(p.text, s.meta.cwd, { signal: s.abort.signal });
+            const recorded = recordTaskSteering(s.task, p.expectedTurnId, expanded);
+            if (!recorded.ok) return reply(rpcError(id, ERR.BUSY, recorded.reason));
+            s.task = recorded.task;
+            s.pendingInput.push({ role: "user", content: `${INTERJECT_PREFIX}\n\n${expanded}` });
+            hub.save(s); // task audit is durable even before the running loop reaches its next drain
+            return reply(rpcResult(id!, { accepted: true, taskId: s.task.id, turnId: s.task.turnId }));
           }
           case "session.interrupt": {
             const s = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
@@ -881,6 +961,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!next) return reply(rpcError(id, ERR.PARAMS, `n out of range (1..${s.history.filter((m) => m.role === "user").length})`));
             s.history.length = 0;
             s.history.push(...next);
+            s.task = undefined;
+            s.resumeTaskPending = false;
+            s.pendingInput = [];
             hub.save(s);
             return reply(rpcResult(id!, { sessionId: s.meta.id, history: historyForClient(s.history) }));
           }

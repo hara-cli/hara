@@ -15,10 +15,11 @@ import {
   deleteSession,
   deriveTitle,
 } from "../session/store.js";
+import { forkTaskExecution, recoverTaskExecution, type TaskExecution } from "../session/task.js";
 
 export interface SessionStore {
   load(id: string): SessionData | null;
-  save(meta: SessionMeta, history: NeutralMsg[]): void;
+  save(meta: SessionMeta, history: NeutralMsg[], task?: TaskExecution): void;
   list(cwd?: string): SessionMeta[];
   acquire(id: string): { ok: boolean; pid?: number };
   release(id: string): void;
@@ -39,6 +40,11 @@ export const realStore: SessionStore = {
 export interface ServeSession {
   meta: SessionMeta;
   history: NeutralMsg[];
+  task?: TaskExecution;
+  /** The next ordinary send resumes this unfinished task unless the client explicitly requests a new one. */
+  resumeTaskPending: boolean;
+  /** Accepted mid-turn steering waiting for runAgent's next provider round. */
+  pendingInput: NeutralMsg[];
   provider: Provider;
   approval: ApprovalMode;
   autoApprove: Set<string>; // "don't ask again" tool names, session-scoped (runAgent mutates it)
@@ -71,7 +77,7 @@ export class SessionHub {
       const current = this.store.load(id);
       if (!current) return false;
       mutate(current);
-      this.store.save(current.meta, current.history);
+      this.store.save(current.meta, current.history, current.task);
       return true;
     } finally {
       this.store.release(id);
@@ -91,7 +97,7 @@ export class SessionHub {
     };
     const lock = this.store.acquire(meta.id); // fresh UUID, but filesystem errors must still fail closed
     if (!lock.ok) throw new Error(`could not acquire session lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
-    const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
+    const s: ServeSession = { meta, history: [], resumeTaskPending: false, pendingInput: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
     try {
       this.sessions.set(meta.id, s);
       this.store.save(meta, []); // an empty newly-created thread must survive restart and appear in lists
@@ -119,7 +125,8 @@ export class SessionHub {
       if (!prior) return { missing: true };
       // Credential/provider routing is live, while the model remains the session's explicit pin.
       prior.meta.provider = o.provider.id;
-      const s: ServeSession = { meta: prior.meta, history: [...prior.history], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
+      const task = recoverTaskExecution(prior.task);
+      const s: ServeSession = { meta: prior.meta, history: [...prior.history], task, resumeTaskPending: Boolean(task && task.status !== "completed"), pendingInput: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
       this.sessions.set(id, s);
       keepLock = true; // live session owns it until delete/releaseAll
       return { session: s };
@@ -158,7 +165,7 @@ export class SessionHub {
       const first = s.history.find((m) => m.role === "user");
       if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
     }
-    this.store.save(s.meta, s.history);
+    this.store.save(s.meta, s.history, s.task);
   }
 
   /** Rename a session (live or on-disk). Returns false when the id is unknown. */
@@ -167,7 +174,7 @@ export class SessionHub {
     if (live) {
       if (live.busy || live.configuring) return false;
       live.meta.title = title;
-      this.store.save(live.meta, live.history);
+      this.store.save(live.meta, live.history, live.task);
       return true;
     }
     return this.mutateStored(id, (current) => {
@@ -181,7 +188,7 @@ export class SessionHub {
     if (live) {
       if (live.busy || live.configuring) return false;
       live.meta.archived = on;
-      this.store.save(live.meta, live.history);
+      this.store.save(live.meta, live.history, live.task);
       return true;
     }
     return this.mutateStored(id, (current) => {
@@ -197,7 +204,7 @@ export class SessionHub {
   ): { session: ServeSession } | { missing: true } | { busy: true } {
     const live = this.sessions.get(id);
     if (live?.busy || live?.configuring) return { busy: true };
-    const src: { meta: SessionMeta; history: NeutralMsg[] } | null = live ?? this.store.load(id);
+    const src: { meta: SessionMeta; history: NeutralMsg[]; task?: TaskExecution } | null = live ?? this.store.load(id);
     if (!src) return { missing: true };
     const meta: SessionMeta = {
       id: newSessionId(),
@@ -217,6 +224,9 @@ export class SessionHub {
     const s: ServeSession = {
       meta,
       history: [...src.history],
+      task: forkTaskExecution(src.task),
+      resumeTaskPending: Boolean(src.task),
+      pendingInput: [],
       provider: o.provider,
       approval: o.approval,
       autoApprove: new Set(),
@@ -232,7 +242,7 @@ export class SessionHub {
     };
     try {
       this.sessions.set(meta.id, s);
-      this.store.save(meta, s.history); // persist immediately — a fork should survive a crash unsent
+      this.store.save(meta, s.history, s.task); // persist immediately — a fork should survive a crash unsent
       return { session: s };
     } catch (error) {
       this.sessions.delete(meta.id);

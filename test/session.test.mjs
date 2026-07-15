@@ -321,6 +321,16 @@ test("SessionHub acquires before load and locks offline rename/archive mutations
       updatedAt: "2026-01-01T00:00:00.000Z",
     },
     history: [{ role: "user", content: "latest history" }],
+    task: {
+      schemaVersion: 1,
+      id: "task-stored",
+      objective: "finish stored task",
+      status: "running",
+      turnId: "turn-stored",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      startedAt: "2026-01-01T00:00:00.000Z",
+    },
   };
   const store = {
     acquire(id) {
@@ -337,9 +347,9 @@ test("SessionHub acquires before load and locks offline rename/archive mutations
       events.push(`load:${id}`);
       return id === data.meta.id ? structuredClone(data) : null;
     },
-    save(meta, history) {
+    save(meta, history, task) {
       events.push(`save:${meta.id}`);
-      data = structuredClone({ meta, history });
+      data = structuredClone({ meta, history, ...(task ? { task } : {}) });
     },
     list() { return []; },
     delete() { return false; },
@@ -353,6 +363,8 @@ test("SessionHub acquires before load and locks offline rename/archive mutations
   assert.equal(resumed.session.meta.provider, "new-provider");
   assert.equal(resumed.session.meta.model, "old-model", "resume keeps the persisted model pin");
   assert.equal(resumed.session.continuationSession, true, "non-empty persisted history enables continuity guidance");
+  assert.equal(resumed.session.task.status, "paused", "a persisted running task recovers as paused/interrupted");
+  assert.equal(resumed.session.task.objective, "finish stored task", "resume keeps task identity outside history");
 
   events.length = 0;
   resumed.session.busy = true;

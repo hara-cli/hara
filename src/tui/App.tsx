@@ -21,6 +21,14 @@ import { onTurnPhase, turnPhase, type TurnPhase } from "../agent/phase.js";
 import { listJobs, onJobsChange } from "../exec/jobs.js";
 import { ModelPicker } from "./model-picker.js";
 import type { ReasoningStyle, Effort } from "../providers/reasoning.js";
+import { newSteerInteraction, newTurnInteraction, type TaskInteraction } from "../session/task.js";
+
+export interface QueuedInput {
+  line: string;
+  images?: ImageAttachment[];
+  /** The exact live turn this input was intended to steer. */
+  expectedTurnId: string;
+}
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -46,7 +54,7 @@ export interface Helpers {
   approval: Approval;
   /** Type-ahead steering: drain messages queued while the turn ran (shows each inline), for the
    *  runner to inject before the next model call. Returns [] when nothing is queued. */
-  drainQueue: () => { line: string; images?: ImageAttachment[] }[];
+  drainQueue: () => QueuedInput[];
 }
 /** Structured identity/header info — the runtime (index.ts) builds this once, the view
  *  branches on `kind` to render `personal` vs `org` differently (顾雅 spec). Keep this
@@ -94,7 +102,7 @@ export interface AppProps {
   model: string;
   cwd: string;
   header?: HeaderInfo;
-  onSubmit: (line: string, h: Helpers, images?: ImageAttachment[]) => Promise<void>;
+  onSubmit: (line: string, h: Helpers, images?: ImageAttachment[], interaction?: TaskInteraction) => Promise<void>;
   cycleApproval?: (cur: Approval) => Approval;
   /** Read an image off the OS clipboard for Ctrl+V (injected; omitted in tests). */
   onClipboardImage?: () => ImageAttachment | null;
@@ -465,7 +473,7 @@ function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]
   return (
     <Box marginTop={1}>
       <Text color="yellow">{frames[frame % frames.length]}</Text>
-      <Text dimColor>{` ${verb} · ⏎ queues${queued ? ` (${queued})` : ""}`}</Text>
+      <Text dimColor>{` ${verb} · ⏎ steers task${queued ? ` (${queued})` : ""}`}</Text>
     </Box>
   );
 }
@@ -571,7 +579,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   // in_progress item. The tool emits on every todo_write — keeps the UI in lockstep with the agent.
   const [todos, setTodos] = useState<Todo[]>(() => currentTodos());
   const ctrlRef = useRef<AbortController | null>(null);
-  const queueRef = useRef<{ line: string; images?: ImageAttachment[] }[]>([]); // type-ahead: FIFO of messages entered while working
+  const queueRef = useRef<QueuedInput[]>([]); // type-ahead: FIFO of messages entered while working
+  const activeTurnRef = useRef<string | null>(null); // interaction identity survives React render timing
   const [pool, setPool] = useState<string[]>([]); // type-ahead pool: queued message lines, shown above the input
   const drainingRef = useRef(false); // idempotency guard so the drain effect can't double-send one item
   const statusRef = useRef(status);
@@ -668,7 +677,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   // Type-ahead steering: hand the runner everything queued while the turn ran, showing each message
   // inline (as a user block) at the point it gets folded into the conversation. Drained mid-turn so an
   // addition reaches the model on its next call; whatever's still queued at turn end is the effect below.
-  const drainQueue = useCallback((): { line: string; images?: ImageAttachment[] }[] => {
+  const drainQueue = useCallback((): QueuedInput[] => {
     if (!queueRef.current.length) return [];
     const batch = queueRef.current;
     queueRef.current = [];
@@ -689,7 +698,11 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   }, []);
 
   const handleSubmit = useCallback(
-    async (line: string, images?: ImageAttachment[]): Promise<void> => {
+    async (
+      line: string,
+      images?: ImageAttachment[],
+      forcedInteraction?: Extract<TaskInteraction, { kind: "steer" }>,
+    ): Promise<void> => {
       const t = line.trim();
       // A free-text question (ask_user) is awaiting an answer: this submission IS the answer, not a new turn.
       if (askText) {
@@ -700,15 +713,20 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       }
       if ((!t && !images?.length) || prompt) return; // nothing to send, or a choice is pending
       if (working) {
-        // type-ahead: hold the message in the pool; all pooled messages are sent together when the turn ends
-        queueRef.current.push({ line, images });
+        // Bind every type-ahead message to the exact live turn. A stale message must never silently become
+        // a new task after another turn starts (Codex's expected_turn_id steering invariant).
+        const expectedTurnId = activeTurnRef.current;
+        if (!expectedTurnId) return;
+        queueRef.current.push({ line, images, expectedTurnId });
         setPool(queueRef.current.map((q) => q.line.trim() || "🖼 (image)"));
         return;
       }
+      const interaction: TaskInteraction = forcedInteraction ?? newTurnInteraction();
+      activeTurnRef.current = interaction.turnId;
       // Fold the previous turn's checklist NOW, at the natural boundary (a new task begins). The old
       // 30s-idle timer yanked the input box UP by the panel's height while the user was reading/typing
       // (anti-bob); folding on submit means the shrink coincides with the user's own action.
-      if (currentTodos().length) {
+      if (interaction.kind === "turn" && currentTodos().length) {
         const list = currentTodos();
         const done = list.filter((td) => td.status === "done").length;
         setHistory((h) => [...h, { id: nid(), kind: "notice", text: `  ✓ Todos: ${done}/${list.length} done` }]);
@@ -823,7 +841,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       // so pressing Enter leaves the message stuck in the input box for seconds ("回车一直不动"). One tick.
       await new Promise((resolve) => setTimeout(resolve, 0));
       try {
-        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, ask: askFn, pickModel: pickModelFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval, drainQueue }, images);
+        await onSubmit(t, { sink, confirm: confirmFn, select: selectFn, ask: askFn, pickModel: pickModelFn, setApproval: setApprovalFn, signal: ctrl.signal, exit, approval: statusRef.current.approval, drainQueue }, images, interaction);
       } catch (e: unknown) {
         pushCurrent("notice", `error: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -842,12 +860,14 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       setCurrent([]);
       setWorking(false);
       ctrlRef.current = null;
+      if (activeTurnRef.current === interaction.turnId) activeTurnRef.current = null;
     },
     [working, prompt, askText, onSubmit, pushCurrent, model, exit, drainQueue, noteVisionIfNeeded],
   );
 
-  // Drain the type-ahead pool: when the turn finishes (working → false) and nothing awaits a choice, COALESCE
-  // every pooled message into ONE turn and send it — additions/clarifications go to the agent together, in order.
+  // A message can arrive after runAgent's final pending-input drain but before the view flips to idle. Keep
+  // its original expectedTurnId and run it as a STEER continuation of that task — never as an ordinary new
+  // task inferred from queue timing.
   useEffect(() => {
     if (working || prompt || askText || drainingRef.current || !queueRef.current.length) return;
     drainingRef.current = true;
@@ -856,7 +876,8 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
     setPool([]);
     const line = batch.map((b) => b.line).join("\n\n");
     const images = batch.flatMap((b) => b.images ?? []);
-    void Promise.resolve(handleSubmit(line, images.length ? images : undefined)).finally(() => {
+    const expectedTurnId = batch[0]!.expectedTurnId;
+    void Promise.resolve(handleSubmit(line, images.length ? images : undefined, newSteerInteraction(expectedTurnId))).finally(() => {
       drainingRef.current = false;
     });
   }, [working, prompt, askText, handleSubmit]);

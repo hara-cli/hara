@@ -5,10 +5,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
 import { startServe } from "../dist/serve/server.js";
+import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 
 /** Tiny JSON-RPC-over-ws test client: request/response correlation + notification capture. */
 function connect(port) {
@@ -66,7 +68,11 @@ const memStore = () => {
   return {
     saved: files,
     load: (id) => files.get(id) ?? null,
-    save: (meta, history) => files.set(meta.id, { meta: { ...meta }, history: [...history] }),
+    save: (meta, history, task) => files.set(meta.id, {
+      meta: { ...meta },
+      history: structuredClone(history),
+      ...(task ? { task: structuredClone(task) } : {}),
+    }),
     list: () => [...files.values()].map((d) => d.meta),
     acquire: () => ({ ok: true }),
     release: () => {},
@@ -231,6 +237,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(init.result.protocol, 1);
     assert.equal(init.result.model, "fake-1");
     assert.ok(init.result.capabilities.methods.includes("automation.list"), "capabilities advertised");
+    assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
 
     const created = await c.call("session.create", {});
     const sid = created.result.sessionId;
@@ -318,6 +325,117 @@ test("serve e2e: live metadata and resume are serialized with an active turn", {
   } finally {
     finishTurn?.();
     if (sending) await sending.catch(() => {});
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: session.steer targets the live turn and stays in the same task", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-steer-"));
+  const store = memStore();
+  let releaseFirst;
+  let calls = 0;
+  const providerHistories = [];
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ history, onText }) {
+      calls++;
+      providerHistories.push(structuredClone(history));
+      if (calls === 1) {
+        await new Promise((resolve) => { releaseFirst = resolve; });
+        onText("first");
+        return { text: "first", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+      }
+      onText("steered");
+      return { text: "steered", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  let sending;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    sending = c.call("session.send", { sessionId: result.sessionId, text: "primary objective" });
+    const started = await c.waitEvent("event.turn_start");
+
+    const stale = await c.call("session.steer", { sessionId: result.sessionId, text: "wrong", expectedTurnId: "stale-turn" });
+    assert.equal(stale.error.code, -32002, "stale expectedTurnId is rejected");
+    const steered = await c.call("session.steer", {
+      sessionId: result.sessionId,
+      text: "also cover the edge case",
+      expectedTurnId: started.params.turnId,
+    });
+    assert.equal(steered.result.accepted, true);
+    assert.equal(steered.result.taskId, started.params.taskId, "steering does not replace task identity");
+
+    releaseFirst();
+    const sent = await sending;
+    assert.equal(sent.result.reply, "steered");
+    assert.equal(sent.result.taskId, started.params.taskId);
+    assert.equal(calls, 2, "late steering causes another provider round in the same logical task");
+    assert.ok(providerHistories[1].some((message) => message.role === "user" && message.content.includes("also cover the edge case")));
+    const saved = store.saved.get(result.sessionId);
+    assert.equal(saved.task.objective, "primary objective", "original objective remains authoritative");
+    assert.equal(saved.task.steering.length, 1, "accepted steer has a bounded durable audit entry");
+  } finally {
+    releaseFirst?.();
+    if (sending) await sending.catch(() => {});
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: the first send resumes an unfinished task unless newTask is explicit", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-resume-task-"));
+  const store = memStore();
+  const sessionId = randomUUID();
+  const created = createTaskExecution("finish the original migration", randomUUID(), "2026-07-15T00:00:00.000Z");
+  const paused = finishTaskExecution(created, { status: "completed" }, [{ text: "verify migration", status: "pending" }], false, "2026-07-15T00:01:00.000Z");
+  store.saved.set(sessionId, {
+    meta: {
+      id: sessionId,
+      cwd: dir,
+      provider: "fake",
+      model: "fake-1",
+      title: "migration",
+      createdAt: "2026-07-15T00:00:00.000Z",
+      updatedAt: "2026-07-15T00:01:00.000Z",
+      source: "interactive",
+    },
+    history: [{ role: "user", content: "finish the original migration" }],
+    task: paused,
+  });
+  const systems = [];
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ system, onText }) {
+      systems.push(system);
+      const text = systems.length === 1 ? "continued" : "fresh";
+      onText(text);
+      return { text, toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const resumed = await c.call("session.resume", { sessionId });
+    assert.equal(resumed.result.task.id, paused.id);
+
+    const continued = await c.call("session.send", { sessionId, text: "continue and verify" });
+    assert.equal(continued.result.taskId, paused.id, "ordinary first send keeps the recovered task identity");
+    assert.match(systems[0], /Objective: finish the original migration/);
+    assert.doesNotMatch(systems[0], /Objective: continue and verify/);
+
+    const fresh = await c.call("session.send", { sessionId, text: "start a separate audit", newTask: true });
+    assert.notEqual(fresh.result.taskId, paused.id, "newTask explicitly starts another task");
+    assert.match(systems[1], /Objective: start a separate audit/);
+  } finally {
     c.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });

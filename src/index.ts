@@ -150,6 +150,19 @@ import {
   type SessionMeta,
   type SessionData,
 } from "./session/store.js";
+import {
+  continueTaskExecution,
+  createTaskExecution,
+  finishTaskExecution,
+  formatTaskExecution,
+  newSteerInteraction,
+  newTurnInteraction,
+  recordTaskSteering,
+  recoverTaskExecution,
+  taskExecutionContext,
+  type TaskExecution,
+  type TaskInteraction,
+} from "./session/task.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
 import { loadGlobalRoles, loadRoles, roleToolFilter, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
 import { buildAgentsIndex, canonicalProjectPath, resolveAgent, loadProjects, addProject, removeProject, type AgentIndexEntry } from "./org/projects.js";
@@ -948,7 +961,7 @@ const MEMORY_DISTILL_SYSTEM =
 
 /** Summarize the conversation and replace history with the summary (keeping working-memory notes). Shared by
  *  /compact (manual) and auto-compaction. Returns the summary, or null on failure / nothing to do. */
-async function compactConversation(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, signal?: AbortSignal): Promise<string | null> {
+async function compactConversation(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, signal?: AbortSignal, task?: TaskExecution): Promise<string | null> {
   if (history.length < 2 || signal?.aborted) return null;
   const r = await boundedProviderTurn(provider, {
     system: COMPACT_SYSTEM,
@@ -979,14 +992,14 @@ async function compactConversation(provider: Provider, history: NeutralMsg[], me
   stats.input += r.usage?.input ?? 0;
   stats.output += r.usage?.output ?? 0;
   stats.lastInput = r.usage?.input ?? 0; // ctx% now reflects the (small) summary, not the old full turn
-  saveSession(meta, history);
+  saveSession(meta, history, task);
   return summary;
 }
 
 /** Auto-compact (à la Claude Code) when the last turn filled the context past the threshold, so the NEXT turn
  *  doesn't overflow. Opt-out via `autoCompact: false` / `HARA_AUTO_COMPACT=0`. Best-effort; `notify` surfaces
  *  a one-line status. Returns true if it compacted. */
-async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, cfg: HaraConfig, notify: (m: string) => void, signal?: AbortSignal): Promise<boolean> {
+async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, cfg: HaraConfig, notify: (m: string) => void, signal?: AbortSignal, task?: TaskExecution): Promise<boolean> {
   if (signal?.aborted) return false;
   const lastInput = stats.lastInput ?? 0;
   const pct = bar.ctxPctFor(cfg.model, lastInput);
@@ -998,7 +1011,7 @@ async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta:
   if (!overPct && !overCap) return false;
   if (signal?.aborted) return false;
   notify(`✻ Auto-compacting conversation (context ${pct}% full, ~${Math.round(lastInput / 1000)}k tok)…`);
-  const summary = await compactConversation(provider, history, meta, stats, signal);
+  const summary = await compactConversation(provider, history, meta, stats, signal, task);
   if (signal?.aborted) return false;
   notify(summary ? `(auto-compacted — context replaced with a summary; ${meta.workingSet?.length ?? 0} notes kept)` : "(auto-compact failed — use /compact or /clear)");
   return !!summary;
@@ -2959,6 +2972,7 @@ program.action(async (opts) => {
     // Plain `hara -p` stays stateless. A --resume id with no match is created WITH that id (stable per caller).
     let meta: SessionMeta | null = null;
     let continuationSession = false;
+    let task: TaskExecution | undefined;
     const history: NeutralMsg[] = [];
     if (opts.resume || opts.continue) {
       const resumeArg = opts.resume ? String(opts.resume) : undefined;
@@ -2989,6 +3003,7 @@ program.action(async (opts) => {
       // another gateway/cron process appends history that this stale snapshot later overwrites.
       const prior = loadSession(rid);
       continuationSession = Boolean(prior?.history.length);
+      task = recoverTaskExecution(prior?.task);
       if (sessionFileExists(rid) && !prior) {
         process.stderr.write(`hara: session ${shortId(rid)} exists but is unreadable or corrupt; refusing to overwrite it. Inspect ~/.hara/sessions/${rid}.json.\n`);
         process.exitCode = 2;
@@ -3025,8 +3040,8 @@ program.action(async (opts) => {
         updatedAt: "",
         ...(src.source !== "interactive" ? { source: src.source, sourceName: src.sourceName } : { source: "interactive" as const }),
       };
-      // Task-state continuity: restore the persisted checklist, then mirror every change back onto meta
-      // live — all existing saveSession() sites persist it for free (no per-site threading).
+      // Checklist continuity remains in meta; execution identity is restored independently in top-level
+      // SessionData.task so transcript/interaction changes cannot silently replace the active objective.
       restoreTodos(meta.todos);
       onTodosChange((list) => {
         if (meta) meta.todos = [...list];
@@ -3107,6 +3122,19 @@ program.action(async (opts) => {
     } else {
       history.push({ role: "user", content: userText });
     }
+    // A resumed unfinished task keeps its objective; this prompt is a new turn that steers it. A completed
+    // task (or a stateless -p run) starts a fresh execution identity. Persist before provider side effects so
+    // a crash is recoverable as paused rather than looking like a completed turn.
+    const headlessInteraction: TaskInteraction = task && task.status !== "completed"
+      ? newSteerInteraction(task.turnId)
+      : newTurnInteraction();
+    if (headlessInteraction.kind === "steer") {
+      const continued = continueTaskExecution(task, headlessInteraction);
+      task = continued.ok ? continued.task : createTaskExecution(String(opts.print), headlessInteraction.turnId);
+    } else {
+      task = createTaskExecution(String(opts.print), headlessInteraction.turnId);
+    }
+    if (meta) saveSession(meta, history, task);
     // --role: run this headless turn AS an org role/agent persona (the gateway's /agent switch lands here).
     // Local roles resolve at cwd; qualified project agents were resolved before config/provider startup and
     // cwd is already their registered home. Explicit global roles remain portable in the current project.
@@ -3140,6 +3168,7 @@ program.action(async (opts) => {
       projectContext,
       memory: memoryDigest(cwd),
       continuationSession,
+      executionContext: taskExecutionContext(task, headlessInteraction),
       ...(roleOverride ? { systemOverride: roleOverride } : {}),
       ...(headlessToolFilter ? { toolFilter: headlessToolFilter } : {}),
       hooks: headlessHooks,
@@ -3182,12 +3211,13 @@ program.action(async (opts) => {
       }
     }
     if (meta) {
+      task = finishTaskExecution(task, runOutcome, meta.todos ?? [], false);
       // Long-session safety: auto-compact before saving so a long chat/cron thread never overflows context.
       // Silent (no-op notify) in headless mode so nothing leaks into a captured -p reply. Opt-out via config.
       if (runOutcome.status === "completed") {
-        await maybeAutoCompact(headlessProvider, history, meta, stats, cfg, () => {});
+        await maybeAutoCompact(headlessProvider, history, meta, stats, cfg, () => {}, undefined, task);
       }
-      saveSession(meta, history); // persist when resuming/continuing; plain -p stays stateless
+      saveSession(meta, history, task); // persist when resuming/continuing; plain -p stays stateless
     }
     if (!schemaObj && runOutcome.status === "completed" && (stats.input || stats.output)) out(statusLine(headlessProvider.model, stats.input, stats.output) + "\n");
     await closeMcp();
@@ -3336,6 +3366,10 @@ program.action(async (opts) => {
     updatedAt: "",
     source: "interactive",
   };
+  // Conversation transcript and task execution are restored independently. A process that disappeared
+  // mid-run leaves `running`; recovery turns it into an explicit paused/interrupted task.
+  let task: TaskExecution | undefined = recoverTaskExecution(resumed?.task);
+  let resumeTaskPending = Boolean(resumeId && task && task.status !== "completed");
   // Task-state continuity (interactive twin of the -p path): restore the checklist, mirror changes onto meta.
   restoreTodos(meta.todos);
   onTodosChange((list) => {
@@ -3370,6 +3404,10 @@ program.action(async (opts) => {
     }
   }
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
+  const persistSession = (): void => saveSession(meta, history, task);
+  const keepUnfinishedTaskActive = (): void => {
+    resumeTaskPending = Boolean(task && task.status !== "completed");
+  };
   let continuationSession = Boolean(resumed?.history.length);
   const memorySnap = memoryDigest(cwd); // durable memory, read once (frozen snapshot)
   const buildMemory = (): string =>
@@ -3470,7 +3508,7 @@ program.action(async (opts) => {
         if (p) {
           provider = p;
           if (bar.isActive()) bar.update({ model: id });
-          saveSession(meta, history); // persist the session-pinned model so resume restores it
+          persistSession(); // persist the session-pinned model so resume restores it
           out(c.dim(`(model → ${cfg.provider}:${id}${force ? " · forced (all roles)" : ""})\n`));
         } else out(c.red("(could not rebuild provider)\n"));
       },
@@ -3574,6 +3612,19 @@ program.action(async (opts) => {
       run: () => void out(formatContextReport(history, cfg.model) + "\n"),
     },
     {
+      name: "task",
+      desc: "show separated task/run state: /task · /task clear",
+      run: (a) => {
+        if ((a ?? "").trim() === "clear") {
+          task = undefined;
+          resumeTaskPending = false;
+          persistSession();
+          return void out(c.dim("(task state cleared; conversation kept)\n"));
+        }
+        out(formatTaskExecution(task) + "\n");
+      },
+    },
+    {
       name: "rewind",
       desc: "fork the conversation back to an earlier turn: /rewind (list) · /rewind <n> (files unchanged)",
       run: (a) => {
@@ -3586,7 +3637,9 @@ program.action(async (opts) => {
         if (!nh) return void out(c.dim(`(no such turn: ${arg})\n`));
         history.length = 0;
         history.push(...nh);
-        saveSession(meta, history);
+        task = undefined; // the dropped transcript may have owned the current task; do not retain stale identity
+        resumeTaskPending = false;
+        persistSession();
         out(c.green(`(rewound — dropped the last ${arg} turn(s); ${history.length} messages kept. Files are unchanged. Type your next message.)\n`));
       },
     },
@@ -3614,7 +3667,7 @@ program.action(async (opts) => {
         currentTurn = compactTurn;
         let summary: string | null = null;
         try {
-          summary = await compactConversation(provider, history, meta, stats, compactTurn.signal);
+          summary = await compactConversation(provider, history, meta, stats, compactTurn.signal, task);
         } finally {
           if (currentTurn === compactTurn) currentTurn = null;
         }
@@ -3640,7 +3693,7 @@ program.action(async (opts) => {
         if (!a) return void out(c.dim(`session: ${meta.title || "(untitled)"} · ${meta.id}\n`));
         meta.title = a.slice(0, 32);
         if (bar.isActive()) bar.update({ sessionName: meta.title });
-        saveSession(meta, history);
+        persistSession();
         out(c.green(`(renamed → ${meta.title})\n`));
       },
     },
@@ -3650,13 +3703,15 @@ program.action(async (opts) => {
       desc: "clear conversation context",
       run: () => {
         history.length = 0;
+        task = undefined;
+        resumeTaskPending = false;
         recalledContext = "";
         clearTodos();
         meta.todos = [];
         resetReachability();
         resetRepeatGuard();
         clearTouched();
-        saveSession(meta, history);
+        persistSession();
         out(c.dim("(context cleared)\n"));
       },
     },
@@ -3820,7 +3875,7 @@ program.action(async (opts) => {
       cycleApproval: (m) => cycleMode(m),
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
-      onSubmit: async (line, h, images) => {
+      onSubmit: async (line, h, images, interaction) => {
         // A dropped/pasted file path (`/Users/…/doc.md`, maybe trailing text/images) starts with '/' but
         // is NOT a command — treat it as a file to read, not "Unknown command" (see isSlashCommand).
         if (isSlashCommand(line)) {
@@ -3842,7 +3897,7 @@ program.action(async (opts) => {
                   signal: h.signal,
                   ...agentRunLimits(cfg),
                 });
-                saveSession(meta, history);
+                persistSession();
               } catch {
                 /* exit anyway */
               }
@@ -3854,6 +3909,8 @@ program.action(async (opts) => {
             return void h.sink.notice(getTools().map((t) => `${t.name}${t.kind !== "read" ? " *" : ""} — ${t.description}`).join("\n"));
           if (nm === "reset" || nm === "clear") {
             history.length = 0;
+            task = undefined;
+            resumeTaskPending = false;
             continuationSession = false;
             recalledContext = "";
             resetReachability(); // fresh start — drop any "host unreachable" marks (network may be fixed)
@@ -3861,7 +3918,7 @@ program.action(async (opts) => {
             clearTouched();
             clearTodos();
             meta.todos = [];
-            saveSession(meta, history);
+            persistSession();
             return void h.sink.notice("(context cleared)");
           }
           if (nm === "undo") {
@@ -3891,7 +3948,7 @@ program.action(async (opts) => {
               const p2 = await buildProvider(cfg);
               if (!p2) return void h.sink.notice("(could not rebuild provider)");
               provider = p2;
-              saveSession(meta, history);
+              persistSession();
               return void h.sink.notice(`(model → ${cfg.provider}:${cfg.model} · thinking ${chosen.effort ?? "default"})`);
             }
             cfg.model = id;
@@ -3902,7 +3959,7 @@ program.action(async (opts) => {
             const p = await buildProvider(cfg);
             if (p) {
               provider = p;
-              saveSession(meta, history); // persist the session-pinned model so resume restores it
+              persistSession(); // persist the session-pinned model so resume restores it
               return void h.sink.notice(`(model → ${cfg.provider}:${id}${force ? " · forced (all roles)" : ""})`);
             }
             return void h.sink.notice("(could not rebuild provider)");
@@ -3918,10 +3975,19 @@ program.action(async (opts) => {
             if (!arg) return void h.sink.notice(`session: ${meta.title || "(untitled)"} · ${meta.id}`);
             meta.title = arg.slice(0, 32);
             h.sink.session(meta.title);
-            saveSession(meta, history);
+            persistSession();
             return void h.sink.notice(`(renamed → ${meta.title})`);
           }
           if (nm === "context") return void h.sink.notice(formatContextReport(history, cfg.model));
+          if (nm === "task") {
+            if (arg === "clear") {
+              task = undefined;
+              resumeTaskPending = false;
+              persistSession();
+              return void h.sink.notice("(task state cleared; conversation kept)");
+            }
+            return void h.sink.notice(formatTaskExecution(task));
+          }
           if (nm === "rewind") {
             if (!arg) {
               const turns = userTurnPreviews(history);
@@ -3931,7 +3997,9 @@ program.action(async (opts) => {
             if (!nh) return void h.sink.notice(`(no such turn: ${arg})`);
             history.length = 0;
             history.push(...nh);
-            saveSession(meta, history);
+            task = undefined;
+            resumeTaskPending = false;
+            persistSession();
             return void h.sink.notice(`(rewound — kept ${history.length} messages; files unchanged. Type your next message.)`);
           }
           if (nm === "checkpoint") {
@@ -3971,7 +4039,7 @@ program.action(async (opts) => {
             if (h.signal.aborted || (distillOutcome && distillOutcome.status !== "completed")) {
               return void h.sink.notice("(compact cancelled — memory distillation was interrupted)");
             }
-            const summary = await compactConversation(provider, history, meta, stats, h.signal);
+            const summary = await compactConversation(provider, history, meta, stats, h.signal, task);
             return void h.sink.notice(summary ? `(compacted — kept ${meta.workingSet?.length ?? 0} working-memory notes)` : "(nothing to compact / compact failed)");
           }
           if (nm === "sessions") {
@@ -4061,10 +4129,19 @@ program.action(async (opts) => {
             const sk = loadSkillIndex(cwd).find((s) => s.id === nm && s.userInvocable);
             if (sk) {
               h.sink.notice(`↗ entering ${sk.id}…`);
-              history.push({
-                role: "user",
-                content: `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${arg ? ` — request: ${arg}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`,
-              });
+              resumeTaskPending = false; // an explicit skill entry starts its own task
+              const skillContent = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${arg ? ` — request: ${arg}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
+              const skillInteraction = interaction ?? newTurnInteraction();
+              if (skillInteraction.kind === "steer") {
+                const continued = continueTaskExecution(task, skillInteraction);
+                if (!continued.ok) return void h.sink.notice(`(steer rejected: ${continued.reason})`);
+                task = continued.task;
+              } else {
+                task = createTaskExecution(arg || `enter ${sk.id}`, skillInteraction.turnId);
+              }
+              const skillExecutionContext = taskExecutionContext(task, skillInteraction);
+              history.push({ role: "user", content: skillContent });
+              persistSession();
               const skin = stats.input;
               const skout = stats.output;
               // `h.approval` is the TUI-level union (includes "plan"); runAgent wants the config-level
@@ -4073,7 +4150,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -4082,7 +4159,9 @@ program.action(async (opts) => {
                 h.sink.session(meta.title);
               }
               h.sink.usage(stats.input - skin, stats.output - skout);
-              saveSession(meta, history);
+              task = finishTaskExecution(task, skillOutcome, meta.todos ?? [], h.signal.aborted);
+              keepUnfinishedTaskActive();
+              persistSession();
               return;
             }
           }
@@ -4094,6 +4173,24 @@ program.action(async (opts) => {
         line = inlineLeadingPath(line, existsSync);
         const ui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
         const appr = h.approval;
+        let submittedInteraction: TaskInteraction = interaction ?? newTurnInteraction();
+        if (resumeTaskPending && task && submittedInteraction.kind === "turn") {
+          submittedInteraction = { kind: "steer", expectedTurnId: task.turnId, turnId: submittedInteraction.turnId };
+        }
+        const beginExecution = (objective: string): string | null => {
+          if (submittedInteraction.kind === "steer") {
+            const continued = continueTaskExecution(task, submittedInteraction);
+            if (!continued.ok) {
+              h.sink.notice(`(steer rejected: ${continued.reason})`);
+              return null;
+            }
+            task = continued.task;
+          } else {
+            task = createTaskExecution(objective, submittedInteraction.turnId);
+          }
+          resumeTaskPending = false;
+          return taskExecutionContext(task, submittedInteraction);
+        };
         // Type-ahead steering: fold messages typed mid-turn into the next model call (codex-style) so a
         // clarification/addition course-corrects the live task, rather than waiting for a fresh turn.
         // Shared by every turn below (plan investigate, plan execute, and the regular turn).
@@ -4104,8 +4201,17 @@ program.action(async (opts) => {
             const body = await expandMentionsAsync(it.line, cwd, { signal: h.signal }) + (r2.skip ? "" : (r2.extraText ?? ""));
             const attach = !r2.skip && r2.attach?.length ? r2.attach : undefined;
             if (!body.trim() && !attach) continue; // image-only message whose image was skipped → nothing to add
+            const recorded = recordTaskSteering(task, it.expectedTurnId, body || "(image-only steering)");
+            if (!recorded.ok) {
+              h.sink.notice(`(steer rejected: ${recorded.reason})`);
+              continue;
+            }
+            task = recorded.task;
             out.push({ role: "user", content: `${INTERJECT_PREFIX}\n\n${body}`, ...(attach ? { images: attach } : {}) });
           }
+          // runAgent appends these immediately after return. Persist an equivalent snapshot first so an
+          // abrupt process exit cannot lose accepted steering while retaining a running task identity.
+          if (out.length) saveSession(meta, [...history, ...out], task);
           return out;
         };
         const turnStart = Date.now(); // for the task-done notification (gated on elapsed)
@@ -4115,7 +4221,11 @@ program.action(async (opts) => {
           // investigation / Q&A end back at the input, still in plan mode, with no nagging.
           const planImg = await resolveImages(images, h);
           if (planImg.skip) return;
-          history.push({ role: "user", content: (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (planImg.extraText ?? ""), ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
+          const planContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (planImg.extraText ?? "");
+          const executionContext = beginExecution(line);
+          if (!executionContext) return;
+          history.push({ role: "user", content: planContent, ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
+          persistSession();
           recalledContext = "";
           const pin = stats.input;
           const pout = stats.output;
@@ -4147,6 +4257,7 @@ program.action(async (opts) => {
             memory: buildMemory(),
             projectContext,
             continuationSession,
+            executionContext,
             stats,
             signal: h.signal,
             pendingInput,
@@ -4157,8 +4268,11 @@ program.action(async (opts) => {
             h.sink.session(meta.title);
           }
           h.sink.usage(stats.input - pin, stats.output - pout);
-          saveSession(meta, history);
+          persistSession();
           if (planOutcome.status !== "completed" || h.signal.aborted) {
+            task = finishTaskExecution(task, planOutcome, meta.todos ?? [], h.signal.aborted);
+            keepUnfinishedTaskActive();
+            persistSession();
             notifyDone(cfg.notify, {
               message: planOutcome.error ?? "plan turn did not complete",
               elapsedMs: Date.now() - turnStart,
@@ -4168,6 +4282,9 @@ program.action(async (opts) => {
           }
           if (!proposedPlan) {
             // No exit_plan this turn — the model was investigating or answering. Stay in plan mode quietly.
+            task = finishTaskExecution(task, planOutcome, meta.todos ?? [], h.signal.aborted);
+            keepUnfinishedTaskActive();
+            persistSession();
             notifyDone(cfg.notify, {
               message: meta.title || "plan turn complete",
               elapsedMs: Date.now() - turnStart,
@@ -4193,6 +4310,7 @@ program.action(async (opts) => {
               autoApprove,
               projectContext,
               continuationSession,
+              executionContext,
               stats,
               signal: h.signal,
               pendingInput,
@@ -4200,8 +4318,12 @@ program.action(async (opts) => {
               ...agentRunLimits(cfg),
             });
             h.sink.usage(stats.input - xin, stats.output - xout);
-            saveSession(meta, history);
           }
+          task = choice === "no"
+            ? finishTaskExecution(task, planOutcome, [{ text: "execute approved plan", status: "pending" }], false)
+            : finishTaskExecution(task, planOutcome, meta.todos ?? [], h.signal.aborted);
+          keepUnfinishedTaskActive();
+          persistSession();
           notifyDone(cfg.notify, {
             message: planOutcome.status === "halted" ? (planOutcome.error ?? "agent run halted") : (meta.title || "plan turn complete"),
             elapsedMs: Date.now() - turnStart,
@@ -4213,7 +4335,10 @@ program.action(async (opts) => {
         if (ri.skip) return;
         const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (ri.extraText ?? "");
         recalledContext = "";
+        const executionContext = beginExecution(line);
+        if (!executionContext) return;
         history.push({ role: "user", content: userContent, ...(ri.attach?.length ? { images: ri.attach } : {}) });
+        persistSession();
         if (cfg.fileCheckpoints) checkpoint(cwd, line.slice(0, 80)); // shadow-git snapshot before the turn mutates
         const beforeIn = stats.input;
         const beforeOut = stats.output;
@@ -4226,6 +4351,7 @@ program.action(async (opts) => {
           autoApprove,
           projectContext,
           continuationSession,
+          executionContext,
           stats,
           signal: h.signal,
           pendingInput,
@@ -4243,9 +4369,11 @@ program.action(async (opts) => {
           elapsedMs: Date.now() - turnStart,
           minMs: turnOutcome.status === "halted" ? 0 : undefined,
         });
-        saveSession(meta, history);
+        task = finishTaskExecution(task, turnOutcome, meta.todos ?? [], h.signal.aborted);
+        keepUnfinishedTaskActive();
+        persistSession();
         if (turnOutcome.status === "completed" && !h.signal.aborted) {
-          await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => h.sink.notice(m), h.signal);
+          await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => h.sink.notice(m), h.signal, task);
         }
       },
     });
@@ -4289,15 +4417,18 @@ program.action(async (opts) => {
           // ENTER the mode: load the skill + run a kickoff turn now (mirrors the TUI path) so e.g. /design
           // opens its workspace + surfaces prior progress immediately, instead of just staging context.
           out(c.dim(`↗ entering ${sk.id}…\n`));
-          history.push({
-            role: "user",
-            content: `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest.length ? ` — request: ${rest.join(" ")}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`,
-          });
+          const skillContent = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest.length ? ` — request: ${rest.join(" ")}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
+          const skillInteraction = newTurnInteraction();
+          resumeTaskPending = false;
+          task = createTaskExecution(rest.join(" ") || `enter ${sk.id}`, skillInteraction.turnId);
+          const skillExecutionContext = taskExecutionContext(task, skillInteraction);
+          history.push({ role: "user", content: skillContent });
+          persistSession();
           const skillTurn = new AbortController();
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -4305,7 +4436,9 @@ program.action(async (opts) => {
             if (!meta.title && skillOutcome?.status === "completed" && !skillTurn.signal.aborted) {
               meta.title = await nameSession(provider, history, skillTurn.signal);
             }
-            saveSession(meta, history);
+            task = finishTaskExecution(task, skillOutcome, meta.todos ?? [], skillTurn.signal.aborted);
+            keepUnfinishedTaskActive();
+            persistSession();
           } finally {
             if (currentTurn === skillTurn) currentTurn = null;
           }
@@ -4323,14 +4456,29 @@ program.action(async (opts) => {
     line = inlineLeadingPath(line, existsSync); // leading dropped file path → @-mention so it's read in
     const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd);
     recalledContext = "";
+    let interaction: TaskInteraction = newTurnInteraction();
+    if (resumeTaskPending && task) interaction = newSteerInteraction(task.turnId);
+    if (interaction.kind === "steer") {
+      const continued = continueTaskExecution(task, interaction);
+      if (!continued.ok) {
+        out(c.red(`(steer rejected: ${continued.reason})\n`));
+        continue;
+      }
+      task = continued.task;
+    } else {
+      task = createTaskExecution(line, interaction.turnId);
+    }
+    resumeTaskPending = false;
+    const executionContext = taskExecutionContext(task, interaction);
     history.push({ role: "user", content: userContent });
+    persistSession();
     if (cfg.fileCheckpoints) checkpoint(cwd, userContent.slice(0, 80)); // shadow-git snapshot before the turn mutates
     const turnController = new AbortController();
     currentTurn = turnController;
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }
@@ -4353,9 +4501,11 @@ program.action(async (opts) => {
       } else {
         out(statusLine(cfg.model, stats.input, stats.output) + "\n\n");
       }
-      saveSession(meta, history);
+      task = finishTaskExecution(task, turnOutcome, meta.todos ?? [], turnController.signal.aborted);
+      keepUnfinishedTaskActive();
+      persistSession();
       const compacted = turnOutcome?.status === "completed" && !turnController.signal.aborted
-        ? await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => out(c.dim(`${m}\n`)), turnController.signal)
+        ? await maybeAutoCompact(provider, history, meta, stats, cfg, (m) => out(c.dim(`${m}\n`)), turnController.signal, task)
         : false;
       if (!compacted) {
         const ctxPct = bar.ctxPctFor(cfg.model, stats.lastInput ?? 0);

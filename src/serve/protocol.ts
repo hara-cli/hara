@@ -8,7 +8,8 @@
 //   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,updatedAt}]}
 //   session.create    {cwd?,approval?}           → {sessionId,model}
 //   session.resume    {sessionId}                → {sessionId,model,history:[{role,text}]}
-//   session.send      {sessionId,text,images?}   → (streams events, then) {reply,usage}
+//   session.send      {sessionId,text,images?,newTask?} → (streams events, then) {reply,usage,taskId,turnId}
+//   session.steer     {sessionId,text,expectedTurnId} → {accepted,taskId,turnId}
 //                      images: [{path,mediaType?}] — pasted screenshots etc., inlined for vision models
 //   session.interrupt {sessionId}                → {}
 //   approval.reply    {approvalId,allow,always?}  → {}

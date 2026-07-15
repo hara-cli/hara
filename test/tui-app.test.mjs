@@ -417,9 +417,11 @@ test("App renders assistant markdown (bold/inline-code styled, not raw)", async 
 
 test("App type-ahead: typing while working queues, then sends after the turn", async () => {
   const seen = [];
+  const interactions = [];
   let releaseFirst;
-  const onSubmit = async (line) => {
+  const onSubmit = async (line, _helpers, _images, interaction) => {
     seen.push(line);
+    interactions.push(interaction);
     if (line === "first") await new Promise((r) => (releaseFirst = r)); // hold turn 1 open
   };
   const { lastFrame, stdin, unmount } = render(
@@ -440,6 +442,10 @@ test("App type-ahead: typing while working queues, then sends after the turn", a
   releaseFirst(); // finish turn 1 → pool drains
   await tick(150);
   assert.ok(seen.includes("second"), "queued message sent after the turn finished");
+  assert.equal(interactions[0].kind, "turn", "the initial submission creates a task turn");
+  assert.equal(interactions[1].kind, "steer", "late type-ahead remains a steer, not a new task");
+  assert.equal(interactions[1].expectedTurnId, interactions[0].turnId, "steer is bound to the exact prior turn");
+  assert.notEqual(interactions[1].turnId, interactions[0].turnId, "the continuation receives its own turn identity");
   unmount();
 });
 
@@ -471,6 +477,38 @@ test("App type-ahead: multiple pooled messages coalesce into one turn", async ()
   await tick(150);
   assert.equal(seen.length, 2, "exactly one coalesced turn after the first");
   assert.ok(seen[1].includes("also do A") && seen[1].includes("and B"), "both pooled messages combined into one turn");
+  unmount();
+});
+
+test("App type-ahead: an in-turn drain carries the exact expectedTurnId", async () => {
+  let releaseDrain;
+  let firstInteraction;
+  let drained = [];
+  let calls = 0;
+  const onSubmit = async (_line, helpers, _images, interaction) => {
+    calls++;
+    firstInteraction = interaction;
+    await new Promise((resolve) => { releaseDrain = resolve; });
+    drained = helpers.drainQueue();
+  };
+  const { stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("primary");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("refine it");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  releaseDrain();
+  await tick(150);
+  assert.equal(calls, 1, "drained steering stays inside the live turn");
+  assert.equal(drained.length, 1);
+  assert.equal(drained[0].line, "refine it");
+  assert.equal(drained[0].expectedTurnId, firstInteraction.turnId);
   unmount();
 });
 
@@ -692,7 +730,7 @@ test("App status slot: idle shows key hints; working swaps in the spinner (no �
   stdin.write("\r");
   await tick(90); // mid-turn
   const mid = strip(lastFrame());
-  assert.ok(/working \d+s/.test(mid) || mid.includes("⏎ queues"), "working → spinner row in the same slot");
+  assert.ok(/working \d+s/.test(mid) || mid.includes("⏎ steers task"), "working → spinner row in the same slot");
   assert.ok(!mid.includes("⏎ send · @ file"), "hints swapped OUT while working (one row at a time)");
   assert.ok(!mid.includes("⌨ working"), "the old extra working-hint row is gone");
   await tick(250); // turn ends

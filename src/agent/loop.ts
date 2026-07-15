@@ -147,6 +147,7 @@ function composeSystem(
   override?: string,
   memory?: string,
   continuationSession = false,
+  executionContext?: string,
 ): string {
   const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
   const skills = skillsDigest(cwd);
@@ -154,6 +155,7 @@ function composeSystem(
     head +
     gatewayNote() +
     (continuationSession ? `\n\n${CONTINUATION_SYSTEM}` : "") +
+    (executionContext ? `\n\n${executionContext}` : "") +
     (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "") +
     (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "") +
     (skills ? `\n\n# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
@@ -175,6 +177,8 @@ export interface RunOpts {
   /** The process attached to persisted history. Teach the first/new provider route to continue that history
    * instead of treating process startup as a reason to rediscover the workspace. */
   continuationSession?: boolean;
+  /** Structured task/run identity. Unlike transcript text, this remains authoritative across resume/steer. */
+  executionContext?: string;
   stats?: { input: number; output: number; lastInput?: number };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
@@ -522,7 +526,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           return { text: "", toolUses: [], stop: "error" as const, errorMsg: "interrupted" };
         }
         return activeProvider.turn({
-          system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory, opts.continuationSession),
+          system: composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory, opts.continuationSession, opts.executionContext),
           history,
           tools: specs,
       // Any stream chunk keeps the connection considered alive — even suppressed reasoning_content, so a

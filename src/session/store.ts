@@ -17,6 +17,7 @@ import {
 import { randomUUID } from "node:crypto";
 import type { NeutralMsg } from "../providers/types.js";
 import { redactSensitiveValue } from "../security/secrets.js";
+import { isTaskExecution, type TaskExecution } from "./task.js";
 
 /** Who created a session. Absent = legacy/interactive. Drives UI segregation (desktop: automated
  *  sessions render as a status timeline, never mixed into the manual list) and the title strategy
@@ -68,6 +69,8 @@ export interface SessionMeta {
 export interface SessionData {
   meta: SessionMeta;
   history: NeutralMsg[];
+  /** Active/most-recent task execution, deliberately separate from the conversational transcript. */
+  task?: TaskExecution;
 }
 
 function sessionsDir(): string {
@@ -393,13 +396,37 @@ function redactedSessionCopy(data: SessionData): SessionData {
   if (data.meta.effort !== undefined) safe.meta.effort = data.meta.effort;
   if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
+  if (data.task && safe.task) {
+    // Task objective/steering are free-form and stay redacted. Execution identity and transition metadata
+    // are structural: preserve them exactly so resume/expectedTurnId validation cannot be corrupted by a
+    // credential-looking identifier.
+    safe.task.schemaVersion = data.task.schemaVersion;
+    safe.task.id = data.task.id;
+    safe.task.status = data.task.status;
+    safe.task.turnId = data.task.turnId;
+    safe.task.createdAt = data.task.createdAt;
+    safe.task.updatedAt = data.task.updatedAt;
+    safe.task.startedAt = data.task.startedAt;
+    if (data.task.endedAt !== undefined) safe.task.endedAt = data.task.endedAt;
+    if (data.task.lastOutcome !== undefined) safe.task.lastOutcome = data.task.lastOutcome;
+    if (data.task.steering && safe.task.steering) {
+      for (let index = 0; index < data.task.steering.length; index++) {
+        const source = data.task.steering[index];
+        const target = safe.task.steering[index];
+        if (!source || !target) continue;
+        target.id = source.id;
+        target.turnId = source.turnId;
+        target.createdAt = source.createdAt;
+      }
+    }
+  }
   return safe;
 }
 
-export function saveSession(meta: SessionMeta, history: NeutralMsg[]): void {
+export function saveSession(meta: SessionMeta, history: NeutralMsg[], task?: TaskExecution): void {
   checkedSessionId(meta.id);
   meta.updatedAt = new Date().toISOString();
-  const safe = redactedSessionCopy({ meta, history });
+  const safe = redactedSessionCopy({ meta, history, ...(task ? { task } : {}) });
 
   const target = sessionFile(meta.id);
   const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
@@ -505,9 +532,10 @@ function isSessionMeta(value: unknown): value is SessionMeta {
 
 /** True if a parsed object has the SessionData shape we can safely use. */
 function isSessionData(d: unknown): d is SessionData {
-  const o = d as { meta?: unknown; history?: unknown } | null;
+  const o = d as { meta?: unknown; history?: unknown; task?: unknown } | null;
   return !!o && typeof o === "object" && !Array.isArray(o) && isSessionMeta(o.meta) &&
-    Array.isArray(o.history) && o.history.every(isNeutralMessage);
+    Array.isArray(o.history) && o.history.every(isNeutralMessage) &&
+    (o.task === undefined || isTaskExecution(o.task));
 }
 
 /** Read only. Legacy plaintext is redacted in the returned in-memory copy but intentionally not migrated
