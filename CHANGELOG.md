@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## Unreleased — task/thread semantics, durable steering, and context resilience
+## 0.124.0 — 2026-07-16 — task-safe interaction, bounded context, and private-state hardening
 
 - **Idle conversation no longer hijacks an unfinished task.** Ordinary input starts a new execution while
   keeping the conversation thread; explicit `继续` / `continue` / `resume` / `go on` resumes the paused task,
