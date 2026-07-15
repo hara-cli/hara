@@ -5,6 +5,34 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.123.0 — 2026-07-15 — task-aware interaction and input/security hardening
+
+- **Conversation and execution are separate state.** Sessions now persist a bounded, redacted task record
+  beside the transcript: stable task/turn IDs, the original objective, running/paused/completed/blocked
+  status, outcomes, and steering audit. A crashed running task recovers as paused/interrupted; the first
+  input after resume continues an unfinished objective instead of silently replacing it. Legacy sessions
+  without task state still load normally, and `/task` shows or clears only execution state while preserving
+  the conversation.
+- **Mid-turn input targets an exact run.** TUI type-ahead carries an `expectedTurnId`, late input remains a
+  steer rather than becoming an accidental new task, and Desktop/serve exposes additive `session.steer`,
+  task/turn events, resumed task metadata, plus explicit `newTask: true`. Task context is injected separately
+  from transcript/project context so a conversational reply cannot redefine the active coding objective.
+- **Terminal text paste follows bracketed-paste framing.** Hara enables terminal mode 2004, buffers split
+  `ESC[200~`/`ESC[201~` frames into one logical insert, handles immediate paste+Enter correctly, restores the
+  terminal on exit, and fails visibly on incomplete or over-2 MiB input. Multiline Claude output no longer
+  freezes, disappears, or requires Ctrl+C before it can be pasted.
+- **Three reported path/alias escapes are closed.** Windows Guardian containment uses platform-aware relative
+  paths; global `~/.hara/config.json` reads reject symlink/hard-link aliases and writes use a private atomic
+  replacement without modifying an external inode; organization role sync accepts only portable role IDs
+  and verifies every final path remains directly below `~/.hara/org-roles`.
+- **Home remains private without becoming inconvenient.** `hara --cwd /path/to/project` explicitly selects a
+  project as an alternative to `cd`, and every Home-boundary refusal now shows both choices. Hara deliberately
+  does not scan Home and guess a repository, avoiding ambiguous selection and renewed private-directory
+  inventory.
+- **Cancellation gates no longer probe PID 0.** Computer/cron process-tree fixtures wait for a fully published
+  positive child PID before cancellation assertions, retaining the original strict settlement and process
+  disappearance deadlines under full-suite contention.
+
 ## 0.122.7 — 2026-07-15 — isolated build-context parity
 
 - **Docker builds carry every package-build dependency.** The image build stage now copies the local-link
