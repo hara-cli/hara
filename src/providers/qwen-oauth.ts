@@ -2,8 +2,11 @@
 // Token (access/refresh/resource_url) is stored in ~/.hara/qwen-oauth.json and auto-refreshed.
 import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
+import {
+  bindPrivateHaraStateFile,
+  readPrivateStateFileSnapshotSync,
+  writePrivateStateFileSync,
+} from "../security/private-state.js";
 
 const BASE = "https://chat.qwen.ai";
 const DEVICE_CODE_URL = `${BASE}/api/v1/oauth2/device/code`;
@@ -20,30 +23,19 @@ export interface QwenToken {
   resourceUrl?: string;
 }
 
-function tokenPath(): string {
-  return join(homedir(), ".hara", "qwen-oauth.json");
-}
-
 export function loadQwenToken(): QwenToken | null {
-  const p = tokenPath();
-  if (!existsSync(p)) return null;
   try {
-    return JSON.parse(readFileSync(p, "utf8")) as QwenToken;
+    const binding = bindPrivateHaraStateFile(homedir(), [], "qwen-oauth.json");
+    const snapshot = readPrivateStateFileSnapshotSync(binding.path, 1024 * 1024);
+    return snapshot ? JSON.parse(snapshot.text) as QwenToken : null;
   } catch {
     return null;
   }
 }
 
 function saveQwenToken(t: QwenToken): void {
-  const p = tokenPath();
-  mkdirSync(join(homedir(), ".hara"), { recursive: true });
-  // 0600 — the file holds long-lived access + refresh tokens; don't leave it world-readable on shared boxes.
-  writeFileSync(p, JSON.stringify(t, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
-  try {
-    chmodSync(p, 0o600); // tighten an existing file that predated the mode
-  } catch {
-    /* best-effort */
-  }
+  const binding = bindPrivateHaraStateFile(homedir(), [], "qwen-oauth.json");
+  writePrivateStateFileSync(binding, JSON.stringify(t, null, 2) + "\n");
 }
 
 const b64url = (b: Buffer) =>

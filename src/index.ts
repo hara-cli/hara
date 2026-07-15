@@ -137,7 +137,7 @@ function renderBgJobs(): string {
   });
   return `Background jobs — /jobs tail <id> · /jobs kill <id>:\n${rows.join("\n")}`;
 }
-import { qwenDeviceLogin, getValidQwenAuth } from "./providers/qwen-oauth.js";
+import { qwenDeviceLogin, getValidQwenAuth, loadQwenToken } from "./providers/qwen-oauth.js";
 import { loadAgentContext, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import { homeWorkspaceActionError, isHomeWorkspace } from "./context/workspace-scope.js";
 import { getEmbedder } from "./search/embed.js";
@@ -1161,7 +1161,7 @@ function runDoctor(cfg: HaraConfig): string {
   const dot = c.dim("·");
   const nodeSupported = unsupportedNodeMessage() === null;
   const hasKey = !!(cfg.apiKey || process.env[providerEnvKey(cfg.provider)] || process.env.HARA_API_KEY);
-  const oauthOk = cfg.provider === "qwen-oauth" && existsSync(join(homedir(), ".hara", "qwen-oauth.json"));
+  const oauthOk = cfg.provider === "qwen-oauth" && loadQwenToken() !== null;
   const authed = hasKey || oauthOk;
   const ad = assetsDir();
   const roles = loadRoles(cfg.cwd);
@@ -2142,13 +2142,8 @@ program
         if (!creds) return void out(c.yellow(`↩ ${pane} registered, but no WeChat login (run \`hara gateway --platform weixin --login\`). Your next reply to the bot still injects here.\n`));
         let peer = process.env.HARA_WX_PEER;
         if (!peer) {
-          try {
-            const f = join(homedir(), ".hara", "weixin", `${creds.account_id}.context-tokens.json`);
-            const keys = Object.keys(JSON.parse(readFileSync(f, "utf8")));
-            peer = keys.find((k) => k.endsWith("@im.wechat")) || keys[0];
-          } catch {
-            /* no peer file */
-          }
+          const peers = wx.weixinKnownPeers(creds.account_id);
+          peer = peers.find((candidate) => candidate.endsWith("@im.wechat")) || peers[0];
         }
         if (peer) await wx.weixinAdapter(creds).send(peer, text);
         out(c.green(`↩ asked on WeChat + registered ${pane}`) + ` — reply on WeChat and it'll be injected here. Daemon must be running.\n`);

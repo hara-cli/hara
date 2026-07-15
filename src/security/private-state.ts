@@ -7,15 +7,21 @@ import {
   constants,
   fchmodSync,
   fstatSync,
+  fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
+  readSync,
   readdirSync,
   realpathSync,
+  renameSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   FileReadLimitError,
   MAX_EDIT_READ_BYTES,
@@ -45,6 +51,11 @@ export interface PrivateStateFileSnapshot extends RegularFileSnapshot {
   ctimeMs: number;
 }
 
+export interface PrivateStateFileBinding {
+  readonly directory: PrivateStateDirectoryIdentity;
+  readonly path: string;
+}
+
 function isMissing(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
 }
@@ -60,7 +71,14 @@ function chmodPrivate(path: string, mode: number): void {
 }
 
 function checkedPrivateComponent(component: string): string {
-  if (!component || component === "." || component === ".." || basename(component) !== component || component.includes(sep) || component.includes("\0")) {
+  if (
+    !component
+    || component === "."
+    || component === ".."
+    || basename(component) !== component
+    || /[\\/]/.test(component)
+    || component.includes("\0")
+  ) {
     throw new Error(`invalid private Hara state path component '${component}'`);
   }
   return component;
@@ -168,6 +186,275 @@ export function ensurePrivateStateSubdirectory(
     verifyPrivateDirectory(parent);
   }
   return parent;
+}
+
+/** Bind one immediate file below a symlink-free, owner-only Hara state directory. */
+export function bindPrivateHaraStateFile(
+  home: string,
+  subdirectories: readonly string[],
+  filename: string,
+): PrivateStateFileBinding {
+  const directory = ensurePrivateStateSubdirectory(home, [".hara", ...subdirectories]);
+  const name = checkedPrivateComponent(filename);
+  const path = join(directory.path, name);
+  if (dirname(path) !== directory.path) throw new Error(`private Hara state file is outside '${directory.path}'`);
+  verifyPrivateDirectory(directory);
+  return { directory, path };
+}
+
+function privateReadLimit(maxBytes: number): number {
+  const requested = Number.isFinite(maxBytes) ? Math.floor(maxBytes) : MAX_EDIT_READ_BYTES;
+  return Math.min(MAX_EDIT_READ_BYTES, Math.max(1, requested));
+}
+
+function readFdBytes(fd: number, count: number): Buffer {
+  const out = Buffer.allocUnsafe(count);
+  let offset = 0;
+  while (offset < count) {
+    const read = readSync(fd, out, offset, count - offset, offset);
+    if (!read) break;
+    offset += read;
+  }
+  return out.subarray(0, offset);
+}
+
+/** Synchronous private-state reader for startup/auth APIs that cannot make their public contract async. */
+export function readPrivateStateFileSnapshotSync(
+  path: string,
+  maxBytes = MAX_EDIT_READ_BYTES,
+): PrivateStateFileSnapshot | null {
+  const limit = privateReadLimit(maxBytes);
+  let before;
+  try {
+    before = lstatSync(path);
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (before.isSymbolicLink()) throw new Error(`refusing private Hara state file: '${path}' is a symbolic link`);
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  try {
+    let info = fstatSync(fd);
+    verifyOpenedRegularFileSync(path, info, {
+      action: "read private Hara state",
+      rejectHardLinks: true,
+      protectSensitive: false,
+    });
+    try {
+      fchmodSync(fd, 0o600);
+    } catch (error) {
+      if (process.platform !== "win32") throw error;
+    }
+    // chmod may update ctime; capture the authoritative baseline afterwards.
+    info = fstatSync(fd);
+    if (info.size > limit) throw new FileReadLimitError(path, limit);
+    const bytes = readFdBytes(fd, Math.min(limit + 1, info.size + 1));
+    if (bytes.length > limit) throw new FileReadLimitError(path, limit);
+    const latest = fstatSync(fd);
+    verifyOpenedRegularFileSync(path, latest, {
+      action: "read private Hara state",
+      rejectHardLinks: true,
+      protectSensitive: false,
+    });
+    if (
+      latest.dev !== info.dev
+      || latest.ino !== info.ino
+      || latest.size !== info.size
+      || latest.mtimeMs !== info.mtimeMs
+      || latest.ctimeMs !== info.ctimeMs
+    ) throw new Error(`private Hara state file changed while reading: '${path}'`);
+    return {
+      text: bytes.toString("utf8"),
+      dev: latest.dev,
+      ino: latest.ino,
+      mode: latest.mode & 0o777,
+      nlink: latest.nlink,
+      size: latest.size,
+      mtimeMs: latest.mtimeMs,
+      ctimeMs: latest.ctimeMs,
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function samePrivateFile(path: string, expected: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">): boolean {
+  const info = lstatSync(path);
+  return (
+    info.isFile()
+    && !info.isSymbolicLink()
+    && info.dev === expected.dev
+    && info.ino === expected.ino
+    && (info.mode & 0o777) === expected.mode
+    && info.nlink === expected.nlink
+  );
+}
+
+function restorePrivateClaim(
+  claimed: string,
+  target: string,
+  expected: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">,
+): void {
+  if (!samePrivateFile(claimed, expected)) {
+    throw new Error(`private Hara state claim changed; original entry is preserved at '${claimed}'`);
+  }
+  try {
+    linkSync(claimed, target);
+  } catch (error: any) {
+    if (error?.code === "EEXIST") {
+      throw new Error(`another entry appeared at '${target}'; original entry is preserved at '${claimed}'`);
+    }
+    throw error;
+  }
+  const linked = { ...expected, nlink: expected.nlink + 1 };
+  if (!samePrivateFile(claimed, linked) || !samePrivateFile(target, linked)) {
+    throw new Error(`private Hara state restore changed; original entry is preserved at '${claimed}'`);
+  }
+  unlinkSync(claimed);
+}
+
+function syncPrivateDirectory(path: string): void {
+  try {
+    const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+    const directoryOnly = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow | directoryOnly);
+    try {
+      if (fstatSync(fd).isDirectory()) fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    /* Directory fsync is not portable; the staged file itself is always fsynced. */
+  }
+}
+
+/**
+ * Crash-safe, no-follow, compare-and-swap replacement for one bound private state file. Existing entries
+ * are move-claimed before verification so a concurrent alias/replacement is never overwritten silently.
+ */
+export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text: string): void {
+  const { directory, path } = binding;
+  verifyPrivateDirectory(directory);
+  if (resolve(path) !== join(directory.path, checkedPrivateComponent(basename(path)))) {
+    throw new Error(`private Hara state file is outside '${directory.path}'`);
+  }
+  const existing = readPrivateStateFileSnapshotSync(path);
+  verifyPrivateDirectory(directory);
+
+  const temp = join(directory.path, `.hara-private-${process.pid}-${randomUUID()}.tmp`);
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  let fd: number | undefined;
+  let staged: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink"> | undefined;
+  try {
+    fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
+    writeFileSync(fd, text, "utf8");
+    try {
+      fchmodSync(fd, 0o600);
+    } catch (error) {
+      if (process.platform !== "win32") throw error;
+    }
+    fsyncSync(fd);
+    const stagedInfo = fstatSync(fd);
+    if (!stagedInfo.isFile() || stagedInfo.nlink !== 1) throw new Error("unsafe private Hara state staging inode");
+    staged = {
+      dev: stagedInfo.dev,
+      ino: stagedInfo.ino,
+      mode: stagedInfo.mode & 0o777,
+      nlink: stagedInfo.nlink,
+    };
+    closeSync(fd);
+    fd = undefined;
+
+    if (!existing) {
+      try {
+        verifyPrivateDirectory(directory);
+        linkSync(temp, path);
+      } catch (error: any) {
+        if (error?.code === "EEXIST") throw new Error(`private Hara state file changed before create: '${path}'`);
+        throw error;
+      }
+    } else {
+      const claimed = join(directory.path, `.hara-claim-${process.pid}-${randomUUID()}.tmp`);
+      try {
+        verifyPrivateDirectory(directory);
+        renameSync(path, claimed);
+      } catch (error: any) {
+        if (error?.code === "ENOENT") throw new Error(`private Hara state file changed before replace: '${path}'`);
+        throw error;
+      }
+      let verifiedClaim = false;
+      try {
+        const claimedSnapshot = readPrivateStateFileSnapshotSync(claimed);
+        verifiedClaim = Boolean(
+          claimedSnapshot
+          && claimedSnapshot.dev === existing.dev
+          && claimedSnapshot.ino === existing.ino
+          && claimedSnapshot.mode === existing.mode
+          && claimedSnapshot.nlink === existing.nlink
+          && claimedSnapshot.text === existing.text
+        );
+        if (!verifiedClaim) throw new Error(`private Hara state file changed before replace: '${path}'`);
+      } catch (error) {
+        try {
+          restorePrivateClaim(claimed, path, existing);
+        } catch (restoreError: any) {
+          throw new Error(
+            `${error instanceof Error ? error.message : String(error)}; safe restore was incomplete: ${restoreError?.message ?? String(restoreError)}`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+      try {
+        verifyPrivateDirectory(directory);
+        linkSync(temp, path);
+      } catch (error: any) {
+        let recovery = "";
+        try {
+          restorePrivateClaim(claimed, path, existing);
+        } catch (restoreError: any) {
+          recovery = `; original entry is retained: ${restoreError?.message ?? String(restoreError)}`;
+        }
+        throw new Error(`${error?.message ?? String(error)}${recovery}`, { cause: error });
+      }
+      if (verifiedClaim) {
+        try {
+          if (samePrivateFile(claimed, existing)) unlinkSync(claimed);
+        } catch {
+          // The new entry is already committed. Retain a changed/unremovable unpredictable claim instead of
+          // risking deletion of a concurrently supplied path; it contains only the previous private state.
+        }
+      }
+    }
+
+    const linkedStaged = { ...staged, nlink: staged.nlink + 1 };
+    if (!samePrivateFile(temp, linkedStaged) || !samePrivateFile(path, linkedStaged)) {
+      throw new Error(`private Hara state staging identity changed during commit: '${path}'`);
+    }
+    unlinkSync(temp);
+    const committed = lstatSync(path);
+    if (
+      !staged
+      || !committed.isFile()
+      || committed.isSymbolicLink()
+      || committed.dev !== staged.dev
+      || committed.ino !== staged.ino
+      || committed.nlink !== 1
+      || (process.platform !== "win32" && (committed.mode & 0o777) !== 0o600)
+    ) throw new Error(`private Hara state file changed during commit: '${path}'`);
+    verifyPrivateDirectory(directory);
+    syncPrivateDirectory(directory.path);
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* preserve original error */ }
+    if (staged) {
+      try {
+        if (samePrivateFile(temp, staged)) unlinkSync(temp);
+      } catch {
+        /* A changed entry is retained rather than unlinking an attacker-supplied replacement. */
+      }
+    }
+  }
 }
 
 /** Open/read one internal state file without following aliases, reject hard links, and repair mode by fd. */

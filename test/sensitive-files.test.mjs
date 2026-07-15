@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -36,9 +37,12 @@ import {
   toolSubprocessEnv,
 } from "../dist/security/subprocess-env.js";
 import {
+  bindPrivateHaraStateFile,
   ensurePrivateHaraState,
+  readPrivateStateFileSnapshotSync,
   resetPrivateHaraStateForTests,
   tightenPrivateHaraState,
+  writePrivateStateFileSync,
 } from "../dist/security/private-state.js";
 import { isReadOnlyCommand } from "../dist/security/permissions.js";
 import { runShell, shellCommand } from "../dist/sandbox.js";
@@ -314,6 +318,48 @@ test("private-state migration repairs legacy modes without following symlinks", 
     assert.equal(statSync(join(state, "config.json")).mode & 0o777, 0o666, "second startup call is intentionally cheap");
   } finally {
     resetPrivateHaraStateForTests();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("shared private-state storage creates 0700/0600 files and refuses final symlink or hard-link aliases", { skip: process.platform === "win32" }, () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-private-writer-"));
+  try {
+    const created = bindPrivateHaraStateFile(home, ["weixin"], "creds.json");
+    writePrivateStateFileSync(created, '{"token":"placeholder"}\n');
+    assert.equal(lstatSync(join(home, ".hara")).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(home, ".hara", "weixin")).mode & 0o777, 0o700);
+    assert.equal(lstatSync(created.path).mode & 0o777, 0o600);
+    assert.equal(lstatSync(created.path).isSymbolicLink(), false);
+    assert.equal(lstatSync(created.path).nlink, 1);
+    assert.equal(readPrivateStateFileSnapshotSync(created.path)?.text, '{"token":"placeholder"}\n');
+
+    writePrivateStateFileSync(created, '{"token":"rotated"}\n');
+    assert.equal(readFileSync(created.path, "utf8"), '{"token":"rotated"}\n');
+    assert.equal(lstatSync(created.path).mode & 0o777, 0o600);
+
+    for (const [kind, installAlias] of [
+      ["symbolic", (outside, alias) => symlinkSync(outside, alias)],
+      ["hard", (outside, alias) => linkSync(outside, alias)],
+    ]) {
+      const outside = join(home, `outside-${kind}.json`);
+      const original = `outside-${kind}\n`;
+      writeFileSync(outside, original, { mode: 0o640 });
+      chmodSync(outside, 0o640);
+      const outsideMode = lstatSync(outside).mode & 0o777;
+      const binding = bindPrivateHaraStateFile(home, [], `${kind}.json`);
+      installAlias(outside, binding.path);
+
+      assert.throws(
+        () => writePrivateStateFileSync(binding, '{"token":"must-not-escape"}\n'),
+        kind === "symbolic" ? /symbolic link/i : /hard link/i,
+      );
+      assert.equal(readFileSync(outside, "utf8"), original, `${kind} target bytes stay unchanged`);
+      assert.equal(lstatSync(outside).mode & 0o777, outsideMode, `${kind} target mode stays unchanged`);
+      assert.equal(kind === "symbolic" ? lstatSync(binding.path).isSymbolicLink() : lstatSync(binding.path).nlink === 2, true);
+      unlinkSync(binding.path);
+    }
+  } finally {
     rmSync(home, { recursive: true, force: true });
   }
 });

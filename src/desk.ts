@@ -4,9 +4,12 @@
 //
 // Credentials live in ~/.hara/desk.json (0600): the desk URL + this agent's token, written once at
 // `hara desk register`. Every later call reads them back. The token is a bearer secret — never logged.
-import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import {
+  bindPrivateHaraStateFile,
+  readPrivateStateFileSnapshotSync,
+  writePrivateStateFileSync,
+} from "./security/private-state.js";
 
 export interface DeskCreds {
   url: string; // e.g. http://127.0.0.1:4200 (local) or https://desk.nanhara.tech (server)
@@ -15,11 +18,12 @@ export interface DeskCreds {
   token: string;
 }
 
-const credsPath = (): string => join(homedir(), ".hara", "desk.json");
-
 export function loadCreds(): DeskCreds | null {
   try {
-    const c = JSON.parse(readFileSync(credsPath(), "utf8")) as DeskCreds;
+    const binding = bindPrivateHaraStateFile(homedir(), [], "desk.json");
+    const snapshot = readPrivateStateFileSnapshotSync(binding.path, 1024 * 1024);
+    if (!snapshot) return null;
+    const c = JSON.parse(snapshot.text) as DeskCreds;
     return c.url && c.token ? c : null;
   } catch {
     return null;
@@ -27,15 +31,8 @@ export function loadCreds(): DeskCreds | null {
 }
 
 export function saveCreds(c: DeskCreds): void {
-  const dir = join(homedir(), ".hara");
-  mkdirSync(dir, { recursive: true });
-  const p = credsPath();
-  writeFileSync(p, JSON.stringify(c, null, 2));
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* best-effort on non-posix */
-  }
+  const binding = bindPrivateHaraStateFile(homedir(), [], "desk.json");
+  writePrivateStateFileSync(binding, JSON.stringify(c, null, 2) + "\n");
 }
 
 /** One HTTP call to the desk. Auth via bearer token when creds are present. Throws on non-2xx with

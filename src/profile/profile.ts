@@ -32,8 +32,8 @@
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { join, dirname, parse as parsePath, relative, resolve as resolvePath } from "node:path";
-import { readFileSync, writeFileSync, existsSync, lstatSync, mkdirSync, chmodSync, realpathSync, renameSync } from "node:fs";
-import type { ProviderId } from "../config.js";
+import { lstatSync, realpathSync } from "node:fs";
+import { readRawConfig, updateRawConfig, type ProviderId } from "../config.js";
 import { readVerifiedRegularFileSnapshotSync, type RegularFileSnapshot } from "../fs-read.js";
 import {
   atomicWriteText,
@@ -42,6 +42,14 @@ import {
   verifyAtomicWriteBoundary,
 } from "../fs-write.js";
 import { projectRepositoryTrustedAtStartup } from "../security/project-trust.js";
+import {
+  bindPrivateHaraStateFile,
+  readPrivateStateFileSnapshotSync,
+  removePrivateStateFile,
+  writePrivateStateFileSync,
+  type PrivateStateFileBinding,
+  type PrivateStateFileSnapshot,
+} from "../security/private-state.js";
 
 export type ProfileKind = "byok" | "gateway";
 
@@ -75,24 +83,20 @@ export interface ProfilesFile {
 
 const PERSONAL_ID = "personal";
 const DEFAULT_ORG_ID = "default-org";
+const MAX_PROFILE_STATE_BYTES = 4 * 1024 * 1024;
 
-function haraDir(): string {
-  return join(homedir(), ".hara");
-}
-function profilesPath(): string {
-  return join(haraDir(), "profiles.json");
-}
-function configPath(): string {
-  return join(haraDir(), "config.json");
-}
-function orgPath(): string {
-  return join(haraDir(), "org.json");
+interface PrivateJsonState<T> {
+  binding: PrivateStateFileBinding;
+  snapshot: PrivateStateFileSnapshot;
+  value: T;
 }
 
-function readJSON<T>(p: string): T | null {
-  if (!existsSync(p)) return null;
+function readPrivateJSON<T>(filename: string): PrivateJsonState<T> | null {
   try {
-    return JSON.parse(readFileSync(p, "utf8")) as T;
+    const binding = bindPrivateHaraStateFile(homedir(), [], filename);
+    const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_PROFILE_STATE_BYTES);
+    if (!snapshot) return null;
+    return { binding, snapshot, value: JSON.parse(snapshot.text) as T };
   } catch {
     return null;
   }
@@ -100,20 +104,14 @@ function readJSON<T>(p: string): T | null {
 
 /** Write the profiles file 0600 (it can hold device tokens / api keys). */
 function persistProfilesFile(f: ProfilesFile): void {
-  const p = profilesPath();
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(f, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* best-effort */
-  }
+  const binding = bindPrivateHaraStateFile(homedir(), [], "profiles.json");
+  writePrivateStateFileSync(binding, JSON.stringify(f, null, 2) + "\n");
 }
 
 /** Synthesize the "personal" profile view from the legacy config.json. The config.json itself
  *  stays the *storage* — this just presents it as a Profile object. */
 function readPersonalFromConfig(): Profile {
-  const cfg = readJSON<Record<string, any>>(configPath()) ?? {};
+  const cfg = readRawConfig();
   // A legacy user that ran `hara enroll` had their provider written as "hara-gateway" in config.json.
   // After migration that case is handled separately (default-org profile), so when synthesizing the
   // personal profile we coerce a stray "hara-gateway" provider to anthropic (the BYOK default) — the
@@ -136,8 +134,7 @@ function readPersonalFromConfig(): Profile {
 }
 
 /** Synthesize a `default-org` profile from the legacy org.json (Enrollment). */
-function readDefaultOrgFromOrgJson(): Profile | null {
-  const e = readJSON<Record<string, any>>(orgPath());
+function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | null {
   if (!e || !e.gatewayUrl || !e.deviceToken) return null;
   const defaultModel: string = e.model || "";
   return {
@@ -156,11 +153,12 @@ function readDefaultOrgFromOrgJson(): Profile | null {
 
 /** First-time migration. Idempotent — running again is a no-op (profiles.json already present). */
 function maybeMigrate(): ProfilesFile {
-  const existing = readJSON<ProfilesFile>(profilesPath());
+  const existing = readPrivateJSON<ProfilesFile>("profiles.json")?.value;
   if (existing && Array.isArray(existing.profiles) && existing.profiles.length > 0) return existing;
 
   const personal = readPersonalFromConfig();
-  const org = readDefaultOrgFromOrgJson();
+  const legacyOrg = readPrivateJSON<Record<string, any>>("org.json");
+  const org = readDefaultOrgFromOrgJson(legacyOrg?.value ?? null);
   const profiles: Profile[] = [personal];
   let active = PERSONAL_ID;
   if (org) {
@@ -170,10 +168,13 @@ function maybeMigrate(): ProfilesFile {
   const f: ProfilesFile = { active, profiles };
   persistProfilesFile(f);
 
-  // Park org.json so we never re-migrate. We keep the file (don't delete data), just rename.
-  if (org && existsSync(orgPath())) {
+  // Park the exact verified legacy bytes without ever following/replacing an alias. If archival races or
+  // fails, leave org.json untouched; profiles.json already makes the migration idempotent.
+  if (org && legacyOrg) {
     try {
-      renameSync(orgPath(), orgPath() + ".legacy");
+      const archive = bindPrivateHaraStateFile(homedir(), [], "org.json.legacy");
+      writePrivateStateFileSync(archive, legacyOrg.snapshot.text);
+      removePrivateStateFile(legacyOrg.binding.path, legacyOrg.snapshot, legacyOrg.binding.directory);
     } catch {
       /* best-effort */
     }
@@ -574,29 +575,15 @@ export function routeHost(p: Profile): { host: string; isCustom: boolean } | nul
 // config.ts without circular imports. Implemented inline to avoid pulling config.ts.
 // ────────────────────────────────────────────────────────────────────────────────
 function setModelOnPersonal(model: string): { ok: true } | { ok: false; reason: string } {
-  const p = configPath();
-  const cfg = readJSON<Record<string, any>>(p) ?? {};
-  cfg.model = model;
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* best-effort */
-  }
+  updateRawConfig((config) => {
+    config.model = model;
+  });
   return { ok: true };
 }
 function clearModelOnPersonal(): { ok: true } | { ok: false; reason: string } {
-  const p = configPath();
-  const cfg = readJSON<Record<string, any>>(p) ?? {};
-  delete cfg.model;
-  mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
-  try {
-    chmodSync(p, 0o600);
-  } catch {
-    /* best-effort */
-  }
+  updateRawConfig((config) => {
+    delete config.model;
+  });
   return { ok: true };
 }
 

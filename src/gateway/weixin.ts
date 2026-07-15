@@ -4,8 +4,6 @@
 // `qrcode-terminal` dep (graceful fallback to printing the URL). No encryption is needed on the text path
 // (iLink only uses crypto for media upload/download, which v1 doesn't do).
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { randomBytes, randomUUID, createHash, createCipheriv, createDecipheriv } from "node:crypto";
 import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import type { OutboundFilePayload } from "./outbound-files.js";
@@ -17,6 +15,12 @@ import {
   readResponseBytesLimited,
   savePrivateMediaBytes,
 } from "./media.js";
+import {
+  bindPrivateHaraStateFile,
+  readPrivateStateFileSnapshotSync,
+  writePrivateStateFileSync,
+  type PrivateStateFileBinding,
+} from "../security/private-state.js";
 
 const ILINK_BASE_URL = "https://ilinkai.weixin.qq.com";
 const CHANNEL_VERSION = "2.2.0";
@@ -210,39 +214,61 @@ async function apiGet(baseUrl: string, endpoint: string, timeoutMs: number): Pro
   return JSON.parse(raw);
 }
 
-const weixinDir = (): string => join(homedir(), ".hara", "weixin");
-const credsFile = (): string => join(weixinDir(), "creds.json");
+function weixinStateFile(filename: string): PrivateStateFileBinding {
+  return bindPrivateHaraStateFile(homedir(), ["weixin"], filename);
+}
+
+function accountStateFilename(accountId: string, suffix: string): string {
+  const normalized = String(accountId ?? "").trim();
+  const key = /^[A-Za-z0-9_-]{1,128}$/.test(normalized)
+    ? normalized
+    : `account-${createHash("sha256").update(normalized).digest("hex")}`;
+  return `${key}${suffix}`;
+}
+
+/** Return peer identifiers without exposing token values or bypassing the private-state reader. */
+export function weixinKnownPeers(accountId: string): string[] {
+  try {
+    const binding = weixinStateFile(accountStateFilename(accountId, ".context-tokens.json"));
+    const snapshot = readPrivateStateFileSnapshotSync(binding.path, 8 * 1024 * 1024);
+    if (!snapshot) return [];
+    const parsed = JSON.parse(snapshot.text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+    return Object.entries(parsed)
+      .slice(-1000)
+      .filter(([peer, token]) => Boolean(peer) && typeof token === "string" && Boolean(token))
+      .map(([peer]) => peer);
+  } catch {
+    return [];
+  }
+}
 
 export function loadWeixinCreds(): WeixinCreds | null {
   try {
-    return existsSync(credsFile()) ? (JSON.parse(readFileSync(credsFile(), "utf8")) as WeixinCreds) : null;
+    const binding = weixinStateFile("creds.json");
+    const snapshot = readPrivateStateFileSnapshotSync(binding.path, 1024 * 1024);
+    return snapshot ? JSON.parse(snapshot.text) as WeixinCreds : null;
   } catch {
     return null;
   }
 }
 function saveWeixinCreds(c: WeixinCreds): void {
-  mkdirSync(weixinDir(), { recursive: true, mode: 0o700 });
-  try { chmodSync(weixinDir(), 0o700); } catch { /* best effort */ }
-  writeFileSync(credsFile(), JSON.stringify(c, null, 2), { mode: 0o600 });
-  try { chmodSync(credsFile(), 0o600); } catch { /* best effort */ }
+  writePrivateStateFileSync(weixinStateFile("creds.json"), JSON.stringify(c, null, 2) + "\n");
 }
 
 // get_updates_buf cursor — persisted so a restart resumes the message stream where it left off.
 function loadCursor(accountId: string): string {
   try {
-    const f = join(weixinDir(), `${accountId}.cursor`);
-    return existsSync(f) ? readFileSync(f, "utf8") : "";
+    const binding = weixinStateFile(accountStateFilename(accountId, ".cursor"));
+    return readPrivateStateFileSnapshotSync(binding.path, 4 * 1024 * 1024)?.text ?? "";
   } catch {
     return "";
   }
 }
 function saveCursor(accountId: string, buf: string): void {
   try {
-    mkdirSync(weixinDir(), { recursive: true, mode: 0o700 });
-    chmodSync(weixinDir(), 0o700);
-    const file = join(weixinDir(), `${accountId}.cursor`);
-    writeFileSync(file, buf, { mode: 0o600 });
-    chmodSync(file, 0o600);
+    const binding = weixinStateFile(accountStateFilename(accountId, ".cursor"));
+    writePrivateStateFileSync(binding, buf);
   } catch {
     /* best-effort */
   }
@@ -253,9 +279,9 @@ class TokenStore {
   private readonly cache = new Map<string, string>();
   constructor(private accountId: string) {
     try {
-      const exists = existsSync(this.file());
-      const parsed = exists ? JSON.parse(readFileSync(this.file(), "utf8")) : {};
-      if (exists) chmodSync(this.file(), 0o600);
+      const binding = this.binding();
+      const snapshot = readPrivateStateFileSnapshotSync(binding.path, 8 * 1024 * 1024);
+      const parsed = snapshot ? JSON.parse(snapshot.text) : {};
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         for (const [peer, token] of Object.entries(parsed).slice(-1000)) {
           if (peer && typeof token === "string" && token) this.cache.set(peer, token);
@@ -265,28 +291,17 @@ class TokenStore {
       this.cache.clear();
     }
   }
-  private file(): string {
-    return join(weixinDir(), `${this.accountId}.context-tokens.json`);
+  private binding(): PrivateStateFileBinding {
+    return weixinStateFile(accountStateFilename(this.accountId, ".context-tokens.json"));
   }
   private peerKey(peer: string): string {
     return String(peer ?? "").trim().slice(0, 256);
   }
   private persist(): void {
-    const temporary = `${this.file()}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      mkdirSync(weixinDir(), { recursive: true, mode: 0o700 });
-      chmodSync(weixinDir(), 0o700);
-      writeFileSync(temporary, JSON.stringify(Object.fromEntries(this.cache)), { mode: 0o600, flag: "wx" });
-      renameSync(temporary, this.file());
-      chmodSync(this.file(), 0o600);
+      writePrivateStateFileSync(this.binding(), JSON.stringify(Object.fromEntries(this.cache)) + "\n");
     } catch {
       /* best-effort */
-    } finally {
-      try {
-        rmSync(temporary, { force: true });
-      } catch {
-        /* best-effort */
-      }
     }
   }
   get(peer: string): string | undefined {

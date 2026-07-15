@@ -77,7 +77,7 @@ export class HardLinkedFileError extends Error {
   readonly code = "HARA_HARD_LINKED_FILE";
 
   constructor(path: string) {
-    super(`${path} has multiple hard links; its protected identity cannot be established safely`);
+    super(`${path} is hard-linked (has multiple hard links); its protected identity cannot be established safely`);
     this.name = "HardLinkedFileError";
   }
 }

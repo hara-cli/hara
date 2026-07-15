@@ -2,11 +2,11 @@
 // runtime. The existing loaders pick the contents up (skillsDirs/loadRoles append the resolvers below;
 // index.ts merges pluginMcpServers into the MCP set). Manifest is Claude-Code-compatible: we read
 // .claude-plugin/plugin.json, .hara-plugin/plugin.json, or a bare plugin.json at the plugin root.
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync, cpSync, symlinkSync, chmodSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, readdirSync, rmSync, cpSync, symlinkSync, chmodSync } from "node:fs";
 import { join, resolve, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { readRawConfig } from "../config.js";
+import { readRawConfig, updateRawConfig } from "../config.js";
 import type { McpServerConfig } from "../config.js";
 import type { HooksConfig } from "../hooks.js";
 
@@ -217,11 +217,9 @@ export function panelsForProject(cwd: string): { plugin: string; panel: PanelSpe
 
 /** Persist a plugin's enabled flag in ~/.hara/config.json (`plugins.enabled[name]`). */
 export function setPluginEnabled(name: string, on: boolean): void {
-  const p = join(homedir(), ".hara", "config.json");
-  const cfg = readRawConfig();
-  const plugins = (cfg.plugins && typeof cfg.plugins === "object" ? cfg.plugins : {}) as Record<string, any>;
-  plugins.enabled = { ...(plugins.enabled ?? {}), [name]: on };
-  cfg.plugins = plugins;
-  mkdirSync(join(homedir(), ".hara"), { recursive: true });
-  writeFileSync(p, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  updateRawConfig((config) => {
+    const plugins = (config.plugins && typeof config.plugins === "object" ? config.plugins : {}) as Record<string, any>;
+    plugins.enabled = { ...(plugins.enabled ?? {}), [name]: on };
+    config.plugins = plugins;
+  });
 }

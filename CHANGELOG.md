@@ -25,6 +25,11 @@ All notable changes to `@nanhara/hara`.
   classic and TUI exits share proactive reflection. Candidate observations go to logs, only stable evidence-
   backed facts/preferences enter memory, verified repeatable procedures may become skills, and autonomous
   code/config/permission/system-prompt mutation is explicitly outside the feature.
+- **Credential files share one no-alias storage boundary.** Desk registration, identity profiles, Qwen OAuth,
+  Weixin credentials/cursors/context tokens, legacy org enrollment, and global config mutations now use
+  symlink-free 0700 directories, bounded no-follow reads, hard-link rejection, 0600 fsynced staging, and
+  identity-checked compare-and-swap publication. Preseeded aliases fail closed without changing external file
+  bytes or permissions; legacy `org.json` archival/removal is bound to the exact verified inode.
 
 ## 0.123.1 — 2026-07-15 — restore default TUI keyboard input
 

@@ -11,9 +11,15 @@
 //   POST {gateway}/v1/chat/completions  (OpenAI-compatible; the normal agent traffic, Bearer <device_token>)
 import { homedir, hostname, platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, rmSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { orgRolesDir } from "../org/roles.js";
 import { loadActiveProfile, upsertProfile, useProfile, getProfile, DEFAULT_ORG_ID } from "../profile/profile.js";
+import {
+  bindPrivateHaraStateFile,
+  readPrivateStateFileSnapshotSync,
+  removePrivateStateFile,
+  writePrivateStateFileSync,
+} from "../security/private-state.js";
 
 export interface Enrollment {
   gatewayUrl: string; // e.g. https://hara-gw.acme.internal  (no trailing slash)
@@ -24,7 +30,6 @@ export interface Enrollment {
   enrolledAt: string;
 }
 
-const orgPath = (): string => join(homedir(), ".hara", "org.json");
 const deviceInfo = (): { name: string; os: string; hara_version: string } => ({ name: hostname(), os: platform(), hara_version: process.env.HARA_BUILD_VERSION ?? "dev" });
 
 /** The effective OpenAI-compatible base URL for an enrollment (explicit, else <gatewayUrl>/v1). */
@@ -36,14 +41,13 @@ export function loadEnrollment(): Enrollment | null {
   // 1) Legacy storage (~/.hara/org.json) for back-compat with pre-profile builds. After the
   //    profile migration runs (lazily on any profile.ts read), org.json is renamed to .legacy
   //    so this branch only fires for users who never touched the new profile layer yet.
-  const p = orgPath();
-  if (existsSync(p)) {
-    try {
-      const e = JSON.parse(readFileSync(p, "utf8")) as Enrollment;
-      if (e && typeof e === "object" && e.gatewayUrl && e.deviceToken) return e;
-    } catch {
-      /* fall through to profile-derived */
-    }
+  try {
+    const binding = bindPrivateHaraStateFile(homedir(), [], "org.json");
+    const snapshot = readPrivateStateFileSnapshotSync(binding.path, 1024 * 1024);
+    const e = snapshot ? JSON.parse(snapshot.text) as Enrollment : null;
+    if (e && typeof e === "object" && e.gatewayUrl && e.deviceToken) return e;
+  } catch {
+    /* fall through to profile-derived */
   }
   // 2) Active-profile path. profile.ts doesn't import enroll.ts so this static import is safe.
   try {
@@ -65,18 +69,15 @@ export function loadEnrollment(): Enrollment | null {
 }
 
 function saveEnrollment(e: Enrollment): void {
-  mkdirSync(join(homedir(), ".hara"), { recursive: true });
-  writeFileSync(orgPath(), JSON.stringify(e, null, 2) + "\n", { encoding: "utf8", mode: 0o600 }); // holds a device token → 0600
-  try {
-    chmodSync(orgPath(), 0o600);
-  } catch {
-    /* best-effort */
-  }
+  const binding = bindPrivateHaraStateFile(homedir(), [], "org.json");
+  writePrivateStateFileSync(binding, JSON.stringify(e, null, 2) + "\n");
 }
 
 export function clearEnrollment(): boolean {
-  if (!existsSync(orgPath())) return false;
-  rmSync(orgPath());
+  const binding = bindPrivateHaraStateFile(homedir(), [], "org.json");
+  const snapshot = readPrivateStateFileSnapshotSync(binding.path, 1024 * 1024);
+  if (!snapshot) return false;
+  removePrivateStateFile(binding.path, snapshot, binding.directory);
   return true;
 }
 

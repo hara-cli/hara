@@ -1,25 +1,16 @@
-import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
-import {
-  closeSync,
-  constants,
-  existsSync,
-  fstatSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  realpathSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import type { SandboxMode } from "./sandbox.js";
 import type { HooksConfig } from "./hooks.js";
 import type { NotifyMode } from "./notify.js";
 import { agentMaxRounds, agentRunTimeoutMs } from "./agent/limits.js";
-import { ensurePrivateHaraState } from "./security/private-state.js";
+import {
+  bindPrivateHaraStateFile,
+  ensurePrivateHaraState,
+  readPrivateStateFileSnapshotSync,
+  writePrivateStateFileSync,
+} from "./security/private-state.js";
 import { readVerifiedRegularFileSnapshotSync } from "./fs-read.js";
 import { projectRepositoryTrustedAtStartup } from "./security/project-trust.js";
 import { isHomeWorkspace } from "./context/workspace-scope.js";
@@ -221,14 +212,10 @@ function configRecord(value: unknown): Record<string, any> {
 
 export function readRawConfig(): Record<string, any> {
   ensurePrivateHaraState();
-  const p = configPath();
-  if (!existsSync(p)) return {};
   try {
-    const snapshot = readVerifiedRegularFileSnapshotSync(p, MAX_GLOBAL_CONFIG_BYTES, {
-      action: "read global config",
-      protectSensitive: false,
-      rejectHardLinks: true,
-    });
+    const binding = bindPrivateHaraStateFile(homedir(), [], "config.json");
+    const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_GLOBAL_CONFIG_BYTES);
+    if (!snapshot) return {};
     return configRecord(JSON.parse(snapshot.text));
   } catch {
     return {};
@@ -339,80 +326,36 @@ function readProjectConfig(cwd: string): Record<string, any> {
   return {};
 }
 
-function existingConfigIdentity(path: string): { dev: number; ino: number } | null {
-  try {
-    const info = lstatSync(path);
-    if (info.isSymbolicLink()) throw new Error(`refusing global config write: '${path}' is a symbolic link`);
-    if (!info.isFile()) throw new Error(`refusing global config write: '${path}' is not a regular file`);
-    if (info.nlink !== 1) throw new Error(`refusing global config write: '${path}' is hard-linked`);
-    return { dev: info.dev, ino: info.ino };
-  } catch (error: any) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
-  }
+/** Atomically replace the global 0600 config through the shared private-state CAS boundary. */
+function persistConfig(cfg: Record<string, unknown>): void {
+  ensurePrivateHaraState();
+  const binding = bindPrivateHaraStateFile(homedir(), [], "config.json");
+  writePrivateStateFileSync(binding, JSON.stringify(cfg, null, 2) + "\n");
 }
 
-/** Atomically replace the global 0600 config without opening its current directory entry for write. */
-function persistConfig(p: string, cfg: Record<string, unknown>): void {
-  ensurePrivateHaraState();
-  const parent = dirname(p);
-  mkdirSync(parent, { recursive: true, mode: 0o700 });
-  const parentInfo = lstatSync(parent);
-  const canonicalParent = realpathSync.native(parent);
-  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink()) {
-    throw new Error(`refusing global config write: '${parent}' is not a canonical directory`);
-  }
-  const existing = existingConfigIdentity(p);
-  const temp = join(parent, `.config-${process.pid}-${randomUUID()}.tmp`);
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  let fd: number | undefined;
-  try {
-    fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
-    writeFileSync(fd, JSON.stringify(cfg, null, 2) + "\n", "utf8");
-    fsyncSync(fd);
-    const staged = fstatSync(fd);
-    if (!staged.isFile() || staged.nlink !== 1) throw new Error("refusing global config write: unsafe staging inode");
-    closeSync(fd);
-    fd = undefined;
-
-    const parentAfter = lstatSync(parent);
-    if (
-      !parentAfter.isDirectory() || parentAfter.isSymbolicLink() ||
-      parentAfter.dev !== parentInfo.dev || parentAfter.ino !== parentInfo.ino ||
-      realpathSync.native(parent) !== canonicalParent
-    ) throw new Error(`refusing global config write: '${parent}' changed before commit`);
-    const current = existingConfigIdentity(p);
-    if ((existing === null) !== (current === null) || (existing && current && (existing.dev !== current.dev || existing.ino !== current.ino))) {
-      throw new Error(`refusing global config write: '${p}' changed before commit`);
-    }
-    // rename replaces the path entry; it never follows an alias planted after the last identity check.
-    renameSync(temp, p);
-    const committed = lstatSync(p);
-    if (!committed.isFile() || committed.isSymbolicLink() || committed.dev !== staged.dev || committed.ino !== staged.ino || committed.nlink !== 1) {
-      throw new Error(`global config changed during commit: '${p}'`);
-    }
-  } finally {
-    if (fd !== undefined) try { closeSync(fd); } catch { /* preserve original error */ }
-    try { rmSync(temp, { force: true }); } catch { /* preserve original error */ }
-  }
+/** Mutate global config without exposing a second direct-write implementation to feature modules. */
+export function updateRawConfig(
+  mutate: (config: Record<string, any>) => Record<string, any> | void,
+): void {
+  const config = readRawConfig();
+  const replacement = mutate(config);
+  persistConfig(replacement ?? config);
 }
 
 export function writeConfigValue(key: string, value: string): void {
-  const p = configPath();
-  const cfg = readRawConfig();
-  cfg[key] = value;
-  persistConfig(p, cfg);
+  updateRawConfig((config) => {
+    config[key] = value;
+  });
 }
 
 /** Record (or clear, with cap=null) a confirmed per-model vision capability in `modelVision`. */
 export function setModelVisionOverride(model: string, cap: "yes" | "no" | null): void {
-  const p = configPath();
-  const cfg = readRawConfig();
-  const map: Record<string, string> = cfg.modelVision && typeof cfg.modelVision === "object" ? cfg.modelVision : {};
-  if (cap === null) delete map[model];
-  else map[model] = cap;
-  cfg.modelVision = map;
-  persistConfig(p, cfg);
+  updateRawConfig((config) => {
+    const map: Record<string, string> = config.modelVision && typeof config.modelVision === "object" ? config.modelVision : {};
+    if (cap === null) delete map[model];
+    else map[model] = cap;
+    config.modelVision = map;
+  });
 }
 
 /**
