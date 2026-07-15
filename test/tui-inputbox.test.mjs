@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
-import { InputBox, wrapRows, windowRows, cursorRowIndex, MAX_INPUT_ROWS } from "../dist/tui/InputBox.js";
+import { InputBox, wrapRows, windowRows, cursorRowIndex, composerTextForDisplay, MAX_INPUT_ROWS } from "../dist/tui/InputBox.js";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -372,6 +372,25 @@ test("cells: CJK counts 2, ASCII 1, combining 0", () => {
   assert.equal(cells("中a文b"), 6);
   assert.equal(charCells("́"), 0);
   assert.equal(cells("卜瓜🦊"), 6, "emoji is double-width");
+});
+
+test("composer tabs render and wrap as one cell without changing the submitted text", async () => {
+  assert.equal(composerTextForDisplay("left\tright"), "left right");
+  assert.equal(cells("\t"), 1, "tab uses the same one-cell width as its display space");
+  const rows = wrapRows("a\tb", 3);
+  assert.equal(rows[0].end, 3, "one tab plus two letters fits exactly in three cells");
+
+  let submitted = null;
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }),
+  );
+  stdin.write("left\tright");
+  await tick();
+  assert.ok(strip(lastFrame()).includes("left right"), "the visible draft contains a single-column space");
+  stdin.write("\r");
+  await tick();
+  assert.equal(submitted, "left\tright", "the provider still receives the user's literal tab");
+  unmount();
 });
 
 test("wrapRows: CJK text wraps by CELLS, not chars — no row exceeds the terminal width", () => {

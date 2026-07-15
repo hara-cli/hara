@@ -20,6 +20,10 @@ All notable changes to `@nanhara/hara`.
   temporary Home containing a sentinel project, forces the provider to call `ls`, and verifies the tool result
   is a bounded refusal while the persisted history and latest request reach the model without any Home entry
   or file name.
+
+- **Composer tabs no longer move the cursor away from the text.** Literal tabs render and wrap as one-column
+  spaces while the editable and submitted prompt preserves the original tab characters.
+
 ## 0.122.5 — 2026-07-15 — standalone ambient-config security boundary
 
 - **Standalone binaries no longer trust the directory they are launched from.** Bun's runtime `.env` and

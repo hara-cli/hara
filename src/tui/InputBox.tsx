@@ -201,6 +201,13 @@ export function cells(s: string): number {
   return n;
 }
 
+/** One-cell display representation for composer text. The editable/submitted value keeps literal tabs,
+ *  while wrapping, cursor math, and Ink all see the same one-cell glyph. Removing newlines here preserves
+ *  renderRow's invariant that hard line breaks are represented by rows rather than nested Text output. */
+export function composerTextForDisplay(text: string): string {
+  return text.replace(/\n/g, "").replace(/\t/g, " ");
+}
+
 /** Wrap `value` into rows that each fit within `cols` cells, breaking on spaces where possible but
  *  never inside an `[Image #N]` token. Deterministic (no reliance on ink's soft-wrap) so wrapped rows
  *  align under a stable gutter and the cursor position is exact. Always returns at least one row. */
@@ -286,10 +293,10 @@ function renderRow(value: string, row: Row, cursor: number, showCursor: boolean,
   const seg = (token: boolean, text: string, k: string): ReactNode =>
     token ? (
       <Text key={k} backgroundColor="magenta" color="white">
-        {text.replace(/\n/g, "")}
+        {composerTextForDisplay(text)}
       </Text>
     ) : (
-      <Text key={k}>{text.replace(/\n/g, "")}</Text>
+      <Text key={k}>{composerTextForDisplay(text)}</Text>
     );
   // Segments intersected with this row's [start,end) range.
   const parts = segmentize(value);
@@ -310,7 +317,7 @@ function renderRow(value: string, row: Row, cursor: number, showCursor: boolean,
       if (rel > 0) nodes.push(seg(p.token, slice.slice(0, rel), `${keyPrefix}s${ki++}`));
       nodes.push(
         <Text key={`${keyPrefix}c${ki++}`} inverse>
-          {slice[rel] === "\n" ? " " : slice[rel]}
+          {slice[rel] === "\n" || slice[rel] === "\t" ? " " : slice[rel]}
         </Text>,
       );
       if (rel + 1 < slice.length) nodes.push(seg(p.token, slice.slice(rel + 1), `${keyPrefix}e${ki++}`));
