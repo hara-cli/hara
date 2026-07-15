@@ -141,6 +141,10 @@ test("credential-scoped outbound lanes quarantine a timed-out transport and reco
     await assert.rejects(second.send("same-chat", "must-not-overtake"), /timed out after 50ms/);
     assert.deepEqual(sent, ["wedged"], "a queued request never starts while the ambiguous first request is alive");
 
+    // The 50ms budget above is deliberately tiny so the quarantine path is exercised quickly. Recovery is
+    // a different assertion: give its multi-chunk FIFO work a realistic bounded budget so a contended CI
+    // event loop cannot turn scheduler latency into a false transport timeout.
+    process.env.HARA_GATEWAY_OUTBOUND_TIMEOUT_MS = "1000";
     releaseWedged(new Response(JSON.stringify({ ok: true, result: {} }), {
       status: 200,
       headers: { "content-type": "application/json" },
