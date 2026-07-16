@@ -26,7 +26,8 @@ jobs:
           [[ "$GITHUB_REF_NAME" == "$expected" ]] || { echo "release tag mismatch: $GITHUB_REF_NAME != $expected" >&2; exit 1; }
           bun --version
       - run: npm ci
-      - run: npm audit --omit=dev --registry https://registry.npmjs.org/
+      - name: Audit production dependencies
+        run: bash .github/scripts/audit-production.sh
       - run: npm test
       - run: npm run build:binaries
       - name: Execute the native release asset before publishing

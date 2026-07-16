@@ -32,7 +32,8 @@ jobs:
           expected="v$(node -p 'require("./package.json").version')"
           [[ "$GITHUB_REF_NAME" == "$expected" ]] || { echo "npm tag mismatch: $GITHUB_REF_NAME != $expected" >&2; exit 1; }
       - run: npm ci
-      - run: npm audit --omit=dev --registry https://registry.npmjs.org/
+      - name: Audit production dependencies
+        run: bash .github/scripts/audit-production.sh
       - run: npm test
       - name: Publish to npm (idempotent)
         env:
