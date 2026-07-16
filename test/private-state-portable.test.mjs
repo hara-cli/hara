@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { optionalPosixOpenFlag } from "../dist/fs-open-flags.js";
 import {
   bindPrivateHaraStateFile,
+  privateStateFileIdentityMatches,
   readPrivateStateFileSnapshotSync,
   writePrivateStateFileSync,
 } from "../dist/security/private-state.js";
@@ -13,6 +14,25 @@ import {
 test("Windows never receives POSIX-only open flags exposed by an alternate runtime", () => {
   for (const flag of ["O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"]) {
     assert.equal(optionalPosixOpenFlag(flag, "win32"), 0, `${flag} must be omitted on Windows`);
+  }
+});
+
+test("Windows file identity ignores synthetic mode but retains dev, inode and link-count fences", () => {
+  const expected = { dev: 7, ino: 11, mode: 0o600, nlink: 2 };
+  assert.equal(
+    privateStateFileIdentityMatches({ ...expected, mode: 0o666 }, expected, "win32"),
+    true,
+  );
+  assert.equal(
+    privateStateFileIdentityMatches({ ...expected, mode: 0o666 }, expected, "linux"),
+    false,
+  );
+  for (const [field, value] of [["dev", 8], ["ino", 12], ["nlink", 1]]) {
+    assert.equal(
+      privateStateFileIdentityMatches({ ...expected, [field]: value }, expected, "win32"),
+      false,
+      `${field} remains a Windows identity fence`,
+    );
   }
 });
 

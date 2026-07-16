@@ -292,11 +292,48 @@ function samePrivateFile(path: string, expected: Pick<RegularFileSnapshot, "dev"
   return (
     info.isFile()
     && !info.isSymbolicLink()
-    && info.dev === expected.dev
-    && info.ino === expected.ino
-    && (info.mode & 0o777) === expected.mode
-    && info.nlink === expected.nlink
+    && privateStateFileIdentityMatches({
+      dev: info.dev,
+      ino: info.ino,
+      mode: info.mode & 0o777,
+      nlink: info.nlink,
+    }, expected)
   );
+}
+
+/**
+ * Compare the fields Node can use as a stable file identity on the current platform. Windows only exposes
+ * owner read/write permission semantics, so its synthetic POSIX mode can differ between descriptor- and
+ * path-based stats without identifying a different file. File type, dev/ino and hard-link count remain
+ * mandatory there; POSIX additionally requires the exact owner-only mode.
+ */
+export function privateStateFileIdentityMatches(
+  actual: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">,
+  expected: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink">,
+  platform: string = process.platform,
+): boolean {
+  return (
+    actual.dev === expected.dev
+    && actual.ino === expected.ino
+    && actual.nlink === expected.nlink
+    && (platform === "win32" || actual.mode === expected.mode)
+  );
+}
+
+function privateFileIdentitySummary(path: string): string {
+  try {
+    const info = lstatSync(path);
+    return JSON.stringify({
+      file: info.isFile(),
+      symlink: info.isSymbolicLink(),
+      dev: info.dev,
+      ino: info.ino,
+      mode: info.mode & 0o777,
+      nlink: info.nlink,
+    });
+  } catch (error: any) {
+    return JSON.stringify({ error: error?.code ?? error?.message ?? String(error) });
+  }
 }
 
 function restorePrivateClaim(
@@ -445,7 +482,12 @@ export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text
 
     const linkedStaged = { ...staged, nlink: staged.nlink + 1 };
     if (!samePrivateFile(temp, linkedStaged) || !samePrivateFile(path, linkedStaged)) {
-      throw new Error(`private Hara state staging identity changed during commit: '${path}'`);
+      throw new Error(
+        `private Hara state staging identity changed during commit: '${path}'`
+        + `; expected=${JSON.stringify(linkedStaged)}`
+        + `; staging=${privateFileIdentitySummary(temp)}`
+        + `; target=${privateFileIdentitySummary(path)}`,
+      );
     }
     unlinkSync(temp);
     const committed = lstatSync(path);

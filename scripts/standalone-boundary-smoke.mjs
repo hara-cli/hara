@@ -57,7 +57,9 @@ try {
 
   const doctor = run(["doctor"]);
   if (doctor.error || doctor.status !== 0) {
-    throw new Error(`doctor probe failed (status ${doctor.status}): ${doctor.error?.message ?? doctor.stderr.trim()}`);
+    const details = doctor.error?.message
+      ?? [doctor.stderr.trim(), doctor.stdout.trim()].filter(Boolean).join("\n");
+    throw new Error(`doctor probe failed (status ${doctor.status}): ${details}`);
   }
   if (doctor.stdout.includes(dotenvMarker) || doctor.stderr.includes(dotenvMarker)) {
     throw new Error("cwd .env was loaded into the standalone process");
