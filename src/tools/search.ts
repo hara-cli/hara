@@ -295,7 +295,8 @@ function execute() {
 
   const readBuffer = Buffer.allocUnsafe(cfg.maxFileBytes + 1);
   function sameIdentity(info, candidate) {
-    return String(info.dev) === candidate.dev && String(info.ino) === candidate.ino;
+    return String(info.ino) === candidate.ino
+      && (process.platform === "win32" || String(info.dev) === candidate.dev);
   }
   function safeReadText(candidate) {
     const absolute = candidate.path;

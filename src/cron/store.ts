@@ -26,6 +26,7 @@ import { cronMatches, parseCron, validTz, type Schedule } from "./schedule.js";
 import { compareProcessIdentity, defaultProcessIdentity } from "../process-identity.js";
 import { sleepSync } from "../sync-sleep.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
+import { sameOpenedFileIdentity } from "../fs-identity.js";
 
 export type CronNotificationKind = "outcome" | "alert";
 
@@ -150,7 +151,7 @@ function readStoreLockSnapshot(path: string): StoreLockSnapshot | null {
       );
       try {
         const opened = fstatSync(fd);
-        if (opened.isFile() && opened.dev === before.dev && opened.ino === before.ino && opened.size <= MAX_STORE_LOCK_BYTES) {
+        if (opened.isFile() && sameOpenedFileIdentity(opened, before) && opened.size <= MAX_STORE_LOCK_BYTES) {
           const buffer = Buffer.alloc(opened.size);
           let offset = 0;
           while (offset < buffer.length) {

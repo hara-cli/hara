@@ -31,6 +31,7 @@ import {
 import { sleepSync } from "../sync-sleep.js";
 import { compareProcessIdentity, defaultProcessIdentity } from "../process-identity.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
+import { sameOpenedFileIdentity } from "../fs-identity.js";
 
 const PLATFORM = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const LOCK_BYTES = 4 * 1024;
@@ -299,8 +300,7 @@ function readLease(path: string, platform: string): LeaseSnapshot | null {
       !staging.isFile()
       || staging.isSymbolicLink()
       || staging.nlink !== 2
-      || staging.dev !== info.dev
-      || staging.ino !== info.ino
+      || !sameOpenedFileIdentity(staging, info)
     ) throw new Error(`refusing malformed gateway instance lock: ${path}`);
     return { record, dev: info.dev, ino: info.ino, stagingPath };
   } finally {
@@ -312,8 +312,7 @@ function sameLease(left: LeaseSnapshot | null, right: LeaseSnapshot | null): boo
   return Boolean(
     left
     && right
-    && left.dev === right.dev
-    && left.ino === right.ino
+    && sameOpenedFileIdentity(left, right)
     && left.record.pid === right.record.pid
     && left.record.token === right.record.token,
   );
@@ -326,8 +325,7 @@ function unlinkLease(path: string, expected: LeaseSnapshot): void {
     || current.isSymbolicLink()
     || current.nlink < 1
     || current.nlink > 2
-    || current.dev !== expected.dev
-    || current.ino !== expected.ino
+    || !sameOpenedFileIdentity(current, expected)
   ) throw new Error(`gateway instance lock changed before removal: ${path}`);
 
   if (current.nlink === 2) {
@@ -337,8 +335,7 @@ function unlinkLease(path: string, expected: LeaseSnapshot): void {
       !staging.isFile()
       || staging.isSymbolicLink()
       || staging.nlink !== 2
-      || staging.dev !== expected.dev
-      || staging.ino !== expected.ino
+      || !sameOpenedFileIdentity(staging, expected)
     ) throw new Error(`gateway instance lock changed before removal: ${path}`);
     unlinkSync(expected.stagingPath);
     current = lstatSync(path);
@@ -346,8 +343,7 @@ function unlinkLease(path: string, expected: LeaseSnapshot): void {
       !current.isFile()
       || current.isSymbolicLink()
       || current.nlink !== 1
-      || current.dev !== expected.dev
-      || current.ino !== expected.ino
+      || !sameOpenedFileIdentity(current, expected)
     ) throw new Error(`gateway instance lock changed before removal: ${path}`);
   }
   unlinkSync(path);
@@ -360,15 +356,7 @@ function writeLease(path: string, record: LeaseRecord): LeaseSnapshot {
   try {
     // Never expose an empty/partial owner record at the canonical path. The private staging inode is fully
     // written + fsynced first; link(2) then publishes it atomically and refuses to replace an existing owner.
-    fd = openSync(
-      stagingPath,
-      constants.O_WRONLY
-        | constants.O_CREAT
-        | constants.O_EXCL
-        | optionalPosixOpenFlag("O_NOFOLLOW")
-        | optionalPosixOpenFlag("O_NONBLOCK"),
-      0o600,
-    );
+    fd = openSync(stagingPath, "wx", 0o600);
     writeFileSync(fd, JSON.stringify(record), "utf8");
     fsyncSync(fd);
     closeSync(fd);
@@ -1031,8 +1019,7 @@ export class GatewayFlowRunStore {
       !current.isFile()
       || current.isSymbolicLink()
       || current.nlink !== 1
-      || current.dev !== snapshot.dev
-      || current.ino !== snapshot.ino
+      || !sameOpenedFileIdentity(current, snapshot)
     ) throw new Error(`gateway flow run changed before removal: ${path}`);
     unlinkSync(path);
   }
@@ -1356,8 +1343,7 @@ export class GatewayRunOutcomeStore {
       !current.isFile()
       || current.isSymbolicLink()
       || current.nlink !== 1
-      || current.dev !== snapshot.dev
-      || current.ino !== snapshot.ino
+      || !sameOpenedFileIdentity(current, snapshot)
     ) throw new Error(`gateway run outcome changed before removal: ${path}`);
     unlinkSync(path);
   }

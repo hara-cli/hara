@@ -29,6 +29,7 @@ import { psArgumentsExposeEnvironment } from "./sensitive-files.js";
 import { projectRepositoryTrustedAtStartup } from "./project-trust.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
+import { sameOpenedFileIdentity } from "../fs-identity.js";
 
 export type Decision = "allow" | "ask" | "deny";
 export interface PermissionRules {
@@ -429,7 +430,7 @@ function scaffoldProjectPermissions(cwd: string): string | null {
 
     verifiedDirectory(parent, parentIdentity);
     const staged = lstatSync(temp);
-    if (!staged.isFile() || staged.isSymbolicLink() || staged.dev !== tempIdentity.dev || staged.ino !== tempIdentity.ino) {
+    if (!staged.isFile() || staged.isSymbolicLink() || !sameOpenedFileIdentity(staged, tempIdentity)) {
       throw new Error("refusing project permissions write: staging file identity changed");
     }
     verifiedDirectory(parent, parentIdentity);
@@ -445,7 +446,7 @@ function scaffoldProjectPermissions(cwd: string): string | null {
     }
     verifiedDirectory(parent, parentIdentity);
     const written = lstatSync(target);
-    if (!written.isFile() || written.isSymbolicLink() || written.dev !== tempIdentity.dev || written.ino !== tempIdentity.ino) {
+    if (!written.isFile() || written.isSymbolicLink() || !sameOpenedFileIdentity(written, tempIdentity)) {
       throw new Error("refusing project permissions write: committed file identity changed");
     }
     unlinkSync(temp);
@@ -457,7 +458,7 @@ function scaffoldProjectPermissions(cwd: string): string | null {
       try {
         verifiedDirectory(parent, parentIdentity);
         const current = lstatSync(temp);
-        if (current.isFile() && current.dev === tempIdentity.dev && current.ino === tempIdentity.ino) unlinkSync(temp);
+        if (current.isFile() && sameOpenedFileIdentity(current, tempIdentity)) unlinkSync(temp);
       } catch {
         /* Retain an uncertain private staging file rather than unlinking an attacker-controlled replacement. */
       }

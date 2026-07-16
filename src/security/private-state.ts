@@ -31,6 +31,7 @@ import {
   type RegularFileSnapshot,
 } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
+import { sameOpenedFileIdentity } from "../fs-identity.js";
 
 const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin"]);
 const tightenedHomes = new Set<string>();
@@ -313,8 +314,7 @@ export function privateStateFileIdentityMatches(
   platform: string = process.platform,
 ): boolean {
   return (
-    actual.dev === expected.dev
-    && actual.ino === expected.ino
+    sameOpenedFileIdentity(actual, expected, platform)
     && actual.nlink === expected.nlink
     && (platform === "win32" || actual.mode === expected.mode)
   );
@@ -395,11 +395,9 @@ export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text
   let fd: number | undefined;
   let staged: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink"> | undefined;
   try {
-    fd = openSync(
-      temp,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | optionalPosixOpenFlag("O_NOFOLLOW"),
-      0o600,
-    );
+    // `wx` maps to O_WRONLY|O_CREAT|O_EXCL/CREATE_NEW and refuses an already-present symlink or file.
+    // Bun's Windows numeric-open compatibility can otherwise turn this valid create into a false ENOENT.
+    fd = openSync(temp, "wx", 0o600);
     writeFileSync(fd, text, "utf8");
     try {
       fchmodSync(fd, 0o600);
@@ -440,8 +438,7 @@ export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text
         const claimedSnapshot = readPrivateStateFileSnapshotSync(claimed);
         verifiedClaim = Boolean(
           claimedSnapshot
-          && claimedSnapshot.dev === existing.dev
-          && claimedSnapshot.ino === existing.ino
+          && sameOpenedFileIdentity(claimedSnapshot, existing)
           && claimedSnapshot.mode === existing.mode
           && claimedSnapshot.nlink === existing.nlink
           && claimedSnapshot.text === existing.text
@@ -495,8 +492,7 @@ export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text
       !staged
       || !committed.isFile()
       || committed.isSymbolicLink()
-      || committed.dev !== staged.dev
-      || committed.ino !== staged.ino
+      || !sameOpenedFileIdentity(committed, staged)
       || committed.nlink !== 1
       || (process.platform !== "win32" && (committed.mode & 0o777) !== 0o600)
     ) throw new Error(`private Hara state file changed during commit: '${path}'`);
@@ -597,9 +593,8 @@ export function removePrivateStateFile(
     !current.isFile()
     || current.isSymbolicLink()
     || current.nlink !== 1
-    || current.dev !== expected.dev
-    || current.ino !== expected.ino
-    || (current.mode & 0o777) !== expected.mode
+    || !sameOpenedFileIdentity(current, expected)
+    || (process.platform !== "win32" && (current.mode & 0o777) !== expected.mode)
     || current.size !== expected.size
     || current.mtimeMs !== expected.mtimeMs
     || current.ctimeMs !== expected.ctimeMs

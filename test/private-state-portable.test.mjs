@@ -4,6 +4,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { optionalPosixOpenFlag } from "../dist/fs-open-flags.js";
+import { sameOpenedFileIdentity } from "../dist/fs-identity.js";
 import {
   bindPrivateHaraStateFile,
   privateStateFileIdentityMatches,
@@ -17,17 +18,19 @@ test("Windows never receives POSIX-only open flags exposed by an alternate runti
   }
 });
 
-test("Windows file identity ignores synthetic mode but retains dev, inode and link-count fences", () => {
+test("Windows opened-file identity ignores synthetic device/mode but retains inode and link-count fences", () => {
   const expected = { dev: 7, ino: 11, mode: 0o600, nlink: 2 };
   assert.equal(
-    privateStateFileIdentityMatches({ ...expected, mode: 0o666 }, expected, "win32"),
+    privateStateFileIdentityMatches({ ...expected, dev: 0, mode: 0o666 }, expected, "win32"),
     true,
   );
   assert.equal(
     privateStateFileIdentityMatches({ ...expected, mode: 0o666 }, expected, "linux"),
     false,
   );
-  for (const [field, value] of [["dev", 8], ["ino", 12], ["nlink", 1]]) {
+  assert.equal(sameOpenedFileIdentity({ dev: 0, ino: 11 }, expected, "win32"), true);
+  assert.equal(sameOpenedFileIdentity({ dev: 0, ino: 11 }, expected, "linux"), false);
+  for (const [field, value] of [["ino", 12], ["nlink", 1]]) {
     assert.equal(
       privateStateFileIdentityMatches({ ...expected, [field]: value }, expected, "win32"),
       false,

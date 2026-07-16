@@ -15,6 +15,7 @@ import { open, type FileHandle } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { sensitiveFileError } from "./security/sensitive-files.js";
 import { optionalPosixOpenFlag } from "./fs-open-flags.js";
+import { sameOpenedFileIdentity } from "./fs-identity.js";
 
 export class BinaryFileError extends Error {
   constructor(path: string) {
@@ -151,10 +152,8 @@ export function verifyOpenedRegularFileSync(
   const currentTarget = statSync(canonical);
   if (
     currentLink.isSymbolicLink()
-    || currentLink.dev !== opened.dev
-    || currentLink.ino !== opened.ino
-    || currentTarget.dev !== opened.dev
-    || currentTarget.ino !== opened.ino
+    || !sameOpenedFileIdentity(currentLink, opened)
+    || !sameOpenedFileIdentity(currentTarget, opened)
   ) {
     throw new Error(`refusing to access ${path}: path changed while opening it`);
   }

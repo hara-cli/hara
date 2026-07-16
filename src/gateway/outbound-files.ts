@@ -17,6 +17,7 @@ import { open } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { openVerifiedRegularFileNoFollow, verifyOpenedRegularFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
+import { sameOpenedFileIdentity } from "../fs-identity.js";
 
 export const OUTBOUND_FILE_MAX_BYTES = 20 * 1024 * 1024;
 export const OUTBOUND_BATCH_MAX_BYTES = 20 * 1024 * 1024;
@@ -127,9 +128,8 @@ async function appendOutbox(outbox: string, snapshot: string, signal?: AbortSign
       !info.isFile()
       || info.nlink > 1
       || current.isSymbolicLink()
-      || current.dev !== info.dev
-      || current.ino !== info.ino
-      || (before && (before.dev !== info.dev || before.ino !== info.ino))
+      || !sameOpenedFileIdentity(current, info)
+      || (before && !sameOpenedFileIdentity(before, info))
       || !ownedByProcess(path)
     ) throw new Error(`unsafe gateway outbox: ${outbox}`);
     await handle.chmod(0o600);
@@ -269,7 +269,7 @@ async function readOutbox(outbox: string): Promise<string[]> {
     await verified?.handle.close().catch(() => {});
     try {
       const current = lstatSync(resolve(outbox));
-      if (verified && !current.isSymbolicLink() && current.dev === verified.info.dev && current.ino === verified.info.ino) {
+      if (verified && !current.isSymbolicLink() && sameOpenedFileIdentity(current, verified.info)) {
         unlinkSync(resolve(outbox));
       }
     } catch { /* missing or replaced outbox is left alone */ }
@@ -388,8 +388,7 @@ export function cleanupOutboundSnapshot(path: string): void {
       && entry.isFile()
       && !entry.isSymbolicLink()
       && entry.nlink === 1
-      && entry.dev === expected.dev
-      && entry.ino === expected.ino
+      && sameOpenedFileIdentity(entry, expected)
       && ownedByProcess(candidate)
     ) unlinkSync(candidate);
     if (readdirSync(dir).length === 0) rmdirSync(dir);

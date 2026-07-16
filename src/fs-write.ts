@@ -6,6 +6,7 @@ import { constants, linkSync, lstatSync, readlinkSync, realpathSync, renameSync,
 import { lstat, mkdir, open, realpath, rmdir, stat, unlink } from "node:fs/promises";
 import { NonRegularFileError, readRegularFileSnapshotNoFollow, type RegularFileSnapshot } from "./fs-read.js";
 import { optionalPosixOpenFlag } from "./fs-open-flags.js";
+import { sameOpenedFileIdentity } from "./fs-identity.js";
 import {
   canonicalizeProspectivePath,
   lexicalSensitiveFileReason,
@@ -531,8 +532,7 @@ export async function atomicWriteText(path: string, content: string, options: At
         const current = lstatSync(temp);
         if (
           current.isFile()
-          && current.dev === writtenIdentity.dev
-          && current.ino === writtenIdentity.ino
+          && sameOpenedFileIdentity(current, writtenIdentity)
         ) unlinkSync(temp);
       } catch {
         // A changed parent makes path-based cleanup unsafe. Retaining an unpredictable private staging file

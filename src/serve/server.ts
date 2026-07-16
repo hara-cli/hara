@@ -61,6 +61,7 @@ import { SessionHub, realStore, type SessionStore, type ServeSession } from "./s
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
+import { sameOpenedFileIdentity } from "../fs-identity.js";
 import {
   consumePendingTaskSteering,
   createTaskExecution,
@@ -234,11 +235,7 @@ const writeDiscovery = async (dir: string, path: string, record: DiscoveryRecord
     const temp = join(dir, `.serve.json.${process.pid}.${record.instanceId}.tmp`);
     let fd: number | undefined;
     try {
-      fd = openSync(
-        temp,
-        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | optionalPosixOpenFlag("O_NOFOLLOW"),
-        0o600,
-      );
+      fd = openSync(temp, "wx", 0o600);
       fchmodSync(fd, 0o600);
       writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`, "utf8");
       fsyncSync(fd);
@@ -276,7 +273,7 @@ const removeOwnedDiscovery = async (dir: string, path: string, record: Discovery
       // Re-check the directory entry against the already-open, verified inode. Cooperating writers are
       // serialized by the lock; this check also refuses an uncooperative symlink/replacement race.
       const linked = lstatSync(path);
-      if (!linked.isFile() || linked.isSymbolicLink() || linked.dev !== opened.dev || linked.ino !== opened.ino) return;
+      if (!linked.isFile() || linked.isSymbolicLink() || !sameOpenedFileIdentity(linked, opened)) return;
       unlinkSync(path);
       syncDirectory(dir);
     } catch (error: any) {
