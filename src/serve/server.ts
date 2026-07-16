@@ -60,6 +60,7 @@ import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 import { readModelContextFileSync } from "../fs-read.js";
+import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import {
   consumePendingTaskSteering,
   createTaskExecution,
@@ -144,7 +145,10 @@ const ensurePrivateDiscoveryDir = (dir: string): void => {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   let fd: number | undefined;
   try {
-    fd = openSync(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    fd = openSync(
+      dir,
+      fsConstants.O_RDONLY | optionalPosixOpenFlag("O_DIRECTORY") | optionalPosixOpenFlag("O_NOFOLLOW"),
+    );
     const st = fstatSync(fd);
     if (!st.isDirectory()) throw new Error(`${dir} must be a private directory, not a symlink`);
     // mkdir's mode does not affect a legacy directory. Operate through the verified descriptor so a path
@@ -230,7 +234,11 @@ const writeDiscovery = async (dir: string, path: string, record: DiscoveryRecord
     const temp = join(dir, `.serve.json.${process.pid}.${record.instanceId}.tmp`);
     let fd: number | undefined;
     try {
-      fd = openSync(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW, 0o600);
+      fd = openSync(
+        temp,
+        fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | optionalPosixOpenFlag("O_NOFOLLOW"),
+        0o600,
+      );
       fchmodSync(fd, 0o600);
       writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`, "utf8");
       fsyncSync(fd);
@@ -254,7 +262,7 @@ const removeOwnedDiscovery = async (dir: string, path: string, record: Discovery
   await withDiscoveryLock(dir, record.instanceId, () => {
     let fd: number | undefined;
     try {
-      fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      fd = openSync(path, fsConstants.O_RDONLY | optionalPosixOpenFlag("O_NOFOLLOW"));
       const opened = fstatSync(fd);
       if (!opened.isFile() || opened.size > 64 * 1024) return;
       const current = JSON.parse(readFileSync(fd, "utf8")) as Partial<DiscoveryRecord>;

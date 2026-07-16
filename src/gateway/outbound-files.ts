@@ -16,6 +16,7 @@ import {
 import { open } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { openVerifiedRegularFileNoFollow, verifyOpenedRegularFileSync } from "../fs-read.js";
+import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 
 export const OUTBOUND_FILE_MAX_BYTES = 20 * 1024 * 1024;
 export const OUTBOUND_BATCH_MAX_BYTES = 20 * 1024 * 1024;
@@ -114,10 +115,9 @@ async function appendOutbox(outbox: string, snapshot: string, signal?: AbortSign
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   const handle = await open(
     path,
-    constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | noFollow,
+    constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | optionalPosixOpenFlag("O_NOFOLLOW"),
     0o600,
   );
   try {

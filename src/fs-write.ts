@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { constants, linkSync, lstatSync, readlinkSync, realpathSync, renameSync, symlinkSync, unlinkSync } from "node:fs";
 import { lstat, mkdir, open, realpath, rmdir, stat, unlink } from "node:fs/promises";
 import { NonRegularFileError, readRegularFileSnapshotNoFollow, type RegularFileSnapshot } from "./fs-read.js";
+import { optionalPosixOpenFlag } from "./fs-open-flags.js";
 import {
   canonicalizeProspectivePath,
   lexicalSensitiveFileReason,
@@ -336,7 +337,7 @@ async function syncDirectory(path: string): Promise<void> {
   try {
     // The directory name can be exchanged after rename. O_NONBLOCK plus fstat on this exact descriptor
     // keeps best-effort durability from hanging forever on a replacement FIFO/device.
-    const handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    const handle = await open(path, constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK"));
     try {
       if (!(await handle.stat()).isDirectory()) return;
       await handle.sync();

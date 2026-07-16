@@ -30,6 +30,7 @@ import {
 } from "../security/private-state.js";
 import { sleepSync } from "../sync-sleep.js";
 import { compareProcessIdentity, defaultProcessIdentity } from "../process-identity.js";
+import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 
 const PLATFORM = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const LOCK_BYTES = 4 * 1024;
@@ -226,13 +227,14 @@ function leaseStagingPath(path: string, record: LeaseRecord): string {
 }
 
 function readLease(path: string, platform: string): LeaseSnapshot | null {
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  const nonBlock = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
   let fd: number;
   try {
     // O_NONBLOCK is inert for regular files and prevents a hostile FIFO/device at the lock path from hanging
     // gateway startup before fstat can reject it.
-    fd = openSync(path, constants.O_RDONLY | noFollow | nonBlock);
+    fd = openSync(
+      path,
+      constants.O_RDONLY | optionalPosixOpenFlag("O_NOFOLLOW") | optionalPosixOpenFlag("O_NONBLOCK"),
+    );
   } catch (error) {
     if (errorCode(error) === "ENOENT") return null;
     throw error;
@@ -352,15 +354,21 @@ function unlinkLease(path: string, expected: LeaseSnapshot): void {
 }
 
 function writeLease(path: string, record: LeaseRecord): LeaseSnapshot {
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  const nonBlock = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
   const stagingPath = leaseStagingPath(path, record);
   let fd: number | undefined;
   let published = false;
   try {
     // Never expose an empty/partial owner record at the canonical path. The private staging inode is fully
     // written + fsynced first; link(2) then publishes it atomically and refuses to replace an existing owner.
-    fd = openSync(stagingPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow | nonBlock, 0o600);
+    fd = openSync(
+      stagingPath,
+      constants.O_WRONLY
+        | constants.O_CREAT
+        | constants.O_EXCL
+        | optionalPosixOpenFlag("O_NOFOLLOW")
+        | optionalPosixOpenFlag("O_NONBLOCK"),
+      0o600,
+    );
     writeFileSync(fd, JSON.stringify(record), "utf8");
     fsyncSync(fd);
     closeSync(fd);

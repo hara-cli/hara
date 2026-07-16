@@ -14,6 +14,7 @@ import {
 import { open, type FileHandle } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { sensitiveFileError } from "./security/sensitive-files.js";
+import { optionalPosixOpenFlag } from "./fs-open-flags.js";
 
 export class BinaryFileError extends Error {
   constructor(path: string) {
@@ -171,8 +172,10 @@ export async function openVerifiedRegularFileNoFollow(
   }
   const before = lstatSync(path);
   if (before.isSymbolicLink()) throw new NonRegularFileError(path);
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  const handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  const handle = await open(
+    path,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
   try {
     const info = await handle.stat();
     const canonicalPath = verifyOpenedRegularFileSync(path, info, options);
@@ -246,8 +249,10 @@ export function readVerifiedRegularFileSnapshotSync(
   }
   const before = lstatSync(path);
   if (before.isSymbolicLink()) throw new NonRegularFileError(path);
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
   try {
     const info = fstatSync(fd);
     verifyOpenedRegularFileSync(path, info, {
@@ -299,10 +304,12 @@ function withVerifiedContextFdSync<T>(path: string, read: (fd: number, size: num
 
   // O_NOFOLLOW is not exposed on every platform. The before/after lstat checks retain fail-closed symlink
   // behaviour there; on POSIX O_NOFOLLOW makes the critical open itself atomic.
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   const before = lstatSync(path);
   if (before.isSymbolicLink()) throw new NonRegularFileError(path);
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
   try {
     const info = fstatSync(fd);
     verifyOpenedRegularFileSync(path, info, {
@@ -440,13 +447,20 @@ async function readRegularFileSnapshotWithFlags(path: string, maxBytes: number, 
 }
 
 export async function readRegularFileSnapshot(path: string, maxBytes = MAX_EDIT_READ_BYTES): Promise<RegularFileSnapshot> {
-  return readRegularFileSnapshotWithFlags(path, maxBytes, constants.O_RDONLY | constants.O_NONBLOCK);
+  return readRegularFileSnapshotWithFlags(
+    path,
+    maxBytes,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK"),
+  );
 }
 
 /** Quarantine/transaction reader: reject a symlink at open(2), then validate/read that same fd. */
 export async function readRegularFileSnapshotNoFollow(path: string, maxBytes = MAX_EDIT_READ_BYTES): Promise<RegularFileSnapshot> {
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  return readRegularFileSnapshotWithFlags(path, maxBytes, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  return readRegularFileSnapshotWithFlags(
+    path,
+    maxBytes,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
 }
 
 export async function readRegularFileText(path: string, maxBytes = MAX_EDIT_READ_BYTES): Promise<string> {
@@ -458,7 +472,7 @@ export function readTextPrefixSync(path: string, maxChars: number): { text: stri
   const requested = Number.isFinite(maxChars) ? Math.floor(maxChars) : MAX_PREFIX_CHARS;
   const chars = Math.min(MAX_PREFIX_CHARS, Math.max(0, requested));
   // O_NONBLOCK makes opening a FIFO return immediately; fstat on this exact fd then rejects it before read.
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  const fd = openSync(path, constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK"));
   try {
     const info = fstatSync(fd);
     if (!info.isFile()) throw new NonRegularFileError(path);
@@ -563,7 +577,8 @@ export async function streamFileSlice(
   const verified = options.protectSensitive
     ? await openVerifiedRegularFileNoFollow(path, { action: "read", rejectHardLinks: true, protectSensitive: true })
     : null;
-  const handle = verified?.handle ?? await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  const handle = verified?.handle
+    ?? await open(path, constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK"));
   let stream: ReturnType<typeof handle.createReadStream> | undefined;
   try {
     const info = verified?.info ?? await handle.stat();

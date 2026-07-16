@@ -30,6 +30,7 @@ import {
   verifyOpenedRegularFileSync,
   type RegularFileSnapshot,
 } from "../fs-read.js";
+import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 
 const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin"]);
 const tightenedHomes = new Set<string>();
@@ -118,9 +119,13 @@ function verifyAndTightenPrivateDirectory(path: string): PrivateStateDirectoryId
   if (process.platform === "win32") {
     // no POSIX ownership mode to repair
   } else {
-    const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-    const directoryOnly = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow | directoryOnly);
+    const fd = openSync(
+      path,
+      constants.O_RDONLY
+        | optionalPosixOpenFlag("O_NONBLOCK")
+        | optionalPosixOpenFlag("O_NOFOLLOW")
+        | optionalPosixOpenFlag("O_DIRECTORY"),
+    );
     try {
       const opened = fstatSync(fd);
       if (!opened.isDirectory() || opened.dev !== inspected.dev || opened.ino !== inspected.ino) {
@@ -233,8 +238,10 @@ export function readPrivateStateFileSnapshotSync(
     throw error;
   }
   if (before.isSymbolicLink()) throw new Error(`refusing private Hara state file: '${path}' is a symbolic link`);
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
   try {
     let info = fstatSync(fd);
     verifyOpenedRegularFileSync(path, info, {
@@ -317,9 +324,13 @@ function restorePrivateClaim(
 
 function syncPrivateDirectory(path: string): void {
   try {
-    const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-    const directoryOnly = typeof constants.O_DIRECTORY === "number" ? constants.O_DIRECTORY : 0;
-    const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | noFollow | directoryOnly);
+    const fd = openSync(
+      path,
+      constants.O_RDONLY
+        | optionalPosixOpenFlag("O_NONBLOCK")
+        | optionalPosixOpenFlag("O_NOFOLLOW")
+        | optionalPosixOpenFlag("O_DIRECTORY"),
+    );
     try {
       if (fstatSync(fd).isDirectory()) fsyncSync(fd);
     } finally {
@@ -344,11 +355,14 @@ export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text
   verifyPrivateDirectory(directory);
 
   const temp = join(directory.path, `.hara-private-${process.pid}-${randomUUID()}.tmp`);
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
   let fd: number | undefined;
   let staged: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink"> | undefined;
   try {
-    fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow, 0o600);
+    fd = openSync(
+      temp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | optionalPosixOpenFlag("O_NOFOLLOW"),
+      0o600,
+    );
     writeFileSync(fd, text, "utf8");
     try {
       fchmodSync(fd, 0o600);

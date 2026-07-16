@@ -45,11 +45,23 @@ jobs:
         with:
           node-version: "22.12.0"
           cache: npm
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: ".bun-version"
+          # Use the old-CPU-compatible runtime itself; an explicit same-target compile would download it again.
+          bun-download-url: "https://github.com/oven-sh/bun/releases/download/bun-v1.3.9/bun-windows-x64-baseline.zip"
       - run: npm ci
       - run: npm run build
       # Keep this lane focused on the Windows contracts that differ from POSIX: portable/Git-Bash HOME
       # selection and deterministic shell discovery outside PATH. The complete suite remains in build-test.
-      - run: node --test --test-timeout=120000 test/runtime.test.mjs test/windows-shell.test.mjs
+      - run: node --test --test-timeout=120000 test/runtime.test.mjs test/windows-shell.test.mjs test/private-state-portable.test.mjs
+      - name: Compile and execute-smoke the native baseline standalone
+        shell: bash
+        run: |
+          bun scripts/build-binary.ts dist/bin/hara
+          expected="$(node -p 'require("./package.json").version')"
+          test -f dist/bin/hara.exe
+          node scripts/standalone-boundary-smoke.mjs dist/bin/hara.exe "$expected"
 
   docker-runtime:
     runs-on: ubuntu-latest

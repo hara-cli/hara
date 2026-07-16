@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { verifyOpenedRegularFileSync } from "../fs-read.js";
+import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { sensitiveFileReason } from "../security/sensitive-files.js";
 import { redactToolSubprocessOutput, toolSubprocessEnv } from "../security/subprocess-env.js";
 
@@ -153,8 +154,10 @@ function verifiedWorktreeBlobOid(
   maxBytes: number,
 ): string {
   const absolute = join(cwd, path);
-  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-  const fd = openSync(absolute, constants.O_RDONLY | constants.O_NONBLOCK | noFollow);
+  const fd = openSync(
+    absolute,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
   try {
     const before = fstatSync(fd);
     verifyOpenedRegularFileSync(absolute, before, {

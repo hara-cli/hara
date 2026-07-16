@@ -303,7 +303,10 @@ function execute() {
     try {
       const before = fs.lstatSync(absolute, { bigint: true });
       if (!before.isFile() || before.nlink !== 1n || !sameIdentity(before, candidate)) return null;
-      fd = fs.openSync(absolute, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
+      const posixFlags = process.platform === "win32"
+        ? 0
+        : (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0);
+      fd = fs.openSync(absolute, fs.constants.O_RDONLY | posixFlags);
       const info = fs.fstatSync(fd, { bigint: true });
       if (!info.isFile() || info.nlink !== 1n || !sameIdentity(info, candidate) || info.size > BigInt(cfg.maxFileBytes)) return null;
       let total = 0;
