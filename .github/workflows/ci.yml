@@ -51,17 +51,43 @@ jobs:
           # Use the old-CPU-compatible runtime itself; an explicit same-target compile would download it again.
           bun-download-url: "https://github.com/oven-sh/bun/releases/download/bun-v1.3.9/bun-windows-x64-baseline.zip"
       - run: npm ci
-      - run: npm run build
+      - name: Build TypeScript
+        id: windows-build
+        run: npm run build
       # Keep this lane focused on the Windows contracts that differ from POSIX: portable/Git-Bash HOME
       # selection and deterministic shell discovery outside PATH. The complete suite remains in build-test.
-      - run: node --test --test-timeout=120000 test/runtime.test.mjs test/windows-shell.test.mjs test/private-state-portable.test.mjs
+      - name: Run Windows contract tests
+        shell: pwsh
+        run: |
+          node --test --test-timeout=120000 test/runtime.test.mjs test/windows-shell.test.mjs test/private-state-portable.test.mjs 2>&1 |
+            Tee-Object -Variable captured
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $tail = (($captured | Select-Object -Last 80) -join "`n")
+            $tail = $tail.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error file=.github/workflows/ci.yml,title=Windows contract test output::$tail"
+            exit $code
+          }
       - name: Compile and execute-smoke the native baseline standalone
+        if: ${{ !cancelled() && steps.windows-build.outcome == 'success' }}
         shell: bash
         run: |
           bun scripts/build-binary.ts dist/bin/hara
           expected="$(node -p 'require("./package.json").version')"
           test -f dist/bin/hara.exe
-          node scripts/standalone-boundary-smoke.mjs dist/bin/hara.exe "$expected"
+          set +e
+          output="$(node scripts/standalone-boundary-smoke.mjs dist/bin/hara.exe "$expected" 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$output"
+          if [[ "$code" -ne 0 ]]; then
+            summary="$(printf '%s\n' "$output" | tail -n 80)"
+            summary="${summary//'%'/'%25'}"
+            summary="${summary//$'\r'/'%0D'}"
+            summary="${summary//$'\n'/'%0A'}"
+            echo "::error file=scripts/standalone-boundary-smoke.mjs,title=Windows native standalone smoke::$summary"
+            exit "$code"
+          fi
 
   docker-runtime:
     runs-on: ubuntu-latest
