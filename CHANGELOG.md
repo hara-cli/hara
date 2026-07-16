@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.124.1 — 2026-07-16 — Windows native private-state and file-identity portability
+
+- **Windows private state works in both Node and the native Bun executable.** Exclusive staging creation now
+  uses the portable `wx`/`CREATE_NEW` contract instead of passing Bun numeric flags that could surface a false
+  `ENOENT`. Config, credentials, gateway state, discovery records, and other private atomic writers retain
+  create-if-absent publication, hard-link fencing, fsync, and fail-closed alias checks.
+- **Descriptor-to-path identity checks follow the host's real guarantees.** Windows Node may report a
+  volume-derived `dev` from `fstat` but `dev=0` from `lstat` for the exact same NTFS file. Hara now correlates
+  an already-open descriptor with its already-bounded path using the stable file id and link count, while
+  POSIX still requires device, inode, and owner-only mode. Arbitrary path-to-path protected-file detection
+  continues to require device + inode, so the portability fix does not weaken hard-link protection.
+- **The release gate now exercises the reported failure on a real Windows runtime.** CI installs the pinned
+  Bun 1.3.9 x64-baseline runtime, runs portable file-state contracts, compiles `hara.exe`, and executes the
+  hostile-cwd standalone smoke including an isolated `hara doctor`. Bounded failure annotations keep future
+  Windows-only regressions diagnosable without exposing credentials. Production dependency audits retry a
+  transient registry failure only within a fixed bound and still require a real successful audit result.
+- Windows users on 0.124.0 should upgrade with `npm i -g @nanhara/hara@0.124.1`; Desktop releases that bundle
+  a sidecar should pin this patch or newer.
+
 ## 0.124.0 — 2026-07-16 — task-safe interaction, bounded context, and private-state hardening
 
 - **Idle conversation no longer hijacks an unfinished task.** Ordinary input starts a new execution while
