@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +53,8 @@ process.stdout.write(JSON.stringify(selfInvocation(["--resume", "bun-smoke"])));
 
 test("runSelfAttached re-enters the Node CLI asynchronously with inherited stdin/stdout", () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-self-invoke-"));
+  const childCwd = join(dir, "saved-project");
+  mkdirSync(childCwd);
   const fixture = join(dir, "self-entry.mjs");
   const runnerUrl = pathToFileURL(join(process.cwd(), "dist", "cron", "runner.js")).href;
   writeFileSync(fixture, `
@@ -60,9 +62,9 @@ import { runSelfAttached } from ${JSON.stringify(runnerUrl)};
 if (process.argv[2] === "--attached-child") {
   let input = "";
   for await (const chunk of process.stdin) input += chunk;
-  process.stdout.write("child:" + process.argv[3] + ":" + input + "\\n");
+  process.stdout.write("child:" + process.argv[3] + ":" + process.cwd() + ":" + input + "\\n");
 } else {
-  const result = await runSelfAttached(["--attached-child", "resume-smoke"]);
+  const result = await runSelfAttached(["--attached-child", "resume-smoke"], ${JSON.stringify(childCwd)});
   process.stdout.write("parent:" + String(result.code) + ":" + String(result.signal) + "\\n");
 }
 `);
@@ -74,7 +76,10 @@ if (process.argv[2] === "--attached-child") {
       timeout: 5_000,
     });
     assert.equal(run.status, 0, run.stderr);
-    assert.match(run.stdout, /child:resume-smoke:typed-input/, "the resumed child can read inherited input");
+    assert.ok(
+      run.stdout.includes(`child:resume-smoke:${realpathSync.native(childCwd)}:typed-input`),
+      "the resumed child uses the saved project cwd and can read inherited input",
+    );
     assert.match(run.stdout, /parent:0:null/, "the launcher remains responsive until the child exits");
   } finally {
     rmSync(dir, { recursive: true, force: true });

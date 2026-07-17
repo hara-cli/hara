@@ -7,6 +7,11 @@ All notable changes to `@nanhara/hara`.
 
 ## Unreleased
 
+- **Saved sessions now resume in the project they belong to.** `hara resume <id>` validates the persisted
+  project root and relaunches there even when invoked from another directory; session lists show each project
+  path. Inside Hara, `/resume <id>` switches saved sessions while `/continue` exclusively resumes the active
+  task. Missing project roots, corrupt records, concurrent writers, and raw/headless cross-project resumes
+  remain fail-closed.
 - **A total run deadline is now a resumable safety pause.** The 80% warning tells the agent to finish or
   checkpoint its current step, the hard-stop notice explains that the task/checklist remains resumable with
   `/continue`, and deadline outcomes persist as `paused` instead of looking irrecoverably blocked. Loop and

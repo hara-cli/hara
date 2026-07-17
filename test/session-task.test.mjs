@@ -133,7 +133,7 @@ test("idle continuation detection is explicit instead of hijacking every new mes
   for (const text of ["继续", "继续，补测试", "go on", "resume: verify it", "/continue deploy"]) {
     assert.equal(requestsTaskContinuation(text), true, text);
   }
-  for (const text of ["review another project", "修复桌面端", "继续教育模块要改名", "the resume parser is broken"]) {
+  for (const text of ["review another project", "修复桌面端", "继续教育模块要改名", "the resume parser is broken", "/resume deadbeef"]) {
     assert.equal(requestsTaskContinuation(text), false, text);
   }
 });

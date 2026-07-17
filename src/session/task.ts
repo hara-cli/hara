@@ -171,7 +171,7 @@ export function hasPendingTaskSteering(task: TaskExecution | undefined): boolean
 export function requestsTaskContinuation(text: string): boolean {
   const value = text.trim().toLocaleLowerCase();
   if (!value) return false;
-  return /^(?:\/(?:continue|resume)(?:\s|$)|(?:continue|resume|go\s+on)(?:[\s,.:;!?，。：；！？]|$)|(?:继续|接着|接着做|继续处理)(?:[\s,.:;!?，。：；！？]|$))/.test(value);
+  return /^(?:\/continue(?:\s|$)|(?:continue|resume|go\s+on)(?:[\s,.:;!?，。：；！？]|$)|(?:继续|接着|接着做|继续处理)(?:[\s,.:;!?，。：；！？]|$))/.test(value);
 }
 
 export function finishTaskExecution(

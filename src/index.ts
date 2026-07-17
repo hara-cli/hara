@@ -183,6 +183,7 @@ import {
   type TaskExecution,
   type TaskInteraction,
 } from "./session/task.js";
+import { displaySessionCwd, resolveSessionResumeTarget } from "./session/resume.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
 import { loadGlobalRoles, loadRoles, roleToolFilter, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
 import { buildAgentsIndex, canonicalProjectPath, resolveAgent, loadProjects, addProject, removeProject, type AgentIndexEntry } from "./org/projects.js";
@@ -1288,34 +1289,38 @@ program
     }
     for (const m of metas) {
       out(`${c.bold(shortId(m.id))}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${c.dim(m.provider + ":" + m.model)}  ${m.title || c.dim("(untitled)")}\n`);
+      out(`          ${c.dim(displaySessionCwd(m.cwd))}\n`);
     }
     out(c.dim("\nResume:  hara resume <id>\n"));
   });
 
 program
   .command("resume [id]")
-  .description("resume a session — no id resumes the most recent here (list ids with `hara sessions`)")
+  .description("resume a session in its saved project — no id resumes the most recent here")
   .action(async (id?: string) => {
-    let full: string | undefined;
-    if (id) {
-      full = resolveSessionId(id) ?? undefined;
-      if (!full) {
-        out(c.red(`No session matching '${id}'.`) + c.dim(" Run `hara sessions` to list.\n"));
-        process.exit(1);
+    const target = resolveSessionResumeTarget(id, process.cwd());
+    if (!target.ok) {
+      if (target.reason === "not-found") {
+        out(c.red(`No session matching '${id ?? ""}'.`) + c.dim(" Run `hara sessions` to list.\n"));
+        process.exitCode = 1;
+      } else if (target.reason === "no-current") {
+        out(c.dim("No sessions for this directory yet — `hara sessions` lists all projects.\n"));
+      } else if (target.reason === "unreadable") {
+        out(c.red(`Session ${shortId(target.id ?? id ?? "")} exists but is unreadable or corrupt; refusing to resume it.\n`));
+        process.exitCode = 2;
+      } else {
+        out(c.red(`Session ${shortId(target.id ?? id ?? "")} belongs to ${target.cwd}, but that project directory is unavailable.\n`));
+        process.exitCode = 2;
       }
-    } else {
-      const latest = latestForCwd(process.cwd());
-      if (!latest) {
-        out(c.dim("No sessions for this directory yet — `hara sessions` lists all.\n"));
-        process.exit(0);
-      }
-      full = latest.meta.id;
+      return;
     }
-    out(c.dim(`↩ resuming ${shortId(full)}…\n`));
+    out(c.dim(`↩ resuming ${shortId(target.id)} in ${displaySessionCwd(target.cwd)}…\n`));
     // Reuse the existing --resume path exactly (one engine), inheriting this terminal. selfArgv() inside
     // runSelfAttached distinguishes node+entry from a Bun-compiled binary (whose argv[1] is a user arg).
+    // Launch from the persisted project root: the low-level --resume engine intentionally refuses a
+    // foreign cwd so a transcript can never be reinterpreted against the wrong repository.
     try {
-      const result = await runSelfAttached(["--resume", full]);
+      const result = await runSelfAttached(["--resume", target.id], target.cwd);
       if (result.signal) {
         out(c.yellow(`Resumed Hara process stopped by ${result.signal}.\n`));
         process.exitCode = 1;
@@ -3480,10 +3485,13 @@ program.action(async (opts) => {
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
   const persistSession = (): void => saveSession(meta, history, task);
   let requestedWorkspaceSwitch: string | null = null;
-  const relaunchRequestedWorkspace = async (): Promise<void> => {
-    if (!requestedWorkspaceSwitch) return;
-    const target = requestedWorkspaceSwitch;
+  let requestedSessionSwitch: { id: string; cwd: string } | null = null;
+  const relaunchRequestedTarget = async (): Promise<void> => {
+    if (!requestedWorkspaceSwitch && !requestedSessionSwitch) return;
+    const sessionSwitch = requestedSessionSwitch;
+    const target = sessionSwitch?.cwd ?? requestedWorkspaceSwitch!;
     requestedWorkspaceSwitch = null;
+    requestedSessionSwitch = null;
     // The foreground child starts a new session. Do not keep the old session artificially locked for the
     // entire lifetime of the new workspace merely because this small parent process is waiting on it.
     releaseSessionLock(sessionId);
@@ -3494,7 +3502,10 @@ program.action(async (opts) => {
     if (opts.yes) args.push("--yes");
     else if (opts.approval) args.push("--approval", String(opts.approval));
     if (opts.sandbox) args.push("--sandbox", String(opts.sandbox));
-    out(c.dim(`Switching workspace → ${target}\n`));
+    if (sessionSwitch) args.push("--resume", sessionSwitch.id);
+    out(c.dim(sessionSwitch
+      ? `Resuming session ${shortId(sessionSwitch.id)} → ${displaySessionCwd(target)}\n`
+      : `Switching workspace → ${target}\n`));
     try {
       const result = await runSelfAttached(args, target);
       if (result.signal) {
@@ -3564,11 +3575,32 @@ program.action(async (opts) => {
     },
     {
       name: "continue",
-      aliases: ["resume"],
       desc: "resume the unfinished task: /continue [instruction]",
       // Interactive loops translate this command into an ordinary model turn before slash dispatch. This
       // fallback only protects future callers that invoke the command table directly.
       run: () => void out(c.dim("(type /continue [instruction] in an interactive session)\n")),
+    },
+    {
+      name: "resume",
+      desc: "switch to a saved session: /resume <id>",
+      run: (a) => {
+        if (!a.trim()) {
+          const ms = listSessions().slice(0, 12);
+          if (!ms.length) return void out(c.dim("No sessions yet.\n"));
+          for (const m of ms) {
+            out(`  ${shortId(m.id)}  ${c.dim(displaySessionCwd(m.cwd))}  ${m.title || "(untitled)"}\n`);
+          }
+          return void out(c.dim("Use /resume <id> to switch sessions.\n"));
+        }
+        const target = resolveSessionResumeTarget(a.trim(), cwd);
+        if (!target.ok) {
+          if (target.reason === "cwd-unavailable") return void out(c.red(`(saved project unavailable: ${target.cwd})\n`));
+          return void out(c.red(`(cannot resume '${a.trim()}': ${target.reason})\n`));
+        }
+        if (target.id === sessionId) return void out(c.dim("(this session is already open)\n"));
+        requestedSessionSwitch = { id: target.id, cwd: target.cwd };
+        return "exit";
+      },
     },
     {
       name: "init",
@@ -3716,7 +3748,7 @@ program.action(async (opts) => {
       run: () => {
         const ms = listSessions();
         if (!ms.length) return void out(c.dim("No sessions yet.\n"));
-        for (const m of ms) out(`  ${shortId(m.id)}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${m.title || "(untitled)"}\n`);
+        for (const m of ms) out(`  ${shortId(m.id)}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${c.dim(displaySessionCwd(m.cwd))}  ${m.title || "(untitled)"}\n`);
       },
     },
     {
@@ -4065,7 +4097,7 @@ program.action(async (opts) => {
       onSubmit: async (line, h, images, interaction) => {
         // `/continue` is a task interaction, not a control-only command: turn it into a model message before
         // slash dispatch, preserving the submitted turn id while explicitly targeting the unfinished task.
-        const continueCommand = /^\/(?:continue|resume)(?:\s+([\s\S]+))?$/i.exec(line.trim());
+        const continueCommand = /^\/continue(?:\s+([\s\S]+))?$/i.exec(line.trim());
         if (continueCommand) {
           if (!task || task.status === "completed") return void h.sink.notice("(there is no unfinished task to continue)");
           line = continueCommand[1]?.trim() || "continue";
@@ -4086,6 +4118,23 @@ program.action(async (opts) => {
             if (result.cwd === realpathSync.native(cwd)) return void h.sink.notice(`(already in ${result.cwd})`);
             requestedWorkspaceSwitch = result.cwd;
             h.sink.notice(`(switching workspace → ${result.cwd})`);
+            return void h.exit();
+          }
+          if (nm === "resume") {
+            if (!arg) {
+              const ms = listSessions().slice(0, 12);
+              return void h.sink.notice(ms.length
+                ? "Saved sessions — /resume <id>:\n" + ms.map((m) => `  ${shortId(m.id)}  ${displaySessionCwd(m.cwd)}  ${m.title || "(untitled)"}`).join("\n")
+                : "No sessions yet.");
+            }
+            const target = resolveSessionResumeTarget(arg, cwd);
+            if (!target.ok) {
+              if (target.reason === "cwd-unavailable") return void h.sink.notice(`(saved project unavailable: ${target.cwd})`);
+              return void h.sink.notice(`(cannot resume '${arg}': ${target.reason})`);
+            }
+            if (target.id === sessionId) return void h.sink.notice("(this session is already open)");
+            requestedSessionSwitch = { id: target.id, cwd: target.cwd };
+            h.sink.notice(`(resuming ${shortId(target.id)} → ${displaySessionCwd(target.cwd)})`);
             return void h.exit();
           }
           if (nm === "exit" || nm === "quit") {
@@ -4275,7 +4324,7 @@ program.action(async (opts) => {
           if (nm === "sessions") {
             const ms = listSessions();
             return void h.sink.notice(
-              ms.length ? ms.slice(0, 12).map((m) => `  ${shortId(m.id)}  ${m.updatedAt.slice(0, 16).replace("T", " ")}  ${m.title || "(untitled)"}`).join("\n") : "No sessions yet.",
+              ms.length ? ms.slice(0, 12).map((m) => `  ${shortId(m.id)}  ${m.updatedAt.slice(0, 16).replace("T", " ")}  ${displaySessionCwd(m.cwd)}  ${m.title || "(untitled)"}`).join("\n") : "No sessions yet.",
             );
           }
           if (nm === "usage") return void h.sink.notice(`tokens — ↑${stats.input} ↓${stats.output}`);
@@ -4630,7 +4679,7 @@ program.action(async (opts) => {
     if (loadSession(meta.id))
       out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
     await closeMcp();
-    await relaunchRequestedWorkspace();
+    await relaunchRequestedTarget();
     process.exit(process.exitCode ?? 0); // TUI done — exit cleanly (ink can leave stdin referenced)
   }
 
@@ -4656,7 +4705,7 @@ program.action(async (opts) => {
     bar.renderBottom(); // bottom border + modes/usage
     if (!line) continue;
     let forcedContinuation: Extract<TaskInteraction, { kind: "steer" }> | undefined;
-    const continueCommand = /^\/(?:continue|resume)(?:\s+([\s\S]+))?$/i.exec(line);
+    const continueCommand = /^\/continue(?:\s+([\s\S]+))?$/i.exec(line);
     if (continueCommand) {
       if (!task || task.status === "completed") {
         out(c.dim("(there is no unfinished task to continue)\n"));
@@ -4792,7 +4841,7 @@ program.action(async (opts) => {
     out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
   rl.close();
   await closeMcp();
-  await relaunchRequestedWorkspace();
+  await relaunchRequestedTarget();
 });
 
 program.parseAsync().catch((e) => {
