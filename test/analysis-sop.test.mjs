@@ -5,11 +5,18 @@
 //      manifest-first sweep; CC: ">~3 searches → dedicated Explore agent"),
 //   2. the agent tool's when-to-use / when-NOT guidance (CC's AgentTool prompt pattern),
 //   3. the built-in "explore" persona (CC's Explore agent: parallel, excerpts, conclusions-not-dumps).
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runAgent } from "../dist/agent/loop.js";
 import { getTool } from "../dist/tools/registry.js";
 import { EXPLORE_SYSTEM } from "../dist/tools/agent.js";
+
+const TEST_HOME = mkdtempSync(join(tmpdir(), "hara-analysis-sop-home-"));
+process.env.HOME = TEST_HOME;
+after(() => rmSync(TEST_HOME, { recursive: true, force: true }));
 
 test("system prompt teaches the analysis SOP: batch reads, manifest-first, fan out past ~3 searches", async () => {
   let system = "";
@@ -78,6 +85,8 @@ test("agent tool: when-to-use / when-NOT guidance (direct tools for narrow looku
   assert.ok(/more than ~3 searches/.test(t.description), "the 3-query threshold");
   assert.ok(/read_file/.test(t.description) && /grep/.test(t.description), "redirects narrow cases to direct tools");
   assert.ok(/SEVERAL agents in ONE response/.test(t.description), "parallel fan-out instruction");
+  assert.ok(/# Specialist roles/.test(t.description), "points the model at the role metadata catalog");
+  assert.ok(/minimal self-contained brief/.test(t.description), "prevents whole-conversation context dumping");
 });
 
 test("built-in explore persona: read-only, parallel, excerpts, conclusions — never dumps", () => {

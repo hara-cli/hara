@@ -31,6 +31,7 @@ function writeRole(dir, name, description, system, options = {}) {
     options.allowTools ? `allowTools: [${options.allowTools.join(", ")}]` : "",
     options.denyTools ? `denyTools: [${options.denyTools.join(", ")}]` : "",
     options.owns ? `owns: [${options.owns.join(", ")}]` : "",
+    options.disableModelInvocation ? "disable-model-invocation: true" : "",
   ].filter(Boolean).join("\n");
   writeFileSync(
     join(dir, `${name}.md`),
@@ -78,10 +79,12 @@ test("projects registry canonicalizes homes and indexes every material role over
     writeRole(join(home, ".hara", "roles"), "description-only", "global description", "identical persona");
     writeRole(join(home, ".hara", "roles"), "model-only", "same description", "identical persona", { model: "model-a" });
     writeRole(join(home, ".hara", "roles"), "tools-only", "same description", "identical persona", { allowTools: ["read_file"] });
+    writeRole(join(home, ".hara", "roles"), "invocation-only", "same description", "identical persona");
     writeRole(join(alpha, ".hara", "roles"), "shared", "alpha override", "alpha shared persona");
     writeRole(join(alpha, ".hara", "roles"), "description-only", "alpha description", "identical persona");
     writeRole(join(alpha, ".hara", "roles"), "model-only", "same description", "identical persona", { model: "model-b" });
     writeRole(join(alpha, ".hara", "roles"), "tools-only", "same description", "identical persona", { allowTools: ["read_file", "bash"] });
+    writeRole(join(alpha, ".hara", "roles"), "invocation-only", "same description", "identical persona", { disableModelInvocation: true });
     writeRole(join(alpha, ".hara", "roles"), "reviewer", "alpha reviewer", "alpha review persona");
     writeRole(join(beta, ".hara", "roles"), "reviewer", "beta reviewer", "beta review persona");
 
@@ -102,7 +105,7 @@ test("projects registry canonicalizes homes and indexes every material role over
     const index = buildAgentsIndex();
     assert.ok(index.some((entry) => entry.name === "global-only" && entry.home === "" && !entry.project));
     assert.equal(index.filter((entry) => entry.name === "global-only").length, 1, "fully inherited globals are not duplicated");
-    for (const name of ["description-only", "model-only", "tools-only"]) {
+    for (const name of ["description-only", "model-only", "tools-only", "invocation-only"]) {
       assert.equal(index.filter((entry) => entry.name === name).length, 2, `${name} project policy is a material override`);
       assert.ok(index.some((entry) => entry.name === name && entry.project === "alpha" && entry.home === alphaReal));
     }

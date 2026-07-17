@@ -1,13 +1,19 @@
-// Org roles — markdown agent definitions in <project>/.hara/roles/*.md.
-// Frontmatter: name, description, owns[], rejects[], model?, allowTools[], denyTools[], readOnly?. Body = persona/system.
+// Org roles — markdown agent definitions from Hara and Claude Code.
+// Frontmatter: name, description, owns[], rejects[], model?, allowTools[]/tools, denyTools[],
+// readOnly?, disable-model-invocation?. Body = persona/system, loaded only for the selected role.
 import { writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { findProjectRoot } from "../context/agents-md.js";
 import { pluginRoleDirs } from "../plugins/plugins.js";
 import { readModelContextFileSync } from "../fs-read.js";
+import { scanMemory } from "../memory/guard.js";
 
 const MAX_ROLE_BYTES = 512 * 1024;
+const ROLE_DIGEST_CAP = 16_000;
+const ROLE_DESCRIPTION_CAP = 180;
+
+export type RoleSource = "plugin" | "org" | "claude-global" | "global" | "claude-project" | "project";
 
 export interface Role {
   id: string;
@@ -19,6 +25,12 @@ export interface Role {
   denyTools?: string[];
   /** Enforce a genuinely read-only tool surface. Reviewer roles default to true unless explicitly disabled. */
   readOnly?: boolean;
+  /** Hidden from automatic routing/catalogs, but still addressable explicitly with --role or agent(role). */
+  modelInvocable?: boolean;
+  /** Why a foreign role stays explicit-only instead of entering automatic routing. */
+  compatibilityWarnings?: string[];
+  source?: RoleSource;
+  file?: string;
   system: string;
 }
 
@@ -28,6 +40,11 @@ export function rolesDir(cwd: string): string {
 /** Global roles — reusable personas across all projects. */
 export function globalRolesDir(): string {
   return join(homedir(), ".hara", "roles");
+}
+/** Claude Code's personal subagents are portable role prompts. Read them in place so users do not need
+ *  to copy or fork the prompt collection into Hara. Native ~/.hara/roles overrides an id collision. */
+export function globalClaudeAgentsDir(): string {
+  return join(homedir(), ".claude", "agents");
 }
 /** Org-pushed roles (B-end): the digital-employee bundle synced from hara-control's `/v1/roles` into
  *  `~/.hara/org-roles/*.md` (see org-fleet/enroll.ts syncOrgRoles). A managed baseline — above
@@ -71,12 +88,14 @@ export function claudeTools(v: unknown): string[] | undefined {
 }
 
 function parseFrontmatter(text: string): { fm: Record<string, any>; body: string } {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text);
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
   if (!m) return { fm: {}, body: text.trim() };
   const fm: Record<string, any> = {};
-  for (const raw of m[1].split("\n")) {
-    const line = raw.trim();
-    const kv = /^([A-Za-z0-9_]+)\s*:\s*(.*)$/.exec(line);
+  for (const raw of m[1].split(/\r?\n/)) {
+    // This is intentionally a small top-level parser, not YAML. Do not trim before matching: nested
+    // metadata such as `persona:\n  name: Vera` must never overwrite the role's top-level `name`.
+    if (/^\s/.test(raw)) continue;
+    const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(raw);
     if (!kv) continue;
     const key = kv[1];
     const val = kv[2].trim();
@@ -120,39 +139,85 @@ export function roleToolFilter(role: Role | undefined): ((name: string) => boole
 }
 
 export function loadRoles(cwd: string): Role[] {
-  // lowest→highest precedence: plugins < org(B-end push) < global < .claude/agents < .hara/roles (project wins)
-  return [...rolesFromDirs([...pluginRoleDirs(), orgRolesDir(), globalRolesDir(), claudeAgentsDir(cwd), rolesDir(cwd)]).values()];
+  // lowest→highest precedence: plugins < org(B-end push) < personal Claude < personal Hara
+  // < project Claude < project Hara. A user's native Hara definition intentionally wins an id collision.
+  return [...rolesFromDirs([
+    ...pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" })),
+    { dir: orgRolesDir(), source: "org" },
+    { dir: globalClaudeAgentsDir(), source: "claude-global" },
+    { dir: globalRolesDir(), source: "global" },
+    { dir: claudeAgentsDir(cwd), source: "claude-project" },
+    { dir: rolesDir(cwd), source: "project" },
+  ]).values()];
 }
 
-/** The project-independent layers only (plugins + org-pushed + ~/.hara/roles) — what the global agent
- *  index lists as "runs anywhere". Excludes cwd-derived layers by construction. */
+/** The project-independent layers only — what the global agent index lists as "runs anywhere".
+ *  Personal Claude Code agents participate directly; no copy/import step is required. */
 export function loadGlobalRoles(): Role[] {
-  return [...rolesFromDirs([...pluginRoleDirs(), orgRolesDir(), globalRolesDir()]).values()];
+  return [...rolesFromDirs([
+    ...pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" })),
+    { dir: orgRolesDir(), source: "org" },
+    { dir: globalClaudeAgentsDir(), source: "claude-global" },
+    { dir: globalRolesDir(), source: "global" },
+  ]).values()];
 }
 
-function rolesFromDirs(dirs: string[]): Map<string, Role> {
+interface RoleDir {
+  dir: string;
+  source: RoleSource;
+}
+
+const isTrue = (value: unknown): boolean => value === true || String(value).toLowerCase() === "true";
+
+function claudeCompatibilityWarnings(description: string, body: string): string[] {
+  const warnings: string[] = [];
+  if (/\bcalled by\b.*\b(?:only|workflows? only)\b/i.test(description)) warnings.push("workflow-only");
+  if (/\b(?:must be used|mandatory before|always use)\b/i.test(description)) {
+    warnings.push("mandatory auto-invocation directive");
+  }
+  if (/localhost:\d+\/notify|YOUR_VOICE_ID(?:_HERE)?|voice notification/i.test(body)) {
+    warnings.push("local notification dependency");
+  }
+  if (/(?:~|\/Users\/[^/\s]+)\/\.claude\/skills\//i.test(body)) warnings.push("Claude-only skill dependency");
+  return [...new Set(warnings)];
+}
+
+function rolesFromDirs(dirs: RoleDir[]): Map<string, Role> {
   const byId = new Map<string, Role>();
-  for (const dir of dirs) {
+  for (const { dir, source } of dirs) {
     if (!existsSync(dir)) continue;
     for (const f of readdirSync(dir)) {
       if (!f.endsWith(".md") || f === "README.md") continue;
       try {
-        const { fm, body } = parseFrontmatter(readModelContextFileSync(join(dir, f), MAX_ROLE_BYTES));
+        const file = join(dir, f);
+        const { fm, body } = parseFrontmatter(readModelContextFileSync(file, MAX_ROLE_BYTES));
         const id = (fm.name as string) || f.replace(/\.md$/, "");
         const explicitReadOnly = /^(true|false)$/i.test(String(fm.readOnly ?? ""))
           ? String(fm.readOnly).toLowerCase() === "true"
           : undefined;
+        const claudeSource = source === "claude-global" || source === "claude-project";
+        const compatibilityWarnings = claudeSource
+          ? claudeCompatibilityWarnings(String(fm.description ?? ""), body)
+          : [];
+        const rawModel = fm.model ? String(fm.model) : "";
+        const foreignClaudeModel = claudeSource && /^claude(?:[-_.]|$)/i.test(rawModel);
         byId.set(id, {
           id,
           description: (fm.description as string) || "",
           owns: Array.isArray(fm.owns) ? fm.owns : [],
           rejects: Array.isArray(fm.rejects) ? fm.rejects : [],
-          // Claude-Code model ALIASES (sonnet/opus/haiku/inherit) aren't hara model ids — treat as
-          // "inherit the session model" rather than passing a string no provider resolves.
-          model: fm.model && !/^(sonnet|opus|haiku|inherit)$/i.test(String(fm.model)) ? fm.model : undefined,
+          // Claude aliases and Claude-provider ids cannot safely switch Hara's active provider — inherit
+          // the session model instead of passing a foreign id to (for example) a Qwen/OpenAI endpoint.
+          model: rawModel && !/^(sonnet|opus|haiku|inherit)$/i.test(rawModel) && !foreignClaudeModel
+            ? rawModel
+            : undefined,
           allowTools: Array.isArray(fm.allowTools) ? fm.allowTools : claudeTools(fm.tools),
           denyTools: Array.isArray(fm.denyTools) ? fm.denyTools : undefined,
           readOnly: explicitReadOnly ?? (id.toLowerCase() === "reviewer" ? true : undefined),
+          modelInvocable: !isTrue(fm["disable-model-invocation"]) && compatibilityWarnings.length === 0,
+          compatibilityWarnings,
+          source,
+          file,
           system: body,
         });
       } catch {
@@ -161,6 +226,63 @@ function rolesFromDirs(dirs: string[]): Map<string, Role> {
     }
   }
   return byId;
+}
+
+function compactRoleDescription(role: Role): string {
+  const description = role.description.replace(/\s+/g, " ").trim();
+  if (!description || !scanMemory(description).ok) return "";
+  return description.length > ROLE_DESCRIPTION_CAP
+    ? description.slice(0, ROLE_DESCRIPTION_CAP - 1).trimEnd() + "…"
+    : description;
+}
+
+/** Compact metadata catalog for dispatch/planning. Role bodies remain progressive: only the selected role's
+ *  persona is injected into its run. Descriptions are bounded and guarded because plugin roles can be
+ *  untrusted. */
+export function roleCatalog(roles: Role[], cap = ROLE_DIGEST_CAP): string {
+  const lines: string[] = [];
+  const sourceRank: Record<RoleSource, number> = {
+    project: 0,
+    "claude-project": 1,
+    global: 2,
+    "claude-global": 3,
+    org: 4,
+    plugin: 5,
+  };
+  const ordered = [...roles].sort((a, b) => {
+    const source = (sourceRank[a.source ?? "plugin"] ?? 9) - (sourceRank[b.source ?? "plugin"] ?? 9);
+    if (source) return source;
+    const ownership = Number(b.owns.length > 0) - Number(a.owns.length > 0);
+    if (ownership) return ownership;
+    return a.id.localeCompare(b.id);
+  });
+  for (const role of ordered) {
+    if (role.modelInvocable === false) continue;
+    const description = compactRoleDescription(role);
+    if (!description) continue;
+    const flags = [role.readOnly ? "read-only" : "", role.source?.startsWith("claude-") ? "Claude-compatible" : ""]
+      .filter(Boolean)
+      .join(", ");
+    lines.push(`- ${role.id}${flags ? ` [${flags}]` : ""}: ${description}`);
+  }
+  let digest = lines.join("\n");
+  if (digest.length > cap) digest = digest.slice(0, cap) + "\n…";
+  return digest;
+}
+
+let roleDigestCache = new Map<string, string>();
+
+/** Frozen-per-session specialist index for the ordinary Hara agent. This is the missing Claude-style
+ *  discovery layer: the main agent sees role metadata, then loads only the chosen persona through agent/org. */
+export function rolesDigest(cwd: string): string {
+  if (roleDigestCache.has(cwd)) return roleDigestCache.get(cwd)!;
+  const digest = roleCatalog(loadRoles(cwd));
+  roleDigestCache.set(cwd, digest);
+  return digest;
+}
+
+export function invalidateRolesCache(): void {
+  roleDigestCache.clear();
 }
 
 export function hasRoles(cwd: string): boolean {
@@ -208,6 +330,7 @@ Each \`*.md\` here is a role-agent. Frontmatter:
 - \`model\` — optional model override
 - \`allowTools\` / \`denyTools\` — restrict the role's tools
 - \`readOnly\` — enforce read/search-only tools (defaults on for a role named \`reviewer\`)
+- \`disable-model-invocation\` — hide the role from automatic routing while keeping explicit \`--role\` use
 
 Run \`hara org "<task>"\` to dispatch a task to the owning role, or \`hara org --role <id> "<task>"\`.
 `,
@@ -224,5 +347,6 @@ export function scaffoldRoles(cwd: string): string[] {
       written.push(name);
     }
   }
+  if (written.length) invalidateRolesCache();
   return written;
 }

@@ -22,6 +22,7 @@ import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText } from "../security/secrets.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { prepareHistoryForModel } from "./context-budget.js";
+import { rolesDigest } from "../org/roles.js";
 
 /** File tools whose `path` input marks the file as "recently worked with" (post-compaction restore). */
 const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
@@ -92,7 +93,12 @@ are disabled without an interactive approval channel unless the user launched wi
 HARA_ALLOW_TRUSTED_EXTENSIONS=1.
 For broad,
 open-ended exploration (more than ~3 searches), spawn \`agent\` sub-agents — several in one response for
-independent questions (role "explore") — each returns conclusions, not dumps. Messages the user sends
+independent questions (role "explore") — each returns conclusions, not dumps. When specialist roles are
+listed below, delegate only a bounded question that materially benefits from that expertise; give each role
+the minimum self-contained context, relevant paths, constraints, and expected output. Do not dump the whole
+conversation, spawn overlapping roles, or delegate a simple lookup. Reconcile conflicting specialist advice
+yourself before acting. Role-based \`agent\` calls stay read-only; the main agent owns approved edits, while
+\`hara org\` / \`hara plan\` provide write-capable role execution behind their normal gates. Messages the user sends
 mid-task arrive marked as interjections — triage them (refine current / queue as todo / urgent-switch)
 instead of blindly folding everything into the current task; the todo list is your task queue. For a multi-step task, call \`todo_write\` to plan a short checklist and keep it updated as
 you go (one item in_progress at a time) — skip it for trivial one-step tasks. You have a persistent
@@ -155,6 +161,7 @@ function composeSystem(
 ): string {
   const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
   const skills = skillsDigest(cwd);
+  const roles = override ? "" : rolesDigest(cwd);
   return (
     head +
     gatewayNote() +
@@ -162,6 +169,7 @@ function composeSystem(
     (executionContext ? `\n\n${executionContext}` : "") +
     (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "") +
     (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "") +
+    (roles ? `\n\n# Specialist roles (metadata only — use \`agent\` with a role id for bounded read-only expertise)\n${roles}` : "") +
     (skills ? `\n\n# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
   );
 }

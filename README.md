@@ -162,6 +162,7 @@ hara                       # interactive REPL (offers to create AGENTS.md on fir
 hara init                  # analyze the project & (re)generate AGENTS.md
 hara doctor                # check your setup (auth / model / node / assets / roles)
 hara roles init            # scaffold role-agents (implementer / reviewer / docs)
+hara roles                 # list Hara roles + compatible personal/project Claude Code agents
 hara org "review src/ for bugs"   # dispatch a task to the role that owns it (or --role <id>)
 hara projects add shop /absolute/path/to/shop   # register an agent home
 hara agents                # list global + registered project agents
@@ -312,6 +313,18 @@ to a clean start tree; a review that doesn't pass leaves the work uncommitted). 
 **`agent`** tool spawns **parallel read-only sub-agents** for fan-out — analyze / review / search
 several things at once (each can take a `role`), bounded to 8 concurrent (`HARA_MAX_CONCURRENCY`).
 
+Claude Code role collections work in place: Hara discovers both `~/.claude/agents/*.md` and project
+`.claude/agents/*.md`, translates common Claude tool names (`Read`, `Edit`, `Bash`, `WebSearch`, …), and
+treats Claude aliases and Claude-only model ids as “inherit the current Hara model” (a role cannot silently
+switch the active provider). Precedence is plugin < managed org < personal Claude < personal Hara < project
+Claude < project Hara. Ordinary Hara turns receive only a compact,
+guarded catalog of role names and descriptions; a role's full prompt is loaded only after that role is
+selected. This lets the main agent ask an architect, debugger, tester, or reviewer for bounded independent
+analysis without copying every prompt into every request. Claude prompts that declare themselves workflow-only
+or require a private notification server / Claude-only local skill are automatically kept explicit-only; they
+remain available through `--role` / `agent(role)` but cannot be picked by automatic routing. Set
+`disable-model-invocation: true` to make the same boundary explicit for any other host-coupled role.
+
 Register project homes with `hara projects add <name> <absolute-path>`, then `hara agents` becomes a global
 address book across `~/.hara/roles` and each registered project's roles. A qualified address such as
 `shop:reviewer` is unambiguous; both `hara org --role shop:reviewer "<task>"` and one-shot `hara -p "<task>"
@@ -326,7 +339,10 @@ command, so verification is **objective** (e.g. `npm test`, `tsc --noEmit`) rath
 self-assessment. Plan state is the SSOT at `.hara/org/plan.json` (inspectable; execution stops on the
 first failed verification — fix it and **`hara plan resume`** continues, skipping the atoms already done).
 With **`hara plan --parallel`**, independent atoms (the same dependency wave) run **concurrently** — the org
-works the independent parts at once, not one step at a time.
+works the independent parts at once, not one step at a time. The planner sees each automatically-invocable
+role's bounded description and read-only status—not only its id—so it can assign the right specialist and
+will discard a hallucinated, removed, or explicit-only role instead of silently running the atom as a generic
+agent.
 
 ### What it can do
 

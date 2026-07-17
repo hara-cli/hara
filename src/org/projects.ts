@@ -295,7 +295,9 @@ function sameRoleDefinition(a: Role, b: Role): boolean {
     sameList(a.rejects, b.rejects) &&
     sameList(a.allowTools, b.allowTools) &&
     sameList(a.denyTools, b.denyTools) &&
-    a.readOnly === b.readOnly
+    a.readOnly === b.readOnly &&
+    a.modelInvocable === b.modelInvocable &&
+    sameList(a.compatibilityWarnings, b.compatibilityWarnings)
   );
 }
 

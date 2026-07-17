@@ -1,5 +1,5 @@
 // Dispatcher — route a task to the role that OWNs it (keyword match first, LLM fallback).
-import type { Role } from "./roles.js";
+import { roleCatalog, type Role } from "./roles.js";
 
 /** Deterministic routing by `owns`/`rejects` keywords. null if no clear owner. */
 export function routeByKeywords(task: string, roles: Role[]): { role: Role; score: number } | null {
@@ -15,7 +15,7 @@ export function routeByKeywords(task: string, roles: Role[]): { role: Role; scor
 
 /** Prompt for the LLM dispatcher fallback. */
 export function buildDispatchPrompt(task: string, roles: Role[]): string {
-  const list = roles.map((r) => `- ${r.id}: ${r.description}`).join("\n");
+  const list = roleCatalog(roles);
   return `You are the dispatcher in an engineering org. Pick the single best role to own this task.
 
 Roles:

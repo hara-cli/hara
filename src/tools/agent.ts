@@ -18,6 +18,8 @@ registerTool({
   name: "agent",
   description:
     "Delegate an independent sub-task to a fresh READ-ONLY sub-agent and get its conclusions. " +
+    "Specialist role ids and descriptions appear under `# Specialist roles` in the system context; pass one " +
+    "only when its distinct expertise helps, and give it a minimal self-contained brief instead of conversation dumps. " +
     "WHEN TO USE: open-ended exploration ('how does X work across the codebase', 'find everything that touches Y') " +
     "that would take more than ~3 searches — pass role \"explore\" for a fast search specialist; and spawning " +
     "SEVERAL agents in ONE response for independent questions (they run in parallel). " +

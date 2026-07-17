@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.125.0 — 2026-07-18 — Claude-compatible specialist orchestration
+
+- **Personal Claude Code subagents now work in Hara without copying prompts.** Hara discovers
+  `~/.claude/agents/*.md` as portable global roles in addition to project `.claude/agents`, translates common
+  Claude tool names, inherits the active Hara model for Claude aliases/provider-specific ids, and preserves
+  native/project Hara precedence on id collisions. Workflow-only prompts and prompts that require a private
+  Claude notification/skill dependency stay explicit-only rather than being selected automatically.
+- **Ordinary Hara conversations can now discover the right specialist.** The main agent receives a bounded,
+  guarded name/description catalog and loads only the selected role body. Delegation guidance requires a
+  minimal self-contained brief, distinct non-overlapping work, and parent-side synthesis; fan-out specialists
+  remain read-only so role prompts cannot bypass the edit/command approval boundary.
+- **Plans route by responsibility instead of role name alone.** The atom planner receives bounded role
+  descriptions and read-only status, excludes `disable-model-invocation` roles from automatic selection, and
+  removes unknown role ids instead of silently executing under a generic persona. Explicit role execution
+  remains available for host-coupled prompts.
+
 ## 0.124.4 — 2026-07-18 — deadline-aware task checkpoints
 
 - **The 80% run-budget warning now reaches the Agent, not only the user.** Before the next model turn,

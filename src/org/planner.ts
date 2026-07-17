@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { Provider } from "../providers/types.js";
 import { boundedProviderTurn } from "../providers/bounded-turn.js";
-import type { Role } from "./roles.js";
+import { roleCatalog, type Role } from "./roles.js";
 import { runShell, type SandboxMode } from "../sandbox.js";
 import { readModelContextFileSync, readVerifiedRegularFileSnapshot } from "../fs-read.js";
 import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
@@ -44,7 +44,13 @@ export async function decompose(
   roles: Role[],
   opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<Plan> {
-  const roleHint = roles.length ? `\nAvailable roles for the optional "role" field: ${roles.map((r) => r.id).join(", ")}.` : "";
+  const eligibleRoles = roles.filter((role) => role.modelInvocable !== false);
+  const catalog = roleCatalog(eligibleRoles);
+  const roleHint = catalog
+    ? `\nAvailable roles for the optional "role" field:\n${catalog}\n` +
+      "Assign a role only when its specialization materially fits the atom. A read-only role may analyze, " +
+      "research, or verify, but must not own an atom that changes files or executes deployment."
+    : "";
   const r = await boundedProviderTurn(provider, {
     system: PLAN_SYSTEM + roleHint,
     history: [{ role: "user", content: `Task: ${task}\n\nReturn the JSON plan.` }],
@@ -52,7 +58,12 @@ export async function decompose(
     onText: () => {},
   }, { timeoutMs: opts.timeoutMs ?? 60_000, signal: opts.signal, label: "plan decomposition" });
   if (r.stop === "error") return { task, atoms: [], createdAt: new Date().toISOString() };
-  return { task, atoms: parsePlan(r.text), createdAt: new Date().toISOString() };
+  const roleIds = new Set(eligibleRoles.map((role) => role.id));
+  const atoms = parsePlan(r.text);
+  for (const atom of atoms) {
+    if (atom.role && !roleIds.has(atom.role)) atom.role = undefined;
+  }
+  return { task, atoms, createdAt: new Date().toISOString() };
 }
 
 /** Extract + normalize atoms from the model's (possibly fenced/noisy) JSON reply. */

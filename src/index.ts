@@ -607,18 +607,23 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
       return { status: "error", error: `no role '${o.forceRole}' is available` };
     }
   } else {
-    const kw = routeByKeywords(task, roles);
+    const routableRoles = roles.filter((candidate) => candidate.modelInvocable !== false);
+    if (!routableRoles.length) {
+      out(c.yellow("No automatically routable roles — choose an explicit role with --role <id>.\n"));
+      return { status: "error", error: "no roles allow automatic invocation" };
+    }
+    const kw = routeByKeywords(task, routableRoles);
     if (kw) {
       role = kw.role;
     } else {
       const r = await boundedProviderTurn(o.baseProvider, {
         system: "You are a task dispatcher. Reply with only a role id.",
-        history: [{ role: "user", content: buildDispatchPrompt(task, roles) }],
+        history: [{ role: "user", content: buildDispatchPrompt(task, routableRoles) }],
         tools: [],
         onText: () => {},
       }, { timeoutMs: 20_000, label: "role dispatch" });
-      if (r.stop === "error") out(c.yellow(`(role dispatch unavailable — using ${roles[0].id})\n`));
-      role = parseRoleId(r.text, roles) ?? roles[0];
+      if (r.stop === "error") out(c.yellow(`(role dispatch unavailable — using ${routableRoles[0].id})\n`));
+      role = parseRoleId(r.text, routableRoles) ?? routableRoles[0];
     }
   }
   out(c.dim(`→ ${role.id} owns this task\n`));
@@ -727,6 +732,13 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
   atom.status = "running";
   await savePlan(o.cwd, plan);
   const role = atom.role ? roles.find((r) => r.id === atom.role) : undefined;
+  if (atom.role && !role) {
+    atom.status = "failed";
+    atom.note = `planned role '${atom.role}' is no longer available`;
+    await savePlan(o.cwd, plan);
+    out(c.red(`  ✗ ${atom.id} ${atom.note}\n`));
+    return false;
+  }
   const __atomModel = effectiveRoleModel(role?.model, o.cfg.model);
   const roleProvider = __atomModel ? ((await buildProvider({ ...o.cfg, model: __atomModel })) ?? o.baseProvider) : o.baseProvider;
   const toolFilter = roleToolFilter(role);
@@ -1161,6 +1173,15 @@ async function runSubagent(
 }
 
 /** Check the hara setup and print a health summary (provider/auth/model/node/assets/roles). */
+function roleMeta(role: Role): string {
+  return [
+    role.source,
+    role.readOnly ? "read-only" : "",
+    role.modelInvocable === false ? "explicit-only" : "",
+    ...(role.compatibilityWarnings ?? []),
+  ].filter(Boolean).join(" · ");
+}
+
 function runDoctor(cfg: HaraConfig): string {
   const ok = (b: boolean): string => (b ? c.green("✓") : c.red("✗"));
   const dot = c.dim("·");
@@ -1179,7 +1200,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${ok(authed)} auth ${authed ? c.dim("configured") : c.yellow("missing — " + authHint(cfg))}`,
     `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
-    `${dot} roles ${roles.length ? c.dim(roles.map((r) => r.id).join(", ")) : c.dim("none — run: hara roles init")}`,
+    `${dot} roles ${roles.length ? c.dim(`${roles.length} (${roles.slice(0, 8).map((r) => r.id).join(", ")}${roles.length > 8 ? ", …" : ""})`) : c.dim("none — run: hara roles init")}`,
     `${dot} skills ${(() => { const n = loadSkillIndex(cfg.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(cfg.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
     `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)} ${c.dim("· capture")} ${c.bold(cfg.assetCapture)}`,
     `${dot} search ${c.dim("lexical (always on)")}${cfg.embedProvider === "off" ? c.dim(" · semantic off (hara config set embedProvider ollama|qwen)") : c.dim(" · semantic ") + c.bold(cfg.embedProvider) + (() => { const idx = ["repo", "assets", "memory"].filter((n) => indexExists(n, cfg.cwd)); return c.dim(" · indexed: ") + (idx.length ? c.green(idx.join(", ")) : c.yellow("none — run: hara index --all")); })()}`,
@@ -1410,7 +1431,7 @@ program
   .action(() => {
     const idx = buildAgentsIndex();
     if (!idx.length) {
-      out(c.dim("(no agents — add roles to ~/.hara/roles, or register projects: hara projects add <name> <path>)\n"));
+      out(c.dim("(no agents — add roles to ~/.hara/roles or ~/.claude/agents, or register projects: hara projects add <name> <path>)\n"));
       return;
     }
     for (const e of idx) {
@@ -2533,7 +2554,7 @@ memoryCmd
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
 
-const rolesCmd = program.command("roles").description("manage org roles (.hara/roles)");
+const rolesCmd = program.command("roles").description("list/manage Hara roles and compatible Claude Code agents");
 rolesCmd
   .command("init")
   .description("scaffold example roles")
@@ -2552,7 +2573,8 @@ rolesCmd.action(() => {
     return;
   }
   for (const r of roles) {
-    out(`${c.bold(r.id)}${r.model ? c.dim(` (${r.model})`) : ""}  ${c.dim("owns: " + r.owns.join(", "))}\n  ${r.description}\n`);
+    const meta = roleMeta(r);
+    out(`${c.bold(r.id)}${r.model ? c.dim(` (${r.model})`) : ""}${meta ? c.dim(`  [${meta}]`) : ""}  ${c.dim("owns: " + r.owns.join(", "))}\n  ${r.description}\n`);
   }
 });
 
@@ -3700,7 +3722,7 @@ program.action(async (opts) => {
       run: () => {
         const rs = loadRoles(cwd);
         if (!rs.length) return void out(c.dim("No roles. Run `hara roles init`.\n"));
-        for (const r of rs) out(`  ${r.id}  ${c.dim("owns: " + r.owns.join(", "))}\n`);
+        for (const r of rs) out(`  ${r.id}  ${c.dim(`[${roleMeta(r)}] owns: ${r.owns.join(", ")}`)}\n`);
       },
     },
     {
@@ -4338,7 +4360,7 @@ program.action(async (opts) => {
           if (nm === "vision") return void h.sink.notice(applyVision(arg));
           if (nm === "roles") {
             const rs = loadRoles(cwd);
-            return void h.sink.notice(rs.length ? rs.map((r) => `  ${r.id} — owns: ${r.owns.join(", ")}`).join("\n") : "No roles. Run `hara roles init`.");
+            return void h.sink.notice(rs.length ? rs.map((r) => `  ${r.id} [${roleMeta(r)}] — owns: ${r.owns.join(", ")}`).join("\n") : "No roles. Run `hara roles init`.");
           }
           if (nm === "skills") {
             const ss = loadSkillIndex(cwd);

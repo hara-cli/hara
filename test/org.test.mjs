@@ -3,12 +3,24 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadRoles, scaffoldRoles, subagentToolFilter, roleToolFilter } from "../dist/org/roles.js";
+import {
+  globalClaudeAgentsDir,
+  invalidateRolesCache,
+  loadGlobalRoles,
+  loadRoles,
+  rolesDigest,
+  scaffoldRoles,
+  subagentToolFilter,
+  roleToolFilter,
+} from "../dist/org/roles.js";
 import { routeByKeywords, parseRoleId, buildDispatchPrompt } from "../dist/org/router.js";
+import { decompose } from "../dist/org/planner.js";
+import { runAgent } from "../dist/agent/loop.js";
 
 // Hermetic HOME: loadRoles merges ~/.hara/roles + ~/.hara/org-roles (os.homedir() honors $HOME), so a
 // developer's real global roles (e.g. the converted Claude-Code pack) must not leak into these tests.
-process.env.HOME = mkdtempSync(join(tmpdir(), "hara-test-home-"));
+const TEST_HOME = mkdtempSync(join(tmpdir(), "hara-test-home-"));
+process.env.HOME = TEST_HOME;
 
 test("subagentToolFilter: a write-granting role can NOT give a fan-out sub-agent edit/exec (no gate bypass)", () => {
   const ro = (n) => n === "read_file" || n === "grep" || n === "ls"; // the read-kind predicate
@@ -141,4 +153,175 @@ test("loadRoles: a Claude-Code agent file yields usable hara allowTools + drops 
   assert.equal(cfo.model, undefined, "CC 'sonnet' alias dropped → inherit the session model");
   assert.equal(cfo.system, "You are the CFO.", "body becomes the persona");
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("loadRoles: personal Claude agents work globally and native/project definitions keep precedence", () => {
+  const globalClaude = globalClaudeAgentsDir();
+  const globalHara = join(TEST_HOME, ".hara", "roles");
+  const dir = mkdtempSync(join(tmpdir(), "hara-cc-global-"));
+  mkdirSync(join(dir, ".git"));
+  try {
+    mkdirSync(globalClaude, { recursive: true });
+    writeFileSync(
+      join(globalClaude, "portable.md"),
+      "---\nname: portable\ndescription: Claude personal role\nmodel: claude-sonnet-4-6\npersona:\n  name: WRONG_NESTED_NAME\n---\nCLAUDE_GLOBAL",
+    );
+    writeFileSync(
+      join(globalClaude, "workflow-only.md"),
+      "---\nname: workflow-only\ndescription: Called BY a private research workflow only.\n---\n" +
+      "Before work, send a voice notification to http://localhost:8888/notify.",
+    );
+    let role = loadGlobalRoles().find((candidate) => candidate.id === "portable");
+    assert.equal(role?.source, "claude-global");
+    assert.equal(role?.model, undefined, "a Claude-provider model pin cannot silently replace Hara's provider/model");
+    assert.equal(loadGlobalRoles().some((candidate) => candidate.id === "WRONG_NESTED_NAME"), false);
+    assert.equal(loadRoles(dir).find((candidate) => candidate.id === "portable")?.system, "CLAUDE_GLOBAL");
+    const coupled = loadGlobalRoles().find((candidate) => candidate.id === "workflow-only");
+    assert.equal(coupled?.modelInvocable, false, "host-coupled Claude prompt stays explicit-only");
+    assert.deepEqual(
+      coupled?.compatibilityWarnings,
+      ["workflow-only", "local notification dependency"],
+    );
+
+    mkdirSync(globalHara, { recursive: true });
+    writeFileSync(
+      join(globalHara, "portable.md"),
+      "---\nname: portable\ndescription: Native personal role\n---\nHARA_GLOBAL",
+    );
+    role = loadGlobalRoles().find((candidate) => candidate.id === "portable");
+    assert.equal(role?.source, "global");
+    assert.equal(role?.system, "HARA_GLOBAL", "native ~/.hara/roles wins over ~/.claude/agents");
+
+    const projectClaude = join(dir, ".claude", "agents");
+    mkdirSync(projectClaude, { recursive: true });
+    writeFileSync(
+      join(projectClaude, "portable.md"),
+      "---\nname: portable\ndescription: Claude project role\n---\nCLAUDE_PROJECT",
+    );
+    role = loadRoles(dir).find((candidate) => candidate.id === "portable");
+    assert.equal(role?.source, "claude-project");
+    assert.equal(role?.system, "CLAUDE_PROJECT");
+
+    const projectHara = join(dir, ".hara", "roles");
+    mkdirSync(projectHara, { recursive: true });
+    writeFileSync(
+      join(projectHara, "portable.md"),
+      "---\nname: portable\ndescription: Hara project role\n---\nHARA_PROJECT",
+    );
+    role = loadRoles(dir).find((candidate) => candidate.id === "portable");
+    assert.equal(role?.source, "project");
+    assert.equal(role?.system, "HARA_PROJECT", "project .hara role has final precedence");
+  } finally {
+    rmSync(join(globalClaude, "portable.md"), { force: true });
+    rmSync(join(globalClaude, "workflow-only.md"), { force: true });
+    rmSync(join(globalHara, "portable.md"), { force: true });
+    rmSync(dir, { recursive: true, force: true });
+    invalidateRolesCache();
+  }
+});
+
+test("rolesDigest: exposes bounded metadata, not role bodies, and honors disable-model-invocation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-role-digest-"));
+  const roleDir = join(dir, ".hara", "roles");
+  mkdirSync(join(dir, ".git"));
+  mkdirSync(roleDir, { recursive: true });
+  try {
+    writeFileSync(
+      join(roleDir, "architect.md"),
+      "---\r\nname: architect\r\ndescription: Designs service boundaries and API contracts\r\nreadOnly: true\r\n---\r\nROLE_BODY_SHOULD_NOT_LOAD",
+    );
+    writeFileSync(
+      join(roleDir, "manual.md"),
+      "---\nname: manual\ndescription: Explicit-only helper\ndisable-model-invocation: true\n---\nMANUAL_BODY",
+    );
+    invalidateRolesCache();
+    const digest = rolesDigest(dir);
+    assert.match(digest, /architect \[read-only\]: Designs service boundaries/);
+    assert.doesNotMatch(digest, /ROLE_BODY_SHOULD_NOT_LOAD|manual|MANUAL_BODY/);
+    assert.equal(loadRoles(dir).find((role) => role.id === "manual")?.modelInvocable, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    invalidateRolesCache();
+  }
+});
+
+test("ordinary Hara turns see specialist metadata while the persona remains on-demand", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-role-system-"));
+  const roleDir = join(dir, ".hara", "roles");
+  mkdirSync(join(dir, ".git"));
+  mkdirSync(roleDir, { recursive: true });
+  writeFileSync(
+    join(roleDir, "debugger.md"),
+    "---\nname: debugger\ndescription: Finds root causes from reproducible evidence\n---\nPRIVATE_DEBUGGER_PERSONA",
+  );
+  invalidateRolesCache();
+  let system = "";
+  const provider = {
+    id: "fake",
+    model: "fake",
+    async turn(args) {
+      system = args.system;
+      return { text: "ok", toolUses: [], stop: "end" };
+    },
+  };
+  try {
+    await runAgent([{ role: "user", content: "fix a crash" }], {
+      provider,
+      ctx: { cwd: dir },
+      approval: "full-auto",
+      confirm: async () => true,
+      quiet: true,
+    });
+    assert.match(system, /# Specialist roles/);
+    assert.match(system, /debugger: Finds root causes/);
+    assert.doesNotMatch(system, /PRIVATE_DEBUGGER_PERSONA/, "role body is loaded only after selection");
+    assert.match(system, /minimum self-contained context/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    invalidateRolesCache();
+  }
+});
+
+test("planner receives role responsibilities and drops manual or hallucinated role ids", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-role-plan-"));
+  const roleDir = join(dir, ".hara", "roles");
+  mkdirSync(join(dir, ".git"));
+  mkdirSync(roleDir, { recursive: true });
+  writeFileSync(
+    join(roleDir, "architect.md"),
+    "---\nname: architect\ndescription: Designs system boundaries and migration plans\n---\nARCHITECT",
+  );
+  writeFileSync(
+    join(roleDir, "manual.md"),
+    "---\nname: manual\ndescription: Hidden manual role\ndisable-model-invocation: true\n---\nMANUAL",
+  );
+  let system = "";
+  const provider = {
+    id: "fake",
+    model: "fake",
+    async turn(args) {
+      system = args.system;
+      return {
+        text: JSON.stringify({
+          atoms: [
+            { id: "a1", title: "design boundaries", deps: [], role: "architect" },
+            { id: "a2", title: "manual task", deps: ["a1"], role: "manual" },
+            { id: "a3", title: "unknown task", deps: ["a2"], role: "invented" },
+          ],
+        }),
+        toolUses: [],
+        stop: "end",
+      };
+    },
+  };
+  try {
+    const plan = await decompose(provider, "modernize the service", loadRoles(dir));
+    assert.match(system, /architect.*Designs system boundaries/);
+    assert.doesNotMatch(system, /Hidden manual role/);
+    assert.equal(plan.atoms[0].role, "architect");
+    assert.equal(plan.atoms[1].role, undefined);
+    assert.equal(plan.atoms[2].role, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
