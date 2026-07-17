@@ -448,7 +448,17 @@ test("spawned hara gateway uses the local WeCom transport and rejects a blocked 
   const home = mkdtempSync(join(tmpdir(), "hara-wecom-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "hara-wecom-work-"));
   const localSecret = "process-local-secret";
-  const child = spawn(process.execPath, [join(process.cwd(), "dist", "cli.js"), "gateway", "--platform", "wecom", "--cwd", cwd], {
+  const standalone = String(process.env.HARA_TEST_WECOM_CLI ?? "").trim();
+  const executable = standalone || process.execPath;
+  const args = [
+    ...(standalone ? [] : [join(process.cwd(), "dist", "cli.js")]),
+    "gateway",
+    "--platform",
+    "wecom",
+    "--cwd",
+    cwd,
+  ];
+  const child = spawn(executable, args, {
     cwd: process.cwd(),
     env: {
       ...process.env,
