@@ -60,19 +60,20 @@ it runs fine on your laptop behind NAT.
   Shutdown aborts remote TTS requests and terminates the full process tree for local `say`/custom commands.
   For stable-id events, default voice bytes are cached with the coding result, so a failed audio upload retries
   transport with those same bytes rather than rerunning coding or synthesis.
-- Telegram and Feishu outbound text/file transfers have a real cancellation signal and a hard transport
+- Telegram, Feishu, and WeCom outbound text/file transfers have a real cancellation signal and a hard transport
   ceiling (30 seconds for text, 120 seconds for files). Within one live Hara process, sends to one
   credential-scoped chat stay FIFO even when the daemon, a flow, and one-shot delivery use different adapter
   instances. The caller settles at its deadline; an ambiguous underlying transfer remains at the head of that
   process-local lane until it settles, preventing a later admitted send from overtaking it.
-- Before an identified Telegram/Feishu DM can execute coding or tools, the gateway atomically writes a private
+- Before an identified Telegram/Feishu/WeCom DM can execute coding or tools, the gateway atomically writes a private
   credential-scoped `0600` started marker. It stores the completed reply and verified attachment bytes before
-  delivery, then removes that record only after Telegram confirms the advanced offset or Feishu removes the
-  durable event. Redelivery therefore resends cached output, never reruns coding. If the daemon was interrupted
-  after execution began, it sends an explicit recovery warning and requires a new instruction instead of
-  guessing that side effects are safe to repeat. The cache is capped at 32 records, 64 KiB of reply text and
-  four files/20 MiB per record; cached payload bytes expire after 24 hours but downgrade to a small terminal
-  marker rather than deleting the evidence that execution started.
+  delivery. Telegram removes that record after confirming the advanced offset, Feishu after removing its
+  durable event, while WeCom retains the bounded record because its callback transport has no equivalent
+  durable client ACK. Redelivery therefore resends cached output, never reruns coding. If the daemon was
+  interrupted after execution began, it sends an explicit recovery warning and requires a new instruction
+  instead of guessing that side effects are safe to repeat. The cache is capped at 32 records, 64 KiB of reply
+  text and four files/20 MiB per record; cached payload bytes expire after 24 hours but downgrade to a small
+  terminal marker rather than deleting the evidence that execution started.
 - Operators can recover a known marker by its original platform message id while that credential's gateway is
   stopped. Recovery is deliberately single-record and two-stage: `hara gateway --platform <name>
   --recover-outcome <id> --confirm-recovery terminalize:<id>` converts an ambiguous running record into a
@@ -323,8 +324,23 @@ Connects out to WeCom's AI-Bot WebSocket gateway — no public webhook, works be
 HARA_WECOM_BOT_ID=… HARA_WECOM_SECRET=… HARA_GATEWAY_ALLOWED=<your-userid> hara gateway --platform wecom
 ```
 
-Inbound images (incl. AES-encrypted attachments) are downloaded to `~/.hara/wecom/media`; text/markdown replies are
-chunked; outbound images/files supported. (`HARA_WECOM_WS_URL` overrides the gateway URL.)
+Do not commit the Secret to a project `.env`; inject it from your shell, keychain/secret manager, or service
+manager. The adapter does not become send-ready until WeCom confirms the subscription. Invalid credentials stop
+after five bounded attempts, two missed heartbeat acknowledgements reconnect the socket with exponential
+backoff, and a `disconnected_event` stops this process instead of fighting another active bot connection.
+
+Inbound images, files, and videos (including AES-encrypted media) are downloaded to private paths under
+`~/.hara/wecom/media`; only real images enter the vision attachment list. Stable `msgid`/`create_time` fields
+feed Hara's cross-restart stale-event, deduplication, and no-rerun boundary. Text/markdown replies are chunked
+and ordered per chat; outbound images/files use bounded request acknowledgements and chunk retries.
+`HARA_WECOM_WS_URL` overrides the gateway URL for a private relay or local protocol test.
+
+Contributors can run the deterministic local transport and spawned-CLI regression without real credentials:
+
+```bash
+npm run build
+node --test --test-timeout=120000 test/wecom-gateway.test.mjs
+```
 
 ## Signal
 

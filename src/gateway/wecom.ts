@@ -1,25 +1,33 @@
-// WeCom (企业微信 / Enterprise WeChat) adapter for `hara gateway` — connects to WeCom's AI Bot WebSocket gateway
-// (wss://openws.work.weixin.qq.com) over Node's native global WebSocket (zero new dep on Node ≥ 22) so the LOCAL
-// daemon dials OUT: NO public webhook / callback endpoint is required, exactly like Discord/DingTalk/Feishu's
-// long-connection mode. Creds from HARA_WECOM_BOT_ID / HARA_WECOM_SECRET (the AI Bot's id + secret from the WeCom
-// admin console). Same ChatAdapter shape as Telegram/Discord, so all the cross-platform gateway plumbing (system
-// context, stuck-guard, allowlist, send_file, voice) works unchanged.
+// WeCom (企业微信 / Enterprise WeChat) adapter for `hara gateway`.
 //
-// Protocol (ported from the Hermes Python adapter): authenticate with an `aibot_subscribe` frame → receive
-// `aibot_msg_callback` events → reply with `aibot_send_msg` → upload media via the 3-step `aibot_upload_media_*`
-// chunked protocol → AES-256-CBC decrypt inbound media that carries an `aeskey`. Every request frame carries a
-// `headers.req_id` and the server echoes it back so request/response are correlated. v1 limitations are documented
-// at the bottom of this file (the public spec is thin — fields are best-effort and tolerant of shape drift).
+// Hara connects out to WeCom's AI Bot WebSocket gateway, so no public webhook is required. The transport
+// deliberately stays small, but follows the same lifecycle as WeCom's official Node SDK: subscribe and wait
+// for the auth ACK, monitor heartbeat ACKs, reconnect with bounded backoff, correlate every request, and stop
+// reconnecting when `disconnected_event` says another connection has replaced this one.
 import { basename, extname } from "node:path";
-import { randomUUID, createDecipheriv, createHash } from "node:crypto";
-import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
-import { InboundMediaBudget, decodeBase64Media, readResponseBytesLimited, savePrivateMediaBytes } from "./media.js";
+import { createDecipheriv, createHash, randomUUID } from "node:crypto";
+import {
+  chunkText,
+  outboundTransferTimeoutMs,
+  PerChatOutboundLane,
+  withOutboundDeadline,
+  type ChatAdapter,
+  type InboundMsg,
+} from "./telegram.js";
+import {
+  InboundMediaBudget,
+  cleanupTransientMedia,
+  decodeBase64Media,
+  readResponseBytesLimited,
+  savePrivateMediaBytes,
+} from "./media.js";
 import type { OutboundFilePayload } from "./outbound-files.js";
 
 const DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com";
 const WSImpl: any = (globalThis as any).WebSocket;
+const WS_CONNECTING = 0;
+const WS_OPEN = 1;
 
-// app-level command verbs on the AI Bot gateway (mirror the Hermes constants)
 const CMD_SUBSCRIBE = "aibot_subscribe";
 const CMD_CALLBACK = "aibot_msg_callback";
 const CMD_LEGACY_CALLBACK = "aibot_callback";
@@ -32,31 +40,122 @@ const CMD_UPLOAD_FINISH = "aibot_upload_media_finish";
 
 const CALLBACK_CMDS = new Set([CMD_CALLBACK, CMD_LEGACY_CALLBACK]);
 const MAX_MESSAGE_LENGTH = 4000;
-const HEARTBEAT_MS = 30000;
-const REQUEST_TIMEOUT_MS = 15000;
-const UPLOAD_CHUNK_SIZE = 512 * 1024; // 512 KB chunks (WeCom upload protocol)
-const ABSOLUTE_MAX_BYTES = 20 * 1024 * 1024; // WeCom hard cap on any upload
+const DEFAULT_HEARTBEAT_MS = 30_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_RECONNECT_BASE_MS = 1_000;
+const DEFAULT_RECONNECT_MAX_MS = 30_000;
+const DEFAULT_MAX_AUTH_FAILURES = 5;
+const MAX_MISSED_HEARTBEATS = 2;
+const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+const UPLOAD_CHUNK_SIZE = 512 * 1024;
+const MAX_UPLOAD_CHUNK_RETRIES = 2;
+const ABSOLUTE_MAX_BYTES = 20 * 1024 * 1024;
 
-const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
-  new Promise((r) => {
-    if (signal?.aborted) return r();
-    const t = setTimeout(r, ms);
-    signal?.addEventListener?.("abort", () => { clearTimeout(t); r(); }, { once: true });
+export interface WecomTransportOptions {
+  /** Per-frame request/auth ACK timeout. Intended mainly for deterministic local protocol tests. */
+  requestTimeoutMs?: number;
+  /** Heartbeat interval. Two missed ACKs force a reconnect. */
+  heartbeatMs?: number;
+  /** Initial reconnect delay; retries use exponential backoff. */
+  reconnectBaseMs?: number;
+  /** Hard reconnect-delay ceiling. */
+  reconnectMaxMs?: number;
+  /** Repeated credential failures eventually stop the daemon instead of looping forever. */
+  maxAuthFailures?: number;
+}
+
+interface ResolvedWecomTransportOptions {
+  requestTimeoutMs: number;
+  heartbeatMs: number;
+  reconnectBaseMs: number;
+  reconnectMaxMs: number;
+  maxAuthFailures: number;
+}
+
+type WecomRequest = (cmd: string, body: unknown, signal?: AbortSignal) => Promise<any>;
+type LiveConnection = { send: WecomRequest | null };
+type ConnectReason = "closed" | "auth-failed" | "superseded" | "aborted";
+interface ConnectOutcome {
+  reason: ConnectReason;
+  authenticated: boolean;
+  detail?: string;
+}
+
+interface PendingRequest {
+  command: string;
+  resolve: (value: any) => void;
+  reject: (reason: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
+function boundedInteger(value: number | undefined, fallback: number, min: number, max: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
+function resolveTransportOptions(options: WecomTransportOptions = {}): ResolvedWecomTransportOptions {
+  const reconnectBaseMs = boundedInteger(options.reconnectBaseMs, DEFAULT_RECONNECT_BASE_MS, 10, 60_000);
+  return {
+    requestTimeoutMs: boundedInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 50, 60_000),
+    heartbeatMs: boundedInteger(options.heartbeatMs, DEFAULT_HEARTBEAT_MS, 50, 300_000),
+    reconnectBaseMs,
+    reconnectMaxMs: Math.max(
+      reconnectBaseMs,
+      boundedInteger(options.reconnectMaxMs, DEFAULT_RECONNECT_MAX_MS, 10, 300_000),
+    ),
+    maxAuthFailures: boundedInteger(options.maxAuthFailures, DEFAULT_MAX_AUTH_FAILURES, 1, 20),
+  };
+}
+
+function signalError(signal: AbortSignal | undefined, fallback: string): Error {
+  return signal?.reason instanceof Error ? signal.reason : new Error(fallback);
+}
+
+function throwIfAborted(signal: AbortSignal | undefined, label: string): void {
+  if (signal?.aborted) throw signalError(signal, `${label} cancelled`);
+}
+
+function waitForDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signalError(signal, "WeCom operation cancelled"));
+  return new Promise((resolve, reject) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signalError(signal, "WeCom operation cancelled"));
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function reconnectDelay(attempt: number, options: ResolvedWecomTransportOptions): number {
+  return Math.min(options.reconnectMaxMs, options.reconnectBaseMs * (2 ** Math.max(0, attempt - 1)));
+}
+
+function protocolText(value: unknown, secret: string): string {
+  let text = String(value ?? "unknown error").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 240);
+  if (secret) text = text.split(secret).join("[redacted]");
+  return text || "unknown error";
+}
 
 const isImageName = (name: string): boolean => /\.(png|jpe?g|gif|webp)$/i.test(name);
 
-/** A downloadable inbound media item pulled out of a WeCom callback body (pure). `aesKeyB64` present → the bytes at
- *  `url` are AES-256-CBC encrypted and must be decrypted; `base64` present → the bytes are inline. */
+/** A downloadable inbound media item extracted from a WeCom callback body. */
 export interface WecomMediaRef {
-  kind: "image" | "file";
+  kind: "image" | "file" | "video";
   url?: string;
   base64?: string;
   aesKeyB64?: string;
   fileName?: string;
 }
 
-/** Detect an image extension from magic bytes (pure) — used when WeCom doesn't give us a filename. */
 function imageExtFromBytes(data: Buffer): string {
   if (data.length >= 8 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) return ".png";
   if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return ".jpg";
@@ -65,77 +164,90 @@ function imageExtFromBytes(data: Buffer): string {
   return ".jpg";
 }
 
-/** AES-256-CBC decrypt WeCom-encrypted media (pure). The 32-byte key is the base64-decoded `aeskey`; the IV is the
- *  first 16 bytes of that key; padding is PKCS#7 (validated leniently, like the Hermes reference). */
+/** AES-256-CBC + WeCom's PKCS#7 (block size 32) media decryption. Invalid padding fails closed. */
 export function decryptWecomMedia(ciphertext: Buffer, aesKeyB64: string): Buffer {
-  const key = Buffer.from(aesKeyB64, "base64");
+  if (!ciphertext.length) throw new Error("WeCom encrypted media is empty");
+  if (ciphertext.length % 16 !== 0) throw new Error("invalid WeCom encrypted media length");
+  const key = Buffer.from(String(aesKeyB64 ?? ""), "base64");
   if (key.length !== 32) throw new Error(`unexpected WeCom aes_key length: ${key.length} (expected 32)`);
-  const d = createDecipheriv("aes-256-cbc", key, key.subarray(0, 16));
-  d.setAutoPadding(false); // strip PKCS#7 ourselves so a non-conformant tail doesn't throw
-  const padded = Buffer.concat([d.update(ciphertext), d.final()]);
-  if (!padded.length) return padded;
+  const decipher = createDecipheriv("aes-256-cbc", key, key.subarray(0, 16));
+  decipher.setAutoPadding(false);
+  const padded = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   const pad = padded[padded.length - 1];
-  if (pad >= 1 && pad <= 32 && padded.length >= pad) {
-    let ok = true;
-    for (let i = padded.length - pad; i < padded.length; i++) if (padded[i] !== pad) ok = false;
-    if (ok) return padded.subarray(0, padded.length - pad);
+  if (pad < 1 || pad > 32 || pad > padded.length) throw new Error("invalid WeCom media padding");
+  for (let i = padded.length - pad; i < padded.length; i++) {
+    if (padded[i] !== pad) throw new Error("invalid WeCom media padding");
   }
-  return padded;
+  return padded.subarray(0, padded.length - pad);
 }
 
-/** Pull the plain text out of a WeCom callback body (pure). Handles `text`, `voice` (transcription), and `mixed`
- *  (text + image runs) message types — joining all text runs with newlines. */
 function extractWecomText(body: any): string {
   const parts: string[] = [];
   const msgtype = String(body?.msgtype ?? "").toLowerCase();
   if (msgtype === "mixed") {
     const items = Array.isArray(body?.mixed?.msg_item) ? body.mixed.msg_item : [];
-    for (const it of items) {
-      if (String(it?.msgtype ?? "").toLowerCase() === "text") {
-        const c = String(it?.text?.content ?? "").trim();
-        if (c) parts.push(c);
-      }
+    for (const item of items) {
+      if (String(item?.msgtype ?? "").toLowerCase() !== "text") continue;
+      const content = String(item?.text?.content ?? "").trim();
+      if (content) parts.push(content);
     }
   } else {
-    const c = String(body?.text?.content ?? "").trim();
-    if (c) parts.push(c);
+    const content = String(body?.text?.content ?? "").trim();
+    if (content) parts.push(content);
     if (msgtype === "voice") {
-      const v = String(body?.voice?.content ?? "").trim(); // voice transcription, when present
-      if (v) parts.push(v);
+      const transcript = String(body?.voice?.content ?? "").trim();
+      if (transcript) parts.push(transcript);
     }
   }
   return parts.join("\n").trim();
 }
 
-/** Collect downloadable media refs from a WeCom callback body (pure). Covers top-level `image`/`file` and the image
- *  runs inside a `mixed` message. */
 function extractWecomMedia(body: any): WecomMediaRef[] {
   const refs: WecomMediaRef[] = [];
-  const pushMedia = (kind: "image" | "file", m: any): void => {
-    if (!m || typeof m !== "object") return;
-    refs.push({
+  const pushMedia = (kind: WecomMediaRef["kind"], media: any): void => {
+    if (!media || typeof media !== "object") return;
+    const ref: WecomMediaRef = {
       kind,
-      url: typeof m.url === "string" ? m.url : undefined,
-      base64: typeof m.base64 === "string" ? m.base64 : undefined,
-      aesKeyB64: typeof m.aeskey === "string" ? m.aeskey : undefined,
-      fileName: typeof m.filename === "string" ? m.filename : typeof m.name === "string" ? m.name : undefined,
-    });
+      url: typeof media.url === "string" ? media.url : undefined,
+      base64: typeof media.base64 === "string" ? media.base64 : undefined,
+      aesKeyB64: typeof media.aeskey === "string" ? media.aeskey : undefined,
+      fileName: typeof media.filename === "string"
+        ? media.filename
+        : typeof media.name === "string"
+          ? media.name
+          : undefined,
+    };
+    // Do not admit metadata-only placeholders into the download budget.
+    if (ref.url || ref.base64) refs.push(ref);
   };
   const msgtype = String(body?.msgtype ?? "").toLowerCase();
   if (msgtype === "mixed") {
     const items = Array.isArray(body?.mixed?.msg_item) ? body.mixed.msg_item : [];
-    for (const it of items) if (String(it?.msgtype ?? "").toLowerCase() === "image") pushMedia("image", it.image);
+    for (const item of items) {
+      if (String(item?.msgtype ?? "").toLowerCase() === "image") pushMedia("image", item.image);
+    }
   } else {
-    if (body?.image) pushMedia("image", body.image);
-    if (msgtype === "file" && body?.file) pushMedia("file", body.file);
+    if (msgtype === "image") pushMedia("image", body?.image);
+    if (msgtype === "file") pushMedia("file", body?.file);
+    if (msgtype === "video") pushMedia("video", body?.video);
   }
   return refs;
 }
 
-/** Parse a WeCom `aibot_msg_callback` payload → InboundMsg + its downloadable media refs (pure; the actual download
- *  happens in start()). `selfBotId` filters out the bot's own echoes. null = ignore (own message / empty / no chat
- *  id). chatId is the WeCom chatid (group) else the sender's userid (DM); userId/userName are the sender's userid.
- *  Mirrors parseDiscordMessage. */
+/** WeCom transports `create_time` as seconds today; tolerate millisecond fixtures and future protocol drift. */
+export function wecomTimestampMs(value: unknown): number | undefined {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.trunc(parsed < 1_000_000_000_000 ? parsed * 1_000 : parsed);
+}
+
+function stableWecomId(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (Number.isSafeInteger(value)) return String(value);
+  return undefined;
+}
+
+/** Parse a WeCom callback into the gateway's platform-neutral inbound message. */
 export function parseWecomMessage(
   payload: any,
   selfBotId: string,
@@ -145,35 +257,37 @@ export function parseWecomMessage(
 
   const sender = typeof body.from === "object" && body.from ? body.from : {};
   const senderId = String(sender.userid ?? "").trim();
-  // ignore our own messages (the bot speaking) so we never loop on our replies
   if (selfBotId && senderId && senderId === selfBotId) return null;
-  if (selfBotId && String(body.bot_id ?? body.botid ?? "").trim() === selfBotId && !senderId) return null;
+  if (selfBotId && String(body.aibotid ?? body.bot_id ?? body.botid ?? "").trim() === selfBotId && !senderId) return null;
 
   const chatId = String(body.chatid ?? senderId).trim();
   if (!chatId) return null;
-
   const text = extractWecomText(body);
   const media = extractWecomMedia(body);
-  if (!text && !media.length) return null; // unsupported type or empty
+  if (!text && !media.length) return null;
 
-  // WeCom AI Bot callbacks use chattype="single" or "group". Only the explicit single value proves a DM;
-  // missing/unknown types fail closed as group even when chatid happens to be absent.
-  const chatType = String(body.chattype ?? "").trim().toLowerCase() === "single" ? "p2p" : "group";
+  const messageId = stableWecomId(body.msgid) ?? stableWecomId(payload?.headers?.req_id);
+  const createdAtMs = wecomTimestampMs(body.create_time);
+  const marker = media.some((ref) => ref.kind === "image")
+    ? "[图片]"
+    : media.some((ref) => ref.kind === "video")
+      ? "[视频]"
+      : "[附件]";
 
   return {
     msg: {
       chatId,
       userId: senderId || chatId,
       userName: String(sender.name ?? sender.userid ?? senderId ?? chatId),
-      text: text || "[图片]",
-      chatType,
+      text: text || marker,
+      ...(messageId ? { messageId } : {}),
+      ...(createdAtMs === undefined ? {} : { createdAtMs }),
+      chatType: String(body.chattype ?? "").trim().toLowerCase() === "single" ? "p2p" : "group",
     },
     media,
   };
 }
 
-/** Download (and AES-decrypt if needed) a WeCom inbound media ref → a local path under ~/.hara/wecom/media. null on
- *  failure. Inline base64 and remote (optionally encrypted) urls are both handled. */
 async function downloadWecomMedia(
   ref: WecomMediaRef,
   options: { maxBytes: number; signal: AbortSignal },
@@ -183,18 +297,20 @@ async function downloadWecomMedia(
     if (ref.base64) {
       data = decodeBase64Media(ref.base64, options.maxBytes);
     } else if (ref.url) {
-      const r = await fetch(ref.url, { signal: options.signal });
-      if (!r.ok) return null;
-      data = await readResponseBytesLimited(r, options.maxBytes, options.signal);
+      const response = await fetch(ref.url, { signal: options.signal });
+      if (!response.ok) return null;
+      data = await readResponseBytesLimited(response, options.maxBytes, options.signal);
     }
-    if (!data || !data.length) return null;
+    if (!data?.length) return null;
     if (ref.aesKeyB64) data = decryptWecomMedia(data, ref.aesKeyB64);
     if (!data.length || data.length > options.maxBytes) return null;
+
     let name = ref.fileName ? basename(ref.fileName) : "";
-    if (!name || (ref.kind === "image" && !extname(name))) name = `image${imageExtFromBytes(data)}`;
+    if (ref.kind === "image" && (!name || !extname(name))) name = `image${imageExtFromBytes(data)}`;
+    if (!name) name = ref.kind === "video" ? "video.mp4" : "file.bin";
     return await savePrivateMediaBytes(data, {
       platform: "wecom",
-      filenameHint: name || "file.bin",
+      filenameHint: name,
       ...options,
     });
   } catch {
@@ -202,188 +318,416 @@ async function downloadWecomMedia(
   }
 }
 
-export function wecomAdapter(botId: string, secret: string, wsUrl: string = DEFAULT_WS_URL): ChatAdapter {
-  // per-connection request/response correlation lives inside connectOnce; send/sendFile use the live socket handle
-  // it publishes through `conn`.
-  const conn: { send: ((cmd: string, body: any) => Promise<any>) | null } = { send: null };
+export function wecomAdapter(
+  botId: string,
+  secret: string,
+  wsUrl: string = DEFAULT_WS_URL,
+  transportOptions: WecomTransportOptions = {},
+): ChatAdapter {
+  if (!botId.trim() || !secret) throw new Error("WeCom bot id and secret are required");
+  const options = resolveTransportOptions(transportOptions);
+  const conn: LiveConnection = { send: null };
+  const outbound = new PerChatOutboundLane("wecom", botId);
 
-  // Upload already-verified bytes to WeCom via the 3-step chunked protocol → its media_id.
-  async function uploadMedia(file: OutboundFilePayload, mediaType: "image" | "file"): Promise<string> {
-    if (!conn.send) throw new Error("WeCom socket not connected");
+  async function uploadMedia(
+    request: WecomRequest,
+    file: OutboundFilePayload,
+    mediaType: "image" | "file",
+    signal: AbortSignal,
+  ): Promise<string> {
     const data = file.bytes;
+    if (!data.length) throw new Error("cannot upload an empty file to WeCom");
     if (data.length > ABSOLUTE_MAX_BYTES) throw new Error(`file exceeds WeCom 20MB limit: ${data.length} bytes`);
-    const totalChunks = Math.max(1, Math.ceil(data.length / UPLOAD_CHUNK_SIZE));
-    const init = await conn.send(CMD_UPLOAD_INIT, {
+    const totalChunks = Math.ceil(data.length / UPLOAD_CHUNK_SIZE);
+    const init = await request(CMD_UPLOAD_INIT, {
       type: mediaType,
-      filename: file.safeName,
+      filename: basename(file.safeName) || "file.bin",
       total_size: data.length,
       total_chunks: totalChunks,
       md5: createHash("md5").update(data).digest("hex"),
-    });
+    }, signal);
     const uploadId = String(init?.body?.upload_id ?? "").trim();
-    if (!uploadId) throw new Error(`media upload init returned no upload_id (${JSON.stringify(init?.errmsg ?? init)})`);
-    for (let i = 0, start = 0; start < data.length || i === 0; i++, start += UPLOAD_CHUNK_SIZE) {
-      const chunk = data.subarray(start, start + UPLOAD_CHUNK_SIZE);
-      await conn.send(CMD_UPLOAD_CHUNK, { upload_id: uploadId, chunk_index: i, base64_data: chunk.toString("base64") });
-      if (start + UPLOAD_CHUNK_SIZE >= data.length) break;
+    if (!uploadId) throw new Error("WeCom media upload init returned no upload_id");
+
+    for (let index = 0; index < totalChunks; index++) {
+      const start = index * UPLOAD_CHUNK_SIZE;
+      const chunk = data.subarray(start, Math.min(start + UPLOAD_CHUNK_SIZE, data.length));
+      let uploaded = false;
+      let lastError: unknown;
+      for (let attempt = 0; attempt <= MAX_UPLOAD_CHUNK_RETRIES; attempt++) {
+        throwIfAborted(signal, "WeCom upload");
+        try {
+          await request(CMD_UPLOAD_CHUNK, {
+            upload_id: uploadId,
+            chunk_index: index,
+            base64_data: chunk.toString("base64"),
+          }, signal);
+          uploaded = true;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (attempt < MAX_UPLOAD_CHUNK_RETRIES) await waitForDelay(250 * (attempt + 1), signal);
+        }
+      }
+      if (!uploaded) {
+        const reason = lastError instanceof Error ? lastError.message : "unknown transport error";
+        throw new Error(`WeCom media chunk ${index} failed after ${MAX_UPLOAD_CHUNK_RETRIES + 1} attempts: ${reason}`);
+      }
     }
-    const fin = await conn.send(CMD_UPLOAD_FINISH, { upload_id: uploadId });
-    const mediaId = String(fin?.body?.media_id ?? "").trim();
-    if (!mediaId) throw new Error(`media upload finish returned no media_id (${JSON.stringify(fin?.errmsg ?? fin)})`);
+
+    const finish = await request(CMD_UPLOAD_FINISH, { upload_id: uploadId }, signal);
+    const mediaId = String(finish?.body?.media_id ?? "").trim();
+    if (!mediaId) throw new Error("WeCom media upload finish returned no media_id");
     return mediaId;
   }
 
   return {
     name: "wecom",
-    async send(chatId, text) {
-      if (!conn.send) return; // no live socket yet → nothing to reply through
-      for (const part of chunkText(text || "(empty)", MAX_MESSAGE_LENGTH)) {
-        await conn
-          .send(CMD_SEND, { chatid: String(chatId), msgtype: "markdown", markdown: { content: part } })
-          .catch(() => {});
-      }
+    async send(chatId, text, signal) {
+      await withOutboundDeadline("WeCom send", signal, outboundTransferTimeoutMs("text"), async (transferSignal) => {
+        return outbound.run(chatId, async () => {
+          const request = conn.send;
+          if (!request) throw new Error("WeCom socket is not authenticated");
+          for (const part of chunkText(text || "(empty)", MAX_MESSAGE_LENGTH)) {
+            await request(CMD_SEND, {
+              chatid: String(chatId),
+              msgtype: "markdown",
+              markdown: { content: part },
+            }, transferSignal);
+          }
+        });
+      });
     },
-    async sendFile(chatId, file) {
-      if (!conn.send) return;
-      const mediaType: "image" | "file" = isImageName(file.safeName) ? "image" : "file";
-      try {
-        const mediaId = await uploadMedia(file, mediaType);
-        await conn.send(CMD_SEND, { chatid: String(chatId), msgtype: mediaType, [mediaType]: { media_id: mediaId } });
-      } catch {
-        /* upload/send failed — caller surfaces a generic failure; nothing else to do */
-      }
+    async sendFile(chatId, file, signal) {
+      await withOutboundDeadline("WeCom upload", signal, outboundTransferTimeoutMs("file"), async (transferSignal) => {
+        return outbound.run(chatId, async () => {
+          const request = conn.send;
+          if (!request) throw new Error("WeCom socket is not authenticated");
+          const mediaType: "image" | "file" = isImageName(file.safeName) ? "image" : "file";
+          const mediaId = await uploadMedia(request, file, mediaType, transferSignal);
+          await request(CMD_SEND, {
+            chatid: String(chatId),
+            msgtype: mediaType,
+            [mediaType]: { media_id: mediaId },
+          }, transferSignal);
+        });
+      });
     },
     async start(onMessage, signal, shouldDownload) {
-      if (!WSImpl) {
-        console.error("hara gateway: WeCom needs Node ≥ 22 (global WebSocket). Upgrade Node.");
-        return;
-      }
+      if (!WSImpl) throw new Error("WeCom gateway requires Node 22.12 or newer; upgrade Node and restart Hara");
+      let authFailures = 0;
+      let reconnectAttempts = 0;
       while (!signal.aborted) {
-        await connectOnce(botId, secret, wsUrl, conn, onMessage, signal, shouldDownload);
-        if (!signal.aborted) await sleep(3000, signal); // reconnect backoff
+        const outcome = await connectOnce(botId, secret, wsUrl, conn, onMessage, signal, shouldDownload, options);
+        if (signal.aborted || outcome.reason === "aborted") return;
+        if (outcome.reason === "superseded") {
+          throw new Error("WeCom connection was replaced by another active bot connection; stopped to avoid a reconnect loop");
+        }
+
+        let attempt: number;
+        if (outcome.reason === "auth-failed") {
+          authFailures++;
+          reconnectAttempts = 0;
+          if (authFailures >= options.maxAuthFailures) {
+            throw new Error(`WeCom authentication failed ${authFailures} time(s); check HARA_WECOM_BOT_ID and HARA_WECOM_SECRET`);
+          }
+          attempt = authFailures;
+          console.error(
+            `hara wecom: authentication failed (attempt ${authFailures}/${options.maxAuthFailures}); reconnecting.`,
+          );
+        } else {
+          authFailures = 0;
+          reconnectAttempts = outcome.authenticated ? 1 : reconnectAttempts + 1;
+          attempt = reconnectAttempts;
+          console.error(`hara wecom: ${outcome.detail ?? "connection closed"}; reconnecting.`);
+        }
+        await waitForDelay(reconnectDelay(attempt, options), signal).catch(() => undefined);
       }
     },
   };
 }
 
-/** One gateway connection: open WS → `aibot_subscribe` auth → correlate request/response by req_id, dispatch
- *  `aibot_msg_callback` events, heartbeat with `ping`. Resolves on close/abort; the caller reconnects (fresh
- *  subscribe each time — v1 keeps it simple, no resume). */
 function connectOnce(
   botId: string,
   secret: string,
   wsUrl: string,
-  conn: { send: ((cmd: string, body: any) => Promise<any>) | null },
-  onMessage: (m: InboundMsg) => Promise<void>,
+  conn: LiveConnection,
+  onMessage: (message: InboundMsg) => Promise<unknown>,
   signal: AbortSignal,
-  shouldDownload?: (m: InboundMsg) => boolean,
-): Promise<void> {
+  shouldDownload: ((message: InboundMsg) => boolean) | undefined,
+  options: ResolvedWecomTransportOptions,
+): Promise<ConnectOutcome> {
   return new Promise((resolve) => {
     const ws = new WSImpl(wsUrl);
-    let hb: ReturnType<typeof setInterval> | null = null;
-    const pending = new Map<string, { resolve: (v: any) => void; timer: ReturnType<typeof setTimeout> }>();
-    const seen = new Set<string>(); // msgid dedup within this connection (network hiccups can re-deliver)
+    const pending = new Map<string, PendingRequest>();
+    const heartbeatIds = new Set<string>();
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let authTimer: ReturnType<typeof setTimeout> | null = null;
+    let authReqId = "";
+    let missedHeartbeats = 0;
+    let authenticated = false;
+    let settled = false;
 
-    const sendRaw = (frame: any): void => {
+    const closeSocket = (): void => {
       try {
-        ws.send(JSON.stringify(frame));
+        if (ws.readyState === WS_CONNECTING || ws.readyState === WS_OPEN) ws.close();
       } catch {
-        /* socket gone — close handler resolves */
+        /* already closed */
       }
     };
-    // Send a request and await the frame whose headers.req_id matches; times out so callers never hang.
-    const request = (cmd: string, body: any): Promise<any> =>
-      new Promise((res) => {
-        const reqId = `${cmd}-${randomUUID()}`;
-        const timer = setTimeout(() => {
-          pending.delete(reqId);
-          res({ errcode: -1, errmsg: "timeout" });
-        }, REQUEST_TIMEOUT_MS);
-        pending.set(reqId, { resolve: res, timer });
-        sendRaw({ cmd, headers: { req_id: reqId }, body });
-      });
 
-    const cleanup = (): void => {
-      if (hb) clearInterval(hb);
+    const detachPending = (entry: PendingRequest): void => {
+      clearTimeout(entry.timer);
+      if (entry.signal && entry.onAbort) entry.signal.removeEventListener("abort", entry.onAbort);
+    };
+
+    const cleanup = (reason: Error): void => {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (authTimer) clearTimeout(authTimer);
+      heartbeatTimer = null;
+      authTimer = null;
+      heartbeatIds.clear();
       signal.removeEventListener("abort", stop);
-      for (const { resolve: r, timer } of pending.values()) {
-        clearTimeout(timer);
-        r({ errcode: -1, errmsg: "connection closed" });
+      for (const entry of pending.values()) {
+        detachPending(entry);
+        entry.reject(reason);
       }
       pending.clear();
       if (conn.send === request) conn.send = null;
     };
-    const stop = (): void => {
-      cleanup();
-      try {
-        ws.close();
-      } catch {
-        /* already closing */
-      }
-      resolve();
+
+    const finish = (reason: ConnectReason, detail?: string): void => {
+      if (settled) return;
+      settled = true;
+      cleanup(new Error(detail ?? "WeCom connection closed"));
+      if (reason !== "closed") closeSocket();
+      resolve({ reason, authenticated, ...(detail ? { detail } : {}) });
     };
-    signal.addEventListener("abort", stop, { once: true });
 
-    ws.addEventListener("open", () => {
-      // Authenticate, then publish this socket's request() so send/sendFile can use it; heartbeat keeps it alive.
-      sendRaw({ cmd: CMD_SUBSCRIBE, headers: { req_id: `subscribe-${randomUUID()}` }, body: { bot_id: botId, secret } });
-      conn.send = request;
-      hb = setInterval(() => sendRaw({ cmd: CMD_PING, headers: { req_id: `ping-${randomUUID()}` }, body: {} }), HEARTBEAT_MS);
-    });
-    ws.addEventListener("close", () => {
-      cleanup();
-      resolve();
-    });
-    ws.addEventListener("error", () => {});
-    ws.addEventListener("message", async (ev: any) => {
-      // Native WebSocket may hand us a string, an ArrayBuffer, or a Blob — normalize to text first.
-      let raw: string;
-      const d = ev?.data;
-      if (typeof d === "string") raw = d;
-      else if (d instanceof ArrayBuffer) raw = Buffer.from(d).toString("utf8");
-      else if (typeof d?.arrayBuffer === "function") raw = Buffer.from(await d.arrayBuffer()).toString("utf8");
-      else raw = String(d ?? "");
+    const stop = (): void => {
+      finish("aborted", "WeCom gateway stopped");
+      closeSocket();
+    };
 
-      let p: any;
+    const sendRaw = (frame: unknown): void => {
+      if (settled || ws.readyState !== WS_OPEN) throw new Error("WeCom socket is not open");
+      ws.send(JSON.stringify(frame));
+    };
+
+    const request: WecomRequest = (command, body, requestSignal) => {
+      if (settled || !authenticated || ws.readyState !== WS_OPEN) {
+        return Promise.reject(new Error("WeCom socket is not authenticated"));
+      }
+      if (requestSignal?.aborted) return Promise.reject(signalError(requestSignal, `WeCom ${command} cancelled`));
+      const reqId = `${command}-${randomUUID()}`;
+      return new Promise((resolveRequest, rejectRequest) => {
+        const onAbort = (): void => {
+          const entry = pending.get(reqId);
+          if (!entry) return;
+          pending.delete(reqId);
+          detachPending(entry);
+          rejectRequest(signalError(requestSignal, `WeCom ${command} cancelled`));
+        };
+        const timer = setTimeout(() => {
+          const entry = pending.get(reqId);
+          if (!entry) return;
+          pending.delete(reqId);
+          detachPending(entry);
+          rejectRequest(new Error(`WeCom ${command} timed out after ${options.requestTimeoutMs}ms`));
+        }, options.requestTimeoutMs);
+        const entry: PendingRequest = {
+          command,
+          resolve: resolveRequest,
+          reject: rejectRequest,
+          timer,
+          signal: requestSignal,
+          onAbort,
+        };
+        pending.set(reqId, entry);
+        requestSignal?.addEventListener("abort", onAbort, { once: true });
+        try {
+          sendRaw({ cmd: command, headers: { req_id: reqId }, body });
+        } catch (error) {
+          pending.delete(reqId);
+          detachPending(entry);
+          rejectRequest(error instanceof Error ? error : new Error("WeCom request send failed"));
+        }
+      });
+    };
+
+    const settleRequest = (reqId: string, frame: any): boolean => {
+      const entry = pending.get(reqId);
+      if (!entry) return false;
+      pending.delete(reqId);
+      detachPending(entry);
+      const code = Number(frame?.errcode);
+      if (code !== 0) {
+        entry.reject(new Error(
+          `WeCom ${entry.command} failed (code ${Number.isFinite(code) ? code : "invalid"}): ${protocolText(frame?.errmsg, secret)}`,
+        ));
+      } else {
+        entry.resolve(frame);
+      }
+      return true;
+    };
+
+    const handleCallback = async (frame: any): Promise<void> => {
+      if (signal.aborted || !authenticated) return;
+      const parsed = parseWecomMessage(frame, botId);
+      if (!parsed) return;
+      const transientFiles: string[] = [];
+      let handedOff = false;
       try {
-        p = JSON.parse(raw);
-      } catch {
-        return;
-      }
-      const cmd = String(p?.cmd ?? "");
-      const reqId = String(p?.headers?.req_id ?? "");
-
-      // A correlated response to one of our requests (and not itself a callback) → resolve the waiter.
-      if (reqId && pending.has(reqId) && !CALLBACK_CMDS.has(cmd)) {
-        const waiter = pending.get(reqId)!;
-        clearTimeout(waiter.timer);
-        pending.delete(reqId);
-        waiter.resolve(p);
-        return;
-      }
-      if (cmd === CMD_PING || cmd === CMD_EVENT_CALLBACK) return; // server ping / event ack → ignore
-      if (!CALLBACK_CMDS.has(cmd)) return; // pre-auth / unknown frame → ignore
-
-      const msgId = String(p?.body?.msgid ?? reqId ?? "");
-      if (msgId) {
-        if (seen.has(msgId)) return; // duplicate delivery → drop
-        seen.add(msgId);
-        if (seen.size > 1000) seen.clear();
-      }
-      const parsed = parseWecomMessage(p, botId);
-      if (parsed) {
-        if (shouldDownload?.(parsed.msg) === true) {
+        let text = parsed.msg.text;
+        const images: string[] = [];
+        if (shouldDownload?.(parsed.msg) === true && parsed.media.length) {
           const budget = new InboundMediaBudget("wecom", signal);
           for (const ref of parsed.media) {
-            const path = await budget.download((options) => downloadWecomMedia(ref, options));
-            if (path) {
-              (parsed.msg.images ??= []).push(path);
-              (parsed.msg.transientFiles ??= []).push(path);
+            const path = await budget.download((downloadOptions) => downloadWecomMedia(ref, downloadOptions));
+            if (!path) continue;
+            transientFiles.push(path);
+            if (ref.kind === "image") {
+              images.push(path);
+              if (text !== "[图片]" && !text.includes("[图片]")) text += `${text ? "\n" : ""}[图片]`;
+            } else {
+              const filename = ref.fileName ? basename(ref.fileName) : "";
+              const label = ref.kind === "video"
+                ? `视频${filename ? ` ${filename}` : ""}`
+                : `文件${filename ? ` ${filename}` : ""}`;
+              const marker = `[${label}: ${path}]`;
+              text = text === "[附件]" || text === "[视频]" ? marker : `${text}${text ? "\n" : ""}${marker}`;
             }
           }
         }
-        await onMessage(parsed.msg).catch(() => {});
+        if (signal.aborted) return;
+        const inbound: InboundMsg = {
+          ...parsed.msg,
+          text: text.trim() || parsed.msg.text,
+          images: images.length ? images : undefined,
+          transientFiles: transientFiles.length ? transientFiles : undefined,
+        };
+        handedOff = true;
+        await onMessage(inbound);
+      } finally {
+        if (!handedOff && transientFiles.length) await cleanupTransientMedia("wecom", transientFiles);
       }
+    };
+
+    const handleMessage = async (event: any): Promise<void> => {
+      const data = event?.data;
+      if (typeof data === "string" && Buffer.byteLength(data, "utf8") > MAX_FRAME_BYTES) {
+        finish("closed", "received an oversized WeCom frame");
+        closeSocket();
+        return;
+      }
+      if (data instanceof ArrayBuffer && data.byteLength > MAX_FRAME_BYTES) {
+        finish("closed", "received an oversized WeCom frame");
+        closeSocket();
+        return;
+      }
+      if (typeof data?.size === "number" && data.size > MAX_FRAME_BYTES) {
+        finish("closed", "received an oversized WeCom frame");
+        closeSocket();
+        return;
+      }
+
+      let raw: string;
+      if (typeof data === "string") raw = data;
+      else if (data instanceof ArrayBuffer) raw = Buffer.from(data).toString("utf8");
+      else if (typeof data?.arrayBuffer === "function") raw = Buffer.from(await data.arrayBuffer()).toString("utf8");
+      else raw = String(data ?? "");
+      let frame: any;
+      try {
+        frame = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      const cmd = String(frame?.cmd ?? "");
+      const reqId = String(frame?.headers?.req_id ?? "");
+
+      if (reqId && reqId === authReqId) {
+        if (authenticated) return; // a duplicate auth ACK must not install a second heartbeat timer
+        if (authTimer) clearTimeout(authTimer);
+        authTimer = null;
+        if (Number(frame?.errcode) !== 0) {
+          finish(
+            "auth-failed",
+            `WeCom authentication failed (code ${Number.isFinite(Number(frame?.errcode)) ? Number(frame.errcode) : "invalid"}): ${protocolText(frame?.errmsg, secret)}`,
+          );
+          return;
+        }
+        authenticated = true;
+        missedHeartbeats = 0;
+        conn.send = request;
+        console.error("hara wecom: authenticated.");
+        heartbeatTimer = setInterval(() => {
+          if (missedHeartbeats >= MAX_MISSED_HEARTBEATS) {
+            finish("closed", `heartbeat ACK timed out after ${missedHeartbeats} missed ping(s)`);
+            closeSocket();
+            return;
+          }
+          const heartbeatId = `${CMD_PING}-${randomUUID()}`;
+          missedHeartbeats++;
+          heartbeatIds.add(heartbeatId);
+          try {
+            sendRaw({ cmd: CMD_PING, headers: { req_id: heartbeatId }, body: {} });
+          } catch {
+            finish("closed", "heartbeat send failed");
+            closeSocket();
+          }
+        }, options.heartbeatMs);
+        return;
+      }
+
+      if (reqId && heartbeatIds.has(reqId)) {
+        heartbeatIds.delete(reqId);
+        if (Number(frame?.errcode) === 0) {
+          missedHeartbeats = 0;
+          heartbeatIds.clear();
+        }
+        return;
+      }
+
+      if (reqId && !CALLBACK_CMDS.has(cmd) && cmd !== CMD_EVENT_CALLBACK && settleRequest(reqId, frame)) return;
+      if (!authenticated) return;
+      if (cmd === CMD_EVENT_CALLBACK) {
+        if (String(frame?.body?.event?.eventtype ?? "") === "disconnected_event") {
+          finish("superseded", "another active WeCom connection replaced this one");
+        }
+        return;
+      }
+      if (cmd === CMD_PING) return;
+      if (!CALLBACK_CMDS.has(cmd)) return;
+      await handleCallback(frame);
+    };
+
+    signal.addEventListener("abort", stop, { once: true });
+    ws.addEventListener("open", () => {
+      authReqId = `${CMD_SUBSCRIBE}-${randomUUID()}`;
+      authTimer = setTimeout(() => {
+        finish("auth-failed", `WeCom authentication ACK timed out after ${options.requestTimeoutMs}ms`);
+        closeSocket();
+      }, options.requestTimeoutMs);
+      try {
+        sendRaw({
+          cmd: CMD_SUBSCRIBE,
+          headers: { req_id: authReqId },
+          body: { bot_id: botId, secret },
+        });
+      } catch {
+        finish("closed", "could not send the WeCom authentication frame");
+        closeSocket();
+      }
+    });
+    ws.addEventListener("message", (event: any) => {
+      void handleMessage(event).catch((error) => {
+        console.error(`hara wecom: callback handling failed — ${protocolText(error instanceof Error ? error.message : error, secret)}`);
+      });
+    });
+    ws.addEventListener("close", () => finish("closed", "connection closed"));
+    ws.addEventListener("error", () => {
+      finish("closed", "WebSocket transport error");
+      closeSocket();
     });
   });
 }
