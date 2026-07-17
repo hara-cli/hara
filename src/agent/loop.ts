@@ -251,6 +251,7 @@ interface RunLifecycle {
   timeoutController: AbortController;
   timeoutTimer: ReturnType<typeof setTimeout>;
   warningTimer: ReturnType<typeof setTimeout>;
+  checkpointTimer: ReturnType<typeof setTimeout>;
   stopPromise: Promise<typeof RUN_STOPPED>;
   removeStopListener: () => void;
   startedAt: number;
@@ -259,9 +260,21 @@ interface RunLifecycle {
   rounds: number;
   timedOut: boolean;
   warned: boolean;
+  checkpointDue: boolean;
+  checkpointInjected: boolean;
   limitAnnounced: boolean;
   disposed: boolean;
   failedCalls: Map<string, number>;
+}
+
+export function deadlineCheckpointReminder(timeoutMs: number): string {
+  return (
+    `Turn budget checkpoint: about 20% remains before the ${formatAgentDuration(timeoutMs)} safety pause. ` +
+    "Stop expanding scope. Finish only the current atomic step, persist any usable artifact, update todo_write, " +
+    "and reply with the completed checkpoint plus the next exact step. Do not start another generation batch, " +
+    "install, full validation suite, preview, render, deployment, or other multi-minute stage in this turn. " +
+    "The user can run /continue to start that next stage with a fresh bounded budget."
+  );
 }
 
 function showRunNotice(opts: RunOpts, message: string, critical = false): void {
@@ -275,6 +288,16 @@ function showRunNotice(opts: RunOpts, message: string, critical = false): void {
       /* diagnostics must never break lifecycle enforcement */
     }
   }
+}
+
+function requestRunCheckpoint(opts: RunOpts, life: RunLifecycle): void {
+  if (life.disposed || life.checkpointDue || life.signal.aborted) return;
+  life.checkpointDue = true;
+  const remainingMs = Math.max(0, life.timeoutMs - (Date.now() - life.startedAt));
+  showRunNotice(
+    opts,
+    `⚠ agent turn nearing its safety pause: ${formatAgentDuration(remainingMs)} remains. The agent will be told to finish the current atomic step and checkpoint; use \`/continue\` for the next expensive stage.`,
+  );
 }
 
 function warnRun(opts: RunOpts, life: RunLifecycle): void {
@@ -306,6 +329,9 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
   const warningDelay = Math.min(5 * 60_000, Math.max(250, Math.floor(timeoutMs * 0.8)));
   const warningTimer = setTimeout(() => warnRun(opts, life), warningDelay);
   warningTimer.unref?.();
+  const checkpointDelay = Math.max(250, Math.floor(timeoutMs * 0.8));
+  const checkpointTimer = setTimeout(() => requestRunCheckpoint(opts, life), checkpointDelay);
+  checkpointTimer.unref?.();
   let removeStopListener = (): void => {};
   const stopPromise = new Promise<typeof RUN_STOPPED>((resolveStopped) => {
     const stopped = (): void => resolveStopped(RUN_STOPPED);
@@ -318,6 +344,7 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
     timeoutController,
     timeoutTimer,
     warningTimer,
+    checkpointTimer,
     stopPromise,
     removeStopListener,
     startedAt,
@@ -326,6 +353,8 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
     rounds: 0,
     timedOut: false,
     warned: false,
+    checkpointDue: false,
+    checkpointInjected: false,
     limitAnnounced: false,
     disposed: false,
     failedCalls: new Map<string, number>(),
@@ -337,6 +366,7 @@ function disposeRunLifecycle(life: RunLifecycle): void {
   life.disposed = true;
   clearTimeout(life.timeoutTimer);
   clearTimeout(life.warningTimer);
+  clearTimeout(life.checkpointTimer);
   life.removeStopListener();
 }
 
@@ -434,6 +464,14 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     if (life.rounds >= life.maxRounds) return hardStop(opts, life, "max_rounds");
     life.rounds += 1;
     if (life.rounds >= Math.ceil(life.maxRounds * 0.75)) warnRun(opts, life);
+    if (Date.now() - life.startedAt >= Math.floor(life.timeoutMs * 0.8)) requestRunCheckpoint(opts, life);
+    if (!opts.quiet && life.checkpointDue && !life.checkpointInjected) {
+      life.checkpointInjected = true;
+      history.push({
+        role: "user",
+        content: wrapReminders([deadlineCheckpointReminder(life.timeoutMs)]),
+      });
+    }
     // Type-ahead steering: fold in anything the user submitted while the previous step ran, so it
     // reaches the model on this next call (drained after the last tool round; empty on the 1st pass).
     if (opts.pendingInput && !runSignal.aborted) {

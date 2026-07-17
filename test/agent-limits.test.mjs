@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runAgent } from "../dist/agent/loop.js";
+import { deadlineCheckpointReminder, runAgent } from "../dist/agent/loop.js";
 import {
   agentMaxRounds,
   agentRunTimeoutMs,
@@ -234,6 +234,42 @@ test("total deadline stops a provider that stays active forever and ignores Abor
   assert.ok(Date.now() - started < 2_500, "an active/non-cooperative provider cannot hold the run open");
   assert.equal(alerts.length, 1);
   assert.equal(notices.filter((message) => /agent run paused/.test(message)).length, 1);
+});
+
+test("the 80% time boundary reaches the model as an in-band checkpoint instruction", async () => {
+  let turn = 0;
+  let sawCheckpoint = false;
+  const provider = {
+    id: "checkpoint-aware",
+    model: "checkpoint-aware",
+    async turn({ history }) {
+      turn += 1;
+      if (turn === 1) {
+        return { text: "", toolUses: [{ id: "slow-stage-1", name: "slow_stage", input: {} }], stop: "tool_use" };
+      }
+      sawCheckpoint = history.some((message) =>
+        message.role === "user" && message.content.includes("Turn budget checkpoint: about 20% remains"),
+      );
+      return { text: "checkpoint saved", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "do a long staged task" }], base(provider, {
+    timeoutMs: 2_000,
+    maxRounds: 10,
+    extraTools: [{
+      name: "slow_stage",
+      description: "finishes one atomic stage near the checkpoint boundary",
+      input_schema: { type: "object", properties: {} },
+      kind: "read",
+      async run() {
+        await tick(1_650);
+        return "stage artifact saved";
+      },
+    }],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(sawCheckpoint, true);
+  assert.match(deadlineCheckpointReminder(30 * 60_000), /Do not start another generation batch/);
 });
 
 test("total deadline closes a tool round even when the tool ignores cancellation", async () => {

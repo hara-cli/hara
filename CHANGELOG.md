@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.124.4 — 2026-07-18 — deadline-aware task checkpoints
+
+- **The 80% run-budget warning now reaches the Agent, not only the user.** Before the next model turn,
+  Hara injects a hidden checkpoint instruction to finish the current atomic step, persist artifacts,
+  update the checklist, and defer a new multi-minute stage to `/continue`. A video/image batch, full
+  validation, preview, render, install, or deployment should no longer begin with too little turn budget
+  and then appear to stop mysteriously at the 30-minute safety pause.
+
 ## 0.124.3 — 2026-07-17 — project-aware resume and runtime hardening
 
 - **Saved sessions now resume in the project they belong to.** `hara resume <id>` validates the persisted
