@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## Unreleased
+## 0.124.3 — 2026-07-17 — project-aware resume and runtime hardening
 
 - **Saved sessions now resume in the project they belong to.** `hara resume <id>` validates the persisted
   project root and relaunches there even when invoked from another directory; session lists show each project
@@ -26,6 +26,7 @@ All notable changes to `@nanhara/hara`.
 - **Session input is bounded before parsing and recursive processing.** Resume/list reject oversized,
   excessively deep, structure-heavy, symlinked, or hard-linked session files through a verified no-follow
   snapshot; saves fail atomically with compact/new-session guidance before unsafe allocations.
+- Upgrade with `npm i -g @nanhara/hara@0.124.3`.
 
 ## 0.124.2 — 2026-07-17 — reliable WeCom gateway transport
 
