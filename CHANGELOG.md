@@ -5,6 +5,27 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.124.2 — 2026-07-17 — reliable WeCom gateway transport
+
+- **The WeCom gateway is ready only after WeCom accepts its credentials.** Hara now waits for the
+  `aibot_subscribe` acknowledgement, stops after five bounded credential failures, monitors heartbeat
+  acknowledgements, reconnects half-open sockets with bounded exponential backoff, and stops cleanly when
+  `disconnected_event` reports that another active connection replaced it.
+- **A failed WeCom delivery is no longer reported as success.** Correlated requests reject on timeout,
+  cancellation, connection loss, malformed/nonzero acknowledgements, or missing upload results. Text and file
+  transfers have hard deadlines and credential-scoped per-chat FIFO ordering; chunk uploads retry within a
+  fixed bound, and transport diagnostics redact the configured Secret.
+- **WeCom callbacks now participate in Hara's cross-restart execution boundary.** Stable `msgid` and
+  `create_time` metadata feed stale-event filtering, deduplication, and cached no-rerun outcomes so a redelivery
+  cannot silently launch the same coding/file task again.
+- **Inbound media fails closed and keeps file types separate.** Images remain vision attachments, while files
+  and videos become explicit private local-path references. Invalid AES ciphertext/padding is rejected instead
+  of returning padded bytes, and unfinished handoffs remove adapter-owned temporary files.
+- A deterministic local WebSocket suite covers auth failure, heartbeat reconnection, request errors, strict
+  decryption, media classification, two-chunk upload, and a spawned `hara gateway --platform wecom` allowlist
+  round trip without using real enterprise credentials.
+- Upgrade with `npm i -g @nanhara/hara@0.124.2`.
+
 ## 0.124.1 — 2026-07-16 — Windows native private-state and file-identity portability
 
 - **Windows private state works in both Node and the native Bun executable.** Exclusive staging creation now
