@@ -1,7 +1,7 @@
 import type { ToolSpec } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
 import { limitToolResult } from "./result-limit.js";
-import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
+import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
 
 /** Where agent-side output goes. In the TUI it drives ink state; in plain mode it's absent and
  *  the loop/tools fall back to writing the terminal directly. */
@@ -90,7 +90,7 @@ export function registerTool(t: Tool): void {
       // Only explicitly project-scoped operations are blocked. Tool kinds are also used for safe
       // management/delivery side effects, so a kind must not itself imply a project workspace requirement.
       // Canonical comparison closes Home symlink aliases.
-      if (t.requiresProjectWorkspace && isHomeWorkspace(ctx.cwd)) {
+      if (t.requiresProjectWorkspace && isUnsafeProjectWorkspace(ctx.cwd)) {
         return `Error: ${homeWorkspaceActionError(`run ${t.name}`)}`;
       }
       return limitToolResult(await run(input, ctx));

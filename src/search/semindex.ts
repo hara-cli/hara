@@ -18,7 +18,7 @@ import {
 import { zvecBuild, zvecQueryIds, zvecRemove } from "./zvec-store.js";
 import { isSensitiveFilePath } from "../security/sensitive-files.js";
 import { readModelContextFileSync } from "../fs-read.js";
-import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
+import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
 import {
   ensurePrivateStateSubdirectory,
   readPrivateStateFileSnapshot,
@@ -107,7 +107,7 @@ async function ensurePrivateIndexState(name: string, cwd: string): Promise<Priva
 
 function existingPrivateIndexPath(name: string, cwd: string): string | null {
   try {
-    if (name === "repo" && isHomeWorkspace(cwd)) return null;
+    if (name === "repo" && isUnsafeProjectWorkspace(cwd)) return null;
     const requested = indexPath(name, cwd);
     const base = realpathSync.native(indexBase(name, cwd));
     const hara = join(base, ".hara");
@@ -184,7 +184,7 @@ async function rotateLegacyIndex(name: string, cwd: string, state: PrivateIndexS
  *  embedding model forces a full rebuild (old vectors aren't comparable). Returns counts. */
 export async function buildIndex(name: string, chunks: Chunk[], embed: Embedder, cwd: string, model = "embed", signal?: AbortSignal): Promise<{ total: number; embedded: number; reused: number }> {
   if (signal?.aborted) throw new Error("semantic index build interrupted");
-  if (name === "repo" && isHomeWorkspace(cwd)) throw new Error(homeWorkspaceActionError("build a repository index"));
+  if (name === "repo" && isUnsafeProjectWorkspace(cwd)) throw new Error(homeWorkspaceActionError("build a repository index"));
   const state = await ensurePrivateIndexState(name, cwd);
   const p = state.path;
 
@@ -301,7 +301,7 @@ export function collectDirChunks(dir: string, source: string): Chunk[] {
 
 /** Walk the repo (respecting .gitignore) and chunk every code/text file — the corpus `hara index` embeds. */
 export function collectRepoChunks(root: string): Chunk[] {
-  if (isHomeWorkspace(root)) throw new Error(homeWorkspaceActionError("scan the home directory for a repository index"));
+  if (isUnsafeProjectWorkspace(root)) throw new Error(homeWorkspaceActionError("scan the home directory for a repository index"));
   const chunks: Chunk[] = [];
   for (const rel of listProjectFiles(root)) {
     if (!CODE_RE.test(rel) || looksSecret(rel)) continue;
@@ -385,7 +385,7 @@ export async function collectRepoChunksAsync(
   root: string,
   options: FileWalkOptions = {},
 ): Promise<ChunkCollectionResult> {
-  if (isHomeWorkspace(root)) throw new Error(homeWorkspaceActionError("scan the home directory for a repository index"));
+  if (isUnsafeProjectWorkspace(root)) throw new Error(homeWorkspaceActionError("scan the home directory for a repository index"));
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, Math.floor(options.timeoutMs!)) : 30_000;
   const startedAt = Date.now();
   const inventory = await listProjectFilesAsync(root, { ...options, timeoutMs });

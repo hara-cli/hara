@@ -280,9 +280,11 @@ function showRunNotice(opts: RunOpts, message: string, critical = false): void {
 function warnRun(opts: RunOpts, life: RunLifecycle): void {
   if (life.disposed || life.warned || life.signal.aborted) return;
   life.warned = true;
+  const elapsedMs = Date.now() - life.startedAt;
+  const remainingMs = Math.max(0, life.timeoutMs - elapsedMs);
   showRunNotice(
     opts,
-    `⚠ agent still running: ${formatAgentDuration(Date.now() - life.startedAt)} elapsed, round ${life.rounds}/${life.maxRounds}; hard stop at ${formatAgentDuration(life.timeoutMs)}.`,
+    `⚠ agent still running: ${formatAgentDuration(elapsedMs)} elapsed, round ${life.rounds}/${life.maxRounds}; ${formatAgentDuration(remainingMs)} remains before this turn pauses. Finish the current step or leave a checklist checkpoint; unfinished session work can resume with \`/continue\`.`,
   );
 }
 
@@ -341,7 +343,7 @@ function disposeRunLifecycle(life: RunLifecycle): void {
 function hardStop(opts: RunOpts, life: RunLifecycle, kind: RunStopReason, detail?: { tool?: string; count?: number }): RunOutcome {
   const elapsedMs = Date.now() - life.startedAt;
   const message = kind === "deadline"
-    ? `⛔ agent run stopped: total deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). No further model or tool calls will start. Increase it with \`hara config set runTimeoutMs 45m\` (maximum 2h) only for intentional long work.`
+    ? `⏸ agent run paused: total deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). No further model or tool calls will start in this turn. Session-backed work keeps its task and checklist checkpoint; type \`/continue\` to resume in a fresh bounded turn. Only for intentionally long single turns, use \`hara config set runTimeoutMs 45m\` (maximum 2h).`
     : kind === "max_rounds"
       ? `⛔ agent run stopped: ${life.maxRounds}-round safety limit reached after ${formatAgentDuration(elapsedMs)}. This usually means the model is looping. Increase it with \`hara config set maxAgentRounds <n>\` (maximum 256) only if the extra rounds are intentional.`
       : `⛔ agent run stopped: the same failing ${detail?.tool ?? "tool"} call repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;

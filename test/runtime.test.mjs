@@ -5,7 +5,14 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { applyPortableHomeEnv, MIN_NODE_MAJOR, MIN_NODE_VERSION, normalizePortableWindowsHome, unsupportedNodeMessage } from "../dist/runtime.js";
+import {
+  applyPortableHomeEnv,
+  effectiveHomeDir,
+  MIN_NODE_MAJOR,
+  MIN_NODE_VERSION,
+  normalizePortableWindowsHome,
+  unsupportedNodeMessage,
+} from "../dist/runtime.js";
 import { findStaleLocalHaraLinks, isLegacyLinkedTarget, staleLocalLinkWarning } from "../scripts/check-local-bin-link.mjs";
 
 const rootFile = (path) => fileURLToPath(new URL(`../${path}`, import.meta.url));
@@ -57,6 +64,15 @@ test("Windows portable/Git Bash HOME overrides USERPROFILE before Hara state is 
   applyPortableHomeEnv(msysEnv, "win32");
   assert.equal(msysEnv.USERPROFILE, "D:\\portable\\hara");
   assert.equal(bootstrap.normalizePortableWindowsHome("/d/portable/hara"), msysEnv.USERPROFILE);
+  assert.equal(
+    effectiveHomeDir(
+      { HOME: "/d/portable/hara", USERPROFILE: "C:\\Users\\real" },
+      "win32",
+      "C:\\Users\\real",
+    ),
+    "D:\\portable\\hara",
+    "direct module consumers use the same portable Home boundary without relying on bootstrap mutation",
+  );
 });
 
 test("runtime packaging: manifests, executable bin, scripts, and Docker use the guarded entry", () => {

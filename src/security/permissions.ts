@@ -28,7 +28,7 @@ import {
 import { psArgumentsExposeEnvironment } from "./sensitive-files.js";
 import { projectRepositoryTrustedAtStartup } from "./project-trust.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
-import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
+import { homeWorkspaceActionError, isHomeWorkspace, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 
 export type Decision = "allow" | "ask" | "deny";
@@ -399,7 +399,7 @@ function scaffoldProjectPermissions(cwd: string): string | null {
   const project = realpathSync.native(resolve(cwd));
   // Project scaffolding at ~/ would target the same ~/.hara/permissions.json used by global policy and
   // silently promote repository starter rules to every Hara session. Reject before creating `.hara`.
-  if (isHomeWorkspace(project)) throw new Error(homeWorkspaceActionError("create project permissions"));
+  if (isUnsafeProjectWorkspace(project)) throw new Error(homeWorkspaceActionError("create project permissions"));
   const projectIdentity = verifiedDirectory(project);
   const parent = join(project, ".hara");
   try {

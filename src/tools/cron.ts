@@ -11,7 +11,7 @@ import { runJobTracked } from "../cron/runner.js";
 import { parseDeliver } from "../cron/deliver.js";
 import { isInstalled } from "../cron/install.js";
 import { sensitiveShellCommandReason } from "../security/sensitive-files.js";
-import { homeWorkspaceActionError, isHomeWorkspace } from "../context/workspace-scope.js";
+import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
 
 const fmt = (ms: number | null): string => (ms ? new Date(ms).toLocaleString() : "—");
 const fmtNext = (ms: number | null, now: number): string => (
@@ -78,7 +78,7 @@ registerTool({
     if (action === "add") {
       // Every new job persists ctx.cwd and later treats it as its implicit agent/shell workspace. Management
       // of existing jobs remains available at Home, but creating a Home-root job would bypass project scope.
-      if (isHomeWorkspace(ctx.cwd)) return `Error: ${homeWorkspaceActionError("schedule a job")}`;
+      if (isUnsafeProjectWorkspace(ctx.cwd)) return `Error: ${homeWorkspaceActionError("schedule a job")}`;
       const scheduleStr = String(input.schedule ?? "").trim();
       const task = String(input.task ?? "").trim();
       if (!scheduleStr || !task) return "Error: add needs `schedule` and `task`.";

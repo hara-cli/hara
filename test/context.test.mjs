@@ -228,6 +228,10 @@ test("Home scope: autocomplete and coding mutations cannot inventory or promote 
     assert.match(write, /home directory.*cd \/path\/to\/project/i);
     assert.equal(existsSync(join(home, "new.txt")), false);
 
+    const ancestorWrite = await getTool("write_file").run({ path: "ancestor-new.txt", content: "nope" }, { cwd: root });
+    assert.match(ancestorWrite, /home directory.*cd \/path\/to\/project/i);
+    assert.equal(existsSync(join(root, "ancestor-new.txt")), false, "an ancestor scope cannot mutate and descend into Home");
+
     const patched = await getTool("apply_patch").run(
       { changes: [{ path: "patched.txt", type: "create", content: "nope" }] },
       { cwd: home },

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, statSync, readdirSync } from "node:fs";
+import { rmSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, statSync, readdirSync, truncateSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { homedir, tmpdir } from "node:os";
@@ -19,6 +19,8 @@ import {
   deriveTitle,
   validSessionId,
   sessionFileExists,
+  MAX_SESSION_FILE_BYTES,
+  MAX_SESSION_JSON_DEPTH,
 } from "../dist/session/store.js";
 import { SessionHub } from "../dist/serve/sessions.js";
 
@@ -71,12 +73,23 @@ test("session: corrupt / malformed files don't crash load or list (audit M4)", (
     writeFileSync(join(dir, "bad9.json"), JSON.stringify({ meta: { ...validMeta, id: "bad9" }, history: [null] }));
     writeFileSync(join(dir, "bad10.json"), JSON.stringify({ meta: { ...validMeta, id: "bad10" }, history: [{ role: "assistant", text: "x" }] }));
     writeFileSync(join(dir, "spoofed.json"), JSON.stringify({ meta: { ...validMeta, id: "different" }, history: [] }));
+    const oversized = join(dir, "oversized.json");
+    writeFileSync(oversized, "{}");
+    truncateSync(oversized, MAX_SESSION_FILE_BYTES + 1);
+    let nested = { leaf: true };
+    for (let depth = 0; depth < MAX_SESSION_JSON_DEPTH + 2; depth += 1) nested = { next: nested };
+    writeFileSync(join(dir, "too-deep.json"), JSON.stringify({
+      meta: { ...validMeta, id: "too-deep" },
+      history: [{ role: "assistant", text: "x", toolUses: [{ id: "t", name: "deep", input: nested }] }],
+    }));
     assert.equal(loadSession("bad1"), null);
     assert.equal(sessionFileExists("bad1"), true, "callers can fail closed instead of overwriting corrupt data");
     assert.equal(sessionFileExists("missing"), false);
     assert.equal(loadSession("bad2"), null);
     assert.equal(loadSession("bad3"), null, "history must be an array");
-    for (const id of ["bad4", "bad5", "bad6", "bad7", "bad8", "bad9", "bad10", "spoofed"]) assert.equal(loadSession(id), null, id);
+    for (const id of ["bad4", "bad5", "bad6", "bad7", "bad8", "bad9", "bad10", "spoofed", "oversized", "too-deep"]) {
+      assert.equal(loadSession(id), null, id);
+    }
     assert.doesNotThrow(() => listSessions(), "metaless/corrupt files are skipped, not crashed on");
     assert.deepEqual(listSessions(), []);
   } finally {

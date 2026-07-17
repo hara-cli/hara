@@ -17,7 +17,16 @@ import {
 import { randomUUID } from "node:crypto";
 import type { NeutralMsg } from "../providers/types.js";
 import { redactSensitiveValue } from "../security/secrets.js";
+import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 import { isTaskExecution, type TaskExecution } from "./task.js";
+
+/** Durable transcripts are local input on resume. Bound both allocation and post-parse traversal so a
+ * corrupt/hostile session cannot turn startup or `hara sessions` into an unbounded resource operation. */
+export const MAX_SESSION_FILE_BYTES = 64 * 1024 * 1024;
+export const MAX_SESSION_JSON_DEPTH = 64;
+export const MAX_SESSION_JSON_NODES = 250_000;
+export const MAX_SESSION_ARRAY_ITEMS = 50_000;
+export const MAX_SESSION_STRING_CHARS = 8 * 1024 * 1024;
 
 /** Who created a session. Absent = legacy/interactive. Drives UI segregation (desktop: automated
  *  sessions render as a status timeline, never mixed into the manual list) and the title strategy
@@ -428,14 +437,22 @@ function redactedSessionCopy(data: SessionData): SessionData {
 export function saveSession(meta: SessionMeta, history: NeutralMsg[], task?: TaskExecution): void {
   checkedSessionId(meta.id);
   meta.updatedAt = new Date().toISOString();
-  const safe = redactedSessionCopy({ meta, history, ...(task ? { task } : {}) });
+  const data: SessionData = { meta, history, ...(task ? { task } : {}) };
+  if (!sessionValueWithinLimits(data)) {
+    throw new Error("session exceeds Hara's safe persistence complexity limit; compact or start a new session");
+  }
+  const safe = redactedSessionCopy(data);
+  const encoded = JSON.stringify(safe, null, 2);
+  if (Buffer.byteLength(encoded, "utf8") > MAX_SESSION_FILE_BYTES) {
+    throw new Error("session exceeds Hara's 64 MiB persistence limit; compact or start a new session");
+  }
 
   const target = sessionFile(meta.id);
   const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
   let fd: number | undefined;
   try {
     fd = openSync(tmp, "wx", 0o600);
-    writeFileSync(fd, JSON.stringify(safe, null, 2), "utf8");
+    writeFileSync(fd, encoded, "utf8");
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
@@ -532,6 +549,28 @@ function isSessionMeta(value: unknown): value is SessionMeta {
   );
 }
 
+/** Iterative on purpose: reject excessive nesting before recursive redaction/validation can exhaust stack. */
+function sessionValueWithinLimits(value: unknown): boolean {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  let nodes = 0;
+  while (pending.length) {
+    const current = pending.pop()!;
+    nodes += 1;
+    if (nodes > MAX_SESSION_JSON_NODES || current.depth > MAX_SESSION_JSON_DEPTH) return false;
+    if (typeof current.value === "string") {
+      if (current.value.length > MAX_SESSION_STRING_CHARS) return false;
+      continue;
+    }
+    if (!current.value || typeof current.value !== "object") continue;
+    const values = Array.isArray(current.value)
+      ? current.value
+      : Object.values(current.value as Record<string, unknown>);
+    if (values.length > MAX_SESSION_ARRAY_ITEMS) return false;
+    for (const child of values) pending.push({ value: child, depth: current.depth + 1 });
+  }
+  return true;
+}
+
 /** True if a parsed object has the SessionData shape we can safely use. */
 function isSessionData(d: unknown): d is SessionData {
   const o = d as { meta?: unknown; history?: unknown; task?: unknown } | null;
@@ -544,8 +583,13 @@ function isSessionData(d: unknown): d is SessionData {
  *  here: listing/resuming must not perform an unlocked write. The next explicit save atomically migrates it. */
 function readSessionFile(p: string): SessionData | null {
   try {
-    const d = JSON.parse(readFileSync(p, "utf8"));
-    return isSessionData(d) ? redactedSessionCopy(d) : null;
+    const raw = readVerifiedRegularFileSnapshotSync(p, MAX_SESSION_FILE_BYTES, {
+      action: "read Hara session",
+      protectSensitive: false,
+      rejectHardLinks: true,
+    }).text;
+    const d: unknown = JSON.parse(raw);
+    return sessionValueWithinLimits(d) && isSessionData(d) ? redactedSessionCopy(d) : null;
   } catch {
     return null;
   }

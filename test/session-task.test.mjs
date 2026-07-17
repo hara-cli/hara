@@ -75,6 +75,17 @@ test("task completion remains paused while durable todos are unfinished", () => 
   assert.equal(completed.status, "completed");
 });
 
+test("a total deadline is a resumable pause while loop breakers remain blocked", () => {
+  const interaction = newTurnInteraction();
+  const task = createTaskExecution("finish the long task", interaction.turnId);
+  const deadline = finishTaskExecution(task, { status: "halted", stopReason: "deadline", error: "deadline" });
+  assert.equal(deadline.status, "paused");
+  assert.equal(deadline.lastOutcome, "halted");
+
+  const loop = finishTaskExecution(task, { status: "halted", stopReason: "repeat_loop", error: "loop" });
+  assert.equal(loop.status, "blocked");
+});
+
 test("task steering audit is bounded", () => {
   const interaction = newTurnInteraction();
   let task = createTaskExecution("bounded audit", interaction.turnId);

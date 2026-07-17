@@ -229,9 +229,11 @@ test("total deadline stops a provider that stays active forever and ignores Abor
   assert.equal(outcome.status, "halted");
   assert.equal(outcome.stopReason, "deadline");
   assert.match(outcome.error, /total deadline 1s reached/);
+  assert.match(outcome.error, /type `\/continue` to resume/);
+  assert.match(outcome.error, /task and checklist checkpoint/);
   assert.ok(Date.now() - started < 2_500, "an active/non-cooperative provider cannot hold the run open");
   assert.equal(alerts.length, 1);
-  assert.equal(notices.filter((message) => /agent run stopped/.test(message)).length, 1);
+  assert.equal(notices.filter((message) => /agent run paused/.test(message)).length, 1);
 });
 
 test("total deadline closes a tool round even when the tool ignores cancellation", async () => {

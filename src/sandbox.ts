@@ -17,7 +17,7 @@ import {
   sensitiveShellCommandReason,
 } from "./security/sensitive-files.js";
 import { terminateSubprocessTree, toolSubprocessEnv } from "./security/subprocess-env.js";
-import { homeWorkspaceActionError, isHomeWorkspace } from "./context/workspace-scope.js";
+import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "./context/workspace-scope.js";
 
 export type SandboxMode = "off" | "workspace-write" | "read-only";
 
@@ -154,7 +154,7 @@ export interface ShellOpts {
 export function shellCommand(command: string, cwd: string, mode: SandboxMode): { cmd: string; args: string[] } {
   // Shell syntax can recursively traverse arbitrary paths, so unlike explicit read/write tools it is not
   // safe at the Home root. Check before protected-file mask discovery, which itself would have to walk ~/.
-  if (isHomeWorkspace(cwd)) throw new Error(homeWorkspaceActionError("run shell commands"));
+  if (isUnsafeProjectWorkspace(cwd)) throw new Error(homeWorkspaceActionError("run shell commands"));
   const protectedReason = sensitiveShellCommandReason(command, cwd);
   if (protectedReason) {
     throw new Error(

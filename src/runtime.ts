@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+
 export const MIN_NODE_MAJOR = 22;
 // Commander 15 (a direct runtime dependency) requires this exact floor. Keep package engines, startup,
 // doctor, and docs aligned so an early Node 22 release gets an upgrade hint before dependencies load.
@@ -30,6 +32,22 @@ export function normalizePortableWindowsHome(value: string): string {
   if (/^\/\/[^/]/u.test(home)) return `\\\\${home.slice(2).replace(/\//g, "\\")}`;
   if (/^[a-zA-Z]:[\\/]/u.test(home)) return home[0].toUpperCase() + home.slice(1).replace(/\//g, "\\");
   return home;
+}
+
+/**
+ * Resolve the same user home even when Hara modules are embedded directly instead of entered through
+ * `cli.ts`/`runtime-bootstrap.cjs`. Native Windows Node ignores HOME in `os.homedir()`, while Git Bash and
+ * portable launchers intentionally use it. Keeping this resolver side-effect free lets security/workspace
+ * checks honor that explicit boundary without requiring callers to mutate their environment first.
+ */
+export function effectiveHomeDir(
+  env: NodeJS.ProcessEnv = process.env,
+  runtimePlatform: NodeJS.Platform = process.platform,
+  systemHome = homedir(),
+): string {
+  const explicit = String(env.HOME ?? "").trim();
+  if (!explicit) return systemHome;
+  return runtimePlatform === "win32" ? normalizePortableWindowsHome(explicit) : explicit;
 }
 
 function supportedNodeVersion(version: string): boolean {

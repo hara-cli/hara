@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## Unreleased
+
+- **A total run deadline is now a resumable safety pause.** The 80% warning tells the agent to finish or
+  checkpoint its current step, the hard-stop notice explains that the task/checklist remains resumable with
+  `/continue`, and deadline outcomes persist as `paused` instead of looking irrecoverably blocked. Loop and
+  repeated-failure breakers remain blocked until the approach changes.
+- **Home protection now covers recursive ancestor scopes.** Launching from `/`, `/Users`, a symlink alias, or
+  any directory that contains Home cannot implicitly enumerate or mutate private user state. Explicit child
+  projects remain usable, and interactive `/cd <project>` safely relaunches Hara in the selected project while
+  preserving explicit profile/model/approval/sandbox choices.
+- **Windows portable Home is consistent for direct module consumers.** Explicit Git Bash/MSYS `HOME` wins over
+  a different `USERPROFILE` even when callers bypass the normal CLI bootstrap, keeping config, sessions,
+  indexes, permissions, cron state, and project boundaries on one private root.
+- **Session input is bounded before parsing and recursive processing.** Resume/list reject oversized,
+  excessively deep, structure-heavy, symlinked, or hard-linked session files through a verified no-follow
+  snapshot; saves fail atomically with compact/new-session guidance before unsafe allocations.
+
 ## 0.124.2 — 2026-07-17 — reliable WeCom gateway transport
 
 - **The WeCom gateway is ready only after WeCom accepts its credentials.** Hara now waits for the

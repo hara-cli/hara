@@ -189,6 +189,8 @@ export function finishTaskExecution(
     ? "paused"
     : outcome?.status === "completed"
       ? (incomplete ? "paused" : "completed")
+      : outcome?.status === "halted" && outcome.stopReason === "deadline"
+        ? "paused"
       : outcome?.status === "error" || outcome?.status === "empty" || outcome?.status === "halted"
         ? "blocked"
         : "paused";

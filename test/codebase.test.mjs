@@ -45,7 +45,9 @@ test("codebase_search requires launching inside a project instead of promoting a
   mkdirSync(join(project, ".git"), { recursive: true });
   writeFileSync(join(project, "auth.ts"), "export const homeBoundaryProjectNeedle = true;\n");
   const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = join(home, "different-real-profile");
   try {
     const tool = getTool("codebase_search");
     assert.match(
@@ -70,6 +72,8 @@ test("codebase_search requires launching inside a project instead of promoting a
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });

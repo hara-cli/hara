@@ -139,7 +139,11 @@ function renderBgJobs(): string {
 }
 import { qwenDeviceLogin, getValidQwenAuth, loadQwenToken } from "./providers/qwen-oauth.js";
 import { loadAgentContext, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
-import { homeWorkspaceActionError, isHomeWorkspace } from "./context/workspace-scope.js";
+import {
+  homeWorkspaceActionError,
+  isUnsafeProjectWorkspace,
+  resolveWorkspaceSwitch,
+} from "./context/workspace-scope.js";
 import { getEmbedder } from "./search/embed.js";
 import { collectRepoChunksAsync, collectDirChunksAsync, buildIndex, indexPath, indexExists, type Chunk, type ChunkCollectionResult } from "./search/semindex.js";
 import { searchHybrid } from "./search/hybrid.js";
@@ -495,7 +499,7 @@ function agentRunLimits(cfg: Pick<HaraConfig, "runTimeoutMs" | "maxAgentRounds">
 }
 
 async function runInit(provider: Provider, cwd: string, sandbox: SandboxMode = "off", cfg?: HaraConfig): Promise<void> {
-  if (isHomeWorkspace(cwd)) throw new Error(homeWorkspaceActionError("initialize AGENTS.md"));
+  if (isUnsafeProjectWorkspace(cwd)) throw new Error(homeWorkspaceActionError("initialize AGENTS.md"));
   const history: NeutralMsg[] = [{ role: "user", content: INIT_PROMPT }];
   await runAgent(history, { provider, ctx: { cwd, sandbox }, approval: "full-auto", confirm: async () => true, ...(cfg ? agentRunLimits(cfg) : {}) });
 }
@@ -1259,7 +1263,7 @@ program
   .description("analyze the project and (re)generate AGENTS.md")
   .action(async () => {
     const cfg = loadConfig();
-    if (isHomeWorkspace(cfg.cwd)) {
+    if (isUnsafeProjectWorkspace(cfg.cwd)) {
       out(c.red(homeWorkspaceActionError("initialize AGENTS.md")) + "\n");
       process.exitCode = 2;
       return;
@@ -1491,7 +1495,7 @@ program
     const cwd = process.cwd();
     let doRepo = !!(opts.all || opts.repo || (!opts.assets && !opts.all));
     const doAssets = !!(opts.all || opts.assets);
-    if (doRepo && isHomeWorkspace(cwd)) {
+    if (doRepo && isUnsafeProjectWorkspace(cwd)) {
       if (!doAssets) {
         out(c.red(homeWorkspaceActionError("build a repository index")) + "\n");
         process.exitCode = 2;
@@ -2867,7 +2871,7 @@ program.action(async (opts) => {
   }
   const cfg = loadConfig({ overlay: opts.overlay, ...(requestedHeadlessAgent?.home ? { cwd: requestedHeadlessAgent.home } : {}) });
   const cwd = cfg.cwd;
-  const homeWorkspace = isHomeWorkspace(cwd);
+  const homeWorkspace = isUnsafeProjectWorkspace(cwd);
   // Resolve the concrete role before constructing any user/plugin MCP transport. MCP servers are arbitrary
   // stdio subprocesses, so a read-only persona must not start them merely by launching a turn. Reusing this
   // object later also closes the resolve→connect→re-resolve race where a role could disappear or change policy.
@@ -3313,7 +3317,7 @@ program.action(async (opts) => {
   const useTui = stdin.isTTY && stdout.isTTY && process.env.HARA_TUI !== "0";
   out(c.bold(`hara ${pkg.version}`) + c.dim(`  ·  ${cfg.provider}:${cfg.model}  ·  ${approval}${sandbox !== "off" ? `  ·  sandbox:${sandbox}` : ""}  ·  ${cwd}\n`));
   if (homeWorkspace) {
-    out(c.yellow("⚠ Home directory is not treated as a project workspace. Run `cd /path/to/project` or `hara --cwd /path/to/project`; recursive project scans are disabled here.\n"));
+    out(c.yellow("⚠ Home or a directory containing it is not treated as a project workspace. Switch with `/cd /path/to/project`, or launch with `hara --cwd /path/to/project`; project-scoped execution is disabled here.\n"));
   }
   // Startup update notice — cache-driven (a previous session's background probe), so it costs zero
   // latency; today's probe (if due) fires in the background for the NEXT launch. TTY sessions only.
@@ -3475,6 +3479,35 @@ program.action(async (opts) => {
   }
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
   const persistSession = (): void => saveSession(meta, history, task);
+  let requestedWorkspaceSwitch: string | null = null;
+  const relaunchRequestedWorkspace = async (): Promise<void> => {
+    if (!requestedWorkspaceSwitch) return;
+    const target = requestedWorkspaceSwitch;
+    requestedWorkspaceSwitch = null;
+    // The foreground child starts a new session. Do not keep the old session artificially locked for the
+    // entire lifetime of the new workspace merely because this small parent process is waiting on it.
+    releaseSessionLock(sessionId);
+    const args: string[] = [];
+    if (opts.profile) args.push("--profile", String(opts.profile));
+    if (opts.overlay) args.push("--overlay", String(opts.overlay));
+    if (opts.model) args.push("--model", String(opts.model));
+    if (opts.yes) args.push("--yes");
+    else if (opts.approval) args.push("--approval", String(opts.approval));
+    if (opts.sandbox) args.push("--sandbox", String(opts.sandbox));
+    out(c.dim(`Switching workspace → ${target}\n`));
+    try {
+      const result = await runSelfAttached(args, target);
+      if (result.signal) {
+        out(c.yellow(`Hara in ${target} stopped by ${result.signal}.\n`));
+        process.exitCode = 1;
+      } else if (result.code) {
+        process.exitCode = result.code;
+      }
+    } catch (error) {
+      out(c.red(`Could not start Hara in ${target}: ${error instanceof Error ? error.message : String(error)}\n`));
+      process.exitCode = 1;
+    }
+  };
   const keepUnfinishedTaskActive = (): void => {
     resumeTaskPending = Boolean(task && task.status !== "completed");
   };
@@ -3518,6 +3551,17 @@ program.action(async (opts) => {
 
   const commands: Slash[] = [
     { name: "help", desc: "show this help", run: () => void out(helpText(commands)) },
+    {
+      name: "cd",
+      desc: "switch to a project workspace: /cd <directory>",
+      run: (a) => {
+        const result = resolveWorkspaceSwitch(a, cwd);
+        if (!result.ok) return void out(c.red(`(${result.error})\n`));
+        if (result.cwd === realpathSync.native(cwd)) return void out(c.dim(`(already in ${result.cwd})\n`));
+        requestedWorkspaceSwitch = result.cwd;
+        return "exit";
+      },
+    },
     {
       name: "continue",
       aliases: ["resume"],
@@ -4011,7 +4055,7 @@ program.action(async (opts) => {
         // never saw update notices and versions silently went stale (field report: stuck on 0.112.5)
         updateNotice: cfg.updateCheck ? (checkForUpdate(pkg.version) ?? undefined) : undefined,
         workspaceNotice: homeWorkspace
-          ? "Home is not a project workspace · cd there or use hara --cwd /path/to/project"
+          ? "Home is not a project workspace · use /cd /path/to/project to switch"
           : undefined,
       },
       visionNotice: __visionNotice,
@@ -4036,6 +4080,14 @@ program.action(async (opts) => {
         if (isSlashCommand(line)) {
           const [nm, ...rest] = line.slice(1).split(/\s+/);
           const arg = rest.join(" ").trim();
+          if (nm === "cd") {
+            const result = resolveWorkspaceSwitch(arg, cwd);
+            if (!result.ok) return void h.sink.notice(`(${result.error})`);
+            if (result.cwd === realpathSync.native(cwd)) return void h.sink.notice(`(already in ${result.cwd})`);
+            requestedWorkspaceSwitch = result.cwd;
+            h.sink.notice(`(switching workspace → ${result.cwd})`);
+            return void h.exit();
+          }
           if (nm === "exit" || nm === "quit") {
             if (shouldAutoEvolve(cfg.evolve, history.length)) {
               h.sink.notice("✻ distilling session learnings…");
@@ -4578,7 +4630,8 @@ program.action(async (opts) => {
     if (loadSession(meta.id))
       out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
     await closeMcp();
-    process.exit(0); // TUI done — exit cleanly (ink can leave stdin referenced)
+    await relaunchRequestedWorkspace();
+    process.exit(process.exitCode ?? 0); // TUI done — exit cleanly (ink can leave stdin referenced)
   }
 
   out(c.dim(`Type a task. /help · @path attaches a file · shift+tab cycles mode · Esc interrupts · /exit to quit.${hasAgentsMd(cwd) ? "  (AGENTS.md loaded)" : ""}\n\n`));
@@ -4735,9 +4788,11 @@ program.action(async (opts) => {
     }
   }
   bar.uninstall();
-  out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
+  if (loadSession(meta.id))
+    out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
   rl.close();
   await closeMcp();
+  await relaunchRequestedWorkspace();
 });
 
 program.parseAsync().catch((e) => {
