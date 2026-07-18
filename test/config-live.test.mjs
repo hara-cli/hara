@@ -7,7 +7,15 @@ import { tmpdir } from "node:os";
 
 const originalTrustProjectConfig = process.env.HARA_TRUST_PROJECT_CONFIG;
 delete process.env.HARA_TRUST_PROJECT_CONFIG;
-const { loadConfig, readRawConfig, writeConfigValue } = await import("../dist/config.js");
+const {
+  loadConfig,
+  normalizePersonalProviderConfig,
+  providerCatalog,
+  readRawConfig,
+  reusablePersonalProviderApiKey,
+  updatePersonalProviderConfig,
+  writeConfigValue,
+} = await import("../dist/config.js");
 after(() => {
   if (originalTrustProjectConfig === undefined) delete process.env.HARA_TRUST_PROJECT_CONFIG;
   else process.env.HARA_TRUST_PROJECT_CONFIG = originalTrustProjectConfig;
@@ -518,6 +526,112 @@ test("loadConfig: every call re-reads config.json for a rotated key", () => {
     else process.env.HARA_API_KEY = savedKey;
     if (savedOpenAI === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = savedOpenAI;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("provider catalog: Ollama and LM Studio are first-class local no-key presets", () => {
+  const catalog = providerCatalog();
+  const ollama = catalog.find((provider) => provider.id === "ollama");
+  const lmstudio = catalog.find((provider) => provider.id === "lmstudio");
+  assert.deepEqual(
+    { location: ollama?.location, auth: ollama?.auth, baseURL: ollama?.defaultBaseURL },
+    { location: "local", auth: "none", baseURL: "http://127.0.0.1:11434/v1" },
+  );
+  assert.deepEqual(
+    { location: lmstudio?.location, auth: lmstudio?.auth, baseURL: lmstudio?.defaultBaseURL },
+    { location: "local", auth: "none", baseURL: "http://127.0.0.1:1234/v1" },
+  );
+});
+
+test("provider settings validation keeps local endpoints loopback-only and cloud HTTP secure", () => {
+  assert.throws(
+    () => normalizePersonalProviderConfig({ provider: "ollama", model: "qwen3", baseURL: "http://192.168.1.10:11434/v1" }),
+    /must use https|must use localhost|labeled local/i,
+  );
+  assert.throws(
+    () => normalizePersonalProviderConfig({ provider: "openai", model: "gpt", baseURL: "http://provider.example/v1" }),
+    /must use https/i,
+  );
+  assert.throws(
+    () => normalizePersonalProviderConfig({ provider: "openai", model: "gpt", baseURL: "https://user:secret@provider.example/v1" }),
+    /credentials/i,
+  );
+  assert.equal(
+    normalizePersonalProviderConfig({ provider: "lmstudio", model: "local", baseURL: "http://localhost:1234/v1/" }).baseURL,
+    "http://localhost:1234/v1",
+  );
+  assert.throws(
+    () => normalizePersonalProviderConfig({ provider: "openai", model: "gpt", apiKey: "line-one\nline-two" }),
+    /API key is invalid/i,
+  );
+});
+
+test("provider settings reuse a credential only for the exact same endpoint", () => {
+  const raw = {
+    provider: "openai",
+    model: "gpt",
+    baseURL: "https://first.example/v1/",
+    apiKey: "opaque-current-key",
+  };
+  const same = normalizePersonalProviderConfig({
+    provider: "openai",
+    model: "gpt-next",
+    baseURL: "https://FIRST.example/v1",
+  });
+  assert.equal(reusablePersonalProviderApiKey(same, raw, {}), "opaque-current-key");
+
+  const changed = normalizePersonalProviderConfig({
+    provider: "openai",
+    model: "gpt-next",
+    baseURL: "https://second.example/v1",
+  });
+  assert.equal(reusablePersonalProviderApiKey(changed, raw, { HARA_API_KEY: "environment-key" }), undefined);
+  assert.equal(
+    reusablePersonalProviderApiKey({ ...changed, apiKey: "explicit-new-key" }, raw, {}),
+    "explicit-new-key",
+  );
+});
+
+test("personal provider switch never replays a flat key to another vendor and local mode stores no fake key", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-provider-update-"));
+  const home = join(root, "home");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({
+    provider: "openai",
+    model: "gpt-test",
+    apiKey: "sk-provider-a-only",
+  }));
+  const previousHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    updatePersonalProviderConfig({ provider: "ollama", model: "qwen3" });
+    let raw = readRawConfig();
+    assert.equal(raw.provider, "ollama");
+    assert.equal(raw.baseURL, "http://127.0.0.1:11434/v1");
+    assert.equal("apiKey" in raw, false);
+
+    updatePersonalProviderConfig({ provider: "deepseek", model: "deepseek-chat" });
+    raw = readRawConfig();
+    assert.equal(raw.provider, "deepseek");
+    assert.equal("apiKey" in raw, false, "switching vendors without a new key must not reuse the previous credential");
+
+    updatePersonalProviderConfig({
+      provider: "deepseek",
+      model: "deepseek-chat",
+      baseURL: "https://proxy-one.example/v1",
+      apiKey: "proxy-one-key",
+    });
+    updatePersonalProviderConfig({
+      provider: "deepseek",
+      model: "deepseek-reasoner",
+      baseURL: "https://proxy-two.example/v1",
+    });
+    raw = readRawConfig();
+    assert.equal("apiKey" in raw, false, "changing only the endpoint also clears the old credential");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
     rmSync(root, { recursive: true, force: true });
   }
 });

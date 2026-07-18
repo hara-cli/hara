@@ -387,6 +387,7 @@ registerTool({
     required: ["action"],
   },
   kind: "computer",
+  visibility: "deferred",
   async run(input, ctx) {
     if (ctx.signal?.aborted) throw new ComputerInterruptedError();
     const cfg = loadConfig();

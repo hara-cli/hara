@@ -1,6 +1,6 @@
 // todo_write — an inline task checklist the agent maintains during a turn (like codex's update_plan /
 // Claude Code's TodoWrite). Keeps the model organized on multi-step work and shows the user live progress.
-// In-memory, replace-whole-list semantics; kind:"read" so it never prompts and is safe to call freely.
+// In-memory, replace-whole-list semantics; approval-safe but serialized because it mutates shared run state.
 import { registerTool } from "./registry.js";
 
 export type TodoStatus = "pending" | "in_progress" | "done";
@@ -157,7 +157,8 @@ registerTool({
     },
     required: ["todos"],
   },
-  kind: "read", // pure state + display: never prompts, parallel-safe
+  kind: "read", // state/display only: never prompts; input-level traits keep replacement writes serial
+  classify: () => ({ effect: "state", concurrencySafe: false }),
   async run(input, ctx) {
     const scope = scopeKey(ctx.todoScope);
     const raw = Array.isArray(input.todos) ? input.todos : [];

@@ -30,6 +30,7 @@ registerTool({
     required: ["query"],
   },
   kind: "read",
+  concurrencySafe: true,
   async run(input, ctx) {
     const hits = await searchHybrid(String(input.query ?? ""), ctx.cwd, { indexName: "memory", roots: memoryRoots(ctx.cwd), limit: Math.min(Number(input.limit) || 5, 10), signal: ctx.signal });
     if (!hits.length) return "(no memory matches)";
@@ -42,6 +43,7 @@ registerTool({
   description: "Read a memory file in full (use after memory_search to pull the exact entry).",
   input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
   kind: "read",
+  concurrencySafe: true,
   async run(input, ctx) {
     const p = isAbsolute(String(input.path)) ? String(input.path) : resolve(ctx.cwd, String(input.path));
     if (!memoryRoots(ctx.cwd).some((root) => {

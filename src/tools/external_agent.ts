@@ -120,6 +120,7 @@ registerTool({
     "another agent to own end-to-end. It can read/write/run on the host, so it's gated by approval. " +
     "Args: task (required), backend (claude|codex; default = first installed), model (optional).",
   kind: "exec", // → approval gate; never exposed to read-only fan-out sub-agents
+  visibility: "deferred",
   requiresProjectWorkspace: true,
   trustBoundary: "external",
   input_schema: {

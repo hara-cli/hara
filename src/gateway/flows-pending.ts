@@ -26,12 +26,13 @@ import { randomUUID } from "node:crypto";
 import { deliverResult } from "../cron/deliver.js";
 import { selfArgv } from "../cron/runner.js";
 import { resolveAgent } from "../org/projects.js";
-import { loadConfig, providerDefaultBaseURL, type ProviderId } from "../config.js";
-import { loadActiveProfile, effectiveModel } from "../profile/profile.js";
-import { createAnthropicProvider } from "../providers/anthropic.js";
-import { createOpenAIProvider } from "../providers/openai.js";
-import { getValidQwenAuth } from "../providers/qwen-oauth.js";
-import { resolvePlatform } from "../providers/registry.js";
+import { loadConfig } from "../config.js";
+import { createProviderForTarget } from "../providers/factory.js";
+import {
+  profileForConfig,
+  resolveByokProviderTarget,
+  resolveGatewayModel,
+} from "../providers/target.js";
 import type { Provider, TurnResult } from "../providers/types.js";
 import { validateAgainstSchema } from "../agent/structured.js";
 import { terminateSubprocessTree } from "../security/subprocess-env.js";
@@ -601,33 +602,20 @@ function spawnOrgTask(
  * project context, or approval mode exists for untrusted flow/judge input to reach. */
 async function buildNoToolProvider(): Promise<Provider | null> {
   const cfg = loadConfig();
-  const active = loadActiveProfile();
-  if (active.kind === "gateway") {
-    if (!active.gatewayUrl || !active.deviceToken) return null;
-    const baseURL = active.baseURL || `${active.gatewayUrl.replace(/\/$/, "")}/v1`;
-    return createOpenAIProvider({
-      apiKey: active.deviceToken,
-      baseURL,
-      model: cfg.model || effectiveModel(active),
-      label: "hara-gateway",
-      reasoningEffort: cfg.reasoningEffort,
-    });
+  const { profile } = profileForConfig(cfg);
+  if (profile.kind === "gateway") {
+    if (!profile.gatewayUrl || !profile.deviceToken) return null;
+    return createProviderForTarget({
+      provider: "hara-gateway",
+      apiKey: profile.deviceToken,
+      baseURL: profile.baseURL || `${profile.gatewayUrl.replace(/\/$/, "")}/v1`,
+      model: resolveGatewayModel(cfg, profile),
+    }, cfg.reasoningEffort);
   }
-
-  const provider: ProviderId = (cfg.provider && cfg.provider !== "hara-gateway" ? cfg.provider : active.provider) || "anthropic";
-  const model = cfg.model || effectiveModel(active);
-  if (provider === "qwen-oauth") {
-    const auth = await getValidQwenAuth();
-    if (!auth) return null;
-    return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model, label: provider, reasoningEffort: cfg.reasoningEffort });
-  }
-  const apiKey = cfg.apiKey ?? active.apiKey;
-  if (!apiKey) return null;
-  const baseURL = cfg.baseURL ?? active.baseURL ?? providerDefaultBaseURL(provider);
-  const wire = resolvePlatform(provider, baseURL).wireApi;
-  if (wire === "responses") return null; // unsupported transport: fail closed, never fall back to the CLI agent
-  if (wire === "anthropic") return createAnthropicProvider({ apiKey, model, baseURL, reasoningEffort: cfg.reasoningEffort });
-  return createOpenAIProvider({ apiKey, model, baseURL, label: provider, reasoningEffort: cfg.reasoningEffort });
+  return createProviderForTarget(
+    resolveByokProviderTarget(cfg, profile, false),
+    cfg.reasoningEffort,
+  );
 }
 
 function extractJson(raw: string): unknown {

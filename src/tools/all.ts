@@ -3,6 +3,7 @@
 // never empty when runAgent plans a turn — an unregistered tool is silently unplannable, which shows up
 // as "the model called write_file and nothing happened".
 import "./builtin.js"; // read_file / write_file / bash / job
+import "./runtime.js"; // tool_search / tool_result_read
 import "./edit.js"; // edit_file
 import "./search.js"; // grep / glob / ls
 import "./patch.js"; // apply_patch

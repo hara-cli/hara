@@ -60,6 +60,16 @@ registerTool({
     required: ["action"],
   },
   kind: "exec", // scheduling machinery on the user's machine — approval-gated like any exec
+  visibility: "deferred",
+  classify(input) {
+    return input?.action === "list"
+      ? { effect: "read", concurrencySafe: true }
+      : {
+          effect: "exec",
+          concurrencySafe: false,
+          destructive: input?.action === "remove" || input?.action === "disable",
+        };
+  },
   async run(input, ctx) {
     if (process.env.HARA_CRON === "1") return "Error: cron-run sessions cannot manage cron jobs (recursion guard — a scheduled task must not schedule more tasks).";
     const action = String(input.action ?? "");

@@ -33,7 +33,7 @@ import {
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 
-const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin"]);
+const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin", "tool-results"]);
 const tightenedHomes = new Set<string>();
 const DEFAULT_MIGRATION_CAP = 50_000;
 

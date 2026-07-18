@@ -341,6 +341,107 @@ test("serve e2e: models.list derives reasoning controls from the session-pinned 
   }
 });
 
+test("serve e2e: provider settings are capability-advertised, redacted, tested, and saved without echoing credentials", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-provider-settings-"));
+  const state = {
+    current: {
+      provider: "ollama",
+      model: "qwen3",
+      baseURL: "http://127.0.0.1:11434/v1",
+      location: "local",
+      auth: "none",
+      keyConfigured: true,
+      authenticated: true,
+      profileId: "personal",
+      profileKind: "byok",
+      profileSource: "default",
+      editable: true,
+    },
+    providers: [{
+      id: "ollama",
+      label: "Ollama",
+      location: "local",
+      auth: "none",
+      defaultModel: "qwen3",
+      defaultBaseURL: "http://127.0.0.1:11434/v1",
+      customBaseURL: true,
+    }],
+  };
+  let savedInput;
+  const deps = {
+    ...baseDeps(textProvider, memStore()),
+    providerSettings: () => state,
+    testProviderSettings: async (input) => ({
+      ok: false,
+      models: ["qwen3"],
+      error: `upstream rejected apiKey=${input.apiKey}`,
+    }),
+    saveProviderSettings: async (input) => {
+      savedInput = input;
+      return { ...state, accidentalApiKey: input.apiKey };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  try {
+    const init = await c.call("initialize", { token: "tok" });
+    assert.ok(init.result.capabilities.methods.includes("settings.providers.list"));
+    assert.ok(init.result.capabilities.methods.includes("settings.providers.test"));
+    assert.ok(init.result.capabilities.methods.includes("settings.providers.save"));
+
+    const listed = await c.call("settings.providers.list", {});
+    assert.equal(listed.result.current.provider, "ollama");
+    assert.equal(JSON.stringify(listed.result).includes("apiKey"), false);
+
+    const secret = "sk-testsecret-1234567890";
+    const tested = await c.call("settings.providers.test", { provider: "openai", model: "gpt-test", apiKey: secret });
+    assert.equal(tested.result.ok, false);
+    assert.equal(JSON.stringify(tested.result).includes(secret), false, "test errors must never echo a submitted key");
+
+    const saved = await c.call("settings.providers.save", { provider: "openai", model: "gpt-test", apiKey: secret, activatePersonal: true });
+    assert.equal(savedInput.apiKey, secret, "the authenticated callback receives the ephemeral credential");
+    assert.equal(JSON.stringify(saved.result).includes(secret), false, "save results must never echo a submitted key");
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: an unconfigured engine still initializes so Desktop can open System Settings", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-provider-onboarding-"));
+  const state = {
+    current: {
+      provider: "openai",
+      model: "gpt-test",
+      location: "cloud",
+      auth: "api-key",
+      keyConfigured: false,
+      authenticated: false,
+      profileId: "personal",
+      profileKind: "byok",
+      profileSource: "default",
+      editable: true,
+    },
+    providers: [],
+  };
+  const deps = { ...baseDeps(null, memStore()), providerSettings: () => state };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  try {
+    const init = await c.call("initialize", { token: "tok" });
+    assert.equal(init.result.setupState, "needs-credentials");
+    const settings = await c.call("settings.providers.list", {});
+    assert.equal(settings.result.current.authenticated, false);
+    const create = await c.call("session.create", {});
+    assert.equal(create.error.code, -32603, "only task creation is blocked while settings remain available");
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: live metadata and resume are serialized with an active turn", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-busy-"));
   const store = memStore();

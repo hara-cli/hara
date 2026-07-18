@@ -13,6 +13,7 @@ registerTool({
     "call this to get a skill's steps before performing a task it covers, then follow them.",
   input_schema: { type: "object", properties: { id: { type: "string", description: "the skill id from the Skills list" } }, required: ["id"] },
   kind: "read",
+  concurrencySafe: true,
   async run(input, ctx) {
     const id = String(input.id ?? "").trim();
     const sk = loadSkillIndex(ctx.cwd).find((s) => s.id === id);

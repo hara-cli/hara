@@ -1,5 +1,15 @@
 import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
-import { getTool, toolSpecs, missingRequired, type Tool, type ToolContext } from "../tools/registry.js";
+import {
+  approvalKindForOperation,
+  getTool,
+  missingRequired,
+  toolOperationTraits,
+  toolSpecs,
+  type Tool,
+  type ToolContext,
+  type ToolOperationTraits,
+} from "../tools/registry.js";
+import { limitToolResultBatch } from "../tools/result-limit.js";
 import { stdout } from "node:process";
 import { c, out } from "../ui.js";
 import { activity } from "../activity.js";
@@ -32,6 +42,9 @@ import { applyTaskBrief, type TaskBrief, type TaskExecution } from "../session/t
 
 /** File tools whose `path` input marks the file as "recently worked with" (post-compaction restore). */
 const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
+/** Engine-owned, non-authority helpers. Role filters still govern every deferred target activated by
+ * tool_search; these two only reveal an allowed schema or page an already-redacted result. */
+const RUNTIME_HELPER_TOOLS = new Set(["tool_search", "tool_result_read"]);
 
 /** Stall watchdog ceiling: a model attempt that streams NOTHING for this long is treated as a dead /
  *  stalled connection and aborted into the normal error→failover path — instead of hanging on
@@ -99,6 +112,9 @@ are disabled without an interactive approval channel unless the user launched wi
 HARA_ALLOW_TRUSTED_EXTENSIONS=1. Configured MCP servers stay stopped by default; when a task materially needs
 one, call \`mcp_connect\` for that server only, then use the newly available tools on the next round. Never
 connect every configured server speculatively.
+Optional web, desktop, scheduler, external-agent, and connected-MCP schemas may be deferred to keep context
+focused. If a needed capability is absent from the current tool list, call \`tool_search\` once with the
+capability/service name; use the activated tool on the next round. Do not search speculatively.
 For broad,
 open-ended exploration (more than ~3 searches), spawn \`agent\` sub-agents — several in one response for
 independent questions (role "explore") — each returns conclusions, not dumps. When specialist roles are
@@ -453,7 +469,22 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
 async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLifecycle): Promise<RunOutcome> {
   const { provider, ctx } = opts;
   const runSignal = life.signal;
-  const toolCtx: ToolContext = { ...ctx, signal: runSignal };
+  const activatedDeferredTools = new Set<string>();
+  const toolCtx: ToolContext = {
+    ...ctx,
+    signal: runSignal,
+    activateTools(names) {
+      const accepted: string[] = [];
+      for (const name of names) {
+        const tool = getTool(name);
+        if (!tool || tool.visibility !== "deferred") continue;
+        if (opts.toolFilter && !opts.toolFilter(name)) continue;
+        activatedDeferredTools.add(name);
+        accepted.push(name);
+      }
+      return accepted;
+    },
+  };
   let intakeTask = opts.taskIntake?.task;
   let intakeDirty = false;
   const syncIntakeTask = (): void => {
@@ -483,6 +514,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           required: ["intent", "goal", "constraints", "acceptance", "steps"],
         },
         kind: "read",
+        classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
           syncIntakeTask();
           const applied = applyTaskBrief(intakeTask, input);
@@ -600,7 +632,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       const reminders = drainReminders(ctx.todoScope);
       if (reminders.length) history.push({ role: "user", content: wrapReminders(reminders) });
     }
-    const baseSpecs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
+    const visibleSpecs = toolSpecs({ activatedDeferred: activatedDeferredTools });
+    const baseSpecs = opts.toolFilter
+      ? visibleSpecs.filter((t) => RUNTIME_HELPER_TOOLS.has(t.name) || opts.toolFilter!(t.name))
+      : visibleSpecs;
     const specs = runExtraTools.length
       ? [...baseSpecs, ...runExtraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
       : baseSpecs;
@@ -926,11 +961,19 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     interface Plan {
       tu: (typeof r.toolUses)[number];
       tool: ReturnType<typeof getTool>;
+      operation?: ToolOperationTraits;
+      approvalKind?: Tool["kind"];
       denied?: string;
     }
     const plans: Plan[] = [];
     // Extra (per-run) tools win over the registry so a run-scoped tool can't be shadowed by a global one.
-    const resolveTool = (name: string): Tool | undefined => runExtraTools.find((t) => t.name === name) ?? getTool(name);
+    const resolveTool = (name: string): Tool | undefined => {
+      const extra = runExtraTools.find((tool) => tool.name === name);
+      if (extra) return extra;
+      const registered = getTool(name);
+      if (registered?.visibility === "deferred" && !activatedDeferredTools.has(name)) return undefined;
+      return registered;
+    };
     // Planning happens before dispatch, so a previously accepted `change` brief must not let the model
     // revise that brief and perform a side effect in the same response. Treat every intake call as a
     // transaction boundary for the whole response: accept/checkpoint the interpretation first, then let
@@ -950,49 +993,45 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         continue;
       }
       const input = tu.input as Record<string, unknown>;
+      const command = tool.kind === "exec" && typeof input.command === "string" ? input.command : null;
+      let operation = toolOperationTraits(tool, input, toolCtx);
+      // One-release compatibility for embedders/older plugins that only implement static kind. New built-ins
+      // declare classify(); legacy command/action tools retain the established safe semantics until migrated.
+      if (!tool.classify) {
+        if (command !== null) {
+          const parts = splitCompound(command);
+          const readOnly =
+            !Boolean(input.background)
+            && !!parts?.length
+            && parts.every(isReadOnlyCommand);
+          operation = readOnly
+            ? { effect: "read", concurrencySafe: true }
+            : { effect: "exec", concurrencySafe: false };
+        } else if ((tool.name === "task" || tool.name === "cronjob") && input.action === "list") {
+          operation = { effect: "read", concurrencySafe: true };
+        } else if (tool.name === "job" && input.action === "kill") {
+          operation = { effect: "exec", concurrencySafe: false, destructive: true };
+        }
+      }
+      const approvalKind = approvalKindForOperation(operation);
       const preview = redactToolSubprocessOutput(
         String(input.path ?? input.command ?? input.pattern ?? input.url ?? input.task ?? input.server ?? "")
           .replace(/\s+/g, " ")
           .trim(),
       );
-      // Resolve shell read-only policy before the understanding gate: an `investigate` brief may run a
-      // command already classified safe/read-only, while edits and unknown/non-read-only commands require
-      // an explicit `change` brief. Opaque external tools always require a brief and retain their separate
-      // per-action approval boundary.
-      const command = tool.kind === "exec" && typeof input.command === "string" ? input.command : null;
+      // Command rules apply only to the concrete shell tool. Input-level traits independently answer whether
+      // this exact operation mutates state; an allow rule must never turn a mutation into an investigation.
       const cmdDecision = command !== null ? decideCommand(command, permRules) : null;
-      // Permission rules answer whether a command may auto-run; they do not answer whether it mutates state.
-      // In particular, an explicit `allow: ["git commit"]` must not let an `investigate` brief perform a
-      // commit. Classify read-only semantics independently for the understanding boundary.
-      const commandParts = command !== null ? splitCompound(command) : null;
-      const commandReadOnly = !!commandParts?.length && commandParts.every(isReadOnlyCommand);
-      // Bash intentionally treats `background` as a boolean. Be conservative at the policy boundary even
-      // for a malformed model call: any truthy value would otherwise reach a truthiness-based/custom exec
-      // implementation as a process start and bypass an investigate brief.
-      const startsBackgroundProcess = tool.kind === "exec" && Boolean(input.background);
-      const stopsBackgroundProcess = tool.name === "job" && input.action === "kill";
       if (opts.taskIntake && tool.name !== "task_intake") {
-        // Some action-style tools contain both inspection and mutation behind one registry kind. Classify
-        // the concrete operation, not only the approval class: listing tasks/cron jobs is evidence gathering,
-        // while their other actions remain state changes.
-        const readOnlyAction =
-          (tool.name === "task" || tool.name === "cronjob") &&
-          input.action === "list";
         const operationReadOnly =
-          readOnlyAction ||
-          (tool.kind === "read" && !stopsBackgroundProcess) ||
-          (tool.kind === "exec" && commandReadOnly && !startsBackgroundProcess);
+          operation.effect === "read"
+          || operation.effect === "state"
+          || operation.effect === "interactive";
         const needsBrief = tool.trustBoundary === "external" || !operationReadOnly;
         const requiresChange =
           tool.trustBoundary !== "external" &&
           !operationReadOnly &&
-          (
-            tool.kind === "edit" ||
-            tool.kind === "computer" ||
-            stopsBackgroundProcess ||
-            startsBackgroundProcess ||
-            (tool.kind === "exec" && !commandReadOnly)
-          );
+          (operation.effect === "edit" || operation.effect === "exec" || operation.effect === "computer");
         if (taskBriefTransitionInRound && (requiresChange || tool.trustBoundary === "external")) {
           plans.push({
             tu,
@@ -1027,7 +1066,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
       // Screen control and opaque host extensions are gated on EVERY action — a prior "don't ask again"
       // and even full-auto must never silently turn them into a side channel.
-      const alwaysGate = tool.kind === "computer" || tool.trustBoundary === "external";
+      const alwaysGate = approvalKind === "computer" || tool.trustBoundary === "external";
       if (tool.trustBoundary === "external" && !ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
         plans.push({
           tu,
@@ -1049,7 +1088,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       // commands classify `low` (pure Node, no LLM) and skip everything below — zero added latency. Only a
       // genuinely HIGH-RISK action pays for a cheap-model veto, and that veto fails OPEN on any glitch.
       if (guardianOn && !breakerHalt) {
-        const risk = classifyRisk(tu.name, tool.kind, input, ctx.cwd);
+        const risk = classifyRisk(tu.name, approvalKind, input, ctx.cwd);
         if (risk.level === "high") {
           const safeRiskReason = redactToolSubprocessOutput(risk.reason);
           const detail = redactToolSubprocessOutput(
@@ -1112,7 +1151,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           }
         }
       }
-      const shouldConfirm = alwaysGate || (cmdDecision !== "allow" && needsConfirm(tool.kind, opts.approval) && !opts.autoApprove?.has(tu.name));
+      const shouldConfirm = alwaysGate || (cmdDecision !== "allow" && needsConfirm(approvalKind, opts.approval) && !opts.autoApprove?.has(tu.name));
       if (shouldConfirm) {
         let replyResult: boolean | "always" | typeof RUN_STOPPED;
         try {
@@ -1132,7 +1171,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
         if (reply === "always" && !alwaysGate) opts.autoApprove?.add(tu.name); // computer: treat "always" as one-time yes
       }
-      plans.push({ tu, tool });
+      plans.push({ tu, tool, operation, approvalKind });
       if (!opts.quiet) {
         const pv = preview ? preview.slice(0, 80) : "";
         if (sink) sink.tool(tu.name, pv);
@@ -1192,7 +1231,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           (value) => { settled = { ok: true, value }; return value; },
           (error) => { settled = { ok: false, error }; throw error; },
         );
-        try { opts.onToolRun?.(observedTool, { name: p.tool!.name, kind: p.tool!.kind }); } catch { /* observers cannot affect execution */ }
+        try { opts.onToolRun?.(observedTool, { name: p.tool!.name, kind: p.approvalKind }); } catch { /* observers cannot affect execution */ }
         const toolResult = await bounded(observedTool);
         if (toolResult === RUN_STOPPED) {
           await Promise.resolve(); // allow an already-completed async tool's fulfillment handler to publish
@@ -1217,7 +1256,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         activity.dec();
       }
     };
-    let batch: number[] = []; // indices of pending read-kind tools (run concurrently, capped)
+    let batch: number[] = []; // indices of input-classified concurrency-safe operations
     const flush = async (): Promise<void> => {
       if (!batch.length) return;
       const idx = batch;
@@ -1227,13 +1266,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     for (let i = 0; i < plans.length; i++) {
       if (runSignal.aborted) return finalizeStoppedToolRound();
       const p = plans[i];
-      // ask_user is interaction-safe but not parallel-safe: the TUI deliberately owns one prompt slot.
-      // task_intake is also a state transition: run it alone so its persisted brief has a deterministic
-      // boundary before the next model round. Flush other reads before either.
-      if (p.denied === undefined && p.tool?.kind === "read" && p.tool.name !== "ask_user" && p.tool.name !== "task_intake") {
+      if (p.denied === undefined && p.operation?.concurrencySafe === true) {
         batch.push(i); // safe → accumulate to run concurrently
       } else {
-        await flush(); // flush pending reads before an edit/exec
+        await flush(); // flush safe operations before a serial/shared-state operation
         if (runSignal.aborted) return finalizeStoppedToolRound();
         await runOne(i, p);
         if (runSignal.aborted) return finalizeStoppedToolRound();
@@ -1241,6 +1277,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }
     await flush();
     if (runSignal.aborted) return finalizeStoppedToolRound();
+    const boundedContents = limitToolResultBatch(results.map((result) => result.content));
+    for (let i = 0; i < results.length; i++) results[i].content = boundedContents[i];
     history.push({ role: "tool", results });
     if (intakeDirty && intakeTask) {
       try {
@@ -1301,7 +1339,11 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }
 
     if (guard && !nudged) {
-      for (const p of plans) if (p.tool && p.tool.kind !== "read") toolCounts.set(p.tu.name, (toolCounts.get(p.tu.name) ?? 0) + 1);
+      for (const p of plans) {
+        if (p.tool && p.operation && p.operation.effect !== "read" && p.operation.effect !== "state" && p.operation.effect !== "interactive") {
+          toolCounts.set(p.tu.name, (toolCounts.get(p.tu.name) ?? 0) + 1);
+        }
+      }
       for (const res of results) if (typeof res.content === "string" && /Configure a vision model/.test(res.content)) blindShots++;
       const maxRepeat = Math.max(0, ...toolCounts.values());
       const blind = blindShots >= 2;

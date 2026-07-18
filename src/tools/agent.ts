@@ -35,6 +35,7 @@ registerTool({
     required: ["task"],
   },
   kind: "read", // parallel-safe: multiple agent() calls in a turn run concurrently
+  concurrencySafe: true,
   async run(input, ctx) {
     if (!ctx.spawn) return "Error: sub-agents are not available in this context.";
     if (typeof input.task !== "string" || !input.task.trim()) return "Error: agent needs a `task`.";

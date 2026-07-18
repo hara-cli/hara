@@ -522,6 +522,7 @@ registerTool({
     required: ["pattern"],
   },
   kind: "read",
+  concurrencySafe: true,
   async run(input, ctx) {
     const pattern = typeof input.pattern === "string" ? input.pattern : "";
     if (pattern.length > MAX_PATTERN_CHARS) return `Error: grep pattern exceeds ${MAX_PATTERN_CHARS} characters.`;
@@ -594,6 +595,7 @@ registerTool({
     required: ["pattern"],
   },
   kind: "read",
+  concurrencySafe: true,
   async run(input, ctx) {
     const root = absOf(input.path, ctx.cwd);
     const denied = sensitiveFileError(root, "search");
@@ -654,6 +656,7 @@ registerTool({
     properties: { path: { type: "string", description: "directory (default: cwd)" } },
   },
   kind: "read",
+  concurrencySafe: true,
   async run(input, ctx) {
     if (isHomeWorkspace(ctx.cwd)) return homeWorkspaceDirectoryScanError("ls");
     const dir = absOf(input.path, ctx.cwd);

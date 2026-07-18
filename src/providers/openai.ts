@@ -87,8 +87,16 @@ export function createOpenAIProvider(opts: {
   baseURL?: string;
   label?: string;
   reasoningEffort?: "off" | "low" | "medium" | "high" | "max";
+  /** Local OpenAI-compatible endpoints may intentionally use auth:none. The SDK still requires a
+   * constructor value, so explicitly remove its generated Authorization header at the final header layer. */
+  omitAuthorization?: boolean;
 }): Provider {
-  const client = new OpenAI({ apiKey: opts.apiKey, maxRetries: 4, ...(opts.baseURL ? { baseURL: opts.baseURL } : {}) });
+  const client = new OpenAI({
+    apiKey: opts.apiKey,
+    maxRetries: 4,
+    ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
+    ...(opts.omitAuthorization ? { defaultHeaders: { Authorization: null } } : {}),
+  });
   return {
     id: opts.label ?? "openai",
     model: opts.model,

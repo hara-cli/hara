@@ -3,7 +3,7 @@
 // Everything here is PURE (parse + frame builders + error codes) and unit-tested.
 //
 // Client → server requests:
-//   initialize        {token,capabilities?}      → {name,version,protocol,cwd,provider,model,
+//   initialize        {token,capabilities?}      → {name,version,protocol,cwd,provider,model,setupState,
 //                                                   capabilities:{methods:[…]}}  (feature detection)
 //   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,updatedAt}]}
 //   session.create    {cwd?,approval?}           → {sessionId,model}
@@ -19,6 +19,9 @@
 //   automation.list   {}                          → {jobs:[{id,name,mode,enabled,lastRunAt,lastStatus,…}],
 //                                                    sessions:[{id,title,source,sourceName,updatedAt,…}]}
 //   models.list       {}                          → {models:[…], current, effortLevels:[…]}
+//   settings.providers.list {}                    → redacted provider catalog + current profile state
+//   settings.providers.test {provider,model,…}     → {ok,models,error?} (credential is ephemeral)
+//   settings.providers.save {provider,model,…}     → redacted state (credential is never returned)
 //   automation.add    {name,schedule,task,mode?,cwd?,tz?} → {id,name,schedule}
 //   automation.toggle {id,enabled}                → {id,enabled}
 //   automation.delete {id}                        → {id,deleted}

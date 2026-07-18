@@ -408,6 +408,8 @@ registerTool({
     required: ["query"],
   },
   kind: "read",
+  concurrencySafe: true,
+  visibility: "deferred",
   async run(input, ctx) {
     if (ctx.signal?.aborted) throw interrupted("web search");
     const q = String(input.query ?? "").trim();
@@ -514,6 +516,8 @@ registerTool({
     required: ["url"],
   },
   kind: "read",
+  concurrencySafe: true,
+  visibility: "deferred",
   async run(input, ctx) {
     if (ctx.signal?.aborted) throw interrupted("web fetch");
     let url: URL;

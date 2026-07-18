@@ -59,6 +59,7 @@ const BY_PROVIDER: Record<string, Partial<PlatformCaps>> = {
   glm: { wireApi: "chat", reasoning: "none", cache: "auto" }, // Zhipu native /paas/v4 — different thinking param; leave alone (its /anthropic endpoint resolves via baseURL)
   deepseek: { wireApi: "chat", reasoning: "deepseek", cache: "auto" }, // V4: thinking:{type} + reasoning_effort(high|max)
   ollama: { wireApi: "chat", reasoning: "ollama_think", cache: "none" }, // local; `think` toggles reasoning
+  lmstudio: { wireApi: "chat", reasoning: "ollama_think", cache: "none" }, // local OpenAI-compatible server
   openai: { wireApi: "chat", reasoning: "reasoning_effort", cache: "auto" },
   openrouter: { wireApi: "chat", reasoning: "none", cache: "auto" },
   "hara-gateway": { wireApi: "chat", reasoning: "none", cache: "auto" },

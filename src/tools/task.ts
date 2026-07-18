@@ -459,6 +459,11 @@ registerTool({
     required: ["action"],
   },
   kind: "edit",
+  classify(input) {
+    return input?.action === "list"
+      ? { effect: "read", concurrencySafe: true }
+      : { effect: "edit", concurrencySafe: false, destructive: input?.action === "remove" };
+  },
   async run(input: TaskActionInput, ctx) {
     try {
       return withTaskLock(ctx.cwd, () => {

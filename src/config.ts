@@ -15,7 +15,17 @@ import { readVerifiedRegularFileSnapshotSync } from "./fs-read.js";
 import { projectRepositoryTrustedAtStartup } from "./security/project-trust.js";
 import { isHomeWorkspace } from "./context/workspace-scope.js";
 
-export type ProviderId = "anthropic" | "qwen" | "qwen-oauth" | "openai" | "glm" | "deepseek" | "openrouter" | "hara-gateway";
+export type ProviderId =
+  | "anthropic"
+  | "qwen"
+  | "qwen-oauth"
+  | "openai"
+  | "glm"
+  | "deepseek"
+  | "openrouter"
+  | "ollama"
+  | "lmstudio"
+  | "hara-gateway";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
 
 export interface McpServerConfig {
@@ -130,8 +140,68 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
     baseURL: "https://openrouter.ai/api/v1",
     envKey: "OPENROUTER_API_KEY",
   },
+  ollama: {
+    model: "qwen3",
+    baseURL: "http://127.0.0.1:11434/v1",
+    envKey: "",
+  },
+  lmstudio: {
+    model: "local-model",
+    baseURL: "http://127.0.0.1:1234/v1",
+    envKey: "",
+  },
   "hara-gateway": { model: "", envKey: "HARA_GATEWAY_TOKEN" }, // B-end: enrolled device → token in ~/.hara/org.json, routed by the gateway
 };
+
+export type ProviderLocation = "cloud" | "local" | "managed";
+export type ProviderAuth = "api-key" | "oauth" | "none" | "managed";
+
+export interface ProviderCatalogEntry {
+  id: ProviderId;
+  label: string;
+  location: ProviderLocation;
+  auth: ProviderAuth;
+  defaultModel: string;
+  defaultBaseURL?: string;
+  customBaseURL: boolean;
+}
+
+const PROVIDER_LABELS: Record<ProviderId, Omit<ProviderCatalogEntry, "id" | "defaultModel" | "defaultBaseURL">> = {
+  anthropic: { label: "Anthropic", location: "cloud", auth: "api-key", customBaseURL: true },
+  openai: { label: "OpenAI / compatible", location: "cloud", auth: "api-key", customBaseURL: true },
+  qwen: { label: "Qwen (DashScope)", location: "cloud", auth: "api-key", customBaseURL: true },
+  "qwen-oauth": { label: "Qwen Coding (browser sign-in)", location: "cloud", auth: "oauth", customBaseURL: false },
+  glm: { label: "GLM (Zhipu)", location: "cloud", auth: "api-key", customBaseURL: true },
+  deepseek: { label: "DeepSeek", location: "cloud", auth: "api-key", customBaseURL: true },
+  openrouter: { label: "OpenRouter", location: "cloud", auth: "api-key", customBaseURL: true },
+  ollama: { label: "Ollama", location: "local", auth: "none", customBaseURL: true },
+  lmstudio: { label: "LM Studio", location: "local", auth: "none", customBaseURL: true },
+  "hara-gateway": { label: "Hara Enterprise Gateway", location: "managed", auth: "managed", customBaseURL: false },
+};
+
+export const PROVIDER_IDS = Object.freeze(Object.keys(PROVIDER_DEFAULTS) as ProviderId[]);
+
+export function isProviderId(value: unknown): value is ProviderId {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(PROVIDER_DEFAULTS, value);
+}
+
+export function providerRequiresApiKey(provider: ProviderId): boolean {
+  return PROVIDER_LABELS[provider].auth === "api-key";
+}
+
+export function providerIsLocal(provider: ProviderId): boolean {
+  return PROVIDER_LABELS[provider].location === "local";
+}
+
+/** Redacted, deterministic catalog shared by CLI setup, serve and Desktop. */
+export function providerCatalog(): ProviderCatalogEntry[] {
+  return PROVIDER_IDS.map((id) => ({
+    id,
+    ...PROVIDER_LABELS[id],
+    defaultModel: PROVIDER_DEFAULTS[id].model,
+    ...(PROVIDER_DEFAULTS[id].baseURL ? { defaultBaseURL: PROVIDER_DEFAULTS[id].baseURL } : {}),
+  }));
+}
 
 export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = ["off", "low", "medium", "high", "max"];
@@ -348,6 +418,146 @@ export function writeConfigValue(key: string, value: string): void {
   });
 }
 
+export interface PersonalProviderConfigUpdate {
+  provider: ProviderId;
+  model: string;
+  baseURL?: string;
+  /** Undefined keeps the current key only when the provider is unchanged. Empty string is also treated as
+   * undefined; use clearApiKey for an explicit removal. */
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+
+export interface NormalizedPersonalProviderConfigUpdate extends PersonalProviderConfigUpdate {
+  model: string;
+  baseURL?: string;
+  apiKey?: string;
+}
+
+function cleanProviderModel(value: string): string {
+  const model = value.trim();
+  if (!model || model.length > 256 || /[\u0000-\u001f\u007f]/.test(model)) {
+    throw new Error("model must be 1–256 printable characters");
+  }
+  return model;
+}
+
+function loopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+}
+
+function cleanProviderBaseURL(provider: ProviderId, value: string | undefined): string | undefined {
+  const raw = value?.trim() || PROVIDER_DEFAULTS[provider].baseURL;
+  if (!raw) return undefined;
+  if (raw.length > 2_048 || /[\u0000-\u001f\u007f]/.test(raw)) throw new Error("base URL is invalid");
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("base URL must be an absolute http(s) URL");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("base URL must use http or https");
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error("base URL cannot contain credentials, query parameters, or a fragment");
+  }
+  if (url.protocol === "http:" && !loopbackHost(url.hostname)) {
+    throw new Error("non-loopback provider endpoints must use https");
+  }
+  if (providerIsLocal(provider) && !loopbackHost(url.hostname)) {
+    throw new Error(`${provider} is labeled local and must use localhost/127.0.0.1/::1; use an OpenAI-compatible cloud profile for a remote host`);
+  }
+  return raw.replace(/\/+$/, "");
+}
+
+function providerEndpointIdentity(provider: ProviderId, value: string | undefined): string {
+  const cleaned = cleanProviderBaseURL(provider, value);
+  if (!cleaned) return "";
+  const url = new URL(cleaned);
+  const pathname = url.pathname.replace(/\/+$/, "");
+  return `${url.protocol}//${url.host.toLowerCase()}${pathname}`;
+}
+
+/** Validate a Desktop/serve candidate without persisting it. Kept beside the writer so a connection test
+ * and the eventual save cannot disagree about endpoint or credential safety. */
+export function normalizePersonalProviderConfig(input: PersonalProviderConfigUpdate): NormalizedPersonalProviderConfigUpdate {
+  if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
+    throw new Error("provider is not a configurable personal provider");
+  }
+  const model = cleanProviderModel(input.model);
+  const baseURL = cleanProviderBaseURL(input.provider, input.baseURL);
+  const apiKey = input.apiKey?.trim();
+  if (apiKey && (apiKey.length > 32 * 1024 || /[\u0000-\u001f\u007f]/.test(apiKey))) {
+    throw new Error("API key is invalid");
+  }
+  if (apiKey && !providerRequiresApiKey(input.provider)) {
+    throw new Error(`${input.provider} does not accept an API key`);
+  }
+  return {
+    provider: input.provider,
+    model,
+    ...(baseURL ? { baseURL } : {}),
+    ...(apiKey ? { apiKey } : {}),
+    ...(input.clearApiKey === true ? { clearApiKey: true } : {}),
+  };
+}
+
+/**
+ * Resolve a credential that may safely be reused for a Desktop connection test/save.
+ *
+ * A provider id is not a credential boundary by itself: OpenAI-compatible providers allow a custom
+ * endpoint. Never replay a stored or environment key when that endpoint changes, even when the provider id
+ * stays the same. Local/OAuth providers never receive this flat API-key slot.
+ */
+export function reusablePersonalProviderApiKey(
+  input: NormalizedPersonalProviderConfigUpdate,
+  raw: Record<string, any>,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (!providerRequiresApiKey(input.provider)) return undefined;
+  if (input.apiKey) return input.apiKey;
+  if (input.clearApiKey) return undefined;
+  const previousProvider = isProviderId(raw.provider) ? raw.provider : "anthropic";
+  if (previousProvider !== input.provider) return undefined;
+  const previousEndpoint = providerEndpointIdentity(previousProvider, typeof raw.baseURL === "string" ? raw.baseURL : undefined);
+  const candidateEndpoint = providerEndpointIdentity(input.provider, input.baseURL);
+  if (previousEndpoint !== candidateEndpoint) return undefined;
+  const envKey = providerEnvKey(input.provider);
+  return nonBlankEnv(env.HARA_API_KEY)
+    ?? (envKey ? nonBlankEnv(env[envKey]) : undefined)
+    ?? nonBlankEnv(typeof raw.apiKey === "string" ? raw.apiKey : undefined);
+}
+
+/** Atomically update the legacy/personal provider slot without returning or logging its credential. */
+export function updatePersonalProviderConfig(input: PersonalProviderConfigUpdate): void {
+  const normalized = normalizePersonalProviderConfig(input);
+  const { model, baseURL, apiKey } = normalized;
+
+  updateRawConfig((config) => {
+    const previousProvider = isProviderId(config.provider) ? config.provider : "anthropic";
+    const previousEndpoint = providerEndpointIdentity(
+      previousProvider,
+      typeof config.baseURL === "string" ? config.baseURL : undefined,
+    );
+    const nextEndpoint = providerEndpointIdentity(normalized.provider, baseURL);
+    const endpointChanged =
+      previousProvider !== normalized.provider || previousEndpoint !== nextEndpoint;
+    config.provider = normalized.provider;
+    config.model = model;
+    if (baseURL) config.baseURL = baseURL;
+    else delete config.baseURL;
+
+    if (!providerRequiresApiKey(normalized.provider) || normalized.clearApiKey === true) {
+      delete config.apiKey;
+    } else if (apiKey) {
+      config.apiKey = apiKey;
+    } else if (endpointChanged) {
+      // A flat legacy key belongs to one exact endpoint, not merely a provider label.
+      delete config.apiKey;
+    }
+  });
+}
+
 /** Record (or clear, with cap=null) a confirmed per-model vision capability in `modelVision`. */
 export function setModelVisionOverride(model: string, cap: "yes" | "no" | null): void {
   updateRawConfig((config) => {
@@ -386,11 +596,13 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     ...withoutBlankRoutingValues(project),
   };
 
-  const provider = (nonBlankEnv(process.env.HARA_PROVIDER) ?? merged.provider ?? "anthropic") as ProviderId;
-  const d = PROVIDER_DEFAULTS[provider] ?? PROVIDER_DEFAULTS.anthropic;
+  const requestedProvider = nonBlankEnv(process.env.HARA_PROVIDER) ?? merged.provider ?? "anthropic";
+  const provider: ProviderId = isProviderId(requestedProvider) ? requestedProvider : "anthropic";
+  const d = PROVIDER_DEFAULTS[provider];
   const model = nonBlankEnv(process.env.HARA_MODEL) ?? merged.model ?? d.model;
   const baseURL = nonBlankEnv(process.env.HARA_BASE_URL) ?? merged.baseURL ?? d.baseURL;
-  const apiKey = nonBlankEnv(process.env.HARA_API_KEY) ?? nonBlankEnv(process.env[d.envKey]) ?? merged.apiKey;
+  const providerEnvApiKey = d.envKey ? nonBlankEnv(process.env[d.envKey]) : undefined;
+  const apiKey = nonBlankEnv(process.env.HARA_API_KEY) ?? providerEnvApiKey ?? merged.apiKey;
   const approval = (process.env.HARA_APPROVAL ?? merged.approval ?? "suggest") as ApprovalMode;
   const sandbox = (process.env.HARA_SANDBOX ?? merged.sandbox ?? "off") as SandboxMode;
   const theme = (process.env.HARA_THEME ?? merged.theme ?? "dark") as "dark" | "light";
@@ -426,7 +638,8 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   const fileCheckpoints = !(process.env.HARA_CHECKPOINTS === "0" || merged.fileCheckpoints === false || merged.fileCheckpoints === "false"); // default ON
   const updateCheck = !(process.env.HARA_UPDATE_CHECK === "0" || merged.updateCheck === false || merged.updateCheck === "false"); // default ON
   const fallbackModel = nonBlankEnv(process.env.HARA_FALLBACK_MODEL) ?? merged.fallbackModel;
-  const fallbackProvider = (nonBlankEnv(process.env.HARA_FALLBACK_PROVIDER) ?? merged.fallbackProvider) as ProviderId | undefined;
+  const requestedFallbackProvider = nonBlankEnv(process.env.HARA_FALLBACK_PROVIDER) ?? merged.fallbackProvider;
+  const fallbackProvider = isProviderId(requestedFallbackProvider) ? requestedFallbackProvider : undefined;
   const fallbackBaseURL = nonBlankEnv(process.env.HARA_FALLBACK_BASE_URL) ?? merged.fallbackBaseURL;
   const fallbackApiKey = nonBlankEnv(process.env.HARA_FALLBACK_API_KEY) ?? merged.fallbackApiKey;
   const reasoningRaw = process.env.HARA_REASONING_EFFORT ?? merged.reasoningEffort;
@@ -445,4 +658,8 @@ export function providerEnvKey(provider: ProviderId): string {
  *  Used by `hara setup` to write a self-contained baseURL for GLM/DeepSeek/OpenRouter. */
 export function providerDefaultBaseURL(provider: ProviderId): string | undefined {
   return PROVIDER_DEFAULTS[provider]?.baseURL;
+}
+
+export function providerDefaultModel(provider: ProviderId): string {
+  return PROVIDER_DEFAULTS[provider]?.model ?? PROVIDER_DEFAULTS.anthropic.model;
 }

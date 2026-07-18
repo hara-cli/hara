@@ -62,6 +62,7 @@ import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } fro
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
+import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 import {
   consumePendingTaskSteering,
   createTaskExecution,
@@ -85,6 +86,11 @@ export interface ServeDeps {
   buildProviderFor?: (model: string, effort?: string, cwd?: string) => Promise<Provider | null>;
   /** live model list from the endpoint (may be empty — not every endpoint enumerates) */
   listModels?: (cwd?: string) => Promise<string[]>;
+  /** Redacted provider/local-model control plane for Desktop settings. Credentials are accepted only by
+   * save/test and must never be returned by these callbacks. */
+  providerSettings?: (cwd?: string) => ProviderSettingsState;
+  saveProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
+  testProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
   /** thinking-dial levels valid for this endpoint's reasoning style (from the provider registry) */
   effortLevels?: string[];
   /** Live defaults advertised to persistent clients after config/profile edits. `model` lets a session
@@ -101,6 +107,49 @@ export interface ServeDeps {
   quietDiscovery?: boolean; // tests: skip ~/.hara/serve.json
   discoveryHome?: string; // tests: isolate the discovery file from the real home directory
   compactTimeoutMs?: number; // tests/embedders: bound a provider that ignores cancellation
+}
+
+export interface ProviderSettingsCatalogEntry {
+  id: string;
+  label: string;
+  location: "cloud" | "local" | "managed";
+  auth: "api-key" | "oauth" | "none" | "managed";
+  defaultModel: string;
+  defaultBaseURL?: string;
+  customBaseURL: boolean;
+}
+
+export interface ProviderSettingsState {
+  current: {
+    provider: string;
+    model: string;
+    baseURL?: string;
+    location: "cloud" | "local" | "managed";
+    auth: "api-key" | "oauth" | "none" | "managed";
+    keyConfigured: boolean;
+    authenticated: boolean;
+    profileId: string;
+    profileKind: "byok" | "gateway";
+    profileSource: "flag" | "env" | "pin" | "default" | "fallback";
+    editable: boolean;
+    environmentOverride?: boolean;
+  };
+  providers: ProviderSettingsCatalogEntry[];
+}
+
+export interface ProviderSettingsInput {
+  provider: string;
+  model: string;
+  baseURL?: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+  activatePersonal?: boolean;
+}
+
+export interface ProviderSettingsTestResult {
+  ok: boolean;
+  models: string[];
+  error?: string;
 }
 
 export interface ServeOpts {
@@ -328,11 +377,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const fresh = deps.buildProviderFor
       ? await deps.buildProviderFor(session.meta.model, session.effort, session.meta.cwd)
       : await deps.buildSessionProvider(session.meta.cwd);
-    if (!fresh) return false;
+    if (!fresh || fresh.model !== session.meta.model) return false;
     session.provider = fresh;
     session.meta.provider = fresh.id;
-    // Preserve the user's pinned model in meta; provider factories should honor it, but fail closed if they do not.
-    return fresh.model === session.meta.model;
+    return true;
   };
   const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 10 * 1024 * 1024 });
   await new Promise<void>((res, rej) => {
@@ -692,11 +740,24 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.list", "session.create", "session.resume", "session.send", "session.steer", "session.interrupt", "session.set-model",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
+            "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
             "tasks.list", "approvals.list", "approvals.resolve",
           ];
           const runtime = runtimeInfo();
-          return reply(rpcResult(id!, { name: "hara", version: deps.version, protocol: PROTOCOL_VERSION, cwd: opts.cwd, provider: runtime.providerId, model: runtime.model, capabilities: { methods } }));
+          const setupState = deps.providerSettings
+            ? (deps.providerSettings(opts.cwd).current.authenticated ? "ready" : "needs-credentials")
+            : "ready";
+          return reply(rpcResult(id!, {
+            name: "hara",
+            version: deps.version,
+            protocol: PROTOCOL_VERSION,
+            cwd: opts.cwd,
+            provider: runtime.providerId,
+            model: runtime.model,
+            setupState,
+            capabilities: { methods },
+          }));
         }
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
 
@@ -859,6 +920,37 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const current = session?.meta.model ?? defaultRuntime.model;
             const currentRuntime = runtimeInfo(targetCwd, current);
             return reply(rpcResult(id!, { models, current, effort: session?.effort ?? null, effortLevels: currentRuntime.effortLevels }));
+          }
+          case "settings.providers.list": {
+            if (!deps.providerSettings) return reply(rpcError(id, ERR.METHOD, "provider settings not supported by this server"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, redactSensitiveValue(deps.providerSettings(targetCwd)).value));
+          }
+          case "settings.providers.test":
+          case "settings.providers.save": {
+            const callback = req.method === "settings.providers.test" ? deps.testProviderSettings : deps.saveProviderSettings;
+            if (!callback) return reply(rpcError(id, ERR.METHOD, "provider settings not supported by this server"));
+            if (
+              typeof p.provider !== "string" ||
+              typeof p.model !== "string" ||
+              (p.baseURL !== undefined && typeof p.baseURL !== "string") ||
+              (p.apiKey !== undefined && typeof p.apiKey !== "string") ||
+              (p.clearApiKey !== undefined && typeof p.clearApiKey !== "boolean") ||
+              (p.activatePersonal !== undefined && typeof p.activatePersonal !== "boolean")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "provider + model required; optional baseURL/apiKey/clearApiKey/activatePersonal have invalid types"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const input: ProviderSettingsInput = {
+              provider: p.provider,
+              model: p.model,
+              ...(p.baseURL !== undefined ? { baseURL: p.baseURL } : {}),
+              ...(p.apiKey !== undefined ? { apiKey: p.apiKey } : {}),
+              ...(p.clearApiKey !== undefined ? { clearApiKey: p.clearApiKey } : {}),
+              ...(p.activatePersonal !== undefined ? { activatePersonal: p.activatePersonal } : {}),
+            };
+            const result = await callback(input, targetCwd);
+            return reply(rpcResult(id!, redactSensitiveValue(result).value));
           }
           case "session.set-model": {
             // per-session model / thinking-effort switch (the composer picker). Rebuilds the session's
@@ -1025,7 +1117,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcError(id, ERR.METHOD, `unknown method ${req.method}`));
         }
         } catch (e: any) {
-          return reply(rpcError(id, ERR.INTERNAL, String(e?.message ?? e)));
+          return reply(rpcError(id, ERR.INTERNAL, redactSensitiveText(String(e?.message ?? e)).text));
         }
       })();
       inFlightRequests.add(task);

@@ -20,8 +20,15 @@ import {
   readRawConfig,
   writeConfigValue,
   setModelVisionOverride,
+  providerCatalog,
   providerEnvKey,
   providerDefaultBaseURL,
+  providerIsLocal,
+  providerRequiresApiKey,
+  normalizePersonalProviderConfig,
+  reusablePersonalProviderApiKey,
+  updatePersonalProviderConfig,
+  isProviderId,
   CONFIG_KEYS,
   APPROVAL_MODES,
   SANDBOX_MODES,
@@ -114,8 +121,14 @@ import { resetReachability } from "./tools/net-reachability.js";
 import { resetRepeatGuard } from "./agent/repeat-guard.js";
 import { allowsEvolutionTool, EVOLUTION_SYSTEM, evolutionStatus, shouldAutoEvolve } from "./agent/evolution.js";
 import { EXPLORE_SYSTEM } from "./tools/agent.js";
-import { createAnthropicProvider } from "./providers/anthropic.js";
-import { createOpenAIProvider } from "./providers/openai.js";
+import {
+  overrideProviderTarget,
+  profileForConfig,
+  resolveByokProviderTarget,
+  resolveGatewayModel,
+  type ProviderTargetOverride,
+} from "./providers/target.js";
+import { createProviderForTarget } from "./providers/factory.js";
 import { resolvePlatform } from "./providers/registry.js";
 import { boundedProviderTurn } from "./providers/bounded-turn.js";
 import { levelsFor } from "./tui/model-picker.js";
@@ -123,6 +136,7 @@ import { listModels } from "./providers/models.js";
 import { listJobs, tailJob, killJob } from "./exec/jobs.js";
 import { readModelContextFileSync } from "./fs-read.js";
 import { MIN_NODE_VERSION, unsupportedNodeMessage } from "./runtime.js";
+import { redactKnownSecrets, redactSensitiveText } from "./security/secrets.js";
 
 /** Render the background-job list for /jobs (user-facing view of what the agent has running in the
  *  background — dev servers, watchers, long tasks). Mirrors codex/Claude-Code process visibility. */
@@ -137,7 +151,7 @@ function renderBgJobs(): string {
   });
   return `Background jobs — /jobs tail <id> · /jobs kill <id>:\n${rows.join("\n")}`;
 }
-import { qwenDeviceLogin, getValidQwenAuth, loadQwenToken } from "./providers/qwen-oauth.js";
+import { qwenDeviceLogin, loadQwenToken } from "./providers/qwen-oauth.js";
 import { loadAgentContext, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import {
   homeWorkspaceActionError,
@@ -201,6 +215,7 @@ import { c, out, statusLine } from "./ui.js";
 import * as bar from "./statusbar.js";
 import { nearest } from "./fuzzy.js";
 import "./tools/builtin.js"; // register read_file/write_file/bash
+import "./tools/runtime.js"; // register tool_search/tool_result_read
 import "./tools/edit.js"; // register edit_file
 import "./tools/search.js"; // register grep/glob/ls
 import "./tools/patch.js"; // register apply_patch
@@ -233,71 +248,56 @@ const pkg = {
     })()),
 };
 
-const maskKey = (v?: string) => (v ? `${v.slice(0, 7)}…${v.slice(-4)}` : "(unset)");
+const maskKey = (v?: string) => (v ? `••••${v.slice(-4)}` : "(unset)");
 
-async function buildProvider(cfg: HaraConfig): Promise<Provider | null> {
+async function buildProvider(
+  cfg: HaraConfig,
+  targetOverride?: ProviderTargetOverride,
+): Promise<Provider | null> {
   // Identity-profile is the source of truth for routing. `cfg` is the *merged* HaraConfig (env +
   // project + global) and still drives non-routing concerns (model overrides, baseURL fallbacks
   // for things like vision/route/fallback sidecars). The active profile decides "where to send
   // requests" — gateway (deviceToken at the gateway) vs BYOK (user's key direct to the provider).
-  const ap = loadActiveProfile();
-  // CFG-OVERRIDE PATH: when a sidecar (vision / route / fallback) calls buildProvider with a tweaked
-  // cfg that explicitly carries an apiKey + baseURL, honor those over the profile — they're the
-  // sidecar's intended target. Detected by "cfg.apiKey present + cfg.baseURL present and we're not
-  // routing to a gateway." This keeps `withRouting`/vision unchanged.
-  const isSidecarOverride = !!cfg.apiKey && !!cfg.baseURL && ap.kind === "byok" && cfg.apiKey !== ap.apiKey;
-
-  if (ap.kind === "gateway" && !isSidecarOverride) {
+  const { profile: ap } = profileForConfig(cfg);
+  if (ap.kind === "gateway") {
     if (!ap.gatewayUrl || !ap.deviceToken) return null;
     const baseURL = ap.baseURL || `${ap.gatewayUrl.replace(/\/$/, "")}/v1`;
-    const model = cfg.model || effectiveModel(ap);
-    return createOpenAIProvider({ apiKey: ap.deviceToken, baseURL, model, label: "hara-gateway", reasoningEffort: cfg.reasoningEffort });
+    const model = resolveGatewayModel(cfg, ap, process.env, targetOverride?.model);
+    const target = { provider: "hara-gateway" as const, apiKey: ap.deviceToken, baseURL, model };
+    const built = await createProviderForTarget(target, cfg.reasoningEffort);
+    if (!targetOverride && built) {
+      cfg.provider = target.provider;
+      cfg.model = target.model;
+      cfg.baseURL = target.baseURL;
+      cfg.apiKey = undefined;
+    }
+    return built;
   }
 
-  // BYOK paths — use the active profile's provider/key/baseURL by default, but let the merged cfg
-  // override (so `--profile`/`HARA_PROFILE`-overridden values flow + sidecar provider builds work).
-  const provider: ProviderId = (cfg.provider && cfg.provider !== "hara-gateway" ? cfg.provider : ap.provider) || "anthropic";
-  const apiKey = cfg.apiKey ?? ap.apiKey;
-  // Resolve base URL: explicit (cfg → profile) wins; otherwise fall back to the provider's preset
-  // (GLM/DeepSeek/OpenRouter). This keeps `profile add --byok --provider glm` working even when the
-  // user didn't pass --base-url (anthropic/openai stay undefined → their SDK defaults).
-  const baseURL = cfg.baseURL ?? ap.baseURL ?? providerDefaultBaseURL(provider);
-  const model = cfg.model || effectiveModel(ap);
-
-  if (provider === "qwen-oauth") {
-    const auth = await getValidQwenAuth();
-    if (!auth) return null;
-    return createOpenAIProvider({ apiKey: auth.accessToken, baseURL: auth.baseURL, model, label: "qwen-oauth", reasoningEffort: cfg.reasoningEffort });
+  const baseTarget = resolveByokProviderTarget(cfg, ap, false);
+  const target = overrideProviderTarget(baseTarget, targetOverride);
+  const built = await createProviderForTarget(target, cfg.reasoningEffort);
+  // The rest of the active run (status, vision classification, role defaults, resume) must see the resolved
+  // identity route rather than the always-populated Personal/global fields. Explicit sidecars stay isolated.
+  if (!targetOverride && built) {
+    cfg.provider = target.provider;
+    cfg.model = target.model;
+    cfg.baseURL = target.baseURL;
+    cfg.apiKey = target.apiKey;
   }
-  if (!apiKey) return null;
-  // Transport is chosen from the provider REGISTRY (the dictionary) by wire protocol — so a custom
-  // baseURL Just Works: a vendor's `.../anthropic` endpoint (DeepSeek/Kimi/GLM/MiniMax/Aliyun) speaks the
-  // Anthropic wire (gets cache_control + thinking budget), DashScope/Ollama/OpenAI speak chat, etc.
-  const wire = resolvePlatform(provider, baseURL).wireApi;
-  if (wire === "anthropic") {
-    return createAnthropicProvider({ apiKey, model, baseURL, reasoningEffort: cfg.reasoningEffort });
-  }
-  if (wire === "responses") {
-    // The OpenAI Responses API (e.g. Aliyun Token Plan's newest models) — a distinct wire hara doesn't
-    // speak yet. Fail with guidance instead of sending a chat body it will reject. (Tracked for when a
-    // Token-Plan key is available to build + verify against; the chat + anthropic endpoints work today.)
-    return {
-      id: provider,
-      model,
-      async turn() {
-        return { text: "", toolUses: [], stop: "error" as const, errorMsg: `This endpoint uses the OpenAI Responses API, which hara doesn't speak yet. Point hara at the plan's OpenAI-compatible chat endpoint (…/compatible-mode/v1 or …/v1) or its Anthropic-compatible endpoint (…/apps/anthropic) instead.` };
-      },
-    };
-  }
-  return createOpenAIProvider({ apiKey, model, baseURL, label: provider, reasoningEffort: cfg.reasoningEffort });
+  return built;
 }
 
 /** Wrap the main provider with per-turn model routing when `routeModel` is configured: trivial/non-coding
  *  turns go to the alternate (cheap/general) model, real coding/action work stays on the primary. No-op when
  *  routeModel is unset or equals the primary model. routeBaseURL/routeApiKey default to the primary's. */
 async function withRouting(primary: Provider | null, cfg: HaraConfig): Promise<Provider | null> {
-  if (!primary || !cfg.routeModel || cfg.routeModel === cfg.model) return primary;
-  const alt = await buildProvider({ ...cfg, model: cfg.routeModel, baseURL: cfg.routeBaseURL ?? cfg.baseURL, apiKey: cfg.routeApiKey ?? cfg.apiKey });
+  if (!primary || !cfg.routeModel || cfg.routeModel === primary.model) return primary;
+  const alt = await buildProvider(cfg, {
+    model: cfg.routeModel,
+    ...(cfg.routeBaseURL ? { baseURL: cfg.routeBaseURL } : {}),
+    ...(cfg.routeApiKey ? { apiKey: cfg.routeApiKey } : {}),
+  });
   return alt ? routingProvider(primary, alt) : primary;
 }
 
@@ -308,21 +308,171 @@ async function withRouting(primary: Provider | null, cfg: HaraConfig): Promise<P
 async function buildGuardian(cfg: HaraConfig, primary: Provider | null): Promise<{ provider: Provider | null; enabled: boolean } | undefined> {
   if (cfg.guardian === "off") return undefined;
   let gp: Provider | null = primary;
-  if (cfg.routeModel && cfg.routeModel !== cfg.model) {
-    gp = (await buildProvider({ ...cfg, model: cfg.routeModel, baseURL: cfg.routeBaseURL ?? cfg.baseURL, apiKey: cfg.routeApiKey ?? cfg.apiKey })) ?? primary;
+  if (cfg.routeModel && cfg.routeModel !== primary?.model) {
+    gp = (await buildProvider(cfg, {
+      model: cfg.routeModel,
+      ...(cfg.routeBaseURL ? { baseURL: cfg.routeBaseURL } : {}),
+      ...(cfg.routeApiKey ? { apiKey: cfg.routeApiKey } : {}),
+    })) ?? primary;
   }
   return { provider: gp, enabled: true };
 }
 
 function authHint(cfg: HaraConfig): string {
-  const ap = loadActiveProfile();
+  const { profile: ap } = profileForConfig(cfg);
   if (ap.kind === "gateway") return `Active profile '${ap.id}' is a gateway profile but is missing deviceToken — re-enroll with \`hara profile add ${ap.id} --gateway <url> --code <code>\`.`;
-  const provider = ap.provider ?? cfg.provider;
+  const target = resolveByokProviderTarget(cfg, ap, false);
+  const provider = target.provider;
   if (provider === "qwen-oauth") return `Run ${c.bold("hara login qwen")} to authenticate.`;
+  if (providerIsLocal(provider)) {
+    return `Start ${provider === "ollama" ? "Ollama" : "LM Studio"} at ${c.bold(target.baseURL ?? "its local endpoint")}, then choose an installed model.`;
+  }
   return `Set ${c.bold(providerEnvKey(provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara setup")}.`;
 }
 
-const SETUP_DEFAULT_MODEL: Record<string, string> = { anthropic: "claude-opus-4-8", qwen: "qwen-plus", openai: "gpt-4o-mini", glm: "glm-4.6", deepseek: "deepseek-chat", openrouter: "openai/gpt-4o-mini", "qwen-oauth": "coder-model" };
+function providerEnvironmentOverride(): boolean {
+  return !!(
+    process.env.HARA_PROVIDER ||
+    process.env.HARA_MODEL ||
+    process.env.HARA_BASE_URL
+  );
+}
+
+function providerSettingsSnapshot(targetCwd: string) {
+  const live = loadConfig({ cwd: targetCwd });
+  const { profile, resolution } = profileForConfig(live);
+  const catalog = providerCatalog();
+
+  if (profile.kind === "gateway") {
+    const entry = catalog.find((candidate) => candidate.id === "hara-gateway")!;
+    return {
+      current: {
+        provider: "hara-gateway",
+        model: process.env.HARA_MODEL || effectiveModel(profile) || live.model,
+        baseURL: profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined),
+        location: entry.location,
+        auth: entry.auth,
+        keyConfigured: !!profile.deviceToken,
+        authenticated: !!profile.gatewayUrl && !!profile.deviceToken,
+        profileId: profile.id,
+        profileKind: profile.kind,
+        profileSource: resolution.source,
+        editable: false,
+      },
+      providers: catalog,
+    };
+  }
+
+  const target = resolveByokProviderTarget(live, profile, false);
+  const provider = target.provider;
+  const entry = catalog.find((candidate) => candidate.id === provider) ?? catalog[0];
+  const baseURL = target.baseURL;
+  const model = target.model;
+  const apiKey = target.apiKey;
+  const environmentOverride = providerEnvironmentOverride();
+  const keyConfigured =
+    providerIsLocal(provider) ||
+    (provider === "qwen-oauth" ? loadQwenToken() !== null : !!apiKey);
+
+  return {
+    current: {
+      provider,
+      model,
+      ...(baseURL ? { baseURL } : {}),
+      location: entry.location,
+      auth: entry.auth,
+      keyConfigured,
+      authenticated: keyConfigured,
+      profileId: profile.id,
+      profileKind: profile.kind,
+      profileSource: resolution.source,
+      editable: profile.id === PERSONAL_ID && !environmentOverride,
+      ...(environmentOverride ? { environmentOverride: true } : {}),
+    },
+    providers: catalog,
+  };
+}
+
+async function testProviderSettingsCandidate(input: {
+  provider: string;
+  model: string;
+  baseURL?: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+}): Promise<{ ok: boolean; models: string[]; error?: string }> {
+  if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
+    throw new Error("provider is not a configurable personal provider");
+  }
+  const candidate = normalizePersonalProviderConfig({
+    provider: input.provider,
+    model: input.model,
+    baseURL: input.baseURL,
+    apiKey: input.apiKey,
+    clearApiKey: input.clearApiKey,
+  });
+  const raw = readRawConfig();
+  const apiKey = reusablePersonalProviderApiKey(candidate, raw);
+  if (providerRequiresApiKey(candidate.provider) && !apiKey) {
+    return {
+      ok: false,
+      models: [],
+      error: "A new API key is required when the provider or endpoint changes",
+    };
+  }
+  const models = await listModels(candidate.baseURL, apiKey ?? "");
+  const probeModel =
+    providerIsLocal(candidate.provider) &&
+    models.length > 0 &&
+    !models.includes(candidate.model) &&
+    (candidate.model === "local-model" || candidate.model === "qwen3")
+      ? models[0]
+      : candidate.model;
+  const provider = await createProviderForTarget({
+    provider: candidate.provider,
+    apiKey,
+    model: probeModel,
+    baseURL: candidate.baseURL,
+  });
+  if (!provider) {
+    const error = candidate.provider === "qwen-oauth"
+      ? "Qwen browser sign-in is not complete; run `hara login qwen` first"
+      : "provider is not authenticated";
+    return { ok: false, models, error };
+  }
+  const result = await boundedProviderTurn(
+    provider,
+    {
+      system: "This is a connection check. Reply with the single word ok.",
+      history: [{ role: "user", content: "ok" }],
+      tools: [],
+      onText: () => {},
+    },
+    { timeoutMs: 12_000, label: "provider connection test" },
+  );
+  if (result.stop === "error") {
+    return {
+      ok: false,
+      models,
+      error: redactKnownSecrets(
+        result.errorMsg || "provider connection test failed",
+        [apiKey],
+      ).text.slice(0, 500),
+    };
+  }
+  return { ok: true, models };
+}
+
+const SETUP_DEFAULT_MODEL: Record<string, string> = {
+  anthropic: "claude-opus-4-8",
+  qwen: "qwen-plus",
+  openai: "gpt-4o-mini",
+  glm: "glm-4.6",
+  deepseek: "deepseek-chat",
+  openrouter: "openai/gpt-4o-mini",
+  ollama: "qwen3",
+  lmstudio: "local-model",
+  "qwen-oauth": "coder-model",
+};
 
 /** Numbered provider menu for `hara setup`. Order is the displayed order; `id` maps to a ProviderId
  *  (or the special "custom"/"qwen-oauth" routes). GLM/DeepSeek carry a preset base URL so the user
@@ -333,6 +483,8 @@ const SETUP_MENU: { label: string; id: ProviderId | "custom" }[] = [
   { label: "GLM (Zhipu)", id: "glm" },
   { label: "DeepSeek", id: "deepseek" },
   { label: "Qwen (DashScope key)", id: "qwen" },
+  { label: "Ollama (local, no key)", id: "ollama" },
+  { label: "LM Studio (local, no key)", id: "lmstudio" },
   { label: "OpenAI-compatible (custom base URL)", id: "custom" },
   { label: "Qwen — free, no key (browser sign-in)", id: "qwen-oauth" },
 ];
@@ -408,12 +560,10 @@ function readSecret(prompt: string, rl: ReturnType<typeof createInterface>): Pro
  *  friendly "connected" hint; the wizard saves config regardless. */
 async function pingProvider(args: { provider: ProviderId; apiKey: string; model: string; baseURL?: string }): Promise<boolean> {
   const { provider, apiKey, model, baseURL } = args;
-  if (!apiKey || !model) return false;
-  const prov =
-    provider === "anthropic"
-      ? createAnthropicProvider({ apiKey, model, baseURL })
-      : createOpenAIProvider({ apiKey, model, baseURL, label: provider });
+  if ((!apiKey && !providerIsLocal(provider)) || !model) return false;
   try {
+    const prov = await createProviderForTarget({ provider, apiKey: apiKey || undefined, model, baseURL });
+    if (!prov) return false;
     const r = await boundedProviderTurn(prov, {
       system: "Reply with the single word: ok",
       history: [{ role: "user", content: "ping" }],
@@ -447,8 +597,11 @@ async function runSetup(): Promise<void> {
     if (choice.id === "qwen-oauth") {
       try {
         await qwenDeviceLogin((m) => out(m + "\n"));
-        writeConfigValue("provider", "qwen-oauth");
-        writeConfigValue("model", "coder-model");
+        updatePersonalProviderConfig({
+          provider: "qwen-oauth",
+          model: "coder-model",
+          clearApiKey: true,
+        });
         out(c.green("\n✓ Qwen OAuth complete — provider set to qwen-oauth (model coder-model).\n") + c.dim(`Check it with ${c.bold("hara doctor")}, then just run ${c.bold("hara")}.\n`));
       } catch (e: any) {
         out(c.red(`\nQwen OAuth failed: ${e?.message ?? e}\n`));
@@ -471,17 +624,22 @@ async function runSetup(): Promise<void> {
     }
 
     const envKey = providerEnvKey(provider);
-    const apiKey = (await readSecret(`API key ${c.dim(`(masked; blank = use the ${envKey} env var)`)}: `, rl)).trim();
+    const apiKey = providerRequiresApiKey(provider)
+      ? (await readSecret(`API key ${c.dim(`(masked; blank = use the ${envKey} env var)`)}: `, rl)).trim()
+      : "";
     const defaultModel = SETUP_DEFAULT_MODEL[choice.id === "custom" ? "openai" : provider] ?? "";
     const model = (await rl.question(`Model [${defaultModel || "?"}]: `)).trim() || defaultModel;
 
-    writeConfigValue("provider", provider);
-    if (baseURL) writeConfigValue("baseURL", baseURL);
-    if (apiKey) writeConfigValue("apiKey", apiKey);
-    if (model) writeConfigValue("model", model);
+    updatePersonalProviderConfig({
+      provider,
+      model,
+      ...(baseURL ? { baseURL } : {}),
+      ...(apiKey ? { apiKey } : {}),
+      ...(!providerRequiresApiKey(provider) ? { clearApiKey: true } : {}),
+    });
 
     // One-shot validation ping (best-effort; never blocks saving). Only when we have a key + model.
-    if (apiKey && model) {
+    if ((apiKey || providerIsLocal(provider)) && model) {
       out(c.dim("\nChecking connection… "));
       const ok = await pingProvider({ provider, apiKey, model, baseURL: baseURL || undefined });
       out(ok ? c.green("✓ connected\n") : c.yellow(`⚠ couldn't reach ${provider} (saved anyway)\n`));
@@ -632,7 +790,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   // Role-model resolution: respect role.model by default; --force collapses everything to cfg.model.
   const __roleModel = effectiveRoleModel(role.model, o.cfg.model);
   const roleProvider = __roleModel
-    ? ((await buildProvider({ ...o.cfg, model: __roleModel })) ?? o.baseProvider)
+    ? ((await buildProvider(o.cfg, { model: __roleModel })) ?? o.baseProvider)
     : o.baseProvider;
   const toolFilter = roleToolFilter(role);
 
@@ -670,7 +828,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   // Review chain: a reviewer role inspects the diff and APPROVES or sends it back, looping until clean.
   const reviewer = roles.find((r) => r.id === "reviewer");
   const __revModel = effectiveRoleModel(reviewer?.model, o.cfg.model);
-  const revProvider = __revModel ? ((await buildProvider({ ...o.cfg, model: __revModel })) ?? o.baseProvider) : o.baseProvider;
+  const revProvider = __revModel ? ((await buildProvider(o.cfg, { model: __revModel })) ?? o.baseProvider) : o.baseProvider;
   const revSystem = reviewer?.system ?? REVIEWER_SYSTEM;
   const revTools = roleToolFilter(reviewer ? { ...reviewer, readOnly: true } : undefined) ?? ((n: string) => READONLY_TOOLS.has(n));
   const maxRounds = Math.max(1, o.rounds ?? 3);
@@ -741,7 +899,7 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
     return false;
   }
   const __atomModel = effectiveRoleModel(role?.model, o.cfg.model);
-  const roleProvider = __atomModel ? ((await buildProvider({ ...o.cfg, model: __atomModel })) ?? o.baseProvider) : o.baseProvider;
+  const roleProvider = __atomModel ? ((await buildProvider(o.cfg, { model: __atomModel })) ?? o.baseProvider) : o.baseProvider;
   const toolFilter = roleToolFilter(role);
   const history: NeutralMsg[] = [{ role: "user", content: atomPrompt(atom, plan, done) }];
   try {
@@ -1125,7 +1283,7 @@ async function runSubagent(
   }
   const __subModel = effectiveRoleModel(role?.model, baseProvider.model);
   const provider = __subModel && __subModel !== baseProvider.model
-    ? ((await buildProvider({ ...cfg, model: __subModel })) ?? baseProvider)
+    ? ((await buildProvider(cfg, { model: __subModel })) ?? baseProvider)
     : baseProvider;
   // A sub-agent runs full-auto + UNCONFIRMED + parallel, so it is ALWAYS read-only — a role may narrow
   // further but can never GRANT write/exec to a fan-out sub-agent (that would bypass the approval gate).
@@ -1187,9 +1345,10 @@ function runDoctor(cfg: HaraConfig): string {
   const ok = (b: boolean): string => (b ? c.green("✓") : c.red("✗"));
   const dot = c.dim("·");
   const nodeSupported = unsupportedNodeMessage() === null;
-  const hasKey = !!(cfg.apiKey || process.env[providerEnvKey(cfg.provider)] || process.env.HARA_API_KEY);
+  const envKey = providerEnvKey(cfg.provider);
+  const hasKey = !!(cfg.apiKey || (envKey ? process.env[envKey] : undefined) || process.env.HARA_API_KEY);
   const oauthOk = cfg.provider === "qwen-oauth" && loadQwenToken() !== null;
-  const authed = hasKey || oauthOk;
+  const authed = hasKey || oauthOk || providerIsLocal(cfg.provider);
   const ad = assetsDir();
   const roles = loadRoles(cfg.cwd);
   const vcap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
@@ -1198,7 +1357,7 @@ function runDoctor(cfg: HaraConfig): string {
     c.bold("hara doctor"),
     `${ok(nodeSupported)} node ${process.versions.node} ${c.dim(`(need ≥${MIN_NODE_VERSION})`)}`,
     `${dot} provider ${c.bold(cfg.provider)} · model ${c.bold(cfg.model)}${cfg.baseURL ? c.dim(" · " + cfg.baseURL) : ""}`,
-    `${ok(authed)} auth ${authed ? c.dim("configured") : c.yellow("missing — " + authHint(cfg))}`,
+    `${ok(authed)} auth ${providerIsLocal(cfg.provider) ? c.dim("not required (local endpoint)") : authed ? c.dim("configured") : c.yellow("missing — " + authHint(cfg))}`,
     `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
     `${dot} roles ${roles.length ? c.dim(`${roles.length} (${roles.slice(0, 8).map((r) => r.id).join(", ")}${roles.length > 8 ? ", …" : ""})`) : c.dim("none — run: hara roles init")}`,
@@ -1776,7 +1935,7 @@ profileCmd
   .option("--code <code>", "(gateway) enrollment code from your admin")
   .option("--label <label>", "human-friendly label for the profile")
   .option("--byok", "(byok) BYOK profile — bring your own provider key")
-  .option("--provider <id>", "(byok) anthropic | openai | glm | deepseek | openrouter | qwen | qwen-oauth")
+  .option("--provider <id>", "(byok/local) anthropic | openai | glm | deepseek | openrouter | qwen | qwen-oauth | ollama | lmstudio")
   .option("--key <key>", "(byok) API key (else read from the provider's env var at use-time)")
   .option("--base-url <url>", "(byok) override the provider base URL (OpenAI-compatible endpoints)")
   .option("--model <model>", "(byok) default model for this profile")
@@ -1811,16 +1970,33 @@ profileCmd
       return;
     }
     if (opts.byok || opts.provider) {
-      const provider = (opts.provider || "anthropic") as ProviderId;
+      const requestedProvider = opts.provider || "anthropic";
+      if (!isProviderId(requestedProvider)) {
+        return void out(c.red(`Unknown provider '${requestedProvider}'. Run \`hara setup\` to see supported providers.\n`));
+      }
+      const provider = requestedProvider;
       if (provider === "hara-gateway") return void out(c.red("`--provider hara-gateway` is retired — use --gateway <url> --code <code> instead.\n"));
+      const preset = providerCatalog().find((entry) => entry.id === provider)!;
+      let normalized;
+      try {
+        normalized = normalizePersonalProviderConfig({
+          provider,
+          apiKey: opts.key,
+          baseURL: opts.baseUrl ?? preset.defaultBaseURL,
+          model: opts.model ?? preset.defaultModel,
+        });
+      } catch (err) {
+        out(c.red(`Invalid provider profile: ${err instanceof Error ? err.message : String(err)}\n`));
+        process.exit(1);
+      }
       const p: Profile = {
         id,
         kind: "byok",
         label: opts.label || id,
-        provider,
-        apiKey: opts.key,
-        baseURL: opts.baseUrl,
-        defaultModel: opts.model,
+        provider: normalized.provider,
+        apiKey: normalized.apiKey,
+        baseURL: normalized.baseURL,
+        defaultModel: normalized.model,
       };
       const r = addProfile(p);
       if (!r.ok) {
@@ -1831,7 +2007,7 @@ profileCmd
       out(c.dim(`Switch to it with \`hara profile use ${id}\`.\n`));
       return;
     }
-    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|openai|glm|deepseek|openrouter|qwen|qwen-oauth [--key … --base-url … --model …]\n"));
+    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|openai|glm|deepseek|openrouter|qwen|qwen-oauth|ollama|lmstudio [--key … --base-url … --model …]\n"));
     process.exit(1);
   });
 
@@ -2067,14 +2243,10 @@ program
   .option("--cwd <dir>", "default working directory for new sessions (default: current directory)")
   .option("--approval <mode>", "default approval mode for sessions: suggest | auto-edit | full-auto", "auto-edit")
   .action(async (o) => {
-    const cfg = loadConfig();
-    const provider0 = await withRouting(await buildProvider(cfg), cfg);
-    if (!provider0) {
-      out(c.red(`Not authenticated for '${cfg.provider}' — run \`hara setup\` first.\n`));
-      process.exit(1);
-    }
-    const guardianOpt = await buildGuardian(cfg, provider0);
     const cwd = o.cwd ? (await import("node:path")).resolve(o.cwd) : process.cwd();
+    const cfg = loadConfig({ cwd });
+    const provider0 = await withRouting(await buildProvider(cfg), cfg);
+    const guardianOpt = await buildGuardian(cfg, provider0);
     const sandbox = (process.env.HARA_SANDBOX ?? cfg.sandbox ?? "off") as SandboxMode;
     const approval = (APPROVAL_MODES as readonly string[]).includes(o.approval) ? (o.approval as ApprovalMode) : "auto-edit";
     const { startServe } = await import("./serve/server.js");
@@ -2094,23 +2266,73 @@ program
         buildProviderFor: async (model, effort, targetCwd) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           return withRouting(
-            await buildProvider({ ...live, model, reasoningEffort: (effort as HaraConfig["reasoningEffort"]) ?? live.reasoningEffort }),
+            await buildProvider(
+              {
+                ...live,
+                reasoningEffort: (effort as HaraConfig["reasoningEffort"]) ?? live.reasoningEffort,
+              },
+              { model },
+            ),
             live,
           );
         },
         listModels: (targetCwd) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
-          return listModels(live.baseURL ?? providerDefaultBaseURL(live.provider), live.apiKey ?? "");
+          const { profile } = profileForConfig(live);
+          if (profile.kind === "gateway") {
+            const baseURL = profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined);
+            return listModels(baseURL, profile.deviceToken ?? "");
+          }
+          const target = resolveByokProviderTarget(live, profile, false);
+          return listModels(target.baseURL, target.apiKey ?? "");
+        },
+        providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
+        testProviderSettings: (input) => testProviderSettingsCandidate(input),
+        saveProviderSettings: async (input, targetCwd) => {
+          const settingsCwd = targetCwd ?? cwd;
+          if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
+            throw new Error("provider is not a configurable personal provider");
+          }
+          if (providerEnvironmentOverride()) {
+            throw new Error("provider/model/base URL is overridden by HARA_* environment variables; remove the override before editing System Settings");
+          }
+          const resolution = resolveActive(settingsCwd);
+          if (resolution.id !== PERSONAL_ID) {
+            if (resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin") {
+              throw new Error(`profile '${resolution.id}' is selected by ${resolution.source}; switch or unpin it before editing Personal provider settings`);
+            }
+            if (input.activatePersonal !== true) {
+              throw new Error(`profile '${resolution.id}' is active; confirm activatePersonal to save and switch to Personal`);
+            }
+          }
+          const normalized = normalizePersonalProviderConfig({
+            provider: input.provider,
+            model: input.model,
+            baseURL: input.baseURL,
+            apiKey: input.apiKey,
+            clearApiKey: input.clearApiKey,
+          });
+          const raw = readRawConfig();
+          const availableKey = reusablePersonalProviderApiKey(normalized, raw);
+          if (providerRequiresApiKey(normalized.provider) && !availableKey) {
+            throw new Error("a new API key is required when the provider or endpoint changes");
+          }
+          updatePersonalProviderConfig(normalized);
+          if (resolution.id !== PERSONAL_ID) {
+            const switched = useProfile(PERSONAL_ID);
+            if (!switched.ok) throw new Error(switched.reason);
+          }
+          return providerSettingsSnapshot(settingsCwd);
         },
         effortLevels: levelsFor(resolvePlatform(cfg.provider, cfg.baseURL ?? providerDefaultBaseURL(cfg.provider)).reasoning, cfg.model).filter((e): e is NonNullable<typeof e> => !!e),
         runtimeInfo: (targetCwd, selectedModel) => {
-          const live = loadConfig({ cwd: targetCwd ?? cwd });
-          const model = selectedModel ?? live.model;
+          const current = providerSettingsSnapshot(targetCwd ?? cwd).current;
+          const model = selectedModel ?? current.model;
           return {
-            providerId: live.provider,
+            providerId: current.provider,
             model,
             effortLevels: levelsFor(
-              resolvePlatform(live.provider, live.baseURL ?? providerDefaultBaseURL(live.provider)).reasoning,
+              resolvePlatform(current.provider, current.baseURL).reasoning,
               model,
             ).filter((e): e is NonNullable<typeof e> => !!e),
           };
@@ -2130,7 +2352,8 @@ program
         approval,
       },
     );
-    out(c.bold("hara serve") + c.dim(`  ·  ws://${o.host}:${handle.port}  ·  ${cfg.provider}:${cfg.model}  ·  approval ${approval}  ·  token → ~/.hara/serve.json\n`));
+    const setupStatus = provider0 ? `${cfg.provider}:${cfg.model}` : `setup required · ${cfg.provider}:${cfg.model}`;
+    out(c.bold("hara serve") + c.dim(`  ·  ws://${o.host}:${handle.port}  ·  ${setupStatus}  ·  approval ${approval}  ·  token → ~/.hara/serve.json\n`));
     const bye = async (): Promise<void> => {
       await handle.close();
       process.exit(0);
@@ -2925,29 +3148,39 @@ program.action(async (opts) => {
   }
   const machineOutput = !!opts.print && !!opts.schema;
   if (opts.model) cfg.model = opts.model;
-  const provider0 = await withRouting(await buildProvider(cfg), cfg);
+  const provider0 = await withRouting(
+    await buildProvider(cfg, opts.model ? { model: cfg.model } : undefined),
+    cfg,
+  );
+  if (provider0) {
+    cfg.provider = provider0.id as ProviderId;
+    cfg.model = provider0.model;
+  }
   // Fallback provider, built correctly for CROSS-PROVIDER failover. The old `baseURL: fallbackBaseURL ??
   // baseURL` sent the fallback model to the PRIMARY endpoint when no fallbackBaseURL was set — e.g.
   // deepseek-v4-pro posted to coding.dashscope → 400. Now: `fallbackProvider` routes to that vendor's
   // endpoint + its own key (fallbackBaseURL/fallbackApiKey still override); without it we stay on the
   // primary endpoint (correct only for a same-endpoint fallback).
   let fallbackProv: Provider | null = null;
-  if (provider0 && cfg.fallbackModel && cfg.fallbackModel !== cfg.model) {
+  if (provider0 && cfg.fallbackModel && cfg.fallbackModel !== provider0.model) {
     const fp = cfg.fallbackProvider;
-    const cross = !!fp && fp !== cfg.provider;
+    const cross = !!fp && fp !== provider0.id;
     const family = (m: string): string => m.toLowerCase().split(/[-.:/]/)[0];
-    if (cross && !cfg.fallbackApiKey && !cfg.apiKey) {
+    const fallbackEnvKey = fp ? providerEnvKey(fp) : "";
+    const crossKey = cfg.fallbackApiKey ?? (fallbackEnvKey ? process.env[fallbackEnvKey] : undefined);
+    if (fp === "hara-gateway") {
+      process.stderr.write("hara: fallbackProvider cannot be hara-gateway; select an enrolled gateway profile instead. Fallback disabled.\n");
+    } else if (cross && providerRequiresApiKey(fp!) && !crossKey) {
       process.stderr.write(`hara: fallbackProvider '${fp}' needs its own key — set fallbackApiKey. Fallback disabled.\n`);
-    } else if (!fp && !cfg.fallbackBaseURL && family(cfg.fallbackModel) !== family(cfg.model)) {
+    } else if (!fp && !cfg.fallbackBaseURL && family(cfg.fallbackModel) !== family(provider0.model)) {
       // A different-looking vendor with no routing set would hit the primary endpoint and 400 on failover.
-      process.stderr.write(`hara: fallbackModel '${cfg.fallbackModel}' looks like a different vendor than '${cfg.model}', but no fallbackProvider/fallbackBaseURL is set — it would hit the PRIMARY endpoint (likely 400). Set fallbackProvider (+ fallbackApiKey). Fallback disabled.\n`);
+      process.stderr.write(`hara: fallbackModel '${cfg.fallbackModel}' looks like a different vendor than '${provider0.model}', but no fallbackProvider/fallbackBaseURL is set — it would hit the PRIMARY endpoint (likely 400). Set fallbackProvider (+ fallbackApiKey). Fallback disabled.\n`);
     } else {
-      fallbackProv = await buildProvider({
-        ...cfg,
-        provider: fp ?? cfg.provider,
+      fallbackProv = await buildProvider(cfg, {
+        ...(fp ? { provider: fp } : {}),
         model: cfg.fallbackModel,
-        baseURL: cfg.fallbackBaseURL ?? (fp ? providerDefaultBaseURL(fp) : cfg.baseURL),
-        apiKey: cfg.fallbackApiKey ?? (cross ? undefined : cfg.apiKey),
+        ...(cfg.fallbackBaseURL ? { baseURL: cfg.fallbackBaseURL } : {}),
+        ...(cross ? { apiKey: crossKey } : cfg.fallbackApiKey ? { apiKey: cfg.fallbackApiKey } : {}),
       });
     }
   }
@@ -3027,7 +3260,11 @@ program.action(async (opts) => {
     const describeImage = async (path: string, hint?: string, signal?: AbortSignal): Promise<string> => {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
       const vp = cfg.visionModel
-        ? ((await buildProvider({ ...cfg, model: cfg.visionModel, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey })) ?? null)
+        ? ((await buildProvider(cfg, {
+            model: cfg.visionModel,
+            ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
+            ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
+          })) ?? null)
         : cap === "vision"
           ? provider
           : null;
@@ -3130,11 +3367,11 @@ program.action(async (opts) => {
             try { process.stderr.write(`hara: resumed session pinned '${meta.model}' not in availableModels — falling back to '${__fb}'.\n`); } catch { /* ignore */ }
             cfg.model = __fb;
             meta.model = __fb;
-            const __rb = await buildProvider(cfg);
+            const __rb = await buildProvider(cfg, { model: cfg.model });
             if (__rb) provider = __rb;
           } else {
             cfg.model = meta.model;
-            const __rb = await buildProvider(cfg);
+            const __rb = await buildProvider(cfg, { model: cfg.model });
             if (__rb) provider = __rb;
           }
         }
@@ -3190,7 +3427,11 @@ program.action(async (opts) => {
     } else if (inboundImgs.length && cfg.visionModel) {
       let desc = "";
       try {
-        const vp = await buildProvider({ ...cfg, model: cfg.visionModel, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey });
+        const vp = await buildProvider(cfg, {
+          model: cfg.visionModel,
+          ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
+          ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
+        });
         if (vp) desc = await describeImages(vp, inboundImgs);
       } catch {
         /* describe is best-effort — fall back to the marker-only text */
@@ -3232,7 +3473,7 @@ program.action(async (opts) => {
       if (requestedHeadlessRole.readOnly) headlessHooks = false;
       const roleModel = effectiveRoleModel(requestedHeadlessRole.model, cfg.model);
       if (roleModel && roleModel !== provider.model) {
-        const selected = await buildProvider({ ...cfg, model: roleModel });
+        const selected = await buildProvider(cfg, { model: roleModel });
         if (!selected) {
           process.stderr.write(`hara: role '${opts.role}' requires model '${roleModel}', but that provider is not authenticated.\n`);
           process.exitCode = 2;
@@ -3489,11 +3730,11 @@ program.action(async (opts) => {
         out(c.yellow(`⚠ resumed session was pinned to '${meta.model}', which isn't in this profile's availableModels (${__ap.availableModels!.join(", ")}). Falling back to '${__fallback}'.\n`));
         cfg.model = __fallback;
         meta.model = __fallback;
-        const __rebuilt = await buildProvider(cfg);
+        const __rebuilt = await buildProvider(cfg, { model: cfg.model });
         if (__rebuilt) provider = __rebuilt;
       } else {
         cfg.model = meta.model;
-        const __rebuilt = await buildProvider(cfg);
+        const __rebuilt = await buildProvider(cfg, { model: cfg.model });
         if (__rebuilt) provider = __rebuilt;
       }
     }
@@ -3687,7 +3928,7 @@ program.action(async (opts) => {
         setSessionForceModel(force);
         visionProvider = undefined;
         remindedVision = false;
-        const p = await buildProvider(cfg);
+        const p = await buildProvider(cfg, { model: cfg.model });
         if (p) {
           provider = p;
           if (bar.isActive()) bar.update({ model: id });
@@ -3993,7 +4234,11 @@ program.action(async (opts) => {
     // once and remembered per-model in cfg.modelVision. See classifyVision for the capability map.
     const getVisionProvider = async (): Promise<Provider | null> => {
       if (visionProvider !== undefined) return visionProvider;
-      visionProvider = await buildProvider({ ...cfg, model: cfg.visionModel!, baseURL: cfg.visionBaseURL ?? cfg.baseURL, apiKey: cfg.visionApiKey ?? cfg.apiKey });
+      visionProvider = await buildProvider(cfg, {
+        model: cfg.visionModel!,
+        ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
+        ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
+      });
       return visionProvider;
     };
     // lets the computer tool return a screenshot as text (describe via the vision sidecar / a vision main model).
@@ -4281,7 +4526,7 @@ program.action(async (opts) => {
               cfg.reasoningEffort = chosen.effort;
               visionProvider = undefined;
               remindedVision = false;
-              const p2 = await buildProvider(cfg);
+              const p2 = await buildProvider(cfg, { model: cfg.model });
               if (!p2) return void h.sink.notice("(could not rebuild provider)");
               provider = p2;
               persistSession();
@@ -4292,7 +4537,7 @@ program.action(async (opts) => {
             setSessionForceModel(force);
             visionProvider = undefined; // new model may resolve a different describer / capability
             remindedVision = false;
-            const p = await buildProvider(cfg);
+            const p = await buildProvider(cfg, { model: cfg.model });
             if (p) {
               provider = p;
               persistSession(); // persist the session-pinned model so resume restores it

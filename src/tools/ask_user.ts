@@ -26,6 +26,7 @@ registerTool({
     "In a non-interactive run (no terminal) it returns a 'proceed with your best judgment' note instead of " +
     "blocking, so prefer making a reasonable call over asking when context already answers the question.",
   kind: "read", // the prompt itself is the interaction; never route it through the approval gate
+  classify: () => ({ effect: "interactive", concurrencySafe: false }),
   input_schema: {
     type: "object",
     properties: {

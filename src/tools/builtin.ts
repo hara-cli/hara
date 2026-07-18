@@ -13,6 +13,7 @@ import { BinaryFileError, readVerifiedRegularFileSnapshot, resolveVerifiedModelP
 import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
 import { sensitiveFileError, sensitiveShellCommandReason } from "../security/sensitive-files.js";
 import { createToolOutputLineRedactor, redactToolSubprocessOutput } from "../security/subprocess-env.js";
+import { isReadOnlyCommand, splitCompound } from "../security/permissions.js";
 import {
   hostsInCommand,
   isNetworkGitOp,
@@ -137,6 +138,7 @@ registerTool({
     required: ["path"],
   },
   kind: "read",
+  concurrencySafe: true,
   async run(input, ctx) {
     const p = abs(input.path, ctx.cwd);
     const denied = sensitiveFileError(p, "read");
@@ -217,6 +219,17 @@ registerTool({
     required: ["command"],
   },
   kind: "exec",
+  classify(input) {
+    const command = typeof input?.command === "string" ? input.command : "";
+    const parts = command ? splitCompound(command) : null;
+    const readOnly =
+      !Boolean(input?.background)
+      && !!parts?.length
+      && parts.every(isReadOnlyCommand);
+    return readOnly
+      ? { effect: "read", concurrencySafe: true }
+      : { effect: "exec", concurrencySafe: false };
+  },
   requiresProjectWorkspace: true,
   async run(input, ctx) {
     if (input.background !== undefined && typeof input.background !== "boolean") {
@@ -318,7 +331,13 @@ registerTool({
     },
     required: ["action"],
   },
-  kind: "read", // manages only the agent's own background jobs; safe to run unconfirmed
+  kind: "exec", // conservative default; list/tail are downgraded per input, kill remains approval-gated
+  classify(input) {
+    const action = String(input?.action ?? "");
+    return action === "list" || action === "tail"
+      ? { effect: "read", concurrencySafe: true }
+      : { effect: "exec", concurrencySafe: false, destructive: action === "kill" };
+  },
   async run(input) {
     const action = String(input.action);
     if (action === "list") {

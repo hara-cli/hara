@@ -102,6 +102,24 @@ export function redactSensitiveText(text: string): SecretRedaction {
   return { text: out, redactions };
 }
 
+/** Remove caller-known secret values before pattern matching. Provider/server errors may echo an opaque key
+ * that has no recognizable prefix, so field-name and token-shape heuristics alone cannot uphold no-echo APIs. */
+export function redactKnownSecrets(text: string, secrets: readonly (string | undefined)[]): SecretRedaction {
+  let out = text;
+  const exactHits: string[] = [];
+  for (const value of secrets) {
+    if (!value) continue;
+    const variants = new Set([value, encodeURIComponent(value)]);
+    for (const variant of variants) {
+      if (!variant || !out.includes(variant)) continue;
+      out = out.split(variant).join("***");
+      exactHits.push("known-secret");
+    }
+  }
+  const patterned = redactSensitiveText(out);
+  return { text: patterned.text, redactions: [...exactHits, ...patterned.redactions] };
+}
+
 /** Structured tool/config data often carries an opaque value that has no recognizable token prefix. In that
  *  case the FIELD name is the evidence (`apiKey`, `access_token`, `FEISHU_APP_SECRET`, …). Keep this narrow
  *  enough not to erase ordinary fields such as `tokenCount` or `secretary`. */

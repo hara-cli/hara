@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { redactSensitiveText, redactSensitiveValue } from "../dist/security/secrets.js";
+import { redactKnownSecrets, redactSensitiveText, redactSensitiveValue } from "../dist/security/secrets.js";
 import { issueTitle } from "../dist/feedback.js";
 
 test("secret redaction covers chat, env, JSON, headers, flags, and nested tool data", () => {
@@ -52,6 +52,18 @@ test("secret redaction handles quoted whitespace, URL credentials, and common st
   assert.match(redacted, /PASSWORD="\*\*\*"/);
   assert.match(redacted, /https:\/\/robot:\*\*\*@example\.test/);
   assert.match(redacted, /--token '\*\*\*'/);
+});
+
+test("known-secret redaction removes opaque values echoed without a credential label", () => {
+  const opaque = "plainopaquevalue987654";
+  const encoded = encodeURIComponent("secret/value+with symbols");
+  const result = redactKnownSecrets(
+    `upstream rejected ${opaque}; encoded=${encoded}`,
+    [opaque, "secret/value+with symbols"],
+  );
+  assert.equal(result.text.includes(opaque), false);
+  assert.equal(result.text.includes(encoded), false);
+  assert.ok(result.redactions.includes("known-secret"));
 });
 
 test("deep redaction clones without mutating frozen input or treating __proto__ as a setter", () => {

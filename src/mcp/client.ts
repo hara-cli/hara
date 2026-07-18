@@ -190,6 +190,7 @@ export async function connectMcpServers(
           description: t.description ?? `${name}/${t.name}`,
           input_schema: schema,
           kind: "exec",
+          visibility: "deferred",
           trustBoundary: "external",
           async run(input, ctx) {
             if (!ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {

@@ -40,6 +40,7 @@ registerTool({
     required: ["query"],
   },
   kind: "read",
+  concurrencySafe: true,
   async run(input, ctx) {
     if (ctx.signal?.aborted) throw new Error("codebase_search interrupted by agent run deadline or cancellation");
     const words = [...new Set(String(input.query ?? "").toLowerCase().split(/\s+/).filter((w) => w.length > 1))];
