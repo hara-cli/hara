@@ -41,6 +41,9 @@ if (process.env.MCP_HANG_LIST === "1") {
 }
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
+  if (process.env.MCP_LIST_REQUEST_FILE) {
+    writeFileSync(process.env.MCP_LIST_REQUEST_FILE, "requested\n");
+  }
   if (process.env.MCP_HANG_LIST === "1") await new Promise(() => {});
   return {
     tools: [

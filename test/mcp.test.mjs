@@ -129,25 +129,38 @@ test("mcp: startup and calls default closed; reviewed/opted-in calls work and st
 test("mcp: cancelling the owning turn aborts lazy startup and closes its child", { timeout: 4000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-mcp-abort-"));
   const pidFile = join(dir, "list.pid");
+  const listRequestFile = join(dir, "list-requested");
   const controller = new AbortController();
   const logs = [];
   try {
-    const abortTimer = setTimeout(() => controller.abort(), 100);
     const started = Date.now();
-    const count = await connectMcpServers(
+    const connecting = connectMcpServers(
       {
         "cancelled-list": {
           command: process.execPath,
           args: [fixture],
-          env: { MCP_PID_FILE: pidFile, MCP_HANG_LIST: "1" },
+          env: {
+            MCP_PID_FILE: pidFile,
+            MCP_HANG_LIST: "1",
+            MCP_LIST_REQUEST_FILE: listRequestFile,
+          },
         },
       },
       (message) => logs.push(message),
       { approved: true, timeoutMs: 10_000, signal: controller.signal },
     );
-    clearTimeout(abortTimer);
+    // Wait for the fixture to confirm that initialization completed and listTools reached the server.
+    // A fixed abort delay raced slower Node/Windows CI and sometimes cancelled connect instead, leaving
+    // this test to assert an implementation-detail timing accident rather than the intended ownership rule.
+    for (let attempt = 0; attempt < 200 && !existsSync(listRequestFile); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const reachedListTools = existsSync(listRequestFile);
+    controller.abort();
+    const count = await connecting;
     const elapsed = Date.now() - started;
 
+    assert.equal(reachedListTools, true, "fixture received the listTools request before cancellation");
     assert.equal(count, 0);
     assert.ok(elapsed < 2_000, `turn cancellation should return promptly (actual ${elapsed}ms)`);
     assert.match(logs.join("\n"), /failed during list tools.*abort/i);

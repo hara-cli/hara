@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.125.2 — 2026-07-18 — conversation/task boundary and deliberate execution
+## 0.125.3 — 2026-07-18 — conversation/task boundary and deliberate execution
 
 - **Chat delivery is now separate from task execution.** Slash controls such as `/model` no longer create a
   fake steer target; input typed while a picker or other local control is busy is visibly queued as the next
@@ -40,7 +40,7 @@ All notable changes to `@nanhara/hara`.
   lines. Other npm warnings and all actual server errors remain visible and redacted. Hara does not read,
   rewrite, or weaken the user's `.npmrc`. Esc, interruption, and the total task deadline now also cancel a
   lazy MCP startup/tool call and close an unresponsive child instead of leaving it behind.
-- Upgrade with `npm i -g @nanhara/hara@0.125.2`.
+- Upgrade with `npm i -g @nanhara/hara@0.125.3`.
 
 ## 0.125.1 — 2026-07-18 — installed plugin commands inside agent tasks
 
