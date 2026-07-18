@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   MAX_TASK_STEERING_ENTRIES,
+  applyTaskBrief,
   continueTaskExecution,
   consumePendingTaskSteering,
   createTaskExecution,
@@ -14,6 +15,7 @@ import {
   newSteerInteraction,
   newTurnInteraction,
   recordTaskSteering,
+  routeTaskInteraction,
   requestsTaskContinuation,
   recoverTaskExecution,
   taskExecutionContext,
@@ -48,6 +50,27 @@ test("task execution context restores the bounded checklist as an immediate reco
   assert.match(context, /\[done\] edit schema/);
   assert.match(context, /\[in progress\] run migration test/);
   assert.match(context, /first unfinished item/);
+});
+
+test("task brief records the interpreted goal and acceptance separately from the raw objective", () => {
+  const interaction = newTurnInteraction();
+  const task = createTaskExecution("这个全面优化一下", interaction.turnId, "2026-07-18T00:00:00.000Z");
+  const accepted = applyTaskBrief(task, {
+    intent: "change",
+    goal: "separate conversation routing from task execution",
+    constraints: ["preserve unrelated changes"],
+    acceptance: ["control-command input is never steered or dropped", "side effects require an accepted brief"],
+    steps: ["fix routing", "gate execution", "run regression tests"],
+  }, "2026-07-18T00:01:00.000Z");
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.task.objective, "这个全面优化一下", "the user's original request remains immutable");
+  assert.equal(accepted.task.brief.goal, "separate conversation routing from task execution");
+  assert.doesNotMatch(
+    taskExecutionContext(accepted.task, interaction),
+    /Accepted task brief|side effects require an accepted brief/,
+    "the mutable brief is composed dynamically by the agent loop instead of frozen into execution context",
+  );
+  assert.equal(isTaskExecution(accepted.task), true);
 });
 
 test("task steering rejects stale turn identity", () => {
@@ -138,6 +161,27 @@ test("idle continuation detection is explicit instead of hijacking every new mes
   }
 });
 
+test("a queued steer with no executable task falls forward to a normal turn without changing its id", () => {
+  const steer = newSteerInteraction("ui-control-turn");
+  const routed = routeTaskInteraction(undefined, steer);
+  assert.equal(routed.recoveredMissingTask, true);
+  assert.deepEqual(routed.interaction, { kind: "turn", turnId: steer.turnId });
+
+  const existing = createTaskExecution("real task", "active-turn");
+  const stale = newSteerInteraction("different-turn");
+  const retained = routeTaskInteraction(existing, stale);
+  assert.equal(retained.recoveredMissingTask, false);
+  assert.equal(retained.interaction.kind, "steer", "an existing-task mismatch remains visible to the stale-turn guard");
+
+  const completed = finishTaskExecution(existing, { status: "completed" }, []);
+  const late = routeTaskInteraction(completed, newSteerInteraction(existing.turnId));
+  assert.equal(late.interaction.kind, "turn", "a retained but finished task is not an executable steer target");
+  assert.equal(late.recoveredMissingTask, true);
+
+  const explicit = routeTaskInteraction(completed, newSteerInteraction(existing.turnId), { allowInactive: true });
+  assert.equal(explicit.interaction.kind, "steer", "explicit /continue may deliberately reopen an inactive task");
+});
+
 test("session task state round-trips separately, redacts secrets, and legacy sessions remain valid", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-task-session-"));
   const previousHome = process.env.HOME;
@@ -154,12 +198,22 @@ test("session task state round-trips separately, redacts secrets, and legacy ses
       updatedAt: "",
     };
     const interaction = newTurnInteraction();
-    const task = createTaskExecution("deploy with API_KEY=super-secret-123456", interaction.turnId);
+    let task = createTaskExecution("deploy with API_KEY=super-secret-123456", interaction.turnId);
+    const briefed = applyTaskBrief(task, {
+      intent: "change",
+      goal: "deploy using API_KEY=super-secret-123456 from the environment",
+      constraints: ["never print API_KEY=super-secret-123456"],
+      acceptance: ["deployment succeeds"],
+      steps: ["deploy"],
+    });
+    assert.equal(briefed.ok, true);
+    task = briefed.task;
     saveSession(meta, [{ role: "user", content: "continue" }], task);
     const loaded = loadSession(id);
     assert.ok(loaded.task, "new top-level task is restored");
     assert.equal(loaded.history[0].content, "continue", "transcript remains independent");
     assert.ok(!loaded.task.objective.includes("super-secret-123456"), "task objective is redacted too");
+    assert.ok(!JSON.stringify(loaded.task.brief).includes("super-secret-123456"), "interpreted task brief is redacted too");
 
     const legacyId = newSessionId();
     const legacy = { meta: { ...meta, id: legacyId, updatedAt: "2026-07-15T00:00:00.000Z" }, history: [] };

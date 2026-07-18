@@ -6,11 +6,26 @@ export const TASK_SCHEMA_VERSION = 1;
 export const MAX_TASK_OBJECTIVE_CHARS = 4096;
 export const MAX_TASK_STEERING_CHARS = 24_000;
 export const MAX_TASK_STEERING_ENTRIES = 24;
+export const MAX_TASK_BRIEF_GOAL_CHARS = 2_000;
+export const MAX_TASK_BRIEF_LIST_ENTRIES = 12;
+export const MAX_TASK_BRIEF_ITEM_CHARS = 800;
 
 export type TaskExecutionStatus = "running" | "paused" | "completed" | "blocked";
+export type TaskIntent = "answer" | "investigate" | "change";
 export type TaskInteraction =
   | { kind: "turn"; turnId: string }
   | { kind: "steer"; turnId: string; expectedTurnId: string };
+
+/** Model-authored understanding checkpoint. The raw user request remains `objective`; this brief records
+ * the interpreted goal and proof of completion before side effects begin. */
+export interface TaskBrief {
+  intent: TaskIntent;
+  goal: string;
+  constraints: string[];
+  acceptance: string[];
+  steps: string[];
+  createdAt: string;
+}
 
 export interface TaskSteering {
   id: string;
@@ -37,6 +52,8 @@ export interface TaskExecution {
   startedAt: string;
   endedAt?: string;
   lastOutcome?: RunOutcome["status"] | "interrupted";
+  /** Present once the model has explicitly understood this execution. Required before side effects. */
+  brief?: TaskBrief;
   /** Bounded audit trail; full user messages remain in the transcript. */
   steering?: TaskSteering[];
 }
@@ -58,12 +75,55 @@ function validTimestamp(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && Number.isFinite(Date.parse(value));
 }
 
+function boundedList(value: unknown, fallback: string): string[] {
+  if (!Array.isArray(value)) return [fallback];
+  const out = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => boundedText(item, MAX_TASK_BRIEF_ITEM_CHARS))
+    .filter(Boolean)
+    .slice(0, MAX_TASK_BRIEF_LIST_ENTRIES);
+  return out.length ? out : [fallback];
+}
+
+function validBriefList(value: unknown): value is string[] {
+  return Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= MAX_TASK_BRIEF_LIST_ENTRIES &&
+    value.every((item) => typeof item === "string" && item.length > 0 && item.length <= MAX_TASK_BRIEF_ITEM_CHARS);
+}
+
 export function newTurnInteraction(): Extract<TaskInteraction, { kind: "turn" }> {
   return { kind: "turn", turnId: randomUUID() };
 }
 
 export function newSteerInteraction(expectedTurnId: string): Extract<TaskInteraction, { kind: "steer" }> {
   return { kind: "steer", expectedTurnId, turnId: randomUUID() };
+}
+
+export interface RoutedTaskInteraction {
+  interaction: TaskInteraction;
+  /** A type-ahead message raced with the end of the UI operation it targeted. There is no executable
+   * task left to steer, so the input must fall forward into a normal turn instead of being rejected or
+   * dropped. This mirrors Codex's NoActiveTurn race recovery at the conversation boundary. */
+  recoveredMissingTask: boolean;
+}
+
+/** Resolve a UI-delivery hint against authoritative task state. `steer` is never itself proof that an
+ * executable task is running: controls also occupy the composer briefly, and a real turn may finish between
+ * enqueue and dequeue. Preserve the submitted turn id but promote late input to a new turn. Only an explicit
+ * continuation path may opt into reopening a paused/completed task; stale live-turn ids remain hard errors
+ * in `continueTaskExecution`. */
+export function routeTaskInteraction(
+  task: TaskExecution | undefined,
+  interaction: TaskInteraction,
+  options: { allowInactive?: boolean } = {},
+): RoutedTaskInteraction {
+  const steerable = !!task && (task.status === "running" || options.allowInactive === true);
+  if (interaction.kind !== "steer" || steerable) return { interaction, recoveredMissingTask: false };
+  return {
+    interaction: { kind: "turn", turnId: interaction.turnId },
+    recoveredMissingTask: true,
+  };
 }
 
 export function createTaskExecution(objective: string, turnId: string, at: Date | string = new Date()): TaskExecution {
@@ -77,6 +137,46 @@ export function createTaskExecution(objective: string, turnId: string, at: Date 
     createdAt: now,
     updatedAt: now,
     startedAt: now,
+  };
+}
+
+export interface TaskBriefInput {
+  intent?: unknown;
+  goal?: unknown;
+  constraints?: unknown;
+  acceptance?: unknown;
+  steps?: unknown;
+}
+
+/** Attach or revise the explicit understanding checkpoint. Revision is intentional: steering may add a
+ * constraint or convert an investigation into an approved change, while the original request remains intact. */
+export function applyTaskBrief(
+  task: TaskExecution | undefined,
+  input: TaskBriefInput,
+  at: Date | string = new Date(),
+): { ok: true; task: TaskExecution; brief: TaskBrief } | { ok: false; reason: string } {
+  if (!task) return { ok: false, reason: "there is no task to brief" };
+  if (task.status !== "running") return { ok: false, reason: `task ${task.id} is ${task.status}, not running` };
+  const intent = input.intent;
+  if (intent !== "answer" && intent !== "investigate" && intent !== "change") {
+    return { ok: false, reason: "intent must be answer, investigate, or change" };
+  }
+  if (typeof input.goal !== "string" || !input.goal.trim()) {
+    return { ok: false, reason: "goal must be a non-empty string" };
+  }
+  const now = iso(at);
+  const brief: TaskBrief = {
+    intent,
+    goal: boundedText(input.goal, MAX_TASK_BRIEF_GOAL_CHARS),
+    constraints: boundedList(input.constraints, "preserve unrelated user work and stated boundaries"),
+    acceptance: boundedList(input.acceptance, intent === "change" ? "the requested change is verified" : "the answer is supported by relevant evidence"),
+    steps: boundedList(input.steps, intent === "change" ? "inspect, change, and verify" : "inspect and report"),
+    createdAt: now,
+  };
+  return {
+    ok: true,
+    brief,
+    task: { ...task, brief, updatedAt: now },
   };
 }
 
@@ -238,6 +338,9 @@ export function taskExecutionContext(task: TaskExecution, interaction: TaskInter
     steeringNote,
     "Conversation messages provide evidence and refinements, but the task objective above remains authoritative until an explicit new task starts.",
   ];
+  // The accepted brief is deliberately absent here. `taskExecutionContext` is the stable per-interaction
+  // identity/recovery snapshot, while runAgent composes the current brief dynamically on every model round.
+  // Duplicating it here would leave the pre-run version in the prompt after a mid-run task_intake revision.
   if (todos.length) {
     lines.push(
       "## Persisted execution checkpoint",
@@ -258,6 +361,7 @@ export function formatTaskExecution(task: TaskExecution | undefined): string {
     `task ${task.id.slice(0, 8)} · ${task.status}`,
     `turn ${task.turnId.slice(0, 8)} · outcome ${task.lastOutcome ?? "running"}`,
     `objective: ${task.objective}`,
+    `brief: ${task.brief ? `${task.brief.intent} · ${task.brief.goal}` : "(not accepted yet)"}`,
     `steering: ${task.steering?.length ?? 0}`,
   ].join("\n");
 }
@@ -275,6 +379,18 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
     (task.endedAt !== undefined && !validTimestamp(task.endedAt)) ||
     (task.lastOutcome !== undefined && task.lastOutcome !== "completed" && task.lastOutcome !== "error" && task.lastOutcome !== "empty" && task.lastOutcome !== "halted" && task.lastOutcome !== "interrupted")
   ) return false;
+  if (task.brief !== undefined) {
+    if (!task.brief || typeof task.brief !== "object" || Array.isArray(task.brief)) return false;
+    const brief = task.brief as Record<string, unknown>;
+    if (
+      (brief.intent !== "answer" && brief.intent !== "investigate" && brief.intent !== "change") ||
+      typeof brief.goal !== "string" || brief.goal.length === 0 || brief.goal.length > MAX_TASK_BRIEF_GOAL_CHARS ||
+      !validBriefList(brief.constraints) ||
+      !validBriefList(brief.acceptance) ||
+      !validBriefList(brief.steps) ||
+      !validTimestamp(brief.createdAt)
+    ) return false;
+  }
   if (task.steering === undefined) return true;
   if (!Array.isArray(task.steering) || task.steering.length > MAX_TASK_STEERING_ENTRIES) return false;
   return task.steering.every((entry) => {

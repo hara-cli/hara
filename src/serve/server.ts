@@ -87,8 +87,9 @@ export interface ServeDeps {
   listModels?: (cwd?: string) => Promise<string[]>;
   /** thinking-dial levels valid for this endpoint's reasoning style (from the provider registry) */
   effortLevels?: string[];
-  /** Live defaults advertised to persistent clients after config/profile edits. */
-  runtimeInfo?: (cwd?: string) => { providerId: string; model: string; effortLevels?: string[] };
+  /** Live defaults advertised to persistent clients after config/profile edits. `model` lets a session
+   * pinned to a non-default model ask for that model's valid reasoning controls. */
+  runtimeInfo?: (cwd?: string, model?: string) => { providerId: string; model: string; effortLevels?: string[] };
   /** Per-project lifecycle limits, read at turn start so persistent Desktop sessions pick up config edits. */
   runLimits?: (cwd?: string) => { timeoutMs: number; maxRounds: number };
   spawnSubagent: (provider: Provider, cwd: string, projectContext: string | undefined, stats: { input: number; output: number; lastInput?: number }, task: string, role?: string, signal?: AbortSignal) => Promise<string>;
@@ -315,11 +316,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
   const hub = new SessionHub(deps.store ?? realStore);
-  const runtimeInfo = (cwd?: string): { providerId: string; model: string; effortLevels: string[] } => {
-    const live = deps.runtimeInfo?.(cwd);
+  const runtimeInfo = (cwd?: string, model?: string): { providerId: string; model: string; effortLevels: string[] } => {
+    const live = deps.runtimeInfo?.(cwd, model);
     return {
       providerId: live?.providerId ?? deps.providerId,
-      model: live?.model ?? deps.model,
+      model: live?.model ?? model ?? deps.model,
       effortLevels: live?.effortLevels ?? deps.effortLevels ?? [],
     };
   };
@@ -504,6 +505,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         memory: memoryDigest(s.meta.cwd),
         continuationSession: s.continuationSession,
         executionContext,
+        taskIntake: {
+          task: s.task,
+          current: () => s.task,
+          onUpdate: (next): void => {
+            s.task = next;
+          },
+          onCheckpoint: (next): void => {
+            s.task = next;
+            hub.save(s);
+          },
+        },
         pendingInput: async () => {
           materializePendingSteering(s); // helper updates the shared live history after its write-ahead save
           return [];
@@ -843,8 +855,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const session = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : (session?.meta.cwd ?? opts.cwd);
             const models = deps.listModels ? await deps.listModels(targetCwd).catch(() => []) : [];
-            const runtime = runtimeInfo(targetCwd);
-            return reply(rpcResult(id!, { models, current: session?.meta.model ?? runtime.model, effort: session?.effort ?? null, effortLevels: runtime.effortLevels }));
+            const defaultRuntime = runtimeInfo(targetCwd);
+            const current = session?.meta.model ?? defaultRuntime.model;
+            const currentRuntime = runtimeInfo(targetCwd, current);
+            return reply(rpcResult(id!, { models, current, effort: session?.effort ?? null, effortLevels: currentRuntime.effortLevels }));
           }
           case "session.set-model": {
             // per-session model / thinking-effort switch (the composer picker). Rebuilds the session's

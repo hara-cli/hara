@@ -178,6 +178,7 @@ import {
   newTurnInteraction,
   recordTaskSteering,
   recoverTaskExecution,
+  routeTaskInteraction,
   requestsTaskContinuation,
   taskExecutionContext,
   type TaskExecution,
@@ -191,7 +192,7 @@ import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks, haraBinDir } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
 import { decompose, topoOrder, topoWaves, savePlan, loadPlan, atomPrompt, verify, runCheck, type Atom, type Plan } from "./org/planner.js";
-import { connectMcpServers, closeMcp } from "./mcp/client.js";
+import { closeMcp, registerLazyMcpServers } from "./mcp/client.js";
 import { sandboxSupported, runShell, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
 import { searchAssets, scaffoldAssets, assetsDir, assetSearchRoots } from "./recall.js";
@@ -2101,13 +2102,17 @@ program
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           return listModels(live.baseURL ?? providerDefaultBaseURL(live.provider), live.apiKey ?? "");
         },
-        effortLevels: levelsFor(resolvePlatform(cfg.provider, cfg.baseURL ?? providerDefaultBaseURL(cfg.provider)).reasoning).filter((e): e is NonNullable<typeof e> => !!e),
-        runtimeInfo: (targetCwd) => {
+        effortLevels: levelsFor(resolvePlatform(cfg.provider, cfg.baseURL ?? providerDefaultBaseURL(cfg.provider)).reasoning, cfg.model).filter((e): e is NonNullable<typeof e> => !!e),
+        runtimeInfo: (targetCwd, selectedModel) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
+          const model = selectedModel ?? live.model;
           return {
             providerId: live.provider,
-            model: live.model,
-            effortLevels: levelsFor(resolvePlatform(live.provider, live.baseURL ?? providerDefaultBaseURL(live.provider)).reasoning).filter((e): e is NonNullable<typeof e> => !!e),
+            model,
+            effortLevels: levelsFor(
+              resolvePlatform(live.provider, live.baseURL ?? providerDefaultBaseURL(live.provider)).reasoning,
+              model,
+            ).filter((e): e is NonNullable<typeof e> => !!e),
           };
         },
         runLimits: (targetCwd) => agentRunLimits(loadConfig({ cwd: targetCwd ?? cwd })),
@@ -2993,40 +2998,16 @@ program.action(async (opts) => {
   }
   const stats = { input: 0, output: 0, lastInput: 0 };
 
-  // Connecting to MCP executes configured external commands before an MCP tool is selected, so the ordinary
-  // per-tool confirmation is too late. Obtain one explicit startup grant for the named server set. askConfirm
-  // uses a short-lived Ink prompt and restores stdin, making it safe before either the main TUI or readline REPL
-  // owns the terminal. Non-interactive runs remain closed unless the user opted in before process launch.
+  // Advertise configured MCP capabilities without starting any subprocess or blocking startup for permission.
+  // The model can call `mcp_connect` when a task first needs ONE server; that external-boundary tool goes
+  // through the ordinary interactive grant, and the newly discovered tools appear on the next model round.
+  // Read-only headless roles do not receive the launcher at all.
   const mcpAll = { ...pluginMcpServers(), ...cfg.mcpServers }; // user config wins over plugin-contributed servers
-  const mcpNames = Object.keys(mcpAll);
-  if (!requestedHeadlessRole?.readOnly && mcpNames.length) {
-    const trustedOptIn = process.env.HARA_ALLOW_TRUSTED_EXTENSIONS === "1";
-    const interactiveTerminal = !opts.print && !!stdin.isTTY && !!stdout.isTTY;
-    const approved =
-      trustedOptIn ||
-      (interactiveTerminal &&
-        (await askConfirm(
-          `Start configured MCP server${mcpNames.length === 1 ? "" : "s"} ${mcpNames
-            .slice(0, 8)
-            .map((name) => `'${name.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 80)}'`)
-            .join(", ")}${mcpNames.length > 8 ? ` and ${mcpNames.length - 8} more` : ""}? ` +
-            "They execute external code outside Hara's protected-file boundary.",
-          false,
-        )));
-    if (approved) {
-      await connectMcpServers(
-        mcpAll,
-        (m) => machineOutput ? process.stderr.write(m + "\n") : out(c.dim(m + "\n")),
-        { approved: true },
-      );
-    } else {
-      const message = interactiveTerminal
-        ? "hara: MCP server startup declined; no configured MCP command was executed.\n"
-        : "hara: MCP servers skipped because this run has no interactive startup approval. " +
-          "Set HARA_ALLOW_TRUSTED_EXTENSIONS=1 before launch only for reviewed servers.\n";
-      if (machineOutput || !interactiveTerminal) process.stderr.write(message);
-      else out(c.dim(message));
-    }
+  if (!requestedHeadlessRole?.readOnly && Object.keys(mcpAll).length) {
+    registerLazyMcpServers(
+      mcpAll,
+      (message) => machineOutput ? process.stderr.write(message + "\n") : out(c.dim(message + "\n")),
+    );
   }
 
   // one-shot
@@ -3272,6 +3253,17 @@ program.action(async (opts) => {
       memory: memoryDigest(cwd),
       continuationSession,
       executionContext: taskExecutionContext(task, headlessInteraction, meta?.todos ?? []),
+      taskIntake: {
+        task,
+        current: () => task,
+        onUpdate: (next: TaskExecution): void => {
+          task = next;
+        },
+        onCheckpoint: (next: TaskExecution): void => {
+          task = next;
+          if (meta) saveSession(meta, history, task);
+        },
+      },
       ...(roleOverride ? { systemOverride: roleOverride } : {}),
       ...(headlessToolFilter ? { toolFilter: headlessToolFilter } : {}),
       hooks: headlessHooks,
@@ -3508,6 +3500,19 @@ program.action(async (opts) => {
   }
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
   const persistSession = (): void => saveSession(meta, history, task);
+  const taskIntakeForRun = () => task
+    ? {
+        task,
+        current: (): TaskExecution | undefined => task,
+        onUpdate: (next: TaskExecution): void => {
+          task = next;
+        },
+        onCheckpoint: (next: TaskExecution): void => {
+          task = next;
+          persistSession();
+        },
+      }
+    : undefined;
   let requestedWorkspaceSwitch: string | null = null;
   let requestedSessionSwitch: { id: string; cwd: string } | null = null;
   const relaunchRequestedTarget = async (): Promise<void> => {
@@ -4094,6 +4099,7 @@ program.action(async (opts) => {
       initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
       cwd,
+      agentSlashCommands: loadSkillIndex(cwd).filter((skill) => skill.userInvocable).map((skill) => skill.id),
       header: {
         version: pkg.version,
         modelLabel: `${cfg.provider}:${cfg.model}`,
@@ -4131,6 +4137,39 @@ program.action(async (opts) => {
             turnId: interaction?.turnId ?? newTurnInteraction().turnId,
           };
         }
+        // Type-ahead steering belongs to every executable Agent turn, including `/skill` kickoff turns.
+        // Local slash controls never publish a steer target in App, so they cannot enter this callback.
+        const pendingInput = async (): Promise<NeutralMsg[]> => {
+          const freshMessages = new Map<string, NeutralMsg>();
+          for (const it of h.drainQueue()) {
+            const r2 = await resolveImages(it.images, h);
+            const body = await expandMentionsAsync(it.line, cwd, { signal: h.signal }) + (r2.skip ? "" : (r2.extraText ?? ""));
+            const attach = !r2.skip && r2.attach?.length ? r2.attach : undefined;
+            if (!body.trim() && !attach) continue;
+            const recorded = recordTaskSteering(task, it.expectedTurnId, body || "(image-only steering)");
+            if (!recorded.ok) {
+              h.sink.notice(`(steer rejected: ${recorded.reason})`);
+              continue;
+            }
+            task = recorded.task;
+            const accepted = task.steering?.at(-1);
+            if (accepted?.deliveryState === "pending") {
+              freshMessages.set(accepted.id, { role: "user", content: `${INTERJECT_PREFIX}\n\n${body}`, ...(attach ? { images: attach } : {}) });
+            }
+          }
+          const consumed = consumePendingTaskSteering(task);
+          if (!consumed) return [];
+          const out = consumed.entries.map((entry): NeutralMsg => freshMessages.get(entry.id) ?? ({
+            role: "user",
+            content: `${INTERJECT_PREFIX}\n\n${entry.content}`,
+          }));
+          // Write ahead both the transcript projection and the consumed inbox state. Returning [] prevents
+          // runAgent from appending the same messages again after this shared live history is updated.
+          saveSession(meta, [...history, ...out], consumed.task);
+          task = consumed.task;
+          history.push(...out);
+          return [];
+        };
         // A dropped/pasted file path (`/Users/…/doc.md`, maybe trailing text/images) starts with '/' but
         // is NOT a command — treat it as a file to read, not "Unknown command" (see isSlashCommand).
         if (isSlashCommand(line)) {
@@ -4436,7 +4475,7 @@ program.action(async (opts) => {
               clearTodos();
               meta.todos = [];
               const skillContent = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${arg ? ` — request: ${arg}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
-              const skillInteraction = interaction ?? newTurnInteraction();
+              const skillInteraction = routeTaskInteraction(task, interaction ?? newTurnInteraction()).interaction;
               if (skillInteraction.kind === "steer") {
                 const continued = continueTaskExecution(task, skillInteraction);
                 if (!continued.ok) return void h.sink.notice(`(steer rejected: ${continued.reason})`);
@@ -4455,7 +4494,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -4478,7 +4517,11 @@ program.action(async (opts) => {
         line = inlineLeadingPath(line, existsSync);
         const ui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
         const appr = h.approval;
-        let submittedInteraction: TaskInteraction = interaction ?? newTurnInteraction();
+        let submittedInteraction: TaskInteraction = routeTaskInteraction(
+          task,
+          interaction ?? newTurnInteraction(),
+          { allowInactive: !!continueCommand },
+        ).interaction;
         if (resumeTaskPending && task && submittedInteraction.kind === "turn" &&
           (hasPendingTaskSteering(task) || requestsTaskContinuation(line))) {
           submittedInteraction = { kind: "steer", expectedTurnId: task.turnId, turnId: submittedInteraction.turnId };
@@ -4498,41 +4541,6 @@ program.action(async (opts) => {
           }
           resumeTaskPending = false;
           return taskExecutionContext(task, submittedInteraction, meta.todos ?? []);
-        };
-        // Type-ahead steering: fold messages typed mid-turn into the next model call (codex-style) so a
-        // clarification/addition course-corrects the live task, rather than waiting for a fresh turn.
-        // Shared by every turn below (plan investigate, plan execute, and the regular turn).
-        const pendingInput = async (): Promise<NeutralMsg[]> => {
-          const freshMessages = new Map<string, NeutralMsg>();
-          for (const it of h.drainQueue()) {
-            const r2 = await resolveImages(it.images, h);
-            const body = await expandMentionsAsync(it.line, cwd, { signal: h.signal }) + (r2.skip ? "" : (r2.extraText ?? ""));
-            const attach = !r2.skip && r2.attach?.length ? r2.attach : undefined;
-            if (!body.trim() && !attach) continue; // image-only message whose image was skipped → nothing to add
-            const recorded = recordTaskSteering(task, it.expectedTurnId, body || "(image-only steering)");
-            if (!recorded.ok) {
-              h.sink.notice(`(steer rejected: ${recorded.reason})`);
-              continue;
-            }
-            task = recorded.task;
-            const accepted = task.steering?.at(-1);
-            if (accepted?.deliveryState === "pending") {
-              freshMessages.set(accepted.id, { role: "user", content: `${INTERJECT_PREFIX}\n\n${body}`, ...(attach ? { images: attach } : {}) });
-            }
-          }
-          const consumed = consumePendingTaskSteering(task);
-          if (!consumed) return [];
-          const out = consumed.entries.map((entry): NeutralMsg => freshMessages.get(entry.id) ?? ({
-            role: "user",
-            content: `${INTERJECT_PREFIX}\n\n${entry.content}`,
-          }));
-          // Persist the projected transcript and consumed inbox state first, then update the same live
-          // history synchronously. Returning [] prevents runAgent from appending the messages twice;
-          // loop from appending twice; cancellation/error saves can no longer overwrite the projected input.
-          saveSession(meta, [...history, ...out], consumed.task);
-          task = consumed.task;
-          history.push(...out);
-          return [];
         };
         const turnStart = Date.now(); // for the task-done notification (gated on elapsed)
         if (appr === "plan") {
@@ -4578,6 +4586,7 @@ program.action(async (opts) => {
             projectContext,
             continuationSession,
             executionContext,
+            taskIntake: taskIntakeForRun(),
             stats,
             signal: h.signal,
             pendingInput,
@@ -4631,6 +4640,7 @@ program.action(async (opts) => {
               projectContext,
               continuationSession,
               executionContext,
+              taskIntake: taskIntakeForRun(),
               stats,
               signal: h.signal,
               pendingInput,
@@ -4672,6 +4682,7 @@ program.action(async (opts) => {
           projectContext,
           continuationSession,
           executionContext,
+          taskIntake: taskIntakeForRun(),
           stats,
           signal: h.signal,
           pendingInput,
@@ -4761,7 +4772,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -4823,7 +4834,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { walkFiles, walkFilesAsync, dirPrefixes, listProjectFiles, listProjectFilesAsync } from "../dist/fs-walk.js";
 import { fileCandidates } from "../dist/context/mentions.js";
 import { activity } from "../dist/activity.js";
-import { borderTop, borderBottom, ctxPctFor, nextMode } from "../dist/statusbar.js";
+import { borderTop, borderBottom, contextWindow, ctxPctFor, nextMode } from "../dist/statusbar.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/search.js";
 import "../dist/tools/edit.js";
@@ -409,4 +409,16 @@ test("statusbar: ctxPctFor + nextMode cycle", () => {
   assert.equal(nextMode("full-auto"), "suggest");
   assert.ok(ctxPctFor("claude-haiku-4-5", 20000) > 0); // 200k window → ~10%
   assert.equal(ctxPctFor("any", 0), 0);
+});
+
+test("statusbar: Coding Plan context windows use exact documented sizes", () => {
+  assert.equal(contextWindow("qwen3.7-plus"), 1_000_000);
+  assert.equal(contextWindow("qwen/qwen3.5-plus-2026-04-20"), 1_000_000);
+  assert.equal(contextWindow("qwen3-coder-plus"), 1_000_000);
+  assert.equal(contextWindow("qwen3-coder-next"), 262_144);
+  assert.equal(contextWindow("qwen3-max-2026-01-23"), 262_144);
+  assert.equal(contextWindow("kimi-k2.5"), 262_144);
+  assert.equal(contextWindow("glm-5"), 202_752);
+  assert.equal(contextWindow("glm-4.7"), 202_752);
+  assert.equal(contextWindow("MiniMax-M2.5"), 196_608);
 });

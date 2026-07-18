@@ -31,9 +31,17 @@ const truncate = (s: string, max: number): string => (s.length <= max ? s : s.sl
 const rule = (n: number): string => c.dim("─".repeat(Math.max(0, n)));
 
 export function contextWindow(model: string): number {
-  const m = model.toLowerCase();
+  // Provider prefixes are common (`qwen/qwen3.7-plus`). Match the actual model id and prefer exact
+  // documented Coding Plan families over broad words such as "coder"/"max": those previously labeled
+  // qwen3-coder-next and qwen3-max as 1M, causing the context guard to overfeed their 262k windows.
+  const m = model.toLowerCase().split("/").at(-1) ?? model.toLowerCase();
   if (/haiku/.test(m)) return 200_000;
-  if (/(opus|sonnet|fable)|claude-4|qwen3|glm-[45]|max-2026|coder|1m/.test(m)) return 1_000_000;
+  if (/^qwen3\.[567]-plus(?:-|$)/.test(m) || /^qwen3-coder-plus(?:-|$)/.test(m)) return 1_000_000;
+  if (/^(?:qwen3-max-2026-01-23|qwen3-coder-next)(?:-|$)/.test(m) || /^kimi-k2\.5(?:-|$)/.test(m)) return 262_144;
+  if (/^glm-(?:5|4\.7)(?:-|$)/.test(m)) return 202_752;
+  if (/^minimax-m2\.5(?:-|$)/.test(m)) return 196_608;
+  if (/qwen3\.6[-:]27b/.test(m)) return 262_144;
+  if (/(opus|sonnet|fable)|claude-4|1m/.test(m)) return 1_000_000;
   return 200_000;
 }
 export const ctxPctFor = (model: string, lastInput: number): number =>

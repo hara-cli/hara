@@ -3,7 +3,7 @@
 // styles and the resolver that makes a custom DashScope profile Just Work.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { reasoningParams } from "../dist/providers/reasoning.js";
+import { reasoningParams, supportsReasoningStyle } from "../dist/providers/reasoning.js";
 import { resolvePlatform } from "../dist/providers/registry.js";
 
 const DS = "https://coding.dashscope.aliyuncs.com/v1"; // the reporter's custom endpoint
@@ -13,6 +13,15 @@ test("reasoningParams enable_thinking: off → stop thinking (fast), levels → 
   assert.deepEqual(reasoningParams("enable_thinking", "low"), { enable_thinking: true });
   assert.deepEqual(reasoningParams("enable_thinking", "high"), { enable_thinking: true });
   assert.deepEqual(reasoningParams("enable_thinking", undefined), {}, "UNSET → {} (model default, zero impact)");
+});
+
+test("Coding Plan coder models suppress the unsupported thinking parameter", () => {
+  for (const model of ["qwen3-coder-next", "qwen3-coder-plus", "qwen/qwen3-coder-plus"]) {
+    assert.equal(supportsReasoningStyle("enable_thinking", model), false, model);
+    assert.deepEqual(reasoningParams("enable_thinking", "high", model), {}, model);
+    assert.deepEqual(reasoningParams("enable_thinking", "off", model), {}, `${model} also rejects enable_thinking:false`);
+  }
+  assert.equal(supportsReasoningStyle("enable_thinking", "qwen3.7-plus"), true);
 });
 
 test("reasoningParams reasoning_effort: only OpenAI reasoning models; off → minimal", () => {

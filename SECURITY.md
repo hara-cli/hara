@@ -70,11 +70,13 @@ local user (who already has your shell).
 - **MCP/external agents are trusted extensions.** They execute outside Hara's protected-file boundary. Every
   interactive tool call requires confirmation, including in `full-auto`; non-interactive runs disable them by
   default. Reviewed automation can explicitly enable them before launch with
-  `HARA_ALLOW_TRUSTED_EXTENSIONS=1`. Their inherited environment is still scrubbed, but the extension may use
-  its own credentials or access anything its host process permits.
+  `HARA_ALLOW_TRUSTED_EXTENSIONS=1`. Merely configuring an MCP server does not start it: `mcp_connect` requests
+  permission and starts one named server only when a task needs it. Their inherited environment is still
+  scrubbed, but the extension may use its own credentials or access anything its host process permits.
 - **Plugins are code you trust.** Installing a plugin (`hara plugin add`) grants its author code execution:
-  its MCP servers and hooks run shell commands on launch. `hara plugin add` **prints the exact commands** a
-  plugin will run so you can review them; disable with `hara plugin disable <name>`.
+  its MCP servers may run on first relevant use and its hooks may run around matching tool calls. `hara plugin
+  add` **prints the exact commands** a plugin can run so you can review them; disable with
+  `hara plugin disable <name>`.
 - **Coding-plan keys.** Provider keys you configure are used only to call the model endpoint you set.
 
 ## What is *not* a security boundary

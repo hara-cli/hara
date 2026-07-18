@@ -2,11 +2,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
-import { App } from "../dist/tui/App.js";
+import { App, submissionCanBeSteered } from "../dist/tui/App.js";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 70) => new Promise((r) => setTimeout(r, ms));
 const status = { sessionName: "demo", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
+
+test("composer routing distinguishes control work from executable task work", () => {
+  assert.equal(submissionCanBeSteered("/model"), false);
+  assert.equal(submissionCanBeSteered("/skills"), false);
+  assert.equal(submissionCanBeSteered("/continue"), true);
+  assert.equal(submissionCanBeSteered("/design", ["design"]), true, "a user-invocable skill owns a real agent turn");
+  assert.equal(submissionCanBeSteered("更新一下千问的模型列表"), true);
+  assert.equal(submissionCanBeSteered("/Users/me/project/readme.md"), true, "an absolute file path is not a slash control");
+});
 
 test("App runs a turn: user line in, streamed assistant reply out, status bar pinned below", async () => {
   const onSubmit = async (line, h) => {
@@ -449,6 +458,73 @@ test("App type-ahead: typing while working queues, then sends after the turn", a
   unmount();
 });
 
+test("App control-command race: input typed while /model is busy becomes a normal next turn", async () => {
+  const seen = [];
+  const interactions = [];
+  let releaseControl;
+  const onSubmit = async (line, _helpers, _images, interaction) => {
+    seen.push(line);
+    interactions.push(interaction);
+    if (line === "/model") await new Promise((resolve) => { releaseControl = resolve; });
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("/model");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("更新一下千问的模型列表");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  assert.equal(seen.length, 1, "the request waits until the control command finishes");
+  assert.ok(strip(lastFrame()).includes("⏎ queues next"), "the status row does not claim a control command can be steered");
+  assert.ok(strip(lastFrame()).includes("next: 更新一下千问的模型列表"), "the queued request is visibly a next turn");
+  releaseControl();
+  await tick(180);
+  assert.deepEqual(seen, ["/model", "更新一下千问的模型列表"]);
+  assert.equal(interactions[1].kind, "turn", "the request is not mislabeled as a steer");
+  unmount();
+});
+
+test("App isolates a slash control typed during a live task from the following queued task", async () => {
+  const seen = [];
+  const interactions = [];
+  let releaseTask;
+  const onSubmit = async (line, _helpers, _images, interaction) => {
+    seen.push(line);
+    interactions.push(interaction);
+    if (line === "first") await new Promise((resolve) => { releaseTask = resolve; });
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  await tick();
+  stdin.write("first");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("/model");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("do another task");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  const queued = strip(lastFrame());
+  assert.ok(queued.includes("control: /model"), "the pending control has an explicit non-task queue mode");
+  assert.ok(queued.includes("next: do another task"), "later task text stays behind the control barrier");
+  releaseTask();
+  await tick(300);
+  assert.deepEqual(seen, ["first", "/model", "do another task"], "control and task drain as separate submissions");
+  assert.equal(interactions[1].kind, "turn", "the slash control is never delivered as task steering");
+  assert.equal(interactions[2].kind, "turn", "the later request retains its own task identity");
+  unmount();
+});
+
 test("App /next: queues a separate task instead of steering the active turn", async () => {
   const seen = [];
   const interactions = [];
@@ -538,6 +614,46 @@ test("App type-ahead: an in-turn drain carries the exact expectedTurnId", async 
   assert.equal(drained.length, 1);
   assert.equal(drained[0].line, "refine it");
   assert.equal(drained[0].expectedTurnId, firstInteraction.turnId);
+  unmount();
+});
+
+test("App user-invocable slash skill publishes a real steer target", async () => {
+  let releaseDrain;
+  let skillInteraction;
+  let drained = [];
+  let calls = 0;
+  const onSubmit = async (line, helpers, _images, interaction) => {
+    calls++;
+    assert.equal(line, "/design landing page");
+    skillInteraction = interaction;
+    await new Promise((resolve) => { releaseDrain = resolve; });
+    drained = helpers.drainQueue();
+  };
+  const { stdin, unmount } = render(
+    React.createElement(App, {
+      initialStatus: status,
+      model: "glm-5",
+      cwd: process.cwd(),
+      agentSlashCommands: ["design"],
+      onSubmit,
+    }),
+  );
+  await tick();
+  stdin.write("/design landing page");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  stdin.write("also make the hero calmer");
+  await tick();
+  stdin.write("\r");
+  await tick();
+  releaseDrain();
+  await tick(150);
+
+  assert.equal(calls, 1, "the refinement is drained into the live skill instead of starting another task");
+  assert.equal(drained.length, 1);
+  assert.equal(drained[0].line, "also make the hero calmer");
+  assert.equal(drained[0].expectedTurnId, skillInteraction.turnId);
   unmount();
 });
 

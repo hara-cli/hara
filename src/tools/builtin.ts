@@ -219,6 +219,9 @@ registerTool({
   kind: "exec",
   requiresProjectWorkspace: true,
   async run(input, ctx) {
+    if (input.background !== undefined && typeof input.background !== "boolean") {
+      return "Error: `background` must be a boolean (true or false), not a string or another truthy value.";
+    }
     const protectedReason = sensitiveShellCommandReason(String(input.command ?? ""), ctx.cwd);
     if (protectedReason) {
       return (

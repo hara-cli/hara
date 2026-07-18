@@ -29,6 +29,13 @@ if (process.env.MCP_EMIT_OVERSIZED_STDERR === "1") {
   process.stderr.write(`oversized=${"x".repeat(20 * 1024)}\n`);
 }
 
+if (process.env.MCP_EMIT_NPM_CONFIG_WARNINGS === "1") {
+  process.stderr.write('npm warn Unknown user config "always-auth" (//registry.example/:always-auth). This will stop working in the next major version of npm.\n');
+  process.stderr.write('npm warn Unknown user config "home". This will stop working in the next major version of npm.\n');
+  process.stderr.write('npm warn Unknown user config "custom-setting". Keep this diagnostic visible.\n');
+  process.stderr.write("real MCP startup warning\n");
+}
+
 if (process.env.MCP_HANG_LIST === "1") {
   process.stdin.once("end", () => process.exit(0));
 }

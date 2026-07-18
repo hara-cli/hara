@@ -8,7 +8,12 @@ import { skillsDigest } from "../skills/skills.js";
 import { runHooks } from "../hooks.js";
 import { mapLimit, maxParallel } from "../concurrency.js";
 import type { ApprovalMode } from "../config.js";
-import { decideCommand, loadPermissionRules } from "../security/permissions.js";
+import {
+  decideCommand,
+  isReadOnlyCommand,
+  loadPermissionRules,
+  splitCompound,
+} from "../security/permissions.js";
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
 import { keyOf, looksFailed, recordCall } from "./repeat-guard.js";
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration } from "./limits.js";
@@ -23,6 +28,7 @@ import { redactSensitiveText } from "../security/secrets.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { prepareHistoryForModel } from "./context-budget.js";
 import { rolesDigest } from "../org/roles.js";
+import { applyTaskBrief, type TaskBrief, type TaskExecution } from "../session/task.js";
 
 /** File tools whose `path` input marks the file as "recently worked with" (post-compaction restore). */
 const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
@@ -90,7 +96,9 @@ mask to existing protected paths; Linux/Windows shell checks are
 static guardrails, not a kernel sandbox. MCP and external coding agents run outside this boundary: use them
 only as reviewed trusted extensions. Their tool calls require confirmation every time in interactive use and
 are disabled without an interactive approval channel unless the user launched with
-HARA_ALLOW_TRUSTED_EXTENSIONS=1.
+HARA_ALLOW_TRUSTED_EXTENSIONS=1. Configured MCP servers stay stopped by default; when a task materially needs
+one, call \`mcp_connect\` for that server only, then use the newly available tools on the next round. Never
+connect every configured server speculatively.
 For broad,
 open-ended exploration (more than ~3 searches), spawn \`agent\` sub-agents — several in one response for
 independent questions (role "explore") — each returns conclusions, not dumps. When specialist roles are
@@ -158,15 +166,40 @@ function composeSystem(
   memory?: string,
   continuationSession = false,
   executionContext?: string,
+  intake?: { enabled: boolean; brief?: TaskBrief },
 ): string {
   const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
   const skills = skillsDigest(cwd);
   const roles = override ? "" : rolesDigest(cwd);
+  const intakeContext = !intake?.enabled
+    ? ""
+    : intake.brief
+      ? (
+          "\n\n# Understanding → execution boundary\n" +
+          "The task brief below is the accepted interpretation for this run. Keep actions inside it. If new " +
+          "user input materially changes the goal, constraints, acceptance checks, or intended side effects, " +
+          "call `task_intake` again before further side effects.\n" +
+          `Intent: ${intake.brief.intent}\n` +
+          `Goal: ${intake.brief.goal}\n` +
+          `Constraints:\n${intake.brief.constraints.map((item) => `- ${item}`).join("\n")}\n` +
+          `Acceptance:\n${intake.brief.acceptance.map((item) => `- ${item}`).join("\n")}\n` +
+          `Steps:\n${intake.brief.steps.map((item, index) => `${index + 1}. ${item}`).join("\n")}`
+        )
+      : (
+          "\n\n# Understanding → execution boundary\n" +
+          "Do not jump from a raw request straight into side effects. You may answer, inspect files, search, " +
+          "ask a necessary question, or build a todo list first. BEFORE the first edit, non-read-only command, " +
+          "background-process start/stop, computer action, external agent, or MCP connection, call `task_intake` in its OWN tool round with " +
+          "the interpreted goal, intent, constraints, acceptance checks, and short steps. Use intent `answer` " +
+          "for a direct answer, `investigate` for evidence gathering/diagnosis, and `change` when the user asked " +
+          "you to modify or deliver something. Do not claim completion until the acceptance checks are verified."
+        );
   return (
     head +
     gatewayNote() +
     (continuationSession ? `\n\n${CONTINUATION_SYSTEM}` : "") +
     (executionContext ? `\n\n${executionContext}` : "") +
+    intakeContext +
     (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "") +
     (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "") +
     (roles ? `\n\n# Specialist roles (metadata only — use \`agent\` with a role id for bounded read-only expertise)\n${roles}` : "") +
@@ -191,6 +224,19 @@ export interface RunOpts {
   continuationSession?: boolean;
   /** Structured task/run identity. Unlike transcript text, this remains authoritative across resume/steer. */
   executionContext?: string;
+  /** Main-task understanding checkpoint. Read-only investigation can happen first, but side effects are
+   * engine-gated until the model records a structured brief. Sub-agents/review helpers omit this. */
+  taskIntake?: {
+    task: TaskExecution;
+    /** Read the runner's authoritative task snapshot. Type-ahead steering can update it while runAgent is
+     * alive; refreshing prevents a later brief from overwriting newly accepted steering/audit state. */
+    current?: () => TaskExecution | undefined;
+    /** Publish the accepted task snapshot at the closed tool-round boundary. */
+    onUpdate?: (task: TaskExecution) => void;
+    /** Called at the closed tool-round boundary, after task_intake's result is in history and before any
+     * later model/tool round. Persistent runners use this for a crash-safe session snapshot. */
+    onCheckpoint?: (task: TaskExecution) => void;
+  };
   stats?: { input: number; output: number; lastInput?: number };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
@@ -408,6 +454,55 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   const { provider, ctx } = opts;
   const runSignal = life.signal;
   const toolCtx: ToolContext = { ...ctx, signal: runSignal };
+  let intakeTask = opts.taskIntake?.task;
+  let intakeDirty = false;
+  const syncIntakeTask = (): void => {
+    const current = opts.taskIntake?.current?.();
+    if (current && (!intakeTask || current.id === intakeTask.id)) intakeTask = current;
+  };
+  const taskIntakeTool: Tool | undefined = opts.taskIntake
+    ? {
+        name: "task_intake",
+        description:
+          "Record or revise your explicit understanding of the active task before side effects. Call this " +
+          "in its own tool round only after using the conversation and any needed read-only evidence to identify " +
+          "the real goal. Required before edits, non-read-only commands, background-process start/stop, computer actions, external agents, or MCP.",
+        input_schema: {
+          type: "object",
+          properties: {
+            intent: {
+              type: "string",
+              enum: ["answer", "investigate", "change"],
+              description: "answer = direct response, investigate = evidence/diagnosis, change = modify or deliver",
+            },
+            goal: { type: "string", description: "One concrete interpreted outcome; include the actual target, not generic 'help the user'." },
+            constraints: { type: "array", items: { type: "string" }, description: "User/project boundaries that must remain true." },
+            acceptance: { type: "array", items: { type: "string" }, description: "Observable checks that prove the task is done." },
+            steps: { type: "array", items: { type: "string" }, description: "Short ordered approach, normally 2–6 steps." },
+          },
+          required: ["intent", "goal", "constraints", "acceptance", "steps"],
+        },
+        kind: "read",
+        run: async (input) => {
+          syncIntakeTask();
+          const applied = applyTaskBrief(intakeTask, input);
+          if (!applied.ok) return `Error: task brief rejected — ${applied.reason}`;
+          intakeTask = applied.task;
+          intakeDirty = true;
+          return (
+            `Task brief accepted (${applied.brief.intent}).\n` +
+            `Goal: ${applied.brief.goal}\n` +
+            `Acceptance:\n${applied.brief.acceptance.map((item) => `- ${item}`).join("\n")}\n` +
+            "Proceed within this brief; revise task_intake first if the user's intent materially changes."
+          );
+        },
+      }
+    : undefined;
+  // `task_intake` is engine-owned and cannot be shadowed by an ad-hoc tool with the same name.
+  const runExtraTools: Tool[] = [
+    ...(opts.extraTools ?? []).filter((tool) => tool.name !== "task_intake"),
+    ...(taskIntakeTool ? [taskIntakeTool] : []),
+  ];
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
   let triedFallback = false;
@@ -494,6 +589,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
       if (pending === RUN_STOPPED) return stoppedOutcome();
       for (const m of pending) history.push(m);
+      // pendingInput may have durably accepted steering into the owner's immutable task snapshot. Refresh
+      // before composing the system or applying a later brief so that state is never overwritten.
+      syncIntakeTask();
     }
     // system-reminder injection: event-driven context queued since the last call (todo staleness today)
     // lands as ONE wrapped user message the UI never renders. Quiet runs don't drain — a parallel
@@ -503,11 +601,19 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       if (reminders.length) history.push({ role: "user", content: wrapReminders(reminders) });
     }
     const baseSpecs = opts.toolFilter ? toolSpecs().filter((t) => opts.toolFilter!(t.name)) : toolSpecs();
-    const specs = opts.extraTools?.length
-      ? [...baseSpecs, ...opts.extraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
+    const specs = runExtraTools.length
+      ? [...baseSpecs, ...runExtraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
       : baseSpecs;
     const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
-    const system = composeSystem(ctx.cwd, opts.projectContext, opts.systemOverride, opts.memory, opts.continuationSession, opts.executionContext);
+    const system = composeSystem(
+      ctx.cwd,
+      opts.projectContext,
+      opts.systemOverride,
+      opts.memory,
+      opts.continuationSession,
+      opts.executionContext,
+      { enabled: !!opts.taskIntake, brief: intakeTask?.brief },
+    );
     const prepared = prepareHistoryForModel(history, {
       model: activeProvider.model,
       system,
@@ -824,7 +930,12 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }
     const plans: Plan[] = [];
     // Extra (per-run) tools win over the registry so a run-scoped tool can't be shadowed by a global one.
-    const resolveTool = (name: string): Tool | undefined => opts.extraTools?.find((t) => t.name === name) ?? getTool(name);
+    const resolveTool = (name: string): Tool | undefined => runExtraTools.find((t) => t.name === name) ?? getTool(name);
+    // Planning happens before dispatch, so a previously accepted `change` brief must not let the model
+    // revise that brief and perform a side effect in the same response. Treat every intake call as a
+    // transaction boundary for the whole response: accept/checkpoint the interpretation first, then let
+    // the next model round act against the newly authoritative brief.
+    const taskBriefTransitionInRound = r.toolUses.some((tu) => tu.name === "task_intake");
     for (const tu of r.toolUses) {
       if (runSignal.aborted) return finalizeStoppedToolRound();
       if (breakerHalt) {
@@ -840,10 +951,80 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
       const input = tu.input as Record<string, unknown>;
       const preview = redactToolSubprocessOutput(
-        String(input.path ?? input.command ?? input.pattern ?? input.url ?? input.task ?? "")
+        String(input.path ?? input.command ?? input.pattern ?? input.url ?? input.task ?? input.server ?? "")
           .replace(/\s+/g, " ")
           .trim(),
       );
+      // Resolve shell read-only policy before the understanding gate: an `investigate` brief may run a
+      // command already classified safe/read-only, while edits and unknown/non-read-only commands require
+      // an explicit `change` brief. Opaque external tools always require a brief and retain their separate
+      // per-action approval boundary.
+      const command = tool.kind === "exec" && typeof input.command === "string" ? input.command : null;
+      const cmdDecision = command !== null ? decideCommand(command, permRules) : null;
+      // Permission rules answer whether a command may auto-run; they do not answer whether it mutates state.
+      // In particular, an explicit `allow: ["git commit"]` must not let an `investigate` brief perform a
+      // commit. Classify read-only semantics independently for the understanding boundary.
+      const commandParts = command !== null ? splitCompound(command) : null;
+      const commandReadOnly = !!commandParts?.length && commandParts.every(isReadOnlyCommand);
+      // Bash intentionally treats `background` as a boolean. Be conservative at the policy boundary even
+      // for a malformed model call: any truthy value would otherwise reach a truthiness-based/custom exec
+      // implementation as a process start and bypass an investigate brief.
+      const startsBackgroundProcess = tool.kind === "exec" && Boolean(input.background);
+      const stopsBackgroundProcess = tool.name === "job" && input.action === "kill";
+      if (opts.taskIntake && tool.name !== "task_intake") {
+        // Some action-style tools contain both inspection and mutation behind one registry kind. Classify
+        // the concrete operation, not only the approval class: listing tasks/cron jobs is evidence gathering,
+        // while their other actions remain state changes.
+        const readOnlyAction =
+          (tool.name === "task" || tool.name === "cronjob") &&
+          input.action === "list";
+        const operationReadOnly =
+          readOnlyAction ||
+          (tool.kind === "read" && !stopsBackgroundProcess) ||
+          (tool.kind === "exec" && commandReadOnly && !startsBackgroundProcess);
+        const needsBrief = tool.trustBoundary === "external" || !operationReadOnly;
+        const requiresChange =
+          tool.trustBoundary !== "external" &&
+          !operationReadOnly &&
+          (
+            tool.kind === "edit" ||
+            tool.kind === "computer" ||
+            stopsBackgroundProcess ||
+            startsBackgroundProcess ||
+            (tool.kind === "exec" && !commandReadOnly)
+          );
+        if (taskBriefTransitionInRound && (requiresChange || tool.trustBoundary === "external")) {
+          plans.push({
+            tu,
+            tool,
+            denied:
+              "Understanding gate: task_intake establishes or revises the brief in this tool round, so this " +
+              "side effect was NOT executed. Wait for the next model round, then act against the checkpointed brief.",
+          });
+          continue;
+        }
+        if (needsBrief && !intakeTask?.brief) {
+          plans.push({
+            tu,
+            tool,
+            denied:
+              "Understanding gate: this action was NOT executed. First inspect/ask what is needed, then call " +
+              "task_intake in its own tool round with goal, intent, constraints, acceptance, and steps.",
+          });
+          continue;
+        }
+        if (requiresChange && intakeTask?.brief?.intent !== "change") {
+          plans.push({
+            tu,
+            tool,
+            denied:
+              `Understanding gate: task brief intent is '${intakeTask?.brief?.intent ?? "unset"}', so this ` +
+              "side effect was NOT executed. Revise task_intake to intent 'change' with the user's authorized " +
+              "goal and acceptance checks before trying again.",
+          });
+          continue;
+        }
+      }
       // Screen control and opaque host extensions are gated on EVERY action — a prior "don't ask again"
       // and even full-auto must never silently turn them into a side channel.
       const alwaysGate = tool.kind === "computer" || tool.trustBoundary === "external";
@@ -859,7 +1040,6 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
       // Command-level policy for shell commands: a deny rule blocks even in full-auto; an allow rule (or a
       // read-only command) auto-runs even in suggest mode. Composes with, doesn't replace, the approval mode.
-      const cmdDecision = tool.kind === "exec" && typeof input.command === "string" ? decideCommand(input.command, permRules) : null;
       if (cmdDecision === "deny") {
         plans.push({ tu, tool, denied: "Denied by a permission rule (~/.hara/permissions.json). Loosen the rule or run it yourself." });
         continue;
@@ -1048,8 +1228,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       if (runSignal.aborted) return finalizeStoppedToolRound();
       const p = plans[i];
       // ask_user is interaction-safe but not parallel-safe: the TUI deliberately owns one prompt slot.
-      // Flush other reads and ask sequentially so two questions cannot overwrite each other and hang.
-      if (p.denied === undefined && p.tool?.kind === "read" && p.tool.name !== "ask_user") {
+      // task_intake is also a state transition: run it alone so its persisted brief has a deterministic
+      // boundary before the next model round. Flush other reads before either.
+      if (p.denied === undefined && p.tool?.kind === "read" && p.tool.name !== "ask_user" && p.tool.name !== "task_intake") {
         batch.push(i); // safe → accumulate to run concurrently
       } else {
         await flush(); // flush pending reads before an edit/exec
@@ -1061,6 +1242,28 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     await flush();
     if (runSignal.aborted) return finalizeStoppedToolRound();
     history.push({ role: "tool", results });
+    if (intakeDirty && intakeTask) {
+      try {
+        // The tool-use/result pair is now protocol-complete. Persist here—never inside the tool—so a crash
+        // cannot leave a session ending in an orphaned tool_use, and no later side effect starts before the
+        // accepted understanding has a durable checkpoint. A steer can be acknowledged while another read
+        // from this same tool round is still settling, so merge from the authoritative owner once more at
+        // this exact boundary instead of overwriting that acknowledged input with the earlier snapshot.
+        const acceptedBrief = intakeTask.brief;
+        syncIntakeTask();
+        // The current owner may still carry the previous brief when this call is a revision. The accepted
+        // brief is the state transition from this round; authoritative refresh contributes newer steering,
+        // while this assignment contributes the new interpretation.
+        if (acceptedBrief && intakeTask) {
+          intakeTask = { ...intakeTask, brief: acceptedBrief };
+        }
+        opts.taskIntake?.onUpdate?.(intakeTask);
+        opts.taskIntake?.onCheckpoint?.(intakeTask);
+        intakeDirty = false;
+      } catch (error) {
+        return interactionFailure("task-intake checkpoint", error);
+      }
+    }
     if (repeatHalt) return hardStop(opts, life, "repeat_loop", repeatHalt);
 
     // Synthesis nudge (CC's KN5, hara-shaped): a round that fanned out to several parallel agents just

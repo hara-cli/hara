@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { levelsFor, levelLabel, movePicker } from "../dist/tui/model-picker.js";
-import { listModels } from "../dist/providers/models.js";
+import { CODING_PLAN_FALLBACK_MODELS, codingPlanFallbackModels, listModels } from "../dist/providers/models.js";
 
 test("levelsFor: binary thinking styles → off/on; graded → full dial; deepseek adds max; none → nothing", () => {
   assert.deepEqual(levelsFor("enable_thinking"), ["off", "high"]);
@@ -12,6 +12,8 @@ test("levelsFor: binary thinking styles → off/on; graded → full dial; deepse
   assert.deepEqual(levelsFor("thinking_budget"), ["off", "low", "medium", "high"]);
   assert.deepEqual(levelsFor("deepseek"), ["off", "low", "medium", "high", "max"]);
   assert.deepEqual(levelsFor("none"), []);
+  assert.deepEqual(levelsFor("enable_thinking", "qwen3-coder-next"), [], "model-level capability overrides the shared endpoint");
+  assert.deepEqual(levelsFor("enable_thinking", "qwen3-coder-plus"), []);
 });
 
 test("levelLabel: binary reads as on/off, graded as the level name", () => {
@@ -51,4 +53,25 @@ test("listModels: parses /models, de-dups + sorts; [] on non-ok / no baseURL / t
   assert.deepEqual(await listModels("https://x/v1", "k", notOk), [], "non-ok → []");
   const boom = async () => { throw new Error("network"); };
   assert.deepEqual(await listModels("https://x/v1", "k", boom), [], "throw → [] (best-effort)");
+});
+
+test("Coding Plan model discovery uses live ids first and the documented exact list only as a host-scoped fallback", async () => {
+  assert.deepEqual(codingPlanFallbackModels("https://coding.dashscope.aliyuncs.com/v1"), [...CODING_PLAN_FALLBACK_MODELS]);
+  assert.deepEqual(codingPlanFallbackModels("https://coding-intl.dashscope.aliyuncs.com/v1"), [...CODING_PLAN_FALLBACK_MODELS]);
+  assert.deepEqual(codingPlanFallbackModels("https://evil-coding.dashscope.aliyuncs.com/v1"), [], "hostname matching is exact");
+  assert.ok(CODING_PLAN_FALLBACK_MODELS.includes("qwen3.5-plus"), "current Qwen list includes qwen3.5-plus");
+  assert.ok(CODING_PLAN_FALLBACK_MODELS.includes("qwen3.7-plus"));
+
+  const unavailable = async () => ({ ok: false, json: async () => ({}) });
+  assert.deepEqual(
+    await listModels("https://coding.dashscope.aliyuncs.com/v1", "k", unavailable),
+    [...CODING_PLAN_FALLBACK_MODELS],
+    "a non-enumerating official coding endpoint still gives the picker its supported ids",
+  );
+  const live = async () => ({ ok: true, json: async () => ({ data: [{ id: "future-model" }] }) });
+  assert.deepEqual(
+    await listModels("https://coding.dashscope.aliyuncs.com/v1", "k", live),
+    ["future-model"],
+    "live discovery is authoritative and is never polluted by a stale fallback",
+  );
 });

@@ -187,8 +187,8 @@ test("headless project:name builds provider/persona at the registered home and r
     );
     assert.equal(trusted.code, 0, trusted.stderr);
     assert.match(trusted.stdout, /TARGET_HOME_OK/);
-    assert.equal(existsSync(userMcpMarker), true, "launch-time trusted-extension opt-in enables user MCP subprocesses");
-    assert.equal(existsSync(pluginMcpMarker), true, "launch-time trusted-extension opt-in enables plugin MCP subprocesses");
+    assert.equal(existsSync(userMcpMarker), false, "trusted-extension opt-in permits later use but never eagerly starts user MCP");
+    assert.equal(existsSync(pluginMcpMarker), false, "trusted-extension opt-in permits later use but never eagerly starts plugin MCP");
 
     const foreignId = "foreign-session";
     writeFileSync(

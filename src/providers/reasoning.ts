@@ -29,6 +29,16 @@ export function isReasoningModel(model: string): boolean {
   return /^(o1|o3|o4|gpt-5)/i.test(model);
 }
 
+/** Endpoint capability is not enough: Alibaba's Coding Plan serves qwen3-coder-next/plus on the same
+ * DashScope URL as thinking models, but documents both coder ids as not supporting thinking mode. */
+export function supportsReasoningStyle(style: ReasoningStyle, model = ""): boolean {
+  if (style === "none") return false;
+  if (style === "enable_thinking" && /^qwen3-coder-(?:next|plus)(?:-|$)/i.test(model.split("/").at(-1) ?? model)) {
+    return false;
+  }
+  return true;
+}
+
 /** Translate the dial into request params to MERGE into the wire body (chat/responses styles). Returns an
  *  empty object — leave the request untouched — when the dial is UNSET (keep the model's own default; zero
  *  impact, the safe default) or the style/model has nothing to add. Anthropic's `thinking_budget` is built
@@ -37,6 +47,7 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
   if (effort === undefined) return {};
   switch (style) {
     case "enable_thinking":
+      if (!supportsReasoningStyle(style, model)) return {};
       // off → false (stop the thinking phase, fast); any explicit level → true (keep it on).
       return { enable_thinking: effort !== "off" };
     case "ollama_think":

@@ -91,7 +91,9 @@ const textProvider = {
   },
 };
 
-/** Fake provider: first turn asks to write a file (forces the approval gate under "suggest"), second ends. */
+/** Fake provider: first records its task understanding, then asks to write a file (forcing the approval
+ * gate under "suggest"), then ends. This exercises the real understanding → execution boundary instead of
+ * relying on the runtime to let a raw request jump directly into a side effect. */
 const toolProvider = () => {
   let n = 0;
   return {
@@ -99,6 +101,24 @@ const toolProvider = () => {
     model: "fake-1",
     async turn({ onText }) {
       if (n++ === 0) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "brief1",
+            name: "task_intake",
+            input: {
+              intent: "change",
+              goal: "write approved.txt with the requested content",
+              constraints: ["write only inside the test workspace"],
+              acceptance: ["approved.txt contains hi"],
+              steps: ["record the task brief", "request approval and write the file", "report completion"],
+            },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (n === 2) {
         return { text: "", toolUses: [{ id: "t1", name: "write_file", input: { path: "approved.txt", content: "hi" } }], stop: "tool_use", usage: { input: 1, output: 1 } };
       }
       onText("done");
@@ -274,6 +294,46 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(auto.result.sessions.some((s) => s.id === sid), false, "serve session not in automation list");
     const listed2 = await c.call("session.list", {});
     assert.equal(listed2.result.sessions[0].source, "interactive", "session.list carries source");
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: models.list derives reasoning controls from the session-pinned model", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-model-controls-"));
+  const store = memStore();
+  const runtimeRequests = [];
+  const deps = {
+    ...baseDeps(textProvider, store),
+    buildProviderFor: async (model) => ({
+      ...textProvider,
+      model,
+    }),
+    listModels: async () => ["qwen3.7-plus", "qwen3-coder-next"],
+    runtimeInfo: (cwd, model) => {
+      runtimeRequests.push({ cwd, model });
+      const selected = model ?? "qwen3.7-plus";
+      return {
+        providerId: "qwen",
+        model: selected,
+        effortLevels: selected === "qwen3-coder-next" ? [] : ["low", "medium", "high"],
+      };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const sid = (await c.call("session.create", {})).result.sessionId;
+    const switched = await c.call("session.set-model", { sessionId: sid, model: "qwen3-coder-next" });
+    assert.equal(switched.result.model, "qwen3-coder-next");
+
+    const listed = await c.call("models.list", { sessionId: sid });
+    assert.equal(listed.result.current, "qwen3-coder-next");
+    assert.deepEqual(listed.result.effortLevels, [], "a coder model without thinking controls must not inherit the configured default model's dial");
+    assert.ok(runtimeRequests.some((request) => request.model === "qwen3-coder-next"));
   } finally {
     c.close();
     await srv.close();

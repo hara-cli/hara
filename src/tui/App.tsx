@@ -23,6 +23,16 @@ import { ModelPicker } from "./model-picker.js";
 import type { ReasoningStyle, Effort } from "../providers/reasoning.js";
 import { newSteerInteraction, newTurnInteraction, requestsTaskContinuation, type TaskInteraction } from "../session/task.js";
 
+/** Composer work and executable task work are different states. Slash controls (for example `/model`)
+ * may keep the TUI busy while opening a picker or doing local bookkeeping, but there is no model task to
+ * steer. `/continue` and user-invocable skill commands are executable Agent turns. */
+export function submissionCanBeSteered(line: string, agentSlashCommands: readonly string[] = []): boolean {
+  const value = line.trim();
+  const slash = /^\/([a-z][\w-]*)(?:\s|$)/i.exec(value);
+  if (!slash) return true;
+  return slash[1].toLowerCase() === "continue" || agentSlashCommands.includes(slash[1]);
+}
+
 interface QueuedBase {
   line: string;
   images?: ImageAttachment[];
@@ -35,7 +45,12 @@ export interface QueuedSteerInput extends QueuedBase {
 export interface QueuedNextInput extends QueuedBase {
   mode: "next";
 }
-export type QueuedInput = QueuedSteerInput | QueuedNextInput;
+export interface QueuedControlInput extends QueuedBase {
+  /** A slash control is serialized with task work but must be submitted alone; coalescing later text into
+   * `/model\n\nfix the parser` would consume that text as command arguments instead of a task. */
+  mode: "control";
+}
+export type QueuedInput = QueuedSteerInput | QueuedNextInput | QueuedControlInput;
 
 export interface Sink {
   assistantDelta(t: string): void;
@@ -110,6 +125,9 @@ export interface AppProps {
   cwd: string;
   header?: HeaderInfo;
   onSubmit: (line: string, h: Helpers, images?: ImageAttachment[], interaction?: TaskInteraction) => Promise<void>;
+  /** Slash commands that launch a real Agent turn (currently user-invocable skills). Unlike local controls,
+   * these publish a steer target while they run. */
+  agentSlashCommands?: readonly string[];
   cycleApproval?: (cur: Approval) => Approval;
   /** Read an image off the OS clipboard for Ctrl+V (injected; omitted in tests). */
   onClipboardImage?: () => ImageAttachment | null;
@@ -449,7 +467,7 @@ export function spinnerVerb(list: Todo[], elapsedSec: number): string {
 // wall-clock start, so the "Ns" text stays exact and stable.
 const SPINNER_FRAME_MS = 125;
 const IDLE_HINTS = "⏎ send · @ file · ctrl+v image · ctrl+t transcript · shift+tab mode";
-function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]; queued: number }) {
+function StatusRow({ working, steerable, todos, queued }: { working: boolean; steerable: boolean; todos: Todo[]; queued: number }) {
   const [frame, setFrame] = useState(0);
   const [phase, setPhase] = useState<TurnPhase>(() => turnPhase());
   const startRef = useRef(Date.now());
@@ -480,7 +498,9 @@ function StatusRow({ working, todos, queued }: { working: boolean; todos: Todo[]
   return (
     <Box marginTop={1}>
       <Text color="yellow">{frames[frame % frames.length]}</Text>
-      <Text dimColor>{` ${verb} · ⏎ steers · /next queues${queued ? ` (${queued})` : ""}`}</Text>
+      <Text dimColor>
+        {` ${verb} · ${steerable ? "⏎ steers · /next queues" : "⏎ queues next"}${queued ? ` (${queued})` : ""}`}
+      </Text>
     </Box>
   );
 }
@@ -555,7 +575,18 @@ const TodoPanel = memo(function TodoPanel({ todos }: { todos: Todo[] }) {
   );
 });
 
-export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval, onClipboardImage, vim, visionNotice }: AppProps) {
+export function App({
+  initialStatus,
+  model,
+  cwd,
+  header,
+  onSubmit,
+  agentSlashCommands = [],
+  cycleApproval,
+  onClipboardImage,
+  vim,
+  visionNotice,
+}: AppProps) {
   const { exit } = useApp();
   const { stdout: termOut } = useStdout();
   // Live tail budget: terminal rows minus the rest of the dynamic chrome (todo panel ≤10, status slot,
@@ -686,11 +717,13 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
   // addition reaches the model on its next call; whatever's still queued at turn end is the effect below.
   const drainQueue = useCallback((): QueuedSteerInput[] => {
     if (!queueRef.current.length) return [];
-    const barrier = queueRef.current.findIndex((item) => item.mode === "next");
+    const barrier = queueRef.current.findIndex((item) => item.mode !== "steer");
     const batch = (barrier < 0 ? queueRef.current : queueRef.current.slice(0, barrier)) as QueuedSteerInput[];
     if (!batch.length) return [];
     queueRef.current = barrier < 0 ? [] : queueRef.current.slice(barrier);
-    setPool(queueRef.current.map((item) => `${item.mode === "next" ? "next: " : ""}${item.line.trim() || "🖼 (image)"}`));
+    setPool(queueRef.current.map((item) =>
+      `${item.mode === "next" ? "next: " : item.mode === "control" ? "control: " : ""}${item.line.trim() || "🖼 (image)"}`,
+    ));
     if (batch.some((b) => b.images?.length)) noteVisionIfNeeded();
     for (const b of batch) pushCurrent("user", b.line.trim() || "🖼 (image)");
     return batch;
@@ -725,23 +758,38 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
         // Enter steers the live turn; `/next …` creates an explicit queue barrier for a separate next task.
         // Once such a barrier exists, later type-ahead stays behind it instead of leaking backward.
         const expectedTurnId = activeTurnRef.current;
-        if (!expectedTurnId) return;
         const next = /^\/(?:next|queue)(?:\s+([\s\S]+))?$/.exec(t);
         if (next && !next[1]?.trim() && !images?.length) {
           pushCurrent("notice", "usage: /next <message>  (queues a separate task after the current turn)");
           return;
         }
-        const behindBarrier = queueRef.current.some((item) => item.mode === "next");
-        if (next || behindBarrier) {
-          queueRef.current.push({ mode: "next", line: next?.[1]?.trim() || line, images });
+        // A control command can be "working" without owning a TaskExecution. Input typed during that UI
+        // operation is a real next turn, never a steer and never disposable. The same next barrier keeps
+        // later messages ordered behind it.
+        const queuedLine = next?.[1]?.trim() || line;
+        const queuedControl = !submissionCanBeSteered(queuedLine, agentSlashCommands);
+        const behindBarrier =
+          !expectedTurnId ||
+          queueRef.current.some((item) => item.mode !== "steer");
+        if (queuedControl) {
+          queueRef.current.push({ mode: "control", line: queuedLine, images });
+        } else if (next || behindBarrier) {
+          queueRef.current.push({ mode: "next", line: queuedLine, images });
         } else {
           queueRef.current.push({ mode: "steer", line, images, expectedTurnId });
         }
-        setPool(queueRef.current.map((item) => `${item.mode === "next" ? "next: " : ""}${item.line.trim() || "🖼 (image)"}`));
+        setPool(queueRef.current.map((item) =>
+          `${item.mode === "next" ? "next: " : item.mode === "control" ? "control: " : ""}${item.line.trim() || "🖼 (image)"}`,
+        ));
         return;
       }
       const interaction: TaskInteraction = forcedInteraction ?? newTurnInteraction();
-      activeTurnRef.current = interaction.turnId;
+      // Only a model task may receive type-ahead steering. A slash control still sets `working` so its
+      // picker/output is serialized, but leaves this ref empty; submissions then queue as ordinary turns.
+      activeTurnRef.current =
+        interaction.kind === "steer" || submissionCanBeSteered(t, agentSlashCommands)
+          ? interaction.turnId
+          : null;
       // Fold the previous turn's checklist NOW, at the natural boundary (a new task begins). The old
       // 30s-idle timer yanked the input box UP by the panel's height while the user was reading/typing
       // (anti-bob); folding on submit means the shrink coincides with the user's own action.
@@ -882,7 +930,7 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       ctrlRef.current = null;
       if (activeTurnRef.current === interaction.turnId) activeTurnRef.current = null;
     },
-    [working, prompt, askText, onSubmit, pushCurrent, model, exit, drainQueue, noteVisionIfNeeded],
+    [working, prompt, askText, onSubmit, agentSlashCommands, pushCurrent, model, exit, drainQueue, noteVisionIfNeeded],
   );
 
   // A message can arrive after runAgent's final pending-input drain but before the view flips to idle. Late
@@ -897,7 +945,11 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       for (let at = 0; at < batch.length;) {
         const mode = batch[at]!.mode;
         let end = at + 1;
-        while (end < batch.length && batch[end]!.mode === mode) end++;
+        // Controls are barriers and always execute one-at-a-time. Task steering/next messages may still
+        // coalesce within their own adjacent group to preserve the established type-ahead behavior.
+        if (mode !== "control") {
+          while (end < batch.length && batch[end]!.mode === mode) end++;
+        }
         const group = batch.slice(at, end);
         const line = group.map((item) => item.line).join("\n\n");
         const images = group.flatMap((item) => item.images ?? []);
@@ -1016,7 +1068,9 @@ export function App({ initialStatus, model, cwd, header, onSubmit, cycleApproval
       {/* Constant-height status slot (the anti-bob keystone): ModeLine and StatusRow are both exactly
           one row + one margin row, and ONE of them is always rendered — so shift+tab, turn start, and
           turn end never change the chrome height under the transcript. */}
-      {modeSelector ? <ModeLine approval={status.approval} /> : <StatusRow working={working} todos={todos} queued={pool.length} />}
+      {modeSelector
+        ? <ModeLine approval={status.approval} />
+        : <StatusRow working={working} steerable={!!activeTurnRef.current} todos={todos} queued={pool.length} />}
       <InputBox status={status} cwd={cwd} model={model} route={header?.routeHost} isActive={!prompt} vim={vim} onSubmit={handleSubmit} onClipboardImage={onClipboardImage} />
     </Box>
   );

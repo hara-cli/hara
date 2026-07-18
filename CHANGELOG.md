@@ -5,6 +5,43 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.125.2 — 2026-07-18 — conversation/task boundary and deliberate execution
+
+- **Chat delivery is now separate from task execution.** Slash controls such as `/model` no longer create a
+  fake steer target; input typed while a picker or other local control is busy is visibly queued as the next
+  turn. If a real turn ends between enqueue and delivery, Hara promotes the raced steer to a normal turn
+  instead of rejecting it with `there is no task to steer` or dropping the input. Queued controls execute
+  alone rather than absorbing the following task as command arguments, and paused/completed tasks are never
+  implicit steer targets—only explicit `/continue` may reopen one. User-invocable slash Skills remain real
+  Agent turns, so refinements typed while `/design`, `/video`, or another Skill is running steer that Skill
+  instead of becoming an unrelated task.
+- **Main tasks now establish an explicit understanding checkpoint before side effects.** The engine-owned
+  `task_intake` records intent, interpreted goal, constraints, acceptance checks, and short steps in the
+  durable task state. Reads and diagnosis may happen first, but edits, non-read-only commands, computer
+  actions, external agents, and MCP connections are blocked until the brief is accepted in a completed tool
+  round. Starting or stopping a background process is also treated as a state change even when its command or
+  job tool is otherwise read-only; malformed string-valued `background` flags are rejected. Read-only actions
+  inside mixed tools (`task list`, `cronjob list`) stay available for evidence gathering. Brief revisions
+  replace the old prompt copy and cannot share a round with a side effect. A later steer cannot be overwritten
+  by a concurrent or revised checkpoint.
+- **Alibaba Coding Plan discovery follows the current exact model contract.** `/model` prefers the endpoint's
+  live response and uses the documented ten-model list only for official Coding Plan hosts. Context guards now
+  use each model's published window, and `qwen3-coder-next` / `qwen3-coder-plus` no longer expose an unsupported
+  thinking control. Desktop/serve derives the reasoning dial from each session's pinned model rather than the
+  current global default.
+- **Configured MCP servers no longer execute or ask for permission when Hara starts.** Hara exposes a
+  zero-side-effect `mcp_connect` capability; the agent calls it only when the current task materially needs
+  one named server, receives the existing external-boundary approval, and discovers that server's tools for
+  the next model round. Other configured servers remain stopped.
+- Interactive calls to connected MCP tools still require confirmation every time, protected-file-shaped
+  inputs remain blocked, read-only roles cannot receive the launcher, and headless runs remain fail-closed
+  unless `HARA_ALLOW_TRUSTED_EXTENSIONS=1` was set before launch.
+- MCP stderr now drops only npm 11's repeated `Unknown user config "always-auth"` and `"home"` deprecation
+  lines. Other npm warnings and all actual server errors remain visible and redacted. Hara does not read,
+  rewrite, or weaken the user's `.npmrc`. Esc, interruption, and the total task deadline now also cancel a
+  lazy MCP startup/tool call and close an unresponsive child instead of leaving it behind.
+- Upgrade with `npm i -g @nanhara/hara@0.125.2`.
+
 ## 0.125.1 — 2026-07-18 — installed plugin commands inside agent tasks
 
 - **Commands contributed by an installed Hara plugin are now available to Hara's own tool subprocesses.**
