@@ -13,7 +13,7 @@ import { readFileSync, existsSync, realpathSync, statSync, writeFileSync, rmSync
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { dirname, join, relative, resolve } from "node:path";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
 import {
   loadConfig,
   configPath,
@@ -2741,11 +2741,13 @@ pluginCmd
         m.mcpServers ? `${Object.keys(m.mcpServers).length} mcp server(s)` : "",
       ].filter(Boolean);
       out(c.green(`Installed ${p.name}@${p.version}${parts.length ? c.dim(" — " + parts.join(", ")) : ""}\n`));
-      // A plugin can ship CLI commands (manifest `bin`); they're linked into ~/.hara/bin. Tell the user to PATH it.
+      // Hara's model-controlled subprocesses append this directory automatically. The user's independent
+      // interactive shell still needs its own PATH entry when they want to invoke the command directly.
       const bins = Object.keys(m.bin ?? {});
       if (bins.length) {
-        const onPath = (process.env.PATH ?? "").split(":").includes(haraBinDir());
+        const onPath = (process.env.PATH ?? "").split(delimiter).includes(haraBinDir());
         out(c.green(`Linked command(s): ${bins.join(", ")} → ${c.dim(haraBinDir())}\n`));
+        out(c.dim("  available to tool commands started inside Hara automatically\n"));
         if (!onPath) out(c.yellow(`  add to PATH once:  echo 'export PATH="$HOME/.hara/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc\n`));
       }
       // Surface the code-execution surface: a plugin's MCP servers + hooks run shell commands on every

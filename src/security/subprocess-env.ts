@@ -3,7 +3,10 @@
 // A user can explicitly pass selected names with HARA_SUBPROCESS_ENV_ALLOW=NAME,OTHER before launching Hara.
 import { redactSensitiveText } from "./secrets.js";
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { platform } from "node:os";
+import { delimiter, join } from "node:path";
+import { normalizePortableWindowsHome } from "../runtime.js";
 
 const SECRET_NAME = /(?:^|_)(?:API_?KEY|KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|COOKIE|JWT|AUTH)(?:_|$)/i;
 const SECRET_EXACT = new Set([
@@ -32,6 +35,32 @@ function explicitAllow(env: NodeJS.ProcessEnv): Set<string> {
   );
 }
 
+function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const key = Object.keys(env).find((candidate) => candidate.toUpperCase() === name);
+  return key ? env[key] : undefined;
+}
+
+/** Installed plugin commands are user-approved Hara extensions. Make them reachable by model-controlled
+ * subprocesses without allowing them to shadow an existing system/project command: ~/.hara/bin is appended,
+ * never prepended. The interactive shell still owns its own PATH configuration. */
+function appendHaraPluginBin(env: NodeJS.ProcessEnv): void {
+  const explicitHome = environmentValue(env, "HOME");
+  const fallbackHome = environmentValue(env, "USERPROFILE");
+  // Match Hara's portable-home contract: an explicit Git Bash/MSYS HOME wins on Windows too.
+  const home = platform() === "win32" && explicitHome
+    ? normalizePortableWindowsHome(explicitHome)
+    : explicitHome ?? fallbackHome;
+  if (!home) return;
+  const pluginBin = join(home, ".hara", "bin");
+  if (!existsSync(pluginBin)) return;
+
+  const pathKey = Object.keys(env).find((candidate) => candidate.toUpperCase() === "PATH") ?? "PATH";
+  const current = env[pathKey] ?? "";
+  const comparable = (value: string): string => platform() === "win32" ? value.toLowerCase() : value;
+  if (current.split(delimiter).some((entry) => comparable(entry) === comparable(pluginBin))) return;
+  env[pathKey] = current ? `${current}${delimiter}${pluginBin}` : pluginBin;
+}
+
 /** Build an own copy so callers never mutate process.env. Explicit overrides (for example an MCP server's
  * configured env) are intentional and win after the inherited environment has been scrubbed. */
 export function toolSubprocessEnv(
@@ -51,6 +80,7 @@ export function toolSubprocessEnv(
     if (value === undefined) delete out[name];
     else out[name] = value;
   }
+  appendHaraPluginBin(out);
   return out;
 }
 

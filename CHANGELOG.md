@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.125.1 — 2026-07-18 — installed plugin commands inside agent tasks
+
+- **Commands contributed by an installed Hara plugin are now available to Hara's own tool subprocesses.**
+  Hara appends the user-approved `~/.hara/bin` directory after the inherited `PATH`, so a plugin command
+  such as `hara-video` can be called during an agent task without shadowing a project or system executable.
+  Interactive shells remain user-controlled and still receive the existing one-time PATH hint.
+- This closes the failure mode where the Video Skill was loaded but the agent saw `hara-video: command not
+  found`, hand-built an ungoverned replacement project, and then bypassed the plugin's verification command.
+- Upgrade with `npm i -g @nanhara/hara@0.125.1`.
+
 ## 0.125.0 — 2026-07-18 — Claude-compatible specialist orchestration
 
 - **Personal Claude Code subagents now work in Hara without copying prompts.** Hara discovers

@@ -79,6 +79,31 @@ test("sensitive path policy denies real secret files and symlink aliases but per
   }
 });
 
+test("tool subprocesses can reach installed Hara plugin commands without letting them shadow PATH", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-plugin-path-"));
+  const unrelatedProfile = mkdtempSync(join(tmpdir(), "hara-plugin-profile-"));
+  try {
+    const pluginBin = join(home, ".hara", "bin");
+    mkdirSync(pluginBin, { recursive: true });
+    const source = {
+      HOME: home,
+      USERPROFILE: unrelatedProfile,
+      PATH: join(home, "project-bin"),
+    };
+
+    const first = toolSubprocessEnv(source);
+    assert.equal(first.PATH, `${source.PATH}${process.platform === "win32" ? ";" : ":"}${pluginBin}`);
+    assert.equal(first.PATH.split(process.platform === "win32" ? ";" : ":")[0], source.PATH);
+
+    const second = toolSubprocessEnv(first);
+    assert.equal(second.PATH, first.PATH, "the Hara plugin bin is appended only once");
+    assert.equal(source.PATH, join(home, "project-bin"), "the caller's environment is not mutated");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(unrelatedProfile, { recursive: true, force: true });
+  }
+});
+
 test("sensitive path policy covers Hara control-plane state, NTFS aliases, and nested safe templates", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-private-policy-"));
   const previousHome = process.env.HOME;
