@@ -6,13 +6,13 @@
 // the TUI. In headless / non-TTY / `-p` / gateway runs there is no interactive user (ctx.ask is absent) — the
 // tool returns a clear "proceed with your best judgment" string instead of hanging. kind:"read" so it never
 // itself triggers the approval gate (the interaction IS the prompt).
-import { registerTool, type ToolContext } from "./registry.js";
+import { getTool, registerTool, type Tool, type ToolContext } from "./registry.js";
 
 /** Returned when nobody can answer (headless / non-TTY / -p / gateway / sub-agent). Phrased so the model
  *  keeps going on its own judgment rather than re-asking or stalling. */
 export const NO_INTERACTIVE_USER = "(no interactive user available — proceed with your best judgment)";
 
-registerTool({
+const definition: Tool = {
   name: "ask_user",
   description:
     "Ask the user ONE structured question mid-turn and wait for their answer, then continue. " +
@@ -69,4 +69,10 @@ registerTool({
       return `${NO_INTERACTIVE_USER} (ask failed: ${e?.message ?? e})`;
     }
   },
-});
+};
+
+registerTool(definition);
+
+/** Exact registered identity used by the agent loop to grant the engine-owned prompt its pausable
+ * active-budget semantics. A plugin that later shadows the public name does not inherit that authority. */
+export const askUserTool = getTool(definition.name)!;

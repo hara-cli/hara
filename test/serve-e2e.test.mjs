@@ -159,6 +159,7 @@ const hangingCompactProvider = () => {
   let markStarted;
   const started = new Promise((resolve) => { markStarted = resolve; });
   let compactSignal;
+  let finishCompact;
   return {
     provider: {
       id: "fake",
@@ -170,11 +171,16 @@ const hangingCompactProvider = () => {
         }
         compactSignal = signal;
         markStarted();
-        return new Promise(() => {}); // intentionally ignores abort: serve must settle its own operation
+        return new Promise((resolve) => {
+          // Intentionally ignore abort: Serve must settle its logical operation while retaining the
+          // session lock until this physical provider Promise is explicitly released by the test.
+          finishCompact = () => resolve({ text: "late summary", toolUses: [], stop: "end" });
+        });
       },
     },
     started,
     signal: () => compactSignal,
+    finish: () => finishCompact?.(),
   };
 };
 
@@ -592,6 +598,10 @@ test("serve e2e: interrupt after steer cannot overwrite the write-ahead transcri
     assert.equal(afterInterrupt.task.steering[0].deliveryState, "consumed");
     assert.equal(afterInterrupt.history.filter((message) => message.role === "user" && message.content.includes("must survive interrupt")).length, 1);
 
+    const overlapping = await c.call("session.send", { sessionId: result.sessionId, text: "继续" });
+    assert.equal(overlapping.error.code, -32002, "the interrupted physical provider retains the session lease");
+    releaseFirst();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     const resumed = await c.call("session.send", { sessionId: result.sessionId, text: "继续" });
     assert.equal(resumed.result.reply, "recovered");
     assert.equal(providerHistories[1].filter((message) => message.role === "user" && message.content.includes("must survive interrupt")).length, 1, "recovery sees the accepted steer exactly once");
@@ -744,6 +754,36 @@ test("serve e2e: graceful close aborts turns, closes clients, releases settled l
   }
 });
 
+test("serve e2e: authenticated server.shutdown acknowledges then runs the graceful close path", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-rpc-shutdown-"));
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(textProvider, memStore()),
+  );
+  const c = await connect(srv.port);
+  try {
+    const initialized = await c.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.methods.includes("server.shutdown"));
+    const socketClosed = new Promise((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error("server.shutdown did not close the socket")),
+        3_000,
+      );
+      c.ws.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+    const stopped = await c.call("server.shutdown", {});
+    assert.deepEqual(stopped.result, { accepted: true });
+    await socketClosed;
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: operations settling after shutdown grace release their retained locks", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-late-close-"));
   const store = memStore();
@@ -830,8 +870,16 @@ test("serve e2e: session.interrupt settles a compaction even when its provider i
     assert.equal(result.error.code, -32603);
     assert.match(result.error.message, /compaction interrupted/);
     assert.equal(hanging.signal()?.aborted, true, "compact provider receives the interrupt signal");
-    assert.equal((await c.call("session.rename", { sessionId: sid, title: "idle again" })).result.title, "idle again", "busy clears after interruption");
+    assert.equal(
+      (await c.call("session.rename", { sessionId: sid, title: "too early" })).error.code,
+      -32002,
+      "the physical compaction retains the session lease after logical interruption",
+    );
+    hanging.finish();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal((await c.call("session.rename", { sessionId: sid, title: "idle again" })).result.title, "idle again", "busy clears after physical settlement");
   } finally {
+    hanging.finish();
     if (compacting) await compacting.catch(() => {});
     c.close();
     await srv.close();
@@ -839,7 +887,7 @@ test("serve e2e: session.interrupt settles a compaction even when its provider i
   }
 });
 
-test("serve e2e: compaction has a hard timeout and close releases its lock", { timeout: 10000 }, async () => {
+test("serve e2e: compaction has a hard timeout and close retains its lock until physical settlement", { timeout: 15000 }, async () => {
   for (const mode of ["timeout", "close"]) {
     const dir = mkdtempSync(join(tmpdir(), `hara-serve-compact-${mode}-`));
     const store = memStore();
@@ -864,15 +912,30 @@ test("serve e2e: compaction has a hard timeout and close releases its lock", { t
         assert.equal(result.error.code, -32603);
         assert.match(result.error.message, /compaction timed out/);
         assert.equal(hanging.signal()?.aborted, true, "hard timeout also aborts provider work");
-        assert.equal((await c.call("session.rename", { sessionId: sid, title: "after timeout" })).result.title, "after timeout");
+        assert.equal(
+          (await c.call("session.rename", { sessionId: sid, title: "after timeout" })).error.code,
+          -32002,
+          "the physical compaction retains the session lease after logical timeout",
+        );
         c.close();
         await srv.close();
       } else {
         await srv.close();
         assert.equal(hanging.signal()?.aborted, true, "shutdown interrupts compact");
       }
-      assert.ok(released.includes(sid), `${mode} shutdown released the attached session lock`);
+      assert.equal(
+        released.includes(sid),
+        false,
+        `${mode} shutdown keeps the attached session lock while the ignored provider is physical pending`,
+      );
+      hanging.finish();
+      const releaseDeadline = Date.now() + 1_000;
+      while (!released.includes(sid) && Date.now() < releaseDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(released.includes(sid), `${mode} provider settlement released the attached session lock`);
     } finally {
+      hanging.finish();
       await srv.close();
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1046,8 +1109,8 @@ test("serve e2e: interrupt settles a pending approval immediately and leaves val
   }
 });
 
-test("serve e2e: run deadline dismisses its approval and leaves no executable stale prompt", { timeout: 10000 }, async () => {
-  const dir = mkdtempSync(join(tmpdir(), "hara-serve-deadline-approval-"));
+test("serve e2e: approval wait pauses the active deadline and remains executable", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-paused-approval-"));
   const store = memStore();
   const deps = {
     ...baseDeps(toolProvider(), store, "suggest"),
@@ -1061,22 +1124,19 @@ test("serve e2e: run deadline dismisses its approval and leaves no executable st
     const { result } = await c.call("session.create", {});
     sending = c.call("session.send", { sessionId: result.sessionId, text: "wait forever for approval" });
     const approval = await c.waitEvent("approval.request");
-    const failed = await Promise.race([
-      sending,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("run deadline did not settle approval")), 2_500)),
-    ]);
-    assert.equal(failed.error.code, -32603);
-    assert.match(failed.error.message, /total deadline 1s reached/);
-    assert.equal(existsSync(join(dir, "approved.txt")), false);
+    let settled = false;
+    void sending.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    assert.equal(settled, false, "human wait may exceed runTimeoutMs without consuming active budget");
+    assert.equal(existsSync(join(dir, "approved.txt")), false, "the tool remains gated until the reply");
 
-    const saved = store.saved.get(result.sessionId);
-    assert.deepEqual(saved.history.slice(-2).map((message) => message.role), ["assistant", "tool"]);
-    assert.match(saved.history.at(-1).results[0].content, /run deadline 1s reached/);
-
-    // A late UI reply is idempotent and cannot resurrect the abandoned call after its map entry was removed.
     assert.deepEqual((await c.call("approval.reply", { approvalId: approval.params.approvalId, allow: true })).result, {});
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(existsSync(join(dir, "approved.txt")), false);
+    const sent = await Promise.race([
+      sending,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("approved turn did not resume")), 2_500)),
+    ]);
+    assert.equal(sent.result.reply, "done");
+    assert.equal(readFileSync(join(dir, "approved.txt"), "utf8"), "hi");
   } finally {
     if (sending) await sending.catch(() => {});
     c.close();

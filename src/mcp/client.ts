@@ -22,7 +22,7 @@ export interface McpConnectOptions {
    * embedders do not have to wait for the production default when exercising an unresponsive server. */
   timeoutMs?: number;
   /** Owning agent turn. Cancellation must stop startup/tool discovery and close the external child instead
-   * of letting a lazy MCP launch outlive Esc, an interrupt, or the total run deadline. */
+   * of letting a lazy MCP launch outlive Esc, an interrupt, or the active execution deadline. */
   signal?: AbortSignal;
 }
 

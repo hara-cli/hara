@@ -5,6 +5,8 @@
 // Client → server requests:
 //   initialize        {token,capabilities?}      → {name,version,protocol,cwd,provider,model,setupState,
 //                                                   capabilities:{methods:[…]}}  (feature detection)
+//   server.shutdown   {}                         → {accepted:true} (authenticated graceful local shutdown;
+//                                                   BUSY while any client work/approval is active)
 //   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,updatedAt}]}
 //   session.create    {cwd?,approval?}           → {sessionId,model}
 //   session.resume    {sessionId}                → {sessionId,model,history:[{role,text}]}
@@ -49,7 +51,7 @@ export const ERR = {
   PARAMS: -32602,
   INTERNAL: -32603,
   UNAUTHORIZED: -32001, // initialize first (or bad token)
-  BUSY: -32002, // session already has a turn in flight
+  BUSY: -32002, // requested operation conflicts with active server/session work
   NO_SESSION: -32003, // unknown/expired sessionId
   LOCKED: -32004, // session held by another live hara process (single-writer lock)
 } as const;

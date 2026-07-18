@@ -24,7 +24,7 @@ import {
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
-import { runAgent } from "../agent/loop.js";
+import { runAgent, type RunOpts } from "../agent/loop.js";
 import {
   COMPACT_SYSTEM,
   buildFileRestore,
@@ -98,7 +98,16 @@ export interface ServeDeps {
   runtimeInfo?: (cwd?: string, model?: string) => { providerId: string; model: string; effortLevels?: string[] };
   /** Per-project lifecycle limits, read at turn start so persistent Desktop sessions pick up config edits. */
   runLimits?: (cwd?: string) => { timeoutMs: number; maxRounds: number };
-  spawnSubagent: (provider: Provider, cwd: string, projectContext: string | undefined, stats: { input: number; output: number; lastInput?: number }, task: string, role?: string, signal?: AbortSignal) => Promise<string>;
+  spawnSubagent: (
+    provider: Provider,
+    cwd: string,
+    projectContext: string | undefined,
+    stats: { input: number; output: number; lastInput?: number },
+    task: string,
+    role?: string,
+    signal?: AbortSignal,
+    observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun">,
+  ) => Promise<string>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
   buildGuardian?: (cwd?: string) => Promise<{ provider?: Provider | null; enabled?: boolean } | undefined>;
   sandbox: SandboxMode;
@@ -392,8 +401,73 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const authed = new Set<WebSocket>();
   const pendingApprovals = new Map<string, (v: boolean | "always") => void>();
   const inFlightRequests = new Set<Promise<void>>();
+  // Physical provider/tool work can outlive its logical timeout. Keep a process-level ledger independent
+  // of SessionHub membership so detach/delete cannot make an updater believe the old engine is quiescent.
+  const activeOperations = new Set<Promise<unknown>>();
   let closing = false;
   let closePromise: Promise<void> | null = null;
+
+  const trackActiveOperation = <T>(operation: Promise<T>): Promise<T> => {
+    activeOperations.add(operation);
+    const settled = (): void => {
+      activeOperations.delete(operation);
+      if (closing) hub.releaseIdle();
+    };
+    void operation.then(settled, settled);
+    return operation;
+  };
+
+  const releaseSessionBusyIfIdle = (session: ServeSession): void => {
+    if (
+      session.abort === null &&
+      session.pendingProviderTurns === 0 &&
+      session.pendingToolRuns === 0
+    ) {
+      session.busy = false;
+    }
+  };
+
+  const observeProviderTurn = (session: ServeSession, turn: Promise<unknown>): void => {
+    session.pendingProviderTurns += 1;
+    trackActiveOperation(turn);
+    const settled = (): void => {
+      session.pendingProviderTurns = Math.max(0, session.pendingProviderTurns - 1);
+      // A logical timeout/interrupt may return before a non-cooperative provider physically settles.
+      // Retain the per-session lease so a second turn cannot share that provider instance concurrently.
+      releaseSessionBusyIfIdle(session);
+      if (closing) hub.releaseIdle();
+    };
+    void turn.then(settled, settled);
+  };
+
+  const observeToolRun = (session: ServeSession, toolRun: Promise<unknown>): void => {
+    session.pendingToolRuns += 1;
+    trackActiveOperation(toolRun);
+    const settled = (): void => {
+      session.pendingToolRuns = Math.max(0, session.pendingToolRuns - 1);
+      // `abort === null` means the logical turn already returned. Keep the session busy/locked until
+      // every late side-effect-capable Promise has physically stopped.
+      releaseSessionBusyIfIdle(session);
+      if (closing) hub.releaseIdle();
+    };
+    void toolRun.then(settled, settled);
+  };
+
+  /** An RPC-requested shutdown is a cooperative handoff (for example, before a Desktop update), not a
+   * force-stop. Refuse it while ANY client still owns live work. `inFlightRequests` covers async work that
+   * has not attached a session yet (provider factories/settings/filesystem scans); the session fields cover
+   * turns, compaction, provider reconfiguration, and physically late provider/tool promises. */
+  const hasActiveClientWork = (): boolean =>
+    inFlightRequests.size > 0 ||
+    activeOperations.size > 0 ||
+    pendingApprovals.size > 0 ||
+    hub.active().some((session) =>
+      session.busy ||
+      session.configuring ||
+      session.abort !== null ||
+      session.pendingProviderTurns > 0 ||
+      session.pendingToolRuns > 0
+    );
 
   const broadcast = (method: string, params: Record<string, unknown>): void => {
     const frame = rpcNotify(method, params);
@@ -508,8 +582,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         pendingApprovals.set(approvalId, finish);
         if (signal.aborted) finish(false);
         else {
-          // `signal` is runAgent's combined Esc + total-deadline signal. Listening only to turnAbort would
-          // leave the approval map and Desktop prompt stale when the internal lifecycle deadline fires.
+          // `signal` composes the owning turn cancellation with runAgent's lifecycle cancellation. Listening
+          // only to turnAbort would leave the approval map and Desktop prompt stale after an internal stop.
           signal.addEventListener("abort", onAbort, { once: true });
           broadcast("approval.request", { sessionId, approvalId, question: q });
         }
@@ -543,7 +617,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           cwd: s.meta.cwd,
           sandbox: deps.sandbox,
           todoScope: sessionId,
-          spawn: (t, role, signal) => deps.spawnSubagent(s.provider, s.meta.cwd, s.projectContext, s.stats, t, role, signal),
+          spawn: (t, role, signal) => deps.spawnSubagent(
+            s.provider,
+            s.meta.cwd,
+            s.projectContext,
+            s.stats,
+            t,
+            role,
+            signal,
+            {
+              onProviderTurn: (turn) => observeProviderTurn(s, turn),
+              onToolRun: (toolRun) => observeToolRun(s, toolRun),
+            },
+          ),
           ui: sink,
         },
         approval: s.approval,
@@ -570,25 +656,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         },
         stats: s.stats,
         signal: turnAbort.signal,
-        onProviderTurn: (turn) => {
-          s.pendingProviderTurns += 1;
-          const settled = (): void => {
-            s.pendingProviderTurns = Math.max(0, s.pendingProviderTurns - 1);
-            if (closing) hub.releaseIdle();
-          };
-          void turn.then(settled, settled);
-        },
-        onToolRun: (toolRun) => {
-          s.pendingToolRuns += 1;
-          const settled = (): void => {
-            s.pendingToolRuns = Math.max(0, s.pendingToolRuns - 1);
-            // `abort === null` means the logical turn already returned. Keep the session busy/locked until
-            // every late side-effect-capable Promise has physically stopped.
-            if (s.pendingToolRuns === 0 && s.abort === null) s.busy = false;
-            if (closing) hub.releaseIdle();
-          };
-          void toolRun.then(settled, settled);
-        },
+        onProviderTurn: (turn) => observeProviderTurn(s, turn),
+        onToolRun: (toolRun) => observeToolRun(s, toolRun),
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
         });
@@ -631,7 +700,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       throw error;
     } finally {
       s.abort = null;
-      s.busy = s.pendingToolRuns > 0;
+      s.busy = s.pendingProviderTurns > 0 || s.pendingToolRuns > 0;
     }
   };
 
@@ -667,7 +736,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       controller.signal.addEventListener("abort", onAbort, { once: true });
       if (controller.signal.aborted) return onAbort();
       // Promise.resolve protects this boundary even if a non-conforming provider throws synchronously.
-      void Promise.resolve().then(() => {
+      const providerTurn = Promise.resolve().then(() => {
         // The abort can fire after scheduling this microtask but before it runs. Gate the provider call at
         // the actual invocation boundary so an interrupted/expired compact cannot start a late request.
         if (controller.signal.aborted) throw new Error(timedOut ? "compaction timed out" : "compaction interrupted");
@@ -678,7 +747,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           onText: () => {},
           signal: controller.signal,
         });
-      }).then(
+      });
+      observeProviderTurn(s, providerTurn);
+      void providerTurn.then(
         (result) => finish(() => resolve(result)),
         (error) => finish(() => reject(error)),
       );
@@ -737,6 +808,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // clients feature-detect up front instead of probing for -32601 per call. `p.capabilities`
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
+            "server.shutdown",
             "session.list", "session.create", "session.resume", "session.send", "session.steer", "session.interrupt", "session.set-model",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
@@ -762,6 +834,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
 
         switch (req.method) {
+          case "server.shutdown": {
+            // The updater's stop request must never abort another client's turn or dismiss its approval.
+            // The current shutdown request is not inserted into inFlightRequests until this synchronous
+            // branch returns, so any entry observed here belongs to another request. Once accepted, close
+            // admission atomically before replying/scheduling close: no new work can race into the gap.
+            if (hasActiveClientWork()) {
+              return reply(rpcError(id, ERR.BUSY, "server has active work — retry shutdown after all sessions and approvals are idle"));
+            }
+            closing = true;
+            reply(rpcResult(id!, { accepted: true }));
+            const shutdown = setTimeout(() => void close(), 0);
+            shutdown.unref();
+            return;
+          }
           case "session.list":
             return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, archived: m.archived ?? false })) }));
           case "session.create": {
@@ -1094,8 +1180,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               broadcast("event.notice", { sessionId: s.meta.id, text: `(compacted — history replaced with a summary; ${s.meta.workingSet?.length ?? 0} notes kept)` });
               return reply(rpcResult(id!, { sessionId: s.meta.id, ctx: ctxOf(s), notes: s.meta.workingSet?.length ?? 0, history: historyForClient(s.history) }));
             } finally {
-              s.busy = false;
               if (s.abort === compactAbort) s.abort = null;
+              s.busy = s.pendingProviderTurns > 0 || s.pendingToolRuns > 0;
             }
           }
           case "session.rewind": {
@@ -1175,7 +1261,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
       let quiet = false;
       while (Date.now() < deadline) {
-        if (inFlightRequests.size === 0 && hub.active().every((session) => !session.busy && !session.configuring && session.pendingProviderTurns === 0 && session.pendingToolRuns === 0)) {
+        if (
+          inFlightRequests.size === 0 &&
+          activeOperations.size === 0 &&
+          hub.active().every((session) => !session.busy && !session.configuring && session.pendingProviderTurns === 0 && session.pendingToolRuns === 0)
+        ) {
           quiet = true;
           break;
         }

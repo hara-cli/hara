@@ -37,7 +37,7 @@ import {
   type ApprovalMode,
   type ProviderId,
 } from "./config.js";
-import { runAgent, type RunOutcome } from "./agent/loop.js";
+import { runAgent, type RunOpts, type RunOutcome } from "./agent/loop.js";
 import {
   formatAgentDuration,
   parseAgentRunTimeoutMs,
@@ -200,6 +200,7 @@ import {
 } from "./session/task.js";
 import { displaySessionCwd, resolveSessionResumeTarget } from "./session/resume.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
+import { createPhysicalOperationDrain } from "./session/operation-drain.js";
 import { loadGlobalRoles, loadRoles, roleToolFilter, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
 import { buildAgentsIndex, canonicalProjectPath, resolveAgent, loadProjects, addProject, removeProject, type AgentIndexEntry } from "./org/projects.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
@@ -1185,7 +1186,15 @@ async function curateSessionLearning(
 
 /** Summarize the conversation and replace history with the summary (keeping working-memory notes). Shared by
  *  /compact (manual) and auto-compaction. Returns the summary, or null on failure / nothing to do. */
-async function compactConversation(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, signal?: AbortSignal, task?: TaskExecution): Promise<string | null> {
+async function compactConversation(
+  provider: Provider,
+  history: NeutralMsg[],
+  meta: SessionMeta,
+  stats: { input: number; output: number; lastInput?: number },
+  signal?: AbortSignal,
+  task?: TaskExecution,
+  onProviderTurn?: RunOpts["onProviderTurn"],
+): Promise<string | null> {
   if (history.length < 2 || signal?.aborted) return null;
   const recent = recentHistoryForCompaction(history);
   const r = await boundedProviderTurn(provider, {
@@ -1193,7 +1202,7 @@ async function compactConversation(provider: Provider, history: NeutralMsg[], me
     history: [...compactionSourceHistory(history), { role: "user", content: "Create the bounded execution checkpoint now." }],
     tools: [],
     onText: () => {},
-  }, { timeoutMs: 60_000, label: "conversation compaction", signal });
+  }, { timeoutMs: 60_000, label: "conversation compaction", signal, onProviderTurn });
   if (signal?.aborted || r.stop === "error") return null;
   const rawSummary = r.text.trim();
   if (!rawSummary) return null;
@@ -1225,7 +1234,17 @@ async function compactConversation(provider: Provider, history: NeutralMsg[], me
 /** Auto-compact (à la Claude Code) when the last turn filled the context past the threshold, so the NEXT turn
  *  doesn't overflow. Opt-out via `autoCompact: false` / `HARA_AUTO_COMPACT=0`. Best-effort; `notify` surfaces
  *  a one-line status. Returns true if it compacted. */
-async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta: SessionMeta, stats: { input: number; output: number; lastInput?: number }, cfg: HaraConfig, notify: (m: string) => void, signal?: AbortSignal, task?: TaskExecution): Promise<boolean> {
+async function maybeAutoCompact(
+  provider: Provider,
+  history: NeutralMsg[],
+  meta: SessionMeta,
+  stats: { input: number; output: number; lastInput?: number },
+  cfg: HaraConfig,
+  notify: (m: string) => void,
+  signal?: AbortSignal,
+  task?: TaskExecution,
+  onProviderTurn?: RunOpts["onProviderTurn"],
+): Promise<boolean> {
   if (signal?.aborted) return false;
   const lastInput = stats.lastInput ?? 0;
   const pct = bar.ctxPctFor(cfg.model, lastInput);
@@ -1237,7 +1256,7 @@ async function maybeAutoCompact(provider: Provider, history: NeutralMsg[], meta:
   if (!overPct && !overCap) return false;
   if (signal?.aborted) return false;
   notify(`✻ Auto-compacting conversation (context ${pct}% full, ~${Math.round(lastInput / 1000)}k tok)…`);
-  const summary = await compactConversation(provider, history, meta, stats, signal, task);
+  const summary = await compactConversation(provider, history, meta, stats, signal, task, onProviderTurn);
   if (signal?.aborted) return false;
   notify(summary ? `(auto-compacted — context replaced with a summary; ${meta.workingSet?.length ?? 0} notes kept)` : "(auto-compact failed — use /compact or /clear)");
   return !!summary;
@@ -1254,6 +1273,7 @@ async function runSubagent(
   task: string,
   roleId?: string,
   signal?: AbortSignal,
+  observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun">,
 ): Promise<string> {
   const roles = loadRoles(cwd);
   const roleRef = roleId?.trim();
@@ -1308,6 +1328,7 @@ async function runSubagent(
       signal,
       timeoutMs: Math.min(cfg.runTimeoutMs, 8 * 60_000),
       maxRounds: Math.min(cfg.maxAgentRounds, 24),
+      ...(observers ?? {}),
     });
   } finally {
     disposeTodoScope(todoScope);
@@ -1369,7 +1390,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
     `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
     `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (cfg.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (cfg.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
-    `${dot} run-limits ${c.bold(formatAgentDuration(cfg.runTimeoutMs))}${c.dim(" total · ")}${c.bold(String(cfg.maxAgentRounds))}${c.dim(" rounds · sub-agents ≤8m/24")}`,
+    `${dot} run-limits ${c.bold(formatAgentDuration(cfg.runTimeoutMs))}${c.dim(" active execution · ")}${c.bold(String(cfg.maxAgentRounds))}${c.dim(" rounds · sub-agents ≤8m/24")}`,
     `${dot} notify ${cfg.notify === "off" ? c.dim("off — hara config set notify bell|system") : c.bold(cfg.notify)}`,
     `${dot} cron ${(() => { try { const n = loadJobs().length; return n ? `${n} job(s) · ${isInstalled() ? c.green("scheduler installed") : c.yellow("scheduler off — hara cron install")}` : c.dim("no jobs — hara cron add"); } catch { return c.red("job store invalid — run hara cron list"); } })()}`,
     `${dot} input ${cfg.vimMode ? c.bold("vim") + c.dim(" (modal)") : c.dim("default — hara config set vimMode true for vim keys")}`,
@@ -2338,9 +2359,9 @@ program
           };
         },
         runLimits: (targetCwd) => agentRunLimits(loadConfig({ cwd: targetCwd ?? cwd })),
-        spawnSubagent: (provider, scwd, projectContext, stats, task, role, signal) => {
+        spawnSubagent: (provider, scwd, projectContext, stats, task, role, signal, observers) => {
           const live = loadConfig({ cwd: scwd });
-          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role, signal);
+          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role, signal, observers);
         },
         guardian: guardianOpt,
         buildGuardian: async (targetCwd) => {
@@ -3246,12 +3267,13 @@ program.action(async (opts) => {
   // one-shot
   if (opts.print) {
     let headlessLockId: string | null = null;
-    const pendingHeadlessOperations = new Set<Promise<unknown>>();
-    const trackHeadlessOperation = (operation: Promise<unknown>): void => {
-      pendingHeadlessOperations.add(operation);
-      const settled = (): void => { pendingHeadlessOperations.delete(operation); };
-      void operation.then(settled, settled);
-    };
+    const headlessOperations = createPhysicalOperationDrain(() => {
+      if (!headlessLockId) return;
+      const lockId = headlessLockId;
+      headlessLockId = null;
+      releaseSessionLock(lockId);
+    });
+    const trackHeadlessOperation = headlessOperations.observe;
     try {
     const projectContext = loadAgentContext(cwd) || undefined;
     // Vision sidecar for headless runs (gateway/cron): without it the computer tool's screenshots come back
@@ -3487,7 +3509,26 @@ program.action(async (opts) => {
     let structuredSet = false;
     const printRunOpts = {
       provider: headlessProvider,
-      ctx: { cwd, sandbox, spawn: (t: string, role?: string, signal?: AbortSignal) => runSubagent(cfg, headlessProvider, cwd, sandbox, projectContext, stats, t, role, signal), describeImage },
+      ctx: {
+        cwd,
+        sandbox,
+        spawn: (t: string, role?: string, signal?: AbortSignal) => runSubagent(
+          cfg,
+          headlessProvider,
+          cwd,
+          sandbox,
+          projectContext,
+          stats,
+          t,
+          role,
+          signal,
+          {
+            onProviderTurn: trackHeadlessOperation,
+            onToolRun: trackHeadlessOperation,
+          },
+        ),
+        describeImage,
+      },
       approval: "full-auto" as const,
       confirm: async () => true,
       projectContext,
@@ -3551,7 +3592,17 @@ program.action(async (opts) => {
       // Long-session safety: auto-compact before saving so a long chat/cron thread never overflows context.
       // Silent (no-op notify) in headless mode so nothing leaks into a captured -p reply. Opt-out via config.
       if (runOutcome.status === "completed") {
-        await maybeAutoCompact(headlessProvider, history, meta, stats, cfg, () => {}, undefined, task);
+        await maybeAutoCompact(
+          headlessProvider,
+          history,
+          meta,
+          stats,
+          cfg,
+          () => {},
+          undefined,
+          task,
+          trackHeadlessOperation,
+        );
       }
       saveSession(meta, history, task); // persist when resuming/continuing; plain -p stays stateless
     }
@@ -3559,18 +3610,11 @@ program.action(async (opts) => {
     await closeMcp();
     return;
     } finally {
-      if (headlessLockId) {
-        const lockId = headlessLockId;
-        if (pendingHeadlessOperations.size) {
-          // Do not await here: the logical deadline stays hard. A late operation with active handles keeps
-          // this process (and therefore its cross-process session lease) alive until physical settlement.
-          // A truly inert never-settling Promise has no side effect/handle, so normal process exit makes the
-          // PID-backed lease safely reclaimable.
-          void Promise.allSettled([...pendingHeadlessOperations]).then(() => releaseSessionLock(lockId));
-        } else {
-          releaseSessionLock(lockId);
-        }
-      }
+      // Do not await here: the logical deadline stays hard. The live drain includes operations registered
+      // by an already-observed outer tool after cleanup begins, and releases the PID-backed session lease
+      // only when the entire physical tree is empty. Handle-less inert Promises cannot keep the process
+      // alive; after process exit the ordinary stale-PID recovery remains authoritative.
+      headlessOperations.close();
       await closeMcp();
     }
   }

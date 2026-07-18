@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import React from "react";
 import { render } from "ink-testing-library";
 import { App, submissionCanBeSteered } from "../dist/tui/App.js";
+import { setTurnPhase } from "../dist/agent/phase.js";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 70) => new Promise((r) => setTimeout(r, ms));
@@ -360,7 +361,12 @@ test("App ask_user (h.ask) with options: shows numbered menu + a 'type my own' e
 test("App ask_user (h.ask) free-text: no options → input box captures the typed answer", async () => {
   let answer = null;
   const onSubmit = async (line, h) => {
-    answer = await h.ask("Where should migrations live?");
+    setTurnPhase("awaiting_user");
+    try {
+      answer = await h.ask("Where should migrations live?");
+    } finally {
+      setTurnPhase("idle");
+    }
   };
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
@@ -370,7 +376,10 @@ test("App ask_user (h.ask) free-text: no options → input box captures the type
   await tick();
   stdin.write("\r");
   await tick();
-  assert.ok(strip(lastFrame()).includes("Where should migrations live?"), "free-text question shown");
+  const asking = strip(lastFrame());
+  assert.ok(asking.includes("Where should migrations live?"), "free-text question shown");
+  assert.ok(asking.includes("waiting for your answer · task timer paused"), "status distinguishes human wait from active work");
+  assert.ok(!asking.includes("waiting for the model"), "human wait is not described as model work");
   stdin.write("db/migrations");
   await tick();
   stdin.write("\r");

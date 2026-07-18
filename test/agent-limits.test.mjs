@@ -14,6 +14,7 @@ import {
 } from "../dist/agent/limits.js";
 import { runShell } from "../dist/sandbox.js";
 import { getTool } from "../dist/tools/registry.js";
+import { onTurnPhase, setTurnPhase } from "../dist/agent/phase.js";
 import "../dist/tools/builtin.js";
 import "../dist/tools/memory.js";
 
@@ -87,7 +88,7 @@ test("an active tool loop hard-stops at maxRounds and alerts exactly once", asyn
   assert.match(outcome.error, /3-round safety limit/);
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].kind, "max_rounds");
-  assert.ok(notices.some((message) => /still running/.test(message)), "75% round warning is visible");
+  assert.ok(notices.some((message) => /still actively working/.test(message)), "75% round warning is visible");
   assert.equal(notices.filter((message) => /agent run stopped/.test(message)).length, 1);
 });
 
@@ -207,7 +208,7 @@ test("three repeated unknown or denied calls are failures and trip the breaker",
   }
 });
 
-test("total deadline stops a provider that stays active forever and ignores AbortSignal", async () => {
+test("active deadline stops a provider that stays active forever and ignores AbortSignal", async () => {
   const notices = [];
   const alerts = [];
   const provider = {
@@ -228,12 +229,48 @@ test("total deadline stops a provider that stays active forever and ignores Abor
   }));
   assert.equal(outcome.status, "halted");
   assert.equal(outcome.stopReason, "deadline");
-  assert.match(outcome.error, /total deadline 1s reached/);
+  assert.match(outcome.error, /active-execution deadline 1s reached/);
   assert.match(outcome.error, /type `\/continue` to resume/);
   assert.match(outcome.error, /task and checklist checkpoint/);
   assert.ok(Date.now() - started < 2_500, "an active/non-cooperative provider cannot hold the run open");
   assert.equal(alerts.length, 1);
   assert.equal(notices.filter((message) => /agent run paused/.test(message)).length, 1);
+});
+
+test("a synchronous provider cannot overrun the active budget and then start a side effect", async () => {
+  let confirmations = 0;
+  let toolRuns = 0;
+  const provider = {
+    id: "busy-provider",
+    model: "busy-provider",
+    turn() {
+      const until = Date.now() + 1_100;
+      while (Date.now() < until) {
+        // Deliberately block the event loop so the setTimeout callback cannot win the race.
+      }
+      return Promise.resolve({
+        text: "",
+        toolUses: [{ id: "late-effect-1", name: "late_effect", input: {} }],
+        stop: "tool_use",
+      });
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "do not run after deadline" }], base(provider, {
+    approval: "suggest",
+    timeoutMs: 1_000,
+    quiet: true,
+    confirm: async () => { confirmations += 1; return true; },
+    extraTools: [{
+      name: "late_effect",
+      description: "must not start after a synchronous budget overrun",
+      input_schema: { type: "object", properties: {} },
+      kind: "edit",
+      async run() { toolRuns += 1; return "ran"; },
+    }],
+  }));
+  assert.equal(outcome.stopReason, "deadline");
+  assert.equal(confirmations, 0);
+  assert.equal(toolRuns, 0);
 });
 
 test("the 80% time boundary reaches the model as an in-band checkpoint instruction", async () => {
@@ -248,7 +285,7 @@ test("the 80% time boundary reaches the model as an in-band checkpoint instructi
         return { text: "", toolUses: [{ id: "slow-stage-1", name: "slow_stage", input: {} }], stop: "tool_use" };
       }
       sawCheckpoint = history.some((message) =>
-        message.role === "user" && message.content.includes("Turn budget checkpoint: about 20% remains"),
+        message.role === "user" && message.content.includes("Turn active-execution budget checkpoint: about 20% remains"),
       );
       return { text: "checkpoint saved", toolUses: [], stop: "end" };
     },
@@ -272,7 +309,7 @@ test("the 80% time boundary reaches the model as an in-band checkpoint instructi
   assert.match(deadlineCheckpointReminder(30 * 60_000), /Do not start another generation batch/);
 });
 
-test("total deadline closes a tool round even when the tool ignores cancellation", async () => {
+test("active deadline closes a tool round even when the tool ignores cancellation", async () => {
   const provider = {
     id: "tool-hang",
     model: "tool-hang",
@@ -302,7 +339,7 @@ test("total deadline closes a tool round even when the tool ignores cancellation
   assert.equal(outcome.stopReason, "deadline");
   assert.ok(Date.now() - started < 2_500);
   assert.equal(history.at(-1).role, "tool");
-  assert.match(history.at(-1).results[0].content, /run deadline 1s reached/);
+  assert.match(history.at(-1).results[0].content, /active-execution deadline 1s reached/);
 });
 
 test("a late non-cooperative wrapper cannot commit through built-in write_file after the deadline", async () => {
@@ -379,10 +416,53 @@ test("a late non-cooperative wrapper cannot start another registered edit tool a
   }
 });
 
-test("total deadline actively aborts and cleans a hanging approval prompt", async () => {
+test("human approval wait does not consume active execution budget", async () => {
+  let round = 0;
   const provider = {
-    id: "approval-hang",
-    model: "approval-hang",
+    id: "approval-wait",
+    model: "approval-wait",
+    async turn() {
+      round += 1;
+      return round === 1
+        ? { text: "", toolUses: [{ id: "approval-1", name: "gated_effect", input: {} }], stop: "tool_use" }
+        : { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const notices = [];
+  let toolRuns = 0;
+  const started = Date.now();
+  const outcome = await runAgent([{ role: "user", content: "ask before running" }], base(provider, {
+    approval: "suggest",
+    timeoutMs: 1_000,
+    maxRounds: 10,
+    ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
+    confirm: async () => {
+      await tick(1_150);
+      return true;
+    },
+    extraTools: [{
+      name: "gated_effect",
+      description: "runs after the user answers",
+      input_schema: { type: "object", properties: {} },
+      kind: "edit",
+      async run() { toolRuns += 1; return "ran"; },
+    }],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(toolRuns, 1);
+  assert.ok(Date.now() - started > 1_050, "wall time may exceed the active execution budget while waiting");
+  assert.equal(
+    notices.some((message) => /still actively working|80% used|agent run paused/.test(message)),
+    false,
+    "active-run warnings stay silent while the user prompt owns the wall time",
+  );
+});
+
+test("external cancellation still aborts and cleans a paused approval", async () => {
+  const controller = new AbortController();
+  const provider = {
+    id: "approval-cancel",
+    model: "approval-cancel",
     async turn() {
       return { text: "", toolUses: [{ id: "approval-1", name: "gated_effect", input: {} }], stop: "tool_use" };
     },
@@ -391,11 +471,14 @@ test("total deadline actively aborts and cleans a hanging approval prompt", asyn
   let sawSignal = false;
   let cleaned = false;
   let toolRuns = 0;
-  const outcome = await runAgent(history, base(provider, {
+  const alerts = [];
+  const running = runAgent(history, base(provider, {
     approval: "suggest",
-    timeoutMs: 1_000,
+    timeoutMs: 10_000,
     maxRounds: 10,
     quiet: true,
+    signal: controller.signal,
+    onLimit: (event) => alerts.push(event),
     confirm: async (_question, signal) => new Promise((_resolve, reject) => {
       sawSignal = signal instanceof AbortSignal;
       signal?.addEventListener("abort", () => {
@@ -411,28 +494,66 @@ test("total deadline actively aborts and cleans a hanging approval prompt", asyn
       async run() { toolRuns += 1; return "ran"; },
     }],
   }));
+  await tick(50);
+  controller.abort();
+  const outcome = await running;
   assert.equal(sawSignal, true, "the approval surface receives the combined run signal");
-  assert.equal(cleaned, true, "deadline actively dismisses the approval instead of only abandoning its Promise");
+  assert.equal(cleaned, true, "Esc/shutdown cancellation dismisses a paused approval");
   assert.equal(toolRuns, 0);
-  assert.equal(outcome.stopReason, "deadline");
+  assert.deepEqual(outcome, { status: "error", error: "(interrupted)" });
+  assert.deepEqual(alerts, []);
   assert.equal(history.at(-1).role, "tool");
-  assert.match(history.at(-1).results[0].content, /run deadline 1s reached/);
+  assert.match(history.at(-1).results[0].content, /interrupted before this tool call completed/);
 });
 
-test("total deadline propagates through ToolContext.ask and closes a hanging question", async () => {
+test("ask_user wait does not consume active budget and resumes the same tool round", async () => {
+  let round = 0;
   const provider = {
-    id: "ask-hang",
-    model: "ask-hang",
+    id: "ask-wait",
+    model: "ask-wait",
     async turn() {
-      return { text: "", toolUses: [{ id: "ask-1", name: "interactive_wait", input: {} }], stop: "tool_use" };
+      round += 1;
+      return round === 1
+        ? { text: "", toolUses: [{ id: "ask-1", name: "ask_user", input: { question: "continue?" } }], stop: "tool_use" }
+        : { text: "continued", toolUses: [], stop: "end" };
     },
   };
   const history = [{ role: "user", content: "ask me" }];
-  let cleaned = false;
+  const started = Date.now();
   const outcome = await runAgent(history, base(provider, {
     timeoutMs: 1_000,
     maxRounds: 10,
     quiet: true,
+    ctx: {
+      cwd: process.cwd(),
+      ask: async () => {
+        await tick(1_150);
+        return "use the gallery";
+      },
+    },
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.ok(Date.now() - started > 1_050);
+  const toolRound = history.find((message) => message.role === "tool");
+  assert.equal(toolRound.results[0].content, "use the gallery");
+});
+
+test("external cancellation still aborts and cleans a paused ask_user", async () => {
+  const controller = new AbortController();
+  const provider = {
+    id: "ask-cancel",
+    model: "ask-cancel",
+    async turn() {
+      return { text: "", toolUses: [{ id: "ask-1", name: "ask_user", input: { question: "continue?" } }], stop: "tool_use" };
+    },
+  };
+  const history = [{ role: "user", content: "ask me" }];
+  let cleaned = false;
+  const running = runAgent(history, base(provider, {
+    timeoutMs: 10_000,
+    maxRounds: 10,
+    quiet: true,
+    signal: controller.signal,
     ctx: {
       cwd: process.cwd(),
       ask: async (_question, _options, signal) => new Promise((_resolve, reject) => {
@@ -443,18 +564,257 @@ test("total deadline propagates through ToolContext.ask and closes a hanging que
         }, { once: true });
       }),
     },
+  }));
+  await tick(50);
+  controller.abort();
+  const outcome = await running;
+  assert.equal(cleaned, true);
+  assert.deepEqual(outcome, { status: "error", error: "(interrupted)" });
+  assert.equal(history.at(-1).role, "tool");
+  assert.match(history.at(-1).results[0].content, /interrupted before this tool call completed/);
+});
+
+test("human wait pauses rather than resets the remaining active budget", async () => {
+  let round = 0;
+  const provider = {
+    id: "active-budget",
+    model: "active-budget",
+    async turn() {
+      round += 1;
+      if (round === 1) return { text: "", toolUses: [{ id: "work-1", name: "active_stage", input: {} }], stop: "tool_use" };
+      if (round === 2) return { text: "", toolUses: [{ id: "ask-1", name: "ask_user", input: { question: "continue?" } }], stop: "tool_use" };
+      return new Promise(() => {});
+    },
+  };
+  const started = Date.now();
+  const outcome = await runAgent([{ role: "user", content: "stage, ask, then hang" }], base(provider, {
+    timeoutMs: 1_000,
+    maxRounds: 10,
+    quiet: true,
+    ctx: {
+      cwd: process.cwd(),
+      ask: async () => {
+        await tick(900);
+        return "continue";
+      },
+    },
     extraTools: [{
-      name: "interactive_wait",
-      description: "wait for an interactive answer",
+      name: "active_stage",
+      description: "consume part of the active budget",
       input_schema: { type: "object", properties: {} },
       kind: "read",
-      async run(_input, ctx) { return ctx.ask("continue?", undefined, ctx.signal); },
+      async run() { await tick(350); return "stage done"; },
     }],
   }));
-  assert.equal(cleaned, true, "the hanging question owns an abort cleanup path");
+  const wallElapsed = Date.now() - started;
   assert.equal(outcome.stopReason, "deadline");
-  assert.equal(history.at(-1).role, "tool");
-  assert.match(history.at(-1).results[0].content, /run deadline 1s reached/);
+  assert.ok(wallElapsed >= 1_700, `human wait should extend wall time (got ${wallElapsed}ms)`);
+  assert.ok(wallElapsed < 3_000, `answering must resume the remaining budget, not reset it (got ${wallElapsed}ms)`);
+});
+
+test("only the engine-owned ask_user tool can pause the active budget", async () => {
+  const provider = {
+    id: "plugin-question",
+    model: "plugin-question",
+    async turn() {
+      return { text: "", toolUses: [{ id: "plugin-ask-1", name: "plugin_question", input: {} }], stop: "tool_use" };
+    },
+  };
+  let cleaned = false;
+  const outcome = await runAgent([{ role: "user", content: "plugin wait" }], base(provider, {
+    timeoutMs: 1_000,
+    quiet: true,
+    ctx: {
+      cwd: process.cwd(),
+      ask: async (_question, _options, signal) => new Promise((_resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("plugin prompt unexpectedly outlived the budget")), 5_000);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          cleaned = true;
+          reject(signal.reason ?? new Error("aborted"));
+        }, { once: true });
+      }),
+    },
+    extraTools: [{
+      name: "plugin_question",
+      description: "third-party prompt wrapper without timer-pause authority",
+      input_schema: { type: "object", properties: {} },
+      kind: "read",
+      async run(_input, ctx) { return ctx.ask("plugin question", undefined, ctx.signal); },
+    }],
+  }));
+  assert.equal(outcome.stopReason, "deadline");
+  assert.equal(cleaned, true);
+});
+
+test("a custom ask signal is composed with the parent run cancellation", async () => {
+  const runController = new AbortController();
+  const ownController = new AbortController();
+  let receivedSignal;
+  let cleaned = false;
+  const provider = {
+    id: "composed-question",
+    model: "composed-question",
+    async turn() {
+      return { text: "", toolUses: [{ id: "composed-ask-1", name: "custom_question", input: {} }], stop: "tool_use" };
+    },
+  };
+  const history = [{ role: "user", content: "cancel the whole run" }];
+  const running = runAgent(history, base(provider, {
+    timeoutMs: 10_000,
+    quiet: true,
+    signal: runController.signal,
+    ctx: {
+      cwd: process.cwd(),
+      ask: async (_question, _options, signal) => new Promise((_resolve, reject) => {
+        receivedSignal = signal;
+        signal?.addEventListener("abort", () => {
+          cleaned = true;
+          reject(signal.reason ?? new Error("aborted"));
+        }, { once: true });
+      }),
+    },
+    extraTools: [{
+      name: "custom_question",
+      description: "passes a tool-owned cancellation signal to the prompt",
+      input_schema: { type: "object", properties: {} },
+      kind: "read",
+      async run(_input, ctx) { return ctx.ask("custom question", undefined, ownController.signal); },
+    }],
+  }));
+  await tick(50);
+  runController.abort();
+  const outcome = await running;
+  assert.ok(receivedSignal instanceof AbortSignal);
+  assert.notEqual(receivedSignal, ownController.signal, "the prompt receives a composed signal");
+  assert.equal(cleaned, true);
+  assert.deepEqual(outcome, { status: "error", error: "(interrupted)" });
+});
+
+test("an already-cancelled custom ask signal never opens the prompt callback", async () => {
+  const ownController = new AbortController();
+  ownController.abort(new Error("question no longer needed"));
+  let promptCalls = 0;
+  let round = 0;
+  const provider = {
+    id: "pre-cancelled-question",
+    model: "pre-cancelled-question",
+    async turn() {
+      round += 1;
+      return round === 1
+        ? { text: "", toolUses: [{ id: "pre-cancelled-ask-1", name: "cancelled_question", input: {} }], stop: "tool_use" }
+        : { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "do not open a stale prompt" }];
+  const outcome = await runAgent(history, base(provider, {
+    quiet: true,
+    ctx: {
+      cwd: process.cwd(),
+      ask: async () => {
+        promptCalls += 1;
+        return "wrong";
+      },
+    },
+    extraTools: [{
+      name: "cancelled_question",
+      description: "passes an already-cancelled tool-owned signal",
+      input_schema: { type: "object", properties: {} },
+      kind: "read",
+      async run(_input, ctx) {
+        return ctx.ask("stale question", undefined, ownController.signal);
+      },
+    }],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(promptCalls, 0);
+  const toolRound = history.find((message) => message.role === "tool");
+  assert.equal(toolRound.results[0].isError, true);
+});
+
+test("a synchronous guardian overrun cannot approve and start the guarded side effect", async () => {
+  let toolRuns = 0;
+  const provider = {
+    id: "guardian-main",
+    model: "guardian-main",
+    async turn() {
+      return {
+        text: "",
+        toolUses: [{ id: "guarded-1", name: "guarded_exec", input: { command: "rm -rf /" } }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const guardian = {
+    id: "guardian-busy",
+    model: "guardian-busy",
+    turn() {
+      const until = Date.now() + 1_100;
+      while (Date.now() < until) {
+        // Block the timer callback, then return a superficially valid allow verdict.
+      }
+      return Promise.resolve({
+        text: '{"decision":"allow","reason":"test"}',
+        toolUses: [],
+        stop: "end",
+      });
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "do not execute after budget expiry" }], base(provider, {
+    timeoutMs: 1_000,
+    quiet: true,
+    guardian: { enabled: true, provider: guardian },
+    extraTools: [{
+      name: "guarded_exec",
+      description: "test-only guarded side effect",
+      input_schema: {
+        type: "object",
+        properties: { command: { type: "string" } },
+        required: ["command"],
+      },
+      kind: "exec",
+      async run() { toolRuns += 1; return "ran"; },
+    }],
+  }));
+  assert.equal(outcome.stopReason, "deadline");
+  assert.equal(toolRuns, 0);
+});
+
+test("the real ask_user integration publishes awaiting_user and restores streaming", async () => {
+  setTurnPhase("idle");
+  const seen = [];
+  const unsubscribe = onTurnPhase((phase) => seen.push(phase));
+  let round = 0;
+  const provider = {
+    id: "phase-question",
+    model: "phase-question",
+    async turn() {
+      round += 1;
+      return round === 1
+        ? { text: "", toolUses: [{ id: "phase-ask-1", name: "ask_user", input: { question: "which style?" } }], stop: "tool_use" }
+        : { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  try {
+    const outcome = await runAgent([{ role: "user", content: "ask once" }], base(provider, {
+      quiet: false,
+      ctx: {
+        cwd: process.cwd(),
+        ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice() {} },
+        ask: async () => {
+          await tick(20);
+          return "product demo";
+        },
+      },
+    }));
+    assert.equal(outcome.status, "completed");
+    const awaitingIndex = seen.indexOf("awaiting_user");
+    assert.ok(awaitingIndex >= 0, `expected awaiting_user in ${seen.join(", ")}`);
+    assert.ok(seen.slice(awaitingIndex + 1).includes("streaming"), "the final human wait restores the active phase");
+  } finally {
+    unsubscribe();
+    setTurnPhase("idle");
+  }
 });
 
 test("a rejected approval closes every tool_use and returns an explicit interaction error", async () => {
@@ -613,13 +973,6 @@ test("multiple ask_user calls in one model round are serialized and every tool_u
         return `answer-${asked.length}`;
       },
     },
-    extraTools: [{
-      name: "ask_user",
-      description: "ask",
-      input_schema: { type: "object", properties: { question: { type: "string" } }, required: ["question"] },
-      kind: "read",
-      async run(input, ctx) { return ctx.ask(input.question, undefined, ctx.signal); },
-    }],
   }));
   assert.equal(outcome.status, "completed");
   assert.equal(peak, 1, "the single TUI prompt slot is never overwritten by parallel asks");

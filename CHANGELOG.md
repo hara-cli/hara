@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## Unreleased
+
+- Human clarification and approval waits no longer consume `runTimeoutMs`. The non-renewable budget now
+  measures active model/tool execution, resumes with the exact remaining time after an answer, and still
+  stops genuinely stuck providers, tools, and loops. Esc, shutdown, and explicit cancellation continue to
+  dismiss a waiting prompt immediately.
+- The TUI distinguishes this state as `waiting for your answer · task timer paused`; five-minute and 80%
+  lifecycle notices no longer fire while Hara is waiting for a person.
+- `hara serve` now exposes authenticated `server.shutdown` so Desktop can gracefully release sessions and
+  locks before relaunching after an update.
+- Timed-out or interrupted provider/tool calls retain their Serve session lease until the underlying
+  operation physically settles. A second turn, session deletion, or updater shutdown receives `BUSY`
+  instead of overlapping a non-cooperative request or releasing its lock early.
+- Headless resumed sessions use the same physical-lifetime rule for dynamically nested sub-agents and
+  automatic compaction, so a late child request cannot escape a cleanup snapshot and release the
+  cross-process lock early.
+
 ## 0.125.3 — 2026-07-18 — conversation/task boundary and deliberate execution
 
 - **Chat delivery is now separate from task execution.** Slash controls such as `/model` no longer create a
@@ -38,7 +55,7 @@ All notable changes to `@nanhara/hara`.
   unless `HARA_ALLOW_TRUSTED_EXTENSIONS=1` was set before launch.
 - MCP stderr now drops only npm 11's repeated `Unknown user config "always-auth"` and `"home"` deprecation
   lines. Other npm warnings and all actual server errors remain visible and redacted. Hara does not read,
-  rewrite, or weaken the user's `.npmrc`. Esc, interruption, and the total task deadline now also cancel a
+  rewrite, or weaken the user's `.npmrc`. Esc, interruption, and the active-execution deadline now also cancel a
   lazy MCP startup/tool call and close an unresponsive child instead of leaving it behind.
 - Upgrade with `npm i -g @nanhara/hara@0.125.3`.
 

@@ -218,7 +218,11 @@ export async function guardianVeto(
   provider: Provider | null | undefined,
   action: { tool: string; detail: string; classifierReason: string },
   history: NeutralMsg[],
-  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+  opts: {
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    onProviderTurn?: (turn: Promise<unknown>) => void;
+  } = {},
 ): Promise<GuardianVerdict> {
   if (!provider) return { decision: "allow", reason: "" }; // fail-open: no model → deterministic layers still guard
 
@@ -234,7 +238,12 @@ export async function guardianVeto(
       history: [{ role: "user", content: prompt }],
       tools: [],
       onText: () => {},
-    }, { timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, signal: opts.signal, label: "security guardian" });
+    }, {
+      timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      signal: opts.signal,
+      label: "security guardian",
+      onProviderTurn: opts.onProviderTurn,
+    });
     if (r.stop === "error") return { decision: "allow", reason: "" }; // fail-open on model error
     return parseVerdict(r.text);
   } catch {

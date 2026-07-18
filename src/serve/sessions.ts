@@ -139,7 +139,14 @@ export class SessionHub {
    * when resume attached successfully but live provider validation failed before the client got a handle. */
   detach(id: string): boolean {
     const live = this.sessions.get(id);
-    if (!live || live.busy || live.configuring) return false;
+    if (
+      !live ||
+      live.busy ||
+      live.configuring ||
+      live.abort !== null ||
+      live.pendingProviderTurns > 0 ||
+      live.pendingToolRuns > 0
+    ) return false;
     this.sessions.delete(id);
     this.store.release(id);
     return true;
@@ -259,7 +266,13 @@ export class SessionHub {
    *  "gone" on success, "busy" when a turn is running, "missing" when unknown/held elsewhere. */
   delete(id: string): "gone" | "busy" | "missing" {
     const live = this.sessions.get(id);
-    if (live?.busy || live?.configuring) return "busy";
+    if (
+      live?.busy ||
+      live?.configuring ||
+      (live?.abort ?? null) !== null ||
+      (live?.pendingProviderTurns ?? 0) > 0 ||
+      (live?.pendingToolRuns ?? 0) > 0
+    ) return "busy";
     const ok = this.store.delete(id);
     if (!ok) return "missing";
     if (live) this.sessions.delete(id);

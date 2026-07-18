@@ -103,7 +103,7 @@ export interface HaraConfig {
   guardian: "on" | "off";
   /** ping when a (non-trivial) turn finishes: off | bell (terminal BEL) | system (OS notification + bell) */
   notify: NotifyMode;
-  /** hard wall-clock ceiling for one agent run; activity cannot renew it forever (default 30 minutes). */
+  /** Hard active provider/tool ceiling for one run; engine-owned human waits are excluded (default 30 minutes). */
   runTimeoutMs: number;
   /** hard provider/tool-round ceiling for one agent run (default 64). */
   maxAgentRounds: number;

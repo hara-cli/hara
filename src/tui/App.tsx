@@ -494,7 +494,13 @@ function StatusRow({ working, steerable, todos, queued }: { working: boolean; st
   const elapsedSec = Math.floor((Date.now() - startRef.current) / 1000);
   // Pre-first-token honesty (codex-parity): "waiting for the model" reads very differently from a
   // generic "working" when the network is slow — the user knows the request is out, not dead.
-  const verb = (phase === "waiting" ? `waiting for the model… ${elapsedSec}s · esc to interrupt` : spinnerVerb(todos, elapsedSec)) + bgTag;
+  const verb = (
+    phase === "awaiting_user"
+      ? "waiting for your answer · task timer paused · esc to cancel"
+      : phase === "waiting"
+        ? `waiting for the model… ${elapsedSec}s · esc to interrupt`
+        : spinnerVerb(todos, elapsedSec)
+  ) + bgTag;
   return (
     <Box marginTop={1}>
       <Text color="yellow">{frames[frame % frames.length]}</Text>

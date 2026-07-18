@@ -7,6 +7,9 @@ export interface BoundedTurnOptions {
   signal?: AbortSignal;
   /** Static, non-sensitive operation name used in the returned error. */
   label?: string;
+  /** Observe the provider Promise's physical lifetime. Persistent hosts use this to delay cooperative
+   * shutdown even when the logical bounded call has already timed out and returned. */
+  onProviderTurn?: (turn: Promise<unknown>) => void;
 }
 
 const errorResult = (message: string): TurnResult => ({ text: "", toolUses: [], stop: "error", errorMsg: message });
@@ -49,6 +52,11 @@ export async function boundedProviderTurn(
     // microtask starts. Re-check here so an already-cancelled auxiliary call never incurs a request/cost.
     .then(() => controller.signal.aborted ? errorResult(`${label} cancelled`) : provider.turn({ ...args, signal: controller.signal }))
     .catch((error: unknown) => errorResult(error instanceof Error ? error.message : String(error)));
+  try {
+    options.onProviderTurn?.(turn);
+  } catch {
+    // Observability must never weaken the provider boundary.
+  }
 
   const result = await Promise.race([turn, stopped]);
   clearTimeout(timer);

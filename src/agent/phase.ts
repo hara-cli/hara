@@ -3,7 +3,7 @@
 // the model is thinking or the connection is dead. The MAIN loop publishes (quiet/sub-agent runs
 // don't — they'd stomp the shared channel); the TUI status row subscribes like it does for todos.
 
-export type TurnPhase = "idle" | "waiting" | "streaming";
+export type TurnPhase = "idle" | "waiting" | "streaming" | "awaiting_user";
 
 let phase: TurnPhase = "idle";
 type Listener = (p: TurnPhase) => void;

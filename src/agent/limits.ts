@@ -18,8 +18,8 @@ export function parseAgentRunTimeoutMs(value: number | string | undefined): numb
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-/** Parse a total run deadline. Invalid/zero values cannot disable the safety boundary. Human values such
- * as `30m`, `90s`, and `1h` are accepted in config; HARA_RUN_TIMEOUT_MS also accepts plain milliseconds. */
+/** Parse the active execution deadline. Invalid/zero values cannot disable the safety boundary. Human values
+ * such as `30m`, `90s`, and `1h` are accepted in config; HARA_RUN_TIMEOUT_MS also accepts plain milliseconds. */
 export function agentRunTimeoutMs(
   value: number | string | undefined = process.env.HARA_RUN_TIMEOUT_MS,
 ): number {

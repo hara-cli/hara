@@ -21,10 +21,12 @@ provider is required; everything else has a sane default.
 - **B-end fleet**: `hara enroll <gateway> --code <code>` → device token in `~/.hara/org.json` (0600); sets `provider=hara-gateway`.
 - **Behavior**: `approval` · `sandbox` · `theme` · `evolve` · `assetCapture` · `computerUse`/`computerApps` · `hooks` · `notify` · `vimMode` · `mcpServers` · `HARA_MAX_CONCURRENCY` (parallel sub-agent/read cap, default 8).
 - **Agent lifecycle**: `runTimeoutMs` defaults to `30m` (accepts `ms`/`s`/`m`/`h`, hard max `2h`) and
-  `maxAgentRounds` defaults to `64` (hard max `256`). They are total run boundaries, so model activity cannot
-  keep renewing them; `0`/invalid values do not disable safety. Equivalent environment overrides are
+  `maxAgentRounds` defaults to `64` (hard max `256`). `runTimeoutMs` measures active model/tool execution:
+  activity cannot renew it, while time spent waiting for an engine-owned human question or approval is
+  excluded. Esc/shutdown still cancel immediately, and answering resumes the remaining budget rather than
+  resetting it. `0`/invalid values do not disable safety. Equivalent environment overrides are
   `HARA_RUN_TIMEOUT_MS` and `HARA_MAX_AGENT_ROUNDS`. Read-only sub-agents use the tighter of the configured
-  limit and `8m`/`24` rounds, and always inherit the parent's remaining deadline/cancellation. One-shot
+  limit and `8m`/`24` rounds, and always inherit the parent's remaining active budget/cancellation. One-shot
   planner, verifier, compaction, naming, commit, guardian, and vision calls also have operation-specific hard
   deadlines even when a custom provider ignores `AbortSignal`.
 - **Build/run**: `bun` (to build single-file binaries) · Docker (to run the container image).

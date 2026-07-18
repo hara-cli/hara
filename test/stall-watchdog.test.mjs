@@ -328,5 +328,5 @@ test("phase: waiting → streaming published for main runs; quiet runs never tou
   await runAgent([{ role: "user", content: "q" }], { provider: slowStreamer, ctx: { cwd: process.cwd() }, approval: "full-auto", confirm: async () => true, quiet: true });
   assert.deepEqual(seen, [], "quiet run published nothing");
   un();
-  assert.ok(["idle", "waiting", "streaming"].includes(turnPhase()), "phase getter sane");
+  assert.ok(["idle", "waiting", "streaming", "awaiting_user"].includes(turnPhase()), "phase getter sane");
 });

@@ -286,9 +286,12 @@ checkpointed in its own model/tool round. Mixed tools are classified by action (
 a brief revision cannot share its round with a side effect. `/task` shows the current execution identity and brief. See
 [`docs/conversation-task-execution.md`](docs/conversation-task-execution.md).
 **Notifications**: `hara config set notify bell` (terminal bell) or `notify system` (OS notification) pings you when a turn finishes — handy for long runs you've stepped away from. Gated on elapsed time so quick turns stay quiet; off by default.
-**Run limits and loop alarms**: every agent turn has a non-renewable 30-minute total deadline and a 64-round
-model/tool cap. Hara warns after five minutes or at 75% of the round budget, stops the third identical failing
-tool call, and surfaces the final reason in CLI, Desktop, or gateway output. Tune intentional long work with
+**Run limits and loop alarms**: every agent turn has a non-renewable 30-minute active-execution budget and a
+64-round model/tool cap. Time spent waiting for an engine-owned question or approval does not consume that
+budget; the status row says the task timer is paused, while Esc, shutdown, and explicit cancellation still
+take effect immediately. Answering resumes the remaining budget rather than resetting it. Hara warns after
+five active minutes or at 75% of the round budget, stops the third identical failing tool call, and surfaces
+the final reason in CLI, Desktop, or gateway output. Tune intentional long work with
 `hara config set runTimeoutMs 45m` (1s..2h) and `hara config set maxAgentRounds 96` (1..256), or
 `HARA_RUN_TIMEOUT_MS` / `HARA_MAX_AGENT_ROUNDS`; neither boundary can be disabled. Sub-agents are capped at
 8 minutes/24 rounds and inherit the parent's cancellation. Auxiliary model work (planning, verification,

@@ -84,6 +84,52 @@ test("PostToolUse: runs the command (observe) and never blocks", async () => {
   });
 });
 
+test("a synchronous tool budget overrun cannot start a PostToolUse command", async () => {
+  await withProject(
+    { PostToolUse: [{ matcher: "cpu_stage", command: "echo late > post-deadline-marker.txt" }] },
+    async (dir) => {
+      let round = 0;
+      const provider = {
+        id: "post-deadline",
+        model: "post-deadline",
+        async turn() {
+          round += 1;
+          return round === 1
+            ? { text: "", toolUses: [{ id: "cpu-stage-1", name: "cpu_stage", input: {} }], stop: "tool_use" }
+            : { text: "wrong", toolUses: [], stop: "end" };
+        },
+      };
+      const outcome = await runAgent([{ role: "user", content: "stop at the active deadline" }], {
+        provider,
+        ctx: { cwd: dir, sandbox: "off" },
+        approval: "full-auto",
+        confirm: async () => true,
+        timeoutMs: 1_000,
+        quiet: true,
+        extraTools: [{
+          name: "cpu_stage",
+          description: "synchronously consumes the remaining budget",
+          input_schema: { type: "object", properties: {} },
+          kind: "read",
+          async run() {
+            const until = Date.now() + 1_100;
+            while (Date.now() < until) {
+              // Deliberately starve the deadline timer until this tool returns.
+            }
+            return "stage complete";
+          },
+        }],
+      });
+      assert.equal(outcome.stopReason, "deadline");
+      assert.equal(
+        existsSync(join(dir, "post-deadline-marker.txt")),
+        false,
+        "the post hook never starts after the synchronous expiry check trips",
+      );
+    },
+  );
+});
+
 test("no hooks configured → fast no-op, never blocks", async () => {
   await withProject({}, async () => {
     assert.equal((await runHooks("PreToolUse", "bash", {}, process.cwd())).block, false);
