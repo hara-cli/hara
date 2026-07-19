@@ -9,8 +9,22 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
-import { startServe } from "../dist/serve/server.js";
+import { historyForClient, startServe } from "../dist/serve/server.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
+import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
+
+test("serve client history hides internal steering triage wrappers", () => {
+  const history = historyForClient([
+    { role: "user", content: "original request" },
+    { role: "user", content: `${INTERJECT_PREFIX}\n\nonly the user's refinement` },
+    { role: "assistant", text: "done", toolUses: [], stop: "end" },
+  ]);
+  assert.deepEqual(history, [
+    { role: "user", text: "original request" },
+    { role: "user", text: "only the user's refinement" },
+    { role: "assistant", text: "done" },
+  ]);
+});
 
 /** Tiny JSON-RPC-over-ws test client: request/response correlation + notification capture. */
 function connect(port) {
@@ -1053,6 +1067,12 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
     const waiting = c.events.find((e) => e.method === "event.task_state" && e.params.state === "waiting");
     assert.equal(waiting?.params.phase, "approval", "task state explicitly enters approval wait");
     assert.ok(waiting?.params.approval?.id, "waiting state carries the approval identity");
+    const toolStates = c.events.filter((e) => e.method === "event.task_state" && e.params.phase === "tool");
+    assert.ok(toolStates.some((event) => event.params.detail === "write_file"), "ambient task state names the active tool");
+    assert.ok(
+      toolStates.every((event) => !event.params.detail.includes(dir)),
+      "ambient task state cannot expose command or workspace path previews",
+    );
     assert.equal(c.events.filter((e) => e.method === "event.task_state").at(-1).params.state, "completed");
     assert.equal(readFileSync(join(dir, "approved.txt"), "utf8"), "hi", "the approved tool actually ran");
   } finally {

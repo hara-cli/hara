@@ -364,7 +364,15 @@ export function lastAssistantText(history: NeutralMsg[]): string {
 export function historyForClient(history: NeutralMsg[]): { role: string; text: string }[] {
   const out: { role: string; text: string }[] = [];
   for (const m of history) {
-    if (m.role === "user") out.push({ role: "user", text: m.content });
+    if (m.role === "user") {
+      const steeringPrefix = `${INTERJECT_PREFIX}\n\n`;
+      out.push({
+        role: "user",
+        text: m.content.startsWith(steeringPrefix)
+          ? m.content.slice(steeringPrefix.length)
+          : m.content,
+      });
+    }
     else if (m.role === "assistant" && m.text) out.push({ role: "assistant", text: m.text });
     // tool results are omitted — clients see live tool events; persisted detail stays in the store
   }
@@ -591,7 +599,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         broadcast("event.reasoning", { sessionId, delta: d });
       },
       tool: (name, preview) => {
-        emitTaskState({ state: "running", phase: "tool", detail: preview ? `${name}: ${preview}` : name });
+        // The task/status plane is safe for ambient surfaces such as an always-on-top companion.
+        // Command/path previews remain on the explicit event.tool transcript plane only.
+        emitTaskState({ state: "running", phase: "tool", detail: name });
         broadcast("event.tool", { sessionId, name, preview });
       },
       diff: (t) => broadcast("event.diff", { sessionId, text: t }),
