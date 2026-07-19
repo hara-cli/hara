@@ -5,7 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## Unreleased
+## 0.126.0 — 2026-07-19 — provider control plane, bounded tools, and honest execution time
+
+- **Desktop can configure providers through an authenticated, redacted Serve control plane.** The shared
+  catalog distinguishes cloud, local, OAuth, and managed routes; settings can list, test, and save a Personal
+  route without returning credentials to the UI. Switching provider or endpoint requires a matching new key
+  instead of replaying another vendor's credential, named/managed profiles remain explicit, and launch-time
+  environment overrides stay immutable from Desktop.
+- **Ollama and LM Studio are first-class local providers.** They require no fake API key, accept only
+  loopback HTTP endpoints, omit the Authorization header on the wire, and can discover installed models
+  through the same bounded connection-test path. Cloud custom endpoints continue to require HTTPS except
+  for an explicit loopback target.
+- **Tool execution has conservative runtime traits.** Tools without a complete declaration default to
+  side-effect-capable and serial; input-level classification can narrow a real read but cannot turn a
+  mutating call into an inherited read approval. Parallel calls share an aggregate result budget so one
+  round cannot flood the next model request.
+- **Long-tail tool schemas and large results are demand-loaded.** `tool_search` activates only matched,
+  role-allowed capabilities for the next model round. Oversized, redacted tool output is kept in a
+  quota/TTL-bounded private store and exposed only through opaque `tool_result_read` continuation IDs, never
+  arbitrary filesystem paths.
 
 - Human clarification and approval waits no longer consume `runTimeoutMs`. The non-renewable budget now
   measures active model/tool execution, resumes with the exact remaining time after an answer, and still
@@ -24,6 +42,7 @@ All notable changes to `@nanhara/hara`.
 - The WeCom gateway now uses the bundled `ws` transport because Node 22's native WebSocket handshake is
   rejected by WeCom's production endpoint before authentication. A late authentication frame can no longer
   revive an already-aborted connection or install a heartbeat after cleanup.
+- Upgrade with `npm i -g @nanhara/hara@0.126.0`.
 
 ## 0.125.3 — 2026-07-18 — conversation/task boundary and deliberate execution
 
