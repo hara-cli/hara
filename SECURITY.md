@@ -74,9 +74,13 @@ local user (who already has your shell).
   permission and starts one named server only when a task needs it. Their inherited environment is still
   scrubbed, but the extension may use its own credentials or access anything its host process permits.
 - **Plugins are code you trust.** Installing a plugin (`hara plugin add`) grants its author code execution:
-  its MCP servers may run on first relevant use and its hooks may run around matching tool calls. `hara plugin
-  add` **prints the exact commands** a plugin can run so you can review them; disable with
-  `hara plugin disable <name>`.
+  its MCP servers may run on first relevant use and its hooks may run around matching tool calls. Installation
+  validates the complete package in a private same-filesystem stage, binds executable contributions to portable
+  package-relative paths, and records an owner-only root/manifest/command receipt before removal is allowed.
+  `hara plugin add` identifies each executable surface without echoing manifest-provided arguments or hook
+  bodies, which may contain credentials; review the package source itself, and disable it with
+  `hara plugin disable <name>`. Plugins installed before `0.126.1` remain usable; reinstalling one from the same
+  reviewed source creates the receipt required for later ownership-safe updates and removal.
 - **Coding-plan keys.** Provider keys you configure are used only to call the model endpoint you set.
 
 ## What is *not* a security boundary

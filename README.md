@@ -238,7 +238,10 @@ and a near-duplicate is flagged so it updates instead of piling up. `assetCaptur
 **Plugins** — bundle skills + roles + MCP servers in one installable unit (Claude-Code-compatible
 `plugin.json` / `.claude-plugin/`). `hara plugin add file:<path> | github:<owner/repo> | git:<url>` installs it;
 `hara plugin` lists; `enable`/`disable`/`remove`. A plugin's skills/roles/MCP auto-contribute (your project &
-global override them). `.claude/agents/*.md` subagents load as roles too.
+global override them). Installation validates the full package in a private stage, activates it atomically,
+and records an owner-only receipt for the exact root and command links. Plugins installed before `0.126.1`
+remain usable; reinstall the same reviewed source once to create the receipt before removing them.
+`.claude/agents/*.md` subagents load as roles too.
 
 **Recall** — `hara recall --init` creates a personal `~/.hara/code-assets` library (snippets as `*.md`);
 `hara recall "<query>"` searches it **plus your skills** (one corpus), and `/recall <query>` pulls the best

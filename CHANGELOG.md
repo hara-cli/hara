@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.126.1 — 2026-07-19 — verified plugin packages and ownership-safe lifecycle
+
+- **Plugin packages now fail closed at staging.** Hara validates a bounded manifest schema, portable IDs and
+  relative paths, declared Skills/roles/binaries/panels, and MCP entry points before activation. Complete
+  package scans reject symbolic links, hard-linked or special files, protected credential-shaped files,
+  filesystem-boundary crossings, and excessive file/byte counts.
+- **Install, update, and removal have an ownership transaction.** A same-filesystem private staging directory
+  is atomically activated; command collisions never overwrite foreign entries; and a private receipt binds the
+  installed root device/inode, manifest digest, and exact command links. Update rollback preserves the previous
+  package and commands, while uninstall refuses a changed root, a foreign command replacement, or an older
+  unreceipted install. A legacy plugin remains usable; reinstalling it from the same reviewed source performs
+  the one-time receipt migration, after which later updates and removal use the verified ownership path.
+- **Plugin MCP processes are rooted in their installed package.** Relative executables and conventional
+  Node/Bun/Deno/Python entry scripts are verified and converted to absolute installed paths, and each server
+  receives the immutable plugin root as its working directory instead of the user's project.
+- Install warnings no longer echo manifest-provided MCP arguments or hook command bodies, which could contain
+  credentials. They still identify each executable surface so the package source can be reviewed before use.
+- Upgrade with `npm i -g @nanhara/hara@0.126.1`.
+
 ## 0.126.0 — 2026-07-19 — provider control plane, bounded tools, and honest execution time
 
 - **Desktop can configure providers through an authenticated, redacted Serve control plane.** The shared
