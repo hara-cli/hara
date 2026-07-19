@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.127.0 — 2026-07-20 — structured context and typed task lifecycle
+
+- **Prompt assembly is now an explicit, ordered runtime layer.** Cache-stable policy, tool, project, and
+  session context are separated from turn-specific execution state and memory digests, deduplicated, and
+  assembled in a deterministic order. Anthropic requests preserve a stable cache prefix while other
+  providers continue to receive the same complete system contract.
+- **Conversation and execution state now travel on separate protocol planes.** Authenticated Serve clients
+  can negotiate the versioned `event.task_state` stream for running, waiting, paused, completed, and blocked
+  work, with stable task/turn identities, phases, accepted task briefs, checkpoints, approvals, outcomes,
+  restore snapshots, and explicit stop/finish transitions.
+- **Mid-turn input uses expected-turn steering.** `session.steer` durably accepts an update only for the
+  intended live turn, so Desktop and other clients can distinguish a real refinement from the next queued
+  task without parsing model prose or losing an end-of-turn race.
+- Ambient lifecycle events never include command or path previews, and resumed client history removes the
+  internal steering-triage wrapper before display. Detailed tool output remains confined to the explicit
+  conversation surface.
+- Upgrade with `npm i -g @nanhara/hara@0.127.0`.
+
 ## 0.126.1 — 2026-07-19 — verified plugin packages and ownership-safe lifecycle
 
 - **Plugin packages now fail closed at staging.** Hara validates a bounded manifest schema, portable IDs and
