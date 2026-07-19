@@ -40,6 +40,7 @@ import { prepareHistoryForModel } from "./context-budget.js";
 import { rolesDigest } from "../org/roles.js";
 import { applyTaskBrief, type TaskBrief, type TaskExecution } from "../session/task.js";
 import { askUserTool } from "../tools/ask_user.js";
+import { PromptAssembler, type AssembledSystemPrompt } from "./prompt.js";
 
 /** File tools whose `path` input marks the file as "recently worked with" (post-compaction restore). */
 const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
@@ -78,9 +79,8 @@ export function needsConfirm(kind: string | undefined, mode: ApprovalMode): bool
   return true; // suggest: confirm edits and exec
 }
 
-const HARA_SYSTEM = (cwd: string) =>
+const HARA_SYSTEM = () =>
   `You are hara, a coding agent running in the user's terminal.
-Working directory: ${cwd}
 Be concise and direct. Use the provided tools to read files, edit/write files, and run shell
 commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
 them whole. Batch INDEPENDENT tool calls in a single response — especially reads (read_file / grep /
@@ -176,7 +176,7 @@ const CONTINUATION_SYSTEM =
   "and reuse prior conclusions and tool results. Inspect files only when the latest request requires it. If the working " +
   "directory is Home, ask the user to start Hara from a concrete project instead of enumerating Home or its children.";
 
-function composeSystem(
+export function composeSystem(
   cwd: string,
   projectContext?: string,
   override?: string,
@@ -184,8 +184,9 @@ function composeSystem(
   continuationSession = false,
   executionContext?: string,
   intake?: { enabled: boolean; brief?: TaskBrief },
-): string {
-  const head = override ? `${override}\n\nWorking directory: ${cwd}` : HARA_SYSTEM(cwd);
+): AssembledSystemPrompt {
+  const assembler = new PromptAssembler();
+  assembler.add("core", "static", "core", override || HARA_SYSTEM());
   const skills = skillsDigest(cwd);
   const roles = override ? "" : rolesDigest(cwd);
   const intakeContext = !intake?.enabled
@@ -211,17 +212,17 @@ function composeSystem(
           "for a direct answer, `investigate` for evidence gathering/diagnosis, and `change` when the user asked " +
           "you to modify or deliver something. Do not claim completion until the acceptance checks are verified."
         );
-  return (
-    head +
-    gatewayNote() +
-    (continuationSession ? `\n\n${CONTINUATION_SYSTEM}` : "") +
-    (executionContext ? `\n\n${executionContext}` : "") +
-    intakeContext +
-    (projectContext ? `\n\n# Project context (AGENTS.md)\n${projectContext}` : "") +
-    (memory ? `\n\n# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "") +
-    (roles ? `\n\n# Specialist roles (metadata only — use \`agent\` with a role id for bounded read-only expertise)\n${roles}` : "") +
-    (skills ? `\n\n# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
-  );
+  assembler
+    .add("working-directory", "session", "runtime", `Working directory: ${cwd}`)
+    .add("gateway-channel", "session", "channel", gatewayNote())
+    .add("continuation", "session", "task", continuationSession ? CONTINUATION_SYSTEM : "")
+    .add("execution", "session", "task", executionContext)
+    .add("project", "session", "project", projectContext ? `# Project context (AGENTS.md)\n${projectContext}` : "")
+    .add("memory", "session", "memory", memory ? `# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "")
+    .add("roles", "session", "role", roles ? `# Specialist roles (metadata only — use \`agent\` with a role id for bounded read-only expertise)\n${roles}` : "")
+    .add("skills", "session", "skill", skills ? `# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
+    .add("task-intake", "turn", "task", intakeContext);
+  return assembler.build();
 }
 
 export interface RunOpts {
@@ -753,7 +754,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       ? [...baseSpecs, ...runExtraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
       : baseSpecs;
     const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
-    const system = composeSystem(
+    const assembledSystem = composeSystem(
       ctx.cwd,
       opts.projectContext,
       opts.systemOverride,
@@ -762,6 +763,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       opts.executionContext,
       { enabled: !!opts.taskIntake, brief: intakeTask?.brief },
     );
+    const system = assembledSystem.text;
     const prepared = prepareHistoryForModel(history, {
       model: activeProvider.model,
       system,
@@ -849,6 +851,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
         return activeProvider.turn({
           system,
+          systemParts: assembledSystem.parts,
           history: prepared.history,
           tools: specs,
       // Any stream chunk keeps the connection considered alive — even suppressed reasoning_content, so a

@@ -264,6 +264,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(init.result.model, "fake-1");
     assert.ok(init.result.capabilities.methods.includes("automation.list"), "capabilities advertised");
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
+    assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
 
     const created = await c.call("session.create", {});
     const sid = created.result.sessionId;
@@ -275,6 +276,13 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     const deltas = c.events.filter((e) => e.method === "event.text").map((e) => e.params.delta).join("");
     assert.equal(deltas, "hello", "text streamed as events");
     await c.waitEvent("event.turn_end");
+    const taskStates = c.events.filter((e) => e.method === "event.task_state").map((e) => e.params);
+    assert.equal(taskStates[0].state, "running");
+    assert.equal(taskStates[0].phase, "starting");
+    assert.ok(taskStates.some((state) => state.phase === "responding"), "stream phase is explicit");
+    assert.equal(taskStates.at(-1).state, "completed");
+    assert.equal(taskStates.at(-1).taskStatus, "completed");
+    assert.equal(taskStates.at(-1).phase, "finished");
 
     // persisted through the (injected) store + listed
     assert.ok(store.saved.get(sid), "session persisted after the turn");
@@ -1042,6 +1050,10 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
     await approver;
     assert.equal(sent.result.reply, "done");
     assert.equal(c.events.filter((e) => e.method === "approval.request").length, 1, "exactly one approval asked");
+    const waiting = c.events.find((e) => e.method === "event.task_state" && e.params.state === "waiting");
+    assert.equal(waiting?.params.phase, "approval", "task state explicitly enters approval wait");
+    assert.ok(waiting?.params.approval?.id, "waiting state carries the approval identity");
+    assert.equal(c.events.filter((e) => e.method === "event.task_state").at(-1).params.state, "completed");
     assert.equal(readFileSync(join(dir, "approved.txt"), "utf8"), "hi", "the approved tool actually ran");
   } finally {
     c.close();
@@ -1090,6 +1102,9 @@ test("serve e2e: interrupt settles a pending approval immediately and leaves val
     assert.equal(failed.error.code, -32603, "interrupted send fails instead of reporting success");
     assert.match(failed.error.message, /interrupted/);
     assert.equal(existsSync(join(dir, "approved.txt")), false, "interrupted approval never runs the tool");
+    const lifecycle = c.events.filter((event) => event.method === "event.task_state");
+    assert.ok(lifecycle.some((event) => event.params.phase === "stopping"), "interrupt announces safe stopping");
+    assert.equal(lifecycle.at(-1).params.state, "paused", "interrupted task ends paused, not completed");
 
     const saved = store.saved.get(result.sessionId);
     assert.deepEqual(saved.history.slice(-2).map((message) => message.role), ["assistant", "tool"]);

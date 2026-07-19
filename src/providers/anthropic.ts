@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { Provider, NeutralMsg, TurnArgs, TurnResult } from "./types.js";
+import type { Provider, NeutralMsg, SystemPromptPart, TurnArgs, TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
 
 export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
@@ -55,15 +55,17 @@ const CACHE = { type: "ephemeral" as const };
  *  conversation prefix FROM CACHE instead of re-billing + re-processing the whole prompt — the single
  *  biggest latency + cost win as history grows (uncached, a long session pays full input every turn).
  *
- *  Anthropic caps breakpoints at 4 and orders the cache prefix `tools → system → messages`, so a mark
- *  on `system` already caches tools+system (the big static block) in one shot. We then spend up to two
- *  rolling marks near the message tail: the last message (so THIS turn's full prefix is written) and one
- *  ~2 back (so the NEXT turn — which appends new messages — still finds a long cached prefix to read).
+ *  Anthropic caps breakpoints at 4 and orders the cache prefix `tools → system → messages`. Structured Hara
+ *  prompts spend up to two marks on the static and session boundaries, leaving the changing turn suffix
+ *  uncached; legacy strings keep one system mark. We then spend up to two rolling marks near the message
+ *  tail: the last message (so THIS turn's full prefix is written) and one ~2 back (so the NEXT turn — which
+ *  appends new messages — still finds a long cached prefix to read).
  *  Mutates `messages` in place (toAnthropic hands us a fresh array each turn); returns the request-shaped
  *  system. Exported pure for tests. */
 export function applyCacheControl(
   system: string,
   messages: Anthropic.MessageParam[],
+  systemParts?: SystemPromptPart[],
 ): { system: string | Anthropic.TextBlockParam[]; messages: Anthropic.MessageParam[] } {
   const mark = (m: Anthropic.MessageParam): void => {
     if (typeof m.content === "string") {
@@ -77,7 +79,26 @@ export function applyCacheControl(
   if (messages.length >= 3) idxs.add(messages.length - 3);
   for (const i of idxs) mark(messages[i]);
   // Only cache system when it's substantial enough to matter (an empty text block would 400).
-  const cachedSystem: string | Anthropic.TextBlockParam[] = system ? [{ type: "text", text: system, cache_control: CACHE }] : system;
+  let cachedSystem: string | Anthropic.TextBlockParam[] = system;
+  const renderedParts = systemParts?.map((part) => part.content).join("\n\n");
+  if (system && systemParts?.length && renderedParts === system) {
+    const sections: { stability: SystemPromptPart["stability"]; text: string }[] = [];
+    for (const part of systemParts) {
+      const tail = sections.at(-1);
+      if (tail?.stability === part.stability) tail.text += `\n\n${part.content}`;
+      else sections.push({ stability: part.stability, text: part.content });
+    }
+    cachedSystem = sections.map((section, index): Anthropic.TextBlockParam => ({
+      type: "text",
+      // Anthropic concatenates adjacent text blocks directly. Preserve the authoritative rendered string
+      // byte-for-byte across our cache boundaries.
+      text: section.text + (index < sections.length - 1 ? "\n\n" : ""),
+      ...(section.stability === "turn" ? {} : { cache_control: CACHE }),
+    }));
+  } else if (system) {
+    // Legacy/custom callers still receive the original single cached system block.
+    cachedSystem = [{ type: "text", text: system, cache_control: CACHE }];
+  }
   return { system: cachedSystem, messages };
 }
 
@@ -113,9 +134,9 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
   return {
     id: "anthropic",
     model: opts.model,
-    async turn({ system, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
+    async turn({ system, systemParts, history, tools, onText, onReasoning, signal }: TurnArgs): Promise<TurnResult> {
       const thinking = buildThinkingParam(opts.model, opts.reasoningEffort);
-      const { system: cachedSystem, messages } = applyCacheControl(system, toAnthropic(history));
+      const { system: cachedSystem, messages } = applyCacheControl(system, toAnthropic(history), systemParts);
       const stream = client.messages.stream(
         {
           model: opts.model,

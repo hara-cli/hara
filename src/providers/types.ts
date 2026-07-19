@@ -17,6 +17,21 @@ export type ToolSpec = {
   input_schema: Record<string, unknown>;
 };
 
+/** Prompt metadata is additive: `system` remains the fully rendered string for provider and custom
+ * provider compatibility, while built-in providers may use these deterministic boundaries for caching.
+ * Parts must be ordered static → session → turn so a changing task suffix never invalidates the reusable
+ * core/project prefix. */
+export type SystemPromptStability = "static" | "session" | "turn";
+export type SystemPromptSource = "core" | "runtime" | "channel" | "project" | "task" | "memory" | "role" | "skill";
+export interface SystemPromptPart {
+  id: string;
+  stability: SystemPromptStability;
+  source: SystemPromptSource;
+  content: string;
+  /** Short content identity for cache/debug telemetry. It never contains prompt text. */
+  digest: string;
+}
+
 export interface TurnResult {
   text: string;
   toolUses: ToolUse[];
@@ -27,6 +42,9 @@ export interface TurnResult {
 
 export interface TurnArgs {
   system: string;
+  /** Optional structured boundaries for cache-aware providers. `system` is always authoritative; a
+   * provider must fall back to it if these parts do not reproduce the same text exactly. */
+  systemParts?: SystemPromptPart[];
   history: NeutralMsg[];
   tools: ToolSpec[];
   onText: (delta: string) => void;

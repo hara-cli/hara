@@ -55,10 +55,11 @@ import { loadJobs, addJob, removeJob, setEnabled } from "../cron/store.js";
 import { parseSchedule, describeSchedule } from "../cron/schedule.js";
 import { loadTasks } from "../tools/task.js";
 import { listPending, resolvePending } from "../gateway/flows-pending.js";
-import { disposeTodoScope, restoreTodos, serializeTodos } from "../tools/todo.js";
+import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from "../tools/todo.js";
 import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
+import { taskLifecycleEvent, type TaskLifecycleActivity } from "./task-events.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
@@ -473,6 +474,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const frame = rpcNotify(method, params);
     for (const ws of authed) if (ws.readyState === ws.OPEN) ws.send(frame);
   };
+  const broadcastTaskState = (session: ServeSession, activity: TaskLifecycleActivity): void => {
+    if (!session.task) return;
+    broadcast("event.task_state", { ...taskLifecycleEvent(
+      session.meta.id,
+      session.task,
+      session.meta.todos ?? [],
+      activity,
+    ) });
+  };
 
   // Discovery file — the desktop shell reads this to find the running server (like a pid/port file).
   const discoveryDir = join(deps.discoveryHome ?? homedir(), ".hara");
@@ -554,13 +564,36 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       s.busy = false;
       throw error;
     }
+    let lastTaskStateSignature = "";
+    const emitTaskState = (
+      activity: TaskLifecycleActivity,
+      todos = s.meta.todos ?? [],
+    ): void => {
+      if (!s.task) return;
+      const event = taskLifecycleEvent(sessionId, s.task, todos, activity);
+      const { at: _at, ...stableEvent } = event;
+      const signature = JSON.stringify(stableEvent);
+      if (signature === lastTaskStateSignature) return;
+      lastTaskStateSignature = signature;
+      broadcast("event.task_state", { ...event });
+    };
     broadcast("event.turn_start", { sessionId, taskId: s.task.id, turnId: s.task.turnId });
+    emitTaskState({ state: "running", phase: "starting" });
     const historyStart = s.history.length;
     const before = { input: s.stats.input, output: s.stats.output };
     const sink: UiSink = {
-      text: (d) => broadcast("event.text", { sessionId, delta: d }),
-      reasoning: (d) => broadcast("event.reasoning", { sessionId, delta: d }),
-      tool: (name, preview) => broadcast("event.tool", { sessionId, name, preview }),
+      text: (d) => {
+        emitTaskState({ state: "running", phase: "responding" });
+        broadcast("event.text", { sessionId, delta: d });
+      },
+      reasoning: (d) => {
+        emitTaskState({ state: "running", phase: "thinking" });
+        broadcast("event.reasoning", { sessionId, delta: d });
+      },
+      tool: (name, preview) => {
+        emitTaskState({ state: "running", phase: "tool", detail: preview ? `${name}: ${preview}` : name });
+        broadcast("event.tool", { sessionId, name, preview });
+      },
       diff: (t) => broadcast("event.diff", { sessionId, text: t }),
       notice: (t) => broadcast("event.notice", { sessionId, text: t }),
     };
@@ -575,6 +608,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           clearTimeout(timer);
           pendingApprovals.delete(approvalId);
           signal.removeEventListener("abort", onAbort);
+          if (!signal.aborted && s.task?.status === "running") {
+            emitTaskState({
+              state: "running",
+              phase: "thinking",
+              detail: v === false ? "Approval denied; continuing safely" : "Approval granted; continuing",
+            });
+          }
           resolve(v);
         };
         const onAbort = (): void => finish(false);
@@ -585,15 +625,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // `signal` composes the owning turn cancellation with runAgent's lifecycle cancellation. Listening
           // only to turnAbort would leave the approval map and Desktop prompt stale after an internal stop.
           signal.addEventListener("abort", onAbort, { once: true });
+          emitTaskState({
+            state: "waiting",
+            phase: "approval",
+            detail: q,
+            approval: { id: approvalId, question: q },
+          });
           broadcast("approval.request", { sessionId, approvalId, question: q });
         }
       });
+    let stopTodoEvents = (): void => {};
     try {
       if (!(await refreshSessionProvider(s))) {
         throw new Error(`provider not authenticated for pinned model '${s.meta.model}' at ${s.meta.cwd}`);
       }
       const turnGuardian = deps.buildGuardian ? await deps.buildGuardian(s.meta.cwd) : deps.guardian;
       restoreTodos(s.meta.todos, sessionId);
+      stopTodoEvents = onTodosChange((todos) => {
+        // Keep the session snapshot current while the turn runs. Steering and task-intake checkpoints can
+        // then publish/persist the same checklist the model just wrote instead of regressing to turn-start.
+        s.meta.todos = serializeTodos(sessionId);
+        emitTaskState({ state: "running", phase: "checkpoint" }, s.meta.todos);
+      }, sessionId);
       // Slash skills, CLI parity: "/skill-id request…" expands into the skill-entering message, so a
       // desktop composer's "/" popup triggers the exact behavior the terminal gets. Unknown ids fall
       // through as plain text (the model sees what the user typed).
@@ -644,10 +697,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           current: () => s.task,
           onUpdate: (next): void => {
             s.task = next;
+            emitTaskState({ state: "running", phase: "checkpoint" }, serializeTodos(sessionId));
           },
           onCheckpoint: (next): void => {
             s.task = next;
             hub.save(s);
+            emitTaskState({ state: "running", phase: "checkpoint" }, serializeTodos(sessionId));
           },
         },
         pendingInput: async () => {
@@ -669,6 +724,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       s.meta.todos = serializeTodos(sessionId);
       s.task = finishTaskExecution(s.task, outcome, s.meta.todos, turnAbort.signal.aborted);
       hub.save(s);
+      emitTaskState({ phase: "finished" }, s.meta.todos);
       const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
       // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
       // clients render a meter without an extra round-trip.
@@ -696,9 +752,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           turnAbort.signal.aborted,
         );
         hub.save(s);
+        emitTaskState({ phase: "finished" }, s.meta.todos ?? []);
       }
       throw error;
     } finally {
+      stopTodoEvents();
       s.abort = null;
       s.busy = s.pendingProviderTurns > 0 || s.pendingToolRuns > 0;
     }
@@ -828,7 +886,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             provider: runtime.providerId,
             model: runtime.model,
             setupState,
-            capabilities: { methods },
+            capabilities: { methods, events: ["event.task_state"] },
           }));
         }
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
@@ -885,6 +943,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
+            broadcastTaskState(r.session, { phase: "restored" });
             return reply(rpcResult(id!, {
               sessionId: r.session.meta.id,
               model: r.session.meta.model,
@@ -921,11 +980,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!recorded.ok) return reply(rpcError(id, ERR.BUSY, recorded.reason));
             s.task = recorded.task;
             hub.save(s); // executable inbox entry is durable before ACK
+            broadcastTaskState(s, { state: "running", phase: "steering", detail: "Steering accepted" });
             return reply(rpcResult(id!, { accepted: true, taskId: s.task.id, turnId: s.task.turnId }));
           }
           case "session.interrupt": {
             const s = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
+            if (s.abort && s.task?.status === "running") {
+              broadcastTaskState(s, { state: "running", phase: "stopping", detail: "Stopping at a safe boundary" });
+            }
             s.abort?.abort();
             return reply(rpcResult(id!, {}));
           }

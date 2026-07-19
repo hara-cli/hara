@@ -18,6 +18,29 @@ test("empty system stays a bare string (an empty cached block would 400)", () =>
   assert.equal(system, "");
 });
 
+test("structured system caches static + session prefixes but leaves the changing turn suffix uncached", () => {
+  const parts = [
+    { id: "core", stability: "static", source: "core", content: "CORE", digest: "a" },
+    { id: "cwd", stability: "session", source: "runtime", content: "CWD", digest: "b" },
+    { id: "project", stability: "session", source: "project", content: "PROJECT", digest: "c" },
+    { id: "task", stability: "turn", source: "task", content: "TASK", digest: "d" },
+  ];
+  const text = parts.map((part) => part.content).join("\n\n");
+  const { system } = applyCacheControl(text, [], parts);
+  assert.deepEqual(system, [
+    { type: "text", text: "CORE\n\n", cache_control: CC },
+    { type: "text", text: "CWD\n\nPROJECT\n\n", cache_control: CC },
+    { type: "text", text: "TASK" },
+  ]);
+  assert.equal(system.map((block) => block.text).join(""), text, "cache boundaries preserve the authoritative prompt bytes");
+});
+
+test("mismatched structured metadata falls back to the authoritative legacy system string", () => {
+  const parts = [{ id: "core", stability: "static", source: "core", content: "different", digest: "a" }];
+  const { system } = applyCacheControl("authoritative", [], parts);
+  assert.deepEqual(system, [{ type: "text", text: "authoritative", cache_control: CC }]);
+});
+
 test("last message gets a rolling breakpoint; string content is lifted to a block to carry it", () => {
   const msgs = [{ role: "user", content: "hi" }];
   const { messages } = applyCacheControl("sys", msgs);
@@ -46,9 +69,15 @@ test("mark lands on the LAST content block (e.g. a tool_result), not the first",
   assert.deepEqual(messages[0].content[1].cache_control, CC);
 });
 
-test("no more than 4 breakpoints total (Anthropic's cap): system + ≤2 message marks", () => {
+test("no more than 4 breakpoints total (Anthropic's cap): ≤2 system sections + ≤2 message marks", () => {
   const msgs = Array.from({ length: 10 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: [{ type: "text", text: String(i) }] }));
-  const { system, messages } = applyCacheControl("sys", msgs);
+  const parts = [
+    { id: "core", stability: "static", source: "core", content: "core", digest: "a" },
+    { id: "cwd", stability: "session", source: "runtime", content: "cwd", digest: "b" },
+    { id: "task", stability: "turn", source: "task", content: "task", digest: "c" },
+  ];
+  const text = parts.map((part) => part.content).join("\n\n");
+  const { system, messages } = applyCacheControl(text, msgs, parts);
   const marks = (Array.isArray(system) ? system.filter((b) => b.cache_control).length : 0) + messages.reduce((n, m) => n + (Array.isArray(m.content) ? m.content.filter((b) => b.cache_control).length : 0), 0);
   assert.ok(marks <= 4, `expected ≤4 breakpoints, got ${marks}`);
 });
