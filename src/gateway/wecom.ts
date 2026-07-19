@@ -6,6 +6,7 @@
 // reconnecting when `disconnected_event` says another connection has replaced this one.
 import { basename, extname } from "node:path";
 import { createDecipheriv, createHash, randomUUID } from "node:crypto";
+import WebSocket from "ws";
 import {
   chunkText,
   outboundTransferTimeoutMs,
@@ -24,7 +25,10 @@ import {
 import type { OutboundFilePayload } from "./outbound-files.js";
 
 const DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com";
-const WSImpl: any = (globalThis as any).WebSocket;
+// WeCom's production endpoint rejects Node 22's native/undici WebSocket handshake even though a
+// standards-compliant `ws` handshake succeeds. Keep this adapter on the already-bundled `ws` client;
+// the local protocol tests deliberately model that production compatibility boundary.
+const WSImpl: any = WebSocket;
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
 
@@ -614,6 +618,9 @@ function connectOnce(
     };
 
     const handleMessage = async (event: any): Promise<void> => {
+      // An auth ACK can already be queued when shutdown wins the race. Never let that late frame
+      // re-authenticate the settled connection or install a heartbeat interval after cleanup.
+      if (settled || signal.aborted) return;
       const data = event?.data;
       if (typeof data === "string" && Buffer.byteLength(data, "utf8") > MAX_FRAME_BYTES) {
         finish("closed", "received an oversized WeCom frame");

@@ -21,6 +21,9 @@ All notable changes to `@nanhara/hara`.
 - Headless resumed sessions use the same physical-lifetime rule for dynamically nested sub-agents and
   automatic compaction, so a late child request cannot escape a cleanup snapshot and release the
   cross-process lock early.
+- The WeCom gateway now uses the bundled `ws` transport because Node 22's native WebSocket handshake is
+  rejected by WeCom's production endpoint before authentication. A late authentication frame can no longer
+  revive an already-aborted connection or install a heartbeat after cleanup.
 
 ## 0.125.3 — 2026-07-18 — conversation/task boundary and deliberate execution
 

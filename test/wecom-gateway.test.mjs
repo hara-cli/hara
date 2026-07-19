@@ -30,8 +30,12 @@ async function waitFor(predicate, label, timeoutMs = 3_000) {
   }
 }
 
-async function fakeWecom(handler) {
-  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+async function fakeWecom(handler, options = {}) {
+  const server = new WebSocketServer({
+    host: "127.0.0.1",
+    port: 0,
+    ...(options.verifyClient ? { verifyClient: options.verifyClient } : {}),
+  });
   const sockets = new Set();
   const errors = [];
   let connections = 0;
@@ -129,6 +133,40 @@ test("WeCom media decryption rejects empty, malformed, and invalid-padded cipher
   cipher.setAutoPadding(false);
   const invalidCiphertext = Buffer.concat([cipher.update(invalidPlain), cipher.final()]);
   assert.throws(() => decryptWecomMedia(invalidCiphertext, encodedKey), /padding/);
+});
+
+test("WeCom uses the server-compatible ws handshake instead of Node's rejected native handshake", async () => {
+  let resolveSubscribe;
+  const subscribed = new Promise((resolve) => { resolveSubscribe = resolve; });
+  const fake = await fakeWecom((frame, socket) => {
+    if (frame.cmd !== "aibot_subscribe") return;
+    resolveSubscribe(frame);
+    socket.send(ACK(frame));
+  }, {
+    // Node 22's native client currently identifies its handshake with this header; the `ws` package
+    // does not. The production WeCom endpoint accepts `ws` and rejects the native client before auth.
+    verifyClient: ({ req }) => req.headers["user-agent"] !== "node",
+  });
+  const controller = new AbortController();
+  const adapter = wecomAdapter("bot-handshake", "secret-handshake", fake.url, {
+    requestTimeoutMs: 500,
+    reconnectBaseMs: 10,
+    maxAuthFailures: 1,
+  });
+  const running = adapter.start(async () => undefined, controller.signal);
+  try {
+    const frame = await Promise.race([
+      subscribed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for compatible handshake")), 2_000)),
+    ]);
+    assert.deepEqual(frame.body, { bot_id: "bot-handshake", secret: "secret-handshake" });
+    assert.equal(fake.connectionCount(), 1);
+    assert.deepEqual(fake.errors, []);
+  } finally {
+    controller.abort();
+    await running;
+    await fake.close();
+  }
 });
 
 test("WeCom local WebSocket round-trip authenticates before send and uploads verified chunks", async () => {
