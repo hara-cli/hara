@@ -1,9 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
-import { installPlugin, uninstallPlugin, enabledPlugins, setPluginEnabled, pluginSkillDirs, pluginRoleDirs, pluginMcpServers } from "../dist/plugins/plugins.js";
+import { dirname, join, resolve } from "node:path";
+import {
+  installPlugin,
+  uninstallPlugin,
+  enabledPlugins,
+  listInstalled,
+  setPluginEnabled,
+  pluginSkillDirs,
+  pluginRoleDirs,
+  pluginMcpServers,
+} from "../dist/plugins/plugins.js";
 import { loadSkillIndex } from "../dist/skills/skills.js";
 import { loadRoles } from "../dist/org/roles.js";
 
@@ -33,6 +42,26 @@ function cleanPluginFlag(name) {
   }
 }
 
+function makePlugin(manifest, files = {}) {
+  const root = join(tmpdir(), "hara-plugin-fixture-" + Math.random().toString(36).slice(2));
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, "plugin.json"), JSON.stringify(manifest));
+  for (const [rel, contents] of Object.entries(files)) {
+    const path = join(root, rel);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, contents);
+  }
+  return root;
+}
+
+function installedRoot(name) {
+  return join(homedir(), ".hara", "plugins", name);
+}
+
+function receiptPath(name) {
+  return join(homedir(), ".hara", "plugin-receipts", `${name}.json`);
+}
+
 test("plugin install → skills/roles/mcp auto-contribute; disable hides them; uninstall removes", () => {
   const pname = "hara-test-plugin-" + Math.random().toString(36).slice(2, 8);
   const src = makeDemoPlugin(pname);
@@ -57,6 +86,175 @@ test("plugin install → skills/roles/mcp auto-contribute; disable hides them; u
     rmSync(src, { recursive: true, force: true });
     rmSync(dest, { recursive: true, force: true });
     cleanPluginFlag(pname);
+  }
+});
+
+test("plugin staging rejects traversal, absolute paths, undeclared panel commands, and relative MCP escapes", () => {
+  const outside = join(tmpdir(), "hara-plugin-escape-" + Math.random().toString(36).slice(2));
+  writeFileSync(outside, "outside");
+  const cases = [
+    { name: "../escape" },
+    { name: "bad-skills", skills: ["../outside"] },
+    { name: "bad-agents", agents: [tmpdir()] },
+    { name: "bad-bin", bin: { bad: "../outside" } },
+    { name: "bad-mcp", mcpServers: { bad: { command: "../outside" } } },
+    { name: "bad-panel", bin: { panel: "panel.mjs" }, panels: [{ id: "p", title: "P", command: "panel", detect: ["../secret"] }] },
+    { name: "bad-panel-command", panels: [{ id: "p", title: "P", command: "external" }] },
+  ];
+  try {
+    for (const manifest of cases) {
+      const files = manifest.bin ? { "panel.mjs": "#!/usr/bin/env node\n" } : {};
+      const source = makePlugin(manifest, files);
+      try {
+        assert.throws(() => installPlugin(`file:${source}`), /plugin|relative|manifest|panel|MCP|path|name/i);
+      } finally {
+        rmSync(source, { recursive: true, force: true });
+      }
+    }
+    assert.equal(existsSync(join(homedir(), ".hara", "escape")), false);
+  } finally {
+    rmSync(outside, { force: true });
+  }
+});
+
+test("plugin MCP entry scripts and cwd are bound to the installed immutable package root", () => {
+  const name = "hara-mcp-root-" + Math.random().toString(36).slice(2, 8);
+  const source = makePlugin(
+    {
+      name,
+      mcpServers: {
+        server: { command: "node", args: ["server.mjs", "--stdio"] },
+        direct: { command: "./server.mjs" },
+      },
+    },
+    { "server.mjs": "process.exit(0);\n" },
+  );
+  try {
+    const plugin = installPlugin(`file:${source}`);
+    const servers = pluginMcpServers();
+    const server = servers.server;
+    assert.equal(server.cwd, plugin.root);
+    assert.equal(server.command, "node");
+    assert.equal(server.args[0], join(plugin.root, "server.mjs"));
+    assert.equal(servers.direct.cwd, plugin.root);
+    assert.equal(servers.direct.command, join(plugin.root, "server.mjs"));
+    assert.equal(uninstallPlugin(name), true);
+  } finally {
+    rmSync(source, { recursive: true, force: true });
+    rmSync(installedRoot(name), { recursive: true, force: true });
+    rmSync(receiptPath(name), { force: true });
+    cleanPluginFlag(name);
+  }
+});
+
+test("plugin packages containing symlinks are rejected before activation", { skip: process.platform === "win32" }, () => {
+  const name = "hara-link-plugin-" + Math.random().toString(36).slice(2, 8);
+  const source = makePlugin({ name, skills: ["skills"] });
+  const outside = join(tmpdir(), "hara-plugin-link-target-" + Math.random().toString(36).slice(2));
+  mkdirSync(join(source, "skills"), { recursive: true });
+  writeFileSync(outside, "do not copy");
+  symlinkSync(outside, join(source, "skills", "outside"));
+  try {
+    assert.throws(() => installPlugin(`file:${source}`), /symbolic link/i);
+    assert.equal(existsSync(installedRoot(name)), false);
+  } finally {
+    rmSync(source, { recursive: true, force: true });
+    rmSync(outside, { force: true });
+  }
+});
+
+test("plugin update fails closed on a foreign bin collision and preserves the prior install", () => {
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const name = `hara-update-${suffix}`;
+  const oldCommand = `hara-old-${suffix}`;
+  const sharedCommand = `hara-shared-${suffix}`;
+  const foreignCommand = `hara-foreign-${suffix}`;
+  const oldSource = makePlugin(
+    {
+      name,
+      version: "1.0.0",
+      bin: {
+        [oldCommand]: "bin/old.mjs",
+        [sharedCommand]: "bin/shared.mjs",
+      },
+    },
+    {
+      "bin/old.mjs": "#!/usr/bin/env node\n",
+      "bin/shared.mjs": "#!/usr/bin/env node\n",
+    },
+  );
+  const nextSource = makePlugin(
+    {
+      name,
+      version: "2.0.0",
+      bin: {
+        [sharedCommand]: "bin/shared.mjs",
+        [foreignCommand]: "bin/new.mjs",
+      },
+    },
+    {
+      "bin/shared.mjs": "#!/usr/bin/env node\n",
+      "bin/new.mjs": "#!/usr/bin/env node\n",
+    },
+  );
+  const foreign = join(homedir(), ".hara", "bin", foreignCommand);
+  try {
+    const first = installPlugin(`file:${oldSource}`);
+    writeFileSync(foreign, "owned by somebody else");
+    assert.throws(() => installPlugin(`file:${nextSource}`), /foreign command entry/i);
+    const stillInstalled = listInstalled().find((plugin) => plugin.name === name);
+    assert.equal(stillInstalled?.version, "1.0.0");
+    const oldLink = join(homedir(), ".hara", "bin", oldCommand);
+    const sharedLink = join(homedir(), ".hara", "bin", sharedCommand);
+    assert.equal(lstatSync(oldLink).isSymbolicLink(), true);
+    assert.equal(resolve(dirname(oldLink), readlinkSync(oldLink)), join(first.root, "bin/old.mjs"));
+    assert.equal(lstatSync(sharedLink).isSymbolicLink(), true);
+    assert.equal(resolve(dirname(sharedLink), readlinkSync(sharedLink)), join(first.root, "bin/shared.mjs"));
+    rmSync(foreign, { force: true });
+    assert.equal(uninstallPlugin(name), true);
+  } finally {
+    rmSync(foreign, { force: true });
+    rmSync(oldSource, { recursive: true, force: true });
+    rmSync(nextSource, { recursive: true, force: true });
+    rmSync(installedRoot(name), { recursive: true, force: true });
+    rmSync(receiptPath(name), { force: true });
+    cleanPluginFlag(name);
+  }
+});
+
+test("plugin uninstall requires its receipt and never removes a foreign replacement bin", () => {
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const name = `hara-owned-${suffix}`;
+  const command = `hara-owned-bin-${suffix}`;
+  const source = makePlugin(
+    { name, bin: { [command]: "bin/run.mjs" } },
+    { "bin/run.mjs": "#!/usr/bin/env node\n" },
+  );
+  const link = join(homedir(), ".hara", "bin", command);
+  try {
+    installPlugin(`file:${source}`);
+    rmSync(link);
+    writeFileSync(link, "foreign");
+    assert.throws(() => uninstallPlugin(name), /foreign command entry/i);
+    assert.equal(existsSync(installedRoot(name)), true);
+
+    rmSync(link);
+    symlinkSync(join(installedRoot(name), "bin/run.mjs"), link, "file");
+    assert.equal(uninstallPlugin(name), true);
+    assert.equal(existsSync(link), false);
+    assert.equal(existsSync(receiptPath(name)), false);
+
+    // A manually copied legacy root has no receipt and therefore cannot authorize recursive deletion.
+    mkdirSync(installedRoot(name), { recursive: true });
+    writeFileSync(join(installedRoot(name), "plugin.json"), JSON.stringify({ name }));
+    assert.throws(() => uninstallPlugin(name), /without an ownership receipt/i);
+    assert.equal(existsSync(installedRoot(name)), true);
+  } finally {
+    rmSync(link, { force: true });
+    rmSync(source, { recursive: true, force: true });
+    rmSync(installedRoot(name), { recursive: true, force: true });
+    rmSync(receiptPath(name), { force: true });
+    cleanPluginFlag(name);
   }
 });
 

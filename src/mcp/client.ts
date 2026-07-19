@@ -162,6 +162,7 @@ export async function connectMcpServers(
       transport = new StdioClientTransport({
         command: cfg.command,
         args: cfg.args ?? [],
+        ...(cfg.cwd ? { cwd: cfg.cwd } : {}),
         // The inherited agent environment is scrubbed; server-specific cfg.env is an explicit grant.
         env: toolSubprocessEnv(process.env, cfg.env ?? {}) as Record<string, string>,
         // The SDK default is "inherit", which would let an external server print credentials or terminal

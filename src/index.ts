@@ -2999,11 +2999,11 @@ pluginCmd
         out(c.dim("  available to tool commands started inside Hara automatically\n"));
         if (!onPath) out(c.yellow(`  add to PATH once:  echo 'export PATH="$HOME/.hara/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc\n`));
       }
-      // Surface the code-execution surface: a plugin's MCP servers + hooks run shell commands on every
-      // hara launch with no prompt. Installing a plugin = trusting its author to run code; show what.
+      // Surface the code-execution surface without echoing manifest-provided arguments or hook bodies:
+      // those fields may contain credentials. Installing a plugin means trusting code from its author.
       const execs: string[] = [];
-      for (const [name, s] of Object.entries(m.mcpServers ?? {})) execs.push(`mcp ${name}: ${[s.command, ...(s.args ?? [])].join(" ")}`);
-      for (const h of [...(m.hooks?.PreToolUse ?? []), ...(m.hooks?.PostToolUse ?? [])]) execs.push(`hook: ${h.command}`);
+      for (const [name, s] of Object.entries(m.mcpServers ?? {})) execs.push(`mcp ${name}: ${s.command}`);
+      for (const _hook of [...(m.hooks?.PreToolUse ?? []), ...(m.hooks?.PostToolUse ?? [])]) execs.push("hook configured (command hidden)");
       if (execs.length) {
         out(
           c.yellow(`⚠ ${p.name} will run these commands on every hara launch (a plugin is code you run — review them):\n`) +
@@ -3019,7 +3019,13 @@ pluginCmd
   .command("remove <name>")
   .alias("uninstall")
   .description("uninstall a plugin")
-  .action((name: string) => out(uninstallPlugin(name) ? c.green(`Removed ${name}\n`) : c.dim(`(no plugin '${name}')\n`)));
+  .action((name: string) => {
+    try {
+      out(uninstallPlugin(name) ? c.green(`Removed ${name}\n`) : c.dim(`(no plugin '${name}')\n`));
+    } catch (error: any) {
+      out(c.red(`Remove failed: ${error?.message ?? String(error)}\n`));
+    }
+  });
 pluginCmd
   .command("enable <name>")
   .description("enable an installed plugin")

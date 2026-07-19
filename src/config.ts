@@ -32,6 +32,8 @@ export interface McpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /** Optional trusted process directory. Plugin-contributed servers bind this to their immutable package root. */
+  cwd?: string;
 }
 
 export interface HaraConfig {
