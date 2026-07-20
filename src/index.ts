@@ -50,7 +50,16 @@ import { notifyDone } from "./notify.js";
 import { startMcpServer, mcpServeToolNames } from "./mcp/server.js";
 import { completionScript } from "./completions.js";
 import { renderSessionMarkdown } from "./export.js";
-import { loadEnrollment, clearEnrollment, enrollDevice, heartbeat, gatewayBaseURL, syncOrgRoles } from "./org-fleet/enroll.js";
+import {
+  loadEnrollment,
+  clearEnrollment,
+  enrollDevice,
+  heartbeat,
+  gatewayBaseURL,
+  syncOrgRoles,
+  deviceTokenExpired,
+  deviceTokenExpiryWarning,
+} from "./org-fleet/enroll.js";
 import {
   loadActiveProfile,
   listProfiles,
@@ -261,7 +270,7 @@ async function buildProvider(
   // requests" — gateway (deviceToken at the gateway) vs BYOK (user's key direct to the provider).
   const { profile: ap } = profileForConfig(cfg);
   if (ap.kind === "gateway") {
-    if (!ap.gatewayUrl || !ap.deviceToken) return null;
+    if (!ap.gatewayUrl || !ap.deviceToken || deviceTokenExpired(ap.tokenExpiresAt)) return null;
     const baseURL = ap.baseURL || `${ap.gatewayUrl.replace(/\/$/, "")}/v1`;
     const model = resolveGatewayModel(cfg, ap, process.env, targetOverride?.model);
     const target = { provider: "hara-gateway" as const, apiKey: ap.deviceToken, baseURL, model };
@@ -321,7 +330,12 @@ async function buildGuardian(cfg: HaraConfig, primary: Provider | null): Promise
 
 function authHint(cfg: HaraConfig): string {
   const { profile: ap } = profileForConfig(cfg);
-  if (ap.kind === "gateway") return `Active profile '${ap.id}' is a gateway profile but is missing deviceToken — re-enroll with \`hara profile add ${ap.id} --gateway <url> --code <code>\`.`;
+  if (ap.kind === "gateway") {
+    if (deviceTokenExpired(ap.tokenExpiresAt)) {
+      return `Active profile '${ap.id}' has expired organization access — re-enroll with \`hara profile add ${ap.id} --gateway ${ap.gatewayUrl || "<url>"} --code <code>\`.`;
+    }
+    return `Active profile '${ap.id}' is a gateway profile but is missing deviceToken — re-enroll with \`hara profile add ${ap.id} --gateway <url> --code <code>\`.`;
+  }
   const target = resolveByokProviderTarget(cfg, ap, false);
   const provider = target.provider;
   if (provider === "qwen-oauth") return `Run ${c.bold("hara login qwen")} to authenticate.`;
@@ -346,6 +360,7 @@ function providerSettingsSnapshot(targetCwd: string) {
 
   if (profile.kind === "gateway") {
     const entry = catalog.find((candidate) => candidate.id === "hara-gateway")!;
+    const tokenExpired = deviceTokenExpired(profile.tokenExpiresAt);
     return {
       current: {
         provider: "hara-gateway",
@@ -354,11 +369,12 @@ function providerSettingsSnapshot(targetCwd: string) {
         location: entry.location,
         auth: entry.auth,
         keyConfigured: !!profile.deviceToken,
-        authenticated: !!profile.gatewayUrl && !!profile.deviceToken,
+        authenticated: !!profile.gatewayUrl && !!profile.deviceToken && !tokenExpired,
         profileId: profile.id,
         profileKind: profile.kind,
         profileSource: resolution.source,
         editable: false,
+        ...(profile.tokenExpiresAt ? { tokenExpiresAt: profile.tokenExpiresAt, tokenExpired } : {}),
       },
       providers: catalog,
     };
@@ -1843,6 +1859,9 @@ function printWhoami(): void {
     out(c.dim(`  gateway:  ${p.gatewayUrl}\n`));
     if (p.deviceId) out(c.dim(`  device:   ${p.deviceId.length > 8 ? "…" + p.deviceId.slice(-8) : p.deviceId}\n`));
     if (p.availableModels?.length) out(c.dim(`  available: ${p.availableModels.join(", ")}\n`));
+    if (p.tokenExpiresAt) out(c.dim(`  expires:  ${p.tokenExpiresAt}\n`));
+    const warning = deviceTokenExpiryWarning(p.tokenExpiresAt);
+    if (warning) out(c.yellow(`  ⚠ ${warning}\n`));
   } else {
     out(c.dim(`  provider: ${p.provider}\n`));
     if (p.baseURL) out(c.dim(`  baseURL:  ${p.baseURL}\n`));
@@ -1976,6 +1995,7 @@ profileCmd
           defaultModel: e.model || "",
           availableModels: e.model ? [e.model] : [],
           enrolledAt: e.enrolledAt,
+          tokenExpiresAt: e.expiresAt,
         };
         upsertProfile(p); // upsert: re-enrolling the same id rotates the token
         const r = useProfile(id);
@@ -2157,8 +2177,8 @@ program
   .option("--clear", "switch active profile back to personal (does NOT delete the gateway profile)")
   .action(async (gatewayUrl: string | undefined, opts: { code?: string; status?: boolean; clear?: boolean }) => {
     if (opts.status) {
-      const p = loadActiveProfile();
-      return void out(p.kind === "gateway" ? c.green("enrolled") + c.dim(` · ${p.gatewayUrl} · device ${p.deviceId || "?"} · model ${effectiveModel(p) || "(gateway default)"} · since ${p.enrolledAt || "?"}\n`) : c.dim("Not enrolled — `hara enroll <gateway-url> --code <code>`.\n"));
+      printWhoami();
+      return;
     }
     if (opts.clear) {
       // Behavior change: don't *delete* the gateway profile (keeps the token around for re-use);
@@ -2183,6 +2203,7 @@ program
         defaultModel: e.model || "",
         availableModels: e.model ? [e.model] : [],
         enrolledAt: e.enrolledAt,
+        tokenExpiresAt: e.expiresAt,
       };
       upsertProfile(p);
       useProfile(DEFAULT_ORG_ID);
@@ -3241,6 +3262,10 @@ program.action(async (opts) => {
   // to suppress everywhere.
   if (!opts.print && process.env.HARA_QUIET !== "1") {
     out(c.dim(activeProfileLine(__activeP)) + "\n");
+    const expiryWarning = __activeP.kind === "gateway"
+      ? deviceTokenExpiryWarning(__activeP.tokenExpiresAt)
+      : null;
+    if (expiryWarning) out(c.yellow(`⚠ ${expiryWarning}\n`));
   }
   if (__activeP.kind === "gateway" || cfg.provider === "hara-gateway") {
     void heartbeat(); // fleet visibility — fire-and-forget, never blocks startup

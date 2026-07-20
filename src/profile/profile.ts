@@ -74,6 +74,8 @@ export interface Profile {
    *  byok stays empty (no list constraint). P1 may pull this from /v1/models. */
   availableModels?: string[];
   enrolledAt?: string;
+  /** Control/data-plane shared expiry for the gateway device token. */
+  tokenExpiresAt?: string;
 }
 
 export interface ProfilesFile {
@@ -148,6 +150,7 @@ function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | nul
     defaultModel,
     availableModels: defaultModel ? [defaultModel] : [],
     enrolledAt: e.enrolledAt || new Date().toISOString(),
+    tokenExpiresAt: typeof e.expiresAt === "string" ? e.expiresAt : undefined,
   };
 }
 

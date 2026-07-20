@@ -5,7 +5,7 @@
 // plane fleet visibility. Token + endpoint live in ~/.hara/org.json (0600).
 //
 // Protocol (what `hara-control` implements on the other end):
-//   POST {gateway}/v1/enroll      {code, device:{name,os,hara_version}} -> {device_token, device_id, model, base_url?}
+//   POST {gateway}/v1/enroll      {code, device:{name,os,hara_version}} -> {device_token, device_id, model, base_url?, expires_at?}
 //   POST {gateway}/v1/heartbeat   Bearer <device_token> {device_id, name, os, hara_version} -> 200/204
 //   GET  {gateway}/v1/roles       Bearer <device_token> -> {version, org_policy, roles:[…]}  (B3 digital-employee push-down)
 //   POST {gateway}/v1/chat/completions  (OpenAI-compatible; the normal agent traffic, Bearer <device_token>)
@@ -28,6 +28,8 @@ export interface Enrollment {
   model: string; // default model the gateway routes to ("" = gateway decides)
   baseURL?: string; // explicit OpenAI-compatible base; defaults to <gatewayUrl>/v1
   enrolledAt: string;
+  /** Device-token expiry shared by Hara Control and the model gateway. Missing on legacy servers. */
+  expiresAt?: string;
 }
 
 const deviceInfo = (): { name: string; os: string; hara_version: string } => ({ name: hostname(), os: platform(), hara_version: process.env.HARA_BUILD_VERSION ?? "dev" });
@@ -60,6 +62,7 @@ export function loadEnrollment(): Enrollment | null {
         model: ap.defaultModel || "",
         baseURL: ap.baseURL,
         enrolledAt: ap.enrolledAt || new Date().toISOString(),
+        expiresAt: ap.tokenExpiresAt,
       };
     }
   } catch {
@@ -85,6 +88,14 @@ export function clearEnrollment(): boolean {
 export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknown>, now: string): Enrollment {
   const deviceToken = (j.device_token ?? j.deviceToken) as string | undefined;
   if (!deviceToken) throw new Error("enroll response missing device_token");
+  const rawExpiresAt = j.expires_at ?? j.expiresAt;
+  let expiresAt: string | undefined;
+  if (rawExpiresAt !== undefined && rawExpiresAt !== null) {
+    if (typeof rawExpiresAt !== "string" || !Number.isFinite(Date.parse(rawExpiresAt))) {
+      throw new Error("enroll response contains an invalid expires_at");
+    }
+    expiresAt = new Date(rawExpiresAt).toISOString();
+  }
   return {
     gatewayUrl: gatewayUrl.replace(/\/$/, ""),
     deviceToken,
@@ -92,7 +103,33 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     model: String(j.model ?? ""),
     baseURL: (j.base_url ?? j.baseURL) as string | undefined,
     enrolledAt: now,
+    expiresAt,
   };
+}
+
+/** Legacy control planes did not advertise token expiry, so absence remains compatible. New control
+ * planes provide it and the CLI can fail early with an actionable re-enrollment message. */
+export function deviceTokenExpired(expiresAt: string | undefined, now = new Date()): boolean {
+  if (!expiresAt) return false;
+  const expiryMs = Date.parse(expiresAt);
+  // A present-but-corrupt lifecycle boundary must not silently become a legacy non-expiring token.
+  return !Number.isFinite(expiryMs) || expiryMs <= now.getTime();
+}
+
+/** Only warn near the boundary; healthy week-long tokens should not add startup noise. */
+export function deviceTokenExpiryWarning(expiresAt: string | undefined, now = new Date()): string | null {
+  if (!expiresAt) return null;
+  const expiryMs = Date.parse(expiresAt);
+  if (!Number.isFinite(expiryMs)) return "organization access expiry is unreadable; re-enroll this profile";
+  const remainingMs = expiryMs - now.getTime();
+  if (remainingMs <= 0) return "organization access expired; re-enroll this profile before running a task";
+  if (remainingMs > 24 * 60 * 60_000) return null;
+  const remainingMinutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+  const remaining =
+    remainingMinutes < 60
+      ? `${remainingMinutes}m`
+      : `${Math.ceil(remainingMinutes / 60)}h`;
+  return `organization access expires in ${remaining}; ask your admin for a new enrollment code`;
 }
 
 /** Exchange a one-time code for a device token at the gateway, persist it, and return the Enrollment. */

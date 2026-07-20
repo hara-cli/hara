@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.127.1 — 2026-07-20 — managed access lifecycle
+
+- Managed enrollment now persists the control plane's authoritative device-token expiry. Hara warns
+  during the final 24 hours, reports the boundary in `whoami`/`enroll --status`, and fails closed with
+  a focused re-enrollment command once access expires or lifecycle data is corrupt.
+- Serve provider settings expose only expiry metadata—not the token—so Hara Desktop can distinguish
+  an authenticated managed route from an expired one.
+- Upgrade with `npm i -g @nanhara/hara@0.127.1`.
+
 ## 0.127.0 — 2026-07-20 — structured context and typed task lifecycle
 
 - **Prompt assembly is now an explicit, ordered runtime layer.** Cache-stable policy, tool, project, and

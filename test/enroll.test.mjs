@@ -4,17 +4,46 @@ import { createServer } from "node:http";
 import { mkdtempSync, rmSync, statSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { enrollDevice, loadEnrollment, clearEnrollment, heartbeat, gatewayBaseURL, parseEnrollResponse, syncOrgRoles } from "../dist/org-fleet/enroll.js";
+import {
+  enrollDevice,
+  loadEnrollment,
+  clearEnrollment,
+  heartbeat,
+  gatewayBaseURL,
+  parseEnrollResponse,
+  syncOrgRoles,
+  deviceTokenExpired,
+  deviceTokenExpiryWarning,
+} from "../dist/org-fleet/enroll.js";
 import { orgRolesDir, loadRoles } from "../dist/org/roles.js";
 
-test("parseEnrollResponse: snake_case + camelCase, trims slash, requires a token", () => {
-  const e = parseEnrollResponse("http://gw/", { device_token: "t1", device_id: "d1", model: "m1" }, "2026-01-01");
+test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry, requires a token", () => {
+  const e = parseEnrollResponse(
+    "http://gw/",
+    { device_token: "t1", device_id: "d1", model: "m1", expires_at: "2026-01-08T00:00:00Z" },
+    "2026-01-01",
+  );
   assert.equal(e.gatewayUrl, "http://gw");
   assert.equal(e.deviceToken, "t1");
   assert.equal(e.deviceId, "d1");
+  assert.equal(e.expiresAt, "2026-01-08T00:00:00.000Z");
   assert.equal(gatewayBaseURL(e), "http://gw/v1");
   assert.equal(gatewayBaseURL({ ...e, baseURL: "http://gw/openai" }), "http://gw/openai");
   assert.throws(() => parseEnrollResponse("http://gw", {}, "t"), /device_token/);
+  assert.throws(
+    () => parseEnrollResponse("http://gw", { device_token: "t1", expires_at: "not-a-date" }, "t"),
+    /invalid expires_at/,
+  );
+});
+
+test("device token expiry: legacy is compatible; expiring and expired tokens are actionable", () => {
+  const now = new Date("2026-01-01T00:00:00Z");
+  assert.equal(deviceTokenExpired(undefined, now), false, "legacy control planes remain compatible");
+  assert.equal(deviceTokenExpired("2025-12-31T23:59:59Z", now), true);
+  assert.equal(deviceTokenExpired("not-a-date", now), true, "corrupt lifecycle data fails closed");
+  assert.match(deviceTokenExpiryWarning("2025-12-31T23:59:59Z", now), /expired.*re-enroll/);
+  assert.match(deviceTokenExpiryWarning("2026-01-01T02:00:00Z", now), /expires in 2h/);
+  assert.equal(deviceTokenExpiryWarning("2026-01-03T00:00:00Z", now), null, "healthy tokens stay quiet");
 });
 
 test("enroll → store (0600) → heartbeat → clear, against a stub control plane", async () => {
