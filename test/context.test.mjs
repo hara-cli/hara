@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, linkSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadAgentContext, loadAgentsMd, hasAgentsMd, findProjectRoot } from "../dist/context/agents-md.js";
-import { canonicalWorkspacePath, isHomeWorkspace } from "../dist/context/workspace-scope.js";
+import { canonicalWorkspacePath, isHomeWorkspace, suggestedProjectWorkspace } from "../dist/context/workspace-scope.js";
 import { expandMentions, expandMentionsAsync, fileCandidates } from "../dist/context/mentions.js";
 import { needsConfirm } from "../dist/agent/loop.js";
 import "../dist/tools/edit.js";
@@ -24,6 +24,21 @@ test("approval gate: needsConfirm per mode/kind", () => {
   // full-auto: nothing prompts
   assert.equal(needsConfirm("edit", "full-auto"), false);
   assert.equal(needsConfirm("exec", "full-auto"), false);
+});
+
+test("Home startup suggestion uses only an existing safe candidate and skips stale/Home paths", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-home-suggest-"));
+  const project = join(home, "work", "project");
+  mkdirSync(project, { recursive: true });
+  try {
+    assert.equal(
+      suggestedProjectWorkspace([home, join(home, "gone"), project], home),
+      realpathSync.native(project),
+    );
+    assert.equal(suggestedProjectWorkspace([home, join(home, "gone")], home), undefined);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("agents-md: finds root via .git and loads AGENTS.md from an ancestor", () => {

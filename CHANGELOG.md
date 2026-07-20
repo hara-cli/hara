@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## Unreleased — immutable revision transactions
+## 0.129.0 — 2026-07-20 — durable revisions and workspace recovery
 
 - Authenticated Serve clients can commit a user-selected file as a new immutable Artifact revision with
   `artifact.commit`. Every write carries `baseRevisionId`; a stale editor receives the dedicated protocol
@@ -17,6 +17,19 @@ All notable changes to `@nanhara/hara`.
   audit identity.
 - This slice does not yet export files or claim Office fidelity. ExportReceipt, validation reports, worker
   identity, format-specific editing, and Panel v2 remain separate release gates.
+- Interactive launches from the home directory now offer an explicit, one-step switch to a recent or
+  registered project before provider and MCP startup. Hara never enumerates the home directory and never
+  changes workspace scope without confirmation.
+- Repeated protected-home failures are now grouped by semantic root cause across `ls`, `grep`, `glob`, and
+  other filesystem tools. A run stops after the bounded retry threshold with a focused recovery instruction
+  instead of trying different tools against the same boundary indefinitely.
+- Git plugin installation now rejects credential-bearing source URLs, bounds clone time, and safely
+  distinguishes missing Git, network, authentication/access, and private/not-found repository failures
+  without echoing URLs, tokens, or Git stderr.
+- Feishu WebSocket gateways now report connected, disconnected, and reconnected lifecycle events with
+  one-hour and 24-hour counters. Repeated disconnects raise rate-limited alerts, while terminal SDK recovery
+  failures stop the adapter after a safe drain so a process supervisor can restart it.
+- Upgrade with `npm i -g @nanhara/hara@0.129.0`.
 
 ## 0.128.0 — 2026-07-20 — local deliverable foundation
 

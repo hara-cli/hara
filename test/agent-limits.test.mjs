@@ -122,6 +122,40 @@ test("three identical failed tool calls trip the repeat-loop circuit breaker", a
   assert.equal(history.at(-1).role, "tool", "the last assistant tool_use remains protocol-complete");
 });
 
+test("three different tools blocked by the same Home boundary trip one root-cause breaker", async () => {
+  let turns = 0;
+  const names = ["home_grep", "home_glob", "home_ls"];
+  const diagnostics = [
+    "Error: grep will not recursively scan the home directory. Run Hara from a project.",
+    "Error: glob will not enumerate or recursively scan directories while Hara is rooted at the home directory.",
+    "Error: ls will not enumerate or recursively scan directories while Hara is rooted at the home directory.",
+  ];
+  const provider = {
+    id: "home-boundary",
+    model: "home-boundary",
+    async turn() {
+      const index = Math.min(turns, names.length - 1);
+      turns += 1;
+      return { text: "", toolUses: [{ id: `home-${turns}`, name: names[index], input: { different: index } }], stop: "tool_use" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "scan Home" }], base(provider, {
+    maxRounds: 20,
+    timeoutMs: "10s",
+    quiet: true,
+    extraTools: names.map((name, index) => ({
+      name,
+      description: "test Home boundary",
+      input_schema: { type: "object", properties: { different: { type: "number" } } },
+      kind: "read",
+      async run() { return diagnostics[index]; },
+    })),
+  }));
+  assert.equal(turns, 3);
+  assert.equal(outcome.stopReason, "repeat_loop");
+  assert.match(outcome.error, /same failing Home workspace boundary repeated 3 times/i);
+});
+
 test("a changed failure or successful call clears an older repeated-failure streak", async () => {
   let turn = 0;
   const sequence = ["fail", "fail", "other-fail", "fail", "fail", "progress", "fail", "fail", "done"];

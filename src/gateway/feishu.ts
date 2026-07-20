@@ -20,6 +20,68 @@ import {
 } from "./telegram.js";
 import { InboundMediaBudget, cleanupTransientMedia, savePrivateResponse } from "./media.js";
 import { GatewayEventSpool, gatewayRuntimeScope } from "./runtime-state.js";
+import { redactKnownSecrets } from "../security/secrets.js";
+
+const FEISHU_WS_HOUR_MS = 60 * 60_000;
+const FEISHU_WS_DAY_MS = 24 * FEISHU_WS_HOUR_MS;
+const FEISHU_WS_HOURLY_ALERT = 5;
+const FEISHU_WS_DAILY_ALERT = 25;
+
+export interface FeishuWsDisconnectHealth {
+  total: number;
+  hourCount: number;
+  dayCount: number;
+  connectedForMs?: number;
+  alert: boolean;
+}
+
+/** Process-local WS lifecycle accounting. PM2/systemd retains the structured log across restarts; keeping
+ * raw connection history out of Hara state avoids another privacy-sensitive durable file. */
+export class FeishuWsHealthMonitor {
+  private connectedAt?: number;
+  private disconnectedAt?: number;
+  private disconnects: number[] = [];
+  private total = 0;
+  private lastAlertAt = Number.NEGATIVE_INFINITY;
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  ready(): void {
+    this.connectedAt = this.now();
+    this.disconnectedAt = undefined;
+  }
+
+  disconnect(): FeishuWsDisconnectHealth {
+    const at = this.now();
+    this.disconnects = this.disconnects.filter((value) => at - value <= FEISHU_WS_DAY_MS);
+    this.disconnects.push(at);
+    this.total += 1;
+    const hourCount = this.disconnects.filter((value) => at - value <= FEISHU_WS_HOUR_MS).length;
+    const dayCount = this.disconnects.length;
+    const connectedForMs = this.connectedAt === undefined ? undefined : Math.max(0, at - this.connectedAt);
+    this.connectedAt = undefined;
+    this.disconnectedAt = at;
+    const unhealthy = hourCount >= FEISHU_WS_HOURLY_ALERT || dayCount >= FEISHU_WS_DAILY_ALERT;
+    const alert = unhealthy && at - this.lastAlertAt >= FEISHU_WS_HOUR_MS;
+    if (alert) this.lastAlertAt = at;
+    return { total: this.total, hourCount, dayCount, connectedForMs, alert };
+  }
+
+  reconnected(): number | undefined {
+    const at = this.now();
+    const disconnectedForMs = this.disconnectedAt === undefined ? undefined : Math.max(0, at - this.disconnectedAt);
+    this.connectedAt = at;
+    this.disconnectedAt = undefined;
+    return disconnectedForMs;
+  }
+}
+
+function wsDuration(ms: number | undefined): string {
+  if (ms === undefined) return "unknown";
+  if (ms < 60_000) return `${Math.max(0, Math.round(ms / 1_000))}s`;
+  if (ms < 60 * 60_000) return `${Math.round(ms / 60_000)}m`;
+  return `${Math.round(ms / (60 * 60_000))}h`;
+}
 
 /** Normalize a Feishu message's parsed content by type → text + any media keys (pure; download done by caller). */
 export function parseFeishuContent(
@@ -194,6 +256,8 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
   // gateway go deaf. Turning it on means: no inbound frame within pingTimeout seconds of a ping → presumed dead
   // → reconnect. handshakeTimeoutMs stops a stuck DNS/proxy handshake from hanging. Lifecycle logs give
   // visibility so a reconnect is observable instead of a mystery silence.
+  const wsHealth = new FeishuWsHealthMonitor();
+  let failActiveStart: ((error: Error) => void) | undefined;
   const wsClient = new lark.WSClient({
     appId,
     appSecret,
@@ -201,9 +265,33 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
     autoReconnect: true,
     wsConfig: { pingTimeout: 10 },
     handshakeTimeoutMs: 15_000,
-    onReconnecting: () => console.error("hara feishu: ⟳ ws reconnecting…"),
-    onReconnected: () => console.error("hara feishu: ✓ ws reconnected"),
-    onError: (err: Error) => console.error(`hara feishu: ws error — ${err?.message ?? err}`),
+    onReady: () => {
+      wsHealth.ready();
+      console.error("hara feishu: ✓ ws connected");
+    },
+    onReconnecting: () => {
+      const health = wsHealth.disconnect();
+      console.error(
+        `hara feishu: ws disconnected #${health.total} · ${health.hourCount}/1h · ${health.dayCount}/24h · ` +
+        `previous connection ${wsDuration(health.connectedForMs)} · auto-reconnecting (SDK does not expose close code/reason)`,
+      );
+      if (health.alert) {
+        console.error(
+          "hara feishu: ALERT WebSocket disconnect frequency is unhealthy; check duplicate bot instances, host network/proxy, " +
+          "and adjacent SDK error/watchdog logs. Automatic reconnect remains active.",
+        );
+      }
+    },
+    onReconnected: () => {
+      console.error(`hara feishu: ✓ ws reconnected after ${wsDuration(wsHealth.reconnected())}`);
+    },
+    onError: (err: Error) => {
+      const safe = redactKnownSecrets(String(err?.message ?? err), [appId, appSecret]).text
+        .replace(/\s+/gu, " ")
+        .slice(0, 300);
+      console.error(`hara feishu: ALERT ws reconnect entered terminal failure — ${safe || "unknown SDK error"}`);
+      failActiveStart?.(new Error("Feishu WebSocket entered terminal failure; inspect the redacted gateway log"));
+    },
   });
   // Generated SDK methods discard unknown request options before they reach axios, so passing `signal` there
   // is not cooperative cancellation. REST and media use native fetch instead; the SDK remains responsible for
@@ -413,22 +501,29 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
       });
     },
     async start(onMessage, signal, shouldDownload) {
+      const runAbort = new AbortController();
+      const relayAbort = (): void => {
+        runAbort.abort(signal.reason instanceof Error ? signal.reason : new Error("Feishu gateway cancelled"));
+      };
+      if (signal.aborted) relayAbort();
+      else signal.addEventListener("abort", relayAbort, { once: true });
+      const runSignal = runAbort.signal;
       const spool = await GatewayEventSpool.open(gatewayRuntimeScope("feishu-inbound", appId));
       const locallyCompleted = new Set<string>();
       const cleanupFailures = new Map<string, number>();
       const retryStateFailures = new Map<string, number>();
       const postAckCleanups = new Map<string, InboundAckCleanup>();
       const runWorker = async (): Promise<void> => {
-        while (!signal.aborted) {
+        while (!runSignal.aborted) {
           const item = await spool.nextReady();
           if (!item) {
-            await waitForFeishuWork(250, signal);
+            await waitForFeishuWork(250, runSignal);
             continue;
           }
           try {
             if (!locallyCompleted.has(item.id)) {
-              const m = await toInbound(downloadResource, item.payload, await ensureBotOpenId(signal), signal, shouldDownload);
-              if (signal.aborted) {
+              const m = await toInbound(downloadResource, item.payload, await ensureBotOpenId(runSignal), runSignal, shouldDownload);
+              if (runSignal.aborted) {
                 await spool.release(item.id);
                 return;
               }
@@ -436,7 +531,7 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
                 const cleanup = await dispatchFeishuInbound(onMessage, m);
                 if (cleanup) postAckCleanups.set(item.id, cleanup);
               }
-              if (signal.aborted) {
+              if (runSignal.aborted) {
                 await spool.release(item.id);
                 return;
               }
@@ -458,7 +553,7 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
               }
             }
           } catch {
-            if (signal.aborted) {
+            if (runSignal.aborted) {
               await spool.release(item.id);
               return;
             }
@@ -474,7 +569,7 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
                 console.error("hara feishu: ALERT durable spool cleanup suspended after 5 failures; the completed item is retained for startup recovery");
                 return; // keep the in-memory lease: no busy loop and no agent replay in this process
               }
-              await waitForFeishuWork(Math.min(30_000, 2_000 * (2 ** (failures - 1))), signal);
+              await waitForFeishuWork(Math.min(30_000, 2_000 * (2 ** (failures - 1))), runSignal);
               await spool.release(item.id);
               continue;
             }
@@ -499,7 +594,7 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
                 console.error("hara feishu: ALERT durable spool retry-state persistence suspended after 5 failures; event retained for startup recovery");
                 return;
               }
-              await waitForFeishuWork(Math.min(30_000, 2_000 * (2 ** (failures - 1))), signal);
+              await waitForFeishuWork(Math.min(30_000, 2_000 * (2 ** (failures - 1))), runSignal);
               await spool.release(item.id);
             }
           }
@@ -515,7 +610,7 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
         "im.message.receive_v1": async (data: any) => {
           // Feishu requires a long-connection callback within three seconds. Durably enqueue first, then ACK;
           // workers run the potentially minutes-long agent task independently and survive process restarts.
-          if (signal.aborted) throw new Error("Feishu gateway cancelled");
+          if (runSignal.aborted) throw new Error("Feishu gateway cancelled");
           const write = spool.enqueue(feishuEventSpoolId(data), data);
           persistenceWrites.add(write);
           void write.then(
@@ -523,33 +618,48 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
             () => persistenceWrites.delete(write),
           );
           try {
-            await withOutboundDeadline("Feishu event persistence", signal, 2_500, async () => write);
+            await withOutboundDeadline("Feishu event persistence", runSignal, 2_500, async () => write);
           } catch (error) {
-            if (!signal.aborted) {
+            if (!runSignal.aborted) {
               console.error(`hara feishu: ALERT event could not be durably queued before ACK — ${error instanceof Error ? error.message : String(error)}`);
             }
             throw error;
           }
         },
       });
-      wsClient.start({ eventDispatcher }); // runs its own background long-connection (auto-reconnect + watchdog)
-      // Keep the adapter alive until the gateway aborts, then CLOSE the WSClient so its socket + timers release
-      // the event loop and the process actually exits on SIGTERM (previously the live connection pinned the
-      // loop, so only kill -9 worked — and a hard kill leaves a dirty disconnect that Feishu can throttle).
-      await new Promise<void>((resolve) => {
-        if (signal.aborted) return resolve();
-        signal.addEventListener("abort", () => resolve(), { once: true });
+      const terminalFailure = new Promise<void>((_resolve, reject) => {
+        failActiveStart = (error) => {
+          reject(error);
+          runAbort.abort(error);
+        };
+      });
+      const stopped = new Promise<void>((resolve) => {
+        if (runSignal.aborted) return resolve();
+        runSignal.addEventListener("abort", () => resolve(), { once: true });
       });
       try {
-        wsClient.close();
-      } catch {
-        /* best-effort clean shutdown */
+        // The SDK owns ordinary reconnect/backoff. A terminal callback is different: keeping this process alive
+        // but deaf defeats PM2/systemd recovery, so reject start after draining the durable inbound workers.
+        void Promise.resolve(wsClient.start({ eventDispatcher })).catch((error) => {
+          const safe = redactKnownSecrets(String(error instanceof Error ? error.message : error), [appId, appSecret]).text;
+          failActiveStart?.(new Error(`Feishu WebSocket start failed: ${safe.slice(0, 300)}`));
+        });
+        await Promise.race([stopped, terminalFailure]);
+      } finally {
+        failActiveStart = undefined;
+        runAbort.abort(new Error("Feishu gateway stopped"));
+        signal.removeEventListener("abort", relayAbort);
+        try {
+          wsClient.close();
+        } catch {
+          /* best-effort clean shutdown */
+        }
+        // Do not release the gateway instance lease while an old worker or an ACK-persistence write can still
+        // mutate the spool. A replacement process must never race this process's final CAS write or run the same
+        // durable item concurrently.
+        while (persistenceWrites.size) await Promise.allSettled([...persistenceWrites]);
+        await workersSettled;
       }
-      // Do not release the gateway instance lease while an old worker or an ACK-persistence write can still
-      // mutate the spool. A replacement process must never race this process's final CAS write or run the same
-      // durable item concurrently.
-      while (persistenceWrites.size) await Promise.allSettled([...persistenceWrites]);
-      await workersSettled;
     },
   };
 }

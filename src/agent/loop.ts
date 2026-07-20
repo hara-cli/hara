@@ -25,7 +25,7 @@ import {
   splitCompound,
 } from "../security/permissions.js";
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
-import { keyOf, looksFailed, recordCall } from "./repeat-guard.js";
+import { failureIdentity, looksFailed, recordCall } from "./repeat-guard.js";
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
@@ -545,13 +545,13 @@ function disposeRunLifecycle(life: RunLifecycle): void {
   life.removeStopListener();
 }
 
-function hardStop(opts: RunOpts, life: RunLifecycle, kind: RunStopReason, detail?: { tool?: string; count?: number }): RunOutcome {
+function hardStop(opts: RunOpts, life: RunLifecycle, kind: RunStopReason, detail?: { label?: string; count?: number }): RunOutcome {
   const elapsedMs = runActiveElapsedMs(life);
   const message = kind === "deadline"
     ? `⏸ agent run paused: active-execution deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). Waiting for your answers did not consume this budget. No further model or tool calls will start in this turn. Session-backed work keeps its task and checklist checkpoint; type \`/continue\` to resume in a fresh bounded turn. Only for intentionally long single turns, use \`hara config set runTimeoutMs 45m\` (maximum 2h).`
     : kind === "max_rounds"
       ? `⛔ agent run stopped: ${life.maxRounds}-round safety limit reached after ${formatAgentDuration(elapsedMs)}. This usually means the model is looping. Increase it with \`hara config set maxAgentRounds <n>\` (maximum 256) only if the extra rounds are intentional.`
-      : `⛔ agent run stopped: the same failing ${detail?.tool ?? "tool"} call repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
+      : `⛔ agent run stopped: the same failing ${detail?.label ?? "tool call"} repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
   const event: RunLimitEvent = { kind, message, elapsedMs, rounds: life.rounds, timeoutMs: life.timeoutMs, maxRounds: life.maxRounds };
   if (!life.limitAnnounced) {
     life.limitAnnounced = true;
@@ -1053,18 +1053,18 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       return outcome;
     };
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
-    let repeatHalt: { tool: string; count: number } | null = null;
+    let repeatHalt: { label: string; count: number } | null = null;
     const noteCall = (name: string, input: unknown, content: string, isError = false): string => {
       const note = recordCall(name, input, content, isError, ctx.todoScope);
-      const key = keyOf(name, input);
+      const identity = failureIdentity(name, input, content, isError);
       if (isError || looksFailed(content, name)) {
-        const count = (life.failedCalls.get(key) ?? 0) + 1;
+        const count = (life.failedCalls.get(identity.key) ?? 0) + 1;
         // This is a *consecutive no-progress* streak, not a lifetime counter for the call. A different
         // failure is a changed attempt; keep only that new streak instead of letting an old failure
         // silently accumulate across intervening work.
         life.failedCalls.clear();
-        life.failedCalls.set(key, count);
-        if (count >= REPEATED_FAILURE_LIMIT && !repeatHalt) repeatHalt = { tool: name, count };
+        life.failedCalls.set(identity.key, count);
+        if (count >= REPEATED_FAILURE_LIMIT && !repeatHalt) repeatHalt = { label: identity.label, count };
       } else {
         // Any successful action is progress (in particular edit/exec calls that may have fixed the
         // underlying cause), so a later retry starts a fresh failure streak.

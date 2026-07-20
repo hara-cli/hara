@@ -75,6 +75,29 @@ export type WorkspaceSwitchResult =
   | { ok: true; cwd: string }
   | { ok: false; error: string };
 
+/** Pick the first existing project directory from an already-authorized candidate list. This deliberately
+ * does not enumerate Home: callers supply recent-session or registered-project paths, and the user still
+ * confirms the handoff before Hara changes process.cwd(). */
+export function suggestedProjectWorkspace(
+  candidates: readonly string[],
+  home = effectiveHomeDir(),
+): string | undefined {
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    try {
+      const target = realpathSync.native(resolve(candidate));
+      if (seen.has(target)) continue;
+      seen.add(target);
+      if (!statSync(target).isDirectory() || isUnsafeProjectWorkspace(target, home)) continue;
+      return target;
+    } catch {
+      // Stale session/project registrations are ordinary; skip them without weakening the boundary.
+    }
+  }
+  return undefined;
+}
+
 /** Resolve an explicit interactive workspace handoff without accepting Home/ancestor scopes. */
 export function resolveWorkspaceSwitch(
   input: string,

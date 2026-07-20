@@ -8,6 +8,7 @@
 // sessions in one process, so streaks are keyed by the same run scope as todo/reminder state.
 const DEFAULT_SCOPE = "default";
 const seenByScope = new Map<string, Map<string, { fails: number }>>();
+const HOME_WORKSPACE_BOUNDARY_KEY = "root-cause:home-workspace-boundary";
 
 function scopedSeen(scope?: string): Map<string, { fails: number }> {
   const key = scope?.trim() || DEFAULT_SCOPE;
@@ -64,22 +65,68 @@ export function looksFailed(content: string, name?: string): boolean {
   return false;
 }
 
+/** Several different filesystem tools can hit the same protected Home-workspace boundary. Treating each
+ * tool name/argument tuple as a fresh idea lets a model spin through grep → glob → ls even though the
+ * root cause cannot change inside that run. Only Hara's own stable boundary diagnostics are coalesced. */
+function isHomeWorkspaceBoundaryFailure(content: string): boolean {
+  return (
+    /will not recursively scan the home directory\b/i.test(content)
+    || /will not enumerate or recursively scan directories while Hara is rooted at the home directory\b/i.test(content)
+    || /workspace that is the home directory or contains it\b/i.test(content)
+  );
+}
+
+export interface FailureIdentity {
+  key: string;
+  label: string;
+  semantic: boolean;
+}
+
+/** Stable identity used by both the warning note and the run-level hard breaker. */
+export function failureIdentity(
+  name: string,
+  input: unknown,
+  content: string,
+  isError = false,
+): FailureIdentity {
+  const failed = isError || looksFailed(content, name);
+  if (failed && isHomeWorkspaceBoundaryFailure(content)) {
+    return {
+      key: HOME_WORKSPACE_BOUNDARY_KEY,
+      label: "Home workspace boundary",
+      semantic: true,
+    };
+  }
+  return {
+    key: keyOf(name, input),
+    label: `${name} call`,
+    semantic: false,
+  };
+}
+
 /** Record a completed call; returns a warning to APPEND to the tool result when the same call has now
  *  failed >=2x in a row (empty string otherwise). Pure aside from the session-scoped map. */
 export function recordCall(name: string, input: unknown, content: string, isError = false, scope?: string): string {
-  const k = keyOf(name, input);
   const failed = isError || looksFailed(content, name);
+  const identity = failureIdentity(name, input, content, isError);
   const seen = scopedSeen(scope);
   if (!failed) {
     seen.clear(); // any success is progress; a later failure starts a fresh no-progress streak
     return "";
   }
-  const s = seen.get(k) ?? { fails: 0 };
+  const s = seen.get(identity.key) ?? { fails: 0 };
   s.fails++;
   // "In a row" is literal: a different failed call is a changed attempt and breaks the old streak.
   seen.clear();
-  seen.set(k, s);
+  seen.set(identity.key, s);
   if (s.fails < 2) return "";
+  if (identity.semantic) {
+    return (
+      `\n\n⟳ hara: the same ${identity.label} has now blocked ${s.fails} consecutive tool calls — ` +
+      "another filesystem/search tool cannot bypass it. Ask the user to switch with `/cd <project>` " +
+      "or stop this run; do not probe another directory tool from Home."
+    );
+  }
   return (
     `\n\n⟳ hara: this exact ${name} call has now FAILED ${s.fails}× with identical arguments — ` +
     `repeating it unchanged will fail again. Read the error above, change something (arguments / approach / tool), ` +

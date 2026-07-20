@@ -2,7 +2,7 @@
 // this" note appended to its result; successes never warn and reset the streak.
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { recordCall, looksFailed, keyOf, resetRepeatGuard } from "../dist/agent/repeat-guard.js";
+import { failureIdentity, recordCall, looksFailed, keyOf, resetRepeatGuard } from "../dist/agent/repeat-guard.js";
 
 beforeEach(() => resetRepeatGuard());
 
@@ -61,6 +61,14 @@ test("2nd identical failure warns; 1st doesn't; different args are a different c
   const warn = recordCall("bash", args, "Command failed: exit code 128");
   assert.match(warn, /FAILED 2×/, "second identical failure warns");
   assert.equal(recordCall("bash", { command: "git pull origin dev" }, "Command failed: x"), "", "different args -> separate streak");
+});
+
+test("different directory tools share the same protected-Home root cause", () => {
+  const grep = "Error: grep will not recursively scan the home directory. Run Hara from a project.";
+  const glob = "Error: glob will not enumerate or recursively scan directories while Hara is rooted at the home directory.";
+  assert.equal(failureIdentity("grep", { pattern: "x" }, grep).semantic, true);
+  assert.equal(recordCall("grep", { pattern: "x" }, grep), "");
+  assert.match(recordCall("glob", { pattern: "**/*" }, glob), /same Home workspace boundary.*2 consecutive/is);
 });
 
 test("a success resets the streak; loop-level errors (isError) count as failures", () => {

@@ -12,6 +12,7 @@ import {
   pluginSkillDirs,
   pluginRoleDirs,
   pluginMcpServers,
+  pluginGitCloneFailure,
 } from "../dist/plugins/plugins.js";
 import { loadSkillIndex } from "../dist/skills/skills.js";
 import { loadRoles } from "../dist/org/roles.js";
@@ -61,6 +62,38 @@ function installedRoot(name) {
 function receiptPath(name) {
   return join(homedir(), ".hara", "plugin-receipts", `${name}.json`);
 }
+
+test("plugin Git clone diagnostics distinguish private-repo access without echoing remote stderr", () => {
+  const privateError = pluginGitCloneFailure("github", {
+    stderr: "remote: Repository not found. token=ghp_do-not-echo\nfatal: Authentication failed",
+  });
+  assert.match(privateError, /authentication|access was denied/i);
+  assert.match(privateError, /gh auth login/);
+  assert.doesNotMatch(privateError, /ghp_do-not-echo|remote:/);
+
+  const networkError = pluginGitCloneFailure("git", {
+    stderr: "fatal: unable to access 'https://secret@example.invalid/x': Could not resolve host",
+  });
+  assert.match(networkError, /DNS|network/i);
+  assert.doesNotMatch(networkError, /secret@example/);
+
+  assert.match(pluginGitCloneFailure("github", { code: "ENOENT" }), /Git is not installed/i);
+});
+
+test("plugin Git source rejects embedded HTTPS credentials before network access", () => {
+  assert.throws(
+    () => installPlugin("git:https://ghp_never_echo@example.invalid/org/plugin.git"),
+    /must not embed credentials/i,
+  );
+  assert.throws(
+    () => installPlugin("git:https://example.invalid/org/plugin.git?token=never"),
+    /query\/fragment secrets/i,
+  );
+  assert.throws(
+    () => installPlugin("git:ssh://git:never@example.invalid/org/plugin.git"),
+    /must not embed credentials/i,
+  );
+});
 
 test("plugin install → skills/roles/mcp auto-contribute; disable hides them; uninstall removes", () => {
   const pname = "hara-test-plugin-" + Math.random().toString(36).slice(2, 8);

@@ -347,7 +347,99 @@ function validGitSource(source: string): string {
   if (!/^(?:https:\/\/|ssh:\/\/|git@)[^\s\0]+$/u.test(url)) {
     throw new Error("git source must use an https://, ssh://, or git@ URL");
   }
+  if (url.startsWith("https://") || url.startsWith("ssh://")) {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error("git source contains an invalid URL");
+    }
+    const secretAuthority = url.startsWith("https://")
+      ? Boolean(parsed.username || parsed.password)
+      : Boolean(parsed.password);
+    if (secretAuthority || parsed.search || parsed.hash) {
+      throw new Error(
+        "git source must not embed credentials or query/fragment secrets; configure a Git credential helper or SSH key instead",
+      );
+    }
+  }
   return url;
+}
+
+type PluginGitSourceKind = "github" | "git";
+
+/** Turn git's often credential-bearing stderr into a bounded, actionable diagnosis. Never echo the URL,
+ * stderr, usernames, tokens, credential-helper output, or the original command line. */
+export function pluginGitCloneFailure(kind: PluginGitSourceKind, error: unknown): string {
+  const value = error as {
+    code?: unknown;
+    signal?: unknown;
+    killed?: unknown;
+    stderr?: unknown;
+    message?: unknown;
+  };
+  const stderr = Buffer.isBuffer(value?.stderr)
+    ? value.stderr.toString("utf8")
+    : typeof value?.stderr === "string"
+      ? value.stderr
+      : "";
+  const diagnostic = stderr.toLowerCase();
+  const label = kind === "github" ? "GitHub plugin repository" : "plugin Git repository";
+
+  if (value?.code === "ENOENT") {
+    return `Could not clone the ${label}: Git is not installed or is not available on PATH. Install Git, then retry.`;
+  }
+  if (
+    value?.code === "ETIMEDOUT"
+    || value?.signal === "SIGTERM"
+    || value?.killed === true
+    || /timed out|connection timed out/u.test(diagnostic)
+  ) {
+    return `Could not clone the ${label}: the network operation exceeded Hara's 2-minute limit. Check connectivity/proxy settings, then retry.`;
+  }
+  if (
+    /could not resolve host|failed to connect|connection refused|network is unreachable|connection reset/u.test(diagnostic)
+  ) {
+    return `Could not clone the ${label}: Git could not reach the remote host. Check DNS, network, VPN, and Git proxy settings, then retry.`;
+  }
+  if (
+    /authentication failed|permission denied|access denied|could not read username|terminal prompts disabled|publickey|http basic/u.test(diagnostic)
+  ) {
+    return (
+      `Could not clone the ${label}: authentication or repository access was denied. ` +
+      (kind === "github"
+        ? "For a private repository, authenticate GitHub (`gh auth login` then `gh auth setup-git`) or use `git:git@github.com:owner/repository.git` with a working SSH key. "
+        : "Configure credentials for that Git host or use an SSH URL backed by a working key. ") +
+      "Do not put a token in the plugin URL."
+    );
+  }
+  if (/repository not found|not found|could not read from remote repository/u.test(diagnostic)) {
+    return (
+      `Could not clone the ${label}: it does not exist or the current Git identity cannot access it. ` +
+      (kind === "github"
+        ? "Check owner/repository spelling; for a private repository run `gh auth login` and `gh auth setup-git`, or use a working SSH URL. "
+        : "Check the repository URL and credentials. ") +
+      "Do not put a token in the plugin URL."
+    );
+  }
+  return (
+    `Could not clone the ${label}. Run an equivalent \`git clone\` yourself to diagnose the remote, ` +
+    "then retry Hara after Git credentials/network access work. No remote stderr was shown because it may contain credentials."
+  );
+}
+
+function clonePluginRepository(url: string, staging: string, kind: PluginGitSourceKind): void {
+  try {
+    execFileSync("git", ["clone", "--depth", "1", url, staging], {
+      encoding: "utf8",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      maxBuffer: 256 * 1024,
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: 2 * 60_000,
+    });
+  } catch (error) {
+    throw new Error(pluginGitCloneFailure(kind, error));
+  }
 }
 
 function populateStaging(source: string, staging: string): void {
@@ -365,9 +457,9 @@ function populateStaging(source: string, staging: string): void {
   } else if (source.startsWith("github:")) {
     const repo = source.slice("github:".length);
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repo)) throw new Error("github source must be owner/repository");
-    execFileSync("git", ["clone", "--depth", "1", `https://github.com/${repo}.git`, staging], { stdio: "ignore" });
+    clonePluginRepository(`https://github.com/${repo}.git`, staging, "github");
   } else if (source.startsWith("git:")) {
-    execFileSync("git", ["clone", "--depth", "1", validGitSource(source), staging], { stdio: "ignore" });
+    clonePluginRepository(validGitSource(source), staging, "git");
   } else {
     throw new Error("source must be file:<path>, github:<owner/repo>, or git:<url>");
   }

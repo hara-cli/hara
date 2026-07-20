@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseTelegramUpdate, chunkText, photoFileId, telegramAdapter } from "../dist/gateway/telegram.js";
 import { parseDiscordMessage } from "../dist/gateway/discord.js";
-import { dispatchFeishuInbound, feishuAdapter, parseFeishuContent, flattenPost, feishuTimestampMs } from "../dist/gateway/feishu.js";
+import { dispatchFeishuInbound, FeishuWsHealthMonitor, feishuAdapter, parseFeishuContent, flattenPost, feishuTimestampMs } from "../dist/gateway/feishu.js";
 import { parseSlackEvent } from "../dist/gateway/slack.js";
 import { parseMattermostPost } from "../dist/gateway/mattermost.js";
 import { matrixChatType, matrixDirectRoomsFromSync, parseMatrixEvent, parseMxc } from "../dist/gateway/matrix.js";
@@ -433,6 +433,30 @@ test("parseDiscordMessage: ignores self+bots, parses text, surfaces image attach
   assert.equal(img.msg.text, "[图片]");
   assert.equal(img.msg.userName, "Jeff");
   assert.deepEqual(img.imageUrls, [{ url: "https://cdn/x.png", name: "x.png" }]); // pdf excluded
+});
+
+test("Feishu WS health tracks reconnect duration and raises a bounded frequency alert", () => {
+  let now = 0;
+  const health = new FeishuWsHealthMonitor(() => now);
+  health.ready();
+  let last;
+  for (let i = 0; i < 5; i++) {
+    now += 1_000;
+    last = health.disconnect();
+    assert.equal(last.total, i + 1);
+    assert.equal(last.hourCount, i + 1);
+    assert.equal(last.alert, i === 4, "only the threshold crossing alerts");
+    now += 500;
+    assert.equal(health.reconnected(), 500);
+  }
+  assert.equal(last.dayCount, 5);
+  assert.equal(last.connectedForMs, 1_000);
+
+  now += 60 * 60_000 + 1;
+  const later = health.disconnect();
+  assert.equal(later.hourCount, 1, "the one-hour window expires old disconnects");
+  assert.equal(later.dayCount, 6);
+  assert.equal(later.alert, false);
 });
 
 test("parseFeishuContent: text/image/file/audio/post normalization", () => {

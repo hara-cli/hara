@@ -166,6 +166,7 @@ import {
   homeWorkspaceActionError,
   isUnsafeProjectWorkspace,
   resolveWorkspaceSwitch,
+  suggestedProjectWorkspace,
 } from "./context/workspace-scope.js";
 import { getEmbedder } from "./search/embed.js";
 import { collectRepoChunksAsync, collectDirChunksAsync, buildIndex, indexPath, indexExists, type Chunk, type ChunkCollectionResult } from "./search/semindex.js";
@@ -3157,6 +3158,71 @@ program.action(async (opts) => {
   // hook above — see setFlagOverride() + resolveActive() in profile.ts. activeId() / loadActiveProfile()
   // pick it up automatically. `HARA_PROFILE` env still works as a transient override (one slot lower
   // in the priority chain than --profile).
+  // An interactive launch from Home gets an explicit, pre-provider handoff. Candidate discovery is limited
+  // to paths the user already established through interactive sessions/project registration; Hara never
+  // enumerates Home and never silently promotes a readable child into the workspace.
+  if (
+    !opts.print
+    && !opts.cwd
+    && !opts.resume
+    && stdin.isTTY
+    && stdout.isTTY
+    && isUnsafeProjectWorkspace(process.cwd())
+  ) {
+    let candidate: string | undefined;
+    try {
+      const recent = listSessions()
+        .filter((session) => session.source === undefined || session.source === "interactive")
+        .map((session) => session.cwd);
+      candidate = suggestedProjectWorkspace([
+        ...recent,
+        ...loadProjects().map((project) => project.path),
+      ]);
+    } catch {
+      // A damaged optional history/registry must not weaken the Home boundary or block startup.
+    }
+
+    const startupUsesTui = process.env.HARA_TUI !== "0";
+    if (candidate && startupUsesTui) {
+      // A readline question before Ink mounts leaves stdin unreadable on some terminals. The small Ink
+      // confirmation unmounts cleanly and is the same handoff used by the first-run AGENTS.md prompt.
+      if (await askConfirm(`Home is protected as personal-data scope. Switch to recent project ${displaySessionCwd(candidate)}?`)) {
+        process.chdir(candidate);
+      }
+    } else if (!candidate && startupUsesTui) {
+      out(
+        c.yellow("Home is protected as personal-data scope; no recent project is available to offer safely. ")
+          + c.dim("Start with `hara --cwd /path/to/project`, or use `/cd /path/to/project` after startup.\n"),
+      );
+    } else {
+      const rl = createInterface({ input: stdin, output: stdout });
+      try {
+        if (candidate) {
+          const answer = (
+            await rl.question(
+              c.yellow(`Home is protected as personal-data scope. Switch to recent project ${displaySessionCwd(candidate)}? `)
+                + c.dim("[Y/n] "),
+            )
+          ).trim().toLowerCase();
+          if (answer === "" || answer === "y" || answer === "yes") process.chdir(candidate);
+        } else {
+          const answer = (
+            await rl.question(
+              c.yellow("Home is protected as personal-data scope. Enter a project directory to switch now")
+                + c.dim(" (leave empty to stay at Home): "),
+            )
+          ).trim();
+          if (answer) {
+            const switched = resolveWorkspaceSwitch(answer, process.cwd());
+            if (switched.ok) process.chdir(switched.cwd);
+            else out(c.red(`(${switched.error})\n`));
+          }
+        }
+      } finally {
+        rl.close();
+      }
+    }
+  }
   // Resolve addressable headless roles BEFORE loading config/provider/MCP. A qualified project role is
   // an execution-home selection, so every downstream route (credentials, model, AGENTS.md, tools) must be
   // constructed from that home rather than from the shell directory that happened to launch hara.
