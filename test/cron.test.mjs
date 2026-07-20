@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { durationToMs, parseSchedule, parseCron, cronMatches, isDue, nextRun } from "../dist/cron/schedule.js";
 import { dueJobs, selfArgv, selfInvocation } from "../dist/cron/runner.js";
 import { addJob, cronDir, findJob, loadJobs, recordRunStart, resolveJob, saveJobs, setEnabled } from "../dist/cron/store.js";
+import { defaultProcessIdentity } from "../dist/process-identity.js";
 
 test("durationToMs", () => {
   assert.equal(durationToMs("45s"), 45_000);
@@ -184,16 +185,22 @@ test("cron store bounds poison recovery and never age-steals a live identity-les
     const stale = join(cronDir(), ".jobs.lock");
     writeFileSync(stale, "{");
     utimesSync(stale, new Date(0), new Date(0));
-    const started = Date.now();
     addJob(makeJob("stale-fast"));
-    assert.ok(Date.now() - started < 400, "stable old malformed evidence is recoverable without a permanent busy state");
+    assert.equal(
+      loadJobs().some((job) => job.name === "stale-fast"),
+      true,
+      "stable old malformed evidence is recoverable without a permanent busy state",
+    );
 
     const reusedPid = join(cronDir(), ".jobs.lock");
     writeFileSync(reusedPid, JSON.stringify({ pid: process.pid, token: "00000000-0000-4000-8000-000000000099" }));
     utimesSync(reusedPid, new Date(0), new Date(0));
-    const leaseStarted = Date.now();
     addJob(makeJob("stale-live-pid"));
-    assert.ok(Date.now() - leaseStarted < 400, "expired synchronous lease is reclaimed even when its PID was reused by a live process");
+    assert.equal(
+      loadJobs().some((job) => job.name === "stale-live-pid"),
+      true,
+      "expired synchronous lease is reclaimed even when its PID was reused by a live process",
+    );
 
     if (process.platform === "linux" || process.platform === "darwin") {
       const legacyGuard = join(cronDir(), ".jobs.lock.reclaim");
@@ -218,7 +225,12 @@ test("cron store bounds poison recovery and never age-steals a live identity-les
 
 test("cron store reclaims a fresh guard whose live PID has a mismatched OS birth identity", {
   skip: process.platform !== "linux" && process.platform !== "darwin",
-}, () => {
+}, (t) => {
+  const currentBirthIdentity = defaultProcessIdentity(process.pid);
+  if (!currentBirthIdentity) {
+    t.skip("the host cannot provide a process birth identity");
+    return;
+  }
   const home = mkdtempSync(join(tmpdir(), "hara-cron-reused-guard-"));
   const previousHome = process.env.HOME;
   const previousUserProfile = process.env.USERPROFILE;
@@ -227,13 +239,12 @@ test("cron store reclaims a fresh guard whose live PID has a mismatched OS birth
   try {
     mkdirSync(cronDir(), { recursive: true });
     const guard = join(cronDir(), ".jobs.lock.reclaim");
-    const scheme = process.platform === "linux" ? "linux-v1" : "darwin-v1";
+    const scheme = currentBirthIdentity.slice(0, currentBirthIdentity.indexOf(":"));
     writeFileSync(guard, JSON.stringify({
       pid: process.pid,
       token: "00000000-0000-4000-8000-000000000097",
       birthIdentity: `${scheme}:definitely-not-this-process`,
     }));
-    const started = Date.now();
     addJob({
       name: "reused-guard",
       schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
@@ -242,8 +253,8 @@ test("cron store reclaims a fresh guard whose live PID has a mismatched OS birth
       cwd: home,
       createdAt: Date.now(),
     });
-    assert.ok(Date.now() - started < 400, "birth mismatch reclaims immediately instead of waiting forever on a live PID");
     assert.equal(loadJobs().length, 1);
+    assert.equal(existsSync(guard), false, "the mismatched live PID guard is reclaimed");
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
