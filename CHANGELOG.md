@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.127.2 — 2026-07-20 — quiet scheduled monitoring
+
+- Cron delivery now supports `--deliver-mode always|on-output|on-error`. Existing jobs retain the
+  `always` heartbeat; high-frequency monitors can use `on-output` to stay silent unless redacted stdout
+  is non-empty, while `on-error` sends only failed outcomes.
+- Failure streak alarms remain independent of outcome filtering, so an `on-output` watchdog still sends
+  its configured `--alert-after N` alert even when routine runs and stderr-only diagnostics are quiet.
+- CLI, agent tool, and Desktop Serve automation APIs validate, persist, list, and display the same policy.
+- Upgrade with `npm i -g @nanhara/hara@0.127.2`.
+
 ## 0.127.1 — 2026-07-20 — managed access lifecycle
 
 - Managed enrollment now persists the control plane's authoritative device-token expiry. Hara warns

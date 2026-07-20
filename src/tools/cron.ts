@@ -40,8 +40,9 @@ registerTool({
     "something on a time basis. action=add needs `schedule` (cron expr \"0 9 * * *\" · \"every 30m\" · \"in 2h\" · ISO time) " +
     "and `task`. Optional: `name`; `mode` — \"print\" (default: run task as a hara prompt), \"org\" (role-routed), or " +
     "\"command\" (run task as a plain SHELL COMMAND — deterministic, no agent, no tokens; prefer it for fixed scripts); " +
-    "`tz` (IANA, e.g. Asia/Shanghai, for cron exprs); `deliver` (push each run's result: telegram:<chatId> | " +
-    "feishu:<chatId> | webhook:<url>); `alertAfter` (1..1000 consecutive failures, default 3). Other actions: " +
+    "`tz` (IANA, e.g. Asia/Shanghai, for cron exprs); `deliver` (telegram:<chatId> | feishu:<chatId> | " +
+    "weixin:<peerId> | webhook:<url>); `deliverMode` — always (default), on-output (stdout non-empty), or " +
+    "on-error (failed runs only); `alertAfter` (1..1000 consecutive failures, default 3). Other actions: " +
     "list · remove · enable · disable · run (fire now), with `id`. " +
     "Jobs fire via the OS scheduler even when hara isn't running.",
   input_schema: {
@@ -53,7 +54,8 @@ registerTool({
       name: { type: "string" },
       mode: { type: "string", enum: ["print", "org", "command"] },
       tz: { type: "string", description: "IANA timezone for cron exprs" },
-      deliver: { type: "string", description: "telegram:<chatId> | feishu:<chatId> | webhook:<url>" },
+      deliver: { type: "string", description: "telegram:<chatId> | feishu:<chatId> | weixin:<peerId> | webhook:<url>" },
+      deliverMode: { type: "string", enum: ["always", "on-output", "on-error"] },
       alertAfter: { type: "integer", minimum: 1, maximum: 1000, description: "consecutive failures before 🚨 (default 3)" },
       id: { type: "string", description: "job id (or unique prefix) for remove/enable/disable/run" },
     },
@@ -81,7 +83,7 @@ registerTool({
         .map((j) => {
           const now = Date.now();
           const next = nextRun(j, now);
-          return `${j.id} · ${j.enabled ? "on " : "OFF"} · ${j.name} · ${describeSchedule(j.schedule)}${j.tz ? ` @ ${j.tz}` : ""} · mode ${j.mode}${j.deliver ? ` · → ${j.deliver}` : ""} · next ${fmtNext(next, now)} · last ${status(j)}${j.consecutiveErrors ? ` (${j.consecutiveErrors}✗)` : ""}`;
+          return `${j.id} · ${j.enabled ? "on " : "OFF"} · ${j.name} · ${describeSchedule(j.schedule)}${j.tz ? ` @ ${j.tz}` : ""} · mode ${j.mode}${j.deliver ? ` · → ${j.deliver} (${j.deliverMode ?? "always"})` : ""} · next ${fmtNext(next, now)} · last ${status(j)}${j.consecutiveErrors ? ` (${j.consecutiveErrors}✗)` : ""}`;
         })
         .join("\n");
     }
@@ -102,6 +104,11 @@ registerTool({
         const d = parseDeliver(deliver);
         if ("error" in d) return `Error: ${d.error}`;
       }
+      const deliverMode = input.deliverMode === undefined ? undefined : String(input.deliverMode);
+      if (deliverMode && !deliver) return "Error: `deliverMode` requires `deliver`.";
+      if (deliverMode && !["always", "on-output", "on-error"].includes(deliverMode)) {
+        return "Error: `deliverMode` must be always, on-output, or on-error.";
+      }
       const alertAfter = input.alertAfter === undefined ? undefined : Number(input.alertAfter);
       if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
         return "Error: `alertAfter` must be an integer from 1 to 1000.";
@@ -121,6 +128,7 @@ registerTool({
           cwd: ctx.cwd,
           ...(tz ? { tz } : {}),
           ...(deliver ? { deliver } : {}),
+          ...(deliverMode ? { deliverMode: deliverMode as "always" | "on-output" | "on-error" } : {}),
           ...(alertAfter !== undefined ? { alertAfter } : {}),
           createdAt: Date.now(),
         });
@@ -128,7 +136,7 @@ registerTool({
         return `Error: ${error instanceof Error ? error.message : String(error)}`;
       }
       const warn = isInstalled() ? "" : "\n⚠ The OS scheduler isn't installed yet — tell the user to run `hara cron install` once, or jobs won't fire.";
-      return `✓ scheduled ${job.id} · ${describeSchedule(sched)}${tz ? ` @ ${tz}` : ""} · mode ${mode}${deliver ? ` · → ${deliver}` : ""}${alertAfter !== undefined ? ` · alert ≥${alertAfter}` : ""} · next ${fmt(nextRun(job, Date.now()))}${warn}`;
+      return `✓ scheduled ${job.id} · ${describeSchedule(sched)}${tz ? ` @ ${tz}` : ""} · mode ${mode}${deliver ? ` · → ${deliver} (${deliverMode ?? "always"})` : ""}${alertAfter !== undefined ? ` · alert ≥${alertAfter}` : ""} · next ${fmt(nextRun(job, Date.now()))}${warn}`;
     }
     // id-based actions
     const idArg = String(input.id ?? "").trim();

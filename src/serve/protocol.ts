@@ -24,7 +24,8 @@
 //   settings.providers.list {}                    → redacted provider catalog + current profile state
 //   settings.providers.test {provider,model,…}     → {ok,models,error?} (credential is ephemeral)
 //   settings.providers.save {provider,model,…}     → redacted state (credential is never returned)
-//   automation.add    {name,schedule,task,mode?,cwd?,tz?} → {id,name,schedule}
+//   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?}
+//                                                               → {id,name,schedule}
 //   automation.toggle {id,enabled}                → {id,enabled}
 //   automation.delete {id}                        → {id,deleted}
 //   session.rename    {sessionId,title}           → {sessionId,title}

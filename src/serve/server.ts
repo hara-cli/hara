@@ -53,6 +53,7 @@ import { listInstalled, enabledPlugins, setPluginEnabled, panelsForProject } fro
 import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
 import { loadJobs, addJob, removeJob, setEnabled } from "../cron/store.js";
 import { parseSchedule, describeSchedule } from "../cron/schedule.js";
+import { parseDeliver } from "../cron/deliver.js";
 import { loadTasks } from "../tools/task.js";
 import { listPending, resolvePending } from "../gateway/flows-pending.js";
 import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from "../tools/todo.js";
@@ -1142,7 +1143,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             // The automation timeline's data: cron jobs with their last outcome, plus this machine's
             // automated sessions (source=cron/gateway) so the desktop can render results and "continue
             // as conversation". Read-only.
-            const jobs = loadJobs().map((j) => ({ id: j.id, name: j.name, mode: j.mode, cwd: j.cwd, enabled: j.enabled, deliver: j.deliver, lastRunAt: j.lastRunAt, lastStatus: j.lastStatus, lastError: j.lastError, schedule: describeSchedule(j.schedule) }));
+            const jobs = loadJobs().map((j) => ({
+              id: j.id,
+              name: j.name,
+              mode: j.mode,
+              cwd: j.cwd,
+              enabled: j.enabled,
+              deliver: j.deliver,
+              deliverMode: j.deliverMode ?? "always",
+              alertAfter: j.alertAfter ?? 3,
+              lastRunAt: j.lastRunAt,
+              lastStatus: j.lastStatus,
+              lastError: j.lastError,
+              schedule: describeSchedule(j.schedule),
+            }));
             const automated = hub.list().filter((m) => m.source === "cron" || m.source === "gateway").map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, source: m.source, sourceName: m.sourceName, updatedAt: m.updatedAt }));
             return reply(rpcResult(id!, { jobs, sessions: automated }));
           }
@@ -1173,6 +1187,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const sched = parseSchedule(p.schedule, Date.now());
             if ("error" in sched) return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${sched.error}`));
+            const deliver = typeof p.deliver === "string" && p.deliver ? p.deliver : undefined;
+            if (deliver) {
+              const parsed = parseDeliver(deliver);
+              if ("error" in parsed) return reply(rpcError(id, ERR.PARAMS, parsed.error));
+            }
+            const deliverMode = typeof p.deliverMode === "string" && p.deliverMode
+              ? p.deliverMode
+              : undefined;
+            if (deliverMode && !deliver) return reply(rpcError(id, ERR.PARAMS, "deliverMode requires deliver"));
+            if (deliverMode && !["always", "on-output", "on-error"].includes(deliverMode)) {
+              return reply(rpcError(id, ERR.PARAMS, "deliverMode must be always, on-output, or on-error"));
+            }
+            const alertAfter = p.alertAfter === undefined ? undefined : Number(p.alertAfter);
+            if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
+              return reply(rpcError(id, ERR.PARAMS, "alertAfter must be an integer from 1 to 1000"));
+            }
             const job = addJob({
               name: p.name.slice(0, 60),
               schedule: sched,
@@ -1180,6 +1210,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               mode: (["print", "org", "command"] as const).includes(p.mode) ? p.mode : "print",
               cwd: typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd,
               ...(typeof p.tz === "string" && p.tz ? { tz: p.tz } : {}),
+              ...(deliver ? { deliver } : {}),
+              ...(deliverMode ? { deliverMode: deliverMode as "always" | "on-output" | "on-error" } : {}),
+              ...(alertAfter !== undefined ? { alertAfter } : {}),
               createdAt: Date.now(),
             });
             return reply(rpcResult(id!, { id: job.id, name: job.name, schedule: describeSchedule(job.schedule) }));

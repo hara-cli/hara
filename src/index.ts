@@ -2632,7 +2632,8 @@ function renderCronJobs(): string {
           : j.lastStatus === "error"
             ? c.red(`err${elapsed}`)
             : c.dim("—");
-    return `${c.bold(j.id)} ${describeSchedule(j.schedule)} ${c.dim(`· ${j.mode} · next ${nextLabel} · last ${status}`)}${j.enabled ? "" : c.dim(" [disabled]")}\n   ${c.dim(j.name)}`;
+    const delivery = j.deliver ? ` · deliver ${j.deliver} (${j.deliverMode ?? "always"})` : "";
+    return `${c.bold(j.id)} ${describeSchedule(j.schedule)} ${c.dim(`· ${j.mode}${delivery} · next ${nextLabel} · last ${status}`)}${j.enabled ? "" : c.dim(" [disabled]")}\n   ${c.dim(j.name)}`;
   });
   return head + "\n" + lines.join("\n") + "\n";
 }
@@ -2645,9 +2646,10 @@ cronCmd
   .option("--org", "run via `hara org` (role routing + review) instead of a plain `hara -p` prompt")
   .option("--command", "run the task as a plain SHELL COMMAND — deterministic, no agent, no tokens")
   .option("--tz <zone>", 'IANA timezone for cron exprs (e.g. "Asia/Shanghai"); default = local time')
-  .option("--deliver <spec>", "push each run's result: telegram:<chatId> | feishu:<chatId> | webhook:<url>")
+  .option("--deliver <spec>", "push selected results: telegram:<chatId> | feishu:<chatId> | weixin:<peerId> | webhook:<url>")
+  .option("--deliver-mode <mode>", "notification policy: always (default) | on-output | on-error")
   .option("--alert-after <n>", "send a 🚨 after N consecutive failures (1..1000; default 3)")
-  .action((schedule: string, taskParts: string[], opts: { name?: string; org?: boolean; command?: boolean; tz?: string; deliver?: string; alertAfter?: string }) => {
+  .action((schedule: string, taskParts: string[], opts: { name?: string; org?: boolean; command?: boolean; tz?: string; deliver?: string; deliverMode?: string; alertAfter?: string }) => {
     const task = taskParts.join(" ");
     if (opts.org && opts.command) return void out(c.red("--org and --command are mutually exclusive\n"));
     const sched = parseSchedule(schedule, Date.now());
@@ -2657,6 +2659,10 @@ cronCmd
     if (opts.deliver) {
       const d = parseDeliver(opts.deliver);
       if ("error" in d) return void out(c.red(d.error + "\n"));
+    }
+    if (opts.deliverMode && !opts.deliver) return void out(c.red("--deliver-mode requires --deliver\n"));
+    if (opts.deliverMode && !["always", "on-output", "on-error"].includes(opts.deliverMode)) {
+      return void out(c.red("--deliver-mode must be always, on-output, or on-error\n"));
     }
     const alertAfter = opts.alertAfter === undefined ? undefined : Number(opts.alertAfter);
     if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
@@ -2673,13 +2679,14 @@ cronCmd
         cwd: process.cwd(),
         ...(opts.tz ? { tz: opts.tz } : {}),
         ...(opts.deliver ? { deliver: opts.deliver } : {}),
+        ...(opts.deliverMode ? { deliverMode: opts.deliverMode as "always" | "on-output" | "on-error" } : {}),
         ...(alertAfter !== undefined ? { alertAfter } : {}),
         createdAt: Date.now(),
       });
     } catch (error) {
       return void out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
     }
-    out(c.green(`✓ scheduled ${job.id}`) + c.dim(` · ${describeSchedule(sched)}${opts.tz ? ` @ ${opts.tz}` : ""} · ${job.mode}${opts.deliver ? ` · → ${opts.deliver}` : ""}${alertAfter !== undefined ? ` · alert ≥${alertAfter}` : ""} · cwd ${job.cwd}\n`));
+    out(c.green(`✓ scheduled ${job.id}`) + c.dim(` · ${describeSchedule(sched)}${opts.tz ? ` @ ${opts.tz}` : ""} · ${job.mode}${opts.deliver ? ` · → ${opts.deliver} (${opts.deliverMode ?? "always"})` : ""}${alertAfter !== undefined ? ` · alert ≥${alertAfter}` : ""} · cwd ${job.cwd}\n`));
     if (!isInstalled()) out(c.yellow("⚠ scheduler not installed yet — run `hara cron install` so jobs actually fire.\n"));
   });
 // Resolve an id/prefix to one job, printing a clear error for none / ambiguous (never act on a guess).

@@ -267,6 +267,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
   const store = memStore();
   const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(textProvider, store));
   const c = await connect(srv.port);
+  let automationId;
   try {
     // unauthenticated calls bounce; bad token bounces
     const denied = await c.call("session.list", {});
@@ -320,9 +321,44 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(Array.isArray(auto.result.jobs) && Array.isArray(auto.result.sessions), "automation.list returns jobs + sessions");
     // sessions created through serve are stamped interactive → never leak into the automation timeline
     assert.equal(auto.result.sessions.some((s) => s.id === sid), false, "serve session not in automation list");
+
+    const quietAutomation = await c.call("automation.add", {
+      name: `quiet monitor ${Date.now()}`,
+      schedule: "every 5m",
+      task: "check",
+      mode: "command",
+      deliver: "feishu:oc_test",
+      deliverMode: "on-output",
+      alertAfter: 2,
+    });
+    automationId = quietAutomation.result.id;
+    assert.ok(automationId, "automation.add returns the created id");
+    const autoWithQuiet = await c.call("automation.list", {});
+    const quietJob = autoWithQuiet.result.jobs.find((job) => job.id === automationId);
+    assert.equal(quietJob.deliver, "feishu:oc_test");
+    assert.equal(quietJob.deliverMode, "on-output");
+    assert.equal(quietJob.alertAfter, 2);
+
+    const missingDeliver = await c.call("automation.add", {
+      name: "missing delivery",
+      schedule: "every 5m",
+      task: "check",
+      deliverMode: "on-error",
+    });
+    assert.equal(missingDeliver.error.code, -32602);
+    const invalidDeliverMode = await c.call("automation.add", {
+      name: "bad delivery mode",
+      schedule: "every 5m",
+      task: "check",
+      deliver: "feishu:oc_test",
+      deliverMode: "sometimes",
+    });
+    assert.equal(invalidDeliverMode.error.code, -32602);
+
     const listed2 = await c.call("session.list", {});
     assert.equal(listed2.result.sessions[0].source, "interactive", "session.list carries source");
   } finally {
+    if (automationId) await c.call("automation.delete", { id: automationId });
     c.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });

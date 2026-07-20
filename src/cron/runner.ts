@@ -325,6 +325,8 @@ export interface CronRunOptions {
 export interface CronRunResult {
   ok: boolean;
   error?: string;
+  /** Redacted stdout tail only; delivery mode on-output intentionally ignores stderr. */
+  stdout?: string;
   output?: string;
   /** A real job deadline or tick watchdog fired (not merely a non-zero exit). */
   timedOut?: boolean;
@@ -423,7 +425,8 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
       resolve({ ok: false, error: `failed to start: ${error instanceof Error ? error.message : String(error)}`, output: "" });
       return;
     }
-    let tail = ""; // last few KB, for chat delivery (the full stream goes to the log file)
+    let tail = ""; // combined stdout/stderr tail for diagnostics and ordinary delivery
+    let stdoutTail = ""; // separate so on-output never turns stderr noise into a notification
     let logBytes = (() => { try { return statSync(log).size; } catch { return 0; } })();
     let logCapped = false;
     let done = false;
@@ -453,7 +456,10 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
     };
     // stdout and stderr are separate byte streams; sharing a line buffer can splice unrelated chunks and
     // either corrupt output or create an unsafe synthetic token. Keep an independent redactor per stream.
-    const stdout = createToolOutputLineRedactor(appendSafe);
+    const stdout = createToolOutputLineRedactor((safe) => {
+      stdoutTail = (stdoutTail + safe).slice(-4_000);
+      appendSafe(safe);
+    });
     const stderr = createToolOutputLineRedactor(appendSafe);
     const flush = (): void => { stdout.flush(); stderr.flush(); };
     const settle = (result: CronRunResult): void => {
@@ -470,6 +476,7 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
       resolve({
         ...result,
         error: result.error ? redactToolSubprocessOutput(result.error) : undefined,
+        stdout: stdoutTail,
         output: tail,
       });
     };

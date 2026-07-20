@@ -39,8 +39,10 @@ const {
   MAX_CRON_TICK_TIMEOUT_MS,
 } = await import("../dist/cron/runner.js");
 const { parseDeliver } = await import("../dist/cron/deliver.js");
+const { defaultProcessIdentity } = await import("../dist/process-identity.js");
 const { getTool } = await import("../dist/tools/registry.js");
 await import("../dist/tools/cron.js");
+const processBirthIdentityAvailable = defaultProcessIdentity(process.pid) !== null;
 
 test("timezone: '0 9 * * *' @ Asia/Shanghai fires at 01:00 UTC, not at 09:00 UTC", () => {
   assert.ok(validTz("Asia/Shanghai") && !validTz("Not/AZone"), "tz validation");
@@ -61,6 +63,19 @@ test("command mode: runs the task as a shell command — deterministic, exit cod
     const r = await runJobOnce(ok);
     assert.equal(r.ok, true);
     assert.ok(r.output.includes("deterministic-42"), "stdout captured for delivery");
+    assert.ok(r.stdout.includes("deterministic-42"), "stdout is tracked separately for on-output delivery");
+    const stderrOnly = addJob({
+      name: "stderr-only",
+      schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+      task: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stderr.write('diagnostic-only')")}`,
+      mode: "command",
+      cwd: process.cwd(),
+      createdAt: Date.now(),
+    });
+    const stderrResult = await runJobOnce(stderrOnly);
+    assert.equal(stderrResult.ok, true);
+    assert.match(stderrResult.output, /diagnostic-only/);
+    assert.equal(stderrResult.stdout, "", "stderr must not make an on-output job noisy");
     const bad = addJob({ name: "boom", schedule: { kind: "every", everyMs: 60_000, display: "every 1m" }, task: "exit 3", mode: "command", cwd: process.cwd(), createdAt: Date.now() });
     const rb = await runJobOnce(bad);
     assert.equal(rb.ok, false);
@@ -571,7 +586,9 @@ test("a dead takeover guard is recoverable but an aged live legacy guard fails c
 });
 
 test("a live tick PID with a different same-version birth identity is reclaimable", {
-  skip: process.platform !== "linux" && process.platform !== "darwin",
+  // Sandboxed macOS runners may deny the nested `ps` probe. Production correctly fails closed in that
+  // environment, but this specific PID-reuse assertion needs a comparable birth identity.
+  skip: (process.platform !== "linux" && process.platform !== "darwin") || !processBirthIdentityAvailable,
 }, async () => {
   const savedHome = process.env.HOME;
   const home = mkdtempSync(join(tmpdir(), "hara-cron-reused-tick-pid-"));
@@ -676,6 +693,72 @@ test("delivery + failure alert: outcome pushed; 🚨 fires at the threshold with
   // success resets the streak
   recordRun(job.id, now + 5, "ok");
   assert.equal(findJob(job.id).consecutiveErrors, 0, "streak reset on success");
+});
+
+test("delivery modes suppress empty heartbeat noise without weakening failure alerts", async () => {
+  const sent = [];
+  const fakeDeliver = async (spec, text) => (sent.push({ spec, text }), null);
+  const now = Date.now();
+  const base = {
+    schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+    task: "x",
+    mode: "command",
+    cwd: process.cwd(),
+    deliver: "feishu:oc_test",
+    createdAt: now,
+  };
+
+  const outputOnly = addJob({ ...base, name: "output-only", deliverMode: "on-output", alertAfter: 1 });
+  await deliverOutcome(
+    findJob(outputOnly.id),
+    { ok: true, stdout: "", output: "stderr-only diagnostic" },
+    fakeDeliver,
+    now + 1,
+  );
+  assert.equal(sent.length, 0, "empty stdout success stays silent even when stderr/log output exists");
+
+  await deliverOutcome(
+    findJob(outputOnly.id),
+    { ok: true, stdout: "price changed", output: "price changed" },
+    fakeDeliver,
+    now + 2,
+  );
+  assert.equal(sent.filter((entry) => entry.text.startsWith("⏰")).length, 1);
+
+  recordRun(outputOnly.id, now + 3, "error", "feed unavailable");
+  await deliverOutcome(
+    findJob(outputOnly.id),
+    { ok: false, error: "feed unavailable", stdout: "", output: "stderr-only" },
+    fakeDeliver,
+    now + 3,
+  );
+  assert.equal(
+    sent.filter((entry) => entry.text.startsWith("🚨")).length,
+    1,
+    "on-output suppresses the routine outcome but alertAfter still reports a failure streak",
+  );
+
+  const errorsOnly = addJob({ ...base, name: "errors-only", deliverMode: "on-error" });
+  await deliverOutcome(
+    findJob(errorsOnly.id),
+    { ok: true, stdout: "routine result", output: "routine result" },
+    fakeDeliver,
+    now + 4,
+  );
+  const beforeFailure = sent.length;
+  await deliverOutcome(
+    findJob(errorsOnly.id),
+    { ok: false, error: "failed", stdout: "", output: "" },
+    fakeDeliver,
+    now + 5,
+  );
+  assert.equal(sent.length, beforeFailure + 1);
+  assert.match(sent.at(-1).text, /^⏰ errors-only ✗/);
+
+  const legacy = addJob({ ...base, name: "legacy-always" });
+  const beforeLegacy = sent.length;
+  await deliverOutcome(findJob(legacy.id), { ok: true, stdout: "", output: "" }, fakeDeliver, now + 6);
+  assert.equal(sent.length, beforeLegacy + 1, "missing deliverMode remains backward-compatible always");
 });
 
 test("failed timeout delivery stays durable and a later tick retries the same idempotency keys", async () => {
@@ -964,6 +1047,27 @@ test("cronjob tool: add/list/remove work; cron-run sessions are refused (recursi
   assert.match(badTz, /invalid timezone/);
   const badAlert = await tool.run({ action: "add", schedule: "0 9 * * *", task: "x", alertAfter: 0 }, { cwd: process.cwd() });
   assert.match(badAlert, /alertAfter.*1 to 1000/);
+  const quiet = await tool.run({
+    action: "add",
+    schedule: "every 5m",
+    task: "check price",
+    deliver: "feishu:oc_test",
+    deliverMode: "on-output",
+  }, { cwd: process.cwd() });
+  assert.match(quiet, /on-output/);
+  const quietId = /✓ scheduled (\S+)/.exec(quiet)[1];
+  assert.equal(findJob(quietId).deliverMode, "on-output");
+  const quietList = await tool.run({ action: "list" }, { cwd: process.cwd() });
+  assert.match(quietList, /feishu:oc_test \(on-output\)/);
+  assert.match(
+    await tool.run({ action: "add", schedule: "every 5m", task: "x", deliverMode: "on-error" }, { cwd: process.cwd() }),
+    /requires `deliver`/,
+  );
+  assert.match(
+    await tool.run({ action: "add", schedule: "every 5m", task: "x", deliver: "feishu:oc_test", deliverMode: "sometimes" }, { cwd: process.cwd() }),
+    /always, on-output, or on-error/,
+  );
+  assert.match(await tool.run({ action: "remove", id: quietId }, { cwd: process.cwd() }), /✓ removed/);
 });
 
 test("cronjob at Home keeps management actions but refuses to persist a new Home-root job", async () => {

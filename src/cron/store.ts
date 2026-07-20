@@ -46,8 +46,12 @@ export interface CronPendingNotification {
 export interface CronDeliveryOutcome {
   ok: boolean;
   error?: string;
+  /** Redacted stdout only. `output` may also contain stderr for diagnostics. */
+  stdout?: string;
   output?: string;
 }
+
+export type CronDeliverMode = "always" | "on-output" | "on-error";
 
 /** Hard persistence bounds: outages must apply backpressure instead of growing jobs.json forever. */
 export const MAX_CRON_PENDING_NOTIFICATIONS = 64;
@@ -68,6 +72,8 @@ export interface CronJob {
   tz?: string;
   /** Push each run's outcome to a channel: telegram:<chatId> | feishu:<chatId> | webhook:<url>. */
   deliver?: string;
+  /** Outcome noise policy. Alerts remain independent and are still sent at alertAfter. */
+  deliverMode?: CronDeliverMode;
   /** Consecutive failures before a 🚨 alert fires on the deliver channel (default 3). */
   alertAfter?: number;
   enabled: boolean;
@@ -458,6 +464,13 @@ function validCronJob(value: unknown): value is CronJob {
     && (job.pendingDueAt === undefined || (job.schedule.kind === "cron" && validFinite(job.pendingDueAt)))
     && (job.tz === undefined || (typeof job.tz === "string" && validTz(job.tz)))
     && (job.deliver === undefined || (typeof job.deliver === "string" && job.deliver.length > 0 && job.deliver.length <= 4_096))
+    && (
+      job.deliverMode === undefined
+      || (
+        job.deliver !== undefined
+        && (job.deliverMode === "always" || job.deliverMode === "on-output" || job.deliverMode === "on-error")
+      )
+    )
     && (job.alertAfter === undefined || (Number.isInteger(job.alertAfter) && job.alertAfter >= 1 && job.alertAfter <= 1_000))
     && (job.lastRunAt === undefined || validFinite(job.lastRunAt))
     && (job.runningSince === undefined || validFinite(job.runningSince))
@@ -724,10 +737,17 @@ function enqueueOutcomeForJob(
   if (!job.deliver) return [];
   const queued: string[] = [];
   const snippet = notificationText(result.output, 1_500).trim();
+  const stdout = notificationText(result.stdout, 1_500).trim();
   const safeError = notificationText(result.error || "failed", 1_000);
   const head = result.ok ? `⏰ ${job.name} ✓` : `⏰ ${job.name} ✗ ${safeError}`;
-  const outcomeId = enqueueNotification(job, "outcome", snippet ? `${head}\n${snippet}` : head, nowMs, attemptKey);
-  if (outcomeId) queued.push(outcomeId);
+  const mode = job.deliverMode ?? "always";
+  const shouldDeliverOutcome = mode === "always"
+    || (mode === "on-output" && stdout.length > 0)
+    || (mode === "on-error" && !result.ok);
+  if (shouldDeliverOutcome) {
+    const outcomeId = enqueueNotification(job, "outcome", snippet ? `${head}\n${snippet}` : head, nowMs, attemptKey);
+    if (outcomeId) queued.push(outcomeId);
+  }
 
   if (!result.ok) {
     const count = job.consecutiveErrors ?? 0;
