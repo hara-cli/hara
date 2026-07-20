@@ -28,6 +28,10 @@
 //                                                               → {id,name,schedule}
 //   automation.toggle {id,enabled}                → {id,enabled}
 //   automation.delete {id}                        → {id,deleted}
+//   artifact.import   {sourcePath,title?,kind?}    → {artifact,currentRevision,content}
+//   artifact.list     {}                          → {artifacts,invalid,truncated}
+//   artifact.get      {artifactId}                → {artifact,currentRevision,content}
+//   artifact.revisions {artifactId}               → {artifactId,revisions}
 //   session.rename    {sessionId,title}           → {sessionId,title}
 //   session.archive   {sessionId,archived}        → {sessionId,archived}   (list hides archived unless {archived:true})
 //   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)

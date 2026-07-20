@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.128.0 — 2026-07-20 — local deliverable foundation
+
+- Hara Serve now provides the first `artifact/1` local runtime through authenticated
+  `artifact.import`, `artifact.list`, `artifact.get`, and `artifact.revisions` methods. Presentations,
+  spreadsheets, and documents receive opaque Artifact/revision identities and a stable content receipt.
+- Import is copy-on-write and leaves the selected file untouched. The private store rejects relative paths,
+  symbolic links, hard links, protected credential/configuration files, macro-enabled Office extensions,
+  type-confused Office packages, empty files, and files over 64 MiB; activation and immutable binary writes
+  are crash-safe, owner-only, and digest-verified.
+- Local metadata never retains the selected absolute path. Corrupt entries remain hidden without hiding
+  healthy work, and unexpected filesystem failures cross the Desktop RPC boundary as path-free errors.
+- This release intentionally stores and verifies deliverables but does not render, edit, export, or execute
+  them. Those actions remain gated on a matching reviewed Office capability in the next vertical slices.
+- Upgrade with `npm i -g @nanhara/hara@0.128.0`.
+
 ## 0.127.2 — 2026-07-20 — quiet scheduled monitoring
 
 - Cron delivery now supports `--deliver-mode always|on-output|on-error`. Existing jobs retain the

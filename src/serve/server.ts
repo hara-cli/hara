@@ -66,6 +66,14 @@ import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 import {
+  ArtifactStoreError,
+  getArtifact,
+  importArtifact,
+  listArtifactRevisions,
+  listArtifacts,
+  type ArtifactKind,
+} from "../artifacts/store.js";
+import {
   consumePendingTaskSteering,
   createTaskExecution,
   continueTaskExecution,
@@ -117,6 +125,7 @@ export interface ServeDeps {
   store?: SessionStore; // tests inject a hermetic store
   quietDiscovery?: boolean; // tests: skip ~/.hara/serve.json
   discoveryHome?: string; // tests: isolate the discovery file from the real home directory
+  artifactHome?: string; // tests/embedders: isolate ~/.hara/artifacts from the real home directory
   compactTimeoutMs?: number; // tests/embedders: bound a provider that ignores cancellation
 }
 
@@ -181,6 +190,24 @@ const COMPACT_TIMEOUT_MS = 60_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 const SOCKET_CLOSE_GRACE_MS = 250;
 const DISCOVERY_LOCK_WAIT_MS = 2_000;
+
+const artifactRpcError = (
+  id: number | string | null,
+  error: unknown,
+  action: "import" | "list" | "open" | "list revisions",
+): string => {
+  if (error instanceof ArtifactStoreError) {
+    const code = error.code === "ARTIFACT_CORRUPT" ? ERR.INTERNAL : ERR.PARAMS;
+    return rpcError(id, code, error.message);
+  }
+  return rpcError(
+    id,
+    ERR.INTERNAL,
+    action === "import"
+      ? "Artifact import failed safely; the source file was not modified"
+      : `Artifact ${action} failed safely; local Artifact data was not changed`,
+  );
+};
 
 interface DiscoveryRecord {
   host: string;
@@ -495,6 +522,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
   // Discovery file — the desktop shell reads this to find the running server (like a pid/port file).
   const discoveryDir = join(deps.discoveryHome ?? homedir(), ".hara");
+  const artifactHome = deps.artifactHome ?? homedir();
   const discoveryPath = join(discoveryDir, "serve.json");
   const discovery: DiscoveryRecord = { host: opts.host, port, token, pid: process.pid, version: deps.version, instanceId };
   if (!deps.quietDiscovery) {
@@ -883,6 +911,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
+            "artifact.import", "artifact.list", "artifact.get", "artifact.revisions",
             "tasks.list", "approvals.list", "approvals.resolve",
           ];
           const runtime = runtimeInfo();
@@ -1226,6 +1255,58 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.id !== "string") return reply(rpcError(id, ERR.PARAMS, "id required"));
             if (!removeJob(p.id)) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
             return reply(rpcResult(id!, { id: p.id, deleted: true }));
+          }
+          case "artifact.import": {
+            if (typeof p.sourcePath !== "string" || !p.sourcePath) {
+              return reply(rpcError(id, ERR.PARAMS, "sourcePath required"));
+            }
+            if (
+              p.kind !== undefined
+              && p.kind !== "presentation"
+              && p.kind !== "spreadsheet"
+              && p.kind !== "document"
+            ) return reply(rpcError(id, ERR.PARAMS, "kind must be presentation, spreadsheet, or document"));
+            if (p.title !== undefined && typeof p.title !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "title must be a string"));
+            }
+            try {
+              const details = await importArtifact(artifactHome, {
+                sourcePath: p.sourcePath,
+                ...(p.title !== undefined ? { title: p.title } : {}),
+                ...(p.kind !== undefined ? { kind: p.kind as ArtifactKind } : {}),
+              });
+              return reply(rpcResult(id!, details));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "import"));
+            }
+          }
+          case "artifact.list": {
+            try {
+              return reply(rpcResult(id!, listArtifacts(artifactHome)));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "list"));
+            }
+          }
+          case "artifact.get": {
+            if (typeof p.artifactId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId required"));
+            }
+            try {
+              return reply(rpcResult(id!, getArtifact(artifactHome, p.artifactId)));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "open"));
+            }
+          }
+          case "artifact.revisions": {
+            if (typeof p.artifactId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId required"));
+            }
+            try {
+              const revisions = listArtifactRevisions(artifactHome, p.artifactId);
+              return reply(rpcResult(id!, { artifactId: p.artifactId, revisions }));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "list revisions"));
+            }
           }
           case "skills.list": {
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;

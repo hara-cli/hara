@@ -265,7 +265,10 @@ test("serve discovery: a write failure closes the already-listening socket", { t
 test("serve e2e: auth gate → create → send streams text events and returns the reply", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-"));
   const store = memStore();
-  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(textProvider, store));
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    { ...baseDeps(textProvider, store), artifactHome: dir },
+  );
   const c = await connect(srv.port);
   let automationId;
   try {
@@ -280,6 +283,27 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(init.result.capabilities.methods.includes("automation.list"), "capabilities advertised");
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
+    for (const method of ["artifact.import", "artifact.list", "artifact.get", "artifact.revisions"]) {
+      assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
+    }
+
+    const artifactSource = join(dir, "brief.docx");
+    writeFileSync(artifactSource, Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x01]));
+    const importedArtifact = await c.call("artifact.import", {
+      sourcePath: artifactSource,
+      title: "Client brief",
+    });
+    assert.equal(importedArtifact.result.artifact.kind, "document");
+    assert.equal(importedArtifact.result.artifact.title, "Client brief");
+    const artifactId = importedArtifact.result.artifact.artifactId;
+    const artifactList = await c.call("artifact.list", {});
+    assert.equal(artifactList.result.artifacts.some((artifact) => artifact.artifactId === artifactId), true);
+    const artifactDetails = await c.call("artifact.get", { artifactId });
+    assert.equal(artifactDetails.result.currentRevision.artifactId, artifactId);
+    const artifactRevisions = await c.call("artifact.revisions", { artifactId });
+    assert.equal(artifactRevisions.result.revisions.length, 1);
+    const badArtifactImport = await c.call("artifact.import", { sourcePath: "relative.docx" });
+    assert.equal(badArtifactImport.error.code, -32602);
 
     const created = await c.call("session.create", {});
     const sid = created.result.sessionId;

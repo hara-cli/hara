@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.127.2",
+  "version": "0.128.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"

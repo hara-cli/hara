@@ -33,7 +33,7 @@ import {
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 
-const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin", "tool-results", "plugin-receipts"]);
+const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin", "tool-results", "plugin-receipts", "artifacts"]);
 const tightenedHomes = new Set<string>();
 const DEFAULT_MIGRATION_CAP = 50_000;
 
@@ -375,6 +375,97 @@ function syncPrivateDirectory(path: string): void {
     }
   } catch {
     /* Directory fsync is not portable; the staged file itself is always fsynced. */
+  }
+}
+
+/**
+ * Crash-safe immutable binary creation below a bound private-state directory.
+ *
+ * Artifact revisions use this instead of the text replacement writer: revision content is immutable,
+ * may be a binary Office file, and must never replace an entry that appeared concurrently. The staged
+ * inode is fsync'd, hard-linked into place with create-if-absent semantics, and checked again after the
+ * temporary name is removed.
+ */
+export function writePrivateStateBytesOnceSync(
+  binding: PrivateStateFileBinding,
+  bytes: Uint8Array,
+): void {
+  const { directory, path } = binding;
+  verifyPrivateDirectory(directory);
+  if (resolve(path) !== join(directory.path, checkedPrivateComponent(basename(path)))) {
+    throw new Error(`private Hara state file is outside '${directory.path}'`);
+  }
+  try {
+    lstatSync(path);
+    throw new Error(`private Hara state file already exists: '${path}'`);
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
+  const temp = join(directory.path, `.hara-private-${process.pid}-${randomUUID()}.tmp`);
+  let fd: number | undefined;
+  let staged: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink"> | undefined;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    writeFileSync(fd, bytes);
+    try {
+      fchmodSync(fd, 0o600);
+    } catch (error) {
+      if (process.platform !== "win32") throw error;
+    }
+    fsyncSync(fd);
+    const stagedInfo = fstatSync(fd);
+    if (!stagedInfo.isFile() || stagedInfo.nlink !== 1) {
+      throw new Error("unsafe private Hara binary staging inode");
+    }
+    staged = {
+      dev: stagedInfo.dev,
+      ino: stagedInfo.ino,
+      mode: stagedInfo.mode & 0o777,
+      nlink: stagedInfo.nlink,
+    };
+    closeSync(fd);
+    fd = undefined;
+
+    verifyPrivateDirectory(directory);
+    try {
+      linkSync(temp, path);
+    } catch (error: any) {
+      if (error?.code === "EEXIST") {
+        throw new Error(`private Hara state file changed before create: '${path}'`);
+      }
+      throw error;
+    }
+
+    const linkedStaged = { ...staged, nlink: staged.nlink + 1 };
+    if (!samePrivateFile(temp, linkedStaged) || !samePrivateFile(path, linkedStaged)) {
+      throw new Error(
+        `private Hara binary staging identity changed during commit: '${path}'`
+        + `; expected=${JSON.stringify(linkedStaged)}`
+        + `; staging=${privateFileIdentitySummary(temp)}`
+        + `; target=${privateFileIdentitySummary(path)}`,
+      );
+    }
+    unlinkSync(temp);
+    const committed = lstatSync(path);
+    if (
+      !committed.isFile()
+      || committed.isSymbolicLink()
+      || !sameOpenedFileIdentity(committed, staged)
+      || committed.nlink !== 1
+      || (process.platform !== "win32" && (committed.mode & 0o777) !== 0o600)
+    ) throw new Error(`private Hara state file changed during commit: '${path}'`);
+    verifyPrivateDirectory(directory);
+    syncPrivateDirectory(directory.path);
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* preserve original error */ }
+    if (staged) {
+      try {
+        if (samePrivateFile(temp, staged)) unlinkSync(temp);
+      } catch {
+        /* A changed entry is retained rather than unlinking an attacker-supplied replacement. */
+      }
+    }
   }
 }
 
