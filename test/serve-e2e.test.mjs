@@ -354,6 +354,19 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     const taskStates = c.events.filter((e) => e.method === "event.task_state").map((e) => e.params);
     assert.equal(taskStates[0].state, "running");
     assert.equal(taskStates[0].phase, "starting");
+    assert.equal(
+      new Set(taskStates.map((state) => state.streamId)).size,
+      1,
+      "one server run emits one ordered task-state stream",
+    );
+    assert.ok(
+      taskStates.every((state) => Number.isSafeInteger(state.sequence) && state.sequence > 0),
+      "every task state has a valid stream sequence",
+    );
+    assert.ok(
+      taskStates.every((state, index) => index === 0 || state.sequence > taskStates[index - 1].sequence),
+      "task-state sequences strictly increase",
+    );
     assert.ok(taskStates.some((state) => state.phase === "responding"), "stream phase is explicit");
     assert.equal(taskStates.at(-1).state, "completed");
     assert.equal(taskStates.at(-1).taskStatus, "completed");
@@ -1170,6 +1183,11 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
       "ambient task state cannot expose command or workspace path previews",
     );
     assert.equal(c.events.filter((e) => e.method === "event.task_state").at(-1).params.state, "completed");
+    const lifecycle = c.events.filter((e) => e.method === "event.task_state").map((e) => e.params);
+    assert.ok(
+      lifecycle.every((event, index) => index === 0 || event.sequence > lifecycle[index - 1].sequence),
+      "approval transitions retain strict event ordering",
+    );
     assert.equal(readFileSync(join(dir, "approved.txt"), "utf8"), "hi", "the approved tool actually ran");
   } finally {
     c.close();

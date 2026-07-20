@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.130.0 — 2026-07-20 — ordered task-state delivery
+
+- Typed `event.task_state` notifications now carry a server-stream identity and a positive,
+  monotonically increasing sequence. Desktop and other authenticated Serve clients can reject
+  duplicated or stale lifecycle transitions instead of letting a late event overwrite the current
+  task, approval, checkpoint, or completion state.
+- Ordering spans every session and every resume within one `hara serve` process. A server restart
+  creates a new stream identity, so clients can accept the fresh sequence without confusing it with
+  an older connection.
+- Conversation streaming remains independent from execution state, and task event payloads retain
+  the same redacted ambient-data boundary. Existing protocol-v1 clients remain compatible because
+  the ordering fields are additive.
+- Upgrade with `npm i -g @nanhara/hara@0.130.0`.
+
 ## 0.129.0 — 2026-07-20 — durable revisions and workspace recovery
 
 - Authenticated Serve clients can commit a user-selected file as a new immutable Artifact revision with

@@ -60,7 +60,11 @@ import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from ".
 import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
-import { taskLifecycleEvent, type TaskLifecycleActivity } from "./task-events.js";
+import {
+  taskLifecycleEvent,
+  type TaskLifecycleActivity,
+  type TaskLifecycleCursor,
+} from "./task-events.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
@@ -449,6 +453,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   // Physical provider/tool work can outlive its logical timeout. Keep a process-level ledger independent
   // of SessionHub membership so detach/delete cannot make an updater believe the old engine is quiescent.
   const activeOperations = new Set<Promise<unknown>>();
+  let taskEventSequence = 0;
   let closing = false;
   let closePromise: Promise<void> | null = null;
 
@@ -518,14 +523,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const frame = rpcNotify(method, params);
     for (const ws of authed) if (ws.readyState === ws.OPEN) ws.send(frame);
   };
+  const nextTaskEventCursor = (): TaskLifecycleCursor => {
+    const sequence = taskEventSequence + 1;
+    if (!Number.isSafeInteger(sequence)) {
+      throw new Error("task lifecycle event sequence exhausted");
+    }
+    return { streamId: instanceId, sequence };
+  };
+  const publishTaskState = (event: ReturnType<typeof taskLifecycleEvent>): void => {
+    // Commit the cursor immediately before the synchronous broadcast. Dedupe paths never consume one,
+    // while every published event has a unique position in this server-wide stream.
+    taskEventSequence = event.sequence;
+    broadcast("event.task_state", { ...event });
+  };
   const broadcastTaskState = (session: ServeSession, activity: TaskLifecycleActivity): void => {
     if (!session.task) return;
-    broadcast("event.task_state", { ...taskLifecycleEvent(
+    publishTaskState(taskLifecycleEvent(
       session.meta.id,
       session.task,
       session.meta.todos ?? [],
       activity,
-    ) });
+      nextTaskEventCursor(),
+    ));
   };
 
   // Discovery file — the desktop shell reads this to find the running server (like a pid/port file).
@@ -615,12 +634,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       todos = s.meta.todos ?? [],
     ): void => {
       if (!s.task) return;
-      const event = taskLifecycleEvent(sessionId, s.task, todos, activity);
-      const { at: _at, ...stableEvent } = event;
+      const event = taskLifecycleEvent(
+        sessionId,
+        s.task,
+        todos,
+        activity,
+        nextTaskEventCursor(),
+      );
+      const {
+        at: _at,
+        streamId: _streamId,
+        sequence: _sequence,
+        ...stableEvent
+      } = event;
       const signature = JSON.stringify(stableEvent);
       if (signature === lastTaskStateSignature) return;
       lastTaskStateSignature = signature;
-      broadcast("event.task_state", { ...event });
+      publishTaskState(event);
     };
     broadcast("event.turn_start", { sessionId, taskId: s.task.id, turnId: s.task.turnId });
     emitTaskState({ state: "running", phase: "starting" });

@@ -26,8 +26,17 @@ export interface TaskLifecycleActivity {
   };
 }
 
+export interface TaskLifecycleCursor {
+  /** Identifies one ordered `hara serve` event stream. A server restart creates a new stream. */
+  streamId: string;
+  /** Monotonically increasing within `streamId`, across every session carried by that stream. */
+  sequence: number;
+}
+
 export interface TaskLifecycleEvent {
   version: typeof TASK_LIFECYCLE_EVENT_VERSION;
+  streamId: string;
+  sequence: number;
   sessionId: string;
   taskId: string;
   turnId: string;
@@ -68,8 +77,16 @@ export function taskLifecycleEvent(
   task: TaskExecution,
   todos: Todo[] = [],
   activity: TaskLifecycleActivity,
+  cursor: TaskLifecycleCursor,
   at = new Date().toISOString(),
 ): TaskLifecycleEvent {
+  const streamId = cursor.streamId.trim();
+  if (!streamId || streamId.length > 128) {
+    throw new Error("task lifecycle streamId must contain 1-128 characters");
+  }
+  if (!Number.isSafeInteger(cursor.sequence) || cursor.sequence <= 0) {
+    throw new Error("task lifecycle sequence must be a positive safe integer");
+  }
   const current = todos.find((todo) => todo.status === "in_progress")
     ?? todos.find((todo) => todo.status === "pending");
   const detail = bounded(activity.detail, 500);
@@ -86,6 +103,8 @@ export function taskLifecycleEvent(
     : task.status;
   return {
     version: TASK_LIFECYCLE_EVENT_VERSION,
+    streamId,
+    sequence: cursor.sequence,
     sessionId,
     taskId: task.id,
     turnId: task.turnId,

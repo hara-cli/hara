@@ -18,10 +18,13 @@ test("task lifecycle event separates durable running status from a temporary app
       detail: " Waiting   for release approval ",
       approval: { id: "approval-1", question: "Allow publish?" },
     },
+    { streamId: "serve-1", sequence: 7 },
     "2026-07-19T12:01:00.000Z",
   );
 
   assert.equal(event.version, TASK_LIFECYCLE_EVENT_VERSION);
+  assert.equal(event.streamId, "serve-1");
+  assert.equal(event.sequence, 7);
   assert.equal(event.state, "waiting");
   assert.equal(event.taskStatus, "running");
   assert.equal(event.phase, "approval");
@@ -42,7 +45,14 @@ test("task lifecycle event defaults its runtime state to the durable task status
     lastOutcome: "completed",
     endedAt: "2026-07-19T12:01:00.000Z",
   };
-  const event = taskLifecycleEvent("session-2", task, [], { phase: "finished" }, "2026-07-19T12:01:00.000Z");
+  const event = taskLifecycleEvent(
+    "session-2",
+    task,
+    [],
+    { phase: "finished" },
+    { streamId: "serve-1", sequence: 8 },
+    "2026-07-19T12:01:00.000Z",
+  );
   assert.equal(event.state, "completed");
   assert.equal(event.taskStatus, "completed");
   assert.equal(event.lastOutcome, "completed");
@@ -61,8 +71,33 @@ test("a late runtime phase cannot resurrect a terminal task as running", () => {
     task,
     [],
     { state: "running", phase: "thinking" },
+    { streamId: "serve-1", sequence: 9 },
     "2026-07-19T12:02:00.000Z",
   );
   assert.equal(event.state, "blocked");
   assert.equal(event.taskStatus, "blocked");
+});
+
+test("task lifecycle cursors fail closed when ordering metadata is invalid", () => {
+  const task = createTaskExecution("ordered work", "turn-4", "2026-07-19T12:00:00.000Z");
+  assert.throws(
+    () => taskLifecycleEvent(
+      "session-4",
+      task,
+      [],
+      { phase: "starting" },
+      { streamId: " ", sequence: 1 },
+    ),
+    /streamId/,
+  );
+  assert.throws(
+    () => taskLifecycleEvent(
+      "session-4",
+      task,
+      [],
+      { phase: "starting" },
+      { streamId: "serve-1", sequence: 0 },
+    ),
+    /sequence/,
+  );
 });

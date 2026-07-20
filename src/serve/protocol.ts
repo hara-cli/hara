@@ -42,7 +42,7 @@
 // Server → client notifications (all carry sessionId):
 //   event.text / event.reasoning {delta} · event.tool {name,preview} · event.diff {text}
 //   event.notice {text} · event.turn_end {reply,usage,error?} · approval.request {approvalId,question}
-//   event.task_state {version,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
+//   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events
 
 export const PROTOCOL_VERSION = 1;
