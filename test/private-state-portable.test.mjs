@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { optionalPosixOpenFlag } from "../dist/fs-open-flags.js";
 import { sameOpenedFileIdentity } from "../dist/fs-identity.js";
 import {
+  PrivateStateConflictError,
   bindPrivateHaraStateFile,
   privateStateFileIdentityMatches,
   readPrivateStateFileSnapshotSync,
@@ -48,6 +49,15 @@ test("private-state creates and replaces a file without leaking staging entries"
 
     writePrivateStateFileSync(binding, '{"model":"test"}\n');
     assert.equal(readPrivateStateFileSnapshotSync(binding.path)?.text, '{"model":"test"}\n');
+    assert.throws(
+      () => writePrivateStateFileSync(binding, '{"model":"stale"}\n', { expectedText: "{}\n" }),
+      (error) => error instanceof PrivateStateConflictError,
+    );
+    assert.equal(
+      readPrivateStateFileSnapshotSync(binding.path)?.text,
+      '{"model":"test"}\n',
+      "a stale compare-and-swap cannot overwrite current private state",
+    );
     assert.deepEqual(
       readdirSync(join(home, ".hara")).filter((name) => name.startsWith(".hara-private-") || name.startsWith(".hara-claim-")),
       [],

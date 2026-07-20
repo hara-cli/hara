@@ -67,10 +67,12 @@ import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 import {
   ArtifactStoreError,
+  commitArtifact,
   getArtifact,
   importArtifact,
   listArtifactRevisions,
   listArtifacts,
+  revertArtifact,
   type ArtifactKind,
 } from "../artifacts/store.js";
 import {
@@ -194,18 +196,24 @@ const DISCOVERY_LOCK_WAIT_MS = 2_000;
 const artifactRpcError = (
   id: number | string | null,
   error: unknown,
-  action: "import" | "list" | "open" | "list revisions",
+  action: "import" | "commit" | "revert" | "list" | "open" | "list revisions",
 ): string => {
   if (error instanceof ArtifactStoreError) {
-    const code = error.code === "ARTIFACT_CORRUPT" ? ERR.INTERNAL : ERR.PARAMS;
+    const code = error.code === "ARTIFACT_CORRUPT"
+      ? ERR.INTERNAL
+      : error.code === "ARTIFACT_CONFLICT"
+        ? ERR.CONFLICT
+        : ERR.PARAMS;
     return rpcError(id, code, error.message);
   }
   return rpcError(
     id,
     ERR.INTERNAL,
-    action === "import"
-      ? "Artifact import failed safely; the source file was not modified"
-      : `Artifact ${action} failed safely; local Artifact data was not changed`,
+    action === "import" || action === "commit"
+      ? `Artifact ${action} failed safely; the source file was not modified`
+      : action === "revert"
+        ? "Artifact revert failed safely; no current revision was replaced"
+        : `Artifact ${action} failed safely; local Artifact data was not changed`,
   );
 };
 
@@ -911,7 +919,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
-            "artifact.import", "artifact.list", "artifact.get", "artifact.revisions",
+            "artifact.import", "artifact.commit", "artifact.revert",
+            "artifact.list", "artifact.get", "artifact.revisions",
             "tasks.list", "approvals.list", "approvals.resolve",
           ];
           const runtime = runtimeInfo();
@@ -1278,6 +1287,65 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcResult(id!, details));
             } catch (error) {
               return reply(artifactRpcError(id, error, "import"));
+            }
+          }
+          case "artifact.commit": {
+            if (
+              typeof p.artifactId !== "string"
+              || typeof p.baseRevisionId !== "string"
+              || typeof p.sourcePath !== "string"
+              || !p.sourcePath
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId, baseRevisionId, and sourcePath required"));
+            }
+            if (p.actor !== undefined) {
+              return reply(rpcError(id, ERR.PARAMS, "actor is assigned by the authenticated host"));
+            }
+            if (p.taskRunId !== undefined && typeof p.taskRunId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "taskRunId must be a string"));
+            }
+            if (p.changedPaths !== undefined && !Array.isArray(p.changedPaths)) {
+              return reply(rpcError(id, ERR.PARAMS, "changedPaths must be an array"));
+            }
+            try {
+              const details = await commitArtifact(artifactHome, {
+                artifactId: p.artifactId,
+                baseRevisionId: p.baseRevisionId,
+                sourcePath: p.sourcePath,
+                actor: "user",
+                ...(p.taskRunId !== undefined ? { taskRunId: p.taskRunId } : {}),
+                ...(p.changedPaths !== undefined ? { changedPaths: p.changedPaths as string[] } : {}),
+              });
+              return reply(rpcResult(id!, details));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "commit"));
+            }
+          }
+          case "artifact.revert": {
+            if (
+              typeof p.artifactId !== "string"
+              || typeof p.baseRevisionId !== "string"
+              || typeof p.targetRevisionId !== "string"
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId, baseRevisionId, and targetRevisionId required"));
+            }
+            if (p.actor !== undefined) {
+              return reply(rpcError(id, ERR.PARAMS, "actor is assigned by the authenticated host"));
+            }
+            if (p.taskRunId !== undefined && typeof p.taskRunId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "taskRunId must be a string"));
+            }
+            try {
+              const details = revertArtifact(artifactHome, {
+                artifactId: p.artifactId,
+                baseRevisionId: p.baseRevisionId,
+                targetRevisionId: p.targetRevisionId,
+                actor: "user",
+                ...(p.taskRunId !== undefined ? { taskRunId: p.taskRunId } : {}),
+              });
+              return reply(rpcResult(id!, details));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "revert"));
             }
           }
           case "artifact.list": {

@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## Unreleased — immutable revision transactions
+
+- Authenticated Serve clients can commit a user-selected file as a new immutable Artifact revision with
+  `artifact.commit`. Every write carries `baseRevisionId`; a stale editor receives the dedicated protocol
+  conflict code and cannot replace the current revision.
+- `artifact.revert` restores an earlier ancestor by creating another immutable revision rather than moving
+  the pointer backward or mutating history. The imported original and every prior revision remain unchanged.
+- Revision pointer updates now use a private-state compare-and-swap guard that also closes a cross-process
+  race. The authenticated host assigns the user actor, so a Desktop client cannot forge an Agent/migration
+  audit identity.
+- This slice does not yet export files or claim Office fidelity. ExportReceipt, validation reports, worker
+  identity, format-specific editing, and Panel v2 remain separate release gates.
+
 ## 0.128.0 — 2026-07-20 — local deliverable foundation
 
 - Hara Serve now provides the first `artifact/1` local runtime through authenticated

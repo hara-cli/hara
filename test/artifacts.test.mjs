@@ -17,10 +17,12 @@ import { join } from "node:path";
 import {
   ArtifactStoreError,
   MAX_ARTIFACT_IMPORT_BYTES,
+  commitArtifact,
   getArtifact,
   importArtifact,
   listArtifactRevisions,
   listArtifacts,
+  revertArtifact,
 } from "../dist/artifacts/store.js";
 import {
   bindPrivateHaraStateFile,
@@ -180,6 +182,109 @@ test("Artifact import rejects ambiguous, executable, linked, protected, and over
     await expectArtifactError(
       importArtifact(home, { sourcePath: huge }),
       "ARTIFACT_TOO_LARGE",
+    );
+  });
+});
+
+test("Artifact commit uses optimistic concurrency and revert creates an immutable new revision", async () => {
+  await withHome(async (home) => {
+    const work = join(home, "work");
+    mkdirSync(work);
+    const source = join(work, "brief.md");
+    writeFileSync(source, "# Version one\n");
+    const imported = await importArtifact(home, { sourcePath: source });
+    const firstRevisionId = imported.currentRevision.revisionId;
+
+    const edited = join(work, "brief-edited.md");
+    writeFileSync(edited, "# Version two\n");
+    const committed = await commitArtifact(home, {
+      artifactId: imported.artifact.artifactId,
+      baseRevisionId: firstRevisionId,
+      sourcePath: edited,
+      actor: "agent",
+      taskRunId: "task-test",
+      changedPaths: ["body/heading"],
+    });
+    assert.notEqual(committed.currentRevision.revisionId, firstRevisionId);
+    assert.equal(committed.currentRevision.parentRevisionId, firstRevisionId);
+    assert.equal(committed.currentRevision.baseRevisionId, firstRevisionId);
+    assert.equal(committed.currentRevision.actor, "agent");
+    assert.equal(committed.currentRevision.taskRunId, "task-test");
+    assert.deepEqual(committed.currentRevision.changedPaths, ["body/heading"]);
+    assert.equal(
+      readFileSync(
+        join(
+          home,
+          ".hara",
+          "artifacts",
+          imported.artifact.artifactId,
+          "revisions",
+          firstRevisionId,
+          imported.currentRevision.contentRef,
+        ),
+        "utf8",
+      ),
+      "# Version one\n",
+      "the previous revision remains immutable",
+    );
+
+    await expectArtifactError(
+      commitArtifact(home, {
+        artifactId: imported.artifact.artifactId,
+        baseRevisionId: firstRevisionId,
+        sourcePath: edited,
+      }),
+      "ARTIFACT_CONFLICT",
+    );
+    assert.equal(
+      getArtifact(home, imported.artifact.artifactId).currentRevision.revisionId,
+      committed.currentRevision.revisionId,
+      "a stale commit never changes the current pointer",
+    );
+
+    const wrongKind = join(work, "wrong.xlsx");
+    writeFileSync(wrongKind, Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x01]));
+    await expectArtifactError(
+      commitArtifact(home, {
+        artifactId: imported.artifact.artifactId,
+        baseRevisionId: committed.currentRevision.revisionId,
+        sourcePath: wrongKind,
+      }),
+      "ARTIFACT_INVALID_INPUT",
+    );
+
+    const reverted = revertArtifact(home, {
+      artifactId: imported.artifact.artifactId,
+      baseRevisionId: committed.currentRevision.revisionId,
+      targetRevisionId: firstRevisionId,
+    });
+    assert.notEqual(reverted.currentRevision.revisionId, firstRevisionId);
+    assert.notEqual(reverted.currentRevision.revisionId, committed.currentRevision.revisionId);
+    assert.equal(reverted.currentRevision.parentRevisionId, committed.currentRevision.revisionId);
+    assert.equal(reverted.currentRevision.baseRevisionId, committed.currentRevision.revisionId);
+    assert.equal(reverted.currentRevision.contentDigest, imported.currentRevision.contentDigest);
+    assert.deepEqual(
+      readFileSync(
+        join(
+          home,
+          ".hara",
+          "artifacts",
+          imported.artifact.artifactId,
+          "revisions",
+          reverted.currentRevision.revisionId,
+          reverted.currentRevision.contentRef,
+        ),
+      ),
+      Buffer.from("# Version one\n"),
+    );
+    assert.equal(listArtifactRevisions(home, imported.artifact.artifactId).length, 3);
+    assert.throws(
+      () => revertArtifact(home, {
+        artifactId: imported.artifact.artifactId,
+        baseRevisionId: reverted.currentRevision.revisionId,
+        targetRevisionId: reverted.currentRevision.revisionId,
+      }),
+      (error) => error instanceof ArtifactStoreError && error.code === "ARTIFACT_INVALID_INPUT",
     );
   });
 });

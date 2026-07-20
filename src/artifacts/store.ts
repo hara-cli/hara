@@ -22,6 +22,7 @@ import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import {
   bindPrivateHaraStateFile,
   ensurePrivateStateSubdirectory,
+  PrivateStateConflictError,
   readPrivateStateFileSnapshotSync,
   writePrivateStateBytesOnceSync,
   writePrivateStateFileSync,
@@ -102,11 +103,29 @@ export interface ArtifactListResult {
   truncated: boolean;
 }
 
+export interface ArtifactCommitInput {
+  artifactId: string;
+  baseRevisionId: string;
+  sourcePath: string;
+  actor?: "user" | "agent" | "migration";
+  taskRunId?: string;
+  changedPaths?: string[];
+}
+
+export interface ArtifactRevertInput {
+  artifactId: string;
+  baseRevisionId: string;
+  targetRevisionId: string;
+  actor?: "user" | "agent" | "migration";
+  taskRunId?: string;
+}
+
 export type ArtifactStoreErrorCode =
   | "ARTIFACT_INVALID_INPUT"
   | "ARTIFACT_NOT_FOUND"
   | "ARTIFACT_SOURCE_REJECTED"
   | "ARTIFACT_TOO_LARGE"
+  | "ARTIFACT_CONFLICT"
   | "ARTIFACT_CORRUPT";
 
 export class ArtifactStoreError extends Error {
@@ -304,6 +323,54 @@ function checkedRevisionId(value: string): string {
   return value;
 }
 
+function checkedInputRevisionId(value: unknown, field: string): string {
+  if (typeof value !== "string" || !REVISION_ID.test(value)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", `${field} is not a valid opaque Revision id`);
+  }
+  return value;
+}
+
+function checkedActor(value: unknown): ArtifactRevision["actor"] {
+  if (value === undefined) return "user";
+  if (value !== "user" && value !== "agent" && value !== "migration") {
+    throw storeError("ARTIFACT_INVALID_INPUT", "actor must be user, agent, or migration");
+  }
+  return value;
+}
+
+function checkedTaskRunId(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "string"
+    || value.length < 1
+    || value.length > 256
+    || /[\u0000-\u001f\u007f]/.test(value)
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "taskRunId must be a safe string of at most 256 characters");
+  return value;
+}
+
+function normalizeArtifactPath(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 1_024 || value.includes("\0")) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "changedPaths entries must be non-empty relative paths");
+  }
+  if (value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:/.test(value) || value.includes("\\")) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "changedPaths entries must use relative forward-slash paths");
+  }
+  const segments = value.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "changedPaths contains an unsafe path segment");
+  }
+  return segments.join("/");
+}
+
+function checkedChangedPaths(value: unknown): string[] {
+  if (value === undefined) return ["content"];
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10_000) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "changedPaths must contain 1 to 10000 relative paths");
+  }
+  return [...new Set(value.map(normalizeArtifactPath))];
+}
+
 function childDirectory(
   parent: PrivateStateDirectoryIdentity,
   name: string,
@@ -329,6 +396,25 @@ function childDirectory(
 
 function artifactDirectory(home: string, artifactId: string): PrivateStateDirectoryIdentity {
   return childDirectory(artifactRoot(home), checkedArtifactId(artifactId), `no artifact ${artifactId}`);
+}
+
+function readArtifactMetadata(
+  directory: PrivateStateDirectoryIdentity,
+): { artifact: ArtifactRecord; text: string } {
+  verifyDirectory(directory);
+  const snapshot = readPrivateStateFileSnapshotSync(join(directory.path, "metadata.json"), JSON_LIMIT);
+  if (!snapshot) throw storeError("ARTIFACT_CORRUPT", "artifact metadata is missing");
+  let value: unknown;
+  try {
+    value = JSON.parse(snapshot.text);
+  } catch (error) {
+    throw storeError("ARTIFACT_CORRUPT", "artifact metadata is not valid JSON", error);
+  }
+  if (!isArtifactRecord(value) || value.artifactId !== basename(directory.path)) {
+    throw storeError("ARTIFACT_CORRUPT", "artifact metadata does not match its directory");
+  }
+  verifyDirectory(directory);
+  return { artifact: value, text: snapshot.text };
 }
 
 function revisionDirectory(
@@ -392,30 +478,88 @@ function inspectContent(
   verifyDirectory(revision);
 }
 
-function readArtifactDetailsFromDirectory(
-  directory: PrivateStateDirectoryIdentity,
-  verifyDigest: boolean,
-): ArtifactDetails {
-  verifyDirectory(directory);
-  const artifactValue = parseJsonFile(join(directory.path, "metadata.json"));
-  if (!isArtifactRecord(artifactValue) || artifactValue.artifactId !== basename(directory.path)) {
-    throw storeError("ARTIFACT_CORRUPT", "artifact metadata does not match its directory");
+function readContentBytes(
+  revision: PrivateStateDirectoryIdentity,
+  content: ArtifactContentInfo,
+): Buffer {
+  verifyDirectory(revision);
+  const path = join(revision.path, content.contentRef);
+  const before = lstatSync(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) {
+    throw storeError("ARTIFACT_CORRUPT", "artifact content is not an immutable regular file");
   }
-  const currentRevisionId = checkedRevisionId(artifactValue.currentRevisionId);
-  const revisionDir = revisionDirectory(directory, currentRevisionId);
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
+  try {
+    const opened = fstatSync(fd);
+    if (
+      !opened.isFile()
+      || opened.nlink !== 1
+      || !sameOpenedFileIdentity(before, opened)
+      || opened.size !== content.byteSize
+      || (process.platform !== "win32" && (opened.mode & 0o777) !== 0o600)
+    ) throw storeError("ARTIFACT_CORRUPT", "artifact content identity or size does not match its receipt");
+    const bytes = Buffer.allocUnsafe(content.byteSize);
+    let position = 0;
+    while (position < bytes.length) {
+      const read = readSync(fd, bytes, position, bytes.length - position, position);
+      if (!read) throw storeError("ARTIFACT_CORRUPT", "artifact content ended before its recorded size");
+      position += read;
+    }
+    if (createHash("sha256").update(bytes).digest("hex") !== content.sha256) {
+      throw storeError("ARTIFACT_CORRUPT", "artifact content digest does not match its receipt");
+    }
+    const after = fstatSync(fd);
+    const linked = lstatSync(path);
+    if (
+      !sameOpenedFileIdentity(opened, after)
+      || opened.size !== after.size
+      || opened.mtimeMs !== after.mtimeMs
+      || opened.ctimeMs !== after.ctimeMs
+      || !sameOpenedFileIdentity(after, linked)
+    ) throw storeError("ARTIFACT_CORRUPT", "artifact content changed while it was read");
+    verifyDirectory(revision);
+    return bytes;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readRevisionDetails(
+  artifact: PrivateStateDirectoryIdentity,
+  revisionId: string,
+  verifyDigest: boolean,
+): { revision: ArtifactRevision; content: ArtifactContentInfo } {
+  const revisionDir = revisionDirectory(artifact, revisionId);
   const revisionValue = parseJsonFile(join(revisionDir.path, "revision.json"));
   const contentValue = parseJsonFile(join(revisionDir.path, "content.json"));
   if (
     !isRevision(revisionValue)
-    || revisionValue.revisionId !== currentRevisionId
-    || revisionValue.artifactId !== artifactValue.artifactId
-  ) throw storeError("ARTIFACT_CORRUPT", "current revision metadata does not match its Artifact");
+    || revisionValue.revisionId !== revisionId
+    || revisionValue.artifactId !== basename(artifact.path)
+  ) throw storeError("ARTIFACT_CORRUPT", "revision metadata does not match its Artifact");
   if (
     !isContentInfo(contentValue)
     || contentValue.contentRef !== revisionValue.contentRef
     || contentValue.sha256 !== revisionValue.contentDigest
-  ) throw storeError("ARTIFACT_CORRUPT", "current revision content receipt is inconsistent");
+  ) throw storeError("ARTIFACT_CORRUPT", "revision content receipt is inconsistent");
   inspectContent(revisionDir, contentValue, verifyDigest);
+  return { revision: revisionValue, content: contentValue };
+}
+
+function readArtifactDetailsFromDirectory(
+  directory: PrivateStateDirectoryIdentity,
+  verifyDigest: boolean,
+): ArtifactDetails {
+  const { artifact: artifactValue } = readArtifactMetadata(directory);
+  const currentRevisionId = checkedRevisionId(artifactValue.currentRevisionId);
+  const { revision: revisionValue, content: contentValue } = readRevisionDetails(
+    directory,
+    currentRevisionId,
+    verifyDigest,
+  );
   verifyDirectory(directory);
   return { artifact: artifactValue, currentRevision: revisionValue, content: contentValue };
 }
@@ -432,6 +576,41 @@ function titleFor(sourcePath: string, extension: string, requested: string | und
     throw storeError("ARTIFACT_INVALID_INPUT", "artifact title must be at most 1024 characters");
   }
   return title;
+}
+
+function sourceFormat(
+  sourcePathInput: unknown,
+  claimedKind?: ArtifactKind,
+): { sourcePath: string; extension: string; format: ArtifactFormat } {
+  if (
+    typeof sourcePathInput !== "string"
+    || !sourcePathInput
+    || sourcePathInput.length > 4_096
+  ) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "sourcePath must be a non-empty path of at most 4096 characters");
+  }
+  if (!isAbsolute(sourcePathInput)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "sourcePath must be an absolute path selected by the user");
+  }
+  const sourcePath = resolve(sourcePathInput);
+  const extension = extname(sourcePath).toLowerCase();
+  if (MACRO_FORMATS.has(extension)) {
+    throw storeError(
+      "ARTIFACT_SOURCE_REJECTED",
+      "macro-enabled Office files are not supported; save a macro-free copy before using it as an Artifact revision",
+    );
+  }
+  const format = FORMATS.get(extension);
+  if (!format) {
+    throw storeError(
+      "ARTIFACT_INVALID_INPUT",
+      "supported files are PPT/PPTX/ODP, XLS/XLSX/CSV/ODS, DOC/DOCX/ODT/RTF, Markdown, and text",
+    );
+  }
+  if (claimedKind !== undefined && claimedKind !== format.kind) {
+    throw storeError("ARTIFACT_INVALID_INPUT", `the selected file is ${format.kind}, not ${claimedKind}`);
+  }
+  return { sourcePath, extension, format };
 }
 
 async function readImportSource(sourcePath: string): Promise<Buffer> {
@@ -572,30 +751,6 @@ export async function importArtifact(
   home: string,
   input: { sourcePath: string; title?: string; kind?: ArtifactKind },
 ): Promise<ArtifactDetails> {
-  if (typeof input.sourcePath !== "string" || !input.sourcePath || input.sourcePath.length > 4_096) {
-    throw storeError("ARTIFACT_INVALID_INPUT", "sourcePath must be a non-empty path of at most 4096 characters");
-  }
-  if (!isAbsolute(input.sourcePath)) {
-    throw storeError("ARTIFACT_INVALID_INPUT", "sourcePath must be an absolute path selected by the user");
-  }
-  const sourcePath = resolve(input.sourcePath);
-  const extension = extname(sourcePath).toLowerCase();
-  if (MACRO_FORMATS.has(extension)) {
-    throw storeError(
-      "ARTIFACT_SOURCE_REJECTED",
-      "macro-enabled Office files are not supported; save a macro-free copy before importing",
-    );
-  }
-  const format = FORMATS.get(extension);
-  if (!format) {
-    throw storeError(
-      "ARTIFACT_INVALID_INPUT",
-      "supported files are PPT/PPTX/ODP, XLS/XLSX/CSV/ODS, DOC/DOCX/ODT/RTF, Markdown, and text",
-    );
-  }
-  if (input.kind !== undefined && input.kind !== format.kind) {
-    throw storeError("ARTIFACT_INVALID_INPUT", `the selected file is ${format.kind}, not ${input.kind}`);
-  }
   if (
     input.kind !== undefined
     && input.kind !== "presentation"
@@ -605,6 +760,7 @@ export async function importArtifact(
   if (input.title !== undefined && typeof input.title !== "string") {
     throw storeError("ARTIFACT_INVALID_INPUT", "title must be a string");
   }
+  const { sourcePath, extension, format } = sourceFormat(input.sourcePath, input.kind);
 
   const bytes = await readImportSource(sourcePath);
   verifyClaimedFormat(extension, bytes);
@@ -663,6 +819,218 @@ export async function importArtifact(
   );
   activateStaging(root, staging, artifactId);
   return getArtifact(home, artifactId, false);
+}
+
+function activateRevisionStaging(
+  artifact: PrivateStateDirectoryIdentity,
+  staging: PrivateStateDirectoryIdentity,
+  revisionId: string,
+): void {
+  const revisions = childDirectory(artifact, "revisions", "artifact revisions are missing");
+  verifyDirectory(staging);
+  const destination = join(revisions.path, revisionId);
+  try {
+    lstatSync(destination);
+    throw storeError("ARTIFACT_CORRUPT", "a Revision id collision occurred; retry the commit");
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  renameSync(staging.path, destination);
+  const activated = lstatSync(destination);
+  if (
+    !activated.isDirectory()
+    || activated.isSymbolicLink()
+    || activated.dev !== staging.dev
+    || activated.ino !== staging.ino
+    || realpathSync.native(destination) !== destination
+  ) throw storeError("ARTIFACT_CORRUPT", "Revision activation changed the staged directory identity");
+  verifyDirectory(revisions);
+  syncDirectory(revisions.path);
+}
+
+function commitPreparedRevision(
+  home: string,
+  input: {
+    artifactId: string;
+    baseRevisionId: string;
+    extension: string;
+    mediaType: string;
+    bytes: Buffer;
+    actor: ArtifactRevision["actor"];
+    taskRunId?: string;
+    changedPaths: string[];
+  },
+): ArtifactDetails {
+  const artifact = artifactDirectory(home, input.artifactId);
+  const metadata = readArtifactMetadata(artifact);
+  if (metadata.artifact.currentRevisionId !== input.baseRevisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed after this edit started; reopen the latest version and apply the change again",
+    );
+  }
+  readRevisionDetails(artifact, metadata.artifact.currentRevisionId, true);
+  const format = FORMATS.get(input.extension);
+  if (!format || format.kind !== metadata.artifact.kind || format.mediaType !== input.mediaType) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "the committed file kind does not match the Artifact");
+  }
+  if (input.bytes.byteLength < 1 || input.bytes.byteLength > MAX_ARTIFACT_IMPORT_BYTES) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "revision content size is outside the supported range");
+  }
+  verifyClaimedFormat(input.extension, input.bytes);
+
+  const revisions = childDirectory(artifact, "revisions", "artifact revisions are missing");
+  if (readdirSync(revisions.path).length >= MAX_REVISIONS) {
+    throw storeError("ARTIFACT_TOO_LARGE", `artifact has reached the ${MAX_REVISIONS} revision limit`);
+  }
+
+  const revisionId = newOpaqueId("rev");
+  const sha256 = createHash("sha256").update(input.bytes).digest("hex");
+  const contentRef = `content${input.extension}`;
+  const revision: ArtifactRevision = {
+    revisionId,
+    artifactId: metadata.artifact.artifactId,
+    parentRevisionId: input.baseRevisionId,
+    baseRevisionId: input.baseRevisionId,
+    actor: input.actor,
+    ...(input.taskRunId ? { taskRunId: input.taskRunId } : {}),
+    contentRef,
+    assetRefs: [],
+    contentDigest: sha256,
+    changedPaths: input.changedPaths,
+    createdAt: new Date().toISOString(),
+  };
+  const content: ArtifactContentInfo = {
+    contentRef,
+    extension: input.extension,
+    mediaType: input.mediaType,
+    byteSize: input.bytes.byteLength,
+    sha256,
+  };
+
+  const stagingName = `.staging-${revisionId}-${randomUUID().replaceAll("-", "")}`;
+  const staging = ensurePrivateStateSubdirectory(
+    home,
+    [".hara", "artifacts", metadata.artifact.artifactId, stagingName],
+  );
+  writePrivateStateBytesOnceSync(
+    bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], contentRef),
+    input.bytes,
+  );
+  writePrivateStateFileSync(
+    bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], "content.json"),
+    `${JSON.stringify(content, null, 2)}\n`,
+  );
+  writePrivateStateFileSync(
+    bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], "revision.json"),
+    `${JSON.stringify(revision, null, 2)}\n`,
+  );
+  activateRevisionStaging(artifact, staging, revisionId);
+
+  const updated: ArtifactRecord = {
+    ...metadata.artifact,
+    currentRevisionId: revisionId,
+  };
+  try {
+    writePrivateStateFileSync(
+      bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId], "metadata.json"),
+      `${JSON.stringify(updated, null, 2)}\n`,
+      { expectedText: metadata.text },
+    );
+  } catch (error) {
+    if (error instanceof PrivateStateConflictError) {
+      throw storeError(
+        "ARTIFACT_CONFLICT",
+        "the Artifact changed while this revision was committing; reopen the latest version",
+        error,
+      );
+    }
+    throw error;
+  }
+  return getArtifact(home, metadata.artifact.artifactId);
+}
+
+export async function commitArtifact(
+  home: string,
+  input: ArtifactCommitInput,
+): Promise<ArtifactDetails> {
+  const artifactId = checkedArtifactId(input.artifactId);
+  const baseRevisionId = checkedInputRevisionId(input.baseRevisionId, "baseRevisionId");
+  const actor = checkedActor(input.actor);
+  const taskRunId = checkedTaskRunId(input.taskRunId);
+  const changedPaths = checkedChangedPaths(input.changedPaths);
+
+  const before = getArtifact(home, artifactId);
+  if (before.artifact.currentRevisionId !== baseRevisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed after this edit started; reopen the latest version and apply the change again",
+    );
+  }
+  const { sourcePath, extension, format } = sourceFormat(input.sourcePath, before.artifact.kind);
+  const bytes = await readImportSource(sourcePath);
+  verifyClaimedFormat(extension, bytes);
+  return commitPreparedRevision(home, {
+    artifactId,
+    baseRevisionId,
+    extension,
+    mediaType: format.mediaType,
+    bytes,
+    actor,
+    ...(taskRunId ? { taskRunId } : {}),
+    changedPaths,
+  });
+}
+
+export function revertArtifact(
+  home: string,
+  input: ArtifactRevertInput,
+): ArtifactDetails {
+  const artifactId = checkedArtifactId(input.artifactId);
+  const baseRevisionId = checkedInputRevisionId(input.baseRevisionId, "baseRevisionId");
+  const targetRevisionId = checkedInputRevisionId(input.targetRevisionId, "targetRevisionId");
+  const actor = checkedActor(input.actor);
+  const taskRunId = checkedTaskRunId(input.taskRunId);
+  if (baseRevisionId === targetRevisionId) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "targetRevisionId is already the current revision");
+  }
+
+  const artifact = artifactDirectory(home, artifactId);
+  const current = readArtifactMetadata(artifact).artifact;
+  if (current.currentRevisionId !== baseRevisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed after this revert started; reopen the latest version",
+    );
+  }
+
+  const history = listArtifactRevisions(home, artifactId);
+  const byId = new Map(history.map((revision) => [revision.revisionId, revision]));
+  let cursor: ArtifactRevision | undefined = byId.get(baseRevisionId);
+  let targetIsAncestor = false;
+  for (let count = 0; cursor && count <= history.length; count++) {
+    if (cursor.revisionId === targetRevisionId) {
+      targetIsAncestor = true;
+      break;
+    }
+    cursor = cursor.parentRevisionId ? byId.get(cursor.parentRevisionId) : undefined;
+  }
+  if (!targetIsAncestor) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "targetRevisionId is not an ancestor of the current revision");
+  }
+
+  const target = readRevisionDetails(artifact, targetRevisionId, true);
+  const bytes = readContentBytes(revisionDirectory(artifact, targetRevisionId), target.content);
+  return commitPreparedRevision(home, {
+    artifactId,
+    baseRevisionId,
+    extension: target.content.extension,
+    mediaType: target.content.mediaType,
+    bytes,
+    actor,
+    ...(taskRunId ? { taskRunId } : {}),
+    changedPaths: ["content"],
+  });
 }
 
 export function getArtifact(

@@ -283,7 +283,14 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(init.result.capabilities.methods.includes("automation.list"), "capabilities advertised");
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
-    for (const method of ["artifact.import", "artifact.list", "artifact.get", "artifact.revisions"]) {
+    for (const method of [
+      "artifact.import",
+      "artifact.commit",
+      "artifact.revert",
+      "artifact.list",
+      "artifact.get",
+      "artifact.revisions",
+    ]) {
       assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
     }
 
@@ -302,6 +309,35 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(artifactDetails.result.currentRevision.artifactId, artifactId);
     const artifactRevisions = await c.call("artifact.revisions", { artifactId });
     assert.equal(artifactRevisions.result.revisions.length, 1);
+    const firstRevisionId = artifactDetails.result.currentRevision.revisionId;
+    const artifactEdit = join(dir, "brief-edited.docx");
+    writeFileSync(artifactEdit, Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x02]));
+    const committedArtifact = await c.call("artifact.commit", {
+      artifactId,
+      baseRevisionId: firstRevisionId,
+      sourcePath: artifactEdit,
+      changedPaths: ["document/body"],
+    });
+    assert.equal(committedArtifact.result.currentRevision.parentRevisionId, firstRevisionId);
+    assert.equal(committedArtifact.result.currentRevision.actor, "user");
+    const staleArtifactCommit = await c.call("artifact.commit", {
+      artifactId,
+      baseRevisionId: firstRevisionId,
+      sourcePath: artifactEdit,
+    });
+    assert.equal(staleArtifactCommit.error.code, -32005);
+    const revertedArtifact = await c.call("artifact.revert", {
+      artifactId,
+      baseRevisionId: committedArtifact.result.currentRevision.revisionId,
+      targetRevisionId: firstRevisionId,
+    });
+    assert.equal(
+      revertedArtifact.result.currentRevision.parentRevisionId,
+      committedArtifact.result.currentRevision.revisionId,
+    );
+    assert.equal(revertedArtifact.result.currentRevision.contentDigest, artifactDetails.result.content.sha256);
+    const finalArtifactRevisions = await c.call("artifact.revisions", { artifactId });
+    assert.equal(finalArtifactRevisions.result.revisions.length, 3);
     const badArtifactImport = await c.call("artifact.import", { sourcePath: "relative.docx" });
     assert.equal(badArtifactImport.error.code, -32602);
 

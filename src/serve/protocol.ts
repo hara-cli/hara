@@ -29,6 +29,10 @@
 //   automation.toggle {id,enabled}                → {id,enabled}
 //   automation.delete {id}                        → {id,deleted}
 //   artifact.import   {sourcePath,title?,kind?}    → {artifact,currentRevision,content}
+//   artifact.commit   {artifactId,baseRevisionId,sourcePath,taskRunId?,changedPaths?}
+//                                                   → {artifact,currentRevision,content}
+//   artifact.revert   {artifactId,baseRevisionId,targetRevisionId,taskRunId?}
+//                                                   → {artifact,currentRevision,content}
 //   artifact.list     {}                          → {artifacts,invalid,truncated}
 //   artifact.get      {artifactId}                → {artifact,currentRevision,content}
 //   artifact.revisions {artifactId}               → {artifactId,revisions}
@@ -61,6 +65,7 @@ export const ERR = {
   BUSY: -32002, // requested operation conflicts with active server/session work
   NO_SESSION: -32003, // unknown/expired sessionId
   LOCKED: -32004, // session held by another live hara process (single-writer lock)
+  CONFLICT: -32005, // optimistic version/base no longer matches the current object
 } as const;
 
 /** Parse one inbound text frame into a request. Returns {error} (never throws) on malformed input —

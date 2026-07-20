@@ -59,6 +59,21 @@ export interface PrivateStateFileBinding {
   readonly path: string;
 }
 
+export interface PrivateStateWriteOptions {
+  /**
+   * Optional compare-and-swap guard. When present, the current file must exist with exactly this text
+   * before replacement; otherwise no caller data is written.
+   */
+  expectedText?: string;
+}
+
+export class PrivateStateConflictError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "PrivateStateConflictError";
+  }
+}
+
 function isMissing(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
 }
@@ -473,13 +488,20 @@ export function writePrivateStateBytesOnceSync(
  * Crash-safe, no-follow, compare-and-swap replacement for one bound private state file. Existing entries
  * are move-claimed before verification so a concurrent alias/replacement is never overwritten silently.
  */
-export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text: string): void {
+export function writePrivateStateFileSync(
+  binding: PrivateStateFileBinding,
+  text: string,
+  options: PrivateStateWriteOptions = {},
+): void {
   const { directory, path } = binding;
   verifyPrivateDirectory(directory);
   if (resolve(path) !== join(directory.path, checkedPrivateComponent(basename(path)))) {
     throw new Error(`private Hara state file is outside '${directory.path}'`);
   }
   const existing = readPrivateStateFileSnapshotSync(path);
+  if (options.expectedText !== undefined && existing?.text !== options.expectedText) {
+    throw new PrivateStateConflictError(`private Hara state file no longer matches the expected version: '${path}'`);
+  }
   verifyPrivateDirectory(directory);
 
   const temp = join(directory.path, `.hara-private-${process.pid}-${randomUUID()}.tmp`);
@@ -512,7 +534,9 @@ export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text
         verifyPrivateDirectory(directory);
         linkSync(temp, path);
       } catch (error: any) {
-        if (error?.code === "EEXIST") throw new Error(`private Hara state file changed before create: '${path}'`);
+        if (error?.code === "EEXIST") {
+          throw new PrivateStateConflictError(`private Hara state file changed before create: '${path}'`, { cause: error });
+        }
         throw error;
       }
     } else {
@@ -521,7 +545,9 @@ export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text
         verifyPrivateDirectory(directory);
         renameSync(path, claimed);
       } catch (error: any) {
-        if (error?.code === "ENOENT") throw new Error(`private Hara state file changed before replace: '${path}'`);
+        if (error?.code === "ENOENT") {
+          throw new PrivateStateConflictError(`private Hara state file changed before replace: '${path}'`, { cause: error });
+        }
         throw error;
       }
       let verifiedClaim = false;
@@ -534,7 +560,9 @@ export function writePrivateStateFileSync(binding: PrivateStateFileBinding, text
           && claimedSnapshot.nlink === existing.nlink
           && claimedSnapshot.text === existing.text
         );
-        if (!verifiedClaim) throw new Error(`private Hara state file changed before replace: '${path}'`);
+        if (!verifiedClaim) {
+          throw new PrivateStateConflictError(`private Hara state file changed before replace: '${path}'`);
+        }
       } catch (error) {
         try {
           restorePrivateClaim(claimed, path, existing);
