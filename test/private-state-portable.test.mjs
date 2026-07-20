@@ -4,6 +4,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { optionalPosixOpenFlag } from "../dist/fs-open-flags.js";
+import { tightenPrivateDescriptorMode } from "../dist/fs-permissions.js";
 import { sameOpenedFileIdentity } from "../dist/fs-identity.js";
 import {
   PrivateStateConflictError,
@@ -17,6 +18,27 @@ test("Windows never receives POSIX-only open flags exposed by an alternate runti
   for (const flag of ["O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"]) {
     assert.equal(optionalPosixOpenFlag(flag, "win32"), 0, `${flag} must be omitted on Windows`);
   }
+});
+
+test("Windows omits inapplicable descriptor chmod while POSIX remains fail-closed", () => {
+  let calls = 0;
+  const writeMode = (fd, mode) => {
+    calls += 1;
+    assert.equal(fd, 7);
+    assert.equal(mode, 0o600);
+  };
+  tightenPrivateDescriptorMode(7, 0o600, "win32", writeMode);
+  assert.equal(calls, 0, "Windows must not call fchmod on a native handle");
+
+  tightenPrivateDescriptorMode(7, 0o600, "linux", writeMode);
+  assert.equal(calls, 1, "POSIX keeps the descriptor-based mode fence");
+  assert.throws(
+    () => tightenPrivateDescriptorMode(7, 0o600, "darwin", () => {
+      throw new Error("mode repair failed");
+    }),
+    /mode repair failed/,
+    "POSIX mode failures must not be weakened to best-effort",
+  );
 });
 
 test("Windows opened-file identity ignores synthetic device/mode but retains inode and link-count fences", () => {

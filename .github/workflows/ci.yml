@@ -88,6 +88,7 @@ jobs:
             echo "::error file=scripts/standalone-boundary-smoke.mjs,title=Windows native standalone smoke::$summary"
             exit "$code"
           fi
+          node scripts/standalone-serve-smoke.mjs dist/bin/hara.exe "$expected"
 
   docker-runtime:
     runs-on: ubuntu-latest

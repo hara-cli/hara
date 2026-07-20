@@ -5,7 +5,6 @@ import {
   closeSync,
   chmodSync,
   constants,
-  fchmodSync,
   fstatSync,
   fsyncSync,
   linkSync,
@@ -31,6 +30,7 @@ import {
   type RegularFileSnapshot,
 } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
+import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 
 const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin", "tool-results", "plugin-receipts", "artifacts"]);
@@ -147,7 +147,7 @@ function verifyAndTightenPrivateDirectory(path: string): PrivateStateDirectoryId
       if (!opened.isDirectory() || opened.dev !== inspected.dev || opened.ino !== inspected.ino) {
         throw new Error(`private Hara state directory changed while opening: '${path}'`);
       }
-      fchmodSync(fd, 0o700);
+      tightenPrivateDescriptorMode(fd, 0o700);
     } finally {
       closeSync(fd);
     }
@@ -265,11 +265,7 @@ export function readPrivateStateFileSnapshotSync(
       rejectHardLinks: true,
       protectSensitive: false,
     });
-    try {
-      fchmodSync(fd, 0o600);
-    } catch (error) {
-      if (process.platform !== "win32") throw error;
-    }
+    tightenPrivateDescriptorMode(fd, 0o600);
     // chmod may update ctime; capture the authoritative baseline afterwards.
     info = fstatSync(fd);
     if (info.size > limit) throw new FileReadLimitError(path, limit);
@@ -423,11 +419,7 @@ export function writePrivateStateBytesOnceSync(
   try {
     fd = openSync(temp, "wx", 0o600);
     writeFileSync(fd, bytes);
-    try {
-      fchmodSync(fd, 0o600);
-    } catch (error) {
-      if (process.platform !== "win32") throw error;
-    }
+    tightenPrivateDescriptorMode(fd, 0o600);
     fsyncSync(fd);
     const stagedInfo = fstatSync(fd);
     if (!stagedInfo.isFile() || stagedInfo.nlink !== 1) {
@@ -512,11 +504,7 @@ export function writePrivateStateFileSync(
     // Bun's Windows numeric-open compatibility can otherwise turn this valid create into a false ENOENT.
     fd = openSync(temp, "wx", 0o600);
     writeFileSync(fd, text, "utf8");
-    try {
-      fchmodSync(fd, 0o600);
-    } catch (error) {
-      if (process.platform !== "win32") throw error;
-    }
+    tightenPrivateDescriptorMode(fd, 0o600);
     fsyncSync(fd);
     const stagedInfo = fstatSync(fd);
     if (!stagedInfo.isFile() || stagedInfo.nlink !== 1) throw new Error("unsafe private Hara state staging inode");

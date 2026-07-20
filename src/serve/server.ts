@@ -8,7 +8,6 @@ import { randomBytes, randomUUID, timingSafeEqual, createHash } from "node:crypt
 import {
   closeSync,
   constants as fsConstants,
-  fchmodSync,
   fstatSync,
   fsyncSync,
   lstatSync,
@@ -67,6 +66,7 @@ import {
 } from "./task-events.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
+import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 import {
@@ -254,7 +254,7 @@ const ensurePrivateDiscoveryDir = (dir: string): void => {
     if (!st.isDirectory()) throw new Error(`${dir} must be a private directory, not a symlink`);
     // mkdir's mode does not affect a legacy directory. Operate through the verified descriptor so a path
     // replacement cannot redirect chmod to a symlink target between validation and permission tightening.
-    fchmodSync(fd, 0o700);
+    tightenPrivateDescriptorMode(fd, 0o700);
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
@@ -336,7 +336,7 @@ const writeDiscovery = async (dir: string, path: string, record: DiscoveryRecord
     let fd: number | undefined;
     try {
       fd = openSync(temp, "wx", 0o600);
-      fchmodSync(fd, 0o600);
+      tightenPrivateDescriptorMode(fd, 0o600);
       writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`, "utf8");
       fsyncSync(fd);
       closeSync(fd);

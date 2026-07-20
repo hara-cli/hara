@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.130.1 — 2026-07-21 — Windows private-state portability
+
+- `hara serve` no longer calls the inapplicable POSIX `fchmod` operation on Windows discovery
+  directory and file handles. Official Windows standalone builds can now create the authenticated
+  `serve.json` record instead of exiting with `EPERM`.
+- The same descriptor-mode boundary is shared by all private-state readers and writers: Windows
+  retains file type, identity, no-replace, atomic-write, and symlink/reparse-point checks while
+  omitting only POSIX owner bits; macOS and Linux still fail closed if permission tightening fails.
+- Upgrade with `npm i -g @nanhara/hara@0.130.1`.
+
 ## 0.130.0 — 2026-07-20 — ordered task-state delivery
 
 - Typed `event.task_state` notifications now carry a server-stream identity and a positive,
