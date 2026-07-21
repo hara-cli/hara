@@ -12,6 +12,20 @@ hara gateway --platform <name>
 Because the daemon **connects out** to each platform (long-poll or WebSocket), it needs no public webhook URL —
 it runs fine on your laptop behind NAT.
 
+Check one connector without exposing its credentials:
+
+```bash
+hara gateway status --platform weixin
+hara gateway status --platform feishu --json
+```
+
+Status verifies the private credential state, credential-scoped process lease/PID, real transport lifecycle,
+and the most recent connection, successful poll, inbound message, and bounded error code. It never returns
+tokens, app ids, login URLs, chat/message content, raw errors, or the hash used to isolate two bot accounts.
+An environment-only credential held by a live gateway is shown as `process-only` instead of being
+misreported as missing. Desktop reads the same local status every two minutes; that refresh does not call a
+model or consume tokens.
+
 ## Platforms at a glance
 
 | Platform | Transport | Extra dep | Two-way images | Notes |
@@ -377,3 +391,5 @@ nohup hara gateway --platform <name> > ~/.hara/<name>-gw.log 2>&1 &
 ```
 
 Stop with `Ctrl-C` (or kill the process); cursors/creds persist under `~/.hara/<platform>/`.
+Run `hara gateway status --platform <name>` after starting or stopping it to verify the live PID, connection,
+last activity, and suggested recovery action.

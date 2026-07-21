@@ -258,6 +258,7 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
   // visibility so a reconnect is observable instead of a mystery silence.
   const wsHealth = new FeishuWsHealthMonitor();
   let failActiveStart: ((error: Error) => void) | undefined;
+  let runtimeObserver: Parameters<ChatAdapter["start"]>[3];
   const wsClient = new lark.WSClient({
     appId,
     appSecret,
@@ -267,10 +268,12 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
     handshakeTimeoutMs: 15_000,
     onReady: () => {
       wsHealth.ready();
+      runtimeObserver?.connected();
       console.error("hara feishu: ✓ ws connected");
     },
     onReconnecting: () => {
       const health = wsHealth.disconnect();
+      runtimeObserver?.error("reconnecting");
       console.error(
         `hara feishu: ws disconnected #${health.total} · ${health.hourCount}/1h · ${health.dayCount}/24h · ` +
         `previous connection ${wsDuration(health.connectedForMs)} · auto-reconnecting (SDK does not expose close code/reason)`,
@@ -283,9 +286,11 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
       }
     },
     onReconnected: () => {
+      runtimeObserver?.connected();
       console.error(`hara feishu: ✓ ws reconnected after ${wsDuration(wsHealth.reconnected())}`);
     },
     onError: (err: Error) => {
+      runtimeObserver?.error("transport-terminal");
       const safe = redactKnownSecrets(String(err?.message ?? err), [appId, appSecret]).text
         .replace(/\s+/gu, " ")
         .slice(0, 300);
@@ -500,7 +505,8 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
         });
       });
     },
-    async start(onMessage, signal, shouldDownload) {
+    async start(onMessage, signal, shouldDownload, runtime) {
+      runtimeObserver = runtime;
       const runAbort = new AbortController();
       const relayAbort = (): void => {
         runAbort.abort(signal.reason instanceof Error ? signal.reason : new Error("Feishu gateway cancelled"));
@@ -647,6 +653,7 @@ export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
         await Promise.race([stopped, terminalFailure]);
       } finally {
         failActiveStart = undefined;
+        if (runtimeObserver === runtime) runtimeObserver = undefined;
         runAbort.abort(new Error("Feishu gateway stopped"));
         signal.removeEventListener("abort", relayAbort);
         try {

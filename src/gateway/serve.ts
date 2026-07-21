@@ -31,7 +31,9 @@ import {
   GatewayFlowRunStore,
   GatewayInboundTracker,
   GatewayMessageDeduper,
+  GatewayRuntimeReporter,
   GatewayRunOutcomeStore,
+  inspectGatewayRuntime,
   type GatewayRunOutcomeRecovery,
   type GatewayRunOutcomeState,
 } from "./runtime-state.js";
@@ -535,6 +537,200 @@ function runFlowAgent(prompt: string, _cwd: string, schema?: object, signal?: Ab
 /** Re-exported so `hara gateway --platform weixin --login` can run the QR flow. */
 export { weixinLogin } from "./weixin.js";
 
+export const GATEWAY_PLATFORMS = [
+  "telegram",
+  "weixin",
+  "discord",
+  "feishu",
+  "slack",
+  "mattermost",
+  "matrix",
+  "dingtalk",
+  "wecom",
+  "signal",
+] as const;
+
+export type GatewayPlatform = typeof GATEWAY_PLATFORMS[number];
+export type GatewayConfigurationState = "ready" | "process-only" | "missing" | "incomplete" | "unreadable";
+
+export interface GatewayStatus {
+  platform: GatewayPlatform;
+  label: string;
+  configuration: GatewayConfigurationState;
+  configured: boolean;
+  running: boolean;
+  runningInstances: number;
+  runtimeState: "starting" | "connected" | "degraded" | "stopped" | "failed" | "unknown" | "unreadable";
+  pid?: number;
+  startedAt?: number;
+  lastConnectedAt?: number;
+  lastPollAt?: number;
+  lastMessageAt?: number;
+  lastErrorAt?: number;
+  lastErrorCode?: string;
+  recommendation: string;
+}
+
+interface GatewayConfigurationProbe {
+  state: GatewayConfigurationState;
+  runtimeScope?: string;
+  missingHint: string;
+}
+
+const GATEWAY_LABELS: Record<GatewayPlatform, string> = {
+  telegram: "Telegram",
+  weixin: "WeChat",
+  discord: "Discord",
+  feishu: "Feishu",
+  slack: "Slack",
+  mattermost: "Mattermost",
+  matrix: "Matrix",
+  dingtalk: "DingTalk",
+  wecom: "WeCom",
+  signal: "Signal",
+};
+
+function gatewayPlatform(value: string): GatewayPlatform {
+  const platform = canonicalGatewayPlatform(value);
+  if (!(GATEWAY_PLATFORMS as readonly string[]).includes(platform)) {
+    throw new Error(`unsupported gateway platform '${value}'`);
+  }
+  return platform as GatewayPlatform;
+}
+
+function environmentConfiguration(
+  values: readonly (string | undefined)[],
+  runtimeScope: () => string,
+  missingHint: string,
+): GatewayConfigurationProbe {
+  const present = values.filter((value) => Boolean(value?.trim())).length;
+  return present === values.length
+    ? { state: "ready", runtimeScope: runtimeScope(), missingHint }
+    : { state: present === 0 ? "missing" : "incomplete", missingHint };
+}
+
+async function inspectGatewayConfiguration(platform: GatewayPlatform): Promise<GatewayConfigurationProbe> {
+  if (platform === "weixin") {
+    const { inspectWeixinCredentials } = await import("./weixin.js");
+    const inspected = inspectWeixinCredentials();
+    if (inspected.state === "ready") {
+      return {
+        state: "ready",
+        runtimeScope: gatewayRuntimeScope("weixin", inspected.credentials.user_id),
+        missingHint: "run `hara gateway --platform weixin --login`",
+      };
+    }
+    return {
+      state: inspected.state,
+      missingHint: inspected.state === "unreadable"
+        ? "repair the private WeChat login state, then log in again"
+        : "run `hara gateway --platform weixin --login`",
+    };
+  }
+  if (platform === "telegram") {
+    const token = process.env.HARA_TELEGRAM_TOKEN;
+    return environmentConfiguration([token], () => gatewayRuntimeScope("telegram", token), "set HARA_TELEGRAM_TOKEN");
+  }
+  if (platform === "discord") {
+    const token = process.env.HARA_DISCORD_TOKEN;
+    return environmentConfiguration([token], () => gatewayRuntimeScope("discord", token), "set HARA_DISCORD_TOKEN");
+  }
+  if (platform === "feishu") {
+    const appId = process.env.HARA_FEISHU_APP_ID;
+    const secret = process.env.HARA_FEISHU_APP_SECRET;
+    return environmentConfiguration([appId, secret], () => gatewayRuntimeScope("feishu", appId), "set HARA_FEISHU_APP_ID and HARA_FEISHU_APP_SECRET");
+  }
+  if (platform === "slack") {
+    const appToken = process.env.HARA_SLACK_APP_TOKEN;
+    const botToken = process.env.HARA_SLACK_BOT_TOKEN;
+    return environmentConfiguration([appToken, botToken], () => gatewayRuntimeScope("slack", appToken), "set HARA_SLACK_APP_TOKEN and HARA_SLACK_BOT_TOKEN");
+  }
+  if (platform === "mattermost") {
+    const url = process.env.HARA_MATTERMOST_URL;
+    const token = process.env.HARA_MATTERMOST_TOKEN;
+    return environmentConfiguration([url, token], () => gatewayRuntimeScope("mattermost", `${url}\0${token}`), "set HARA_MATTERMOST_URL and HARA_MATTERMOST_TOKEN");
+  }
+  if (platform === "matrix") {
+    const homeserver = process.env.HARA_MATRIX_HOMESERVER;
+    const token = process.env.HARA_MATRIX_TOKEN;
+    const userId = process.env.HARA_MATRIX_USER_ID;
+    return environmentConfiguration([homeserver, token, userId], () => gatewayRuntimeScope("matrix", `${homeserver}\0${userId}`), "set HARA_MATRIX_HOMESERVER, HARA_MATRIX_TOKEN, and HARA_MATRIX_USER_ID");
+  }
+  if (platform === "dingtalk") {
+    const clientId = process.env.HARA_DINGTALK_CLIENT_ID;
+    const secret = process.env.HARA_DINGTALK_CLIENT_SECRET;
+    return environmentConfiguration([clientId, secret], () => gatewayRuntimeScope("dingtalk", clientId), "set HARA_DINGTALK_CLIENT_ID and HARA_DINGTALK_CLIENT_SECRET");
+  }
+  if (platform === "wecom") {
+    const botId = process.env.HARA_WECOM_BOT_ID;
+    const secret = process.env.HARA_WECOM_SECRET;
+    return environmentConfiguration([botId, secret], () => gatewayRuntimeScope("wecom", botId), "set HARA_WECOM_BOT_ID and HARA_WECOM_SECRET");
+  }
+  const rpcUrl = process.env.HARA_SIGNAL_RPC_URL;
+  const number = process.env.HARA_SIGNAL_NUMBER;
+  return environmentConfiguration([rpcUrl, number], () => gatewayRuntimeScope("signal", `${rpcUrl}\0${number}`), "set HARA_SIGNAL_RPC_URL and HARA_SIGNAL_NUMBER");
+}
+
+function gatewayRecommendation(
+  platform: GatewayPlatform,
+  configuration: GatewayConfigurationProbe,
+  runtime: Awaited<ReturnType<typeof inspectGatewayRuntime>>,
+): string {
+  const unresolvedError = runtime.lastErrorAt !== undefined
+    && runtime.state !== "connected"
+    && (runtime.lastConnectedAt === undefined || runtime.lastErrorAt >= runtime.lastConnectedAt);
+  if (unresolvedError && runtime.lastErrorCode === "session-expired" && platform === "weixin") {
+    return "re-login with `hara gateway --platform weixin --login`, then restart the gateway";
+  }
+  if (runtime.state === "degraded" || runtime.state === "failed" || runtime.state === "unreadable") {
+    return "inspect the redacted gateway log and restart the gateway if the error persists";
+  }
+  if (runtime.running) return "none";
+  if (configuration.state !== "ready") return configuration.missingHint;
+  return `run \`hara gateway --platform ${platform}\``;
+}
+
+/** Read-only, redacted gateway diagnosis shared by the CLI and Desktop serve protocol. */
+export async function gatewayStatus(platformValue: string): Promise<GatewayStatus> {
+  const platform = gatewayPlatform(platformValue);
+  const configuration = await inspectGatewayConfiguration(platform);
+  const runtime = await inspectGatewayRuntime(
+    platform,
+    configuration.runtimeScope ? [configuration.runtimeScope] : [],
+  );
+  // A long-running gateway can own environment-only credentials that are intentionally unavailable to the
+  // Desktop/CLI status process. Report that boundary explicitly instead of contradicting a live connection
+  // with "missing credentials". WeChat uses a shared private state file, so unreadability there stays visible.
+  const exposedConfiguration: GatewayConfigurationState = platform !== "weixin"
+    && runtime.running
+    && configuration.state !== "ready"
+      ? "process-only"
+      : configuration.state;
+  return {
+    platform,
+    label: GATEWAY_LABELS[platform],
+    configuration: exposedConfiguration,
+    configured: exposedConfiguration === "ready" || exposedConfiguration === "process-only" || runtime.running,
+    running: runtime.running,
+    runningInstances: runtime.runningInstances,
+    runtimeState: runtime.state,
+    ...(runtime.pid ? { pid: runtime.pid } : {}),
+    ...(runtime.startedAt ? { startedAt: runtime.startedAt } : {}),
+    ...(runtime.lastConnectedAt ? { lastConnectedAt: runtime.lastConnectedAt } : {}),
+    ...(runtime.lastPollAt ? { lastPollAt: runtime.lastPollAt } : {}),
+    ...(runtime.lastMessageAt ? { lastMessageAt: runtime.lastMessageAt } : {}),
+    ...(runtime.lastErrorAt ? { lastErrorAt: runtime.lastErrorAt } : {}),
+    ...(runtime.lastErrorCode ? { lastErrorCode: runtime.lastErrorCode } : {}),
+    recommendation: gatewayRecommendation(platform, configuration, runtime),
+  };
+}
+
+export async function listGatewayStatuses(
+  platforms: readonly string[] = GATEWAY_PLATFORMS,
+): Promise<GatewayStatus[]> {
+  return Promise.all(platforms.map((platform) => gatewayStatus(platform)));
+}
+
 async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; ownerId?: string; runtimeScope: string } | null> {
   if (platform === "weixin") {
     const { loadWeixinCreds, weixinAdapter } = await import("./weixin.js");
@@ -743,6 +939,12 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   // requested spelling only for startup/config hints; all persisted/routable identities are canonical.
   const platform = adapter.name || canonicalGatewayPlatform(requestedPlatform);
   const releaseInstance = acquireGatewayInstance(runtimeScope, { displayPlatform: platform });
+  let runtimeReporter: GatewayRuntimeReporter | undefined;
+  try {
+    runtimeReporter = await GatewayRuntimeReporter.open(runtimeScope, platform);
+  } catch {
+    console.error("hara gateway: runtime status is unavailable; gateway operation continues");
+  }
   let messageDeduper: GatewayMessageDeduper;
   let flowEffectReceipts: GatewayMessageDeduper;
   let flowRuns: GatewayFlowRunStore;
@@ -757,6 +959,9 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     flowRuns = await GatewayFlowRunStore.open(gatewayRuntimeScope("flow-runs", runtimeScope));
     runOutcomes = await GatewayRunOutcomeStore.open(gatewayRuntimeScope("run-cache", runtimeScope));
   } catch (error) {
+    runtimeReporter?.error("transport-exited");
+    runtimeReporter?.stopped(true);
+    await runtimeReporter?.flush();
     releaseInstance();
     throw error;
   }
@@ -793,6 +998,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   ac.signal.addEventListener("abort", closeQueue, { once: true });
   console.error(`hara gateway: ${adapter.name} up · cwd=${cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
 
+  let transportFailed = false;
   try {
     await pruneStaleMedia(platform).catch((error) => {
       console.error(`hara gateway: media cleanup failed — ${error instanceof Error ? error.message : String(error)}`);
@@ -801,6 +1007,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     await adapter.start((m: InboundMsg) => inboundHandlers.track((async () => {
     try {
     if (ac.signal.aborted) return;
+    runtimeReporter?.message();
     let existingRunOutcome: GatewayRunOutcomeState | null = null;
     let outcomeLoadError: unknown;
     try {
@@ -1201,7 +1408,11 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         console.error(`hara gateway: inbound media cleanup failed — ${error instanceof Error ? error.message : String(error)}`);
       });
     }
-    })()), ac.signal, (m) => shouldDownloadInboundMedia(m, allowlist));
+    })()), ac.signal, (m) => shouldDownloadInboundMedia(m, allowlist), runtimeReporter);
+  } catch (error) {
+    transportFailed = true;
+    runtimeReporter?.error("transport-exited");
+    throw error;
   } finally {
     stop();
     closeQueue();
@@ -1210,11 +1421,19 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     ac.signal.removeEventListener("abort", closeQueue);
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
-    if (handlersDrained) releaseInstance();
+    if (handlersDrained) {
+      releaseInstance();
+      runtimeReporter?.stopped(transportFailed);
+      await runtimeReporter?.flush();
+    }
     else {
       console.error("hara gateway: shutdown timed out with inbound work still active; instance lease retained until callbacks finish.");
       void inboundHandlers.waitForIdle().then(
-        () => releaseInstance(),
+        async () => {
+          releaseInstance();
+          runtimeReporter?.stopped(transportFailed);
+          await runtimeReporter?.flush();
+        },
         (error) => console.error(`hara gateway: could not release the deferred instance lease — ${error instanceof Error ? error.message : String(error)}`),
       );
     }

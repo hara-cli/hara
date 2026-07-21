@@ -13,7 +13,14 @@ import { homedir, hostname, platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { orgRolesDir } from "../org/roles.js";
-import { loadActiveProfile, upsertProfile, useProfile, getProfile, DEFAULT_ORG_ID } from "../profile/profile.js";
+import {
+  loadActiveProfile,
+  upsertProfile,
+  useProfile,
+  getProfile,
+  DEFAULT_ORG_ID,
+  type Profile,
+} from "../profile/profile.js";
 import {
   bindPrivateHaraStateFile,
   readPrivateStateFileSnapshotSync,
@@ -32,7 +39,67 @@ export interface Enrollment {
   expiresAt?: string;
 }
 
+export interface GatewayProfileEnrollmentInput {
+  id: string;
+  label?: string;
+  gatewayUrl: string;
+  code: string;
+  activate?: boolean;
+}
+
+const MAX_ENROLL_RESPONSE_BYTES = 1024 * 1024;
+const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+const loopbackHostname = (hostname: string): boolean => hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+
 const deviceInfo = (): { name: string; os: string; hara_version: string } => ({ name: hostname(), os: platform(), hara_version: process.env.HARA_BUILD_VERSION ?? "dev" });
+
+/** Enrollment codes are sent to a security-sensitive endpoint. Only HTTPS is accepted outside a
+ * loopback development server, and userinfo/path/query/fragment are rejected so a code cannot be
+ * redirected or accidentally embedded in a URL. */
+export function normalizeGatewayUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new Error("organization URL must be a valid absolute URL");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopbackHostname(url.hostname))) {
+    throw new Error("organization URL must use HTTPS (HTTP is allowed only for localhost)");
+  }
+  if (url.username || url.password) throw new Error("organization URL must not contain credentials");
+  if ((url.pathname && url.pathname !== "/") || url.search || url.hash) {
+    throw new Error("organization URL must contain only scheme, host, and optional port");
+  }
+  return url.origin;
+}
+
+function normalizeGatewayBaseUrl(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new Error("enroll response contains an invalid base_url");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("enroll response contains an invalid base_url");
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopbackHostname(url.hostname))) {
+    throw new Error("enroll response contains an insecure base_url");
+  }
+  if (url.username || url.password || url.search || url.hash) throw new Error("enroll response contains an invalid base_url");
+  return `${url.origin}${url.pathname.replace(/\/$/, "")}`;
+}
+
+function validateGatewayProfileInput(input: GatewayProfileEnrollmentInput): GatewayProfileEnrollmentInput {
+  const id = input.id.trim();
+  const label = input.label?.trim();
+  const code = input.code.trim();
+  if (!PROFILE_ID.test(id)) throw new Error("connection id must use 1-64 letters, numbers, dots, underscores, or dashes");
+  if (id === "personal") throw new Error("the personal profile id is reserved");
+  if (label && (label.length > 80 || CONTROL_CHARACTERS.test(label))) throw new Error("organization name must be 80 characters or fewer");
+  if (!code || code.length > 256 || CONTROL_CHARACTERS.test(code)) throw new Error("registration code must be 1-256 printable characters");
+  return { ...input, id, ...(label ? { label } : {}), gatewayUrl: normalizeGatewayUrl(input.gatewayUrl), code };
+}
 
 /** The effective OpenAI-compatible base URL for an enrollment (explicit, else <gatewayUrl>/v1). */
 export function gatewayBaseURL(e: Enrollment): string {
@@ -86,8 +153,18 @@ export function clearEnrollment(): boolean {
 
 /** Parse a control-plane enroll response (tolerant of snake_case / camelCase) into an Enrollment. */
 export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknown>, now: string): Enrollment {
-  const deviceToken = (j.device_token ?? j.deviceToken) as string | undefined;
-  if (!deviceToken) throw new Error("enroll response missing device_token");
+  const deviceToken = j.device_token ?? j.deviceToken;
+  if (typeof deviceToken !== "string" || !deviceToken || deviceToken.length > 16 * 1024 || CONTROL_CHARACTERS.test(deviceToken)) {
+    throw new Error("enroll response missing or contains an invalid device_token");
+  }
+  const rawDeviceId = j.device_id ?? j.deviceId ?? "";
+  const rawModel = j.model ?? "";
+  if (typeof rawDeviceId !== "string" || rawDeviceId.length > 256 || CONTROL_CHARACTERS.test(rawDeviceId)) {
+    throw new Error("enroll response contains an invalid device_id");
+  }
+  if (typeof rawModel !== "string" || rawModel.length > 512 || CONTROL_CHARACTERS.test(rawModel)) {
+    throw new Error("enroll response contains an invalid model");
+  }
   const rawExpiresAt = j.expires_at ?? j.expiresAt;
   let expiresAt: string | undefined;
   if (rawExpiresAt !== undefined && rawExpiresAt !== null) {
@@ -97,11 +174,11 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     expiresAt = new Date(rawExpiresAt).toISOString();
   }
   return {
-    gatewayUrl: gatewayUrl.replace(/\/$/, ""),
+    gatewayUrl: normalizeGatewayUrl(gatewayUrl),
     deviceToken,
-    deviceId: String(j.device_id ?? j.deviceId ?? ""),
-    model: String(j.model ?? ""),
-    baseURL: (j.base_url ?? j.baseURL) as string | undefined,
+    deviceId: rawDeviceId,
+    model: rawModel,
+    baseURL: normalizeGatewayBaseUrl(j.base_url ?? j.baseURL),
     enrolledAt: now,
     expiresAt,
   };
@@ -132,28 +209,105 @@ export function deviceTokenExpiryWarning(expiresAt: string | undefined, now = ne
   return `organization access expires in ${remaining}; ask your admin for a new enrollment code`;
 }
 
-/** Exchange a one-time code for a device token at the gateway, persist it, and return the Enrollment. */
+/** Exchange a one-time code without persisting it. Redirects are rejected so the credential is sent
+ * only to the exact origin the user entered. Server bodies are never reflected into errors. */
+export async function exchangeEnrollment(gatewayUrl: string, code: string, signal?: AbortSignal): Promise<Enrollment> {
+  const base = normalizeGatewayUrl(gatewayUrl);
+  if (!code.trim() || code.length > 256 || CONTROL_CHARACTERS.test(code)) {
+    throw new Error("registration code must be 1-256 printable characters");
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${base}/v1/enroll`, {
+      method: "POST",
+      redirect: "error",
+      signal,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: code.trim(), device: deviceInfo() }),
+    });
+  } catch {
+    throw new Error("organization enrollment request failed");
+  }
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}${res.status === 401 || res.status === 403 ? " — bad or expired code" : ""}`);
+  }
+  const declaredLength = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_ENROLL_RESPONSE_BYTES) {
+    throw new Error("enroll response is too large");
+  }
+  const raw = await res.text();
+  if (Buffer.byteLength(raw, "utf8") > MAX_ENROLL_RESPONSE_BYTES) throw new Error("enroll response is too large");
+  let payload: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid");
+    payload = parsed as Record<string, unknown>;
+  } catch {
+    throw new Error("enroll response is not valid JSON");
+  }
+  return parseEnrollResponse(base, payload, new Date().toISOString());
+}
+
+/** Legacy enrollment path: exchange, then persist ~/.hara/org.json for older callers. */
 export async function enrollDevice(gatewayUrl: string, code: string, signal?: AbortSignal): Promise<Enrollment> {
-  const base = gatewayUrl.replace(/\/$/, "");
-  const res = await fetch(`${base}/v1/enroll`, {
-    method: "POST",
-    signal,
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code, device: deviceInfo() }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}${res.status === 401 || res.status === 403 ? " — bad or expired code" : ""}: ${(await res.text()).slice(0, 200)}`);
-  const e = parseEnrollResponse(base, (await res.json()) as Record<string, unknown>, new Date().toISOString());
+  const e = await exchangeEnrollment(gatewayUrl, code, signal);
   saveEnrollment(e);
   return e;
 }
 
-/** Best-effort heartbeat so the control plane shows this device online. Never throws. */
-export async function heartbeat(signal?: AbortSignal): Promise<boolean> {
-  const e = loadEnrollment();
-  if (!e) return false;
+export function gatewayProfileFromEnrollment(id: string, label: string | undefined, e: Enrollment): Profile {
+  return {
+    id,
+    kind: "gateway",
+    label: label || id,
+    gatewayUrl: e.gatewayUrl,
+    deviceId: e.deviceId,
+    deviceToken: e.deviceToken,
+    baseURL: e.baseURL,
+    defaultModel: e.model || "",
+    availableModels: e.model ? [e.model] : [],
+    enrolledAt: e.enrolledAt,
+    tokenExpiresAt: e.expiresAt,
+  };
+}
+
+/** Desktop/profile-native enrollment: no legacy file is written, and the one-time code is never
+ * stored. An existing id is intentionally replaced so re-enrollment rotates the scoped token. */
+export async function enrollGatewayProfile(
+  input: GatewayProfileEnrollmentInput,
+  signal?: AbortSignal,
+): Promise<{ enrollment: Enrollment; heartbeatOk: boolean }> {
+  const validated = validateGatewayProfileInput(input);
+  const existing = getProfile(validated.id);
+  if (existing && existing.kind !== "gateway") throw new Error("connection id already belongs to a personal provider profile");
+  const enrollment = await exchangeEnrollment(validated.gatewayUrl, validated.code, signal);
+  const profile = gatewayProfileFromEnrollment(validated.id, validated.label, enrollment);
+  upsertProfile(profile);
+  if (validated.activate !== false) {
+    const switched = useProfile(validated.id);
+    if (!switched.ok) throw new Error("organization connection was saved but could not be activated");
+  }
+  return { enrollment, heartbeatOk: await heartbeatEnrollment(enrollment, signal) };
+}
+
+export function enrollmentFromProfile(profile: Profile): Enrollment | null {
+  if (profile.kind !== "gateway" || !profile.gatewayUrl || !profile.deviceToken) return null;
+  return {
+    gatewayUrl: profile.gatewayUrl,
+    deviceToken: profile.deviceToken,
+    deviceId: profile.deviceId || "",
+    model: profile.defaultModel || "",
+    baseURL: profile.baseURL,
+    enrolledAt: profile.enrolledAt || new Date(0).toISOString(),
+    expiresAt: profile.tokenExpiresAt,
+  };
+}
+
+export async function heartbeatEnrollment(e: Enrollment, signal?: AbortSignal): Promise<boolean> {
   try {
     const res = await fetch(`${e.gatewayUrl}/v1/heartbeat`, {
       method: "POST",
+      redirect: "error",
       signal,
       headers: { "content-type": "application/json", authorization: `Bearer ${e.deviceToken}` },
       body: JSON.stringify({ device_id: e.deviceId, ...deviceInfo() }),
@@ -162,6 +316,13 @@ export async function heartbeat(signal?: AbortSignal): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Best-effort heartbeat so the control plane shows this device online. Never throws. */
+export async function heartbeat(signal?: AbortSignal): Promise<boolean> {
+  const e = loadEnrollment();
+  if (!e) return false;
+  return heartbeatEnrollment(e, signal);
 }
 
 // ── B3: org role bundle push-down ────────────────────────────────────────────────────────────────

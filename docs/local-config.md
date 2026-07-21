@@ -20,6 +20,12 @@ provider is required; everything else has a sane default.
 - **Semantic search / vectors** — see below: `embedProvider` (`off` \| `ollama` \| `qwen` \| `openai`) + `embedModel` / `embedBaseURL` / `embedApiKey`.
 - **B-end fleet**: `hara enroll <gateway> --code <code>` → device token in `~/.hara/org.json` (0600); sets `provider=hara-gateway`.
 - **Behavior**: `approval` · `sandbox` · `theme` · `evolve` · `assetCapture` · `computerUse`/`computerApps` · `hooks` · `notify` · `vimMode` · `mcpServers` · `HARA_MAX_CONCURRENCY` (parallel sub-agent/read cap, default 8).
+- **Web-tool proxy**: `web_fetch` / `web_search` honor `HTTPS_PROXY`, `HTTP_PROXY` (and lowercase forms),
+  `NO_PROXY`, or `hara config set proxy http://127.0.0.1:7890`. `HARA_WEB_PROXY` is the Hara-specific
+  process override. This is deliberately scoped to web tools: provider/model, organization enrollment, and
+  chat gateway traffic are not redirected. Authenticated proxy URLs are accepted but always masked by
+  `hara config get`; do not paste them into chat or logs. `web_fetch` keeps its public-DNS/IP pin and private
+  address rejection across every redirect even through CONNECT.
 - **Agent lifecycle**: `runTimeoutMs` defaults to `30m` (accepts `ms`/`s`/`m`/`h`, hard max `2h`) and
   `maxAgentRounds` defaults to `64` (hard max `256`). `runTimeoutMs` measures active model/tool execution:
   activity cannot renew it, while time spent waiting for an engine-owned human question or approval is

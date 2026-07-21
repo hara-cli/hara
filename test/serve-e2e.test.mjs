@@ -505,6 +505,21 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     }],
   };
   let savedInput;
+  let enrolledOrganizationInput;
+  const organizationState = {
+    activeId: "personal",
+    activeSource: "default",
+    switchLocked: false,
+    connections: [{
+      id: "acme",
+      label: "Acme",
+      active: false,
+      gatewayUrl: "https://control.example.com",
+      gatewayHost: "control.example.com",
+      model: "deepseek-chat",
+      accessState: "valid",
+    }],
+  };
   const deps = {
     ...baseDeps(textProvider, memStore()),
     providerSettings: () => state,
@@ -517,6 +532,25 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       savedInput = input;
       return { ...state, accidentalApiKey: input.apiKey };
     },
+    gatewayStatuses: async () => [{
+      platform: "weixin",
+      label: "WeChat",
+      configuration: "ready",
+      configured: true,
+      running: false,
+      runningInstances: 0,
+      runtimeState: "stopped",
+      recommendation: "start it",
+      token: "gateway-secret-must-not-leak",
+    }],
+    organizationConnections: () => ({ ...organizationState, deviceToken: "org-device-secret-must-not-leak" }),
+    enrollOrganizationConnection: async (input) => {
+      enrolledOrganizationInput = input;
+      return { ...organizationState, accidentalCode: input.code, deviceToken: "org-device-secret-must-not-leak" };
+    },
+    useOrganizationConnection: () => ({ ...organizationState, activeId: "acme" }),
+    removeOrganizationConnection: () => ({ ...organizationState, connections: [] }),
+    checkOrganizationConnection: async (id) => ({ id, ok: true, checkedAt: 123 }),
   };
   const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
   const c = await connect(srv.port);
@@ -525,6 +559,14 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.ok(init.result.capabilities.methods.includes("settings.providers.list"));
     assert.ok(init.result.capabilities.methods.includes("settings.providers.test"));
     assert.ok(init.result.capabilities.methods.includes("settings.providers.save"));
+    assert.ok(init.result.capabilities.methods.includes("settings.gateways.list"));
+    for (const method of [
+      "settings.organizations.list",
+      "settings.organizations.enroll",
+      "settings.organizations.use",
+      "settings.organizations.remove",
+      "settings.organizations.check",
+    ]) assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
 
     const listed = await c.call("settings.providers.list", {});
     assert.equal(listed.result.current.provider, "ollama");
@@ -538,6 +580,30 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     const saved = await c.call("settings.providers.save", { provider: "openai", model: "gpt-test", apiKey: secret, activatePersonal: true });
     assert.equal(savedInput.apiKey, secret, "the authenticated callback receives the ephemeral credential");
     assert.equal(JSON.stringify(saved.result).includes(secret), false, "save results must never echo a submitted key");
+
+    const gateways = await c.call("settings.gateways.list", {});
+    assert.equal(gateways.result.gateways[0].platform, "weixin");
+    assert.equal(JSON.stringify(gateways.result).includes("gateway-secret-must-not-leak"), false);
+
+    const organizations = await c.call("settings.organizations.list", {});
+    assert.equal(organizations.result.connections[0].gatewayHost, "control.example.com");
+    assert.equal(JSON.stringify(organizations.result).includes("org-device-secret-must-not-leak"), false);
+
+    const enrollmentCode = "single-use-code-must-not-leak";
+    const enrolled = await c.call("settings.organizations.enroll", {
+      id: "acme",
+      label: "Acme",
+      gatewayUrl: "https://control.example.com",
+      code: enrollmentCode,
+    });
+    assert.equal(enrolledOrganizationInput.code, enrollmentCode, "authenticated callback receives the transient code");
+    assert.equal(JSON.stringify(enrolled.result).includes(enrollmentCode), false, "enrollment results never echo a one-time code");
+    assert.equal(JSON.stringify(enrolled.result).includes("org-device-secret-must-not-leak"), false);
+
+    const checked = await c.call("settings.organizations.check", { id: "acme" });
+    assert.deepEqual(checked.result, { id: "acme", ok: true, checkedAt: 123 });
+    assert.equal((await c.call("settings.organizations.use", { id: "acme" })).result.activeId, "acme");
+    assert.equal((await c.call("settings.organizations.remove", { id: "acme" })).result.connections.length, 0);
   } finally {
     c.close();
     await srv.close();

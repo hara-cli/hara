@@ -42,6 +42,7 @@ import { contextWindow, ctxPctFor } from "../statusbar.js";
 import { listProjectFilesAsync } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
 import type { Provider, NeutralMsg } from "../providers/types.js";
+import type { GatewayStatus } from "../gateway/serve.js";
 import type { UiSink } from "../tools/registry.js";
 import type { ApprovalMode } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
@@ -107,6 +108,15 @@ export interface ServeDeps {
   providerSettings?: (cwd?: string) => ProviderSettingsState;
   saveProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
   testProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
+  /** Read-only, redacted connector health for Desktop settings. */
+  gatewayStatuses?: () => Promise<GatewayStatus[]>;
+  /** Redacted organization/profile control plane. One-time codes are accepted only by enroll and are
+   * never returned. Device tokens remain inside the CLI's private profile store. */
+  organizationConnections?: (cwd?: string) => OrganizationConnectionsState;
+  enrollOrganizationConnection?: (input: OrganizationEnrollmentInput, cwd?: string) => Promise<OrganizationConnectionsState>;
+  useOrganizationConnection?: (id: string, cwd?: string) => OrganizationConnectionsState;
+  removeOrganizationConnection?: (id: string, cwd?: string) => OrganizationConnectionsState;
+  checkOrganizationConnection?: (id: string, cwd?: string) => Promise<OrganizationConnectionCheck>;
   /** thinking-dial levels valid for this endpoint's reasoning style (from the provider registry) */
   effortLevels?: string[];
   /** Live defaults advertised to persistent clients after config/profile edits. `model` lets a session
@@ -176,6 +186,41 @@ export interface ProviderSettingsTestResult {
   ok: boolean;
   models: string[];
   error?: string;
+}
+
+export type OrganizationAccessState = "valid" | "expiring" | "expired" | "legacy" | "invalid";
+
+export interface OrganizationConnectionSummary {
+  id: string;
+  label: string;
+  active: boolean;
+  gatewayUrl: string;
+  gatewayHost: string;
+  model: string;
+  enrolledAt?: string;
+  expiresAt?: string;
+  accessState: OrganizationAccessState;
+}
+
+export interface OrganizationConnectionsState {
+  activeId: string;
+  activeSource: "flag" | "env" | "pin" | "default" | "fallback";
+  switchLocked: boolean;
+  connections: OrganizationConnectionSummary[];
+}
+
+export interface OrganizationEnrollmentInput {
+  id: string;
+  label?: string;
+  gatewayUrl: string;
+  code: string;
+  activate?: boolean;
+}
+
+export interface OrganizationConnectionCheck {
+  id: string;
+  ok: boolean;
+  checkedAt: number;
 }
 
 export interface ServeOpts {
@@ -981,7 +1026,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.list", "session.create", "session.resume", "session.send", "session.steer", "session.interrupt", "session.set-model",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
-            "settings.providers.list", "settings.providers.test", "settings.providers.save",
+            "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.gateways.list",
+            "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
+            "settings.organizations.remove", "settings.organizations.check",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
             "artifact.import", "artifact.commit", "artifact.revert",
             "artifact.list", "artifact.get", "artifact.revisions",
@@ -1187,6 +1234,54 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!deps.providerSettings) return reply(rpcError(id, ERR.METHOD, "provider settings not supported by this server"));
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             return reply(rpcResult(id!, redactSensitiveValue(deps.providerSettings(targetCwd)).value));
+          }
+          case "settings.gateways.list": {
+            if (!deps.gatewayStatuses) return reply(rpcError(id, ERR.METHOD, "gateway status not supported by this server"));
+            const gateways = await deps.gatewayStatuses();
+            return reply(rpcResult(id!, { gateways: redactSensitiveValue(gateways).value }));
+          }
+          case "settings.organizations.list": {
+            if (!deps.organizationConnections) return reply(rpcError(id, ERR.METHOD, "organization settings not supported by this server"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, redactSensitiveValue(deps.organizationConnections(targetCwd)).value));
+          }
+          case "settings.organizations.enroll": {
+            if (!deps.enrollOrganizationConnection) return reply(rpcError(id, ERR.METHOD, "organization enrollment not supported by this server"));
+            if (
+              typeof p.id !== "string" ||
+              typeof p.gatewayUrl !== "string" ||
+              typeof p.code !== "string" ||
+              (p.label !== undefined && typeof p.label !== "string") ||
+              (p.activate !== undefined && typeof p.activate !== "boolean")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "id + gatewayUrl + code required; optional label/activate have invalid types"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const input: OrganizationEnrollmentInput = {
+              id: p.id,
+              gatewayUrl: p.gatewayUrl,
+              code: p.code,
+              ...(p.label !== undefined ? { label: p.label } : {}),
+              ...(p.activate !== undefined ? { activate: p.activate } : {}),
+            };
+            const result = await deps.enrollOrganizationConnection(input, targetCwd);
+            return reply(rpcResult(id!, redactSensitiveValue(result, [p.code]).value));
+          }
+          case "settings.organizations.use":
+          case "settings.organizations.remove":
+          case "settings.organizations.check": {
+            if (typeof p.id !== "string") return reply(rpcError(id, ERR.PARAMS, "organization connection id required"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            if (req.method === "settings.organizations.use") {
+              if (!deps.useOrganizationConnection) return reply(rpcError(id, ERR.METHOD, "organization switching not supported by this server"));
+              return reply(rpcResult(id!, redactSensitiveValue(deps.useOrganizationConnection(p.id, targetCwd)).value));
+            }
+            if (req.method === "settings.organizations.remove") {
+              if (!deps.removeOrganizationConnection) return reply(rpcError(id, ERR.METHOD, "organization removal not supported by this server"));
+              return reply(rpcResult(id!, redactSensitiveValue(deps.removeOrganizationConnection(p.id, targetCwd)).value));
+            }
+            if (!deps.checkOrganizationConnection) return reply(rpcError(id, ERR.METHOD, "organization connection check not supported by this server"));
+            return reply(rpcResult(id!, redactSensitiveValue(await deps.checkOrganizationConnection(p.id, targetCwd)).value));
           }
           case "settings.providers.test":
           case "settings.providers.save": {

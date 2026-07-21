@@ -54,6 +54,10 @@ import {
   loadEnrollment,
   clearEnrollment,
   enrollDevice,
+  enrollGatewayProfile,
+  gatewayProfileFromEnrollment,
+  enrollmentFromProfile,
+  heartbeatEnrollment,
   heartbeat,
   gatewayBaseURL,
   syncOrgRoles,
@@ -273,6 +277,24 @@ const pkg = {
 };
 
 const maskKey = (v?: string) => (v ? `••••${v.slice(-4)}` : "(unset)");
+const SECRET_CONFIG_KEY = /(?:apiKey|secret|token|password)$/i;
+const maskProxy = (value: unknown): string => {
+  if (typeof value !== "string" || !value.trim()) return "(unset)";
+  try {
+    const url = new URL(value);
+    const authenticated = Boolean(url.username || url.password);
+    url.username = "";
+    url.password = "";
+    return `${url.protocol}//${url.host}${authenticated ? " (credentials redacted)" : ""}`;
+  } catch {
+    return "(configured, invalid URL hidden)";
+  }
+};
+const displayConfigValue = (key: string, value: unknown): string => {
+  if (key === "proxy") return maskProxy(value);
+  if (SECRET_CONFIG_KEY.test(key)) return maskKey(typeof value === "string" ? value : undefined);
+  return value === undefined ? "(unset)" : String(value);
+};
 
 async function buildProvider(
   cfg: HaraConfig,
@@ -422,6 +444,57 @@ function providerSettingsSnapshot(targetCwd: string) {
     },
     providers: catalog,
   };
+}
+
+function organizationAccessState(profile: Profile, now = Date.now()): "valid" | "expiring" | "expired" | "legacy" | "invalid" {
+  if (!profile.deviceToken || !profile.gatewayUrl) return "invalid";
+  if (!profile.tokenExpiresAt) return "legacy";
+  const expiry = Date.parse(profile.tokenExpiresAt);
+  if (!Number.isFinite(expiry)) return "invalid";
+  if (expiry <= now) return "expired";
+  return expiry - now <= 24 * 60 * 60_000 ? "expiring" : "valid";
+}
+
+function publicGatewayIdentity(value: string | undefined): { gatewayUrl: string; gatewayHost: string } {
+  try {
+    const url = new URL(value || "");
+    return { gatewayUrl: url.origin, gatewayHost: url.host };
+  } catch {
+    return { gatewayUrl: "", gatewayHost: "invalid endpoint" };
+  }
+}
+
+function organizationConnectionsSnapshot(targetCwd: string) {
+  const resolution = resolveActive(targetCwd);
+  const connections = listProfiles()
+    .filter((profile) => profile.kind === "gateway")
+    .map((profile) => {
+      const endpoint = publicGatewayIdentity(profile.gatewayUrl);
+      return {
+        id: profile.id,
+        label: profile.label || profile.id,
+        active: profile.id === resolution.id,
+        ...endpoint,
+        model: effectiveModel(profile) || "",
+        ...(profile.enrolledAt ? { enrolledAt: profile.enrolledAt } : {}),
+        ...(profile.tokenExpiresAt ? { expiresAt: profile.tokenExpiresAt } : {}),
+        accessState: organizationAccessState(profile),
+      };
+    });
+  return {
+    activeId: resolution.id,
+    activeSource: resolution.source,
+    switchLocked: resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin",
+    connections,
+  };
+}
+
+function assertOrganizationId(value: string): string {
+  const id = value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id) || id === PERSONAL_ID) {
+    throw new Error("invalid organization connection id");
+  }
+  return id;
 }
 
 async function testProviderSettingsCandidate(input: {
@@ -2074,27 +2147,15 @@ profileCmd
     if (opts.gateway) {
       if (!opts.code) return void out(c.red("gateway profile add needs --code <code> from your hara-control admin\n"));
       try {
-        const e = await enrollDevice(opts.gateway, opts.code);
-        const p: Profile = {
+        const { enrollment: e } = await enrollGatewayProfile({
           id,
-          kind: "gateway",
           label: opts.label || id,
-          gatewayUrl: e.gatewayUrl,
-          deviceId: e.deviceId,
-          deviceToken: e.deviceToken,
-          baseURL: e.baseURL,
-          defaultModel: e.model || "",
-          availableModels: e.model ? [e.model] : [],
-          enrolledAt: e.enrolledAt,
-          tokenExpiresAt: e.expiresAt,
-        };
-        upsertProfile(p); // upsert: re-enrolling the same id rotates the token
-        const r = useProfile(id);
-        if (r.ok) {
-          out(c.green(`✓ enrolled and switched to '${id}' (${e.gatewayUrl})`) + c.dim(` · model ${p.defaultModel || "(gateway default)"}\n`));
-          const nRoles = await syncOrgRoles();
-          if (nRoles > 0) out(c.dim(`  ↳ synced ${nRoles} org role${nRoles === 1 ? "" : "s"} → ~/.hara/org-roles/\n`));
-        }
+          gatewayUrl: opts.gateway,
+          code: opts.code,
+        });
+        out(c.green(`✓ enrolled and switched to '${id}' (${e.gatewayUrl})`) + c.dim(` · model ${e.model || "(gateway default)"}\n`));
+        const nRoles = await syncOrgRoles();
+        if (nRoles > 0) out(c.dim(`  ↳ synced ${nRoles} org role${nRoles === 1 ? "" : "s"} → ~/.hara/org-roles/\n`));
       } catch (err) {
         out(c.red(`Enroll failed: ${err instanceof Error ? err.message : String(err)}\n`));
         process.exit(1);
@@ -2283,19 +2344,7 @@ program
     if (!opts.code) return void out(c.red("Need --code <code> — ask your hara-control admin to issue an enrollment code.\n"));
     try {
       const e = await enrollDevice(gatewayUrl, opts.code);
-      const p: Profile = {
-        id: DEFAULT_ORG_ID,
-        kind: "gateway",
-        label: "Default Org",
-        gatewayUrl: e.gatewayUrl,
-        deviceId: e.deviceId,
-        deviceToken: e.deviceToken,
-        baseURL: e.baseURL,
-        defaultModel: e.model || "",
-        availableModels: e.model ? [e.model] : [],
-        enrolledAt: e.enrolledAt,
-        tokenExpiresAt: e.expiresAt,
-      };
+      const p = gatewayProfileFromEnrollment(DEFAULT_ORG_ID, "Default Org", e);
       upsertProfile(p);
       useProfile(DEFAULT_ORG_ID);
       out(c.green(`✓ enrolled with ${e.gatewayUrl}`) + c.dim(` · device ${e.deviceId || "?"} · model ${e.model || "(gateway default)"} · profile ${DEFAULT_ORG_ID}\n`) + c.dim("hara routes through the gateway now — the real provider key stays server-side.\n"));
@@ -2330,42 +2379,75 @@ program
     );
   });
 
-program
+const gatewayCommand = program
   .command("gateway")
   .description("run a supported chat gateway so you can drive your local hara from your phone — opt-in daemon")
-  .option("--platform <name>", "chat platform: telegram | weixin | discord | feishu | slack | mattermost | matrix | dingtalk | wecom | signal", "telegram")
+  .option("--platform <name>", "chat platform: telegram | weixin | discord | feishu | slack | mattermost | matrix | dingtalk | wecom | signal")
   .option("--login", "(weixin) scan a QR to log in and save credentials, then exit")
   .option("--recover-outcome <message-id>", "recover exactly one interrupted/terminal run marker by its original platform message id")
   .option("--confirm-recovery <action:message-id>", "required exact confirmation: terminalize:<id> or delete-terminal:<id>")
-  .option("--cwd <dir>", "directory hara operates in per message (default: ~/.hara/workspace)")
-  .action(async (opts) => {
+  .option("--cwd <dir>", "directory hara operates in per message (default: ~/.hara/workspace)");
+
+gatewayCommand
+  .command("status")
+  .description("show redacted configuration, live process, connection, poll, and error state")
+  .option("--json", "print stable machine-readable JSON")
+  .action(async (opts: { json?: boolean }, command) => {
     const mod = await import("./gateway/serve.js");
-    if (opts.recoverOutcome !== undefined || opts.confirmRecovery !== undefined) {
-      if (typeof opts.recoverOutcome !== "string" || typeof opts.confirmRecovery !== "string") {
-        throw new Error("gateway outcome recovery requires both --recover-outcome <message-id> and --confirm-recovery <action:message-id>");
-      }
-      const result = await mod.recoverGatewayRunOutcome({
-        platform: opts.platform,
-        messageId: opts.recoverOutcome,
-        confirmation: opts.confirmRecovery,
-      });
-      if (result === "missing") out(c.yellow("No outcome marker exists for that message id and gateway credential.\n"));
-      else if (result === "terminalized") {
-        out(c.green("✓ interrupted marker converted to terminal; one active slot is free and coding remains blocked from rerun.\n"));
-      } else if (result === "already-terminal") {
-        out(c.yellow("Marker is already terminal. Delete it only after platform redelivery is impossible, using delete-terminal:<same-message-id>.\n"));
-      } else {
-        out(c.yellow("✓ terminal marker removed. This message id is no longer protected if the platform redelivers it later.\n"));
-      }
+    const platform = command.parent?.opts().platform as string | undefined;
+    const statuses = platform
+      ? [await mod.gatewayStatus(platform)]
+      : await mod.listGatewayStatuses();
+    if (opts.json) {
+      out(`${JSON.stringify(platform ? statuses[0] : { gateways: statuses }, null, 2)}\n`);
       return;
     }
-    if (opts.platform === "weixin" && opts.login) {
-      await mod.weixinLogin();
-      return;
+    const timestamp = (value: number | undefined): string => value ? new Date(value).toISOString() : "never";
+    for (const [index, status] of statuses.entries()) {
+      if (index) out("\n");
+      out(
+        `${c.bold(`${status.label} (${status.platform})`)}\n` +
+        `  configuration: ${status.configuration}\n` +
+        `  process: ${status.running ? `running${status.pid ? ` (pid ${status.pid})` : ""}` : "stopped"}` +
+        `${status.runningInstances > 1 ? ` · ${status.runningInstances} credential-scoped instances` : ""}\n` +
+        `  transport: ${status.runtimeState}\n` +
+        `  started: ${timestamp(status.startedAt)}\n` +
+        `  last connected/poll/message: ${timestamp(status.lastConnectedAt)} / ${timestamp(status.lastPollAt)} / ${timestamp(status.lastMessageAt)}\n` +
+        `  last error: ${status.lastErrorCode ?? "none"}${status.lastErrorAt ? ` at ${timestamp(status.lastErrorAt)}` : ""}\n` +
+        `  action: ${status.recommendation}\n`,
+      );
     }
-    const cwd = opts.cwd ? (await import("node:path")).resolve(opts.cwd) : undefined; // undefined → ~/.hara/workspace
-    await mod.runGateway({ cwd, platform: opts.platform });
   });
+
+gatewayCommand.action(async (opts) => {
+  const mod = await import("./gateway/serve.js");
+  const platform = opts.platform || "telegram";
+  if (opts.recoverOutcome !== undefined || opts.confirmRecovery !== undefined) {
+    if (typeof opts.recoverOutcome !== "string" || typeof opts.confirmRecovery !== "string") {
+      throw new Error("gateway outcome recovery requires both --recover-outcome <message-id> and --confirm-recovery <action:message-id>");
+    }
+    const result = await mod.recoverGatewayRunOutcome({
+      platform,
+      messageId: opts.recoverOutcome,
+      confirmation: opts.confirmRecovery,
+    });
+    if (result === "missing") out(c.yellow("No outcome marker exists for that message id and gateway credential.\n"));
+    else if (result === "terminalized") {
+      out(c.green("✓ interrupted marker converted to terminal; one active slot is free and coding remains blocked from rerun.\n"));
+    } else if (result === "already-terminal") {
+      out(c.yellow("Marker is already terminal. Delete it only after platform redelivery is impossible, using delete-terminal:<same-message-id>.\n"));
+    } else {
+      out(c.yellow("✓ terminal marker removed. This message id is no longer protected if the platform redelivers it later.\n"));
+    }
+    return;
+  }
+  if (platform === "weixin" && opts.login) {
+    await mod.weixinLogin();
+    return;
+  }
+  const cwd = opts.cwd ? (await import("node:path")).resolve(opts.cwd) : undefined; // undefined → ~/.hara/workspace
+  await mod.runGateway({ cwd, platform });
+});
 
 program
   .command("serve")
@@ -2420,6 +2502,50 @@ program
           return listModels(target.baseURL, target.apiKey ?? "");
         },
         providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
+        gatewayStatuses: async () => {
+          const gateway = await import("./gateway/serve.js");
+          return gateway.listGatewayStatuses(["weixin", "feishu"]);
+        },
+        organizationConnections: (targetCwd) => organizationConnectionsSnapshot(targetCwd ?? cwd),
+        enrollOrganizationConnection: async (input, targetCwd) => {
+          const settingsCwd = targetCwd ?? cwd;
+          const resolution = resolveActive(settingsCwd);
+          if (input.activate !== false && (resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin")) {
+            throw new Error("the active profile is locked by a flag, environment variable, or project pin; remove that override before activating an organization connection");
+          }
+          await enrollGatewayProfile(input, AbortSignal.timeout(30_000));
+          return organizationConnectionsSnapshot(settingsCwd);
+        },
+        useOrganizationConnection: (inputId, targetCwd) => {
+          const settingsCwd = targetCwd ?? cwd;
+          const id = assertOrganizationId(inputId);
+          const target = getProfile(id);
+          if (!target || target.kind !== "gateway") throw new Error("organization connection was not found");
+          const resolution = resolveActive(settingsCwd);
+          if (resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin") {
+            throw new Error("the active profile is locked by a flag, environment variable, or project pin; remove that override before switching");
+          }
+          const switched = useProfile(id);
+          if (!switched.ok) throw new Error("organization connection could not be activated");
+          return organizationConnectionsSnapshot(settingsCwd);
+        },
+        removeOrganizationConnection: (inputId, targetCwd) => {
+          const settingsCwd = targetCwd ?? cwd;
+          const id = assertOrganizationId(inputId);
+          const target = getProfile(id);
+          if (!target || target.kind !== "gateway") throw new Error("organization connection was not found");
+          const removed = removeProfile(id);
+          if (!removed.ok) throw new Error("organization connection could not be removed");
+          return organizationConnectionsSnapshot(settingsCwd);
+        },
+        checkOrganizationConnection: async (inputId) => {
+          const id = assertOrganizationId(inputId);
+          const profile = getProfile(id);
+          if (!profile || profile.kind !== "gateway") throw new Error("organization connection was not found");
+          const enrollment = enrollmentFromProfile(profile);
+          const ok = !!enrollment && !deviceTokenExpired(enrollment.expiresAt) && await heartbeatEnrollment(enrollment, AbortSignal.timeout(15_000));
+          return { id, ok, checkedAt: Date.now() };
+        },
         testProviderSettings: (input) => testProviderSettingsCandidate(input),
         saveProviderSettings: async (input, targetCwd) => {
           const settingsCwd = targetCwd ?? cwd;
@@ -3199,6 +3325,17 @@ config
       out(c.red(`Invalid reasoning effort. One of: ${REASONING_EFFORTS.join(", ")}.\n`));
       process.exit(1);
     }
+    if (key === "proxy") {
+      try {
+        const parsed = new URL(value);
+        if (!(["http:", "https:"] as const).includes(parsed.protocol as "http:" | "https:") || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+          throw new Error("invalid proxy URL");
+        }
+      } catch {
+        out(c.red("Invalid proxy. Use an HTTP(S) proxy URL such as http://127.0.0.1:7890; paths, queries, and fragments are not allowed.\n"));
+        process.exit(1);
+      }
+    }
     if (key === "runTimeoutMs") {
       const parsed = parseAgentRunTimeoutMs(value);
       if (parsed === undefined || parsed < MIN_AGENT_RUN_TIMEOUT_MS || parsed > MAX_AGENT_RUN_TIMEOUT_MS) {
@@ -3218,11 +3355,11 @@ config
   });
 config
   .command("get [key]")
-  .description("show config (apiKey masked)")
+  .description("show config (credentials masked)")
   .action((key?: string) => {
     const raw = readRawConfig();
     if (key) {
-      out((key === "apiKey" ? maskKey(raw.apiKey) : raw[key] ?? "(unset)") + "\n");
+      out(displayConfigValue(key, raw[key]) + "\n");
     } else {
       out(
         `path:     ${configPath()}\n` +
@@ -3233,6 +3370,7 @@ config
           `sandbox:  ${raw.sandbox ?? "(default off)"}\n` +
           `timeout:  ${raw.runTimeoutMs ?? "(default 30m)"}\n` +
           `rounds:   ${raw.maxAgentRounds ?? "(default 64)"}\n` +
+          `proxy:    ${maskProxy(raw.proxy)}\n` +
           `apiKey:   ${maskKey(raw.apiKey)}\n`,
       );
     }

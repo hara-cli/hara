@@ -140,12 +140,15 @@ function sensitiveFieldName(key: string): boolean {
 /** Deep-copy a JSON-shaped value while redacting every string. Session history contains secrets not only
  *  in user text but also in assistant tool inputs and tool results, so a top-level content-only pass is
  *  insufficient. The live value is never mutated. */
-export function redactSensitiveValue<T>(value: T): { value: T; redactions: string[] } {
+export function redactSensitiveValue<T>(
+  value: T,
+  knownSecrets: readonly (string | undefined)[] = [],
+): { value: T; redactions: string[] } {
   const hits: string[] = [];
   const seen = new WeakMap<object, unknown>();
   const walk = (v: unknown): unknown => {
     if (typeof v === "string") {
-      const r = redactSensitiveText(v);
+      const r = redactKnownSecrets(v, knownSecrets);
       hits.push(...r.redactions);
       return r.text;
     }

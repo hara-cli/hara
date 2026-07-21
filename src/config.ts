@@ -78,6 +78,8 @@ export interface HaraConfig {
   fileCheckpoints: boolean;
   /** startup update check (cached daily npm probe → one-line notice on launch). default on. */
   updateCheck: boolean;
+  /** Optional HTTP(S) proxy used only by web_fetch/web_search. Standard HTTP(S)_PROXY env vars take precedence. */
+  proxy: string | undefined;
   /** App-level failover: on a recoverable turn error (overload / rate-limit / timeout / context-overflow),
    *  retry once on this model. For a CROSS-PROVIDER fallback (e.g. primary Qwen, fallback DeepSeek) set
    *  `fallbackProvider` — its endpoint + env key are then resolved for you (setting `fallbackBaseURL`
@@ -205,7 +207,7 @@ export function providerCatalog(): ProviderCatalogEntry[] {
   }));
 }
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = ["off", "low", "medium", "high", "max"];
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
@@ -639,6 +641,7 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   const autoCompact = !(process.env.HARA_AUTO_COMPACT === "0" || merged.autoCompact === false || merged.autoCompact === "false"); // default ON
   const fileCheckpoints = !(process.env.HARA_CHECKPOINTS === "0" || merged.fileCheckpoints === false || merged.fileCheckpoints === "false"); // default ON
   const updateCheck = !(process.env.HARA_UPDATE_CHECK === "0" || merged.updateCheck === false || merged.updateCheck === "false"); // default ON
+  const proxy = typeof merged.proxy === "string" && merged.proxy.trim() ? merged.proxy.trim() : undefined;
   const fallbackModel = nonBlankEnv(process.env.HARA_FALLBACK_MODEL) ?? merged.fallbackModel;
   const requestedFallbackProvider = nonBlankEnv(process.env.HARA_FALLBACK_PROVIDER) ?? merged.fallbackProvider;
   const fallbackProvider = isProviderId(requestedFallbackProvider) ? requestedFallbackProvider : undefined;
@@ -649,7 +652,7 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     ? (reasoningRaw as "off" | "low" | "medium" | "high" | "max")
     : undefined;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, vimMode, autoCompact, fileCheckpoints, updateCheck, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

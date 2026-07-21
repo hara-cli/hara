@@ -23,10 +23,12 @@ import {
   GatewayFlowRunStore,
   GatewayInboundTracker,
   GatewayMessageDeduper,
+  GatewayRuntimeReporter,
   GatewayRunOutcomeStore,
+  inspectGatewayRuntime,
 } from "../dist/gateway/runtime-state.js";
 import { compareProcessIdentity, defaultProcessIdentity } from "../dist/process-identity.js";
-import { executeDurableGatewayEffect } from "../dist/gateway/serve.js";
+import { executeDurableGatewayEffect, gatewayStatus } from "../dist/gateway/serve.js";
 
 function temporaryHome() {
   return mkdtempSync(join(tmpdir(), "hara-gateway-runtime-"));
@@ -55,6 +57,106 @@ test("gateway instance lease rejects a second live process and releases idempote
     const releaseAgain = acquireGatewayInstance("feishu", { home });
     releaseAgain();
   } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gateway runtime status reports a live PID and redacted poll/error history, then stops cleanly", async () => {
+  const home = temporaryHome();
+  const connectionIdentity = "app-id:must-never-be-persisted";
+  const scope = gatewayRuntimeScope("weixin", connectionIdentity);
+  let now = 1_000;
+  try {
+    const release = acquireGatewayInstance(scope, { home, displayPlatform: "weixin", now: () => now });
+    const reporter = await GatewayRuntimeReporter.open(scope, "weixin", { home, now: () => now });
+    now = 2_000;
+    reporter.connected();
+    now = 3_000;
+    reporter.poll();
+    now = 4_000;
+    reporter.error("session-expired");
+    await reporter.flush();
+
+    const live = await inspectGatewayRuntime("weixin", [scope], { home });
+    assert.equal(live.running, true);
+    assert.equal(live.runningInstances, 1);
+    assert.equal(live.pid, process.pid);
+    assert.equal(live.state, "degraded");
+    assert.equal(live.lastPollAt, 3_000);
+    assert.equal(live.lastErrorAt, 4_000);
+    assert.equal(live.lastErrorCode, "session-expired");
+    const persisted = readFileSync(join(home, ".hara", "gateway", `status-${scope}.json`), "utf8");
+    assert.equal(persisted.includes(connectionIdentity), false);
+    assert.equal(persisted.includes("token"), false);
+
+    release();
+    now = 5_000;
+    reporter.stopped();
+    await reporter.flush();
+    const stopped = await inspectGatewayRuntime("weixin", [scope], { home });
+    assert.equal(stopped.running, false);
+    assert.equal(stopped.state, "stopped");
+    assert.equal(stopped.pid, undefined);
+    assert.equal(stopped.lastErrorCode, "session-expired");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gateway runtime inspection fails closed on a linked status file without reading its target", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX symlink assertion");
+  const home = temporaryHome();
+  const dir = join(home, ".hara", "gateway");
+  const outside = join(home, "outside.json");
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(outside, JSON.stringify({ secret: "do-not-read" }), { mode: 0o600 });
+    const { symlinkSync } = await import("node:fs");
+    symlinkSync(outside, join(dir, "status-weixin-deadbeefdeadbeef.json"));
+    const status = await inspectGatewayRuntime("weixin", [], { home });
+    assert.equal(status.running, false);
+    assert.equal(status.state, "unreadable");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gateway status marks environment credentials as process-only and does not repeat a recovered error", async () => {
+  const home = temporaryHome();
+  const savedHome = process.env.HOME;
+  const savedAppId = process.env.HARA_FEISHU_APP_ID;
+  const savedSecret = process.env.HARA_FEISHU_APP_SECRET;
+  const scope = gatewayRuntimeScope("feishu", "credential-owned-by-another-process");
+  let now = 1_000;
+  try {
+    process.env.HOME = home;
+    delete process.env.HARA_FEISHU_APP_ID;
+    delete process.env.HARA_FEISHU_APP_SECRET;
+    const release = acquireGatewayInstance(scope, { home, displayPlatform: "feishu", now: () => now });
+    const reporter = await GatewayRuntimeReporter.open(scope, "feishu", { home, now: () => now });
+    now = 2_000;
+    reporter.error("network");
+    now = 3_000;
+    reporter.connected();
+    await reporter.flush();
+
+    const status = await gatewayStatus("feishu");
+    assert.equal(status.configuration, "process-only");
+    assert.equal(status.running, true);
+    assert.equal(status.runtimeState, "connected");
+    assert.equal(status.lastErrorCode, "network", "last error remains available as resolved history");
+    assert.equal(status.recommendation, "none");
+
+    release();
+    reporter.stopped();
+    await reporter.flush();
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedAppId === undefined) delete process.env.HARA_FEISHU_APP_ID;
+    else process.env.HARA_FEISHU_APP_ID = savedAppId;
+    if (savedSecret === undefined) delete process.env.HARA_FEISHU_APP_SECRET;
+    else process.env.HARA_FEISHU_APP_SECRET = savedSecret;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -629,6 +731,31 @@ test("gateway CLI recovery locates one opaque marker from the original message i
     assert.match(removed.stdout, /no longer protected/);
     assert.equal(await store.load(messageId), null);
     assert.deepEqual(await store.load(unrelatedId), { status: "running" });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gateway status CLI accepts the documented subcommand order and returns one redacted platform", () => {
+  const home = temporaryHome();
+  const cli = join(process.cwd(), "dist", "index.js");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [cli, "gateway", "status", "--platform", "weixin", "--json"],
+      {
+        cwd: home,
+        env: { ...process.env, HOME: home, USERPROFILE: home },
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    );
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const status = JSON.parse(result.stdout);
+    assert.equal(status.platform, "weixin");
+    assert.equal(status.configuration, "missing");
+    assert.equal("gateways" in status, false, "--platform returns one object, not an accidental all-platform list");
+    assert.equal(JSON.stringify(status).includes("token"), false);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

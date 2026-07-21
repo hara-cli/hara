@@ -5,6 +5,29 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.132.0 — 2026-07-22 — observable chat gateways and scoped web proxies
+
+- `hara gateway status --platform <name>` now reports redacted credential readability, the live
+  credential-scoped lease/PID, transport state, start time, last connection/poll/message, bounded error code,
+  and one focused action. The same read-only data is available to Desktop through
+  `settings.gateways.list`; no model call, chat content, credential id, token, URL, or raw transport error is
+  stored or returned. WeChat status distinguishes missing, malformed, and readable QR login state, while
+  Feishu lifecycle comes from the SDK's actual connect/reconnect/error callbacks.
+- `web_fetch` and `web_search` now honor `HTTPS_PROXY`, `HTTP_PROXY`, lowercase equivalents, `NO_PROXY`,
+  `HARA_WEB_PROXY`, or global `~/.hara/config.json` key `proxy`. Proxy dispatch is scoped to those two web
+  tools: model/provider, Control enrollment, and chat gateway traffic are unchanged. `web_fetch` still
+  resolves and rejects internal targets before every redirect and sends the approved public IP in the
+  CONNECT tunnel, preserving its DNS-rebinding/SSRF boundary even when a proxy is used.
+- Proxy URLs and every `*ApiKey` config value are masked by `hara config get`; invalid proxy errors do not
+  echo the supplied value. The proxy transport uses patched Undici 7.28.0, and Hono/node-server/fast-uri
+  transitive dependencies are pinned to their current security fixes.
+- Desktop can now list, add, re-enroll, switch, check, and locally remove user-provided organization
+  connections through authenticated `settings.organizations.*` Serve methods. Enrollment rejects redirects,
+  embedded URL credentials, and non-HTTPS remote endpoints; one-time codes are never persisted or returned,
+  while scoped device tokens remain only in the private `profiles.json` store. No enterprise endpoint is
+  preconfigured by Hara.
+- Upgrade with `npm i -g @nanhara/hara@0.132.0`.
+
 ## 0.131.1 — 2026-07-21 — authenticated macOS standalone assets
 
 - Darwin arm64 and Intel standalone binaries are now built on their matching native macOS runners,

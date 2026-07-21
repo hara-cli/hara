@@ -36,6 +36,8 @@ import { sameOpenedFileIdentity } from "../fs-identity.js";
 const PLATFORM = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const LOCK_BYTES = 4 * 1024;
 const LOCK_WAIT_MS = 5_000;
+const RUNTIME_STATUS_BYTES = 32 * 1024;
+const RUNTIME_STATUS_FILE = /^status-([a-z0-9][a-z0-9_-]{0,63})\.json$/;
 const STORE_BYTES = 256 * 1024;
 const DEFAULT_TTL_MS = 60 * 60_000;
 const DEFAULT_CAPACITY = 2_048;
@@ -124,6 +126,50 @@ interface StoredRunOutcome {
   files: { safeName: string; bytes: string }[];
   /** Synthesized default voice reply. Kept separate so a failed voice upload can retry without rerunning TTS. */
   voice?: { safeName: string; bytes: string };
+}
+
+export type GatewayRuntimeErrorCode =
+  | "network"
+  | "platform-error"
+  | "reconnecting"
+  | "session-expired"
+  | "transport-exited"
+  | "transport-terminal";
+
+type StoredGatewayRuntimeState = "starting" | "connected" | "degraded" | "stopped" | "failed";
+
+interface StoredGatewayRuntimeStatus {
+  version: 1;
+  platform: string;
+  pid: number;
+  startedAt: number;
+  updatedAt: number;
+  state: StoredGatewayRuntimeState;
+  lastConnectedAt?: number;
+  lastPollAt?: number;
+  lastMessageAt?: number;
+  lastErrorAt?: number;
+  lastErrorCode?: GatewayRuntimeErrorCode;
+}
+
+export interface GatewayRuntimeObserver {
+  connected(): void;
+  poll(): void;
+  message(): void;
+  error(code: GatewayRuntimeErrorCode): void;
+}
+
+export interface GatewayRuntimeInspection {
+  running: boolean;
+  runningInstances: number;
+  state: StoredGatewayRuntimeState | "unknown" | "unreadable";
+  pid?: number;
+  startedAt?: number;
+  lastConnectedAt?: number;
+  lastPollAt?: number;
+  lastMessageAt?: number;
+  lastErrorAt?: number;
+  lastErrorCode?: GatewayRuntimeErrorCode;
 }
 
 interface InFlightMessage {
@@ -463,6 +509,285 @@ export function acquireGatewayInstance(platformValue: string, options: GatewayRu
     }
     if (Date.now() >= deadline) throw new Error(`gateway '${displayPlatform}' stale instance could not be reclaimed`);
   }
+}
+
+const GATEWAY_RUNTIME_ERROR_CODES = new Set<GatewayRuntimeErrorCode>([
+  "network",
+  "platform-error",
+  "reconnecting",
+  "session-expired",
+  "transport-exited",
+  "transport-terminal",
+]);
+
+function optionalRuntimeTimestamp(value: unknown): number | undefined {
+  return Number.isFinite(value) && (value as number) > 0 ? Math.trunc(value as number) : undefined;
+}
+
+function parseGatewayRuntimeStatus(
+  snapshot: PrivateStateFileSnapshot | null,
+  path: string,
+): StoredGatewayRuntimeStatus | null {
+  if (!snapshot) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(snapshot.text);
+  } catch {
+    throw new Error(`invalid gateway runtime status: ${path}`);
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`invalid gateway runtime status: ${path}`);
+  }
+  const record = value as Partial<StoredGatewayRuntimeStatus>;
+  const state = record.state;
+  const error = record.lastErrorCode;
+  if (
+    record.version !== 1
+    || typeof record.platform !== "string"
+    || checkedPlatform(record.platform) !== record.platform
+    || !Number.isSafeInteger(record.pid)
+    || (record.pid as number) <= 0
+    || !optionalRuntimeTimestamp(record.startedAt)
+    || !optionalRuntimeTimestamp(record.updatedAt)
+    || !(["starting", "connected", "degraded", "stopped", "failed"] as const).includes(state as StoredGatewayRuntimeState)
+    || (error !== undefined && !GATEWAY_RUNTIME_ERROR_CODES.has(error))
+  ) {
+    throw new Error(`invalid gateway runtime status: ${path}`);
+  }
+  for (const timestamp of [
+    record.lastConnectedAt,
+    record.lastPollAt,
+    record.lastMessageAt,
+    record.lastErrorAt,
+  ]) {
+    if (timestamp !== undefined && !optionalRuntimeTimestamp(timestamp)) {
+      throw new Error(`invalid gateway runtime status: ${path}`);
+    }
+  }
+  return record as StoredGatewayRuntimeStatus;
+}
+
+function gatewayRuntimeStatusPath(directory: string, runtimeScope: string): string {
+  return join(directory, `status-${checkedPlatform(runtimeScope)}.json`);
+}
+
+/**
+ * Credential-scoped, redacted health writer for one live gateway. It stores only lifecycle timestamps and
+ * bounded error codes: never tokens, app ids, URLs, chat ids, message text, or raw transport errors.
+ */
+export class GatewayRuntimeReporter implements GatewayRuntimeObserver {
+  private tail: Promise<void> = Promise.resolve();
+  private writeWarningShown = false;
+
+  private constructor(
+    private readonly dir: string,
+    private readonly path: string,
+    private readonly now: () => number,
+    private readonly record: StoredGatewayRuntimeStatus,
+  ) {}
+
+  static async open(
+    runtimeScopeValue: string,
+    platformValue: string,
+    options: Pick<GatewayRuntimeOptions, "home" | "now"> = {},
+  ): Promise<GatewayRuntimeReporter> {
+    const runtimeScope = checkedPlatform(runtimeScopeValue);
+    const platform = checkedPlatform(platformValue);
+    const dir = stateDirectory(options.home ?? homedir());
+    const path = gatewayRuntimeStatusPath(dir, runtimeScope);
+    const previous = parseGatewayRuntimeStatus(
+      await readPrivateStateFileSnapshot(path, RUNTIME_STATUS_BYTES),
+      path,
+    );
+    if (previous && previous.platform !== platform) {
+      throw new Error("gateway runtime status belongs to a different platform");
+    }
+    const now = options.now ?? Date.now;
+    const startedAt = now();
+    const reporter = new GatewayRuntimeReporter(dir, path, now, {
+      version: 1,
+      platform,
+      pid: process.pid,
+      startedAt,
+      updatedAt: startedAt,
+      state: "starting",
+      ...(previous?.lastConnectedAt ? { lastConnectedAt: previous.lastConnectedAt } : {}),
+      ...(previous?.lastPollAt ? { lastPollAt: previous.lastPollAt } : {}),
+      ...(previous?.lastMessageAt ? { lastMessageAt: previous.lastMessageAt } : {}),
+      ...(previous?.lastErrorAt ? { lastErrorAt: previous.lastErrorAt } : {}),
+      ...(previous?.lastErrorCode ? { lastErrorCode: previous.lastErrorCode } : {}),
+    });
+    reporter.scheduleWrite();
+    await reporter.flush();
+    return reporter;
+  }
+
+  private scheduleWrite(): void {
+    this.record.updatedAt = this.now();
+    const payload = JSON.stringify({ ...this.record }, null, 2) + "\n";
+    this.tail = this.tail
+      .then(async () => {
+        const snapshot = await readPrivateStateFileSnapshot(this.path, RUNTIME_STATUS_BYTES);
+        const boundary = bindHaraPrivateStateWritePath(this.path, this.dir, "write gateway runtime status");
+        await atomicWriteText(this.path, payload, {
+          expected: snapshot?.text ?? null,
+          expectedIdentity: snapshot
+            ? { dev: snapshot.dev, ino: snapshot.ino, mode: snapshot.mode, nlink: snapshot.nlink }
+            : undefined,
+          mode: 0o600,
+          boundary,
+        });
+      })
+      .catch(() => {
+        if (!this.writeWarningShown) {
+          this.writeWarningShown = true;
+          console.error("hara gateway: runtime status could not be persisted; gateway operation continues");
+        }
+      });
+  }
+
+  connected(): void {
+    const now = this.now();
+    this.record.state = "connected";
+    this.record.lastConnectedAt = now;
+    this.scheduleWrite();
+  }
+
+  poll(): void {
+    const now = this.now();
+    this.record.state = "connected";
+    this.record.lastConnectedAt = now;
+    this.record.lastPollAt = now;
+    this.scheduleWrite();
+  }
+
+  message(): void {
+    const now = this.now();
+    this.record.state = "connected";
+    this.record.lastConnectedAt = now;
+    this.record.lastMessageAt = now;
+    this.scheduleWrite();
+  }
+
+  error(code: GatewayRuntimeErrorCode): void {
+    if (!GATEWAY_RUNTIME_ERROR_CODES.has(code)) return;
+    this.record.state = code === "transport-terminal" || code === "transport-exited" ? "failed" : "degraded";
+    this.record.lastErrorAt = this.now();
+    this.record.lastErrorCode = code;
+    this.scheduleWrite();
+  }
+
+  stopped(failed = false): void {
+    this.record.state = failed ? "failed" : "stopped";
+    this.scheduleWrite();
+  }
+
+  async flush(): Promise<void> {
+    await this.tail;
+  }
+}
+
+interface InspectedGatewayRuntimeCandidate {
+  scope: string;
+  record: StoredGatewayRuntimeStatus | null;
+  lease: LeaseSnapshot | null;
+  live: boolean;
+}
+
+/** Aggregate all credential-scoped instances of one platform without exposing their scope hashes or ids. */
+export async function inspectGatewayRuntime(
+  platformValue: string,
+  runtimeScopes: readonly string[] = [],
+  options: Pick<GatewayRuntimeOptions, "home" | "pidAlive" | "processIdentity"> = {},
+): Promise<GatewayRuntimeInspection> {
+  const platform = checkedPlatform(platformValue);
+  const dir = stateDirectory(options.home ?? homedir());
+  const scopes = new Set(runtimeScopes.map(checkedPlatform));
+  let unreadable = false;
+  for (const name of readdirSync(dir)) {
+    const match = RUNTIME_STATUS_FILE.exec(name);
+    if (!match) continue;
+    const scope = match[1];
+    try {
+      const record = parseGatewayRuntimeStatus(
+        await readPrivateStateFileSnapshot(join(dir, name), RUNTIME_STATUS_BYTES),
+        join(dir, name),
+      );
+      if (record?.platform === platform) scopes.add(scope);
+    } catch {
+      if (scope === platform || scope.startsWith(`${platform}-`)) unreadable = true;
+    }
+  }
+
+  const pidAlive = options.pidAlive ?? defaultPidAlive;
+  const processIdentity = options.processIdentity ?? defaultProcessIdentity;
+  const candidates: InspectedGatewayRuntimeCandidate[] = [];
+  for (const scope of scopes) {
+    let record: StoredGatewayRuntimeStatus | null = null;
+    let lease: LeaseSnapshot | null = null;
+    try {
+      record = parseGatewayRuntimeStatus(
+        await readPrivateStateFileSnapshot(gatewayRuntimeStatusPath(dir, scope), RUNTIME_STATUS_BYTES),
+        gatewayRuntimeStatusPath(dir, scope),
+      );
+      if (record && record.platform !== platform) continue;
+      lease = readLease(join(dir, `instance-${scope}.lock`), scope);
+    } catch {
+      unreadable = true;
+    }
+    candidates.push({
+      scope,
+      record,
+      lease,
+      live: Boolean(lease && leaseOwnerAlive(lease.record, pidAlive, processIdentity)),
+    });
+  }
+
+  const live = candidates
+    .filter((candidate) => candidate.live && candidate.lease)
+    .sort((left, right) => (right.lease?.record.startedAt ?? 0) - (left.lease?.record.startedAt ?? 0));
+  const selected = live[0]
+    ?? candidates
+      .filter((candidate) => candidate.record)
+      .sort((left, right) => (right.record?.updatedAt ?? 0) - (left.record?.updatedAt ?? 0))[0];
+  const matchingRecord = selected?.record
+    && (!selected.lease || selected.record.pid === selected.lease.record.pid)
+    ? selected.record
+    : null;
+  const history = matchingRecord
+    ? {
+        ...(matchingRecord.lastConnectedAt ? { lastConnectedAt: matchingRecord.lastConnectedAt } : {}),
+        ...(matchingRecord.lastPollAt ? { lastPollAt: matchingRecord.lastPollAt } : {}),
+        ...(matchingRecord.lastMessageAt ? { lastMessageAt: matchingRecord.lastMessageAt } : {}),
+        ...(matchingRecord.lastErrorAt ? { lastErrorAt: matchingRecord.lastErrorAt } : {}),
+        ...(matchingRecord.lastErrorCode ? { lastErrorCode: matchingRecord.lastErrorCode } : {}),
+      }
+    : {};
+
+  if (live.length && selected?.lease) {
+    return {
+      running: true,
+      runningInstances: live.length,
+      state: matchingRecord?.state ?? "unknown",
+      pid: selected.lease.record.pid,
+      startedAt: selected.lease.record.startedAt,
+      ...history,
+    };
+  }
+  if (selected?.record) {
+    return {
+      running: false,
+      runningInstances: 0,
+      state: selected.record.state === "failed" ? "failed" : "stopped",
+      startedAt: selected.record.startedAt,
+      ...history,
+    };
+  }
+  return {
+    running: false,
+    runningInstances: 0,
+    state: unreadable ? "unreadable" : "unknown",
+  };
 }
 
 function parseProcessedStore(snapshot: PrivateStateFileSnapshot | null, path: string): ProcessedMessage[] {

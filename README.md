@@ -127,6 +127,17 @@ hara config set apiKey   ...
 hara config set model    ...
 ```
 
+**Proxy for web tools in mainland/restricted networks** — only `web_fetch` and `web_search` use it:
+```bash
+export HTTPS_PROXY=http://127.0.0.1:7890
+# or persist the same endpoint privately:
+hara config set proxy http://127.0.0.1:7890
+```
+`HTTP_PROXY`, lowercase variants, `NO_PROXY`, and `HARA_WEB_PROXY` are supported. Model/provider calls,
+organization enrollment, and chat gateways are not silently redirected. Even through a proxy, `web_fetch`
+pins each DNS-approved public IP and rechecks redirects; authenticated proxy URLs are masked by
+`hara config get`.
+
 **Vision** — hara **auto-detects** whether your main model can see images. A vision model (Claude, gpt-4o,
 qwen-vl, glm-4v…) gets pasted images **inline**. For a **text-only** model (DeepSeek, coding models), set a
 describer — the "eyes" — and hara OCRs/describes each pasted image into text first:
@@ -183,6 +194,7 @@ hara --sandbox workspace-write   # confine shell writes to the project (macOS Se
 hara --cwd /path/to/project      # explicitly select a workspace without changing your shell directory
 hara -c                    # resume the most recent session in this directory
 hara --profile work        # use a named profile from ~/.hara/config.json
+hara profile add work --gateway https://control.example.com --code <one-time-code>  # user-added org route
 hara -m glm-5              # pick a model
 ```
 
@@ -331,6 +343,9 @@ start an external tool server.
 **Profiles and live config**: select an identity with `--profile <name>`; use `overlays` in
 `~/.hara/config.json` for named config overlays. Project `.hara/config.json` files get the safe preference
 allowlist above; project-specific routing requires `HARA_TRUST_PROJECT_CONFIG=1` before launch.
+Organization connections are never prefilled: add one with `hara profile add <id> --gateway <https-url>
+--code <one-time-code>` or in Desktop's AI & models settings. The registration code is exchanged once and
+discarded; only the scoped, revocable device credential is retained in the private `~/.hara/profiles.json`.
 `.hara-profile` identity pins are read no-follow with size, single-inode, and hard-link checks; pin updates use
 an atomic compare-and-swap, and invalid-pin warnings never echo file contents or paths. A Git-tracked pin is
 repository-controlled and ignored by default; local untracked pins created with `hara profile pin` work

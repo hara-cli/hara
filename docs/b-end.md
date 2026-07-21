@@ -21,7 +21,7 @@ Split the **data plane** (the LLM proxy — protocol conversion, routing to N ba
 ## Topology
 
 ```
-hara device (provider=hara-gateway, token in ~/.hara/org.json, NO real key)
+hara device (gateway profile, scoped token in private ~/.hara/profiles.json, NO real key)
       │  OpenAI-compatible /v1, Bearer <device_token>
       ▼   (private net — Tailscale/WG)
 hara-gateway = hara-control (thin shell: enroll/heartbeat/fleet/audit) + data-plane engine (LiteLLM)
@@ -39,10 +39,15 @@ cloud models  /  internal vLLM·Ollama
 
 ## Status
 
-**✅ Built (this repo — the OSS client side, v0.66):**
-- `hara enroll <gateway-url> --code <code>` / `--status` / `--clear` — `src/org-fleet/enroll.ts`.
+**✅ Built (this repo — the OSS client side):**
+- `hara profile add <id> --gateway <gateway-url> --code <code>` plus the compatibility
+  `hara enroll` alias — `src/org-fleet/enroll.ts`.
 - `hara-gateway` provider (`buildProvider` → OpenAI-compatible client at the gateway with the device token).
-- Device token + endpoint in `~/.hara/org.json` (0600); heartbeat fired on interactive start (fire-and-forget).
+- Multiple user-added connections live in `~/.hara/profiles.json` (0600); the one-time code is never stored.
+  Desktop uses authenticated `settings.organizations.*` Serve methods to list, enroll, switch, explicitly
+  heartbeat-check, and locally remove them without receiving a device token. Remote endpoints require HTTPS;
+  redirects and URL-embedded credentials are rejected.
+- Heartbeat is fired on interactive start and after a new Desktop/profile enrollment.
 - Protocol verified end-to-end against a stub control plane (`test/enroll.test.mjs`).
 
 **`hara-control` (a SEPARATE repo — open-source Apache, self-hostable; see its `docs/selfhost.md` + `docs/AUTH_SPEC.md`):**

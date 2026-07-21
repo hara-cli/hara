@@ -14,26 +14,37 @@ import {
   syncOrgRoles,
   deviceTokenExpired,
   deviceTokenExpiryWarning,
+  normalizeGatewayUrl,
+  enrollGatewayProfile,
 } from "../dist/org-fleet/enroll.js";
 import { orgRolesDir, loadRoles } from "../dist/org/roles.js";
+import { listProfiles, loadActiveProfile } from "../dist/profile/profile.js";
 
 test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry, requires a token", () => {
   const e = parseEnrollResponse(
-    "http://gw/",
+    "https://gw/",
     { device_token: "t1", device_id: "d1", model: "m1", expires_at: "2026-01-08T00:00:00Z" },
     "2026-01-01",
   );
-  assert.equal(e.gatewayUrl, "http://gw");
+  assert.equal(e.gatewayUrl, "https://gw");
   assert.equal(e.deviceToken, "t1");
   assert.equal(e.deviceId, "d1");
   assert.equal(e.expiresAt, "2026-01-08T00:00:00.000Z");
-  assert.equal(gatewayBaseURL(e), "http://gw/v1");
-  assert.equal(gatewayBaseURL({ ...e, baseURL: "http://gw/openai" }), "http://gw/openai");
-  assert.throws(() => parseEnrollResponse("http://gw", {}, "t"), /device_token/);
+  assert.equal(gatewayBaseURL(e), "https://gw/v1");
+  assert.equal(gatewayBaseURL({ ...e, baseURL: "https://gw/openai" }), "https://gw/openai");
+  assert.throws(() => parseEnrollResponse("https://gw", {}, "t"), /device_token/);
   assert.throws(
-    () => parseEnrollResponse("http://gw", { device_token: "t1", expires_at: "not-a-date" }, "t"),
+    () => parseEnrollResponse("https://gw", { device_token: "t1", expires_at: "not-a-date" }, "t"),
     /invalid expires_at/,
   );
+});
+
+test("organization URL validation requires HTTPS outside loopback and rejects embedded credentials or paths", () => {
+  assert.equal(normalizeGatewayUrl("https://control.example.com/"), "https://control.example.com");
+  assert.equal(normalizeGatewayUrl("http://127.0.0.1:8787"), "http://127.0.0.1:8787");
+  assert.throws(() => normalizeGatewayUrl("http://control.example.com"), /HTTPS/);
+  assert.throws(() => normalizeGatewayUrl("https://user:secret@control.example.com"), /credentials/);
+  assert.throws(() => normalizeGatewayUrl("https://control.example.com/tenant?a=1"), /only scheme/);
 });
 
 test("device token expiry: legacy is compatible; expiring and expired tokens are actionable", () => {
@@ -88,6 +99,59 @@ test("enroll → store (0600) → heartbeat → clear, against a stub control pl
     server.close();
     if (prev === undefined) delete process.env.HOME;
     else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("profile-native enrollment stores only the scoped token in private profiles and activates the user-added connection", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-profile-enroll-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  let heartbeatSeen = false;
+  const server = createServer((req, res) => {
+    if (req.url === "/v1/enroll") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        device_token: "scoped-device-token",
+        device_id: "device-one",
+        model: "deepseek-chat",
+        expires_at: "2099-01-01T00:00:00Z",
+      }));
+    } else if (req.url === "/v1/heartbeat") {
+      heartbeatSeen = req.headers.authorization === "Bearer scoped-device-token";
+      res.writeHead(204);
+      res.end();
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const result = await enrollGatewayProfile({
+      id: "team-a",
+      label: "Team A",
+      gatewayUrl: url,
+      code: "one-time-code",
+    });
+    assert.equal(result.heartbeatOk, true);
+    assert.equal(heartbeatSeen, true);
+    assert.equal(loadActiveProfile().id, "team-a");
+    assert.equal(listProfiles().find((profile) => profile.id === "team-a")?.deviceToken, "scoped-device-token");
+    const profilesPath = join(home, ".hara", "profiles.json");
+    assert.equal(statSync(profilesPath).mode & 0o777, 0o600);
+    const stored = readFileSync(profilesPath, "utf8");
+    assert.equal(stored.includes("one-time-code"), false, "the registration code is never persisted");
+    assert.equal(existsSync(join(home, ".hara", "org.json")), false, "Desktop/profile enrollment does not create legacy state");
+    await assert.rejects(
+      () => enrollGatewayProfile({ id: "personal", gatewayUrl: url, code: "another-code" }),
+      /reserved/,
+    );
+  } finally {
+    server.close();
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -195,14 +259,22 @@ test("syncOrgRoles rejects traversal and Windows-special role names without writ
 });
 
 test("enrollDevice: a non-2xx (bad code) throws with a clear message", async () => {
+  const reflectedSecret = "one-time-secret-that-must-not-leak";
   const server = createServer((req, res) => {
     res.writeHead(403);
-    res.end("nope");
+    res.end(`invalid code ${reflectedSecret}`);
   });
   await new Promise((r) => server.listen(0, r));
   const url = `http://127.0.0.1:${server.address().port}`;
   try {
-    await assert.rejects(() => enrollDevice(url, "BAD"), /bad or expired code|403/);
+    await assert.rejects(
+      () => enrollDevice(url, "BAD"),
+      (error) => {
+        assert.match(error.message, /bad or expired code|403/);
+        assert.equal(error.message.includes(reflectedSecret), false, "server response cannot reflect a credential into logs");
+        return true;
+      },
+    );
   } finally {
     server.close();
   }

@@ -48,6 +48,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
       routeApiKey: "route-key",
       routeModel: "route-model",
       routeBaseURL: "https://route.example/v1",
+      proxy: "http://127.0.0.1:7890",
       runTimeoutMs: "45m",
       maxAgentRounds: "96",
     }),
@@ -125,6 +126,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
     assert.equal(cfg.routeApiKey, "route-key");
     assert.equal(cfg.routeModel, "route-model");
     assert.equal(cfg.routeBaseURL, "https://route.example/v1");
+    assert.equal(cfg.proxy, "http://127.0.0.1:7890");
     assert.equal(cfg.runTimeoutMs, 45 * 60_000);
     assert.equal(cfg.maxAgentRounds, 96);
   } finally {
@@ -632,6 +634,41 @@ test("personal provider switch never replays a flat key to another vendor and lo
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("config get masks every API key and authenticated proxy URL", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-redaction-"));
+  const home = join(root, "home");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  const secrets = {
+    visionApiKey: "vision-secret-1234",
+    embedApiKey: "embed-secret-2345",
+    routeApiKey: "route-secret-3456",
+    fallbackApiKey: "fallback-secret-4567",
+    proxy: "http://proxy-user:proxy-password@127.0.0.1:7890",
+  };
+  writeFileSync(join(home, ".hara", "config.json"), JSON.stringify(secrets));
+  const cli = join(process.cwd(), "dist", "index.js");
+  const run = (key) => spawnSync(process.execPath, [cli, "config", "get", key], {
+    cwd: root,
+    env: { ...process.env, HOME: home, USERPROFILE: home, HARA_UPDATE_CHECK: "0" },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  try {
+    for (const key of ["visionApiKey", "embedApiKey", "routeApiKey", "fallbackApiKey"]) {
+      const result = run(key);
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.match(result.stdout, /^••••/u);
+      assert.equal(result.stdout.includes(secrets[key]), false);
+    }
+    const proxy = run("proxy");
+    assert.equal(proxy.status, 0, proxy.stderr || proxy.stdout);
+    assert.match(proxy.stdout, /http:\/\/127\.0\.0\.1:7890 \(credentials redacted\)/);
+    assert.doesNotMatch(proxy.stdout, /proxy-user|proxy-password/);
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });

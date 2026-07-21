@@ -7,7 +7,9 @@ import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { ProxyAgent, fetch as undiciFetch, request as undiciRequest } from "undici";
 import { wrapUntrusted } from "../security/external-content.js";
+import { loadConfig } from "../config.js";
 
 const MAX = 60_000;
 const SEARCH_ATTEMPT_MS = 8_000;
@@ -117,12 +119,191 @@ export async function resolvePublicHost(
 interface PinnedResponse {
   status: number;
   headers: Headers;
-  body: IncomingMessage;
+  body: IncomingMessage | Awaited<ReturnType<typeof undiciRequest>>["body"];
+  release(discard?: boolean): Promise<void>;
+}
+
+export interface WebProxySelection {
+  /** Internal-only: may include authentication and must never be logged or serialized. */
+  uri: string;
+  source: "hara-env" | "environment" | "config";
+}
+
+function nonBlank(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
+}
+
+function defaultPort(url: URL): string {
+  return url.port || (url.protocol === "https:" ? "443" : "80");
+}
+
+/** Common NO_PROXY matching: exact host, domain suffix (`.example.com` / `*.example.com`), optional port,
+ * and `*`. This decision always uses the original public hostname, never the later pinned IP. */
+export function bypassesWebProxy(url: URL, noProxyValue: string | undefined): boolean {
+  const hostname = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  const port = defaultPort(url);
+  for (const raw of noProxyValue?.split(/[\s,]+/u) ?? []) {
+    let rule = raw.trim().toLowerCase();
+    if (!rule) continue;
+    if (rule === "*") return true;
+    try {
+      if (/^https?:\/\//u.test(rule)) {
+        const parsed = new URL(rule);
+        if (parsed.port && parsed.port !== port) continue;
+        rule = parsed.hostname.toLowerCase();
+      }
+    } catch {
+      continue;
+    }
+    let rulePort: string | undefined;
+    if (rule.startsWith("[")) {
+      const match = /^\[([^\]]+)\](?::(\d+))?$/u.exec(rule);
+      if (!match) continue;
+      rule = match[1];
+      rulePort = match[2];
+    } else {
+      const match = /^([^:]+):(\d+)$/u.exec(rule);
+      if (match) {
+        rule = match[1];
+        rulePort = match[2];
+      }
+    }
+    if (rulePort && rulePort !== port) continue;
+    rule = rule.replace(/\.$/u, "");
+    const suffix = rule.startsWith("*.") ? rule.slice(2) : rule.startsWith(".") ? rule.slice(1) : "";
+    if (suffix ? hostname === suffix || hostname.endsWith(`.${suffix}`) : hostname === rule) return true;
+  }
+  return false;
+}
+
+function normalizedProxyUri(value: string): string {
+  try {
+    const parsed = new URL(value);
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+      || !parsed.hostname
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+    ) {
+      throw new Error("unsupported proxy URL");
+    }
+    return parsed.href;
+  } catch {
+    throw new Error("web proxy configuration is invalid; use an HTTP(S) proxy URL without a path, query, or fragment");
+  }
+}
+
+/** Resolve one proxy without mutating Undici's global dispatcher. Standard lowercase variables take
+ * precedence over uppercase, and HTTPS falls back to HTTP_PROXY as documented by EnvHttpProxyAgent. */
+export function selectWebProxy(
+  url: URL,
+  configuredProxy: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): WebProxySelection | undefined {
+  const noProxy = nonBlank(env.no_proxy) ?? nonBlank(env.NO_PROXY);
+  if (bypassesWebProxy(url, noProxy)) return undefined;
+  const haraProxy = nonBlank(env.HARA_WEB_PROXY);
+  if (haraProxy) return { uri: normalizedProxyUri(haraProxy), source: "hara-env" };
+  const protocolProxy = url.protocol === "https:"
+    ? nonBlank(env.https_proxy) ?? nonBlank(env.HTTPS_PROXY) ?? nonBlank(env.http_proxy) ?? nonBlank(env.HTTP_PROXY)
+    : nonBlank(env.http_proxy) ?? nonBlank(env.HTTP_PROXY);
+  if (protocolProxy) return { uri: normalizedProxyUri(protocolProxy), source: "environment" };
+  return configuredProxy ? { uri: normalizedProxyUri(configuredProxy), source: "config" } : undefined;
+}
+
+function webProxy(url: URL, cwd: string): WebProxySelection | undefined {
+  return selectWebProxy(url, loadConfig({ cwd }).proxy);
+}
+
+function proxySafeError(error: unknown): Error {
+  const candidate = error as { name?: unknown; code?: unknown; cause?: { code?: unknown } };
+  const code = typeof candidate?.code === "string"
+    ? candidate.code
+    : typeof candidate?.cause?.code === "string"
+      ? candidate.cause.code
+      : undefined;
+  const suffix = code && /^[A-Z][A-Z0-9_]{1,40}$/u.test(code) ? ` (${code})` : "";
+  const result = new Error(`proxy request failed${suffix}`);
+  result.name = typeof candidate?.name === "string" && /^(?:Abort|Timeout)Error$/u.test(candidate.name)
+    ? candidate.name
+    : "Error";
+  return result;
+}
+
+function safeNetworkError(error: unknown): string {
+  const candidate = error as { name?: unknown; message?: unknown; code?: unknown; cause?: { code?: unknown } };
+  if (candidate?.name === "AbortError" || candidate?.name === "TimeoutError") return "timed out (30s)";
+  const rawCode = typeof candidate?.code === "string" ? candidate.code : candidate?.cause?.code;
+  const code = typeof rawCode === "string" && /^[A-Z][A-Z0-9_]{1,40}$/u.test(rawCode) ? ` [${rawCode}]` : "";
+  const message = String(candidate?.message ?? "network request failed")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/giu, "$1[credentials]@")
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .slice(0, 240);
+  return `${message}${code}`;
+}
+
+function pinnedUrl(url: URL, pinned: PinnedHost): URL {
+  const result = new URL(url.href);
+  result.hostname = pinned.family === 6 ? `[${pinned.address}]` : pinned.address;
+  result.username = "";
+  result.password = "";
+  return result;
+}
+
+function responseHeaders(values: Awaited<ReturnType<typeof undiciRequest>>["headers"]): Headers {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(values)) {
+    if (Array.isArray(value)) for (const item of value) headers.append(name, item);
+    else if (value !== undefined) headers.append(name, String(value));
+  }
+  return headers;
 }
 
 /** One HTTP hop whose TCP socket is pinned to the address approved above. `Host` and TLS SNI retain the
  * original hostname, so virtual hosting/certificate checks work without a second DNS lookup. */
-async function requestPinned(url: URL, pinned: PinnedHost, signal: AbortSignal): Promise<PinnedResponse> {
+export async function requestPinned(
+  url: URL,
+  pinned: PinnedHost,
+  signal: AbortSignal,
+  proxy?: WebProxySelection,
+): Promise<PinnedResponse> {
+  if (proxy) {
+    const servername = url.hostname.replace(/^\[|\]$/g, "");
+    const agent = new ProxyAgent({
+      uri: proxy.uri,
+      proxyTunnel: true,
+      ...(url.protocol === "https:" && !isIP(servername) ? { requestTls: { servername } } : {}),
+    });
+    try {
+      const response = await undiciRequest(pinnedUrl(url, pinned), {
+        dispatcher: agent,
+        method: "GET",
+        signal,
+        headers: {
+          host: url.host,
+          "user-agent": "hara-cli",
+          accept: "text/html,text/plain,application/json,*/*",
+        },
+      });
+      let released = false;
+      return {
+        status: response.statusCode,
+        headers: responseHeaders(response.headers),
+        body: response.body,
+        async release(discard = false) {
+          if (released) return;
+          released = true;
+          if (discard) response.body.destroy();
+          await agent.close();
+        },
+      };
+    } catch (error) {
+      await agent.destroy().catch(() => {});
+      throw proxySafeError(error);
+    }
+  }
   return new Promise((resolve, reject) => {
     const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(
       {
@@ -143,7 +324,14 @@ async function requestPinned(url: URL, pinned: PinnedHost, signal: AbortSignal):
       (body) => {
         const headers = new Headers();
         for (let i = 0; i < body.rawHeaders.length; i += 2) headers.append(body.rawHeaders[i], body.rawHeaders[i + 1]);
-        resolve({ status: body.statusCode ?? 0, headers, body });
+        resolve({
+          status: body.statusCode ?? 0,
+          headers,
+          body,
+          async release(discard = false) {
+            if (discard) body.destroy();
+          },
+        });
       },
     );
     request.once("error", reject);
@@ -176,7 +364,7 @@ async function readCapped(res: Response, maxBytes: number): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function readPinnedCapped(res: IncomingMessage, maxBytes: number): Promise<string> {
+async function readPinnedCapped(res: PinnedResponse["body"], maxBytes: number): Promise<string> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const value of res) {
@@ -362,11 +550,38 @@ function interrupted(label: string): Error {
   return error;
 }
 
-async function searchFetch(url: string, init: RequestInit, parentSignal?: AbortSignal): Promise<Response> {
+const searchProxyAgents = new Map<string, ProxyAgent>();
+
+function searchProxyAgent(uri: string): ProxyAgent {
+  let agent = searchProxyAgents.get(uri);
+  if (!agent) {
+    agent = new ProxyAgent({ uri, proxyTunnel: true });
+    searchProxyAgents.set(uri, agent);
+  }
+  return agent;
+}
+
+async function searchFetch(
+  url: string,
+  init: RequestInit,
+  parentSignal: AbortSignal | undefined,
+  cwd: string,
+): Promise<Response> {
   if (parentSignal?.aborted) throw interrupted("web search");
   const attemptSignal = AbortSignal.timeout(SEARCH_ATTEMPT_MS);
   const signal = parentSignal ? AbortSignal.any([parentSignal, attemptSignal]) : attemptSignal;
-  return fetch(url, { ...init, signal });
+  const proxy = webProxy(new URL(url), cwd);
+  if (!proxy) return fetch(url, { ...init, signal });
+  try {
+    const response = await undiciFetch(url, {
+      ...(init as Parameters<typeof undiciFetch>[1]),
+      dispatcher: searchProxyAgent(proxy.uri),
+      signal,
+    });
+    return response as unknown as Response;
+  } catch (error) {
+    throw proxySafeError(error);
+  }
 }
 
 async function firstSuccessfulSearch(
@@ -430,7 +645,7 @@ registerTool({
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ api_key: key, query: q, max_results: limit }),
-        }, ctx.signal);
+        }, ctx.signal, ctx.cwd);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const j = (await res.json()) as { results?: { title?: string; url?: string; content?: string }[] };
           return (j.results ?? []).map((x) => ({ title: String(x.title ?? x.url ?? ""), url: String(x.url ?? ""), snippet: String(x.content ?? "").slice(0, 200) }));
@@ -444,7 +659,7 @@ registerTool({
           method: "GET",
           redirect: "follow",
           headers: { "user-agent": SEARCH_UA, accept: "text/html" },
-        }, ctx.signal);
+        }, ctx.signal, ctx.cwd);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return parseBingSearchResults(await res.text(), limit);
       },
@@ -463,7 +678,7 @@ registerTool({
               method: "GET",
               redirect: "follow",
               headers: { "user-agent": SEARCH_UA, accept: "text/html" },
-            }, ctx.signal);
+            }, ctx.signal, ctx.cwd);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return parseBaiduSearchResults(await res.text(), limit);
           },
@@ -475,7 +690,7 @@ registerTool({
               method: "GET",
               redirect: "follow",
               headers: { "user-agent": SEARCH_UA, accept: "text/html" },
-            }, ctx.signal);
+            }, ctx.signal, ctx.cwd);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return parseGoogleSearchResults(await res.text(), limit);
           },
@@ -488,7 +703,7 @@ registerTool({
               redirect: "follow",
               headers: { "user-agent": SEARCH_UA, "content-type": "application/x-www-form-urlencoded", accept: "text/html" },
               body: `q=${encodeURIComponent(q)}`,
-            }, ctx.signal);
+            }, ctx.signal, ctx.cwd);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return parseSearchResults(await res.text(), limit);
           },
@@ -524,9 +739,10 @@ registerTool({
     try {
       url = new URL(input.url);
     } catch {
-      return `Error: invalid URL: ${input.url}`;
+      return "Error: invalid URL.";
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") return "Error: only http/https URLs are supported.";
+    if (url.username || url.password) return "Error: URL-embedded credentials are not supported.";
     const cap = Math.min(Math.max(1000, input.max_chars ?? MAX), 200_000);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 30_000);
@@ -539,22 +755,33 @@ registerTool({
         if (ctx.signal?.aborted) throw interrupted("web fetch");
         const pinned = await resolvePublicHost(current.hostname);
         if (ctx.signal?.aborted) throw interrupted("web fetch");
-        res = await requestPinned(current, pinned, signal);
+        res = await requestPinned(current, pinned, signal, webProxy(current, ctx.cwd));
         const loc = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
         if (!loc || hop >= 5) break;
         const next = new URL(loc, current);
         if (next.protocol !== "http:" && next.protocol !== "https:") {
-          res.body.destroy();
+          await res.release(true);
           return "Error: redirect to a non-http(s) URL was blocked.";
+        }
+        if (next.username || next.password) {
+          await res.release(true);
+          return "Error: redirect with URL-embedded credentials was blocked.";
         }
         // We never consume redirect bodies. Destroy the socket before following the next pinned hop so a
         // server cannot accumulate idle response streams across a redirect chain.
-        res.body.destroy();
+        await res.release(true);
         if (ctx.signal?.aborted) throw interrupted("web fetch");
         current = next;
       }
       const ct = res.headers.get("content-type") ?? "";
-      const raw = await readPinnedCapped(res.body, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
+      let raw: string;
+      let bodyRead = false;
+      try {
+        raw = await readPinnedCapped(res.body, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
+        bodyRead = true;
+      } finally {
+        await res.release(!bodyRead);
+      }
       if (ctx.signal?.aborted) throw interrupted("web fetch");
       let text = /html/i.test(ct) ? htmlToText(raw) : raw;
       if (text.length > cap) text = text.slice(0, cap) + `\n…[truncated ${text.length - cap} chars]`;
@@ -567,7 +794,10 @@ registerTool({
       return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(text || "(empty body)", current.href)}`;
     } catch (e: any) {
       if (ctx.signal?.aborted) throw interrupted("web fetch");
-      return `Error fetching ${url.href}: ${e?.name === "AbortError" ? "timed out (30s)" : (e?.message ?? e)}`;
+      const display = new URL(url.href);
+      display.username = "";
+      display.password = "";
+      return `Error fetching ${display.href}: ${safeNetworkError(e)}`;
     } finally {
       clearTimeout(timer);
     }

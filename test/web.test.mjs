@@ -1,8 +1,22 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { htmlToText, parseSearchResults, parseBaiduSearchResults, parseBingSearchResults, parseGoogleSearchResults, looksLikeJsRenderedShell, isPrivateIp, resolvePublicHost } from "../dist/tools/web.js";
+import { createServer } from "node:net";
+import { once } from "node:events";
+import { htmlToText, parseSearchResults, parseBaiduSearchResults, parseBingSearchResults, parseGoogleSearchResults, looksLikeJsRenderedShell, isPrivateIp, resolvePublicHost, bypassesWebProxy, selectWebProxy, requestPinned } from "../dist/tools/web.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/web.js";
+
+// Unit tests must not inherit a developer workstation's persisted/environment proxy. Dedicated cases below
+// pass explicit proxy settings and exercise the real CONNECT path.
+const inheritedNoProxy = process.env.no_proxy;
+const inheritedUpperNoProxy = process.env.NO_PROXY;
+process.env.no_proxy = "*";
+after(() => {
+  if (inheritedNoProxy === undefined) delete process.env.no_proxy;
+  else process.env.no_proxy = inheritedNoProxy;
+  if (inheritedUpperNoProxy === undefined) delete process.env.NO_PROXY;
+  else process.env.NO_PROXY = inheritedUpperNoProxy;
+});
 
 test("parseSearchResults: title/url/snippet + decodes the DuckDuckGo uddg redirect", () => {
   const html = `
@@ -157,8 +171,77 @@ test("resolvePublicHost rejects mixed DNS answers and returns the exact address 
   assert.equal(isPrivateIp("fec0::1"), true, "deprecated site-local IPv6 remains internal");
 });
 
+test("web proxy selection supports config, standard env precedence, and NO_PROXY without logging credentials", () => {
+  const target = new URL("https://docs.example.com/guide");
+  assert.equal(bypassesWebProxy(target, "localhost,.example.com"), true);
+  assert.equal(bypassesWebProxy(target, "example.net,docs.example.com:444"), false);
+  assert.equal(selectWebProxy(target, "http://config-user:config-pass@127.0.0.1:7890", {
+    HTTPS_PROXY: "http://env-user:env-pass@127.0.0.1:8899",
+  }).source, "environment");
+  assert.equal(selectWebProxy(target, "http://127.0.0.1:7890", { NO_PROXY: "*.example.com" }), undefined);
+  assert.throws(
+    () => selectWebProxy(target, undefined, { HTTPS_PROXY: "not-a-proxy secret-password" }),
+    (error) => {
+      assert.match(error.message, /proxy configuration is invalid/);
+      assert.doesNotMatch(error.message, /secret-password/);
+      return true;
+    },
+  );
+});
+
+test("requestPinned uses an authenticated CONNECT proxy while preserving the approved IP and original Host", async () => {
+  let connectLine = "";
+  let requestHead = "";
+  const proxy = createServer((socket) => {
+    let phase = "connect";
+    let buffered = "";
+    socket.on("data", (chunk) => {
+      buffered += chunk.toString("latin1");
+      const boundary = buffered.indexOf("\r\n\r\n");
+      if (boundary < 0) return;
+      const head = buffered.slice(0, boundary);
+      buffered = buffered.slice(boundary + 4);
+      if (phase === "connect") {
+        connectLine = head.split("\r\n", 1)[0];
+        phase = "request";
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        return;
+      }
+      requestHead = head;
+      const body = "proxied-public-body";
+      socket.end(`HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
+    });
+  });
+  proxy.listen(0, "127.0.0.1");
+  await once(proxy, "listening");
+  const address = proxy.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const response = await requestPinned(
+      new URL("http://public.example/through-proxy?ok=1"),
+      { address: "93.184.216.34", family: 4 },
+      AbortSignal.timeout(5_000),
+      { uri: `http://fake-user:fake-password@127.0.0.1:${address.port}`, source: "config" },
+    );
+    const chunks = [];
+    for await (const chunk of response.body) chunks.push(Buffer.from(chunk));
+    await response.release();
+    assert.equal(Buffer.concat(chunks).toString("utf8"), "proxied-public-body");
+    assert.equal(connectLine, "CONNECT 93.184.216.34:80 HTTP/1.1", "the proxy receives the DNS-approved IP, not a hostname it can re-resolve");
+    assert.match(requestHead, /^GET \/through-proxy\?ok=1 HTTP\/1\.1/m);
+    assert.match(requestHead, /^host: public\.example$/im);
+    assert.doesNotMatch(requestHead, /fake-password/);
+  } finally {
+    proxy.close();
+    await once(proxy, "close");
+  }
+});
+
 test("web_fetch: rejects invalid + non-http URLs (no network)", async () => {
-  assert.match(await getTool("web_fetch").run({ url: "not a url" }, { cwd: "." }), /invalid URL/);
+  const invalid = await getTool("web_fetch").run({ url: "not a url secret-must-not-echo" }, { cwd: "." });
+  assert.match(invalid, /invalid URL/);
+  assert.doesNotMatch(invalid, /secret-must-not-echo/);
   assert.match(await getTool("web_fetch").run({ url: "file:///etc/passwd" }, { cwd: "." }), /only http/);
   assert.match(await getTool("web_fetch").run({ url: "ftp://example.com" }, { cwd: "." }), /only http/);
+  assert.match(await getTool("web_fetch").run({ url: "https://user:password@example.com" }, { cwd: "." }), /credentials are not supported/);
 });

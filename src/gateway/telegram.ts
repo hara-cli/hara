@@ -3,7 +3,7 @@
 // / Feishu plug into next.
 import { InboundMediaBudget, savePrivateResponse } from "./media.js";
 import type { OutboundFilePayload } from "./outbound-files.js";
-import { gatewayRuntimeScope } from "./runtime-state.js";
+import { gatewayRuntimeScope, type GatewayRuntimeObserver } from "./runtime-state.js";
 
 const API = "https://api.telegram.org";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -40,6 +40,8 @@ export interface ChatAdapter {
     signal: AbortSignal,
     /** Fail-closed authorization preflight. Media is never fetched when omitted or false. */
     shouldDownload?: (m: InboundMsg) => boolean,
+    /** Optional redacted lifecycle sink. Adapters report only connection/activity states and bounded codes. */
+    runtime?: GatewayRuntimeObserver,
   ): Promise<void>;
   /** `idempotencyKey` is an opaque stable effect id. Adapters whose platform supports idempotent create
    * requests may use it; adapters without that capability retain at-least-once behavior. */

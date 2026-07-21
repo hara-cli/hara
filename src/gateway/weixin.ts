@@ -67,6 +67,10 @@ export interface WeixinCreds {
   user_id: string;
 }
 
+export type WeixinCredentialInspection =
+  | { state: "ready"; credentials: WeixinCreds }
+  | { state: "missing" | "unreadable" };
+
 const num = (v: unknown): number => (typeof v === "number" ? v : 0);
 const str = (v: unknown): string => (v == null ? "" : String(v));
 
@@ -267,14 +271,32 @@ export function weixinKnownPeers(accountId: string): string[] {
   }
 }
 
-export function loadWeixinCreds(): WeixinCreds | null {
+function validWeixinCredentials(value: unknown): value is WeixinCreds {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const credentials = value as Partial<WeixinCreds>;
+  return [credentials.account_id, credentials.token, credentials.base_url, credentials.user_id]
+    .every((part) => typeof part === "string" && part.trim().length > 0);
+}
+
+/** Read-only credential probe. The public status mapper exposes only `state`; credentials stay inside the
+ * gateway module and are used solely to derive the already-redacted runtime scope or start the adapter. */
+export function inspectWeixinCredentials(): WeixinCredentialInspection {
   try {
     const binding = weixinStateFile("creds.json");
     const snapshot = readPrivateStateFileSnapshotSync(binding.path, 1024 * 1024);
-    return snapshot ? JSON.parse(snapshot.text) as WeixinCreds : null;
+    if (!snapshot) return { state: "missing" };
+    const credentials: unknown = JSON.parse(snapshot.text);
+    return validWeixinCredentials(credentials)
+      ? { state: "ready", credentials }
+      : { state: "unreadable" };
   } catch {
-    return null;
+    return { state: "unreadable" };
   }
+}
+
+export function loadWeixinCreds(): WeixinCreds | null {
+  const inspected = inspectWeixinCredentials();
+  return inspected.state === "ready" ? inspected.credentials : null;
 }
 function saveWeixinCreds(c: WeixinCreds): void {
   writePrivateStateFileSync(weixinStateFile("creds.json"), JSON.stringify(c, null, 2) + "\n");
@@ -675,7 +697,7 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
     async sendFile(chatId, file) {
       if (!(await sendMediaFile(creds, tokenStore, String(chatId), file))) throw new Error(`weixin file delivery failed: ${file.safeName}`);
     },
-    async start(onMessage, signal, shouldDownload) {
+    async start(onMessage, signal, shouldDownload, runtime) {
       let buf = loadCursor(creds.account_id);
       let pollMs = LONG_POLL_TIMEOUT_MS;
       while (!signal.aborted) {
@@ -685,20 +707,24 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
           resp = await apiPost(creds.base_url, EP.getUpdates, { get_updates_buf: buf }, creds.token, pollMs + 5_000, signal);
         } catch {
           if (signal.aborted) break;
+          runtime?.error("network");
           await sleep(2000, signal); // timeout (normal) or network blip → re-poll
           continue;
         }
         const ret = num(resp.ret);
         const errcode = num(resp.errcode);
         if (isSessionExpired(ret, errcode, str(resp.errmsg))) {
+          runtime?.error("session-expired");
           console.error("weixin: session expired — re-login with `hara gateway --platform weixin --login`. backing off 600s.");
           await sleep(600_000, signal);
           continue;
         }
         if (ret !== 0 || errcode !== 0) {
+          runtime?.error("platform-error");
           await sleep(2000, signal);
           continue;
         }
+        runtime?.poll();
         buf = str(resp.get_updates_buf) || buf;
         saveCursor(creds.account_id, buf);
         for (const msg of Array.isArray(resp.msgs) ? resp.msgs : []) {

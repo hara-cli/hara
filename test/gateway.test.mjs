@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +16,7 @@ import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
 import { parseSignalMessage, signalAdapter } from "../dist/gateway/signal.js";
 import { parseWecomMessage } from "../dist/gateway/wecom.js";
 import { pickRoute, outputDelta } from "../dist/gateway/tmux-routes.js";
-import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, gatewayAdmissionKey, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
+import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, gatewayAdmissionKey, gatewayStatus, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
 import { chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
 import { synthesize, ttsConfigFromEnv, ttsCleanText, ttsTimeoutMs } from "../dist/gateway/tts.js";
@@ -29,6 +29,64 @@ test("parseTelegramUpdate: text message → InboundMsg; non-text → null", () =
   assert.equal(parseTelegramUpdate({}), null);
   assert.equal(parseTelegramUpdate({ message: { text: "dm", chat: { id: 1, type: "private" }, from: { id: 1 } } }).chatType, "p2p");
   assert.equal(parseTelegramUpdate({ message: { text: "group", chat: { id: -1, type: "supergroup" }, from: { id: 2 } } }).chatType, "group");
+});
+
+test("gatewayStatus exposes only redacted configuration and actionable stopped state", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-gateway-status-"));
+  const saved = {
+    HOME: process.env.HOME,
+    appId: process.env.HARA_FEISHU_APP_ID,
+    secret: process.env.HARA_FEISHU_APP_SECRET,
+  };
+  try {
+    process.env.HOME = home;
+    process.env.HARA_FEISHU_APP_ID = "cli_test_public_identity";
+    process.env.HARA_FEISHU_APP_SECRET = "secret-must-never-leak";
+    const status = await gatewayStatus("lark");
+    assert.equal(status.platform, "feishu");
+    assert.equal(status.configuration, "ready");
+    assert.equal(status.configured, true);
+    assert.equal(status.running, false);
+    assert.equal(status.runtimeState, "unknown");
+    assert.match(status.recommendation, /hara gateway --platform feishu/);
+    const serialized = JSON.stringify(status);
+    assert.equal(serialized.includes("cli_test_public_identity"), false);
+    assert.equal(serialized.includes("secret-must-never-leak"), false);
+  } finally {
+    if (saved.HOME === undefined) delete process.env.HOME;
+    else process.env.HOME = saved.HOME;
+    if (saved.appId === undefined) delete process.env.HARA_FEISHU_APP_ID;
+    else process.env.HARA_FEISHU_APP_ID = saved.appId;
+    if (saved.secret === undefined) delete process.env.HARA_FEISHU_APP_SECRET;
+    else process.env.HARA_FEISHU_APP_SECRET = saved.secret;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gatewayStatus distinguishes readable, missing, and malformed WeChat login state", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-weixin-status-"));
+  const savedHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    assert.equal((await gatewayStatus("weixin")).configuration, "missing");
+    const state = join(home, ".hara", "weixin");
+    mkdirSync(state, { recursive: true, mode: 0o700 });
+    writeFileSync(join(state, "creds.json"), "not-json", { mode: 0o600 });
+    assert.equal((await gatewayStatus("weixin")).configuration, "unreadable");
+    writeFileSync(join(state, "creds.json"), JSON.stringify({
+      account_id: "account",
+      token: "private-token",
+      base_url: "https://example.invalid",
+      user_id: "owner",
+    }), { mode: 0o600 });
+    const ready = await gatewayStatus("weixin");
+    assert.equal(ready.configuration, "ready");
+    assert.equal(JSON.stringify(ready).includes("private-token"), false);
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("telegram media preflight still dispatches metadata but never fetches rejected bytes", async () => {
