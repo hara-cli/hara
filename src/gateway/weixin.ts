@@ -70,6 +70,18 @@ export interface WeixinCreds {
 const num = (v: unknown): number => (typeof v === "number" ? v : 0);
 const str = (v: unknown): string => (v == null ? "" : String(v));
 
+function stableWeixinMessageId(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (Number.isSafeInteger(value)) return String(value);
+  return undefined;
+}
+
+function weixinCreatedAtMs(value: unknown): number | undefined {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.trunc(parsed);
+}
+
 // ── pure protocol helpers (unit-tested) ──────────────────────────────────────
 
 /** X-WECHAT-UIN: base64 of the decimal string of a random uint32 (regenerated per request). */
@@ -171,7 +183,19 @@ export function parseWeixinMessage(msg: any, accountId: string): { inbound: Inbo
   // This tells it the text is already transcribed so it just answers.
   const isVoice = !items.some((i: any) => i?.type === ITEM_TEXT) && items.some((i: any) => i?.type === 3);
   const tagged = isVoice ? `(The user sent this as a voice message; it is already transcribed to text below — just reply to it normally, you don't have or need the audio.)\n\n${text}` : text;
-  return { inbound: { chatId: from, userId: from, userName: from, text: tagged }, contextToken: str(msg?.context_token).trim() };
+  const messageId = stableWeixinMessageId(msg?.message_id);
+  const createdAtMs = weixinCreatedAtMs(msg?.create_time_ms);
+  return {
+    inbound: {
+      chatId: from,
+      userId: from,
+      userName: from,
+      text: tagged,
+      ...(messageId ? { messageId } : {}),
+      ...(createdAtMs === undefined ? {} : { createdAtMs }),
+    },
+    contextToken: str(msg?.context_token).trim(),
+  };
 }
 
 /** iLink signals expiry via -14, or -2 + errmsg "unknown error" (a stale-session masquerading as rate-limit). */

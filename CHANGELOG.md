@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.130.2 — 2026-07-21 — Weixin delivery identity
+
+- Personal WeChat iLink messages now pass valid `message_id` and `create_time_ms` metadata into Hara's
+  cross-restart stale-event, deduplication, and no-rerun boundary.
+- Missing or invalid metadata remains genuinely optional: the adapter omits `messageId` and `createdAtMs`
+  instead of adding own properties whose value is `undefined`.
+- The Feishu SDK's transitive `protobufjs` parser is pinned to the patched 7.6.5 release.
+- Upgrade with `npm i -g @nanhara/hara@0.130.2`.
+
 ## 0.130.1 — 2026-07-21 — Windows private-state portability
 
 - `hara serve` no longer calls the inapplicable POSIX `fchmod` operation on Windows discovery

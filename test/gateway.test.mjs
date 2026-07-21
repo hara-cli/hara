@@ -1080,10 +1080,45 @@ test("weixin guessChatType: room_id ⇒ group; else DM keyed by from_user_id", (
 });
 
 test("weixin parseWeixinMessage: valid DM; null for own echo / group / non-text", () => {
-  assert.deepEqual(
-    parseWeixinMessage({ from_user_id: "u1", item_list: [{ type: 1, text_item: { text: "yo" } }], context_token: "t1" }, "bot"),
-    { inbound: { chatId: "u1", userId: "u1", userName: "u1", text: "yo" }, contextToken: "t1" },
+  const withoutMetadata = parseWeixinMessage(
+    { from_user_id: "u1", item_list: [{ type: 1, text_item: { text: "yo" } }], context_token: "t1" },
+    "bot",
   );
+  assert.deepEqual(withoutMetadata, {
+    inbound: { chatId: "u1", userId: "u1", userName: "u1", text: "yo" },
+    contextToken: "t1",
+  });
+  assert.equal(Object.hasOwn(withoutMetadata.inbound, "messageId"), false);
+  assert.equal(Object.hasOwn(withoutMetadata.inbound, "createdAtMs"), false);
+
+  assert.deepEqual(
+    parseWeixinMessage({
+      from_user_id: "u1",
+      message_id: 42,
+      create_time_ms: 1_762_345_678_901,
+      item_list: [{ type: 1, text_item: { text: "metadata" } }],
+    }, "bot"),
+    {
+      inbound: {
+        chatId: "u1",
+        userId: "u1",
+        userName: "u1",
+        text: "metadata",
+        messageId: "42",
+        createdAtMs: 1_762_345_678_901,
+      },
+      contextToken: "",
+    },
+  );
+
+  const invalidMetadata = parseWeixinMessage({
+    from_user_id: "u1",
+    message_id: Number.MAX_SAFE_INTEGER + 1,
+    create_time_ms: 0,
+    item_list: [{ type: 1, text_item: { text: "invalid metadata" } }],
+  }, "bot");
+  assert.equal(Object.hasOwn(invalidMetadata.inbound, "messageId"), false);
+  assert.equal(Object.hasOwn(invalidMetadata.inbound, "createdAtMs"), false);
   // a transcribed voice message (type 3, no text item) is prefixed with an explicit "already transcribed" note
   const v = parseWeixinMessage({ from_user_id: "u1", item_list: [{ type: 3, voice_item: { text: "在吗" } }] }, "bot").inbound.text;
   assert.match(v, /transcribed/); // tells hara it's transcribed, not raw audio

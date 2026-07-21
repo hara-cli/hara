@@ -211,7 +211,9 @@ hara gateway --platform weixin --login     # scan the QR with WeChat; stores cre
 hara gateway --platform weixin             # run the daemon (the scanner is auto-allowed as owner)
 ```
 
-DMs only. Voice in is auto-transcribed; voice out via `/voice` / `/say`.
+DMs only. Voice in is auto-transcribed; voice out via `/voice` / `/say`. Stable iLink
+`message_id`/`create_time_ms` metadata feeds Hara's cross-restart stale-event, deduplication, and no-rerun
+boundary; messages from older endpoints that omit those optional fields continue normally.
 
 ## Discord
 
