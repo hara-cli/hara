@@ -23,3 +23,15 @@ test("standalone releases use baseline x64 targets and runtime boundary smoke", 
   assert.match(ci, /standalone-boundary-smoke\.mjs/);
   assert.match(release, /standalone-boundary-smoke\.mjs/);
 });
+
+test("Darwin release assets are native-built, signed, immutable, and publicly re-executed", () => {
+  assert.match(release, /runs-on: \$\{\{ matrix\.os \}\}/);
+  assert.match(release, /macos-15-intel/);
+  assert.match(release, /codesign --force --sign - --entitlements \.github\/macos-standalone-entitlements\.plist/);
+  assert.match(release, /codesign --verify --verbose=4/);
+  assert.match(release, /needs: \[linux-binaries, darwin-binaries\]/);
+  assert.match(release, /immutable release asset mismatch/);
+  assert.match(release, /gh release download/);
+  assert.match(release, /public asset digest mismatch/);
+  assert.doesNotMatch(release, /gh release upload[^\n]*--clobber/);
+});

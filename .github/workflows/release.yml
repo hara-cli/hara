@@ -1,5 +1,6 @@
-# Build standalone single-file binaries on a version tag and attach them to the GitHub release, so hara
-# can be installed without Node (see install.sh). Bun cross-compiles every target from one runner.
+# Build standalone single-file binaries on native target runners, assemble one immutable GitHub release,
+# then verify the public Darwin assets on both Mac architectures. This keeps downloaded Bun executables
+# valid under macOS provenance enforcement instead of trusting an unverified Linux cross-compile.
 name: release
 on:
   push:
@@ -8,7 +9,7 @@ permissions:
   contents: write
   packages: write
 jobs:
-  binaries:
+  linux-binaries:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -29,8 +30,12 @@ jobs:
       - name: Audit production dependencies
         run: bash .github/scripts/audit-production.sh
       - run: npm test
-      - run: npm run build:binaries
-      - name: Execute the native release asset before publishing
+      - name: Build Linux release assets
+        shell: bash
+        run: |
+          bun scripts/build-binary.ts dist/bin/hara-linux-x64 bun-linux-x64-baseline
+          bun scripts/build-binary.ts dist/bin/hara-linux-arm64 bun-linux-arm64
+      - name: Execute the native Linux release asset before assembly
         shell: bash
         run: |
           expected="$(node -p 'require("./package.json").version')"
@@ -38,29 +43,160 @@ jobs:
           [[ "$actual" == "$expected" ]] || { echo "standalone version mismatch: $actual != $expected" >&2; exit 1; }
           dist/bin/hara-linux-x64 --help >/dev/null
           node scripts/standalone-boundary-smoke.mjs dist/bin/hara-linux-x64 "$expected"
-      # GitHub-hosted runners already provide gh. Using it directly avoids a third-party action whose
-      # deprecated Node runtime is forced forward by the runner, and makes a rerun explicitly idempotent.
-      - name: Publish GitHub release assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-assets
+          path: |
+            dist/bin/hara-linux-x64
+            dist/bin/hara-linux-arm64
+          if-no-files-found: error
+          retention-days: 1
+
+  darwin-binaries:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: bun-darwin-arm64
+            asset: hara-darwin-arm64
+          - os: macos-15-intel
+            target: bun-darwin-x64-baseline
+            asset: hara-darwin-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Verify tag matches the package version
+        shell: bash
+        run: |
+          expected="v$(node -p 'require("./package.json").version')"
+          [[ "$GITHUB_REF_NAME" == "$expected" ]] || { echo "release tag mismatch: $GITHUB_REF_NAME != $expected" >&2; exit 1; }
+          bun --version
+      - run: npm ci
+      - run: npm test
+      - name: Build, sign, verify, and execute the native Darwin asset
+        shell: bash
+        run: |
+          asset="dist/bin/${{ matrix.asset }}"
+          bun scripts/build-binary.ts "$asset" "${{ matrix.target }}"
+          codesign --force --sign - --entitlements .github/macos-standalone-entitlements.plist "$asset"
+          codesign --verify --verbose=4 "$asset"
+          expected="$(node -p 'require("./package.json").version')"
+          actual="$("$asset" --version)"
+          [[ "$actual" == "$expected" ]] || { echo "standalone version mismatch: $actual != $expected" >&2; exit 1; }
+          "$asset" --help >/dev/null
+          node scripts/standalone-boundary-smoke.mjs "$asset" "$expected"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/bin/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    needs: [linux-binaries, darwin-binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify and publish one immutable asset set
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
           assets=(
-            dist/bin/hara-darwin-arm64
-            dist/bin/hara-darwin-x64
-            dist/bin/hara-linux-x64
-            dist/bin/hara-linux-arm64
+            release-assets/hara-darwin-arm64
+            release-assets/hara-darwin-x64
+            release-assets/hara-linux-x64
+            release-assets/hara-linux-arm64
           )
+          for asset in "${assets[@]}"; do test -s "$asset"; done
+          chmod +x release-assets/hara-linux-x64
+          expected="$(node -p 'require("./package.json").version')"
+          [[ "$(release-assets/hara-linux-x64 --version)" == "$expected" ]]
+          sha256sum "${assets[@]}"
+
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq '.assets[] | [.name, .digest] | @tsv' > remote-assets.tsv
+            for asset in "${assets[@]}"; do
+              name="$(basename "$asset")"
+              local_digest="sha256:$(sha256sum "$asset" | awk '{print $1}')"
+              remote_digest="$(awk -F '\t' -v name="$name" '$1 == name { print $2 }' remote-assets.tsv)"
+              [[ "$remote_digest" == "$local_digest" ]] || {
+                echo "immutable release asset mismatch for $name: ${remote_digest:-missing} != $local_digest" >&2
+                exit 1
+              }
+            done
+            echo "release already contains the identical immutable asset set"
           else
             gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
               --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
           fi
 
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.assets[] | [.name, .digest] | @tsv' > remote-assets.tsv
+          for asset in "${assets[@]}"; do
+            name="$(basename "$asset")"
+            local_digest="sha256:$(sha256sum "$asset" | awk '{print $1}')"
+            remote_digest="$(awk -F '\t' -v name="$name" '$1 == name { print $2 }' remote-assets.tsv)"
+            [[ "$remote_digest" == "$local_digest" ]] || {
+              echo "published release asset mismatch for $name: ${remote_digest:-missing} != $local_digest" >&2
+              exit 1
+            }
+          done
+
+  verify-darwin-release:
+    needs: publish-release
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            asset: hara-darwin-arm64
+          - os: macos-15-intel
+            asset: hara-darwin-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Download, authenticate, and execute the public Darwin asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p downloaded
+          gh release download "$GITHUB_REF_NAME" --pattern "${{ matrix.asset }}" --dir downloaded
+          asset="downloaded/${{ matrix.asset }}"
+          remote_digest="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[] | select(.name == "${{ matrix.asset }}") | .digest')"
+          local_digest="sha256:$(shasum -a 256 "$asset" | awk '{print $1}')"
+          [[ "$remote_digest" == "$local_digest" ]] || { echo "public asset digest mismatch" >&2; exit 1; }
+          chmod +x "$asset"
+          codesign --verify --verbose=4 "$asset"
+          expected="${GITHUB_REF_NAME#v}"
+          [[ "$("$asset" --version)" == "$expected" ]]
+          "$asset" --help >/dev/null
+          node scripts/standalone-boundary-smoke.mjs "$asset" "$expected"
+
   # Build + push the container image so `docker run ghcr.io/hara-cli/hara` works after a release.
   image:
-    needs: binaries
+    needs: [publish-release, verify-darwin-release]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

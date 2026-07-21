@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.131.1 — 2026-07-21 — authenticated macOS standalone assets
+
+- Darwin arm64 and Intel standalone binaries are now built on their matching native macOS runners,
+  signed with the Bun runtime entitlements, verified with `codesign`, and executed through the full
+  standalone boundary smoke before release assembly. This replaces unverified Darwin cross-compiles
+  from the Linux release runner that could be killed by macOS provenance enforcement after download.
+- A release is assembled only after Linux and both Darwin jobs succeed. GitHub asset SHA-256 digests
+  are checked after publication and may not be clobbered on a rerun; two independent macOS jobs then
+  download the public assets, recheck the digests and signatures, and execute them before GHCR starts.
+- Upgrade npm installations with `npm i -g @nanhara/hara@0.131.1`. Standalone users can rerun the
+  installer; the atomic startup check keeps an older working binary intact if a download is incomplete.
+
 ## 0.131.0 — 2026-07-21 — verified upgrades, project recovery, and session recall
 
 - `hara update` (also `hara upgrade`) now identifies the installation that actually launched the process.
