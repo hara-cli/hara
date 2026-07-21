@@ -27,25 +27,36 @@ test("composer routing distinguishes control work from executable task work", ()
 });
 
 test("App runs a turn: user line in, streamed assistant reply out, status bar pinned below", async () => {
+  let releaseTurn = () => {};
+  const holdTurn = new Promise((resolve) => { releaseTurn = resolve; });
+  let markFinished = () => {};
+  const finished = new Promise((resolve) => { markFinished = resolve; });
   const onSubmit = async (line, h) => {
     h.sink.assistantDelta("Hello, ");
     h.sink.assistantDelta("world.");
     h.sink.usage(120, 24);
-    await tick(200); // keep the live region visible long enough to sample
+    await holdTurn; // explicit test-owned gate keeps the live region observable on slow release runners
+    markFinished();
   };
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  stdin.write("say hi");
-  await tick();
-  stdin.write("\r"); // submit → turn runs
-  await tick(80); // sample mid-turn (within onSubmit's 200ms window)
-  const mid = strip(lastFrame());
-  assert.ok(mid.includes("Hello, world."), "streamed assistant text visible during the turn");
-  assert.ok(mid.includes("glm-5 · suggest"), "status footer stays pinned below the live output");
-  await tick(200); // let the turn finish and commit
-  unmount();
+  try {
+    await tick();
+    stdin.write("say hi");
+    await waitUntil(() => strip(lastFrame()).includes("say hi"), "typed composer text visible before submit");
+    stdin.write("\r"); // submit → turn runs
+    await waitUntil(() => {
+      const frame = strip(lastFrame());
+      return frame.includes("Hello, world.") && frame.includes("glm-5 · suggest");
+    }, "streamed assistant text and pinned status visible during the turn");
+    releaseTurn();
+    await finished;
+    await tick();
+  } finally {
+    releaseTurn();
+    unmount();
+  }
 });
 
 test("App header (personal): bordered card, ◆ glyph + title, profile grid, /model ↹ affordance", async () => {

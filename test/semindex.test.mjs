@@ -249,24 +249,39 @@ test("queryIndex returns empty when no index exists", async () => {
 
 test("queryIndex forwards parent cancellation into the embedding request", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-sem-abort-"));
+  const controller = new AbortController();
   try {
     const text = "auth login token ordinary source";
     writeFileSync(join(dir, "auth.ts"), text);
     await buildIndex("repo", chunkText(text, "auth.ts", "repo"), mockEmbed, dir);
-    const controller = new AbortController();
     let sawSignal = false;
+    let markStarted = () => {};
+    const started = new Promise((resolve) => { markStarted = resolve; });
     const hangingEmbed = async (_texts, signal) => {
       sawSignal = signal === controller.signal;
       return await new Promise((_resolve, reject) => {
+        if (signal.aborted) {
+          markStarted();
+          reject(new Error("embedding stopped"));
+          return;
+        }
         signal.addEventListener("abort", () => reject(new Error("embedding stopped")), { once: true });
+        markStarted();
       });
     };
     const running = queryIndex("repo", "auth", hangingEmbed, dir, 3, controller.signal);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    let startupTimer;
+    await Promise.race([
+      started,
+      new Promise((_, reject) => {
+        startupTimer = setTimeout(() => reject(new Error("embedding request did not start")), 3_000);
+      }),
+    ]).finally(() => clearTimeout(startupTimer));
     controller.abort();
     await assert.rejects(running, /embedding stopped|semantic query interrupted/);
     assert.equal(sawSignal, true);
   } finally {
+    controller.abort();
     rmSync(dir, { recursive: true, force: true });
   }
 });

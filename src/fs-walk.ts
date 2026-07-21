@@ -1,8 +1,8 @@
 // Shared filesystem walker — powers @file completion and the grep/glob tools.
 // Walks a directory tree, skipping noise dirs, capped so huge trees stay responsive.
-import { readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { opendir } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { execFile, execSync } from "node:child_process";
 import { fuzzyRank } from "./fuzzy.js";
 import { isSensitiveFilePath } from "./security/sensitive-files.js";
@@ -55,6 +55,30 @@ const DEFAULT_ASYNC_TIMEOUT_MS = 2_000;
 // interruptible. Keep them on a much tighter wall budget; agent/tool paths use the async APIs below.
 const DEFAULT_SYNC_TIMEOUT_MS = 250;
 const DEFAULT_YIELD_EVERY = 128;
+
+function gitMarkerOnPath(start: string): boolean {
+  let dir = resolve(start);
+  for (let depth = 0; depth < 128; depth++) {
+    try {
+      lstatSync(join(dir, ".git"));
+      return true;
+    } catch (error: any) {
+      // An unreadable or otherwise suspicious marker must still take the Git path. Only a definite
+      // absence permits the filesystem fallback to skip spawning Git.
+      if (error?.code !== "ENOENT") return true;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return false;
+    dir = parent;
+  }
+  return true;
+}
+
+function gitMarkerAbove(start: string): boolean {
+  if (gitMarkerOnPath(start)) return true;
+  // Preserve worktree semantics when callers reach a repository through a symlinked project path.
+  try { return gitMarkerOnPath(realpathSync.native(start)); } catch { return false; }
+}
 
 function finiteLimit(value: number | undefined, fallback: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value!)) : fallback;
@@ -250,6 +274,12 @@ export function walkFiles(root: string, cap = DEFAULT_MAX_FILES, options: Omit<F
 export function listProjectFiles(root: string, cap = 8000): string[] {
   if (recursiveRootContainsHome(root)) return [];
   const startedAt = Date.now();
+  // On a non-repository directory, a contended `git ls-files` can consume the entire synchronous
+  // completion budget before the real filesystem walk starts. A bounded marker scan is sufficient to
+  // prove that Git cannot be authoritative here, leaving the budget for the user's actual files.
+  if (!gitMarkerAbove(root)) {
+    return walkFiles(root, cap, { timeoutMs: Math.max(0, DEFAULT_SYNC_TIMEOUT_MS - (Date.now() - startedAt)) });
+  }
   try {
     const out = execSync("git ls-files --cached --others --exclude-standard", {
       cwd: root,
@@ -314,6 +344,18 @@ export async function listProjectFilesAsync(root: string, options: FileWalkOptio
   if (cfg.maxEntries === 0) return result([], 0, 0, "entry_limit");
 
   const remaining = (): number => cfg.timeoutMs - (Date.now() - startedAt);
+  if (!gitMarkerAbove(root)) {
+    const timeoutMs = remaining();
+    if (timeoutMs <= 0) return result([], 0, 0, "time_limit");
+    return walkFilesAsync(root, {
+      maxFiles: cfg.maxFiles,
+      maxDirectories: cfg.maxDirectories,
+      maxEntries: cfg.maxEntries,
+      timeoutMs,
+      signal: cfg.signal,
+      yieldEvery: cfg.yieldEvery,
+    });
+  }
   try {
     if (remaining() <= 0) return result([], 0, 0, "time_limit");
     const stdout = await gitProjectFiles(root, remaining(), cfg.signal);

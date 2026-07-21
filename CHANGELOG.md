@@ -5,15 +5,26 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.132.3 — 2026-07-22 — immediate prompt-key routing and verified release carrier
+## 0.132.4 — 2026-07-22 — release-class Intel readiness handshakes
+
+- Non-Git `@path` completion now skips the bounded Git inventory subprocess when no repository marker
+  exists. Slow or contended machines keep the full synchronous budget for the actual filesystem walk instead
+  of occasionally returning an empty completion list.
+- TUI streaming and semantic-cancellation regressions now synchronize on concrete composer, render, provider,
+  and completion handshakes rather than fixed millisecond sleeps. Main-branch CI also runs the complete suite
+  on the same Intel macOS class used for native releases before any immutable version tag is created.
+- This patch carries the complete 0.132 feature set into the native and Desktop release train. Upgrade with
+  `npm i -g @nanhara/hara@0.132.4`.
+
+## 0.132.3 — 2026-07-22 — immediate prompt-key routing (npm published; native assets withheld)
 
 - TUI approval/select input now reads the live visible prompt and selection through stable refs. A key pressed
   immediately after the prompt paints can no longer hit the previous render's null-prompt closure and be
   swallowed; rapid arrow-plus-Enter input also uses the current selection before the next paint.
 - The confirmation regression waits for the visible prompt and then presses `y` without an arbitrary grace
   delay, covering the Node 24 CI failure directly. Remaining process-tree fixtures also wait for valid PID
-  content rather than file creation alone. This patch carries the complete 0.132 feature set into the native
-  and Desktop release train. Upgrade with `npm i -g @nanhara/hara@0.132.3`.
+  content rather than file creation alone. The npm package is valid, but native assembly was withheld after
+  the release-class Intel lane exposed additional completion/render fixture races; upgrade to 0.132.4 instead.
 
 ## 0.132.2 — 2026-07-22 — complete bounded native release gates (npm published; native assets withheld)
 

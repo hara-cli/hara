@@ -124,6 +124,9 @@ jobs:
         with:
           bun-version: "1.3.9"
       - run: npm ci
+      - name: Run full suite on the release-class Intel runner
+        if: ${{ matrix.os == 'macos-15-intel' }}
+        run: npm test
       - name: Compile and execute the native standalone binary
         shell: bash
         run: |

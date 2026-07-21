@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fuzzyScore, fuzzyRank, nearest } from "../dist/fuzzy.js";
-import { fileCandidates } from "../dist/context/mentions.js";
+import { fileCandidates, invalidateFileCandidates } from "../dist/context/mentions.js";
 import { nearestPaths } from "../dist/fs-walk.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/builtin.js";
@@ -44,6 +44,26 @@ test("@ completion: fuzzy subsequence finds nested file (@idx → src/index.ts)"
     assert.ok(fileCandidates(dir, "sc").some((c) => c.startsWith("src"))); // subsequence (not transposition)
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("@ completion outside Git skips a slow Git probe and keeps its filesystem budget", { skip: process.platform === "win32" }, () => {
+  const dir = fixture();
+  const bin = mkdtempSync(join(tmpdir(), "hara-slow-git-"));
+  const fakeGit = join(bin, "git");
+  const previousPath = process.env.PATH;
+  try {
+    writeFileSync(fakeGit, "#!/bin/sh\n/bin/sleep 5\n", { mode: 0o755 });
+    chmodSync(fakeGit, 0o755);
+    process.env.PATH = `${bin}${delimiter}${previousPath ?? ""}`;
+    invalidateFileCandidates(dir);
+    assert.ok(fileCandidates(dir, "idx").includes("src/index.ts"));
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    invalidateFileCandidates(dir);
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bin, { recursive: true, force: true });
   }
 });
 
