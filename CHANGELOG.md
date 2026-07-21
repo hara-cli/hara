@@ -5,14 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.132.2 — 2026-07-22 — complete bounded native release gates
+## 0.132.3 — 2026-07-22 — immediate prompt-key routing and verified release carrier
+
+- TUI approval/select input now reads the live visible prompt and selection through stable refs. A key pressed
+  immediately after the prompt paints can no longer hit the previous render's null-prompt closure and be
+  swallowed; rapid arrow-plus-Enter input also uses the current selection before the next paint.
+- The confirmation regression waits for the visible prompt and then presses `y` without an arbitrary grace
+  delay, covering the Node 24 CI failure directly. Remaining process-tree fixtures also wait for valid PID
+  content rather than file creation alone. This patch carries the complete 0.132 feature set into the native
+  and Desktop release train. Upgrade with `npm i -g @nanhara/hara@0.132.3`.
+
+## 0.132.2 — 2026-07-22 — complete bounded native release gates (npm published; native assets withheld)
 
 - The remaining approved-org process-tree and TUI confirmation tests now wait for concrete PID/render
   readiness before starting their decisive assertion, and always clean up mounted Ink apps after a failure.
   This closes the last Intel macOS release-runner races without weakening runtime timeouts or child cleanup.
-- This patch is the standalone/Desktop release carrier for the observable gateway status, scoped web proxy,
-  complete config redaction, and user-managed organization connection features introduced in 0.132.0.
-  Upgrade with `npm i -g @nanhara/hara@0.132.2`.
+- The npm package contains the observable gateway status, scoped web proxy, complete config redaction, and
+  user-managed organization connection features introduced in 0.132.0. Native release assembly was cancelled
+  after Node 24 CI exposed a visible-prompt input-handler race; upgrade to 0.132.3 instead.
 
 ## 0.132.1 — 2026-07-22 — bounded native release-gate waits (npm published; native assets withheld)
 

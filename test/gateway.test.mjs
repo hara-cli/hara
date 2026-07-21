@@ -1309,12 +1309,15 @@ test("gateway shutdown aborts TTS and kills its custom-command descendant tree",
       cmd: `trap '' TERM; sleep 30 & echo $! > '${pidFile}'; wait`,
       timeoutMs: 30_000,
     });
-    for (let attempt = 0; attempt < 100 && !existsSync(pidFile); attempt++) {
+    for (let attempt = 0; attempt < 100 && !descendantPid; attempt++) {
+      if (existsSync(pidFile)) {
+        const candidate = Number(readFileSync(pidFile, "utf8").trim());
+        if (Number.isSafeInteger(candidate) && candidate > 1) descendantPid = candidate;
+      }
+      if (descendantPid) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(existsSync(pidFile), true, "custom provider started its descendant");
-    descendantPid = Number(readFileSync(pidFile, "utf8").trim());
-    assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 1);
+    assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 1, "custom provider published a valid descendant pid");
     controller.abort(new Error("gateway shutdown"));
     await assert.rejects(
       Promise.race([
@@ -1327,6 +1330,10 @@ test("gateway shutdown aborts TTS and kills its custom-command descendant tree",
     assert.throws(() => process.kill(descendantPid, 0), (error) => error?.code === "ESRCH");
   } finally {
     controller.abort(new Error("test cleanup"));
+    if ((!Number.isSafeInteger(descendantPid) || descendantPid <= 1) && existsSync(pidFile)) {
+      const candidate = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isSafeInteger(candidate) && candidate > 1) descendantPid = candidate;
+    }
     if (descendantPid) {
       try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }
     }

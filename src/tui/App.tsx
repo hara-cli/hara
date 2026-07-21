@@ -627,6 +627,13 @@ export function App({
     abortTurnOnEscape: boolean;
   } | null>(null);
   const [promptSel, setPromptSel] = useState(0);
+  // Ink updates useInput's callback after a render effect. Keep the visible prompt/selection in refs too,
+  // so the already-registered handler can consume a key pressed immediately after the prompt paints instead
+  // of routing it through the previous render's null prompt closure.
+  const promptRef = useRef(prompt);
+  promptRef.current = prompt;
+  const promptSelRef = useRef(promptSel);
+  promptSelRef.current = promptSel;
   // Free-text question prompt (ask_user with no/declined options): re-enables the InputBox to capture one
   // line, then resolves the awaiting tool with that text. Separate from `prompt` (the select-only path).
   const [askText, setAskText] = useState<{ token: symbol; title: string; resolve: (v: string) => void } | null>(null);
@@ -866,6 +873,7 @@ export function App({
             reject(promptAbortReason(signal));
           };
           signal.addEventListener("abort", onAbort, { once: true });
+          promptSelRef.current = 0;
           setPromptSel(0);
           setPrompt({
             token,
@@ -987,6 +995,7 @@ export function App({
   }, [working, prompt, askText, handleSubmit]);
 
   useInput((input, key) => {
+    const activePrompt = promptRef.current;
     if (key.ctrl && input === "t") return setShowTranscript((x) => !x); // open/close the full-transcript overlay
     if (showTranscript) return; // while open, the overlay's own useInput owns every key (scroll / esc)
     if (picker) return; // the /model picker overlay owns input (↑↓ model, ←→ thinking, ⏎, esc) while open
@@ -998,21 +1007,29 @@ export function App({
       }
       return;
     }
-    if (prompt) {
-      const opts = prompt.options;
-      if (key.upArrow) setPromptSel((s) => (s - 1 + opts.length) % opts.length);
-      else if (key.downArrow) setPromptSel((s) => (s + 1) % opts.length);
+    if (activePrompt) {
+      const opts = activePrompt.options;
+      if (key.upArrow) setPromptSel((s) => {
+        const next = (s - 1 + opts.length) % opts.length;
+        promptSelRef.current = next;
+        return next;
+      });
+      else if (key.downArrow) setPromptSel((s) => {
+        const next = (s + 1) % opts.length;
+        promptSelRef.current = next;
+        return next;
+      });
       else if (key.return) {
-        prompt.resolve(opts[Math.min(promptSel, opts.length - 1)].value);
+        activePrompt.resolve(opts[Math.min(promptSelRef.current, opts.length - 1)].value);
       } else if (key.escape) {
-        if (prompt.abortTurnOnEscape && working && ctrlRef.current) abortCurrentTurn();
-        else prompt.resolve(opts[opts.length - 1].value); // select-only prompt: last option = cancel/no
+        if (activePrompt.abortTurnOnEscape && working && ctrlRef.current) abortCurrentTurn();
+        else activePrompt.resolve(opts[opts.length - 1].value); // select-only prompt: last option = cancel/no
       } else if (/^[1-9]$/.test(input) && Number(input) <= opts.length) {
-        prompt.resolve(opts[Number(input) - 1].value); // type a number to pick directly
+        activePrompt.resolve(opts[Number(input) - 1].value); // type a number to pick directly
       } else if (input) {
         const hit = opts.find((o) => o.key && o.key === input.toLowerCase());
         if (hit) {
-          prompt.resolve(hit.value);
+          activePrompt.resolve(hit.value);
         }
       }
       return;
