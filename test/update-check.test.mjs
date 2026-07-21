@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isNewer, updateNotice, readCache, writeCache, refreshLatest, checkForUpdate, CHECK_EVERY_MS } from "../dist/update-check.js";
+import { isNewer, updateNotice, readCache, writeCache, refreshLatest, checkForUpdate, fetchLatestVersion, CHECK_EVERY_MS } from "../dist/update-check.js";
 
 test("isNewer: numeric triple compare, unparsable never nags", () => {
   assert.equal(isNewer("0.101.0", "0.100.0"), true);
@@ -20,7 +20,19 @@ test("updateNotice: fires only when the cached latest is newer", () => {
   assert.equal(updateNotice("0.100.0", null), null, "no cache → silent");
   assert.equal(updateNotice("0.100.0", { checkedAt: 1, latest: "0.100.0" }), null, "same → silent");
   const n = updateNotice("0.100.0", { checkedAt: 1, latest: "0.101.0" });
-  assert.ok(n.includes("0.100.0 → 0.101.0") && n.includes("npm i -g @nanhara/hara"), "notice carries versions + the command");
+  assert.ok(n.includes("0.100.0 → 0.101.0") && n.includes("hara update"), "notice routes through the source-aware updater");
+});
+
+test("fetchLatestVersion: falls back across fixed registries and rejects non-stable metadata", async () => {
+  let calls = 0;
+  const latest = await fetchLatestVersion(async () => {
+    calls++;
+    return calls === 1
+      ? { ok: true, json: async () => ({ version: "latest" }) }
+      : { ok: true, json: async () => ({ version: "0.130.3" }) };
+  });
+  assert.equal(latest, "0.130.3");
+  assert.equal(calls, 2);
 });
 
 test("cache round-trip + malformed cache reads as null", () => {

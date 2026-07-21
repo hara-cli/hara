@@ -16,6 +16,9 @@ export interface UiSink {
 export interface ToolContext {
   cwd: string;
   sandbox?: SandboxMode;
+  /** Current durable conversation, when this run has one. Transcript recall uses it to exclude the active
+   * session and enforce interactive/gateway/cron audience boundaries. */
+  sessionId?: string;
   /** One-run cancellation boundary. Built-in tools must stop owned subprocesses/work promptly when fired. */
   signal?: AbortSignal;
   /** Isolate the in-memory todo_write checklist for concurrent agent runs (serve sessions/sub-agents). */

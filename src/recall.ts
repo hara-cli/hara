@@ -9,6 +9,109 @@ import { skillsDirs } from "./skills/skills.js";
 import { readModelContextFileSync } from "./fs-read.js";
 
 const MAX_RECALL_SOURCE_BYTES = 256 * 1024;
+const SEARCH_SNIPPET_CHARS = 800;
+const WORD_STOP = new Set(
+  "a an and are can could did do for from i in is it me my of on or our please that the this to was we what when where with you your".split(" "),
+);
+const CJK_STOP = new Set(["之前", "以前", "对话", "会话", "搜索", "查找", "记得", "那个", "这个", "一下", "帮我", "关于", "内容", "讨论"]);
+
+function normalized(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase();
+}
+
+/** Whitespace-only tokenization makes an ordinary Chinese sentence one impossible giant term. Keep
+ * ordinary words, and use overlapping Han bigrams so lexical recall remains useful without a tokenizer
+ * dependency or embeddings. */
+export function lexicalSearchTerms(query: string): string[] {
+  const segments: Array<{ kind: "han" | "word"; text: string }> = [];
+  let kind: "han" | "word" | null = null;
+  let current = "";
+  const flush = (): void => {
+    if (kind && current) segments.push({ kind, text: current });
+    current = "";
+    kind = null;
+  };
+  for (const char of normalized(query)) {
+    const nextKind = /^\p{Script=Han}$/u.test(char)
+      ? "han"
+      : /^[\p{L}\p{N}_.+#@-]$/u.test(char)
+        ? "word"
+        : null;
+    if (!nextKind) {
+      flush();
+      continue;
+    }
+    if (kind && kind !== nextKind) flush();
+    kind = nextKind;
+    current += char;
+  }
+  flush();
+
+  const terms = new Set<string>();
+  const fallbackTerms = new Set<string>();
+  for (const segment of segments) {
+    if (segment.kind === "han") {
+      const chars = [...segment.text];
+      if (chars.length <= 2) {
+        fallbackTerms.add(segment.text);
+        if (!CJK_STOP.has(segment.text)) terms.add(segment.text);
+      } else {
+        for (let index = 0; index < chars.length - 1; index += 1) {
+          const pair = `${chars[index]}${chars[index + 1]}`;
+          fallbackTerms.add(pair);
+          if (!CJK_STOP.has(pair)) terms.add(pair);
+        }
+      }
+    } else {
+      fallbackTerms.add(segment.text);
+      if (!WORD_STOP.has(segment.text)) terms.add(segment.text);
+    }
+  }
+  const all = [...(terms.size ? terms : fallbackTerms)];
+  return all.length <= 48 ? all : [...all.slice(0, 24), ...all.slice(-24)];
+}
+
+/** Return the most relevant bounded window rather than the first bytes of the file. MEMORY.md and daily
+ * logs grow append-only, so a header-only snippet can report a hit while hiding the matching fact. */
+export function matchCenteredSnippet(text: string, terms: string[], max = SEARCH_SNIPPET_CHARS): string {
+  if (text.length <= max) return text;
+  const haystack = normalized(text);
+  const positions: number[] = [];
+  for (const term of terms) {
+    let from = 0;
+    for (let count = 0; count < 16; count += 1) {
+      const found = haystack.indexOf(term, from);
+      if (found < 0) break;
+      positions.push(found);
+      from = found + Math.max(1, term.length);
+    }
+  }
+  if (!positions.length) return `${text.slice(0, max).trimEnd()}…`;
+
+  let anchor = positions[0];
+  let bestScore = -1;
+  for (const position of positions) {
+    const start = Math.max(0, position - Math.floor(max * 0.35));
+    const end = start + max;
+    const score = terms.reduce((sum, term) => {
+      const found = haystack.indexOf(term, start);
+      return sum + (found >= start && found < end ? 1 : 0);
+    }, 0);
+    if (score > bestScore) {
+      bestScore = score;
+      anchor = position;
+    }
+  }
+
+  let start = Math.max(0, anchor - Math.floor(max * 0.35));
+  const priorLine = text.lastIndexOf("\n", start);
+  if (priorLine >= 0 && start - priorLine <= 160) start = priorLine + 1;
+  let end = Math.min(text.length, start + max);
+  const nextLine = text.indexOf("\n", end);
+  if (nextLine >= 0 && nextLine - end <= 160) end = nextLine;
+  const excerpt = text.slice(start, end).trim();
+  return `${start > 0 ? "…\n" : ""}${excerpt}${end < text.length ? "\n…" : ""}`;
+}
 
 export function assetsDir(): string {
   return process.env.HARA_ASSETS || join(homedir(), ".hara", "code-assets");
@@ -60,7 +163,7 @@ export function metaBoost(text: string, title: string, words: string[]): number 
 export function searchAssets(query: string, limit = 5, roots?: string[]): Recalled[] {
   const dirs = roots ?? [assetsDir()];
   const abs = roots !== undefined;
-  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const words = lexicalSearchTerms(query);
   if (!words.length) return [];
   const hits: (Recalled & { boost: number })[] = [];
   for (const dir of dirs) {
@@ -72,11 +175,11 @@ export function searchAssets(query: string, limit = 5, roots?: string[]): Recall
       } catch {
         continue;
       }
-      const hay = (rel + "\n" + text).toLowerCase();
+      const hay = normalized(rel + "\n" + text);
       const score = words.filter((w) => hay.includes(w)).length; // distinct query words present (dedup threshold uses this)
       if (!score) continue;
       const title = titleOf(text, rel);
-      hits.push({ path: abs ? join(dir, rel) : rel, title, snippet: text.slice(0, 800), score, boost: metaBoost(text, title, words) });
+      hits.push({ path: abs ? join(dir, rel) : rel, title, snippet: matchCenteredSnippet(text, words), score, boost: metaBoost(text, title, words) });
     }
   }
   // rank by relevance, then by the declared-dimension boost (title/tags/lang), then prefer the shorter path
@@ -93,7 +196,7 @@ export async function searchAssetsAsync(
 ): Promise<Recalled[]> {
   const dirs = roots ?? [assetsDir()];
   const abs = roots !== undefined;
-  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const words = lexicalSearchTerms(query);
   if (!words.length) return [];
 
   const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, Math.floor(options.timeoutMs!)) : 2_000;
@@ -138,11 +241,11 @@ export async function searchAssetsAsync(
       } catch {
         continue;
       }
-      const hay = (rel + "\n" + text).toLowerCase();
+      const hay = normalized(rel + "\n" + text);
       const score = words.filter((word) => hay.includes(word)).length;
       if (!score) continue;
       const title = titleOf(text, rel);
-      hits.push({ path: abs ? join(dir, rel) : rel, title, snippet: text.slice(0, 800), score, boost: metaBoost(text, title, words) });
+      hits.push({ path: abs ? join(dir, rel) : rel, title, snippet: matchCenteredSnippet(text, words), score, boost: metaBoost(text, title, words) });
     }
     if (Date.now() - startedAt >= timeoutMs || inventory.truncated) break;
   }

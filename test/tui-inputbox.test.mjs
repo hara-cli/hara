@@ -34,9 +34,10 @@ test("InputBox: active mode reads from the footer + usage is formatted", () => {
   const status = { sessionName: "s", approval: "auto-edit", input: 1200, output: 340, ctxPct: 12, agents: 2 };
   const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", route: "gw.nanhara.tech", width: 72 }));
   const frame = strip(lastFrame());
+  const compact = frame.replace(/\s+/g, " ");
   assert.ok(frame.includes("glm-5 · auto-edit"), "active mode shown inline in the footer");
-  assert.ok(frame.includes("↑1.2k ↓340"), "token usage formatted");
-  assert.ok(frame.includes("ctx 12%"), "context percent shown");
+  assert.ok(compact.includes("↑1.2k ↓340"), "token usage formatted across an Ink-owned narrow wrap");
+  assert.ok(compact.includes("ctx 12%"), "context percent shown");
   assert.ok(frame.includes("gw.nanhara.tech"), "route host in the footer when set");
   unmount();
 });
@@ -216,21 +217,21 @@ test("wrapRows: exactly-full content gets an empty trailing row (so the end curs
 
 // ── windowRows: the bottom-anchored viewport that stops a long paste from freezing the box ──
 test("windowRows: short input renders every row (no windowing)", () => {
-  assert.deepEqual(windowRows(5, 4), { first: 0, last: 5 });
+  assert.deepEqual(windowRows(3, 2), { first: 0, last: 3 });
   assert.deepEqual(windowRows(MAX_INPUT_ROWS, 0), { first: 0, last: MAX_INPUT_ROWS });
 });
 
 test("windowRows: long input with cursor at the end shows the LAST window (bottom-anchored)", () => {
   const { first, last } = windowRows(500, 499); // 500 rows, cursor on the last
   assert.equal(last, 500, "window ends at the bottom");
-  assert.equal(last - first, MAX_INPUT_ROWS, "exactly MAX rows drawn (not all 500)");
-  assert.equal(first, 500 - MAX_INPUT_ROWS);
+  assert.equal(last - first, MAX_INPUT_ROWS - 1, "one fixed-height row is reserved for the above indicator");
+  assert.equal(first, 500 - (MAX_INPUT_ROWS - 1));
 });
 
 test("windowRows: cursor mid-text stays visible with a little context below", () => {
   const { first, last } = windowRows(500, 200);
   assert.ok(200 >= first && 200 < last, "cursor row 200 is within the drawn window");
-  assert.equal(last - first, MAX_INPUT_ROWS, "still only MAX rows drawn");
+  assert.equal(last - first, MAX_INPUT_ROWS - 2, "above and below indicators both consume fixed-height rows");
   assert.equal(last, 202, "cursor + 2 rows of look-ahead");
 });
 
@@ -239,6 +240,8 @@ test("windowRows: never draws more than MAX regardless of size", () => {
     const { first, last } = windowRows(n, cur);
     assert.ok(last - first <= MAX_INPUT_ROWS, `≤MAX for n=${n} cur=${cur}`);
     assert.ok(cur >= first && cur < last || n <= MAX_INPUT_ROWS, "cursor stays in view");
+    const rendered = last - first + (first > 0 ? 1 : 0) + (last < n ? 1 : 0);
+    assert.ok(rendered <= MAX_INPUT_ROWS, `content plus indicators stays within the fixed viewport for n=${n} cur=${cur}`);
   }
 });
 
@@ -273,6 +276,22 @@ test("InputBox: long input wraps to multiple visual rows (doesn't render on a si
   // the prompt region spans multiple lines — count lines that carry input words
   const inputLines = frame.split("\n").filter((l) => /this|prompt|wrap|visual|narrow/.test(l));
   assert.ok(inputLines.length >= 2, `long input occupies multiple rows (saw ${inputLines.length})`);
+  unmount();
+});
+
+test("InputBox: narrow CJK typing keeps a fixed frame height and never exceeds the terminal width", async () => {
+  const width = 24;
+  const cjkStatus = { ...S, sessionName: "中文会话标题很长" };
+  const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: cjkStatus, cwd, model: "glm-5", width }));
+  await tick();
+  const initialHeight = strip(lastFrame()).split("\n").length;
+  for (let i = 0; i < 36; i++) {
+    stdin.write("中");
+    await tick(5);
+    const lines = strip(lastFrame()).split("\n");
+    assert.equal(lines.length, initialHeight, `frame height stays fixed after CJK character ${i + 1}`);
+    assert.ok(lines.every((line) => cells(line) <= width), `Ink owns every wrap at character ${i + 1}`);
+  }
   unmount();
 });
 
@@ -420,4 +439,14 @@ test("wrapRows: mixed CJK + long ASCII word — the ASCII word is not torn by ph
   const v = "可能在output";
   const rows = wrapRows(v, 13);
   assert.equal(rows.length, 1, `expected one row, got ${JSON.stringify(rows)}`);
+});
+
+test("wrapRows: a long percent-encoded URL never tears a %XX byte triplet", () => {
+  const value = "https://x/%E5%85%8B%E9%A9%AC";
+  const rows = wrapRows(value, 11);
+  coversExactly(rows, value, 11);
+  for (const row of rows.slice(0, -1)) {
+    const prefix = value.slice(0, row.end);
+    assert.doesNotMatch(prefix, /%(?:[0-9a-f])?$/iu, `row boundary ${row.end} does not split %XX`);
+  }
 });

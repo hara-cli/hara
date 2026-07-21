@@ -73,3 +73,21 @@ test("toOpenAI: plain user turn stays a string (no regression)", () => {
   const msgs = toOpenAI("sys", [{ role: "user", content: "hi" }]);
   assert.equal(msgs[1].content, "hi");
 });
+
+test("toOpenAI omits empty assistant history unless it carries tool calls", () => {
+  const msgs = toOpenAI("sys", [
+    { role: "user", content: "hi" },
+    { role: "assistant", text: "   ", toolUses: [] },
+    { role: "assistant", text: "", toolUses: [{ id: "call-1", name: "read_file", input: { path: "README.md" } }] },
+  ]);
+  assert.equal(msgs.length, 3);
+  assert.deepEqual(msgs[2], {
+    role: "assistant",
+    content: null,
+    tool_calls: [{
+      id: "call-1",
+      type: "function",
+      function: { name: "read_file", arguments: '{"path":"README.md"}' },
+    }],
+  });
+});

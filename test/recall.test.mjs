@@ -63,6 +63,38 @@ test("recall: async asset search preserves ranking and propagates cancellation",
   }
 });
 
+test("recall: CJK queries return a match-centered snippet from a long memory file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-assets-cjk-"));
+  try {
+    mkdirSync(join(dir, "memory"), { recursive: true });
+    const prefix = Array.from({ length: 120 }, (_, index) => `- unrelated historical fact ${index}`).join("\n");
+    writeFileSync(
+      join(dir, "memory", "MEMORY.md"),
+      `${prefix}\n- 讨论过马斯克的维基百科资料，结论保存在上一段会话。\n`,
+    );
+
+    const hits = await searchAssetsAsync("之前讨论的马斯克维基百科", 5, [dir], { timeoutMs: 5_000 });
+    assert.equal(hits.length, 1);
+    assert.match(hits[0].snippet, /马斯克的维基百科资料/);
+    assert.doesNotMatch(hits[0].snippet, /historical fact 0\b/, "snippet is anchored at the match, not the file header");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recall: technical single-letter and punctuation terms remain searchable", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-assets-technical-"));
+  process.env.HARA_ASSETS = dir;
+  try {
+    writeFileSync(join(dir, "native.md"), "# Native notes\nC++ interop and R bindings\n");
+    assert.equal(searchAssets("C++")[0]?.path, "native.md");
+    assert.equal(searchAssets("R bindings")[0]?.path, "native.md");
+  } finally {
+    delete process.env.HARA_ASSETS;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("recall: scaffoldAssets creates an example + README", () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-assets2-"));
   process.env.HARA_ASSETS = dir;

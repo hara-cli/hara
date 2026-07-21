@@ -839,6 +839,49 @@ test("serve e2e: failed and empty turns never replay an earlier assistant reply"
   }
 });
 
+test("serve e2e: an active deadline returns a recoverable paused result instead of an RPC error", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-deadline-paused-"));
+  const provider = {
+    id: "deadline",
+    model: "deadline",
+    async turn() {
+      const until = Date.now() + 1_100;
+      while (Date.now() < until) {
+        // Deliberately hold the event loop past the active budget. The agent loop must notice the elapsed
+        // deadline before accepting this late response as a successful turn.
+      }
+      return { text: "late response", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const deps = {
+    ...baseDeps(provider, memStore()),
+    runLimits: () => ({ timeoutMs: 1_000, maxRounds: 20 }),
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    const sent = await c.call("session.send", { sessionId: result.sessionId, text: "work until the deadline" });
+    assert.equal(sent.error, undefined, "a recoverable deadline is not an RPC failure");
+    assert.equal(sent.result.status, "paused");
+    assert.equal(sent.result.stopReason, "deadline");
+    assert.match(sent.result.reply, /agent run paused.*\/continue/i);
+
+    const turnEnd = c.events.filter((event) => event.method === "event.turn_end").at(-1);
+    assert.equal(turnEnd.params.status, "paused");
+    assert.equal(turnEnd.params.stopReason, "deadline");
+    assert.equal(turnEnd.params.error, undefined);
+    const taskState = c.events.filter((event) => event.method === "event.task_state").at(-1);
+    assert.equal(taskState.params.state, "paused");
+    assert.equal(taskState.params.taskStatus, "paused");
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: graceful close aborts turns, closes clients, releases settled locks, and is idempotent", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-close-"));
   const store = memStore();

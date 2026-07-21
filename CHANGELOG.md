@@ -5,6 +5,58 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.131.0 — 2026-07-21 — verified upgrades, project recovery, and session recall
+
+- `hara update` (also `hara upgrade`) now identifies the installation that actually launched the process.
+  npm updates use the matching Node/npm prefix without a shell, fixed public package/registry, credential-free
+  configuration, and disabled lifecycle scripts; success is reported only after the owning package on disk
+  reads back as the requested version. `hara update --check` is read-only.
+- `hara doctor` shows the active launch path and other Hara commands visible in `PATH`, so switching NVM/Node
+  or preferring a standalone binary can no longer silently turn an apparently successful update back into an
+  old release. Startup notices now route through the installation-aware updater instead of a generic npm line.
+- The standalone installer downloads beside the current binary, executes `--version` as a smoke check, and
+  atomically replaces the destination only after a complete valid download; an interrupted transfer leaves the
+  prior installation intact.
+- Home protection now falls back from unusable Home-root session history to bounded project discovery under
+  conventional `Projects`/`work`/`src` containers. Only `.git`, `package.json`, and `pyproject.toml` mtimes rank
+  candidates; `AGENTS.md` alone is not project evidence, symlinks are not followed, and Home is never scanned
+  recursively. A recent real repository is offered before an old registered directory.
+- The first project tool rejected by the Home boundary now ends that agent run immediately with `/cd` guidance,
+  instead of spending more turns trying other filesystem tools. Core replies follow the user's latest language,
+  and long percent-encoded URLs in the TUI transcript wrap only between complete `%XX` bytes. The composer now
+  uses a fixed four-row viewport and cell-aware width constraints, so narrow-terminal Chinese input no longer
+  grows the Ink repaint region or pushes earlier content upward while typing.
+- `/cd` now continues the current conversation in the selected project as a new project-bound session while
+  preserving the original session. An interactive `hara --cwd …` launch also offers to carry a recent source
+  session instead of silently opening a blank thread; headless and scripted launches remain non-interactive.
+- `session_search` now provides bounded cross-session recall without mixing raw transcripts into durable
+  memory. It searches user/assistant text only, excludes the active session and tool payloads, and separates
+  interactive/gateway/cron audiences. The default prefers the current project, then makes one bounded
+  local-interactive fallback across workspaces when no project match exists, covering conversations split by
+  a prior cwd switch; explicit project-only and broad all-project scopes remain available. Returned excerpts
+  are marked as untrusted reference text.
+- Three consecutive empty `memory_search`/`session_search` attempts now remove both recall tools for the rest
+  of that turn—even when the model changes queries, alternates tools, or emits a large batch—preventing the
+  40+ empty-call loop reported in 0.130.2. The run itself stays alive so the model can plainly say nothing was
+  found and ask for the missing detail or whether to recreate it.
+- Lexical memory/asset recall now tokenizes unspaced Chinese with bounded Han bigrams and returns a window
+  centered on the matching fact instead of the first 800 characters of a growing `MEMORY.md`. When semantic
+  and literal search choose the same file, the live literal match supplies the excerpt rather than an unrelated
+  indexed heading.
+- `memory_write target=user` now defaults to global `USER.md`, so an omitted scope survives into later
+  projects as intended; project `USER.md` files created by older/default-project writes remain injected for
+  compatibility. Durable facts/preferences are exact-deduplicated at the verified write boundary, and agent
+  calls can no longer replace an entire memory file; stale facts must be removed explicitly first.
+- Editable/legacy memory is sanitized again on every prompt/search/get/distill path: secret-shaped values are
+  redacted, injection/exfil lines are isolated, and unsafe content is removed before a semantic index can send
+  text to an embedding provider. This closes the gap between the documented memory guard and actual loads.
+- OpenAI-compatible history conversion now omits empty assistant turns that have neither text nor tool calls,
+  fixing DeepSeek-compatible endpoints that reject `{ role: "assistant", content: null }` with HTTP 400.
+- Active-execution deadlines now cross the Serve/Desktop boundary as a recoverable `paused` result with
+  `/continue` guidance, not an RPC failure rendered with an `error:` prefix. Loop, provider, and tool failures
+  remain errors or blocked states.
+- Upgrade with `npm i -g @nanhara/hara@0.131.0`; future npm installations can use `hara update`.
+
 ## 0.130.2 — 2026-07-21 — Weixin delivery identity
 
 - Personal WeChat iLink messages now pass valid `message_id` and `create_time_ms` metadata into Hara's

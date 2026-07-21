@@ -122,7 +122,7 @@ test("three identical failed tool calls trip the repeat-loop circuit breaker", a
   assert.equal(history.at(-1).role, "tool", "the last assistant tool_use remains protocol-complete");
 });
 
-test("three different tools blocked by the same Home boundary trip one root-cause breaker", async () => {
+test("the first tool blocked by the Home boundary stops before another model round", async () => {
   let turns = 0;
   const names = ["home_grep", "home_glob", "home_ls"];
   const diagnostics = [
@@ -151,9 +151,98 @@ test("three different tools blocked by the same Home boundary trip one root-caus
       async run() { return diagnostics[index]; },
     })),
   }));
-  assert.equal(turns, 3);
+  assert.equal(turns, 1);
   assert.equal(outcome.stopReason, "repeat_loop");
-  assert.match(outcome.error, /same failing Home workspace boundary repeated 3 times/i);
+  assert.match(outcome.error, /first Home workspace boundary rejection.*\/cd <project>/i);
+  assert.match(outcome.error, /current conversation will continue/i);
+});
+
+test("three empty recall attempts disable recall and let the model answer naturally", async () => {
+  let turns = 0;
+  const calls = [
+    { name: "memory_search", input: { query: "马斯克" } },
+    { name: "memory_search", input: { query: "Elon Musk" } },
+    { name: "session_search", input: { query: "Wikipedia Musk" } },
+  ];
+  const provider = {
+    id: "empty-recall",
+    model: "empty-recall",
+    async turn({ tools }) {
+      if (turns === calls.length) {
+        turns += 1;
+        assert.ok(!tools.some((tool) => tool.name === "memory_search" || tool.name === "session_search"));
+        return { text: "没有找到之前的记忆。你要补充细节，还是重新整理一份？", toolUses: [], stop: "end" };
+      }
+      const call = calls[Math.min(turns, calls.length - 1)];
+      turns += 1;
+      return { text: "", toolUses: [{ id: `recall-${turns}`, ...call }], stop: "tool_use" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "找以前的对话" }], base(provider, {
+    maxRounds: 20,
+    timeoutMs: "10s",
+    quiet: true,
+    extraTools: [
+      {
+        name: "memory_search",
+        description: "test curated memory",
+        input_schema: { type: "object", properties: { query: { type: "string" } } },
+        kind: "read",
+        async run() { return "(no memory matches)"; },
+      },
+      {
+        name: "session_search",
+        description: "test session history",
+        input_schema: { type: "object", properties: { query: { type: "string" } } },
+        kind: "read",
+        async run() { return "(no session matches)"; },
+      },
+    ],
+  }));
+  assert.equal(turns, 4);
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.stopReason, undefined);
+});
+
+test("a batched empty-recall burst executes only three serial searches", async () => {
+  let executions = 0;
+  let turns = 0;
+  const provider = {
+    id: "batched-empty-recall",
+    model: "batched-empty-recall",
+    async turn({ tools }) {
+      turns += 1;
+      if (turns === 2) {
+        assert.ok(!tools.some((tool) => tool.name === "memory_search"));
+        return { text: "没有找到历史记录，请提供更多信息。", toolUses: [], stop: "end" };
+      }
+      return {
+        text: "",
+        toolUses: Array.from({ length: 12 }, (_, index) => ({
+          id: `batched-recall-${index}`,
+          name: "memory_search",
+          input: { query: `different query ${index}` },
+        })),
+        stop: "tool_use",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "批量找历史" }], base(provider, {
+    maxRounds: 20,
+    timeoutMs: "10s",
+    quiet: true,
+    extraTools: [{
+      name: "memory_search",
+      description: "test serial recall",
+      input_schema: { type: "object", properties: { query: { type: "string" } } },
+      kind: "read",
+      concurrencySafe: false,
+      async run() { executions += 1; return "(no memory matches)"; },
+    }],
+  }));
+  assert.equal(turns, 2);
+  assert.equal(executions, 3);
+  assert.equal(outcome.status, "completed");
 });
 
 test("a changed failure or successful call clears an older repeated-failure streak", async () => {

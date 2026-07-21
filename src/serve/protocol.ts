@@ -10,7 +10,7 @@
 //   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,updatedAt}]}
 //   session.create    {cwd?,approval?}           → {sessionId,model}
 //   session.resume    {sessionId}                → {sessionId,model,history:[{role,text}]}
-//   session.send      {sessionId,text,images?,newTask?} → (streams events, then) {reply,usage,taskId,turnId}
+//   session.send      {sessionId,text,images?,newTask?} → (streams events, then) {reply,usage,taskId,turnId,status?,stopReason?}
 //   session.steer     {sessionId,text,expectedTurnId} → {accepted,taskId,turnId}
 //                      images: [{path,mediaType?}] — pasted screenshots etc., inlined for vision models
 //   session.interrupt {sessionId}                → {}
@@ -41,7 +41,7 @@
 //   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)
 // Server → client notifications (all carry sessionId):
 //   event.text / event.reasoning {delta} · event.tool {name,preview} · event.diff {text}
-//   event.notice {text} · event.turn_end {reply,usage,error?} · approval.request {approvalId,question}
+//   event.notice {text} · event.turn_end {reply,usage,error?,status?,stopReason?} · approval.request {approvalId,question}
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events
 

@@ -10,7 +10,15 @@
 // ink-testing-library against a fake runner — no provider/network needed.
 import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
 import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { InputBox, MODES, approvalColor, type Status, type Approval } from "./InputBox.js";
+import {
+  InputBox,
+  MODES,
+  approvalColor,
+  composerTextForDisplay,
+  wrapRows,
+  type Status,
+  type Approval,
+} from "./InputBox.js";
 import type { ImageAttachment } from "../providers/types.js";
 import { activity } from "../activity.js";
 import { ctxPctFor } from "../statusbar.js";
@@ -196,7 +204,7 @@ function tailWindow(rendered: string, maxRows: number): { header: string | null;
   };
 }
 
-const Block = memo(function Block({ item, open, liveRows }: { item: Item; open?: boolean; liveRows?: number }) {
+const Block = memo(function Block({ item, open, liveRows, width = 80 }: { item: Item; open?: boolean; liveRows?: number; width?: number }) {
   // Live streaming blocks get a bounded tail view (liveRows set); committed <Static> blocks render full.
   const windowed = (rendered: string): ReactNode => {
     if (!liveRows) return <Text>{rendered}</Text>;
@@ -209,13 +217,20 @@ const Block = memo(function Block({ item, open, liveRows }: { item: Item; open?:
     );
   };
   switch (item.kind) {
-    case "user":
+    case "user": {
+      const rows = wrapRows(item.text, Math.max(1, width - 2));
+      if (rows.length > 1 && rows.at(-1)!.start === rows.at(-1)!.end && !item.text.endsWith("\n")) rows.pop();
       return (
-        <Box marginTop={1}>
-          <Text color="cyan">› </Text>
-          <Text>{item.text}</Text>
+        <Box marginTop={1} flexDirection="column">
+          {rows.map((row, index) => (
+            <Box key={`${row.start}:${row.end}:${index}`}>
+              <Text color="cyan">{index === 0 ? "› " : "  "}</Text>
+              <Text>{composerTextForDisplay(item.text.slice(row.start, row.end))}</Text>
+            </Box>
+          ))}
         </Box>
       );
+    }
     case "assistant":
       return windowed(renderMarkdown(item.text)); // headers/bold/inline-code/bullets + verbatim fences
     case "reasoning": {
@@ -595,6 +610,7 @@ export function App({
 }: AppProps) {
   const { exit } = useApp();
   const { stdout: termOut } = useStdout();
+  const transcriptWidth = Math.max(4, termOut?.columns ?? 80);
   // Live tail budget: terminal rows minus the rest of the dynamic chrome (todo panel ≤10, status slot,
   // input box + footer, margins). Keeps the WHOLE dynamic region under the viewport — the invariant that
   // stops ink's repaint from "running to the top" when a long answer/diff streams. Floor 8 for tiny panes.
@@ -1023,10 +1039,10 @@ export function App({
   return (
     <Box flexDirection="column">
       <Static items={header ? [{ id: -1, kind: "notice" as const, text: "" }, ...history] : history}>
-        {(item) => (item.id === -1 ? <HeaderCard key="hdr" {...header!} /> : <Block key={item.id} item={item} />)}
+        {(item) => (item.id === -1 ? <HeaderCard key="hdr" {...header!} /> : <Block key={item.id} item={item} width={transcriptWidth} />)}
       </Static>
       {current.map((item) => (
-        <Block key={item.id} item={item} open={reasoningOpen} liveRows={liveRows} />
+        <Block key={item.id} item={item} open={reasoningOpen} liveRows={liveRows} width={transcriptWidth} />
       ))}
       <TodoPanel todos={todos} />
       {picker && (

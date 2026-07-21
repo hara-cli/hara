@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, linkSync, mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, utimesSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { loadAgentContext, loadAgentsMd, hasAgentsMd, findProjectRoot } from "../dist/context/agents-md.js";
-import { canonicalWorkspacePath, isHomeWorkspace, suggestedProjectWorkspace } from "../dist/context/workspace-scope.js";
+import { canonicalWorkspacePath, discoverProjectWorkspaces, isHomeWorkspace, suggestedProjectWorkspace } from "../dist/context/workspace-scope.js";
 import { expandMentions, expandMentionsAsync, fileCandidates } from "../dist/context/mentions.js";
 import { needsConfirm } from "../dist/agent/loop.js";
 import "../dist/tools/edit.js";
@@ -36,6 +36,48 @@ test("Home startup suggestion uses only an existing safe candidate and skips sta
       realpathSync.native(project),
     );
     assert.equal(suggestedProjectWorkspace([home, join(home, "gone")], home), undefined);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Home fallback prefers a recently active real project and ignores legacy AGENTS-only directories", { skip: process.platform === "win32" }, () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-home-discovery-"));
+  const actual = join(home, "Projects", "南荒程序员", "feishu-bot");
+  const older = join(home, "Projects", "older-project");
+  const python = join(home, "Projects", "python-project");
+  const legacy = join(home, "design");
+  const privatePackage = join(home, "Documents", "private-package");
+  mkdirSync(join(actual, ".git"), { recursive: true });
+  mkdirSync(join(older, ".git"), { recursive: true });
+  mkdirSync(python, { recursive: true });
+  mkdirSync(legacy, { recursive: true });
+  mkdirSync(privatePackage, { recursive: true });
+  writeFileSync(join(actual, "package.json"), "{}\n");
+  writeFileSync(join(python, "pyproject.toml"), "[project]\nname = 'python-project'\n");
+  writeFileSync(join(legacy, "AGENTS.md"), "legacy only\n");
+  writeFileSync(join(privatePackage, "package.json"), "{}\n");
+  symlinkSync(privatePackage, join(home, "Projects", "private-link"), "dir");
+  const old = new Date("2026-06-30T00:00:00Z");
+  const recent = new Date("2026-07-21T08:00:00Z");
+  utimesSync(older, old, old);
+  utimesSync(join(older, ".git"), old, old);
+  utimesSync(join(python, "pyproject.toml"), old, old);
+  utimesSync(actual, old, old);
+  utimesSync(join(actual, ".git"), recent, recent);
+  utimesSync(join(actual, "package.json"), recent, recent);
+  try {
+    const discovered = discoverProjectWorkspaces(home);
+    assert.equal(discovered[0], realpathSync.native(actual));
+    assert.ok(discovered.includes(realpathSync.native(older)));
+    assert.ok(discovered.includes(realpathSync.native(python)), "pyproject.toml discovers non-Node projects");
+    assert.ok(!discovered.includes(realpathSync.native(legacy)), "AGENTS.md alone is not project evidence");
+    assert.ok(!discovered.includes(realpathSync.native(privatePackage)), "non-project Home roots and symlink escapes are not scanned");
+    assert.equal(
+      suggestedProjectWorkspace([...discovered, legacy], home),
+      realpathSync.native(actual),
+      "bounded discovery outranks an old registered AGENTS-only directory",
+    );
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

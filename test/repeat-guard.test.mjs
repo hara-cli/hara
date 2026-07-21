@@ -27,11 +27,26 @@ test("looksFailed: recognizes tool-specific built-in diagnostics without classif
   assert.equal(looksFailed("Screen control is off. Enable it with hara config.", "computer"), true);
   assert.equal(looksFailed("Grounding needs a vision model that can see images — set one.", "computer"), true);
   assert.equal(looksFailed("Screenshot saved to /tmp/x.png. Configure a vision model so I can read it.", "computer"), true);
+  assert.equal(looksFailed("(no memory matches)", "memory_search"), true);
+  assert.equal(looksFailed("(no session matches)", "session_search"), true);
 
   assert.equal(looksFailed("Search failed is the title of this document.", "read_file"), false);
   assert.equal(looksFailed("The cron output was: ✗ a1 failed: exit 7", "read_file"), false);
   assert.equal(looksFailed("A user may write Refused: in ordinary prose.", "web_fetch"), false);
   assert.equal(looksFailed("Search failed across available providers (quoted example)."), false, "tool identity is required for ambiguous prose-like shapes");
+});
+
+test("three empty recall queries coalesce across changed arguments and both recall tools", () => {
+  const first = recordCall("memory_search", { query: "马斯克" }, "(no memory matches)");
+  const second = recordCall("memory_search", { query: "Elon Musk" }, "(no memory matches)");
+  const third = recordCall("session_search", { query: "Wikipedia Musk" }, "(no session matches)");
+  assert.match(first, /1 consecutive.*at most 2 more/is);
+  assert.match(second, /2 consecutive.*at most 1 more/is);
+  assert.match(third, /3 consecutive.*recall tools are disabled.*tell the user/is);
+  const identity = failureIdentity("session_search", { query: "different" }, "(no session matches)");
+  assert.equal(identity.semantic, true);
+  assert.equal(identity.hardStopAfter, 3);
+  assert.equal(identity.kind, "empty_recall");
 });
 
 test("recordCall advances the repeated-failure streak for tool-specific diagnostics", () => {
@@ -67,7 +82,7 @@ test("different directory tools share the same protected-Home root cause", () =>
   const grep = "Error: grep will not recursively scan the home directory. Run Hara from a project.";
   const glob = "Error: glob will not enumerate or recursively scan directories while Hara is rooted at the home directory.";
   assert.equal(failureIdentity("grep", { pattern: "x" }, grep).semantic, true);
-  assert.equal(recordCall("grep", { pattern: "x" }, grep), "");
+  assert.match(recordCall("grep", { pattern: "x" }, grep), /first project tool.*\/cd <project>.*current conversation will continue/is);
   assert.match(recordCall("glob", { pattern: "**/*" }, glob), /same Home workspace boundary.*2 consecutive/is);
 });
 

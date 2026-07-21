@@ -14,7 +14,7 @@
 - **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**), and `hara plan --parallel` runs independent atoms concurrently.
 - **Drive it from chat** — `hara gateway` runs your local hara from **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk · WeCom · Signal** (10 platforms), with **two-way images where the platform has a byte-upload API**, resumable per-chat sessions, project/agent roaming, bounded per-thread queues, and approval-gated group automations. Connects out — no public webhook. See **[docs/gateway.md](docs/gateway.md)**.
 - **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only investigation → the model submits its plan via `exit_plan` → approve → execute), selectable approvals with "don't ask again", windowed reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
-- **Persistent memory + auditable self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting and can curate evidence-backed facts/preferences plus verified reusable skills. `/evolve status|now` shows or runs the bounded curation policy; it never grants permission to rewrite product code, permissions, config, or system prompts. Inspect/consolidate with **`hara memory show`** and **`hara memory distill`**. Lexical-first by design — semantic search is opt-in, never required.
+- **Persistent memory + auditable self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting and can curate evidence-backed facts/preferences plus verified reusable skills. Durable writes are deduplicated and re-sanitized on load; raw prior chats stay separate behind bounded `session_search`. `/evolve status|now` shows or runs the curation policy; it never grants permission to rewrite product code, permissions, config, or system prompts. Inspect/consolidate with **`hara memory show`** and **`hara memory distill`**. Chinese-aware lexical search works without setup; semantic search remains opt-in.
 - **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
 - **Delegate to other agents** — the **`external_agent`** tool hands a self-contained task to **Claude Code** or **Codex** running headless, and returns the result — so you pick the best engine per task. It is a trusted extension outside Hara's protected-file boundary: every interactive call requires confirmation, and non-interactive use is disabled by default.
 - **Honest under a slow network** — a live "waiting for the model… Ns" status, a stall watchdog that
@@ -221,6 +221,20 @@ because it contains newlines; malformed/incomplete frames are bounded and surfac
 
 Each session gets a **UUID** and an **auto-summarized name** from your first message (kept verbatim, CJK
 included); `hara sessions` lists them by short id, and `--resume <prefix>` accepts the short id.
+When you refer to an older conversation, the agent can use `session_search`: it searches bounded
+user/assistant excerpts from prior sessions, excludes tool payloads and the active session, and keeps
+interactive, gateway, and cron audiences separate. Its default checks the current project first and, only
+when that has no match, makes one bounded fallback across other local interactive workspaces—so a cwd switch
+does not hide the immediately preceding chat. `scope=project` forbids that fallback; `scope=all` requests a
+broad interactive search. Every returned excerpt identifies its source workspace when needed and is treated
+as untrusted reference text rather than an instruction.
+
+Durable memory remains a smaller curated layer: project facts/decisions default to project `MEMORY.md`, while
+`target=user` defaults to global `USER.md`. Exact duplicate facts/preferences are not appended again, and the
+agent cannot replace a whole memory file in one call. Chinese lexical queries return the matching part of a
+long file rather than its header. Because these Markdown files are editable and syncable, Hara re-sanitizes
+them on injection, retrieval, log distillation, and semantic indexing; unsafe lines and secret-shaped values
+never become trusted prompt or embedding input.
 
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal

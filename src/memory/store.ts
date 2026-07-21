@@ -7,6 +7,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { findProjectRoot } from "../context/agents-md.js";
 import { readModelContextFileSync, readVerifiedRegularFileSnapshot, type RegularFileSnapshot } from "../fs-read.js";
 import { atomicWriteText, bindAtomicWritePath, type AtomicWriteBoundary } from "../fs-write.js";
+import { sanitizeMemoryForPrompt } from "./guard.js";
 
 export type Scope = "global" | "project";
 export type Target = "memory" | "user" | "log";
@@ -85,6 +86,42 @@ export async function appendMemory(scope: Scope, target: Target, content: string
   });
   return f;
 }
+
+function comparableEntry(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/^\s*[-*]\s+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Append one durable fact/preference only when an equivalent line is not already present. The duplicate
+ * decision and write share the same verified snapshot/CAS boundary, so proactive curation cannot keep
+ * piling up an identical memory on every session exit. */
+export async function appendMemoryOnce(
+  scope: Scope,
+  target: Exclude<Target, "log">,
+  content: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<{ path: string; appended: boolean }> {
+  const f = targetFile(scope, target, cwd);
+  const { boundary, snapshot } = await inspectMemoryWrite(f, "append memory");
+  const wanted = comparableEntry(content);
+  const exists = snapshot?.text
+    .split("\n")
+    .some((line) => comparableEntry(line) === wanted);
+  if (wanted && exists) return { path: f, appended: false };
+  const text = (snapshot ? `${snapshot.text}\n` : "") + content.trim() + "\n";
+  await atomicWriteText(boundary.target, text, {
+    expected: snapshot?.text ?? null,
+    expectedIdentity: snapshot ?? undefined,
+    boundary,
+    signal,
+  });
+  return { path: f, appended: true };
+}
 export async function replaceMemory(scope: Scope, target: Target, content: string, cwd: string, signal?: AbortSignal): Promise<string> {
   const f = targetFile(scope, target, cwd);
   await commitMemoryText(f, content.trim() + "\n", "replace memory", signal);
@@ -114,6 +151,7 @@ export async function forgetMemory(scope: Scope, target: Target, match: string, 
 export function memoryDigest(cwd: string): string {
   const sources: [Scope, Target, string][] = [
     ["project", "memory", "project MEMORY"],
+    ["project", "user", "project USER preferences"],
     ["global", "memory", "global MEMORY"],
     ["global", "user", "USER preferences"],
   ];
@@ -122,7 +160,7 @@ export function memoryDigest(cwd: string): string {
     const f = targetFile(scope, target, cwd);
     if (!existsSync(f)) continue;
     try {
-      const t = readModelContextFileSync(f, MAX_MEMORY_SOURCE_BYTES).trim();
+      const t = sanitizeMemoryForPrompt(readModelContextFileSync(f, MAX_MEMORY_SOURCE_BYTES)).text.trim();
       if (t) parts.push(`## ${label}\n${capAtLine(t, SOURCE_CAP[target])}`);
     } catch {
       /* skip unreadable */
@@ -143,7 +181,7 @@ export function readRecentLogs(scope: Scope, cwd: string, days: number): string 
     const m = /^(\d{4})-(\d{2})-(\d{2})\.md$/.exec(f);
     if (m && new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() < cutoff) continue;
     try {
-      const t = readModelContextFileSync(join(dir, f), MAX_MEMORY_SOURCE_BYTES).trim();
+      const t = sanitizeMemoryForPrompt(readModelContextFileSync(join(dir, f), MAX_MEMORY_SOURCE_BYTES)).text.trim();
       if (t) out.push(`### ${f}\n${t}`);
     } catch {
       /* skip unreadable */

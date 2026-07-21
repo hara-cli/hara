@@ -114,7 +114,7 @@ function runCli(args, cwd, home) {
   });
 }
 
-test("Home-root resume reuses history and rejects a model-initiated workspace inventory", async () => {
+test("Home-root resume reuses history and halts after the first model-initiated workspace inventory", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-resume-home-"));
   const home = join(root, "home");
   const hiddenProjectName = "HOME_PROJECT_NAME_MUST_NOT_REACH_MODEL";
@@ -149,9 +149,10 @@ test("Home-root resume reuses history and rejects a model-initiated workspace in
     );
 
     const result = await runCli(["-p", "continue the existing task", "--resume", sessionId], home, home);
-    assert.equal(result.code, 0, result.stderr);
-    assert.match(result.stdout, /RESUME_BOUNDARY_OK/);
-    assert.equal(api.requests.length, 2, "one refused tool round followed by the final answer");
+    assert.equal(result.code, 2, result.stderr);
+    assert.match(result.stderr, /first Home workspace boundary rejection.*\/cd <project>/i);
+    assert.doesNotMatch(result.stdout, /RESUME_BOUNDARY_OK/);
+    assert.equal(api.requests.length, 1, "the first Home boundary rejection halts before another model round");
 
     const firstRequest = JSON.stringify(api.requests[0]);
     assert.match(firstRequest, /Existing-session continuity/);
@@ -159,10 +160,6 @@ test("Home-root resume reuses history and rejects a model-initiated workspace in
     assert.match(firstRequest, /continue the existing task/);
     assert.doesNotMatch(firstRequest, new RegExp(hiddenProjectName));
 
-    const secondRequest = JSON.stringify(api.requests[1]);
-    assert.match(secondRequest, /will not enumerate or recursively scan directories/i);
-    assert.doesNotMatch(secondRequest, new RegExp(hiddenProjectName));
-    assert.doesNotMatch(secondRequest, /thousands-of-files-sentinel/);
   } finally {
     await new Promise((resolve) => api.server.close(resolve));
     rmSync(root, { recursive: true, force: true });

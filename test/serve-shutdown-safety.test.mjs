@@ -374,8 +374,10 @@ test("a timed-out provider keeps its session BUSY until the physical request set
     const first = owner.call("session.send", { sessionId, text: "let this provider ignore cancellation" });
     await firstStarted;
     const expired = await first;
-    assert.equal(expired.error.code, -32603);
-    assert.match(expired.error.message, /deadline|timed out/i);
+    assert.equal(expired.error, undefined, "a recoverable deadline is not an RPC error");
+    assert.equal(expired.result.status, "paused");
+    assert.equal(expired.result.stopReason, "deadline");
+    assert.match(expired.result.reply, /deadline|timed out/i);
 
     const overlap = await owner.call("session.send", { sessionId, text: "must wait for physical settlement" });
     assert.equal(overlap.error.code, -32002);
@@ -463,8 +465,10 @@ test("server.shutdown tracks a guardian provider after the logical turn deadline
     sending = owner.call("session.send", { sessionId, text: "exercise guardian timeout" });
     await guardianStarted;
     const sendResult = await sending;
-    assert.equal(sendResult.error.code, -32603);
-    assert.match(sendResult.error.message, /active-execution deadline/i);
+    assert.equal(sendResult.error, undefined, "a recoverable deadline is not an RPC error");
+    assert.equal(sendResult.result.status, "paused");
+    assert.equal(sendResult.result.stopReason, "deadline");
+    assert.match(sendResult.result.reply, /active-execution deadline/i);
     assert.equal(guardianSignal.aborted, true, "the logical deadline still cancels the guardian request");
 
     const shutdownRefused = await updater.call("server.shutdown");

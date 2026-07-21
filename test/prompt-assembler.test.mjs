@@ -62,6 +62,7 @@ test("Hara prompt keeps core/session identities stable when the accepted task br
       "only the turn-level task boundary changes",
     );
     assert.match(after.text, /Working directory: \/workspace\/project/);
+    assert.match(after.text, /Reply in the same language as the user's latest message/);
     assert.match(after.text, /# Project context \(AGENTS\.md\)/);
     assert.match(after.text, /The task brief below is the accepted interpretation/);
   } finally {

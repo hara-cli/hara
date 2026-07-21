@@ -1,4 +1,4 @@
-import { realpathSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { effectiveHomeDir } from "../runtime.js";
 
@@ -96,6 +96,133 @@ export function suggestedProjectWorkspace(
     }
   }
   return undefined;
+}
+
+const DEFAULT_PROJECT_CONTAINERS = [
+  "Projects",
+  "projects",
+  "Developer",
+  "developer",
+  "work",
+  "workspace",
+  "src",
+  "code",
+  "dev",
+  "repos",
+] as const;
+const SKIP_PROJECT_DIRECTORY = new Set([
+  "node_modules",
+  "vendor",
+  "target",
+  "dist",
+  "build",
+  "coverage",
+  ".cache",
+]);
+
+interface ProjectDiscoveryOptions {
+  containers?: readonly string[];
+  maxDepth?: number;
+  maxDirectories?: number;
+}
+
+interface DiscoveredProject {
+  path: string;
+  activityMs: number;
+}
+
+function projectEvidence(path: string): { activityMs: number } | null {
+  let activityMs = 0;
+  const git = resolve(path, ".git");
+  try {
+    const stat = lstatSync(git);
+    if (stat.isDirectory() || stat.isFile()) {
+      activityMs = Math.max(activityMs, stat.mtimeMs);
+    }
+  } catch {
+    // No Git marker.
+  }
+  for (const manifest of ["package.json", "pyproject.toml"]) {
+    try {
+      const stat = lstatSync(resolve(path, manifest));
+      if (stat.isFile()) activityMs = Math.max(activityMs, stat.mtimeMs);
+    } catch {
+      // Language manifests are optional; .git alone remains a valid project marker.
+    }
+  }
+  return activityMs > 0 ? { activityMs } : null;
+}
+
+/** Bounded fallback discovery for an interactive launch at Home. This is intentionally NOT a recursive
+ * Home scan: only conventional project containers are inspected, symlink directories are never followed,
+ * build/vendor trees are skipped, and hard depth/count caps bound both latency and disclosure. Only .git,
+ * package.json, and pyproject.toml mtimes rank filesystem candidates; AGENTS.md alone is not project evidence. */
+export function discoverProjectWorkspaces(
+  home = effectiveHomeDir(),
+  options: ProjectDiscoveryOptions = {},
+): string[] {
+  const canonicalHome = canonicalWorkspacePath(home);
+  const containers = options.containers ?? DEFAULT_PROJECT_CONTAINERS;
+  const maxDepth = Math.max(0, Math.min(6, options.maxDepth ?? 3));
+  const maxDirectories = Math.max(1, Math.min(2_000, options.maxDirectories ?? 400));
+  const queue: { path: string; root: string; depth: number }[] = [];
+  const queued = new Set<string>();
+  for (const name of containers) {
+    if (!/^[^/\\]+$/u.test(name) || name === "." || name === "..") continue;
+    const root = resolve(canonicalHome, name);
+    try {
+      const stat = lstatSync(root);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+      const canonical = realpathSync.native(root);
+      if (queued.has(canonical)) continue;
+      queued.add(canonical);
+      queue.push({ path: canonical, root: canonical, depth: 0 });
+    } catch {
+      // Conventional roots are optional.
+    }
+  }
+
+  const discovered: DiscoveredProject[] = [];
+  const visited = new Set<string>();
+  while (queue.length && visited.size < maxDirectories) {
+    const current = queue.shift()!;
+    let canonical: string;
+    try {
+      const lexical = lstatSync(current.path);
+      if (!lexical.isDirectory() || lexical.isSymbolicLink()) continue;
+      canonical = realpathSync.native(current.path);
+    } catch {
+      continue;
+    }
+    const fromRoot = relative(current.root, canonical);
+    if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) continue;
+    if (visited.has(canonical) || isUnsafeProjectWorkspace(canonical, canonicalHome)) continue;
+    visited.add(canonical);
+    const evidence = projectEvidence(canonical);
+    if (evidence) {
+      discovered.push({ path: canonical, ...evidence });
+      continue;
+    }
+    if (current.depth >= maxDepth) continue;
+    let entries;
+    try {
+      entries = readdirSync(canonical, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (queued.size >= maxDirectories) break;
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      if (entry.name.startsWith(".") || SKIP_PROJECT_DIRECTORY.has(entry.name.toLowerCase())) continue;
+      const path = resolve(canonical, entry.name);
+      if (queued.has(path)) continue;
+      queued.add(path);
+      queue.push({ path, root: current.root, depth: current.depth + 1 });
+    }
+  }
+  return discovered
+    .sort((a, b) => b.activityMs - a.activityMs || a.path.localeCompare(b.path))
+    .map((project) => project.path);
 }
 
 /** Resolve an explicit interactive workspace handoff without accepting Home/ancestor scopes. */

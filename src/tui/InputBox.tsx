@@ -112,13 +112,28 @@ const Footer = memo(function Footer({ model, s, cwdShort, route }: { model: stri
 // fixed `width`, so this line supplies the top with its two corners and everything lines up exactly.
 // Layout (total = width): `╭` + left dashes + ` ● <name> ` + `─╮`. `●` (U+25CF) is a hard 1-cell glyph
 // (unlike the emoji-presentation `⏺`, which some terminals render 2 cells wide and would skew the corner).
+function truncateToCells(value: string, max: number): string {
+  if (cells(value) <= max) return value;
+  const room = Math.max(0, max - 1);
+  let out = "";
+  let used = 0;
+  for (const ch of value) {
+    const width = charCells(ch);
+    if (used + width > room) break;
+    out += ch;
+    used += width;
+  }
+  return out + "…";
+}
+
 const TopBorder = memo(function TopBorder({ name, width }: { name: string; width: number }) {
-  const left = Math.max(2, width - name.length - 7); // ╭(1)+ " "(1)+●(1)+" name "(len+2)+"─╮"(2)
+  const displayName = truncateToCells(name, Math.max(1, width - 9));
+  const left = Math.max(2, width - cells(displayName) - 7); // ╭(1)+ " "(1)+●(1)+" name "(cells+2)+"─╮"(2)
   return (
     <Box>
       <Text dimColor>{"╭" + "─".repeat(left) + " "}</Text>
       <Text color="cyan">●</Text>
-      <Text bold>{` ${name} `}</Text>
+      <Text bold>{` ${displayName} `}</Text>
       <Text dimColor>{"─╮"}</Text>
     </Box>
   );
@@ -259,15 +274,22 @@ export function wrapRows(value: string, cols: number): Row[] {
       col += aCells; // an oversized atomic token may exceed width — acceptable (rare, kept whole)
       if (col >= width) flush(aEnd);
     } else {
-      // A single word longer than the whole width: hard-break it across rows — walking CODE POINTS
-      // and accumulating CELLS, so a double-width char never straddles the terminal edge.
+      // A single word longer than the whole width: hard-break it across rows — walking display units
+      // and accumulating CELLS, so a double-width char never straddles the terminal edge. Percent-encoded
+      // URL bytes stay atomic (`%E5`, not `%` + `E5`): the submitted value was always intact, but tearing a
+      // triplet in the transcript made a valid long link look corrupted and copy badly.
       let s = a.start;
       if (col > 0) flush(s); // start the long word on a fresh row
-      for (const ch of a.text) {
-        const w = charCells(ch);
+      for (let offset = 0; offset < a.text.length;) {
+        const encoded = a.text[offset] === "%" && /^[0-9a-f]{2}$/iu.test(a.text.slice(offset + 1, offset + 3));
+        const ch = encoded
+          ? a.text.slice(offset, offset + 3)
+          : String.fromCodePoint(a.text.codePointAt(offset)!);
+        const w = cells(ch);
         if (col + w > width && col > 0) flush(s);
         col += w;
         s += ch.length;
+        offset += ch.length;
         if (col >= width) flush(s);
       }
     }
@@ -336,18 +358,29 @@ function renderRow(value: string, row: Row, cursor: number, showCursor: boolean,
   return nodes;
 }
 
-/** Max input rows drawn at once. A long multi-line paste (a spec, a stack trace, a design brief) wraps
- *  to hundreds/thousands of rows; rendering them ALL every keystroke floods ink's layout+diff and the
- *  box appears frozen ("卡着"). So we draw a bottom-anchored viewport (codex-style) around the cursor. */
-export const MAX_INPUT_ROWS = 14;
+/** Fixed composer viewport height. Growing the dynamic Ink region while typing makes earlier rows appear
+ * to run upward, and any terminal-side wrap outside Yoga corrupts repaint bookkeeping. Four rows keep the
+ * editor useful without moving the surrounding UI; longer drafts scroll inside this bounded viewport. */
+export const MAX_INPUT_ROWS = 4;
 
 /** The [first, last) slice of rows to render so the cursor stays visible without drawing the whole
  *  input. Bottom-anchored: when the cursor is at the end (typing), you see the last MAX rows; when
  *  editing mid-text, the cursor's row + a little context below stays on screen. Exported pure for tests. */
 export function windowRows(rowCount: number, cursorRow: number, max = MAX_INPUT_ROWS): { first: number; last: number } {
   if (rowCount <= max) return { first: 0, last: rowCount };
-  const last = Math.min(rowCount, Math.max(cursorRow + 2, max));
-  return { first: Math.max(0, last - max), last };
+  // The "more above/below" indicators consume viewport rows too. Iteratively reserve their slots so
+  // rendered content + indicators never exceeds `max` and the fixed-height parent never clips the cursor.
+  let budget = max;
+  let result = { first: 0, last: Math.min(rowCount, max) };
+  for (let i = 0; i < 4; i++) {
+    const last = Math.min(rowCount, Math.max(cursorRow + 2, budget));
+    result = { first: Math.max(0, last - budget), last };
+    const indicators = (result.first > 0 ? 1 : 0) + (result.last < rowCount ? 1 : 0);
+    const next = Math.max(1, max - indicators);
+    if (next === budget) break;
+    budget = next;
+  }
+  return result;
 }
 
 /** Index of the wrapped row that holds the cursor (last row if past the end). */
@@ -740,10 +773,12 @@ export function InputBox({
   const innerW = Math.max(1, w - 4);
   const cwdShort = footerCwd(cwd);
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" width={w}>
       <TopBorder name={status.sessionName || "session"} width={w} />
       <Box borderStyle="round" borderTop={false} borderColor="gray" borderDimColor paddingX={1} width={w}>
-        <InputLine value={value} cursor={cursor} width={innerW} gutter={gutter} gutterColor={gutterColor} placeholder={placeholder} />
+        <Box flexDirection="column" width={innerW} height={MAX_INPUT_ROWS} overflowY="hidden">
+          <InputLine value={value} cursor={cursor} width={innerW} gutter={gutter} gutterColor={gutterColor} placeholder={placeholder} />
+        </Box>
       </Box>
       {vim ? <Text dimColor>{mode === "normal" ? "  -- NORMAL --  i/a insert · h l 0 $ w b e move · x dd D cw p edit" : "  -- INSERT --  Esc → normal"}</Text> : null}
       <Footer model={model} s={status} cwdShort={cwdShort} route={route} />

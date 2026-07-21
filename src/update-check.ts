@@ -55,24 +55,32 @@ export function writeCache(c: UpdateCache, file = cacheFile()): void {
 /** The startup notice, decided purely from cache state (testable without I/O). */
 export function updateNotice(current: string, cache: UpdateCache | null): string | null {
   if (!cache || !isNewer(cache.latest, current)) return null;
-  return `Update available ${current} → ${cache.latest} · npm i -g @nanhara/hara`;
+  return `Update available ${current} → ${cache.latest} · run: hara update`;
+}
+
+/** Resolve the latest public version now. Explicit `hara update` awaits this; startup keeps using the
+ * cache-only path below so an offline registry can never delay the prompt. */
+export async function fetchLatestVersion(fetchFn: typeof fetch = fetch): Promise<string | null> {
+  for (const url of REGISTRIES) {
+    try {
+      const r = await fetchFn(url, { signal: AbortSignal.timeout(3000) });
+      if (!r.ok) continue;
+      const j = (await r.json()) as { version?: unknown };
+      if (typeof j?.version === "string" && /^\d+\.\d+\.\d+$/u.test(j.version)) return j.version;
+    } catch {
+      // A blocked registry is expected on some networks; try the next fixed endpoint.
+    }
+  }
+  return null;
 }
 
 /** Background probe: first registry that answers wins; 3s hard timeout each; silent on total failure
  *  (checkedAt still stamps so an offline machine backs off to daily retries, not every launch). */
 export async function refreshLatest(file = cacheFile(), fetchFn: typeof fetch = fetch): Promise<void> {
-  for (const url of REGISTRIES) {
-    try {
-      const r = await fetchFn(url, { signal: AbortSignal.timeout(3000) });
-      if (!r.ok) continue;
-      const j = (await r.json()) as { version?: string };
-      if (j?.version) {
-        writeCache({ checkedAt: Date.now(), latest: j.version }, file);
-        return;
-      }
-    } catch {
-      /* offline / blocked / slow → try the next registry, then give up quietly */
-    }
+  const latest = await fetchLatestVersion(fetchFn);
+  if (latest) {
+    writeCache({ checkedAt: Date.now(), latest }, file);
+    return;
   }
   const prev = readCache(file);
   writeCache({ checkedAt: Date.now(), latest: prev?.latest ?? "" }, file);

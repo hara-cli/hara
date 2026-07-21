@@ -5,8 +5,8 @@ import { isAbsolute, resolve, join, relative, sep } from "node:path";
 import { registerTool } from "./registry.js";
 import { searchAssetsAsync, assetSearchRoots } from "../recall.js";
 import { searchHybrid } from "../search/hybrid.js";
-import { memoryRoots, appendMemory, replaceMemory, forgetMemory, type Scope, type Target } from "../memory/store.js";
-import { scanMemory, redactSecrets, scrubLocal } from "../memory/guard.js";
+import { memoryRoots, appendMemory, appendMemoryOnce, forgetMemory, type Scope, type Target } from "../memory/store.js";
+import { scanMemory, redactSecrets, sanitizeMemoryForPrompt, scrubLocal } from "../memory/guard.js";
 import { globalSkillsDir, skillsDir, invalidateSkillsCache } from "../skills/skills.js";
 import { sensitiveFileError } from "../security/sensitive-files.js";
 import { readModelContextFileSync, readVerifiedRegularFileSnapshot } from "../fs-read.js";
@@ -17,7 +17,8 @@ export const MAX_SKILL_DESCRIPTION_CHARS = 500;
 export const MAX_SKILL_BODY_CHARS = 24_000;
 
 const asTarget = (v: unknown): Target => (["memory", "user", "log"].includes(v as string) ? (v as Target) : "memory");
-const asScope = (v: unknown): Scope => (v === "global" ? "global" : "project");
+const asScope = (v: unknown, target: Target): Scope =>
+  v === "global" ? "global" : v === "project" ? "project" : target === "user" ? "global" : "project";
 
 registerTool({
   name: "memory_search",
@@ -30,11 +31,26 @@ registerTool({
     required: ["query"],
   },
   kind: "read",
-  concurrencySafe: true,
+  // Keep recall attempts serial so the empty-result breaker can stop after the third call even if a model
+  // emits a large batch of paraphrased searches in one response.
+  concurrencySafe: false,
   async run(input, ctx) {
-    const hits = await searchHybrid(String(input.query ?? ""), ctx.cwd, { indexName: "memory", roots: memoryRoots(ctx.cwd), limit: Math.min(Number(input.limit) || 5, 10), signal: ctx.signal });
-    if (!hits.length) return "(no memory matches)";
-    return hits.map((h) => `${h.path} — ${h.title}\n${h.snippet}`).join("\n\n");
+    const query = String(input.query ?? "").trim();
+    if (!query) return "Error: memory_search requires a non-empty query.";
+    if (query.length > 512) return "Error: memory_search query is too long (maximum 512 characters).";
+    const limit = Math.max(1, Math.min(10, Math.floor(Number(input.limit) || 5)));
+    const hits = await searchHybrid(query, ctx.cwd, { indexName: "memory", roots: memoryRoots(ctx.cwd), limit, signal: ctx.signal });
+    const safeHits = hits
+      .map((hit) => ({
+        ...hit,
+        // Lexical search derives both fields from editable Markdown. Sanitize the heading as well as the
+        // excerpt so an unsafe first heading cannot bypass the memory load boundary as result metadata.
+        title: sanitizeMemoryForPrompt(hit.title).text.trim() || "memory",
+        snippet: sanitizeMemoryForPrompt(hit.snippet).text.trim(),
+      }))
+      .filter((hit) => hit.snippet);
+    if (!safeHits.length) return "(no memory matches)";
+    return safeHits.map((h) => `${h.path} — ${h.title}\n${h.snippet}`).join("\n\n");
   },
 });
 
@@ -54,7 +70,11 @@ registerTool({
     if (denied) return denied;
     if (!existsSync(p)) return `Error: no memory file at ${p}.`;
     try {
-      return readModelContextFileSync(p, 64 * 1024).slice(0, 50_000);
+      const raw = readModelContextFileSync(p, 64 * 1024).slice(0, 50_000);
+      const safe = sanitizeMemoryForPrompt(raw);
+      return safe.text.trim()
+        ? safe.text
+        : "Blocked: this memory file contains no content that is safe to load.";
     } catch (e: any) {
       return `Error: ${e.message}`;
     }
@@ -71,9 +91,8 @@ registerTool({
     type: "object",
     properties: {
       content: { type: "string" },
-      target: { type: "string", enum: ["memory", "user", "log"], description: "memory=durable facts, user=user prefs (global), log=today's note. default memory" },
-      scope: { type: "string", enum: ["project", "global"], description: "default project" },
-      mode: { type: "string", enum: ["append", "replace"], description: "default append" },
+      target: { type: "string", enum: ["memory", "user", "log"], description: "memory=durable facts, user=user prefs (global by default), log=today's note. default memory" },
+      scope: { type: "string", enum: ["project", "global"], description: "default global for target=user; project otherwise" },
     },
     required: ["content"],
   },
@@ -86,12 +105,18 @@ registerTool({
     }
     const scan = scanMemory(content);
     if (!scan.ok) return `Blocked: this looks unsafe to store (${scan.hits.join(", ")}). Rephrase without secrets/injection text.`;
-    const scope = asScope(input.scope);
     const target = asTarget(input.target);
-    const f = input.mode === "replace"
-      ? await replaceMemory(scope, target, content, ctx.cwd, ctx.signal)
-      : await appendMemory(scope, target, content, ctx.cwd, ctx.signal);
-    return `Saved to ${f}`;
+    const scope = asScope(input.scope, target);
+    if (input.mode === "replace") {
+      return "Blocked: memory_write cannot replace an entire memory file. Use memory_forget for the stale entry, then append the corrected fact.";
+    }
+    if (target === "log") {
+      const f = await appendMemory(scope, target, content, ctx.cwd, ctx.signal);
+      return `Saved to ${f}`;
+    }
+    const entry = content.replace(/\s+/g, " ").trim();
+    const result = await appendMemoryOnce(scope, target, entry, ctx.cwd, ctx.signal);
+    return result.appended ? `Saved to ${result.path}` : `Already remembered in ${result.path}`;
   },
 });
 
@@ -201,7 +226,8 @@ registerTool({
   },
   kind: "edit",
   async run(input, ctx) {
-    const n = await forgetMemory(asScope(input.scope), asTarget(input.target), String(input.match ?? ""), ctx.cwd, ctx.signal);
+    const target = asTarget(input.target);
+    const n = await forgetMemory(asScope(input.scope, target), target, String(input.match ?? ""), ctx.cwd, ctx.signal);
     return n ? `Removed ${n} line(s).` : "(no matching lines)";
   },
 });

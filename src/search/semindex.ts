@@ -19,6 +19,7 @@ import { zvecBuild, zvecQueryIds, zvecRemove } from "./zvec-store.js";
 import { isSensitiveFilePath } from "../security/sensitive-files.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
+import { sanitizeMemoryForPrompt } from "../memory/guard.js";
 import {
   ensurePrivateStateSubdirectory,
   readPrivateStateFileSnapshot,
@@ -130,6 +131,10 @@ function statMtime(p: string): number {
   } catch {
     return 0;
   }
+}
+
+function indexableText(text: string, source: string): string {
+  return source === "memory" ? sanitizeMemoryForPrompt(text).text : text;
 }
 
 /** Split a file into chunks: Markdown by `#` headings, code by ~40-line windows. Heuristic, zero-dep —
@@ -294,7 +299,8 @@ export function collectDirChunks(dir: string, source: string): Chunk[] {
     } catch {
       continue;
     }
-    chunks.push(...chunkText(text, abs, source, statMtime(abs)));
+    const safeText = indexableText(text, source);
+    if (safeText.trim()) chunks.push(...chunkText(safeText, abs, source, statMtime(abs)));
   }
   return chunks;
 }
@@ -349,7 +355,8 @@ async function chunksFromInventory(
     } catch {
       continue;
     }
-    chunks.push(...chunkText(text, absolutePaths ? abs : rel, source, statMtime(abs)));
+    const safeText = indexableText(text, source);
+    if (safeText.trim()) chunks.push(...chunkText(safeText, absolutePaths ? abs : rel, source, statMtime(abs)));
   }
   return { chunks, truncated: false };
 }
@@ -451,7 +458,7 @@ export async function queryIndex(name: string, query: string, embed: Embedder, c
     if (cached !== undefined) return cached;
     let fresh = false;
     try {
-      const text = readModelContextFileSync(path, 200_000);
+      const text = indexableText(readModelContextFileSync(path, 200_000), item.source);
       fresh = contentHash(chunkText(text, item.file, item.source)) === item.contentHash;
     } catch {
       fresh = false;

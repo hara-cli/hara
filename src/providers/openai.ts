@@ -62,9 +62,14 @@ export function toOpenAI(system: string, history: NeutralMsg[]): any[] {
         type: "function",
         function: { name: tu.name, arguments: JSON.stringify(tu.input ?? {}) },
       }));
+      // Some OpenAI-compatible providers (observed with DeepSeek) reject a historical assistant
+      // message whose content is null unless it also contains tool_calls. Empty model turns can exist in
+      // older persisted sessions, so omit that no-op history entry instead of serializing an invalid row.
+      // Keep content:null for real tool-call turns: that is the canonical Chat Completions shape.
+      if (!m.text.trim() && tool_calls.length === 0) continue;
       msgs.push({
         role: "assistant",
-        content: m.text || null,
+        content: m.text.trim() ? m.text : null,
         ...(tool_calls.length ? { tool_calls } : {}),
       });
     } else {

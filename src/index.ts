@@ -101,7 +101,14 @@ import {
 } from "./agent/compact.js";
 import { recentTouched, clearTouched } from "./agent/touched.js";
 import { INTERJECT_PREFIX, disposeReminderScope } from "./agent/reminders.js";
-import { checkForUpdate } from "./update-check.js";
+import { checkForUpdate, fetchLatestVersion, isNewer } from "./update-check.js";
+import {
+  inspectInstallation,
+  installationLabel,
+  manualUpdateInstruction,
+  upgradeNpmInstallation,
+  type InstallationInfo,
+} from "./update-install.js";
 import { formatContextReport } from "./agent/context-report.js";
 import { userTurnPreviews, rewindTo } from "./agent/rewind.js";
 import { checkpoint, listCheckpoints, restoreCheckpoint } from "./checkpoints.js";
@@ -164,6 +171,7 @@ import { qwenDeviceLogin, loadQwenToken } from "./providers/qwen-oauth.js";
 import { loadAgentContext, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import {
   homeWorkspaceActionError,
+  discoverProjectWorkspaces,
   isUnsafeProjectWorkspace,
   resolveWorkspaceSwitch,
   suggestedProjectWorkspace,
@@ -209,6 +217,10 @@ import {
   type TaskInteraction,
 } from "./session/task.js";
 import { displaySessionCwd, resolveSessionResumeTarget } from "./session/resume.js";
+import {
+  persistWorkspaceSessionFork,
+  recentWorkspaceTransferCandidate,
+} from "./session/transfer.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
 import { createPhysicalOperationDrain } from "./session/operation-drain.js";
 import { loadGlobalRoles, loadRoles, roleToolFilter, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
@@ -233,6 +245,7 @@ import "./tools/patch.js"; // register apply_patch
 import "./tools/web.js"; // register web_fetch
 import "./tools/agent.js"; // register agent (subagent spawn)
 import "./tools/memory.js"; // register memory_search/get/write/forget/skill_create
+import "./tools/session-search.js"; // register bounded cross-session transcript recall
 import "./tools/skill.js"; // register the skill loader tool
 import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
 import "./tools/todo.js"; // register todo_write (inline task checklist)
@@ -1379,6 +1392,63 @@ function roleMeta(role: Role): string {
   ].filter(Boolean).join(" · ");
 }
 
+const packageRoot = resolve(here, "..");
+
+function activeInstallation(): InstallationInfo {
+  return inspectInstallation(packageRoot, { buildVersion: process.env.HARA_BUILD_VERSION });
+}
+
+function shadowInstallLines(installation: InstallationInfo): string[] {
+  if (!installation.shadowCommands.length) return [];
+  return [
+    c.yellow(`⚠ ${installation.shadowCommands.length} other Hara command(s) are visible in PATH; switching Node or PATH can activate an older copy:`),
+    ...installation.shadowCommands.map((path) => `  ${c.dim(path)}`),
+  ];
+}
+
+async function runUpdateCommand(checkOnly: boolean): Promise<void> {
+  const installation = activeInstallation();
+  out(`${c.bold("hara update")}\n`);
+  out(`  current ${c.bold(pkg.version)} · ${c.bold(installationLabel(installation))} · ${c.dim(installation.launchPath)}\n`);
+  const latest = await fetchLatestVersion();
+  if (!latest) {
+    process.stderr.write("hara: could not reach the npm registry; no installation was changed.\n");
+    process.exitCode = 1;
+    return;
+  }
+  out(`  latest  ${c.bold(latest)}\n`);
+  for (const line of shadowInstallLines(installation)) out(line + "\n");
+  if (!isNewer(latest, pkg.version)) {
+    out(c.green(`✓ the active ${installationLabel(installation)} is up to date\n`));
+    if (installation.shadowCommands.length) {
+      out(c.yellow("  The PATH copies above are separate installations; this check did not execute or modify them.\n"));
+    }
+    return;
+  }
+  if (checkOnly) {
+    out(`  next    ${installation.kind === "npm" ? "run `hara update` without --check" : manualUpdateInstruction(installation)}\n`);
+    return;
+  }
+  if (installation.kind !== "npm") {
+    out(c.yellow("This installation cannot be replaced through npm.\n"));
+    out(`  ${manualUpdateInstruction(installation)}\n`);
+    process.exitCode = 2;
+    return;
+  }
+  try {
+    const result = upgradeNpmInstallation(installation, latest);
+    out(c.green(`✓ upgraded and verified ${result.packageRoot} at ${result.version}\n`));
+    out("  Restart Hara, then confirm with: hara --version\n");
+    if (installation.shadowCommands.length) {
+      out(c.yellow("  Only the active npm prefix was upgraded; the PATH copies listed above remain independent.\n"));
+    }
+  } catch (error) {
+    process.stderr.write(`hara: update failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write("No other Hara installation was modified. Run `hara doctor` to inspect active and shadow commands.\n");
+    process.exitCode = 1;
+  }
+}
+
 function runDoctor(cfg: HaraConfig): string {
   const ok = (b: boolean): string => (b ? c.green("✓") : c.red("✗"));
   const dot = c.dim("·");
@@ -1391,9 +1461,12 @@ function runDoctor(cfg: HaraConfig): string {
   const roles = loadRoles(cfg.cwd);
   const vcap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
   const vdesc = vcap === "vision" ? c.dim("sees images (inline)") : vcap === "text" ? c.dim("text-only") : c.yellow("capability unknown — asks on first image");
+  const installation = activeInstallation();
   const lines = [
     c.bold("hara doctor"),
     `${ok(nodeSupported)} node ${process.versions.node} ${c.dim(`(need ≥${MIN_NODE_VERSION})`)}`,
+    `${dot} install ${c.bold(installationLabel(installation))} · ${c.dim(installation.launchPath)}`,
+    ...shadowInstallLines(installation),
     `${dot} provider ${c.bold(cfg.provider)} · model ${c.bold(cfg.model)}${cfg.baseURL ? c.dim(" · " + cfg.baseURL) : ""}`,
     `${ok(authed)} auth ${providerIsLocal(cfg.provider) ? c.dim("not required (local endpoint)") : authed ? c.dim("configured") : c.yellow("missing — " + authHint(cfg))}`,
     `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
@@ -1432,6 +1505,16 @@ function helpText(commands: Slash[]): string {
   const lines = commands.map((cmd) => `  /${cmd.name.padEnd(13)} ${c.dim(cmd.desc)}`);
   return c.bold("Commands:\n") + lines.join("\n") + "\n" + c.dim("  @path          attach a file's contents (Tab to complete)\n");
 }
+
+// Commander applies --cwd in a preAction hook. Retain the shell's launch directory so an interactive
+// cross-workspace launch can offer to carry a very recent conversation instead of silently starting blank.
+const invocationCwd = (() => {
+  try {
+    return realpathSync.native(process.cwd());
+  } catch {
+    return resolve(process.cwd());
+  }
+})();
 
 const program = new Command();
 program
@@ -1784,8 +1867,15 @@ program
 
 program
   .command("doctor")
-  .description("check your hara setup (provider / auth / model / node / assets / roles)")
+  .description("check your hara setup (install / provider / auth / model / node / assets / roles)")
   .action(() => out(runDoctor(loadConfig()) + "\n"));
+
+program
+  .command("update")
+  .alias("upgrade")
+  .description("update the active Hara installation and verify the resulting version")
+  .option("--check", "check the latest version and installation source without changing anything")
+  .action(async (opts: { check?: boolean }) => runUpdateCommand(opts.check === true));
 
 program
   .command("setup")
@@ -3154,6 +3244,7 @@ config
 
 // default action (interactive REPL / one-shot)
 program.action(async (opts) => {
+  let startupWorkspaceTransferId: string | undefined;
   // Identity-profile selection (--profile flag) is now handled by the program-level preAction
   // hook above — see setFlagOverride() + resolveActive() in profile.ts. activeId() / loadActiveProfile()
   // pick it up automatically. `HARA_PROFILE` env still works as a transient override (one slot lower
@@ -3174,10 +3265,15 @@ program.action(async (opts) => {
       const recent = listSessions()
         .filter((session) => session.source === undefined || session.source === "interactive")
         .map((session) => session.cwd);
-      candidate = suggestedProjectWorkspace([
-        ...recent,
-        ...loadProjects().map((project) => project.path),
-      ]);
+      candidate = suggestedProjectWorkspace(recent);
+      if (!candidate) {
+        // Sessions launched from Home contain no usable project signal. Prefer bounded, marker-backed
+        // discovery under conventional project containers; old registrations remain a final fallback.
+        candidate = suggestedProjectWorkspace([
+          ...discoverProjectWorkspaces(),
+          ...loadProjects().map((project) => project.path),
+        ]);
+      }
     } catch {
       // A damaged optional history/registry must not weaken the Home boundary or block startup.
     }
@@ -3220,6 +3316,61 @@ program.action(async (opts) => {
         }
       } finally {
         rl.close();
+      }
+    }
+  }
+  // `hara --cwd …` is often the user's response to the protected-Home guidance. In an interactive
+  // terminal, offer to fork a very recent source-directory thread into the selected workspace. The old
+  // session stays intact, and headless/scripted launches keep their established non-interactive behavior.
+  if (
+    !opts.print
+    && opts.cwd
+    && !opts.resume
+    && !opts.continue
+    && stdin.isTTY
+    && stdout.isTTY
+  ) {
+    let candidate: SessionData | null = null;
+    try {
+      candidate = recentWorkspaceTransferCandidate(invocationCwd, process.cwd());
+    } catch {
+      // Optional continuity discovery must never make an explicit --cwd unusable.
+    }
+    if (candidate) {
+      const question =
+        `Continue recent session ${shortId(candidate.meta.id)} from ${displaySessionCwd(candidate.meta.cwd)} `
+        + `with its current context in ${displaySessionCwd(process.cwd())}?`;
+      let transfer = false;
+      if (process.env.HARA_TUI !== "0") {
+        transfer = await askConfirm(question);
+      } else {
+        const prompt = createInterface({ input: stdin, output: stdout });
+        try {
+          const answer = (await prompt.question(c.yellow(question) + c.dim(" [Y/n] "))).trim().toLowerCase();
+          transfer = answer === "" || answer === "y" || answer === "yes";
+        } finally {
+          prompt.close();
+        }
+      }
+      if (transfer) {
+        try {
+          const fork = persistWorkspaceSessionFork(candidate, process.cwd());
+          startupWorkspaceTransferId = fork.meta.id;
+          out(c.green(
+            `Continuing ${shortId(candidate.meta.id)} as ${shortId(fork.meta.id)} in ${displaySessionCwd(fork.meta.cwd)}; `
+            + "the original session remains saved.\n",
+          ));
+        } catch (error) {
+          out(c.red(`Could not carry the recent session into ${displaySessionCwd(process.cwd())}: ${error instanceof Error ? error.message : String(error)}.\n`));
+          out(c.dim(`The original session ${shortId(candidate.meta.id)} is unchanged; no blank replacement was started.\n`));
+          process.exitCode = 2;
+          return;
+        }
+      } else {
+        out(c.dim(
+          `Starting a fresh session in ${displaySessionCwd(process.cwd())}; `
+          + `the previous session ${shortId(candidate.meta.id)} remains saved.\n`,
+        ));
       }
     }
   }
@@ -3616,6 +3767,7 @@ program.action(async (opts) => {
       ctx: {
         cwd,
         sandbox,
+        ...(meta ? { sessionId: meta.id } : {}),
         spawn: (t: string, role?: string, signal?: AbortSignal) => runSubagent(
           cfg,
           headlessProvider,
@@ -3805,7 +3957,9 @@ program.action(async (opts) => {
 
   // session: --resume <id> / --continue (latest in this cwd) / new
   let resumeId: string | null = null;
-  if (opts.resume) {
+  if (startupWorkspaceTransferId) {
+    resumeId = startupWorkspaceTransferId;
+  } else if (opts.resume) {
     const rid = resolveSessionId(opts.resume); // accept a full UUID or a unique prefix (short id)
     resumeId = rid;
     if (!resumeId) out(c.yellow(`(no session '${opts.resume}'; starting fresh)\n`));
@@ -3903,7 +4057,21 @@ program.action(async (opts) => {
       }
     : undefined;
   let requestedWorkspaceSwitch: string | null = null;
-  let requestedSessionSwitch: { id: string; cwd: string } | null = null;
+  let requestedSessionSwitch: { id: string; cwd: string; kind: "resume" | "workspace-transfer"; historyCount?: number } | null = null;
+  const queueWorkspaceSwitch = (target: string): string => {
+    if (history.length === 0) {
+      requestedWorkspaceSwitch = target;
+      return `(switching workspace → ${target})`;
+    }
+    const fork = persistWorkspaceSessionFork({ meta, history, ...(task ? { task } : {}) }, target);
+    requestedSessionSwitch = {
+      id: fork.meta.id,
+      cwd: fork.meta.cwd,
+      kind: "workspace-transfer",
+      historyCount: history.length,
+    };
+    return `(switching workspace with ${history.length} messages of current context → ${fork.meta.cwd}; original session stays saved)`;
+  };
   const relaunchRequestedTarget = async (): Promise<void> => {
     if (!requestedWorkspaceSwitch && !requestedSessionSwitch) return;
     const sessionSwitch = requestedSessionSwitch;
@@ -3921,9 +4089,11 @@ program.action(async (opts) => {
     else if (opts.approval) args.push("--approval", String(opts.approval));
     if (opts.sandbox) args.push("--sandbox", String(opts.sandbox));
     if (sessionSwitch) args.push("--resume", sessionSwitch.id);
-    out(c.dim(sessionSwitch
-      ? `Resuming session ${shortId(sessionSwitch.id)} → ${displaySessionCwd(target)}\n`
-      : `Switching workspace → ${target}\n`));
+    out(c.dim(sessionSwitch?.kind === "workspace-transfer"
+      ? `Continuing current context as session ${shortId(sessionSwitch.id)} → ${displaySessionCwd(target)}\n`
+      : sessionSwitch
+        ? `Resuming session ${shortId(sessionSwitch.id)} → ${displaySessionCwd(target)}\n`
+        : `Switching workspace → ${target}\n`));
     try {
       const result = await runSelfAttached(args, target);
       if (result.signal) {
@@ -3987,8 +4157,12 @@ program.action(async (opts) => {
         const result = resolveWorkspaceSwitch(a, cwd);
         if (!result.ok) return void out(c.red(`(${result.error})\n`));
         if (result.cwd === realpathSync.native(cwd)) return void out(c.dim(`(already in ${result.cwd})\n`));
-        requestedWorkspaceSwitch = result.cwd;
-        return "exit";
+        try {
+          out(c.dim(queueWorkspaceSwitch(result.cwd) + "\n"));
+          return "exit";
+        } catch (error) {
+          return void out(c.red(`(could not switch workspace without losing context: ${error instanceof Error ? error.message : String(error)})\n`));
+        }
       },
     },
     {
@@ -4016,7 +4190,7 @@ program.action(async (opts) => {
           return void out(c.red(`(cannot resume '${a.trim()}': ${target.reason})\n`));
         }
         if (target.id === sessionId) return void out(c.dim("(this session is already open)\n"));
-        requestedSessionSwitch = { id: target.id, cwd: target.cwd };
+        requestedSessionSwitch = { id: target.id, cwd: target.cwd, kind: "resume" };
         return "exit";
       },
     },
@@ -4572,9 +4746,12 @@ program.action(async (opts) => {
             const result = resolveWorkspaceSwitch(arg, cwd);
             if (!result.ok) return void h.sink.notice(`(${result.error})`);
             if (result.cwd === realpathSync.native(cwd)) return void h.sink.notice(`(already in ${result.cwd})`);
-            requestedWorkspaceSwitch = result.cwd;
-            h.sink.notice(`(switching workspace → ${result.cwd})`);
-            return void h.exit();
+            try {
+              h.sink.notice(queueWorkspaceSwitch(result.cwd));
+              return void h.exit();
+            } catch (error) {
+              return void h.sink.notice(`(could not switch workspace without losing context: ${error instanceof Error ? error.message : String(error)})`);
+            }
           }
           if (nm === "resume") {
             if (!arg) {
@@ -4589,7 +4766,7 @@ program.action(async (opts) => {
               return void h.sink.notice(`(cannot resume '${arg}': ${target.reason})`);
             }
             if (target.id === sessionId) return void h.sink.notice("(this session is already open)");
-            requestedSessionSwitch = { id: target.id, cwd: target.cwd };
+            requestedSessionSwitch = { id: target.id, cwd: target.cwd, kind: "resume" };
             h.sink.notice(`(resuming ${shortId(target.id)} → ${displaySessionCwd(target.cwd)})`);
             return void h.exit();
           }
@@ -4887,7 +5064,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -4968,10 +5145,10 @@ program.action(async (opts) => {
           };
           let planOutcome = await runAgent(history, {
             provider,
-            ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+            ctx: { cwd, sandbox, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
             approval: "suggest",
             confirm: h.confirm,
-            toolFilter: (n) => READONLY_TOOLS.has(n),
+            toolFilter: (n) => READONLY_TOOLS.has(n) || n === "memory_search" || n === "memory_get" || n === "session_search",
             hooks: false,
             extraTools: [exitPlanTool],
             systemOverride: PLAN_SYSTEM,
@@ -5025,7 +5202,7 @@ program.action(async (opts) => {
             const xout = stats.output;
             planOutcome = await runAgent(history, {
               provider,
-              ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+              ctx: { cwd, sandbox, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
               approval: choice as ApprovalMode,
               memory: buildMemory(),
               confirm: h.confirm,
@@ -5067,7 +5244,7 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         const turnOutcome = await runAgent(history, {
           provider,
-          ctx: { cwd, sandbox, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+          ctx: { cwd, sandbox, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
           approval: appr,
           memory: buildMemory(),
           confirm: h.confirm,
@@ -5165,7 +5342,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -5227,7 +5404,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

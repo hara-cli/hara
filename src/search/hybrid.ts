@@ -28,10 +28,17 @@ export async function searchHybrid(
 
   const out: Recalled[] = [];
   const seen = new Set<string>();
+  const lexicalByPath = new Map(lex.map((hit) => [hit.path, hit]));
   for (const s of sem) {
     if (s.score < 0.2 || seen.has(s.file)) continue;
     seen.add(s.file);
-    out.push({ path: s.file, title: titleOf(s.text, s.file), snippet: s.text.slice(0, 800), score: s.score });
+    const exactLexical = lexicalByPath.get(s.file);
+    // If the same file has a literal hit, keep its match-centered live snippet. The semantic cache may
+    // correctly choose MEMORY.md yet point at a different heading/chunk, hiding the exact fact the user
+    // searched for. Semantic ranking still chooses the file; lexical evidence chooses the excerpt.
+    out.push(exactLexical
+      ? { ...exactLexical, score: Math.max(exactLexical.score, s.score) }
+      : { path: s.file, title: titleOf(s.text, s.file), snippet: s.text.slice(0, 800), score: s.score });
   }
   for (const h of lex) {
     if (out.length >= limit) break;

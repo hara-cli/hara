@@ -596,7 +596,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     text: string,
     images?: { path: string; mediaType: string }[],
     forceNewTask = false,
-  ): Promise<{ reply: string; usage: { input: number; output: number }; ctx: { lastInput: number; window: number; pct: number }; taskId: string; turnId: string }> => {
+  ): Promise<{
+    reply: string;
+    usage: { input: number; output: number };
+    ctx: { lastInput: number; window: number; pct: number };
+    taskId: string;
+    turnId: string;
+    status?: "paused";
+    stopReason?: "deadline";
+  }> => {
     const sessionId = s.meta.id;
     s.busy = true;
     const turnAbort = new AbortController();
@@ -747,6 +755,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           cwd: s.meta.cwd,
           sandbox: deps.sandbox,
           todoScope: sessionId,
+          sessionId,
           spawn: (t, role, signal) => deps.spawnSubagent(
             s.provider,
             s.meta.cwd,
@@ -812,6 +821,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           : outcome.status === "halted"
             ? "agent turn halted by a safety control"
             : "agent turn failed");
+        if (outcome.status === "halted" && outcome.stopReason === "deadline") {
+          // An active-execution deadline is a successful, recoverable checkpoint transition. The typed
+          // task event already says `paused`; returning a normal RPC result keeps Desktop and other Serve
+          // clients from rendering the same state as `error:` while still exposing the focused /continue
+          // guidance to request/response-only clients. Other safety halts remain explicit failures.
+          broadcast("event.turn_end", {
+            sessionId,
+            taskId: s.task!.id,
+            turnId: s.task!.turnId,
+            reply: "",
+            status: "paused",
+            stopReason: "deadline",
+            usage,
+            ctx,
+          });
+          return {
+            reply: failure,
+            usage,
+            ctx,
+            taskId: s.task!.id,
+            turnId: s.task!.turnId,
+            status: "paused",
+            stopReason: "deadline",
+          };
+        }
         broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply: "", error: failure, status: outcome.status, usage, ctx });
         throw new Error(failure);
       }

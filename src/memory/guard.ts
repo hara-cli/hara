@@ -42,6 +42,32 @@ export function redactSecrets(text: string): { text: string; redactions: string[
   return { text: out, redactions };
 }
 
+/** Safe load boundary for editable/synced legacy memory. Agent writes are checked on capture, but a user,
+ * older Hara version, or sync process can still change Markdown later. Redact secret-shaped values, remove
+ * injection/exfil lines, and fail closed if a cross-line pattern remains after filtering. */
+export function sanitizeMemoryForPrompt(text: string): {
+  text: string;
+  redactions: string[];
+  blockedLines: number;
+  blocked: boolean;
+} {
+  const redacted = redactSecrets(text);
+  if (scanMemory(redacted.text).ok) {
+    return { text: redacted.text, redactions: redacted.redactions, blockedLines: 0, blocked: false };
+  }
+  let blockedLines = 0;
+  const safeLines = redacted.text.split("\n").filter((line) => {
+    if (scanMemory(line).ok) return true;
+    blockedLines += 1;
+    return false;
+  });
+  const safe = safeLines.join("\n");
+  if (!scanMemory(safe).ok) {
+    return { text: "", redactions: redacted.redactions, blockedLines, blocked: true };
+  }
+  return { text: safe, redactions: redacted.redactions, blockedLines, blocked: blockedLines > 0 };
+}
+
 /** Deterministically generalize local identifiers so a captured snippet isn't tied to this machine:
  *  the project path → <project>, the home dir → ~, and email addresses → <email>. Light + reversible. */
 export function scrubLocal(text: string, cwd: string): string {
