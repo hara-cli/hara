@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -13,6 +13,18 @@ async function waitForPath(path, timeoutMs = 5_000) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for child readiness: ${path}`);
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+async function waitForValidPid(path, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      const pid = Number(readFileSync(path, "utf8").trim());
+      if (Number.isSafeInteger(pid) && pid > 0) return pid;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for a valid child pid: ${path}`);
 }
 
 const processAlive = (pid) => {
@@ -178,29 +190,41 @@ test("runHara still force-kills a quiet TERM-resistant grandchild after its dire
 test("approved org timeout force-kills a quiet TERM-resistant grandchild after its direct child closes", { skip: process.platform === "win32" }, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "hara-approved-org-tree-"));
   const helper = join(cwd, "org-tree.mjs");
+  const pidFile = join(cwd, "grandchild.pid");
   writeFileSync(helper, `
 import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
 const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], {
   stdio: "ignore",
 });
 grandchild.unref();
+writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid));
 console.log("grandchild:" + grandchild.pid);
 setInterval(() => {}, 1000);
 `);
   let pid = 0;
+  let running;
   try {
     const started = Date.now();
-    const result = await runApprovedOrgProcess(process.execPath, [helper], {
+    running = runApprovedOrgProcess(process.execPath, [helper], {
       cwd,
-      timeoutMs: 250,
+      timeoutMs: 5_000,
       killGraceMs: 50,
     });
-    pid = Number(/grandchild:(\d+)/.exec(result.output)?.[1]);
+    // Wait until the fixture proves the resistant grandchild exists. A 250ms timeout could expire before
+    // Intel release runners scheduled Node, producing empty output without exercising tree termination.
+    pid = await waitForValidPid(pidFile, 4_000);
+    const result = await running;
     assert.equal(result.stopReason, "timeout");
     assert.ok(Number.isSafeInteger(pid) && pid > 0, result.output);
-    assert.ok(Date.now() - started < 1_500, "quiet descendants cannot extend an approved-org timeout indefinitely");
+    assert.ok(Date.now() - started < 8_000, "quiet descendants cannot extend an approved-org timeout indefinitely");
     await assertProcessGone(pid, "approved-org quiet grandchild");
   } finally {
+    if (running) await running.catch(() => undefined);
+    if ((!Number.isSafeInteger(pid) || pid <= 0) && existsSync(pidFile)) {
+      const candidate = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isSafeInteger(candidate) && candidate > 0) pid = candidate;
+    }
     if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) {
       try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
     }

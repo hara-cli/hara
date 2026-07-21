@@ -5,17 +5,26 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.132.1 — 2026-07-22 — stable native release gates
+## 0.132.2 — 2026-07-22 — complete bounded native release gates
+
+- The remaining approved-org process-tree and TUI confirmation tests now wait for concrete PID/render
+  readiness before starting their decisive assertion, and always clean up mounted Ink apps after a failure.
+  This closes the last Intel macOS release-runner races without weakening runtime timeouts or child cleanup.
+- This patch is the standalone/Desktop release carrier for the observable gateway status, scoped web proxy,
+  complete config redaction, and user-managed organization connection features introduced in 0.132.0.
+  Upgrade with `npm i -g @nanhara/hara@0.132.2`.
+
+## 0.132.1 — 2026-07-22 — bounded native release-gate waits (npm published; native assets withheld)
 
 - Native release tests now wait for observable child-process and terminal-render handshakes within explicit
   upper bounds instead of assuming fixed startup delays. This removes an Intel macOS runner race that could
   read fixture state before Node or Ink had started while preserving the timeout, process-tree cleanup, MCP
   diagnostic-boundary, and command-history assertions.
-- This patch carries the observable gateway status, scoped web proxy, full config redaction, and
-  user-managed organization connection features introduced in 0.132.0 into the verified standalone and
-  Desktop release train. Upgrade with `npm i -g @nanhara/hara@0.132.1`.
+- The npm package carries the observable gateway status, scoped web proxy, full config redaction, and
+  user-managed organization connection features introduced in 0.132.0. Its native asset release remained
+  withheld after two further Intel-only test synchronization failures; upgrade to 0.132.2 instead.
 
-## 0.132.0 — 2026-07-22 — observable chat gateways and scoped web proxies
+## 0.132.0 — 2026-07-22 — observable chat gateways and scoped web proxies (npm published; native assets withheld)
 
 - `hara gateway status --platform <name>` now reports redacted credential readability, the live
   credential-scoped lease/PID, transport state, start time, last connection/poll/message, bounded error code,

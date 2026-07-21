@@ -7,6 +7,14 @@ import { setTurnPhase } from "../dist/agent/phase.js";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 70) => new Promise((r) => setTimeout(r, ms));
+const waitUntil = async (predicate, message, timeoutMs = 3_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await tick(10);
+  }
+  assert.fail(message);
+};
 const status = { sessionName: "demo", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
 
 test("composer routing distinguishes control work from executable task work", () => {
@@ -223,17 +231,20 @@ test("App shows a tool-approval confirm and resolves on 'y'", async () => {
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  stdin.write("clean");
-  await tick();
-  stdin.write("\r");
-  await tick();
-  assert.ok(strip(lastFrame()).includes("rm -rf build"), "confirm question shown");
-  assert.ok(strip(lastFrame()).includes("Type a task"), "input box stays visible during confirm (not hidden)");
-  stdin.write("y");
-  await tick(80);
-  assert.equal(granted, true, "confirm resolved true on y");
-  unmount();
+  try {
+    stdin.write("clean");
+    await waitUntil(() => strip(lastFrame()).includes("clean"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(
+      () => strip(lastFrame()).includes("rm -rf build") && strip(lastFrame()).includes("Type a task"),
+      "confirmation did not mount while keeping the input visible",
+    );
+    stdin.write("y");
+    await waitUntil(() => granted !== null, "confirmation did not resolve after y");
+    assert.equal(granted, true, "confirm resolved true on y");
+  } finally {
+    unmount();
+  }
 });
 
 test("App confirm is a selectable list: ↓ then Enter picks 'don't ask again' → always", async () => {
