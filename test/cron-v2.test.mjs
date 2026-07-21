@@ -132,6 +132,7 @@ test("command mode enforces a timeout and caps a single run's log", { skip: proc
     const processDir = mkdtempSync(join(tmpdir(), "hara-cron-tree-"));
     const pidFile = join(processDir, "grandchild.pid");
     let grandchildPid;
+    let treeRun;
     try {
       const script = [
         'const { spawn } = require("node:child_process")',
@@ -148,10 +149,22 @@ test("command mode enforces a timeout and caps a single run's log", { skip: proc
         cwd: processDir,
         createdAt: Date.now(),
       });
-      const treeResult = await runJobOnce(tree, { timeoutMs: 150 });
+      // Prove that the grandchild exists before the runner's deadline expires. A 150ms fixed deadline
+      // raced process startup on loaded Intel macOS release runners and could make the PID assertion fail
+      // without exercising process-group termination at all.
+      treeRun = runJobOnce(tree, { timeoutMs: 3_000 });
+      const startDeadline = Date.now() + 2_000;
+      while (!grandchildPid && Date.now() < startDeadline) {
+        if (existsSync(pidFile)) {
+          const candidate = Number(readFileSync(pidFile, "utf8").trim());
+          if (Number.isSafeInteger(candidate) && candidate > 0) grandchildPid = candidate;
+        }
+        if (!grandchildPid) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(grandchildPid, "fixture grandchild published a valid pid before the bounded timeout");
+      const treeResult = await treeRun;
       assert.equal(treeResult.ok, false);
       assert.match(treeResult.error, /timed out/);
-      grandchildPid = Number(readFileSync(pidFile, "utf8"));
       const deadline = Date.now() + 2_000;
       for (;;) {
         try {
@@ -164,6 +177,11 @@ test("command mode enforces a timeout and caps a single run's log", { skip: proc
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
     } finally {
+      if (treeRun) await treeRun.catch(() => undefined);
+      if (!grandchildPid && existsSync(pidFile)) {
+        const candidate = Number(readFileSync(pidFile, "utf8").trim());
+        if (Number.isSafeInteger(candidate) && candidate > 0) grandchildPid = candidate;
+      }
       if (grandchildPid) try { process.kill(grandchildPid, "SIGKILL"); } catch {}
       rmSync(processDir, { recursive: true, force: true });
     }

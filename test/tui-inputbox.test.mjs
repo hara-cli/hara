@@ -9,6 +9,14 @@ import { join } from "node:path";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
+const waitUntil = async (predicate, message, timeoutMs = 3_000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await tick(10);
+  }
+  assert.fail(message);
+};
 const cwd = process.cwd();
 const S = { sessionName: "s", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
 
@@ -68,23 +76,33 @@ test("InputBox: Up/Down recalls submissions and restores the unsent draft", asyn
   const { lastFrame, stdin, unmount } = render(
     React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => submitted.push(v) }),
   );
-  stdin.write("first command");
-  await tick();
-  stdin.write("\r");
-  await tick();
-  stdin.write("unfinished draft");
-  await tick();
+  try {
+    stdin.write("first command");
+    await waitUntil(() => strip(lastFrame()).includes("first command"), "first command was not rendered");
+    stdin.write("\r");
+    await waitUntil(
+      () => submitted.length === 1 && !strip(lastFrame()).includes("first command"),
+      "first submission did not commit and clear the composer",
+    );
+    stdin.write("unfinished draft");
+    await waitUntil(() => strip(lastFrame()).includes("unfinished draft"), "draft was not rendered");
 
-  stdin.write("\x1b[A");
-  await tick();
-  assert.ok(strip(lastFrame()).includes("first command"), "Up recalls the last submission");
-  stdin.write("\x1b[B");
-  await tick();
-  assert.ok(strip(lastFrame()).includes("unfinished draft"), "Down past newest restores the draft");
-  stdin.write("\r");
-  await tick();
-  assert.deepEqual(submitted, ["first command", "unfinished draft"]);
-  unmount();
+    stdin.write("\x1b[A");
+    await waitUntil(
+      () => strip(lastFrame()).includes("first command") && !strip(lastFrame()).includes("unfinished draft"),
+      "Up did not recall the last submission",
+    );
+    stdin.write("\x1b[B");
+    await waitUntil(
+      () => strip(lastFrame()).includes("unfinished draft") && !strip(lastFrame()).includes("first command"),
+      "Down past newest did not restore the draft",
+    );
+    stdin.write("\r");
+    await waitUntil(() => submitted.length === 2, "restored draft was not submitted");
+    assert.deepEqual(submitted, ["first command", "unfinished draft"]);
+  } finally {
+    unmount();
+  }
 });
 
 test("InputBox: Backspace removes a whole emoji grapheme and Ctrl+W removes a word", async () => {

@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.132.1 — 2026-07-22 — stable native release gates
+
+- Native release tests now wait for observable child-process and terminal-render handshakes within explicit
+  upper bounds instead of assuming fixed startup delays. This removes an Intel macOS runner race that could
+  read fixture state before Node or Ink had started while preserving the timeout, process-tree cleanup, MCP
+  diagnostic-boundary, and command-history assertions.
+- This patch carries the observable gateway status, scoped web proxy, full config redaction, and
+  user-managed organization connection features introduced in 0.132.0 into the verified standalone and
+  Desktop release train. Upgrade with `npm i -g @nanhara/hara@0.132.1`.
+
 ## 0.132.0 — 2026-07-22 — observable chat gateways and scoped web proxies
 
 - `hara gateway status --platform <name>` now reports redacted credential readability, the live

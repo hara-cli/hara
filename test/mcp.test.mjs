@@ -10,6 +10,18 @@ import { getTool } from "../dist/tools/registry.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const fixture = join(here, "fixtures", "mcp-echo-server.mjs");
 
+async function waitForValidPid(path, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      const pid = Number(readFileSync(path, "utf8").trim());
+      if (Number.isSafeInteger(pid) && pid > 0) return pid;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return null;
+}
+
 test("mcp: configured servers stay stopped until the selected server is requested", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-mcp-lazy-"));
   const browserPid = join(dir, "browser.pid");
@@ -183,7 +195,7 @@ test("mcp: cancelling the owning turn aborts lazy startup and closes its child",
   }
 });
 
-test("mcp: connect and listTools time out boundedly, close the child, and bound stderr", { timeout: 4000 }, async () => {
+test("mcp: connect and listTools time out boundedly, close the child, and bound stderr", { timeout: 15_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-mcp-timeout-"));
   const previousAllow = process.env.HARA_ALLOW_TRUSTED_EXTENSIONS;
   delete process.env.HARA_ALLOW_TRUSTED_EXTENSIONS;
@@ -199,20 +211,23 @@ test("mcp: connect and listTools time out boundedly, close the child, and bound 
         }),
       };
       const started = Date.now();
-      const count = await connectMcpServers(
+      const connecting = connectMcpServers(
         { [`hang-${stage}`]: { command: process.execPath, args: [fixture], env } },
         (message) => logs.push(message),
-        { approved: true, timeoutMs: 500 },
+        { approved: true, timeoutMs: 2_500 },
       );
+      // Observe fixture startup independently from the operation timeout. Reading the PID immediately after
+      // a short fixed timeout raced Node startup on loaded Intel release runners and produced ENOENT instead
+      // of testing cleanup for a child that had actually started.
+      const [count, pid] = await Promise.all([connecting, waitForValidPid(pidFile, 2_000)]);
       const elapsed = Date.now() - started;
 
       assert.equal(count, 0);
-      assert.ok(elapsed < 2000, `${stage} timeout should return promptly (actual ${elapsed}ms)`);
+      assert.ok(elapsed < 6_000, `${stage} timeout should return promptly (actual ${elapsed}ms)`);
       assert.match(logs.join("\n"), new RegExp(`failed during ${stage === "connect" ? "connect" : "list tools"}.*timed out`, "i"));
       assert.ok(logs.join("\n").length < 2_000, "stderr diagnostics remain strictly bounded");
       if (stage === "list") assert.match(logs.join("\n"), /oversized diagnostic line omitted/i);
 
-      const pid = Number(readFileSync(pidFile, "utf8").trim());
       assert.ok(Number.isSafeInteger(pid) && pid > 0, `${stage} fixture recorded a child pid`);
       let alive = true;
       for (let attempt = 0; attempt < 20 && alive; attempt++) {
