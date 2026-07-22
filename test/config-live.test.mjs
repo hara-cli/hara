@@ -49,6 +49,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
       routeModel: "route-model",
       routeBaseURL: "https://route.example/v1",
       proxy: "http://127.0.0.1:7890",
+      packageRegistry: "https://packages.example/repository/npm/",
       runTimeoutMs: "45m",
       maxAgentRounds: "96",
     }),
@@ -127,6 +128,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
     assert.equal(cfg.routeModel, "route-model");
     assert.equal(cfg.routeBaseURL, "https://route.example/v1");
     assert.equal(cfg.proxy, "http://127.0.0.1:7890");
+    assert.equal(cfg.packageRegistry, "https://packages.example/repository/npm/");
     assert.equal(cfg.runTimeoutMs, 45 * 60_000);
     assert.equal(cfg.maxAgentRounds, 96);
   } finally {

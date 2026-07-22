@@ -14,6 +14,8 @@ import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
 import { sensitiveFileError, sensitiveShellCommandReason } from "../security/sensitive-files.js";
 import { createToolOutputLineRedactor, redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { isReadOnlyCommand, splitCompound } from "../security/permissions.js";
+import { loadConfig } from "../config.js";
+import { commandHasPackageRegistry, normalizePackageRegistry, packageRegistryEnv } from "../package-registry.js";
 import {
   hostsInCommand,
   isNetworkGitOp,
@@ -276,6 +278,7 @@ registerTool({
       command: { type: "string" },
       timeout_ms: { type: "number", description: "default 300000 (5 min), or 900000 (15 min) for package installs; bounded to 1s..1h" },
       background: { type: "boolean", description: "run as a background job (dev server, watcher, long task); package installs stay foreground unless explicitly requested" },
+      registry: { type: "string", description: "for package installs only: npmjs, npmmirror, or an HTTP(S) registry URL; injected as environment, never shell text" },
     },
     required: ["command"],
   },
@@ -296,6 +299,24 @@ registerTool({
     if (input.background !== undefined && typeof input.background !== "boolean") {
       return "Error: `background` must be a boolean (true or false), not a string or another truthy value.";
     }
+    const packageInstall = isPackageInstallCommand(String(input.command ?? ""));
+    if (input.registry !== undefined && typeof input.registry !== "string") {
+      return "Error: `registry` must be a string such as npmmirror or https://registry.npmjs.org/.";
+    }
+    if (input.registry !== undefined && !packageInstall) {
+      return "Error: `registry` applies only to npm/pnpm/yarn/bun install commands.";
+    }
+    if (input.registry !== undefined && commandHasPackageRegistry(String(input.command ?? ""))) {
+      return "Error: choose one package-registry control: remove either bash.registry or the command's --registry argument.";
+    }
+    let registry: string | undefined;
+    if (packageInstall && !commandHasPackageRegistry(String(input.command ?? ""))) {
+      try {
+        registry = normalizePackageRegistry(input.registry ?? loadConfig({ cwd: ctx.cwd }).packageRegistry);
+      } catch (error: any) {
+        return `Error: invalid package registry: ${error?.message ?? "unsupported value"}. Nothing executed.`;
+      }
+    }
     const protectedReason = sensitiveShellCommandReason(String(input.command ?? ""), ctx.cwd);
     if (protectedReason) {
       return (
@@ -310,9 +331,11 @@ registerTool({
       );
     }
     if (input.background) {
-      const id = startJob(input.command, ctx.cwd, ctx.sandbox ?? "off");
+      const id = startJob(input.command, ctx.cwd, ctx.sandbox ?? "off", registry ? packageRegistryEnv(registry) : {});
       const safeCommand = redactToolSubprocessOutput(String(input.command));
-      return `Started background job ${id}: \`${safeCommand}\`. Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all. Poll until it exits before running steps that depend on it.`;
+      return `Started background job ${id}: \`${safeCommand}\`.` +
+        (registry ? " Explicit package registry override applied." : "") +
+        ` Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all. Poll until it exits before running steps that depend on it.`;
     }
     // Network fault tolerance — short-circuit if this command targets a host already found unreachable this
     // session, so a repeat doesn't burn another ~75s OS connect timeout. Only pays the git-remote lookup
@@ -349,10 +372,14 @@ registerTool({
         maxBuffer: 10 * 1024 * 1024,
         onData: live,
         signal: ctx.signal,
+        ...(registry ? { env: packageRegistryEnv(registry) } : {}),
       });
       flushLive();
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
-      return capHeadTail(redactToolSubprocessOutput(combined.trim() || "(no output)"));
+      // The endpoint can be a private hostname/path. Confirmation is useful, but echoing it back into the
+      // model transcript is unnecessary and may expose organization-specific routing metadata.
+      const notice = registry ? "hara: explicit package registry override applied\n" : "";
+      return capHeadTail(redactToolSubprocessOutput(notice + (combined.trim() || "(no output)")));
     } catch (e: any) {
       flushLive();
       let base = `Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`;
@@ -363,6 +390,11 @@ registerTool({
           `\n⏱ hara: the command hit its ${timeout}ms cap and was killed. Pick ONE: ` +
           `a long build/transform → re-run with a larger timeout_ms; a server/watcher → background:true; ` +
           `a network op (git/curl/npm) → do NOT just retry — check connectivity/proxy or skip this step and tell the user.`;
+        if (packageInstall && !registry && !commandHasPackageRegistry(String(input.command ?? ""))) {
+          base +=
+            " For public npm dependencies, an explicit retry may set bash.registry=\"npmmirror\" (or launch with --registry npmmirror). " +
+            "Hara does not silently redirect installs because private scopes and registry trust must be preserved.";
+        }
       }
       // Network fault tolerance — if this was a genuine host-unreachability (connect timeout / DNS, NOT
       // auth / 404 / connection-refused), remember the host so we fast-fail future ops to it this session.

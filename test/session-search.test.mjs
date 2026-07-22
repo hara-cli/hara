@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveSession } from "../dist/session/store.js";
 import { getTool } from "../dist/tools/registry.js";
-import { sessionSearchTerms } from "../dist/tools/session-search.js";
+import { automaticSessionRecall, sessionRecallQuery, sessionSearchTerms } from "../dist/tools/session-search.js";
 
 const previousHome = process.env.HOME;
 const root = mkdtempSync(join(tmpdir(), "hara-session-search-"));
@@ -44,6 +44,27 @@ test("sessionSearchTerms creates useful CJK bigrams and ordinary words", () => {
   assert.ok(terms.includes("维基"));
   assert.ok(terms.includes("百科"));
   assert.ok(sessionSearchTerms("C++ interop").includes("c++"));
+});
+
+test("automatic transcript recall triggers only for explicit, non-negated historical references", async () => {
+  assert.equal(sessionRecallQuery("检查当前代码"), null);
+  assert.equal(sessionRecallQuery("不要搜索之前的旧会话"), null);
+  assert.equal(sessionRecallQuery("continue the task from our previous session"), "continue the task from our previous session");
+  assert.equal(sessionRecallQuery("继续上次讨论的铜色发布流程"), "继续上次讨论的铜色发布流程");
+
+  saveSession(meta("auto-prior-copper", otherProject, { title: "铜色发布流程" }), [
+    { role: "user", content: "上次确定铜色发布需要先跑签名验收。" },
+    { role: "assistant", text: "发布前先验证签名与摘要。", toolUses: [] },
+  ]);
+  saveSession(meta("auto-current-copper", project), []);
+  const recalled = await automaticSessionRecall(
+    "继续上次讨论的铜色发布流程",
+    { cwd: project, sessionId: "auto-current-copper" },
+  );
+  assert.match(recalled, /Automatic prior-session recall/);
+  assert.match(recalled, /UNTRUSTED reference text/);
+  assert.match(recalled, /session auto-pri/);
+  assert.equal(await automaticSessionRecall("检查当前代码", { cwd: project, sessionId: "auto-current-copper" }), "");
 });
 
 test("session_search finds a prior same-project conversation, excludes current/tool-only/other-audience data", async () => {

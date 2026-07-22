@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.133.0 — 2026-07-22 — in-place document editing without helper scripts
+## 0.133.0 — 2026-07-22 — field-feedback closure: documents, web, recall, and setup
 
 - A new approval-gated `python` tool sends Python 3 source directly over stdin, so one-shot APIs such as
   `python-docx` no longer require Hara to create and later execute a durable `.py` helper. Source size,
@@ -19,6 +19,21 @@ All notable changes to `@nanhara/hara`.
   agent system prompt. Upgrade with `npm i -g @nanhara/hara@0.133.0`.
 - The transitive `fast-uri` parser is pinned to 3.1.4, closing CVE-2026-16221/GHSA-v2hh-gcrm-f6hx's
   backslash-authority host-confusion gap before URL policy and network consumers can disagree on a host.
+- `--proxy <url>` and `--lang <tag>` make the existing scoped web proxy and same-language behavior visible
+  at launch. Proxy credentials remain config/environment-only so they never enter the process list. A user
+  who explicitly refers to an older chat (for example “继续上次的任务”) now triggers bounded, audience-safe
+  `session_search` before the model turn; ordinary prompts and explicit opt-outs do not scan transcripts.
+- `web_fetch` identifies SPA shells and can retry with `render:true`. The render path requires computer-use
+  approval, launches an installed Chrome/Chromium/Edge with a fresh temporary profile, and forces every page,
+  redirect, and subresource request through a capped loopback proxy that re-applies public-IP/SSRF checks.
+  Browser cancellation, complete-DOM output, process-tree cleanup, and missing-browser failures are bounded.
+- Package installs can explicitly switch sources with `--registry npmmirror`, global `packageRegistry`, or
+  `bash.registry`. Registry values are injected as environment rather than shell text and reject credentials.
+  Hara does not silently replay an install against a public mirror, because private scopes and supply-chain
+  trust must be preserved; timeout guidance now points to the explicit public-dependency recovery.
+- A truly empty directory (including only `.DS_Store`/`.gitkeep`) no longer asks to generate `AGENTS.md`.
+  The Intel `--cwd` regression now disables update checks and uses a load-tolerant 30-second process ceiling;
+  product behavior remains checked by status/output rather than runner scheduling speed.
 
 ## 0.132.4 — 2026-07-22 — release-class Intel readiness handshakes
 

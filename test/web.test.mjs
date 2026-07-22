@@ -1,8 +1,12 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { htmlToText, parseSearchResults, parseBaiduSearchResults, parseBingSearchResults, parseGoogleSearchResults, looksLikeJsRenderedShell, isPrivateIp, resolvePublicHost, bypassesWebProxy, selectWebProxy, requestPinned } from "../dist/tools/web.js";
+import { findHeadlessBrowser, renderHeadlessHtml } from "../dist/tools/headless-web.js";
 import { getTool } from "../dist/tools/registry.js";
 import "../dist/tools/web.js";
 
@@ -141,6 +145,39 @@ test("looksLikeJsRenderedShell: catches an empty SPA shell, not real article tex
   assert.equal(looksLikeJsRenderedShell('<div id="root"></div><script src="app.js"></script>', ""), true);
   assert.equal(looksLikeJsRenderedShell('<main id="app"></main><script>boot()</script>', "Loading…"), true);
   assert.equal(looksLikeJsRenderedShell(`<article>${"readable ".repeat(40)}</article>`, "readable ".repeat(40)), false);
+});
+
+test("web_fetch classifies explicit headless rendering behind computer approval", () => {
+  const tool = getTool("web_fetch");
+  assert.deepEqual(tool.classify({ url: "https://example.com" }, { cwd: "." }), { effect: "read", concurrencySafe: true });
+  assert.deepEqual(tool.classify({ url: "https://example.com", render: true }, { cwd: "." }), { effect: "computer", concurrencySafe: false });
+});
+
+test("isolated headless renderer launches the configured browser with a loopback validating proxy", { skip: process.platform === "win32" }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-headless-test-"));
+  const browser = join(root, "fake-browser.mjs");
+  writeFileSync(browser, `#!/usr/bin/env node
+const proxyArg = process.argv.find((arg) => arg.startsWith("--proxy-server="));
+if (!proxyArg || new URL(proxyArg.slice(15)).hostname !== "127.0.0.1") process.exit(2);
+process.stdout.write("<!doctype html><html><body><main>Rendered SPA content</main></body></html>");
+`);
+  chmodSync(browser, 0o755);
+  try {
+    assert.equal(findHeadlessBrowser({ HARA_BROWSER_PATH: browser, PATH: process.env.PATH }, process.platform), browser);
+    const target = new URL("https://public-render.example/spa");
+    const result = await renderHeadlessHtml(
+      target,
+      async (url) => {
+        assert.equal(url.hostname, "public-render.example");
+        return { address: "127.0.0.1", family: 4 };
+      },
+      undefined,
+      { ...process.env, HARA_BROWSER_PATH: browser },
+    );
+    assert.match(result.html ?? "", /Rendered SPA content/, JSON.stringify(result));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("htmlToText: strips tags/scripts, decodes entities, keeps list structure", () => {

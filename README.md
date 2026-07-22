@@ -130,6 +130,8 @@ hara config set model    ...
 **Proxy for web tools in mainland/restricted networks** — only `web_fetch` and `web_search` use it:
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:7890
+# or for one Hara launch (do not put credentials in command-line arguments):
+hara --proxy http://127.0.0.1:7890
 # or persist the same endpoint privately:
 hara config set proxy http://127.0.0.1:7890
 ```
@@ -137,6 +139,24 @@ hara config set proxy http://127.0.0.1:7890
 organization enrollment, and chat gateways are not silently redirected. Even through a proxy, `web_fetch`
 pins each DNS-approved public IP and rechecks redirects; authenticated proxy URLs are masked by
 `hara config get`.
+
+When `web_fetch` receives only a JavaScript SPA shell, it tells the agent to retry with `render:true`.
+That path asks for computer-use approval, uses an installed Chrome/Chromium/Edge with a fresh temporary
+profile, and routes every browser request back through the same private-IP/redirect guard. Set
+`HARA_BROWSER_PATH` only when the browser executable is installed in a non-standard location.
+
+**Package registry for slow/restricted npm networks** — switching is explicit, so Hara never sends a
+private scope to a public mirror without your decision:
+```bash
+hara --registry npmmirror             # this launch
+hara config set packageRegistry npmmirror  # persist globally
+```
+The `bash` tool also accepts `registry:"npmmirror"` for one npm/pnpm/yarn/bun install. Use `npmjs`,
+`npmmirror`, or a credential-free HTTP(S) registry URL; keep private-registry authentication in the package
+manager's normal credential store. `HARA_PACKAGE_REGISTRY` is the environment equivalent.
+
+Replies follow the latest user message's language by default. Use `hara --lang zh-CN` (or `en`) to pin one
+launch, and `hara --lang auto` to restore per-message matching.
 
 **Vision** — hara **auto-detects** whether your main model can see images. A vision model (Claude, gpt-4o,
 qwen-vl, glm-4v…) gets pasted images **inline**. For a **text-only** model (DeepSeek, coding models), set a

@@ -75,7 +75,12 @@ function ensureExitCleanup(): void {
 }
 
 /** Start a background shell job; returns its id immediately. Output is captured to a capped tail buffer. */
-export function startJob(command: string, cwd: string, mode: SandboxMode): string {
+export function startJob(
+  command: string,
+  cwd: string,
+  mode: SandboxMode,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = {},
+): string {
   ensureExitCleanup();
   const running = [...jobs.values()].filter((job) => job.status === "running" || job.terminationPending).length;
   if (running >= MAX_RUNNING_JOBS) {
@@ -84,7 +89,7 @@ export function startJob(command: string, cwd: string, mode: SandboxMode): strin
   pruneFinishedJobs(1);
   const { cmd, args } = shellCommand(command, cwd, mode);
   const processGroup = platform() !== "win32";
-  const child = spawn(cmd, args, { cwd, env: toolSubprocessEnv(), detached: processGroup });
+  const child = spawn(cmd, args, { cwd, env: toolSubprocessEnv(process.env, env), detached: processGroup });
   const job: Job = {
     id: "j" + ++seq,
     // The raw command may contain an inline --token/KEY=value. It is used only for spawning above; every

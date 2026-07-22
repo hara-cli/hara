@@ -80,10 +80,18 @@ export function needsConfirm(kind: string | undefined, mode: ApprovalMode): bool
   return true; // suggest: confirm edits and exec
 }
 
+export function replyLanguageInstruction(env: NodeJS.ProcessEnv = process.env): string {
+  const requested = String(env.HARA_REPLY_LANGUAGE ?? "").trim();
+  if (/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8}){0,3}$/u.test(requested)) {
+    return `Reply in ${requested} unless the user explicitly asks for another language;`;
+  }
+  return "Reply in the same language as the user's latest message unless they explicitly ask for another language;";
+}
+
 const HARA_SYSTEM = () =>
   `You are hara, a coding agent running in the user's terminal.
-Be concise and direct. Reply in the same language as the user's latest message unless they explicitly
-ask for another language; keep code, commands, paths, and technical identifiers unchanged. Use the
+Be concise and direct. ${replyLanguageInstruction()} keep code, commands, paths, and technical identifiers
+unchanged. Use the
 provided tools to read files, edit/write files, and run shell
 commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
 them whole. Batch INDEPENDENT tool calls in a single response — especially reads (read_file / grep /

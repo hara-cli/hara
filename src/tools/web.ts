@@ -10,6 +10,7 @@ import { request as httpsRequest } from "node:https";
 import { ProxyAgent, fetch as undiciFetch, request as undiciRequest } from "undici";
 import { wrapUntrusted } from "../security/external-content.js";
 import { loadConfig } from "../config.js";
+import { renderHeadlessHtml } from "./headless-web.js";
 
 const MAX = 60_000;
 const SEARCH_ATTEMPT_MS = 8_000;
@@ -720,21 +721,30 @@ registerTool({
 registerTool({
   name: "web_fetch",
   description:
-    "Fetch an http(s) URL and return its text content (HTML is reduced to readable text). Read-only. " +
-    "Use for docs, references, or pages the user mentions. Not sandboxed.",
+    "Fetch an http(s) URL and return its text content (HTML is reduced to readable text). Ordinary fetches are read-only. " +
+    "For an SPA shell, retry with render=true to use an installed Chromium-family browser in a fresh isolated profile; " +
+    "rendering executes page JavaScript and therefore requires the computer-use approval boundary. Not sandboxed.",
   input_schema: {
     type: "object",
     properties: {
       url: { type: "string", description: "http:// or https:// URL" },
       max_chars: { type: "number", description: "cap on returned text (default 60000)" },
+      render: { type: "boolean", description: "render JavaScript in an isolated headless browser (approval required; use for SPA shells)" },
     },
     required: ["url"],
   },
   kind: "read",
-  concurrencySafe: true,
+  classify(input) {
+    return input?.render
+      ? { effect: "computer", concurrencySafe: false }
+      : { effect: "read", concurrencySafe: true };
+  },
   visibility: "deferred",
   async run(input, ctx) {
     if (ctx.signal?.aborted) throw interrupted("web fetch");
+    if (input.render !== undefined && typeof input.render !== "boolean") {
+      return "Error: web_fetch `render` must be true or false.";
+    }
     let url: URL;
     try {
       url = new URL(input.url);
@@ -786,9 +796,35 @@ registerTool({
       let text = /html/i.test(ct) ? htmlToText(raw) : raw;
       if (text.length > cap) text = text.slice(0, cap) + `\n…[truncated ${text.length - cap} chars]`;
       if (/html/i.test(ct) && looksLikeJsRenderedShell(raw, text)) {
+        if (input.render === true) {
+          const rendered = await renderHeadlessHtml(current, async (target) => {
+            const approved = await resolvePublicHost(target.hostname);
+            const proxy = webProxy(target, ctx.cwd);
+            return { ...approved, ...(proxy ? { proxyUri: proxy.uri } : {}) };
+          }, signal);
+          if (ctx.signal?.aborted) throw interrupted("web fetch");
+          if (rendered.html) {
+            let renderedText = htmlToText(rendered.html);
+            if (renderedText.length > cap) {
+              renderedText = renderedText.slice(0, cap) + `\n…[truncated ${renderedText.length - cap} chars]`;
+            }
+            if (renderedText && !looksLikeJsRenderedShell(rendered.html, renderedText)) {
+              return `# ${current.href} (rendered in isolated headless browser)\n\n${wrapUntrusted(renderedText, current.href)}`;
+            }
+          }
+          const reason = rendered.error === "browser-unavailable"
+            ? "No installed Chromium-family browser was found. Install Chrome/Chromium/Edge or set HARA_BROWSER_PATH to its executable."
+            : rendered.error === "timed-out"
+              ? "The isolated browser did not finish within 25 seconds."
+              : rendered.error === "output-too-large"
+                ? "The rendered DOM exceeded the 4 MiB safety ceiling."
+                : "The isolated browser finished without usable rendered text.";
+          return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(`${text || "(empty shell)"}\n\nHeadless render unavailable: ${reason}`, current.href)}`;
+        }
         const hint =
           "This page appears to be JavaScript-rendered; web_fetch received only the SPA shell and does not execute page scripts. " +
-          "Use an available browser/web skill for the rendered page, or the site's authenticated API/connector (for example the Feishu Docs API).";
+          "Retry web_fetch with render=true (it uses a fresh isolated browser and requires approval), use an available browser/web skill, " +
+          "or use the site's authenticated API/connector (for example the Feishu Docs API).";
         return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(`${text || "(empty shell)"}\n\n${hint}`, current.href)}`;
       }
       return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(text || "(empty body)", current.href)}`;

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, linkSync, mkdtempSync, realpathSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, utimesSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { loadAgentContext, loadAgentsMd, hasAgentsMd, findProjectRoot } from "../dist/context/agents-md.js";
+import { loadAgentContext, loadAgentsMd, hasAgentsMd, hasProjectContent, findProjectRoot } from "../dist/context/agents-md.js";
 import { canonicalWorkspacePath, discoverProjectWorkspaces, isHomeWorkspace, suggestedProjectWorkspace } from "../dist/context/workspace-scope.js";
 import { expandMentions, expandMentionsAsync, fileCandidates } from "../dist/context/mentions.js";
 import { needsConfirm } from "../dist/agent/loop.js";
@@ -106,6 +106,24 @@ test("agents-md: no file → empty string + hasAgentsMd false", () => {
     mkdirSync(join(dir, ".git"));
     assert.equal(hasAgentsMd(dir), false);
     assert.equal(loadAgentsMd(dir), "");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agents-md: first-run offer distinguishes an empty directory from a real project", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-empty-project-"));
+  try {
+    assert.equal(hasProjectContent(dir), false);
+    writeFileSync(join(dir, ".DS_Store"), "");
+    writeFileSync(join(dir, ".gitkeep"), "");
+    assert.equal(hasProjectContent(dir), false, "OS placeholders do not turn an empty folder into a project");
+
+    writeFileSync(join(dir, "README.md"), "# real content\n");
+    assert.equal(hasProjectContent(dir), true);
+    rmSync(join(dir, "README.md"));
+    mkdirSync(join(dir, ".git"));
+    assert.equal(hasProjectContent(dir), true, "a project marker is sufficient even before source files exist");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

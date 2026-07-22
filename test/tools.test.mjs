@@ -8,6 +8,7 @@ import { capHeadTail, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthCo
 import { getTool, getTools } from "../dist/tools/registry.js";
 import { atomicWriteText } from "../dist/fs-write.js";
 import { readRegularFileSnapshot } from "../dist/fs-read.js";
+import { commandHasPackageRegistry, normalizePackageRegistry, packageRegistryEnv } from "../dist/package-registry.js";
 
 async function settleWithin(promise, ms = 1500) {
   let timer;
@@ -45,6 +46,20 @@ test("package installs and ngrok tunnels are classified for safe timeout/preflig
   assert.equal(shellTimeoutMs("npm ci", 42_000), 42_000);
   assert.equal(shellTimeoutMs("npm ci", -1), 900_000, "invalid requested timeout falls back safely");
   assert.equal(shellTimeoutMs("npm ci", 9_999_999), 3_600_000, "requested timeouts are bounded");
+});
+
+test("package registry switching is explicit, normalized, and injected without shell interpolation", () => {
+  assert.equal(normalizePackageRegistry("npmjs"), "https://registry.npmjs.org/");
+  assert.equal(normalizePackageRegistry("npmmirror"), "https://registry.npmmirror.com/");
+  assert.equal(normalizePackageRegistry("https://packages.example/repository/npm"), "https://packages.example/repository/npm/");
+  assert.throws(() => normalizePackageRegistry("https://user:password@packages.example/"), /without credentials/);
+  assert.equal(commandHasPackageRegistry("npm install --registry=https://registry.example/"), true);
+  assert.equal(commandHasPackageRegistry("npm install"), false);
+  assert.deepEqual(packageRegistryEnv("https://registry.npmmirror.com/"), {
+    NPM_CONFIG_REGISTRY: "https://registry.npmmirror.com/",
+    YARN_NPM_REGISTRY_SERVER: "https://registry.npmmirror.com/",
+    BUN_CONFIG_REGISTRY: "https://registry.npmmirror.com/",
+  });
 });
 
 test("registry contains the built-in tools", () => {

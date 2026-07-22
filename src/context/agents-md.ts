@@ -1,6 +1,6 @@
 // Project-context loading (AGENTS.md) — the cross-tool standard read by Codex/Claude Code/OpenClaw.
 // Walks up from cwd to the project root, concatenates AGENTS.md files, caps total size.
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { readModelContextBytePrefixSync } from "../fs-read.js";
 import { homeWorkspaceGuidance, isHomeWorkspace } from "./workspace-scope.js";
@@ -106,6 +106,21 @@ export function loadAgentContext(cwd: string): string {
 export function hasAgentsMd(cwd: string): boolean {
   const root = findProjectRoot(cwd);
   return FILENAMES.some((n) => existsSync(join(root, n)));
+}
+
+/** An empty directory has nothing useful for the init agent to analyze. Do not interrupt first launch with
+ * an AGENTS.md offer until the user has created a project marker or at least one visible project file. */
+export function hasProjectContent(cwd: string): boolean {
+  const root = findProjectRoot(cwd);
+  try {
+    return readdirSync(root, { withFileTypes: true }).some((entry) => {
+      if (ROOT_MARKERS.includes(entry.name)) return true;
+      if (entry.name === ".DS_Store" || entry.name === ".gitkeep") return false;
+      return !entry.name.startsWith(".");
+    });
+  } catch {
+    return false;
+  }
 }
 
 /** Prompt hara runs against itself to analyze the repo and write AGENTS.md. */

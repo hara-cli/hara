@@ -15,6 +15,20 @@ const MAX_AUTO_PROJECT_CHARS = 8_000_000;
 const MAX_MESSAGE_SCAN_CHARS = 120_000;
 const MAX_EXCERPT_CHARS = 700;
 
+const HISTORICAL_REFERENCE = [
+  /(?:之前|以前|上次|前一(?:次|个)|此前|我们前面)(?:的|聊过|讨论过|说过|做过|处理过|提过|那个|那次|任务|问题|方案|对话|会话|项目|内容)?/u,
+  /(?:继续|接着)(?:之前|以前|上次|前一(?:次|个)|此前)(?:的|那个|那次)?/u,
+  /(?:还记得|记不记得|你记得)(?:之前|以前|上次|我们)?/u,
+  /\b(?:previous|prior|earlier|last)\s+(?:chat|session|conversation|time|task|issue|discussion|project)\b/iu,
+  /\b(?:continue|pick up)\s+(?:from|where)\b/iu,
+  /\b(?:do you remember|we (?:discussed|talked about|worked on)|you said before)\b/iu,
+];
+
+const HISTORICAL_REFERENCE_NEGATION = [
+  /(?:不要|不用|无需|别)(?:查|找|看|搜索|读取|回忆).{0,8}(?:之前|以前|上次|历史|旧会话)/u,
+  /\b(?:do not|don't|dont|no need to)\s+(?:search|read|look at|recall).{0,32}(?:previous|prior|earlier|history|old (?:chat|session))/iu,
+];
+
 type VisibleMessage = { role: "user" | "assistant"; text: string };
 type RankedSession = {
   meta: SessionMeta;
@@ -35,6 +49,26 @@ function compact(value: string): string {
 export function sessionSearchTerms(query: string): string[] {
   const terms = lexicalSearchTerms(query);
   return terms.length <= 32 ? terms : [...terms.slice(0, 16), ...terms.slice(-16)];
+}
+
+/** Only search raw transcripts when the user explicitly points at older work. This makes ordinary turns
+ * deterministic and cheap while fixing the common "continue the task from our previous chat" case without
+ * relying on the model to notice and call session_search itself. Explicit opt-outs always win. */
+export function sessionRecallQuery(messageValue: unknown): string | null {
+  const message = String(messageValue ?? "").replace(/\s+/g, " ").trim();
+  if (!message || HISTORICAL_REFERENCE_NEGATION.some((pattern) => pattern.test(message))) return null;
+  if (!HISTORICAL_REFERENCE.some((pattern) => pattern.test(message))) return null;
+  return message.slice(0, 512);
+}
+
+/** Return an injectable, clearly untrusted recall block, or an empty string when no explicit cue/match
+ * exists. Audience/project enforcement remains centralized in searchSessionHistory. */
+export async function automaticSessionRecall(message: unknown, ctx: ToolContext): Promise<string> {
+  const query = sessionRecallQuery(message);
+  if (!query) return "";
+  const result = await searchSessionHistory(query, "auto", 3, ctx);
+  if (result === "(no session matches)" || result.startsWith("Error:") || result.startsWith("Blocked:")) return "";
+  return `Automatic prior-session recall (triggered by the user's explicit historical reference):\n${result}`;
 }
 
 function visibleMessages(history: NeutralMsg[]): VisibleMessage[] {

@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PromptAssembler } from "../dist/agent/prompt.js";
-import { composeSystem } from "../dist/agent/loop.js";
+import { composeSystem, replyLanguageInstruction } from "../dist/agent/loop.js";
 
 test("PromptAssembler renders deterministic text and refuses a stable suffix after turn context", () => {
   const prompt = new PromptAssembler()
@@ -70,4 +70,14 @@ test("Hara prompt keeps core/session identities stable when the accepted task br
     else process.env.HOME = originalHome;
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("reply language follows the latest message by default and accepts an explicit language tag", () => {
+  assert.match(replyLanguageInstruction({}), /same language as the user's latest message/);
+  assert.match(replyLanguageInstruction({ HARA_REPLY_LANGUAGE: "zh-CN" }), /Reply in zh-CN/);
+  assert.match(
+    replyLanguageInstruction({ HARA_REPLY_LANGUAGE: "not_a_language" }),
+    /same language as the user's latest message/,
+    "invalid environment values fail back to automatic language matching",
+  );
 });

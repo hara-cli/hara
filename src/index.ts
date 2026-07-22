@@ -157,6 +157,7 @@ import { listJobs, tailJob, killJob } from "./exec/jobs.js";
 import { readModelContextFileSync } from "./fs-read.js";
 import { MIN_NODE_VERSION, unsupportedNodeMessage } from "./runtime.js";
 import { redactKnownSecrets, redactSensitiveText } from "./security/secrets.js";
+import { normalizePackageRegistry } from "./package-registry.js";
 
 /** Render the background-job list for /jobs (user-facing view of what the agent has running in the
  *  background — dev servers, watchers, long tasks). Mirrors codex/Claude-Code process visibility. */
@@ -172,7 +173,7 @@ function renderBgJobs(): string {
   return `Background jobs — /jobs tail <id> · /jobs kill <id>:\n${rows.join("\n")}`;
 }
 import { qwenDeviceLogin, loadQwenToken } from "./providers/qwen-oauth.js";
-import { loadAgentContext, hasAgentsMd, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
+import { loadAgentContext, hasAgentsMd, hasProjectContent, INIT_PROMPT, findProjectRoot } from "./context/agents-md.js";
 import {
   homeWorkspaceActionError,
   discoverProjectWorkspaces,
@@ -249,7 +250,7 @@ import "./tools/patch.js"; // register apply_patch
 import "./tools/web.js"; // register web_fetch
 import "./tools/agent.js"; // register agent (subagent spawn)
 import "./tools/memory.js"; // register memory_search/get/write/forget/skill_create
-import "./tools/session-search.js"; // register bounded cross-session transcript recall
+import { automaticSessionRecall } from "./tools/session-search.js"; // register + deterministic explicit-cue recall
 import "./tools/skill.js"; // register the skill loader tool
 import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
 import "./tools/todo.js"; // register todo_write (inline task checklist)
@@ -1603,6 +1604,9 @@ program
   .option("--profile <id>", "use this identity profile for this run (personal / org id) — see `hara profile list`")
   .option("--overlay <name>", "apply a named config overlay from ~/.hara/config.json (legacy: --profile)")
   .option("--cwd <dir>", "run from this explicit project directory (alternative to cd)")
+  .option("--proxy <url>", "HTTP(S) proxy for web_fetch/web_search in this run (credentials belong in config/env)")
+  .option("--registry <url>", "package registry for installs in this run: npmjs, npmmirror, or an HTTP(S) URL")
+  .option("--lang <tag>", "reply language for this run, for example zh-CN or en (default: follow latest message)")
   .option("-c, --continue", "resume the most recent session in this directory")
   .option("--resume <id>", "resume a specific session by id")
   .option("--sandbox <mode>", "sandbox the shell: off | workspace-write | read-only");
@@ -1622,6 +1626,43 @@ program.hook("preAction", (thisCmd) => {
       process.chdir(target);
     } catch (error) {
       out(c.red(`Cannot use --cwd '${cwdFlag}': ${error instanceof Error ? error.message : String(error)}.\n`));
+      process.exit(2);
+    }
+  }
+  const proxyFlag = thisCmd.opts().proxy as string | undefined;
+  if (proxyFlag) {
+    try {
+      const parsed = new URL(proxyFlag);
+      if (
+        !(parsed.protocol === "http:" || parsed.protocol === "https:")
+        || parsed.pathname !== "/"
+        || parsed.search
+        || parsed.hash
+        || parsed.username
+        || parsed.password
+      ) throw new Error("invalid or credential-bearing proxy URL");
+      process.env.HARA_WEB_PROXY = parsed.origin;
+    } catch {
+      out(c.red("Cannot use --proxy: provide an HTTP(S) origin such as http://127.0.0.1:7890. Put authenticated proxy URLs in `hara config set proxy …` or HTTPS_PROXY so credentials do not enter the process list.\n"));
+      process.exit(2);
+    }
+  }
+  const languageFlag = thisCmd.opts().lang as string | undefined;
+  if (languageFlag) {
+    if (languageFlag === "auto") delete process.env.HARA_REPLY_LANGUAGE;
+    else if (/^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8}){0,3}$/u.test(languageFlag)) {
+      process.env.HARA_REPLY_LANGUAGE = languageFlag;
+    } else {
+      out(c.red("Cannot use --lang: provide a language tag such as zh-CN or en, or use auto.\n"));
+      process.exit(2);
+    }
+  }
+  const registryFlag = thisCmd.opts().registry as string | undefined;
+  if (registryFlag) {
+    try {
+      process.env.HARA_PACKAGE_REGISTRY = normalizePackageRegistry(registryFlag);
+    } catch {
+      out(c.red("Cannot use --registry: provide npmjs, npmmirror, or an HTTP(S) registry URL without credentials/query/fragment.\n"));
       process.exit(2);
     }
   }
@@ -3336,6 +3377,15 @@ config
         process.exit(1);
       }
     }
+    if (key === "packageRegistry") {
+      try {
+        value = normalizePackageRegistry(value) ?? "";
+        if (!value) throw new Error("empty registry");
+      } catch {
+        out(c.red("Invalid package registry. Use npmjs, npmmirror, or an HTTP(S) URL without credentials, query parameters, or a fragment.\n"));
+        process.exit(1);
+      }
+    }
     if (key === "runTimeoutMs") {
       const parsed = parseAgentRunTimeoutMs(value);
       if (parsed === undefined || parsed < MIN_AGENT_RUN_TIMEOUT_MS || parsed > MAX_AGENT_RUN_TIMEOUT_MS) {
@@ -3831,7 +3881,13 @@ program.action(async (opts) => {
     // Inbound images (gateway): the platform downloaded the user's photo(s) and passed their paths via env.
     // Let the agent actually SEE them — attached inline for a vision-capable main model, else described via the
     // visionModel sidecar and folded into the message (text-only models can't take image blocks).
-    const userText = await expandMentionsAsync(String(opts.print), cwd) + (schemaObj ? STRUCTURED_INSTRUCTION : "");
+    const printText = String(opts.print);
+    const automaticRecall = meta
+      ? await automaticSessionRecall(printText, { cwd, sessionId: meta.id })
+      : "";
+    const userText = (automaticRecall ? `${automaticRecall}\n\n---\n\n` : "")
+      + await expandMentionsAsync(printText, cwd)
+      + (schemaObj ? STRUCTURED_INSTRUCTION : "");
     const inboundImgs = (process.env.HARA_GATEWAY_IMAGES ?? "")
       .split("\n")
       .map((s) => s.trim())
@@ -4079,7 +4135,7 @@ program.action(async (opts) => {
   // First-run AGENTS.md offer — classic REPL only. In TUI mode we must NOT call rl.question before ink
   // mounts: a readline question puts stdin in a state ink can't read from, leaving the input box dead
   // (the TUI shows a `/init` tip instead, below). See the `tip` in the runTui header.
-  if (!homeWorkspace && !hasAgentsMd(cwd) && !useTui) {
+  if (!homeWorkspace && !hasAgentsMd(cwd) && hasProjectContent(cwd) && !useTui) {
     const ans = (await rl.question(`${c.dim("No AGENTS.md here — analyze this project and create one?")} ${c.dim("[Y/n]")} `)).trim().toLowerCase();
     if (ans === "" || ans.startsWith("y")) {
       out(c.dim("Analyzing project…\n"));
@@ -4677,7 +4733,7 @@ program.action(async (opts) => {
     // First-run AGENTS.md offer — via a tiny ink prompt, NOT readline. A readline question before the
     // main TUI leaves stdin unreadable by ink (dead input box); ink cleans up on unmount, so the TUI
     // mounted right after gets working input. Runs before mount, like the classic path.
-    if (!homeWorkspace && !hasAgentsMd(cwd)) {
+    if (!homeWorkspace && !hasAgentsMd(cwd) && hasProjectContent(cwd)) {
       if (await askConfirm("No AGENTS.md here — analyze this project and create one?")) {
         out(c.dim("Analyzing project…\n"));
         try {
@@ -5257,7 +5313,9 @@ program.action(async (opts) => {
           // investigation / Q&A end back at the input, still in plan mode, with no nagging.
           const planImg = await resolveImages(images, h);
           if (planImg.skip) return;
-          const planContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (planImg.extraText ?? "");
+          const automaticRecall = await automaticSessionRecall(line, { cwd, sessionId: meta.id, signal: h.signal });
+          const recallPrefix = [recalledContext, automaticRecall].filter(Boolean).join("\n\n");
+          const planContent = (recallPrefix ? `${recallPrefix}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (planImg.extraText ?? "");
           const executionContext = beginExecution(line);
           if (!executionContext) return;
           history.push({ role: "user", content: planContent, ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
@@ -5371,7 +5429,9 @@ program.action(async (opts) => {
         }
         const ri = await resolveImages(images, h);
         if (ri.skip) return;
-        const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (ri.extraText ?? "");
+        const automaticRecall = await automaticSessionRecall(line, { cwd, sessionId: meta.id, signal: h.signal });
+        const recallPrefix = [recalledContext, automaticRecall].filter(Boolean).join("\n\n");
+        const userContent = (recallPrefix ? `${recallPrefix}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (ri.extraText ?? "");
         recalledContext = "";
         const executionContext = beginExecution(line);
         if (!executionContext) return;
@@ -5506,7 +5566,9 @@ program.action(async (opts) => {
       continue;
     }
     line = inlineLeadingPath(line, existsSync); // leading dropped file path → @-mention so it's read in
-    const userContent = (recalledContext ? `${recalledContext}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd);
+    const automaticRecall = await automaticSessionRecall(line, { cwd, sessionId: meta.id });
+    const recallPrefix = [recalledContext, automaticRecall].filter(Boolean).join("\n\n");
+    const userContent = (recallPrefix ? `${recallPrefix}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd);
     recalledContext = "";
     const recoveredClassicSteering = consumePendingTaskSteering(task);
     if (recoveredClassicSteering) {
