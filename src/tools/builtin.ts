@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { resolve, isAbsolute } from "node:path";
 import { stdout as procOut } from "node:process";
 import { registerTool } from "./registry.js";
@@ -25,6 +25,13 @@ import {
 } from "./net-reachability.js";
 
 const MAX = 100_000;
+const MAX_PYTHON_SOURCE_BYTES = 500_000;
+
+/** Python source is delivered over stdin, so one-shot library operations never need a durable helper
+ *  script. Keep the command itself fixed: model-authored source must not be interpolated into a shell. */
+export function pythonStdinCommand(plat = platform()): string {
+  return plat === "win32" ? "py -3 -" : "python3 -";
+}
 
 /** Package installs are network-bound and routinely exceed the ordinary foreground cap. */
 export function isPackageInstallCommand(command: string): boolean {
@@ -161,7 +168,10 @@ registerTool({
 
 registerTool({
   name: "write_file",
-  description: "Create or overwrite a UTF-8 text file (creates parent directories).",
+  description:
+    "Create or overwrite a UTF-8 text file (creates parent directories). This is text-only: do not use " +
+    "it for binary Office files or merely to save a one-shot Python helper before executing it; send " +
+    "one-shot Python source directly to the python tool instead.",
   input_schema: {
     type: "object",
     properties: {
@@ -203,6 +213,57 @@ registerTool({
     recordEdit([{ path: input.path, absPath: boundary.target, before: prev, beforeMode: prevSnapshot?.mode, committed, after: input.content }]);
     invalidateFileCandidates(ctx.cwd);
     return `Wrote ${String(input.content).length} chars to ${p}` + (committed.warnings?.length ? ` Warning: ${committed.warnings.join("; ")}` : "");
+  },
+});
+
+registerTool({
+  name: "python",
+  description:
+    "Execute Python 3 source directly from this tool input over stdin; no .py helper file is created. " +
+    "Prefer this for one-shot library APIs such as python-docx. When editing an existing user document, " +
+    "keep the original path as the canonical output unless the user explicitly requests a copy/version. " +
+    "Use a temporary output only for atomic replacement and remove it in finally/on failure.",
+  input_schema: {
+    type: "object",
+    properties: {
+      code: { type: "string", description: "Python 3 source executed from stdin, never written to a .py file" },
+      timeout_ms: { type: "number", description: "default 300000 (5 min), bounded to 1s..1h" },
+    },
+    required: ["code"],
+  },
+  kind: "exec",
+  requiresProjectWorkspace: true,
+  async run(input, ctx) {
+    if (typeof input.code !== "string" || !input.code.trim()) {
+      return "Error: python `code` must be a non-empty string. Nothing executed.";
+    }
+    if (Buffer.byteLength(input.code, "utf8") > MAX_PYTHON_SOURCE_BYTES) {
+      return `Error: python source exceeds ${MAX_PYTHON_SOURCE_BYTES} bytes. Split the operation into smaller direct calls; do not create a helper script.`;
+    }
+    const protectedReason = sensitiveShellCommandReason(input.code, ctx.cwd);
+    if (protectedReason) {
+      return (
+        `Blocked: Python source crosses Hara's protected secret boundary (${protectedReason}). ` +
+        "This deny is not bypassed by direct stdin execution or full-auto."
+      );
+    }
+    const command = pythonStdinCommand();
+    try {
+      const result = await runShell(command, ctx.cwd, ctx.sandbox ?? "off", {
+        timeout: shellTimeoutMs(command, input.timeout_ms),
+        maxBuffer: 1_000_000,
+        signal: ctx.signal,
+        input: input.code,
+      });
+      const rendered = redactToolSubprocessOutput(capHeadTail([result.stdout, result.stderr].filter(Boolean).join("\n"))).trim();
+      return rendered ? `Python completed without creating a helper script.\n${rendered}` : "Python completed without creating a helper script.";
+    } catch (error: any) {
+      const rendered = redactToolSubprocessOutput(capHeadTail([error?.stdout, error?.stderr].filter(Boolean).join("\n"))).trim();
+      if (error?.code === 127) {
+        return "Error: Python 3 is not available on PATH. Install Python 3 and the required library, then retry; no helper script was created.";
+      }
+      return `Python failed: ${error?.message ?? String(error)}.${rendered ? `\n${rendered}` : ""}`;
+    }
   },
 });
 

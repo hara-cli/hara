@@ -36,6 +36,30 @@ test("system prompt teaches the analysis SOP: batch reads, manifest-first, fan o
   assert.ok(/role "explore"/.test(system), "points at the built-in explore persona");
 });
 
+test("system prompt edits existing documents in place without durable helper scripts", async () => {
+  let system = "";
+  const provider = {
+    id: "f",
+    model: "f",
+    async turn(args) {
+      system = args.system;
+      return { text: "ok", toolUses: [], stop: "end" };
+    },
+  };
+  await runAgent([{ role: "user", content: "修改这个 docx" }], {
+    provider,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+  });
+  assert.match(system, /keep its original path as the canonical output/);
+  assert.match(system, /Do not invent suffix copies/);
+  assert.match(system, /call the python tool with source directly/);
+  assert.match(system, /never write a durable helper \.py file/);
+  assert.match(system, /remove it in finally\/on failure/);
+});
+
 test("a resumed session treats persisted history as context instead of rediscovering the workspace", async () => {
   const systems = [];
   const provider = {

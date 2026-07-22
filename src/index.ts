@@ -241,7 +241,7 @@ import type { Provider, NeutralMsg, ImageAttachment } from "./providers/types.js
 import { c, out, statusLine } from "./ui.js";
 import * as bar from "./statusbar.js";
 import { nearest } from "./fuzzy.js";
-import "./tools/builtin.js"; // register read_file/write_file/bash
+import "./tools/builtin.js"; // register read_file/write_file/python/bash/job
 import "./tools/runtime.js"; // register tool_search/tool_result_read
 import "./tools/edit.js"; // register edit_file
 import "./tools/search.js"; // register grep/glob/ls

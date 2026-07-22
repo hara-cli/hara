@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSyn
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { capHeadTail, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
+import { capHeadTail, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
 import { atomicWriteText } from "../dist/fs-write.js";
 import { readRegularFileSnapshot } from "../dist/fs-read.js";
@@ -49,7 +49,45 @@ test("package installs and ngrok tunnels are classified for safe timeout/preflig
 
 test("registry contains the built-in tools", () => {
   const names = getTools().map((t) => t.name).sort();
-  assert.deepEqual(names, ["bash", "job", "read_file", "write_file"]);
+  assert.deepEqual(names, ["bash", "job", "python", "read_file", "write_file"]);
+  assert.equal(pythonStdinCommand("darwin"), "python3 -");
+  assert.equal(pythonStdinCommand("linux"), "python3 -");
+  assert.equal(pythonStdinCommand("win32"), "py -3 -");
+});
+
+test("python executes source through stdin without leaving a helper script", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-python-stdin-"));
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  process.env.HARA_ALLOW_SENSITIVE_FILES = "1";
+  try {
+    const output = await getTool("python").run({
+      code: 'from pathlib import Path\nPath("result.txt").write_text("direct", encoding="utf-8")\nprint("ok")\n',
+    }, { cwd: dir, sandbox: "off" });
+    assert.match(output, /completed without creating a helper script/i);
+    assert.match(output, /ok/);
+    assert.equal(readFileSync(join(dir, "result.txt"), "utf8"), "direct");
+    assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".py")), []);
+  } finally {
+    if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("python stdin source cannot bypass protected-file preflight", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-python-protected-"));
+  const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+  try {
+    const output = await getTool("python").run({
+      code: 'from pathlib import Path\nprint(Path(".env").read_text())\n',
+    }, { cwd: dir, sandbox: "off" });
+    assert.match(output, /Blocked: Python source crosses Hara's protected secret boundary/i);
+    assert.equal(existsSync(join(dir, ".env")), false);
+  } finally {
+    if (previous !== undefined) process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("write_file → read_file round-trips in cwd", async () => {

@@ -94,6 +94,12 @@ grep/glob; don't read whole large files when a targeted search answers the quest
 grep to locate then read_file just that region with offset/limit — not the whole file. After a successful
 edit_file/write_file do NOT re-read the file to verify — the tool already applied and diffed the change;
 re-reading a big file after every edit is the slowest habit an agent can have.
+When editing an existing user artifact, including a DOCX, keep its original path as the canonical output
+and replace it in place by default. Do not invent suffix copies such as "完整版", "简版", or "new" unless
+the user explicitly asks to save a separate version. For one-shot Python library work such as python-docx,
+call the python tool with source directly; never write a durable helper .py file and then run it. If an
+atomic binary save needs a temporary output, remove it in finally/on failure and leave only the requested
+document when the task completes.
 When an attempt FAILS, never repeat it unchanged — read the error, form a hypothesis about the cause, and
 change something (arguments / approach / tool) before trying again. After two failed variants of the same
 approach, stop: re-plan from what you learned, or ask the user, stating concisely what you tried and what

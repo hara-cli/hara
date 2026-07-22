@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.133.0 — 2026-07-22 — in-place document editing without helper scripts
+
+- A new approval-gated `python` tool sends Python 3 source directly over stdin, so one-shot APIs such as
+  `python-docx` no longer require Hara to create and later execute a durable `.py` helper. Source size,
+  active-run cancellation, process-tree timeout, output redaction, workspace sandboxing, and protected-file
+  preflight remain enforced; the tool reports a focused prerequisite error when Python 3 is unavailable.
+- Existing user artifacts now keep their original path as the canonical output by default. Hara must not
+  invent “完整版”, “简版”, “new”, or similar copies unless the user explicitly requests a separate version.
+  Any temporary binary output used for atomic replacement must be removed on both success and failure.
+- Regression coverage executes Python through stdin, proves no `.py` file is left behind, verifies protected
+  files cannot be reached through the new input path, and pins the in-place/no-suffix/no-helper policy in the
+  agent system prompt. Upgrade with `npm i -g @nanhara/hara@0.133.0`.
+- The transitive `fast-uri` parser is pinned to 3.1.4, closing CVE-2026-16221/GHSA-v2hh-gcrm-f6hx's
+  backslash-authority host-confusion gap before URL policy and network consumers can disagree on a host.
+
 ## 0.132.4 — 2026-07-22 — release-class Intel readiness handshakes
 
 - Non-Git `@path` completion now skips the bounded Git inventory subprocess when no repository marker

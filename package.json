@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.132.4",
+  "version": "0.133.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -81,6 +81,6 @@
     },
     "@hono/node-server": "2.0.11",
     "hono": "4.12.31",
-    "fast-uri": "3.1.3"
+    "fast-uri": "3.1.4"
   }
 }

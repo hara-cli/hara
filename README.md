@@ -402,7 +402,8 @@ agent.
 ### What it can do
 
 A streaming agentic loop with built-in tools — `read_file`, `write_file`, **`edit_file`** /
-**`apply_patch`** (surgical edits — single file, or **atomic multi-file** changes), `bash`, and
+**`apply_patch`** (surgical edits — single file, or **atomic multi-file** changes), direct-stdin
+**`python`** (one-shot APIs without helper scripts), `bash`, and
 read-only **`grep`** / **`glob`** / **`ls`** / **`web_fetch`** — behind a human-in-the-loop confirmation gate on the
 dangerous ones unless `-y`. Read-only tools run in parallel within a turn, and edits print a
 **colored diff** of what changed. Shell output streams live; press **Esc** to interrupt a running
