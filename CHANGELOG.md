@@ -34,6 +34,9 @@ All notable changes to `@nanhara/hara`.
 - A truly empty directory (including only `.DS_Store`/`.gitkeep`) no longer asks to generate `AGENTS.md`.
   The Intel `--cwd` regression now disables update checks and uses a load-tolerant 30-second process ceiling;
   product behavior remains checked by status/output rather than runner scheduling speed.
+- The TUI composer now keeps one stable Ink input subscription across renders. Rapid follow-up keys (including
+  Up/Down history navigation on slower terminals) can no longer land between paint and listener resubscription
+  and disappear; the handler still observes the latest draft through React 19 Effect Events.
 
 ## 0.132.4 — 2026-07-22 — release-class Intel readiness handshakes
 

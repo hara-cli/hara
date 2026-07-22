@@ -12,8 +12,8 @@
 //      so long input wraps under a stable continuation indent and the cursor never drifts — instead
 //      of leaning on ink's soft-wrap of a single <Text>, which mis-aligns wrapped rows against the
 //      "› " prompt gutter and reflows unpredictably as you type.
-import { Box, Text, useInput, useStdout } from "ink";
-import { memo, useMemo, useRef, useState, type ReactNode } from "react";
+import { Box, Text, useInput, useStdout, type Key } from "ink";
+import { memo, useEffectEvent, useMemo, useRef, useState, type ReactNode } from "react";
 import { fileCandidates } from "../context/mentions.js";
 import { imagePathFromPaste } from "../images.js";
 import { vimNormal, type VimMode } from "./vim.js";
@@ -609,8 +609,11 @@ export function InputBox({
     setDismissed(false);
   };
 
-  useInput(
-    (input, key) => {
+  // Ink's useInput effect depends on the callback identity. An inline callback therefore tears down and
+  // re-adds the stdin listener after every rendered keystroke; on a loaded/remote terminal, the next key can
+  // arrive after paint but before the passive effect re-subscribes and be lost. Effect Events keep one stable
+  // subscription while reading the latest render state, and are invoked by Ink's effect-owned listener.
+  const handleInput = useEffectEvent((input: string, key: Key) => {
       if (popupOpen && (key.upArrow || key.downArrow)) {
         const n = candidates.length;
         setSel((s) => (key.downArrow ? (s + 1) % n : (s - 1 + n) % n));
@@ -759,9 +762,8 @@ export function InputBox({
         }
         set(value.slice(0, cursor) + input + value.slice(cursor), cursor + input.length);
       }
-    },
-    { isActive },
-  );
+  });
+  useInput(handleInput, { isActive });
 
   const gutter = vim && mode === "normal" ? "◆ " : "› ";
   const gutterColor = vim ? (mode === "normal" ? "yellow" : "green") : "cyan";
