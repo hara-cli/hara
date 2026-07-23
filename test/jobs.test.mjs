@@ -18,6 +18,7 @@ after(() => {
 });
 
 const nodeCommand = (script, ...args) => [process.execPath, script, ...args].map((part) => JSON.stringify(part)).join(" ");
+const processTreeTimeoutMs = 1_000;
 const alive = (pid) => {
   try {
     process.kill(pid, 0);
@@ -131,11 +132,17 @@ test("runShell timeout is wall-clock bounded and kills a SIGTERM-resistant grand
     const script = processTreeFixture(dir);
     const started = Date.now();
     await assert.rejects(
-      runShell(nodeCommand(script, pidFile), dir, "off", { timeout: 200, maxBuffer: 64 * 1024 }),
-      /timed out after 200ms/,
+      runShell(nodeCommand(script, pidFile), dir, "off", { timeout: processTreeTimeoutMs, maxBuffer: 64 * 1024 }),
+      new RegExp(`timed out after ${processTreeTimeoutMs}ms`),
     );
-    assert.ok(Date.now() - started >= 400, "runShell waits until forced tree termination is issued before settling");
-    assert.ok(Date.now() - started < 2500, "descendant-held pipes cannot extend the wall-clock timeout indefinitely");
+    assert.ok(
+      Date.now() - started >= processTreeTimeoutMs + 200,
+      "runShell waits until forced tree termination is issued before settling",
+    );
+    assert.ok(
+      Date.now() - started < processTreeTimeoutMs + 2_500,
+      "descendant-held pipes cannot extend the wall-clock timeout indefinitely",
+    );
     await assertProcessGone(await waitForPid(pidFile), "runShell grandchild");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -148,8 +155,8 @@ test("TERM escalation still kills a quiet grandchild after the direct shell has 
   try {
     const script = processTreeFixture(dir, false, false);
     await assert.rejects(
-      runShell(nodeCommand(script, pidFile), dir, "off", { timeout: 200, maxBuffer: 64 * 1024 }),
-      /timed out after 200ms/,
+      runShell(nodeCommand(script, pidFile), dir, "off", { timeout: processTreeTimeoutMs, maxBuffer: 64 * 1024 }),
+      new RegExp(`timed out after ${processTreeTimeoutMs}ms`),
     );
     await assertProcessGone(await waitForPid(pidFile), "quiet grandchild after shell close");
   } finally {
