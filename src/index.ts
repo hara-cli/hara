@@ -310,6 +310,9 @@ async function buildProvider(
     if (!ap.gatewayUrl || !ap.deviceToken || deviceTokenExpired(ap.tokenExpiresAt)) return null;
     const baseURL = ap.baseURL || `${ap.gatewayUrl.replace(/\/$/, "")}/v1`;
     const model = resolveGatewayModel(cfg, ap, process.env, targetOverride?.model);
+    if (ap.availableModels?.length && !ap.availableModels.includes(model)) {
+      throw new Error(`model '${model}' is not authorized for organization connection '${ap.id}'`);
+    }
     const target = { provider: "hara-gateway" as const, apiKey: ap.deviceToken, baseURL, model };
     const built = await createProviderForTarget(target, cfg.reasoningEffort);
     if (!targetOverride && built) {
@@ -2523,6 +2526,14 @@ program
         },
         buildProviderFor: async (model, effort, targetCwd) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
+          const { profile } = profileForConfig(live);
+          if (
+            profile.kind === "gateway"
+            && profile.availableModels?.length
+            && !profile.availableModels.includes(model)
+          ) {
+            throw new Error(`model '${model}' is not authorized for organization connection '${profile.id}'`);
+          }
           return withRouting(
             await buildProvider(
               {
@@ -2538,6 +2549,7 @@ program
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const { profile } = profileForConfig(live);
           if (profile.kind === "gateway") {
+            if (profile.availableModels?.length) return Promise.resolve([...profile.availableModels]);
             const baseURL = profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined);
             return listModels(baseURL, profile.deviceToken ?? "");
           }
@@ -2630,17 +2642,34 @@ program
           }
           return providerSettingsSnapshot(settingsCwd);
         },
-        effortLevels: levelsFor(resolvePlatform(cfg.provider, cfg.baseURL ?? providerDefaultBaseURL(cfg.provider)).reasoning, cfg.model).filter((e): e is NonNullable<typeof e> => !!e),
+        effortLevels: levelsFor(
+          resolvePlatform(
+            cfg.provider,
+            cfg.baseURL ?? providerDefaultBaseURL(cfg.provider),
+            undefined,
+            cfg.model,
+          ).reasoning,
+          cfg.model,
+        ).filter((e): e is NonNullable<typeof e> => !!e),
         runtimeInfo: (targetCwd, selectedModel) => {
+          const live = loadConfig({ cwd: targetCwd ?? cwd });
+          const { profile } = profileForConfig(live);
           const current = providerSettingsSnapshot(targetCwd ?? cwd).current;
           const model = selectedModel ?? current.model;
+          const inferredEfforts = levelsFor(
+            resolvePlatform(current.provider, current.baseURL, undefined, model).reasoning,
+            model,
+          ).filter((e): e is NonNullable<typeof e> => !!e);
+          const advertisedEfforts = profile.kind === "gateway" && Array.isArray(profile.thinkingEfforts)
+            ? profile.thinkingEfforts.filter((effort) => ["off", "low", "medium", "high", "max"].includes(effort))
+            : undefined;
           return {
             providerId: current.provider,
             model,
-            effortLevels: levelsFor(
-              resolvePlatform(current.provider, current.baseURL).reasoning,
-              model,
-            ).filter((e): e is NonNullable<typeof e> => !!e),
+            effortLevels: advertisedEfforts ?? inferredEfforts,
+            ...(profile.kind === "gateway" && profile.availableModels?.length
+              ? { availableModels: [...profile.availableModels] }
+              : {}),
           };
         },
         runLimits: (targetCwd) => agentRunLimits(loadConfig({ cwd: targetCwd ?? cwd })),
@@ -5041,7 +5070,7 @@ program.action(async (opts) => {
               // doesn't enumerate models.
               const bURL = cfg.baseURL ?? providerDefaultBaseURL(cfg.provider);
               const models = await listModels(bURL, cfg.apiKey ?? "");
-              const style = resolvePlatform(cfg.provider, bURL).reasoning;
+              const style = resolvePlatform(cfg.provider, bURL, undefined, cfg.model).reasoning;
               const chosen = await h.pickModel({ models, style, current: cfg.model, effort: cfg.reasoningEffort });
               if (!chosen) return; // esc — no change
               if (chosen.model) {

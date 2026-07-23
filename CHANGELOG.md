@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.1 — 2026-07-23 — managed DeepSeek V4 model controls
+
+- Hara Control enrollment now preserves the server-authorized model list and thinking levels in the
+  private enterprise profile. Canonical `deepseek-v4-flash` and `deepseek-v4-pro` connections expose only
+  the documented `off`, `high`, and `max` choices through CLI and Serve.
+- Managed DeepSeek requests now retain the DeepSeek V4 `thinking` and `reasoning_effort` fields through the
+  Hara gateway route. Legacy low/medium configuration values normalize to the documented high level.
+- Serve rejects model or thinking changes outside the active enterprise token's advertised scope before a
+  request reaches the gateway, and its model catalog falls back to that stored scope if live discovery is
+  unavailable or broader than the virtual key.
+- Regression coverage captures the real OpenAI-compatible request body and verifies scoped model/effort RPC
+  behavior. Upgrade with `npm i -g @nanhara/hara@0.134.1`.
+
 ## 0.134.0 — 2026-07-23 — Desktop-owned WeChat QR login
 
 - `hara serve` now exposes an authenticated, loopback-only WeChat login lifecycle for Desktop:

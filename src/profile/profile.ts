@@ -73,6 +73,8 @@ export interface Profile {
   /** P0: gateway populates with [defaultModel] (or empty if the gateway didn't say);
    *  byok stays empty (no list constraint). P1 may pull this from /v1/models. */
   availableModels?: string[];
+  /** Server-advertised thinking dial for the scoped gateway model. */
+  thinkingEfforts?: string[];
   enrolledAt?: string;
   /** Control/data-plane shared expiry for the gateway device token. */
   tokenExpiresAt?: string;
@@ -148,7 +150,10 @@ function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | nul
     deviceToken: e.deviceToken,
     baseURL: e.baseURL,
     defaultModel,
-    availableModels: defaultModel ? [defaultModel] : [],
+    availableModels: Array.isArray(e.availableModels)
+      ? e.availableModels
+      : (defaultModel ? [defaultModel] : []),
+    thinkingEfforts: Array.isArray(e.thinkingEfforts) ? e.thinkingEfforts : undefined,
     enrolledAt: e.enrolledAt || new Date().toISOString(),
     tokenExpiresAt: typeof e.expiresAt === "string" ? e.expiresAt : undefined,
   };

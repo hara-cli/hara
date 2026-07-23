@@ -23,12 +23,21 @@ import { listProfiles, loadActiveProfile } from "../dist/profile/profile.js";
 test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry, requires a token", () => {
   const e = parseEnrollResponse(
     "https://gw/",
-    { device_token: "t1", device_id: "d1", model: "m1", expires_at: "2026-01-08T00:00:00Z" },
+    {
+      device_token: "t1",
+      device_id: "d1",
+      model: "deepseek-v4-pro",
+      available_models: ["deepseek-v4-pro"],
+      thinking_efforts: ["off", "high", "max"],
+      expires_at: "2026-01-08T00:00:00Z",
+    },
     "2026-01-01",
   );
   assert.equal(e.gatewayUrl, "https://gw");
   assert.equal(e.deviceToken, "t1");
   assert.equal(e.deviceId, "d1");
+  assert.deepEqual(e.availableModels, ["deepseek-v4-pro"]);
+  assert.deepEqual(e.thinkingEfforts, ["off", "high", "max"]);
   assert.equal(e.expiresAt, "2026-01-08T00:00:00.000Z");
   assert.equal(gatewayBaseURL(e), "https://gw/v1");
   assert.equal(gatewayBaseURL({ ...e, baseURL: "https://gw/openai" }), "https://gw/openai");
@@ -36,6 +45,22 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
   assert.throws(
     () => parseEnrollResponse("https://gw", { device_token: "t1", expires_at: "not-a-date" }, "t"),
     /invalid expires_at/,
+  );
+  assert.throws(
+    () => parseEnrollResponse("https://gw", {
+      device_token: "t1",
+      model: "deepseek-v4-pro",
+      available_models: ["deepseek-v4-flash"],
+    }, "t"),
+    /not present/,
+  );
+  assert.throws(
+    () => parseEnrollResponse("https://gw", {
+      device_token: "t1",
+      model: "deepseek-v4-pro",
+      thinking_efforts: ["xhigh"],
+    }, "t"),
+    /invalid thinking_efforts/,
   );
 });
 
@@ -114,7 +139,9 @@ test("profile-native enrollment stores only the scoped token in private profiles
       res.end(JSON.stringify({
         device_token: "scoped-device-token",
         device_id: "device-one",
-        model: "deepseek-chat",
+        model: "deepseek-v4-pro",
+        available_models: ["deepseek-v4-pro"],
+        thinking_efforts: ["off", "high", "max"],
         expires_at: "2099-01-01T00:00:00Z",
       }));
     } else if (req.url === "/v1/heartbeat") {
@@ -138,7 +165,10 @@ test("profile-native enrollment stores only the scoped token in private profiles
     assert.equal(result.heartbeatOk, true);
     assert.equal(heartbeatSeen, true);
     assert.equal(loadActiveProfile().id, "team-a");
-    assert.equal(listProfiles().find((profile) => profile.id === "team-a")?.deviceToken, "scoped-device-token");
+    const storedProfile = listProfiles().find((profile) => profile.id === "team-a");
+    assert.equal(storedProfile?.deviceToken, "scoped-device-token");
+    assert.deepEqual(storedProfile?.availableModels, ["deepseek-v4-pro"]);
+    assert.deepEqual(storedProfile?.thinkingEfforts, ["off", "high", "max"]);
     const profilesPath = join(home, ".hara", "profiles.json");
     assert.equal(statSync(profilesPath).mode & 0o777, 0o600);
     const stored = readFileSync(profilesPath, "utf8");

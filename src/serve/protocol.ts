@@ -20,7 +20,7 @@
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}
 //   automation.list   {}                          → {jobs:[{id,name,mode,enabled,lastRunAt,lastStatus,…}],
 //                                                    sessions:[{id,title,source,sourceName,updatedAt,…}]}
-//   models.list       {}                          → {models:[…], current, effortLevels:[…]}
+//   models.list       {sessionId?}                → {models:[…], current, effortLevels:[…]}
 //   settings.providers.list {}                    → redacted provider catalog + current profile state
 //   settings.providers.test {provider,model,…}     → {ok,models,error?} (credential is ephemeral)
 //   settings.providers.save {provider,model,…}     → redacted state (credential is never returned)

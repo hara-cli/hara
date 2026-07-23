@@ -30,7 +30,7 @@ export async function createProviderForTarget(
   // discarded all user credentials at target resolution.
   const transportKey = apiKey ?? (providerIsLocal(provider) ? "hara-local-no-secret" : undefined);
   if (!transportKey) return null;
-  const wire = resolvePlatform(provider, baseURL).wireApi;
+  const wire = resolvePlatform(provider, baseURL, undefined, model).wireApi;
   if (wire === "anthropic") {
     return createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort });
   }

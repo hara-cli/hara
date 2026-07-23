@@ -68,10 +68,20 @@ const BY_PROVIDER: Record<string, Partial<PlatformCaps>> = {
 /** Resolve a platform's capabilities from (provider id, baseURL, explicit wireApi override). Precedence:
  *  an explicit `wireApi` from config wins the transport; then the baseURL shape (so custom DashScope/
  *  token-plan/anthropic endpoints Just Work); then the provider-id override; else the wire default. */
-export function resolvePlatform(providerId?: string, baseURL?: string, wireApiOverride?: WireApi): PlatformCaps {
+export function resolvePlatform(
+  providerId?: string,
+  baseURL?: string,
+  wireApiOverride?: WireApi,
+  modelId?: string,
+): PlatformCaps {
   // baseURL shape is the strongest signal for a custom profile; else the provider-id override; else chat.
   const byUrl = baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
-  const byProv = providerId ? BY_PROVIDER[providerId] : undefined;
+  const managedDeepSeekGateway =
+    providerId === "hara-gateway"
+    && /^(?:deepseek-v4-(?:flash|pro)|deepseek-(?:chat|reasoner|pro))$/i.test(modelId ?? "");
+  const byProv = managedDeepSeekGateway
+    ? { ...BY_PROVIDER["hara-gateway"], reasoning: "deepseek" as const }
+    : providerId ? BY_PROVIDER[providerId] : undefined;
   const resolved: PlatformCaps = byUrl ?? { ...BY_WIRE.chat, ...(byProv ?? {}) };
   // An explicit wireApi from config wins the transport. When it changes the wire, the reasoning style
   // follows that wire's default (reasoning is wire-dependent — reasoning_effort on chat vs reasoning_object

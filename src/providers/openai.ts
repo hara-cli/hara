@@ -122,7 +122,7 @@ export function createOpenAIProvider(opts: {
       // enable_thinking, OpenAI reasoning models → reasoning_effort, …); the applier turns hara's dial
       // into the params to merge. UNSET → {} (model default, zero impact). One data-driven line replaces
       // the old per-platform if/else — a new platform is a registry row, not code here.
-      const caps = resolvePlatform(opts.label, opts.baseURL);
+      const caps = resolvePlatform(opts.label, opts.baseURL, undefined, opts.model);
       Object.assign(params, reasoningParams(caps.reasoning, opts.reasoningEffort, opts.model));
 
       // Stream: emit text deltas live; accumulate tool-call args by index; grab usage from the tail chunk.

@@ -478,6 +478,56 @@ test("serve e2e: models.list derives reasoning controls from the session-pinned 
   }
 });
 
+test("serve e2e: managed gateway enforces its model scope and advertised DeepSeek thinking levels", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-managed-model-scope-"));
+  const store = memStore();
+  const deps = {
+    ...baseDeps(textProvider, store),
+    buildProviderFor: async (model) => ({ ...textProvider, model }),
+    listModels: async () => ["deepseek-v4-flash", "deepseek-v4-pro"],
+    runtimeInfo: (_cwd, model) => ({
+      providerId: "hara-gateway",
+      model: model ?? "deepseek-v4-pro",
+      effortLevels: ["off", "high", "max"],
+      availableModels: ["deepseek-v4-pro"],
+    }),
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const sid = (await c.call("session.create", {})).result.sessionId;
+    const switched = await c.call("session.set-model", {
+      sessionId: sid,
+      model: "deepseek-v4-pro",
+      effort: "max",
+    });
+    assert.equal(switched.result.model, "deepseek-v4-pro");
+    assert.equal(switched.result.effort, "max");
+
+    const listed = await c.call("models.list", { sessionId: sid });
+    assert.deepEqual(listed.result.models, ["deepseek-v4-pro"], "stored token scope wins over a broader discovery response");
+    assert.deepEqual(listed.result.effortLevels, ["off", "high", "max"]);
+
+    const forbiddenModel = await c.call("session.set-model", {
+      sessionId: sid,
+      model: "deepseek-v4-flash",
+    });
+    assert.match(forbiddenModel.error.message, /not authorized/);
+
+    const forbiddenEffort = await c.call("session.set-model", {
+      sessionId: sid,
+      model: "deepseek-v4-pro",
+      effort: "medium",
+    });
+    assert.match(forbiddenEffort.error.message, /not supported/);
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: provider settings are capability-advertised, redacted, tested, and saved without echoing credentials", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-provider-settings-"));
   const state = {

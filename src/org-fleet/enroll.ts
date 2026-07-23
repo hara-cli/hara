@@ -5,7 +5,7 @@
 // plane fleet visibility. Token + endpoint live in ~/.hara/org.json (0600).
 //
 // Protocol (what `hara-control` implements on the other end):
-//   POST {gateway}/v1/enroll      {code, device:{name,os,hara_version}} -> {device_token, device_id, model, base_url?, expires_at?}
+//   POST {gateway}/v1/enroll      {code, device:{name,os,hara_version}} -> {device_token, device_id, model, available_models?, thinking_efforts?, base_url?, expires_at?}
 //   POST {gateway}/v1/heartbeat   Bearer <device_token> {device_id, name, os, hara_version} -> 200/204
 //   GET  {gateway}/v1/roles       Bearer <device_token> -> {version, org_policy, roles:[…]}  (B3 digital-employee push-down)
 //   POST {gateway}/v1/chat/completions  (OpenAI-compatible; the normal agent traffic, Bearer <device_token>)
@@ -33,6 +33,10 @@ export interface Enrollment {
   deviceToken: string; // scoped + revocable; issued by hara-control, NOT a provider key
   deviceId: string;
   model: string; // default model the gateway routes to ("" = gateway decides)
+  /** Server-authoritative models permitted by this scoped token. Legacy servers omit this field. */
+  availableModels?: string[];
+  /** Thinking controls accepted by the selected managed model. Legacy servers omit this field. */
+  thinkingEfforts?: string[];
   baseURL?: string; // explicit OpenAI-compatible base; defaults to <gatewayUrl>/v1
   enrolledAt: string;
   /** Device-token expiry shared by Hara Control and the model gateway. Missing on legacy servers. */
@@ -50,6 +54,7 @@ export interface GatewayProfileEnrollmentInput {
 const MAX_ENROLL_RESPONSE_BYTES = 1024 * 1024;
 const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+const THINKING_EFFORTS = new Set(["off", "low", "medium", "high", "max"]);
 const loopbackHostname = (hostname: string): boolean => hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 
 const deviceInfo = (): { name: string; os: string; hara_version: string } => ({ name: hostname(), os: platform(), hara_version: process.env.HARA_BUILD_VERSION ?? "dev" });
@@ -127,6 +132,8 @@ export function loadEnrollment(): Enrollment | null {
         deviceToken: ap.deviceToken,
         deviceId: ap.deviceId || "",
         model: ap.defaultModel || "",
+        availableModels: ap.availableModels,
+        thinkingEfforts: ap.thinkingEfforts,
         baseURL: ap.baseURL,
         enrolledAt: ap.enrolledAt || new Date().toISOString(),
         expiresAt: ap.tokenExpiresAt,
@@ -136,6 +143,37 @@ export function loadEnrollment(): Enrollment | null {
     /* not yet migrated */
   }
   return null;
+}
+
+function parseAdvertisedStringList(
+  value: unknown,
+  field: string,
+  { maxItems, maxLength, allowed }: { maxItems: number; maxLength: number; allowed?: Set<string> },
+): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.length > maxItems) {
+    throw new Error(`enroll response contains an invalid ${field}`);
+  }
+  const result: string[] = [];
+  for (const entry of value) {
+    if (
+      typeof entry !== "string"
+      || !entry
+      || entry.length > maxLength
+      || CONTROL_CHARACTERS.test(entry)
+      || (allowed && !allowed.has(entry))
+    ) {
+      throw new Error(`enroll response contains an invalid ${field}`);
+    }
+    if (!result.includes(entry)) result.push(entry);
+  }
+  return result;
+}
+
+function inferredGatewayThinkingEfforts(model: string): string[] {
+  return /^(?:deepseek-v4-(?:flash|pro)|deepseek-(?:chat|reasoner|pro))$/i.test(model)
+    ? ["off", "high", "max"]
+    : [];
 }
 
 function saveEnrollment(e: Enrollment): void {
@@ -165,6 +203,19 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
   if (typeof rawModel !== "string" || rawModel.length > 512 || CONTROL_CHARACTERS.test(rawModel)) {
     throw new Error("enroll response contains an invalid model");
   }
+  const availableModels = parseAdvertisedStringList(
+    j.available_models ?? j.availableModels,
+    "available_models",
+    { maxItems: 64, maxLength: 512 },
+  ) ?? (rawModel ? [rawModel] : []);
+  if (rawModel && !availableModels.includes(rawModel)) {
+    throw new Error("enroll response model is not present in available_models");
+  }
+  const thinkingEfforts = parseAdvertisedStringList(
+    j.thinking_efforts ?? j.thinkingEfforts,
+    "thinking_efforts",
+    { maxItems: THINKING_EFFORTS.size, maxLength: 16, allowed: THINKING_EFFORTS },
+  ) ?? inferredGatewayThinkingEfforts(rawModel);
   const rawExpiresAt = j.expires_at ?? j.expiresAt;
   let expiresAt: string | undefined;
   if (rawExpiresAt !== undefined && rawExpiresAt !== null) {
@@ -178,6 +229,8 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     deviceToken,
     deviceId: rawDeviceId,
     model: rawModel,
+    availableModels,
+    thinkingEfforts,
     baseURL: normalizeGatewayBaseUrl(j.base_url ?? j.baseURL),
     enrolledAt: now,
     expiresAt,
@@ -265,7 +318,8 @@ export function gatewayProfileFromEnrollment(id: string, label: string | undefin
     deviceToken: e.deviceToken,
     baseURL: e.baseURL,
     defaultModel: e.model || "",
-    availableModels: e.model ? [e.model] : [],
+    availableModels: e.availableModels ?? (e.model ? [e.model] : []),
+    thinkingEfforts: e.thinkingEfforts,
     enrolledAt: e.enrolledAt,
     tokenExpiresAt: e.expiresAt,
   };
@@ -297,6 +351,8 @@ export function enrollmentFromProfile(profile: Profile): Enrollment | null {
     deviceToken: profile.deviceToken,
     deviceId: profile.deviceId || "",
     model: profile.defaultModel || "",
+    availableModels: profile.availableModels,
+    thinkingEfforts: profile.thinkingEfforts,
     baseURL: profile.baseURL,
     enrolledAt: profile.enrolledAt || new Date(0).toISOString(),
     expiresAt: profile.tokenExpiresAt,

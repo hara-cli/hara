@@ -70,6 +70,16 @@ test("resolvePlatform: DeepSeek OpenAI-compat (chat) → the deepseek style (thi
   assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/v1").wireApi, "chat");
   // The vendor's /anthropic endpoint still wins (checked first) → anthropic wire, not the chat deepseek style.
   assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/anthropic").reasoning, "thinking_budget");
+  assert.equal(
+    resolvePlatform("hara-gateway", "https://gw.nanhara.tech/v1", undefined, "deepseek-v4-pro").reasoning,
+    "deepseek",
+    "a canonical managed model keeps DeepSeek thinking controls through Hara Control",
+  );
+  assert.equal(
+    resolvePlatform("hara-gateway", "https://gw.nanhara.tech/v1", undefined, "glm-5").reasoning,
+    "none",
+    "unrelated gateway models never inherit DeepSeek-only request fields",
+  );
 });
 
 test("resolvePlatform: a custom DashScope baseURL → chat + enable_thinking (custom:qwen3.7-plus)", () => {

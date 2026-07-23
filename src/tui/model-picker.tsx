@@ -11,7 +11,7 @@ import { supportsReasoningStyle, type ReasoningStyle, type Effort } from "../pro
 export function levelsFor(style: ReasoningStyle, model = ""): Effort[] {
   if (!supportsReasoningStyle(style, model)) return [];
   if (style === "enable_thinking" || style === "ollama_think") return ["off", "high"]; // "high" renders as "on"
-  if (style === "deepseek") return ["off", "low", "medium", "high", "max"]; // DeepSeek V4 honors a real "max"
+  if (style === "deepseek") return ["off", "high", "max"]; // DeepSeek V4 natively exposes high|max; off uses thinking.disabled
   return ["off", "low", "medium", "high"];
 }
 

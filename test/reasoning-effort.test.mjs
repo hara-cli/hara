@@ -78,9 +78,9 @@ test("deepseek style: high/max → thinking enabled + the effort enum passed thr
   assert.deepEqual(reasoningParams("deepseek", "max", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "max" });
 });
 
-test("deepseek style: low/medium pass through (DeepSeek maps them → high server-side)", () => {
-  assert.deepEqual(reasoningParams("deepseek", "low", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "low" });
-  assert.deepEqual(reasoningParams("deepseek", "medium", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "medium" });
+test("deepseek style: legacy low/medium config values normalize to the documented high wire value", () => {
+  assert.deepEqual(reasoningParams("deepseek", "low", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "high" });
+  assert.deepEqual(reasoningParams("deepseek", "medium", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "high" });
 });
 
 test("deepseek style: NOT gated on isReasoningModel — applies even to a bare model id", () => {

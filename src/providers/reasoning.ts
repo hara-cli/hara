@@ -63,10 +63,13 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
       return { reasoning: { effort: effort === "off" ? "minimal" : effort === "max" ? "high" : effort } };
     case "deepseek":
       // off → turn thinking OFF via the object (reasoning_effort can't say "off"). Any level → thinking ON
-      // + the effort enum; DeepSeek natively honors high|max and maps low/medium→high server-side, so we
-      // pass the dial through as-is (forward-compatible if DeepSeek later distinguishes low/medium).
+      // + the effort enum. DeepSeek natively exposes high|max; normalize legacy low/medium config values
+      // to high so the wire request always uses a documented option.
       if (effort === "off") return { thinking: { type: "disabled" } };
-      return { thinking: { type: "enabled" }, reasoning_effort: effort };
+      return {
+        thinking: { type: "enabled" },
+        reasoning_effort: effort === "max" ? "max" : "high",
+      };
     case "thinking_budget": // Anthropic — applied by anthropic.ts, not on a chat/responses merge body
     case "none":
     default:

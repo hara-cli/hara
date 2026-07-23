@@ -229,3 +229,52 @@ test("local provider factory omits Authorization on the wire", async () => {
     await once(server, "close");
   }
 });
+
+test("managed DeepSeek V4 gateway sends the selected native thinking controls on the wire", async () => {
+  let authorization;
+  let requestBody;
+  const server = createServer((request, response) => {
+    authorization = request.headers.authorization;
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      requestBody = JSON.parse(body);
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end([
+        'data: {"id":"managed-1","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
+        "",
+        'data: {"id":"managed-1","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+        "",
+        "data: [DONE]",
+        "",
+      ].join("\n"));
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const provider = await createProviderForTarget({
+      provider: "hara-gateway",
+      apiKey: "scoped-device-token",
+      model: "deepseek-v4-pro",
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+    }, "max");
+    assert.ok(provider);
+    const result = await provider.turn({
+      system: "reply ok",
+      history: [{ role: "user", content: "ok" }],
+      tools: [],
+      onText: () => {},
+    });
+    assert.equal(result.stop, "end");
+    assert.equal(authorization, "Bearer scoped-device-token");
+    assert.equal(requestBody.model, "deepseek-v4-pro");
+    assert.deepEqual(requestBody.thinking, { type: "enabled" });
+    assert.equal(requestBody.reasoning_effort, "max");
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});

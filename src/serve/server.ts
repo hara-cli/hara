@@ -128,7 +128,13 @@ export interface ServeDeps {
   effortLevels?: string[];
   /** Live defaults advertised to persistent clients after config/profile edits. `model` lets a session
    * pinned to a non-default model ask for that model's valid reasoning controls. */
-  runtimeInfo?: (cwd?: string, model?: string) => { providerId: string; model: string; effortLevels?: string[] };
+  runtimeInfo?: (cwd?: string, model?: string) => {
+    providerId: string;
+    model: string;
+    effortLevels?: string[];
+    /** Finite server-authorized set for a scoped gateway token. Missing means unconstrained discovery. */
+    availableModels?: string[];
+  };
   /** Per-project lifecycle limits, read at turn start so persistent Desktop sessions pick up config edits. */
   runLimits?: (cwd?: string) => { timeoutMs: number; maxRounds: number };
   spawnSubagent: (
@@ -475,12 +481,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
   const hub = new SessionHub(deps.store ?? realStore);
-  const runtimeInfo = (cwd?: string, model?: string): { providerId: string; model: string; effortLevels: string[] } => {
+  const runtimeInfo = (cwd?: string, model?: string): {
+    providerId: string;
+    model: string;
+    effortLevels: string[];
+    availableModels?: string[];
+  } => {
     const live = deps.runtimeInfo?.(cwd, model);
     return {
       providerId: live?.providerId ?? deps.providerId,
       model: live?.model ?? model ?? deps.model,
       effortLevels: live?.effortLevels ?? deps.effortLevels ?? [],
+      ...(live?.availableModels ? { availableModels: live.availableModels } : {}),
     };
   };
   const refreshSessionProvider = async (session: ServeSession): Promise<boolean> => {
@@ -1232,10 +1244,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           case "models.list": {
             const session = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : (session?.meta.cwd ?? opts.cwd);
-            const models = deps.listModels ? await deps.listModels(targetCwd).catch(() => []) : [];
+            const discoveredModels = deps.listModels ? await deps.listModels(targetCwd).catch(() => []) : [];
             const defaultRuntime = runtimeInfo(targetCwd);
             const current = session?.meta.model ?? defaultRuntime.model;
             const currentRuntime = runtimeInfo(targetCwd, current);
+            const models = defaultRuntime.availableModels?.length
+              ? [...defaultRuntime.availableModels]
+              : discoveredModels;
             return reply(rpcResult(id!, { models, current, effort: session?.effort ?? null, effortLevels: currentRuntime.effortLevels }));
           }
           case "settings.providers.list": {
@@ -1366,6 +1381,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const model = typeof p.model === "string" && p.model ? p.model : s.meta.model;
             const effort = typeof p.effort === "string" && p.effort ? p.effort : undefined;
             if (!deps.buildProviderFor) return reply(rpcError(id, ERR.METHOD, "model switching not supported by this server"));
+            const requestedRuntime = runtimeInfo(s.meta.cwd, model);
+            if (requestedRuntime.availableModels?.length && !requestedRuntime.availableModels.includes(model)) {
+              return reply(rpcError(id, ERR.PARAMS, `model '${model}' is not authorized for the active organization connection`));
+            }
+            if (effort && !requestedRuntime.effortLevels.includes(effort)) {
+              return reply(rpcError(id, ERR.PARAMS, `thinking effort '${effort}' is not supported by model '${model}'`));
+            }
             s.configuring = true;
             try {
               const provider = await deps.buildProviderFor(model, effort, s.meta.cwd);
