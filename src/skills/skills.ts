@@ -114,7 +114,15 @@ let _digestCache = new Map<string, string>();
 export function skillsDigest(cwd: string): string {
   if (_digestCache.has(cwd)) return _digestCache.get(cwd)!;
   const lines: string[] = [];
-  for (const s of loadSkillIndex(cwd)) {
+  const sourcePriority: Record<Skill["source"], number> = {
+    project: 0,
+    global: 1,
+    plugin: 2,
+  };
+  const skills = loadSkillIndex(cwd).sort(
+    (a, b) => sourcePriority[a.source] - sourcePriority[b.source],
+  );
+  for (const s of skills) {
     if (!s.modelInvocable || !s.description || !scanMemory(s.description).ok) continue;
     lines.push(`- ${s.id}: ${s.description}${s.whenToUse ? ` — ${s.whenToUse}` : ""}`);
   }

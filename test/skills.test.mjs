@@ -69,13 +69,14 @@ test("fork skill propagates the parent cancellation signal to its sub-agent", as
   }
 });
 
-test("skillsDigest: one line per model-invocable skill, drops disable-model-invocation", () => {
+test("skillsDigest: prioritizes project skills and drops disable-model-invocation", () => {
   const proj = tmpProject();
   try {
     writeSkill(proj, "alpha", "name: alpha\ndescription: Do alpha things", "body");
     writeSkill(proj, "secret", "name: secret\ndescription: hidden helper\ndisable-model-invocation: true", "body");
     invalidateSkillsCache();
     const digest = skillsDigest(proj);
+    assert.match(digest, /^- alpha: Do alpha things/m, "project skills stay ahead of the global/plugin digest cap");
     assert.match(digest, /alpha: Do alpha things/);
     assert.doesNotMatch(digest, /secret|hidden helper/); // disable-model-invocation hides it from the index
   } finally {
