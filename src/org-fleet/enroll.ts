@@ -6,19 +6,21 @@
 //
 // Protocol (what `hara-control` implements on the other end):
 //   POST {gateway}/v1/enroll      {code, device:{name,os,hara_version}} -> {device_token, device_id, model, available_models?, thinking_efforts?, base_url?, expires_at?}
-//   POST {gateway}/v1/heartbeat   Bearer <device_token> {device_id, name, os, hara_version} -> 200/204
+//   POST {gateway}/v1/heartbeat   Bearer <device_token> {device_id, name, os, hara_version}
+//     -> 200 {model, available_models?, thinking_efforts?, expires_at?} or legacy 204
 //   GET  {gateway}/v1/roles       Bearer <device_token> -> {version, org_policy, roles:[…]}  (B3 digital-employee push-down)
 //   POST {gateway}/v1/chat/completions  (OpenAI-compatible; the normal agent traffic, Bearer <device_token>)
 import { homedir, hostname, platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
-import { orgRolesDir } from "../org/roles.js";
+import { invalidateRolesCache, orgRolesDir } from "../org/roles.js";
 import {
   loadActiveProfile,
   upsertProfile,
   useProfile,
   getProfile,
   DEFAULT_ORG_ID,
+  isValidProfileId,
   type Profile,
 } from "../profile/profile.js";
 import {
@@ -52,7 +54,7 @@ export interface GatewayProfileEnrollmentInput {
 }
 
 const MAX_ENROLL_RESPONSE_BYTES = 1024 * 1024;
-const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const MAX_HEARTBEAT_RESPONSE_BYTES = 64 * 1024;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const THINKING_EFFORTS = new Set(["off", "low", "medium", "high", "max"]);
 const loopbackHostname = (hostname: string): boolean => hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
@@ -99,7 +101,7 @@ function validateGatewayProfileInput(input: GatewayProfileEnrollmentInput): Gate
   const id = input.id.trim();
   const label = input.label?.trim();
   const code = input.code.trim();
-  if (!PROFILE_ID.test(id)) throw new Error("connection id must use 1-64 letters, numbers, dots, underscores, or dashes");
+  if (!isValidProfileId(id)) throw new Error("connection id must use 1-64 letters, numbers, dots, underscores, or dashes");
   if (id === "personal") throw new Error("the personal profile id is reserved");
   if (label && (label.length > 80 || CONTROL_CHARACTERS.test(label))) throw new Error("organization name must be 80 characters or fewer");
   if (!code || code.length > 256 || CONTROL_CHARACTERS.test(code)) throw new Error("registration code must be 1-256 printable characters");
@@ -111,18 +113,24 @@ export function gatewayBaseURL(e: Enrollment): string {
   return e.baseURL || `${e.gatewayUrl.replace(/\/$/, "")}/v1`;
 }
 
-export function loadEnrollment(): Enrollment | null {
-  // 1) Legacy storage (~/.hara/org.json) for back-compat with pre-profile builds. After the
-  //    profile migration runs (lazily on any profile.ts read), org.json is renamed to .legacy
-  //    so this branch only fires for users who never touched the new profile layer yet.
+function loadLegacyEnrollment(): Enrollment | null {
   try {
     const binding = bindPrivateHaraStateFile(homedir(), [], "org.json");
     const snapshot = readPrivateStateFileSnapshotSync(binding.path, 1024 * 1024);
     const e = snapshot ? JSON.parse(snapshot.text) as Enrollment : null;
     if (e && typeof e === "object" && e.gatewayUrl && e.deviceToken) return e;
   } catch {
-    /* fall through to profile-derived */
+    /* invalid or absent legacy state */
   }
+  return null;
+}
+
+export function loadEnrollment(): Enrollment | null {
+  // 1) Legacy storage (~/.hara/org.json) for back-compat with pre-profile builds. After the
+  //    profile migration runs (lazily on any profile.ts read), org.json is renamed to .legacy
+  //    so this branch only fires for users who never touched the new profile layer yet.
+  const legacy = loadLegacyEnrollment();
+  if (legacy) return legacy;
   // 2) Active-profile path. profile.ts doesn't import enroll.ts so this static import is safe.
   try {
     const ap = loadActiveProfile();
@@ -341,7 +349,10 @@ export async function enrollGatewayProfile(
     const switched = useProfile(validated.id);
     if (!switched.ok) throw new Error("organization connection was saved but could not be activated");
   }
-  return { enrollment, heartbeatOk: await heartbeatEnrollment(enrollment, signal) };
+  return {
+    enrollment,
+    heartbeatOk: await heartbeatEnrollment(enrollment, signal, { profileId: validated.id }),
+  };
 }
 
 export function enrollmentFromProfile(profile: Profile): Enrollment | null {
@@ -359,7 +370,75 @@ export function enrollmentFromProfile(profile: Profile): Enrollment | null {
   };
 }
 
-export async function heartbeatEnrollment(e: Enrollment, signal?: AbortSignal): Promise<boolean> {
+type HeartbeatPersistence = { profileId?: string; legacy?: boolean };
+
+function updatedEnrollmentFromHeartbeat(e: Enrollment, body: Record<string, unknown>): Enrollment {
+  const rawModel = body.model;
+  const model = rawModel === undefined || rawModel === null ? e.model : rawModel;
+  if (typeof model !== "string" || model.length > 512 || CONTROL_CHARACTERS.test(model)) {
+    throw new Error("heartbeat response contains an invalid model");
+  }
+  const advertisedModels = parseAdvertisedStringList(
+    body.available_models ?? body.availableModels,
+    "available_models",
+    { maxItems: 64, maxLength: 512 },
+  );
+  const availableModels = advertisedModels ?? e.availableModels ?? (model ? [model] : []);
+  if (model && !availableModels.includes(model)) {
+    throw new Error("heartbeat response model is not present in available_models");
+  }
+  const advertisedEfforts = parseAdvertisedStringList(
+    body.thinking_efforts ?? body.thinkingEfforts,
+    "thinking_efforts",
+    { maxItems: THINKING_EFFORTS.size, maxLength: 16, allowed: THINKING_EFFORTS },
+  );
+  const rawExpiresAt = body.expires_at ?? body.expiresAt;
+  let expiresAt = e.expiresAt;
+  if (rawExpiresAt !== undefined && rawExpiresAt !== null) {
+    if (typeof rawExpiresAt !== "string" || !Number.isFinite(Date.parse(rawExpiresAt))) {
+      throw new Error("heartbeat response contains an invalid expires_at");
+    }
+    expiresAt = new Date(rawExpiresAt).toISOString();
+  }
+  return {
+    ...e,
+    model,
+    availableModels,
+    thinkingEfforts: advertisedEfforts ?? e.thinkingEfforts ?? inferredGatewayThinkingEfforts(model),
+    expiresAt,
+  };
+}
+
+function persistHeartbeatCatalog(e: Enrollment, persistence: HeartbeatPersistence): void {
+  if (persistence.legacy) saveEnrollment(e);
+  if (!persistence.profileId) return;
+  const current = getProfile(persistence.profileId);
+  // A concurrent re-enrollment may already have rotated this profile. Never let an older heartbeat
+  // put its catalog or expiry onto the new credential.
+  if (
+    !current
+    || current.kind !== "gateway"
+    || current.deviceToken !== e.deviceToken
+    || current.gatewayUrl !== e.gatewayUrl
+  ) return;
+  const selected = current.model && e.availableModels?.includes(current.model)
+    ? current.model
+    : undefined;
+  upsertProfile({
+    ...current,
+    defaultModel: e.model,
+    ...(selected ? { model: selected } : { model: undefined }),
+    availableModels: e.availableModels,
+    thinkingEfforts: e.thinkingEfforts,
+    tokenExpiresAt: e.expiresAt,
+  });
+}
+
+export async function heartbeatEnrollment(
+  e: Enrollment,
+  signal?: AbortSignal,
+  persistence: HeartbeatPersistence = {},
+): Promise<boolean> {
   try {
     const res = await fetch(`${e.gatewayUrl}/v1/heartbeat`, {
       method: "POST",
@@ -368,7 +447,20 @@ export async function heartbeatEnrollment(e: Enrollment, signal?: AbortSignal): 
       headers: { "content-type": "application/json", authorization: `Bearer ${e.deviceToken}` },
       body: JSON.stringify({ device_id: e.deviceId, ...deviceInfo() }),
     });
-    return res.ok;
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
+      return false;
+    }
+    if (res.status === 204) return true;
+    const text = await res.text();
+    if (!text.trim()) return true;
+    if (Buffer.byteLength(text, "utf8") > MAX_HEARTBEAT_RESPONSE_BYTES) return false;
+    const body = JSON.parse(text) as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+    const next = updatedEnrollmentFromHeartbeat(e, body as Record<string, unknown>);
+    Object.assign(e, next);
+    persistHeartbeatCatalog(next, persistence);
+    return true;
   } catch {
     return false;
   }
@@ -376,8 +468,24 @@ export async function heartbeatEnrollment(e: Enrollment, signal?: AbortSignal): 
 
 /** Best-effort heartbeat so the control plane shows this device online. Never throws. */
 export async function heartbeat(signal?: AbortSignal): Promise<boolean> {
+  // Do not call loadActiveProfile while a real legacy file exists: that migration intentionally
+  // renames org.json, which would turn a harmless heartbeat into a storage-state mutation.
+  const legacy = loadLegacyEnrollment();
+  if (legacy) return heartbeatEnrollment(legacy, signal, { legacy: true });
   const e = loadEnrollment();
   if (!e) return false;
+  try {
+    const active = loadActiveProfile();
+    if (
+      active.kind === "gateway"
+      && active.deviceToken === e.deviceToken
+      && active.gatewayUrl === e.gatewayUrl
+    ) {
+      return heartbeatEnrollment(e, signal, { profileId: active.id });
+    }
+  } catch {
+    // A pre-profile legacy enrollment remains refreshable without triggering migration failure.
+  }
   return heartbeatEnrollment(e, signal);
 }
 
@@ -435,14 +543,14 @@ function renderRoleMd(r: BundleRole): string {
   return fm.join("\n");
 }
 
-/** Pull this device's governed role bundle from the control plane and materialize it into
- *  `~/.hara/org-roles/*.md` — a managed precedence layer below the dev's own global/project roles
- *  (see src/org/roles.ts loadRoles). The org bundle is AUTHORITATIVE: the dir is wiped and rewritten on
- *  every sync, so a server-side revoke/rename actually removes the local role. Best-effort: never throws;
- *  returns the count of roles written (0 on any failure / not enrolled / empty bundle). */
-export async function syncOrgRoles(signal?: AbortSignal): Promise<number> {
-  const e = loadEnrollment();
-  if (!e) return 0;
+/** Pull one exact profile's governed role bundle and materialize it into the profile-scoped managed
+ * directory. The bundle is authoritative for that profile only: another active connection can never
+ * overwrite or supply role prompts to a resumed session. */
+async function syncOrgRolesEnrollment(
+  profileId: string,
+  e: Enrollment,
+  signal?: AbortSignal,
+): Promise<number> {
   try {
     const res = await fetch(`${e.gatewayUrl}/v1/roles`, { signal, headers: { authorization: `Bearer ${e.deviceToken}` } });
     if (!res.ok) return 0;
@@ -450,7 +558,7 @@ export async function syncOrgRoles(signal?: AbortSignal): Promise<number> {
     const roles = Array.isArray(bundle.roles)
       ? [...new Map(bundle.roles.filter(isSafeBundleRole).map((role) => [role.name, role])).values()]
       : [];
-    const dir = orgRolesDir();
+    const dir = orgRolesDir(profileId);
     rmSync(dir, { recursive: true, force: true }); // authoritative replace
     mkdirSync(dir, { recursive: true });
     const root = resolve(dir);
@@ -461,8 +569,28 @@ export async function syncOrgRoles(signal?: AbortSignal): Promise<number> {
     }
     // org policy sidecar (model/tool/approval floors the CLI enforces; skipped by the .md-only role loader)
     writeFileSync(join(dir, "_policy.json"), JSON.stringify({ version: bundle.version ?? 0, org_policy: bundle.org_policy ?? {} }, null, 2) + "\n", "utf8");
+    invalidateRolesCache();
     return roles.length;
   } catch {
     return 0;
   }
+}
+
+/** Exact-profile variant used by persisted sessions and Desktop Serve. */
+export async function syncOrgRolesForProfile(profile: Profile, signal?: AbortSignal): Promise<number> {
+  const e = enrollmentFromProfile(profile);
+  if (!e) return 0;
+  return syncOrgRolesEnrollment(profile.id, e, signal);
+}
+
+/** Active-profile compatibility wrapper for explicit `hara roles sync`-style commands. */
+export async function syncOrgRoles(signal?: AbortSignal): Promise<number> {
+  const active = loadActiveProfile();
+  const exact = enrollmentFromProfile(active);
+  if (exact) return syncOrgRolesEnrollment(active.id, exact, signal);
+  // A legacy caller can create ~/.hara/org.json after profiles.json was already initialized. Preserve that
+  // pre-profile flow without exposing its bundle to Personal: materialize it only under default-org.
+  const legacy = loadEnrollment();
+  if (!legacy) return 0;
+  return syncOrgRolesEnrollment(DEFAULT_ORG_ID, legacy, signal);
 }

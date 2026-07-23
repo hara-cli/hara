@@ -4,10 +4,12 @@
 import { writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import { findProjectRoot } from "../context/agents-md.js";
 import { pluginRoleDirs } from "../plugins/plugins.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { scanMemory } from "../memory/guard.js";
+import { isValidProfileId, resolveActive } from "../profile/profile.js";
 
 const MAX_ROLE_BYTES = 512 * 1024;
 const ROLE_DIGEST_CAP = 16_000;
@@ -46,11 +48,20 @@ export function globalRolesDir(): string {
 export function globalClaudeAgentsDir(): string {
   return join(homedir(), ".claude", "agents");
 }
-/** Org-pushed roles (B-end): the digital-employee bundle synced from hara-control's `/v1/roles` into
- *  `~/.hara/org-roles/*.md` (see org-fleet/enroll.ts syncOrgRoles). A managed baseline — above
- *  third-party plugins, but a dev's own global/project roles still win. */
-export function orgRolesDir(): string {
-  return join(homedir(), ".hara", "org-roles");
+/** Org-pushed roles are identity-scoped. Two organization connections can advertise the same role id
+ * with different policy/persona text, so a global shared directory would let the active connection inject
+ * prompts into a resumed session owned by another connection. */
+export function orgRolesDir(profileId?: string): string {
+  const selected = profileId ?? resolveActive().id;
+  if (!isValidProfileId(selected)) throw new Error("invalid profile id for organization role storage");
+  // Profile ids are case-sensitive in profiles.json, while common macOS/Windows filesystems are not.
+  // A fixed lowercase digest prevents OrgA/orga, trailing-dot, and device-name aliases from sharing a
+  // managed prompt directory. Domain separation keeps this namespace independent of other identity hashes.
+  const storageKey = createHash("sha256")
+    .update("hara-org-roles-v1\0")
+    .update(selected, "utf8")
+    .digest("hex");
+  return join(homedir(), ".hara", "org-roles", storageKey);
 }
 /** Claude-Code subagents (`.claude/agents/*.md`) — consumed for ecosystem interop (project scope). */
 export function claudeAgentsDir(cwd: string): string {
@@ -138,12 +149,16 @@ export function roleToolFilter(role: Role | undefined): ((name: string) => boole
   return role.allowTools || role.denyTools ? declared : undefined;
 }
 
-export function loadRoles(cwd: string): Role[] {
+export function loadRoles(cwd: string, profileId?: string): Role[] {
+  const selectedProfileId = profileId ?? resolveActive(cwd).id;
+  const managedRoleDirs: RoleDir[] = isValidProfileId(selectedProfileId)
+    ? [{ dir: orgRolesDir(selectedProfileId), source: "org" }]
+    : [];
   // lowest→highest precedence: plugins < org(B-end push) < personal Claude < personal Hara
   // < project Claude < project Hara. A user's native Hara definition intentionally wins an id collision.
   return [...rolesFromDirs([
     ...pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" })),
-    { dir: orgRolesDir(), source: "org" },
+    ...managedRoleDirs,
     { dir: globalClaudeAgentsDir(), source: "claude-global" },
     { dir: globalRolesDir(), source: "global" },
     { dir: claudeAgentsDir(cwd), source: "claude-project" },
@@ -153,10 +168,14 @@ export function loadRoles(cwd: string): Role[] {
 
 /** The project-independent layers only — what the global agent index lists as "runs anywhere".
  *  Personal Claude Code agents participate directly; no copy/import step is required. */
-export function loadGlobalRoles(): Role[] {
+export function loadGlobalRoles(profileId?: string): Role[] {
+  const selectedProfileId = profileId ?? resolveActive().id;
+  const managedRoleDirs: RoleDir[] = isValidProfileId(selectedProfileId)
+    ? [{ dir: orgRolesDir(selectedProfileId), source: "org" }]
+    : [];
   return [...rolesFromDirs([
     ...pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" })),
-    { dir: orgRolesDir(), source: "org" },
+    ...managedRoleDirs,
     { dir: globalClaudeAgentsDir(), source: "claude-global" },
     { dir: globalRolesDir(), source: "global" },
   ]).values()];
@@ -274,10 +293,12 @@ let roleDigestCache = new Map<string, string>();
 
 /** Frozen-per-session specialist index for the ordinary Hara agent. This is the missing Claude-style
  *  discovery layer: the main agent sees role metadata, then loads only the chosen persona through agent/org. */
-export function rolesDigest(cwd: string): string {
-  if (roleDigestCache.has(cwd)) return roleDigestCache.get(cwd)!;
-  const digest = roleCatalog(loadRoles(cwd));
-  roleDigestCache.set(cwd, digest);
+export function rolesDigest(cwd: string, profileId?: string): string {
+  const selectedProfileId = profileId ?? resolveActive(cwd).id;
+  const cacheKey = `${cwd}\0${selectedProfileId}`;
+  if (roleDigestCache.has(cacheKey)) return roleDigestCache.get(cacheKey)!;
+  const digest = roleCatalog(loadRoles(cwd, selectedProfileId));
+  roleDigestCache.set(cacheKey, digest);
   return digest;
 }
 
@@ -285,8 +306,8 @@ export function invalidateRolesCache(): void {
   roleDigestCache.clear();
 }
 
-export function hasRoles(cwd: string): boolean {
-  return loadRoles(cwd).length > 0;
+export function hasRoles(cwd: string, profileId?: string): boolean {
+  return loadRoles(cwd, profileId).length > 0;
 }
 
 const SCAFFOLD: Record<string, string> = {

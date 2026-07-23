@@ -12,13 +12,14 @@ import {
   gatewayBaseURL,
   parseEnrollResponse,
   syncOrgRoles,
+  syncOrgRolesForProfile,
   deviceTokenExpired,
   deviceTokenExpiryWarning,
   normalizeGatewayUrl,
   enrollGatewayProfile,
 } from "../dist/org-fleet/enroll.js";
 import { orgRolesDir, loadRoles } from "../dist/org/roles.js";
-import { listProfiles, loadActiveProfile } from "../dist/profile/profile.js";
+import { addProfile, listProfiles, loadActiveProfile, upsertProfile } from "../dist/profile/profile.js";
 
 test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry, requires a token", () => {
   const e = parseEnrollResponse(
@@ -72,6 +73,13 @@ test("organization URL validation requires HTTPS outside loopback and rejects em
   assert.throws(() => normalizeGatewayUrl("https://control.example.com/tenant?a=1"), /only scheme/);
 });
 
+test("profile ids use one persistence-safe validator across BYOK and gateway entry points", () => {
+  const byok = (id) => ({ id, kind: "byok", provider: "openai" });
+  assert.equal(addProfile(byok("team\\escape")).ok, false, "BYOK add rejects a Windows path separator");
+  assert.equal(addProfile(byok("x".repeat(65))).ok, false, "BYOK add rejects ids that session loading cannot resume");
+  assert.throws(() => upsertProfile(byok("team\\escape")), /profile id/);
+});
+
 test("device token expiry: legacy is compatible; expiring and expired tokens are actionable", () => {
   const now = new Date("2026-01-01T00:00:00Z");
   assert.equal(deviceTokenExpired(undefined, now), false, "legacy control planes remain compatible");
@@ -98,8 +106,12 @@ test("enroll → store (0600) → heartbeat → clear, against a stub control pl
         res.end(JSON.stringify({ device_token: "dev-abc", device_id: "dev-1", model: "glm-5" }));
       } else if (req.url === "/v1/heartbeat") {
         hbAuth = req.headers.authorization;
-        res.writeHead(204);
-        res.end();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          model: "glm-5",
+          available_models: ["glm-5", "glm-6"],
+          thinking_efforts: [],
+        }));
       } else {
         res.writeHead(404);
         res.end();
@@ -118,6 +130,11 @@ test("enroll → store (0600) → heartbeat → clear, against a stub control pl
     assert.equal(statSync(join(home, ".hara", "org.json")).mode & 0o777, 0o600, "org.json is 0600 (holds a token)");
     assert.equal(await heartbeat(), true);
     assert.equal(hbAuth, "Bearer dev-abc", "heartbeat carried the device token");
+    assert.deepEqual(
+      loadEnrollment()?.availableModels,
+      ["glm-5", "glm-6"],
+      "the existing credential refreshes its model catalog without re-enrollment",
+    );
     assert.equal(clearEnrollment(), true);
     assert.equal(loadEnrollment(), null);
   } finally {
@@ -146,8 +163,12 @@ test("profile-native enrollment stores only the scoped token in private profiles
       }));
     } else if (req.url === "/v1/heartbeat") {
       heartbeatSeen = req.headers.authorization === "Bearer scoped-device-token";
-      res.writeHead(204);
-      res.end();
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        model: "deepseek-v4-pro",
+        available_models: ["deepseek-v4-flash", "deepseek-v4-pro"],
+        thinking_efforts: ["off", "high", "max"],
+      }));
     } else {
       res.writeHead(404);
       res.end();
@@ -167,7 +188,7 @@ test("profile-native enrollment stores only the scoped token in private profiles
     assert.equal(loadActiveProfile().id, "team-a");
     const storedProfile = listProfiles().find((profile) => profile.id === "team-a");
     assert.equal(storedProfile?.deviceToken, "scoped-device-token");
-    assert.deepEqual(storedProfile?.availableModels, ["deepseek-v4-pro"]);
+    assert.deepEqual(storedProfile?.availableModels, ["deepseek-v4-flash", "deepseek-v4-pro"]);
     assert.deepEqual(storedProfile?.thinkingEfforts, ["off", "high", "max"]);
     const profilesPath = join(home, ".hara", "profiles.json");
     assert.equal(statSync(profilesPath).mode & 0o777, 0o600);
@@ -218,7 +239,7 @@ test("syncOrgRoles: pulls /v1/roles → ~/.hara/org-roles/*.md, maps snake→cam
     const n = await syncOrgRoles();
     assert.equal(n, 1, "one role written");
     assert.equal(rolesAuth, "Bearer dev-r", "carried the device token");
-    const dir = orgRolesDir();
+    const dir = orgRolesDir("default-org");
     assert.ok(existsSync(join(dir, "auditor.md")), "role file written by name");
     const md = readFileSync(join(dir, "auditor.md"), "utf8");
     assert.match(md, /allowTools: \[read_file, bash\]/, "allow_tools → allowTools");
@@ -228,7 +249,7 @@ test("syncOrgRoles: pulls /v1/roles → ~/.hara/org-roles/*.md, maps snake→cam
     assert.equal(policy.version, 7);
     assert.equal(policy.org_policy.requireApprovalForWrites, true);
     // the loader actually picks it up with the camelCase keys mapped
-    const role = loadRoles(cwd).find((r) => r.id === "auditor");
+    const role = loadRoles(cwd, "default-org").find((r) => r.id === "auditor");
     assert.ok(role, "loadRoles resolves the org role");
     assert.deepEqual(role.allowTools, ["read_file", "bash"]);
     assert.deepEqual(role.owns, ["review", "audit"]);
@@ -285,6 +306,66 @@ test("syncOrgRoles rejects traversal and Windows-special role names without writ
     if (prev === undefined) delete process.env.HOME;
     else process.env.HOME = prev;
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("managed role bundles stay isolated by the session's exact organization profile", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-role-profile-isolation-"));
+  const cwd = mkdtempSync(join(tmpdir(), "hara-role-profile-cwd-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  const server = createServer((req, res) => {
+    if (req.url !== "/v1/roles") {
+      res.writeHead(404);
+      return res.end();
+    }
+    const token = req.headers.authorization;
+    const role = token === "Bearer token-a"
+      ? { name: "managed-a-only", description: "A role", system: "You belong to organization A." }
+      : { name: "managed-b-only", description: "B role", system: "You belong to organization B." };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ roles: [role] }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const gatewayUrl = `http://127.0.0.1:${server.address().port}`;
+  const profileA = {
+    id: "OrgA",
+    kind: "gateway",
+    gatewayUrl,
+    deviceToken: "token-a",
+    deviceId: "device-a",
+    defaultModel: "model-a",
+  };
+  const profileB = {
+    id: "orga",
+    kind: "gateway",
+    gatewayUrl,
+    deviceToken: "token-b",
+    deviceId: "device-b",
+    defaultModel: "model-b",
+  };
+  try {
+    assert.equal(await syncOrgRolesForProfile(profileA), 1);
+    assert.equal(await syncOrgRolesForProfile(profileB), 1);
+    assert.notEqual(
+      orgRolesDir("OrgA").toLowerCase(),
+      orgRolesDir("orga").toLowerCase(),
+      "case-sensitive profile ids cannot alias on a case-insensitive filesystem",
+    );
+    assert.ok(existsSync(join(orgRolesDir("OrgA"), "managed-a-only.md")));
+    assert.ok(existsSync(join(orgRolesDir("orga"), "managed-b-only.md")));
+    const rolesA = loadRoles(cwd, "OrgA");
+    const rolesB = loadRoles(cwd, "orga");
+    assert.ok(rolesA.some((role) => role.id === "managed-a-only"));
+    assert.equal(rolesA.some((role) => role.id === "managed-b-only"), false);
+    assert.ok(rolesB.some((role) => role.id === "managed-b-only"));
+    assert.equal(rolesB.some((role) => role.id === "managed-a-only"), false);
+  } finally {
+    server.close();
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 

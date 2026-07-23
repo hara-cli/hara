@@ -29,6 +29,26 @@ export interface ProviderTargetOverride {
   model?: string;
 }
 
+/** Resolve one persisted session's identity without consulting the mutable active-profile chain.
+ * Personal remains backed by the live config.json view; named profiles come from profiles.json.
+ * Returning null is intentional: callers must stop and ask the user to choose a replacement when a
+ * session's profile was removed, rather than silently routing the old conversation through another
+ * organization or the personal account. */
+export function profileByIdForConfig(cfg: HaraConfig, profileId: string): Profile | null {
+  if (profileId === PERSONAL_ID) {
+    return {
+      id: PERSONAL_ID,
+      kind: "byok",
+      label: "Personal",
+      provider: cfg.provider,
+      apiKey: cfg.apiKey,
+      baseURL: cfg.baseURL,
+      defaultModel: cfg.model,
+    };
+  }
+  return getProfile(profileId) ?? null;
+}
+
 /** Resolve the identity profile for the same cwd used to load config. */
 export function profileForConfig(cfg: HaraConfig): {
   profile: Profile;
@@ -43,15 +63,7 @@ export function profileForConfig(cfg: HaraConfig): {
     resolution: resolution.id === PERSONAL_ID
       ? resolution
       : { id: PERSONAL_ID, source: "fallback" },
-    profile: {
-      id: PERSONAL_ID,
-      kind: "byok",
-      label: "Personal",
-      provider: cfg.provider,
-      apiKey: cfg.apiKey,
-      baseURL: cfg.baseURL,
-      defaultModel: cfg.model,
-    },
+    profile: profileByIdForConfig(cfg, PERSONAL_ID)!,
   };
 }
 

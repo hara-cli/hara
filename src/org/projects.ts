@@ -302,14 +302,14 @@ function sameRoleDefinition(a: Role, b: Role): boolean {
 }
 
 /** Build the global index: inherited globals are listed once; any project override gets its qualified home. */
-export function buildAgentsIndex(): AgentIndexEntry[] {
-  const globals = loadGlobalRoles();
+export function buildAgentsIndex(profileId?: string): AgentIndexEntry[] {
+  const globals = loadGlobalRoles(profileId);
   const globalById = new Map(globals.map((role) => [role.id, role]));
   const out: AgentIndexEntry[] = globals.map((role) => ({ name: role.id, description: role.description, home: "" }));
   for (const project of loadProjects()) {
     let roles: Role[] = [];
     try {
-      roles = loadRoles(project.path);
+      roles = loadRoles(project.path, profileId);
     } catch {
       continue;
     }
@@ -328,10 +328,14 @@ export function buildAgentsIndex(): AgentIndexEntry[] {
  * have a working directory (the chat gateway, for example) may pass it as `preferredHome`; a matching
  * project override then wins before the global fallback. This makes `/agent reviewer` do the local thing
  * while keeping registry-wide, context-free lookups deterministic. */
-export function resolveAgent(refInput: string, preferredHome?: string): AgentIndexEntry | { ambiguous: AgentIndexEntry[] } | null {
+export function resolveAgent(
+  refInput: string,
+  preferredHome?: string,
+  profileId?: string,
+): AgentIndexEntry | { ambiguous: AgentIndexEntry[] } | null {
   if (typeof refInput !== "string") return null;
   const ref = refInput.trim();
-  const index = buildAgentsIndex();
+  const index = buildAgentsIndex(profileId);
   const separator = ref.indexOf(":");
   if (separator > 0) {
     const namespace = ref.slice(0, separator).trim().toLowerCase();

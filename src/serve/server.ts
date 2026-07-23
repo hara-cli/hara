@@ -99,11 +99,11 @@ export interface ServeDeps {
   version: string;
   providerId: string;
   model: string;
-  buildSessionProvider: (cwd?: string) => Promise<Provider | null>; // fresh live config/credential route
+  buildSessionProvider: (cwd?: string, profileId?: string) => Promise<Provider | null>; // fresh live config/credential route
   /** provider for a specific model/effort — powers per-session model switching (composer picker) */
-  buildProviderFor?: (model: string, effort?: string, cwd?: string) => Promise<Provider | null>;
+  buildProviderFor?: (model: string, effort?: string, cwd?: string, profileId?: string) => Promise<Provider | null>;
   /** live model list from the endpoint (may be empty — not every endpoint enumerates) */
-  listModels?: (cwd?: string) => Promise<string[]>;
+  listModels?: (cwd?: string, profileId?: string) => Promise<string[]>;
   /** Redacted provider/local-model control plane for Desktop settings. Credentials are accepted only by
    * save/test and must never be returned by these callbacks. */
   providerSettings?: (cwd?: string) => ProviderSettingsState;
@@ -128,9 +128,11 @@ export interface ServeDeps {
   effortLevels?: string[];
   /** Live defaults advertised to persistent clients after config/profile edits. `model` lets a session
    * pinned to a non-default model ask for that model's valid reasoning controls. */
-  runtimeInfo?: (cwd?: string, model?: string) => {
+  runtimeInfo?: (cwd?: string, model?: string, profileId?: string) => {
     providerId: string;
     model: string;
+    /** Effective identity route. Persisted into each new session and reused on resume. */
+    profileId?: string;
     effortLevels?: string[];
     /** Finite server-authorized set for a scoped gateway token. Missing means unconstrained discovery. */
     availableModels?: string[];
@@ -146,9 +148,10 @@ export interface ServeDeps {
     role?: string,
     signal?: AbortSignal,
     observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun">,
+    profileId?: string,
   ) => Promise<string>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
-  buildGuardian?: (cwd?: string) => Promise<{ provider?: Provider | null; enabled?: boolean } | undefined>;
+  buildGuardian?: (cwd?: string, profileId?: string) => Promise<{ provider?: Provider | null; enabled?: boolean } | undefined>;
   sandbox: SandboxMode;
   approval: ApprovalMode;
   store?: SessionStore; // tests inject a hermetic store
@@ -481,24 +484,26 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
   const hub = new SessionHub(deps.store ?? realStore);
-  const runtimeInfo = (cwd?: string, model?: string): {
+  const runtimeInfo = (cwd?: string, model?: string, profileId?: string): {
     providerId: string;
     model: string;
+    profileId?: string;
     effortLevels: string[];
     availableModels?: string[];
   } => {
-    const live = deps.runtimeInfo?.(cwd, model);
+    const live = deps.runtimeInfo?.(cwd, model, profileId);
     return {
       providerId: live?.providerId ?? deps.providerId,
       model: live?.model ?? model ?? deps.model,
+      ...(live?.profileId ? { profileId: live.profileId } : profileId ? { profileId } : {}),
       effortLevels: live?.effortLevels ?? deps.effortLevels ?? [],
       ...(live?.availableModels ? { availableModels: live.availableModels } : {}),
     };
   };
   const refreshSessionProvider = async (session: ServeSession): Promise<boolean> => {
     const fresh = deps.buildProviderFor
-      ? await deps.buildProviderFor(session.meta.model, session.effort, session.meta.cwd)
-      : await deps.buildSessionProvider(session.meta.cwd);
+      ? await deps.buildProviderFor(session.meta.model, session.effort, session.meta.cwd, session.meta.profileId)
+      : await deps.buildSessionProvider(session.meta.cwd, session.meta.profileId);
     if (!fresh || fresh.model !== session.meta.model) return false;
     session.provider = fresh;
     session.meta.provider = fresh.id;
@@ -788,7 +793,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       if (!(await refreshSessionProvider(s))) {
         throw new Error(`provider not authenticated for pinned model '${s.meta.model}' at ${s.meta.cwd}`);
       }
-      const turnGuardian = deps.buildGuardian ? await deps.buildGuardian(s.meta.cwd) : deps.guardian;
+      const turnGuardian = deps.buildGuardian
+        ? await deps.buildGuardian(s.meta.cwd, s.meta.profileId)
+        : deps.guardian;
       restoreTodos(s.meta.todos, sessionId);
       stopTodoEvents = onTodosChange((todos) => {
         // Keep the session snapshot current while the turn runs. Steering and task-intake checkpoints can
@@ -818,6 +825,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ctx: {
           cwd: s.meta.cwd,
           sandbox: deps.sandbox,
+          profileId: s.meta.profileId,
           todoScope: sessionId,
           sessionId,
           spawn: (t, role, signal) => deps.spawnSubagent(
@@ -832,6 +840,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               onProviderTurn: (turn) => observeProviderTurn(s, turn),
               onToolRun: (toolRun) => observeToolRun(s, toolRun),
             },
+            s.meta.profileId,
           ),
           ui: sink,
         },
@@ -1087,30 +1096,39 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return;
           }
           case "session.list":
-            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, archived: m.archived ?? false })) }));
+            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, profileId: m.profileId, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, archived: m.archived ?? false })) }));
           case "session.create": {
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
-            const provider = await deps.buildSessionProvider(cwd);
+            const activeRuntime = runtimeInfo(cwd);
+            const profileId = activeRuntime.profileId ?? "personal";
+            const provider = await deps.buildSessionProvider(cwd, profileId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const approval = (["suggest", "auto-edit", "full-auto"] as ApprovalMode[]).includes(p.approval) ? (p.approval as ApprovalMode) : deps.approval;
-            const s = hub.create({ cwd, provider, providerId: provider.id, model: provider.model, approval, projectContext: loadAgentContext(cwd) || undefined });
-            return reply(rpcResult(id!, { sessionId: s.meta.id, model: s.meta.model }));
+            const s = hub.create({ cwd, profileId, provider, providerId: provider.id, model: provider.model, approval, projectContext: loadAgentContext(cwd) || undefined });
+            return reply(rpcResult(id!, { sessionId: s.meta.id, model: s.meta.model, profileId: s.meta.profileId }));
           }
           case "session.resume": {
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const live = hub.get(p.sessionId);
             if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
             const priorMeta = hub.peekMeta(p.sessionId);
+            const boundProfileId = priorMeta?.profileId ?? runtimeInfo(priorMeta?.cwd).profileId ?? "personal";
             const provider = priorMeta && deps.buildProviderFor
-              ? await deps.buildProviderFor(priorMeta.model, undefined, priorMeta.cwd)
-              : await deps.buildSessionProvider(priorMeta?.cwd);
+              ? await deps.buildProviderFor(priorMeta.model, undefined, priorMeta.cwd, boundProfileId)
+              : await deps.buildSessionProvider(priorMeta?.cwd, boundProfileId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const r = hub.resume(p.sessionId, { provider, approval: deps.approval, projectContext: undefined });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if ("lockedBy" in r) return reply(rpcError(id, ERR.LOCKED, `session held by live pid ${r.lockedBy}`));
             if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
+            if (r.session.meta.profileId && r.session.meta.profileId !== boundProfileId) {
+              hub.detach(r.session.meta.id);
+              return reply(rpcError(id, ERR.BUSY, "session identity changed while resume was starting — retry resume"));
+            }
+            const migratedProfileBinding = !r.session.meta.profileId;
+            r.session.meta.profileId = boundProfileId;
             r.session.configuring = true;
             let refreshed = false;
             try {
@@ -1122,11 +1140,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               hub.detach(r.session.meta.id);
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
+            if (migratedProfileBinding) hub.save(r.session);
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
             broadcastTaskState(r.session, { phase: "restored" });
             return reply(rpcResult(id!, {
               sessionId: r.session.meta.id,
               model: r.session.meta.model,
+              profileId: r.session.meta.profileId,
               history: historyForClient(r.session.history),
               task: r.session.task ? {
                 id: r.session.task.id,
@@ -1207,12 +1227,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             // non-destructive sibling: explore a different direction without losing the original
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const sourceMeta = hub.peekMeta(p.sessionId);
+            const boundProfileId = sourceMeta?.profileId ?? runtimeInfo(sourceMeta?.cwd).profileId ?? "personal";
             const provider = sourceMeta && deps.buildProviderFor
-              ? await deps.buildProviderFor(sourceMeta.model, undefined, sourceMeta.cwd)
-              : await deps.buildSessionProvider(sourceMeta?.cwd);
+              ? await deps.buildProviderFor(sourceMeta.model, undefined, sourceMeta.cwd, boundProfileId)
+              : await deps.buildSessionProvider(sourceMeta?.cwd, boundProfileId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
-            const r = hub.fork(p.sessionId, { provider, providerId: provider.id, approval: deps.approval, projectContext: undefined });
+            const r = hub.fork(p.sessionId, { profileId: boundProfileId, provider, providerId: provider.id, approval: deps.approval, projectContext: undefined });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "source session is mid-turn — fork after it completes"));
             r.session.configuring = true;
@@ -1242,16 +1263,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcResult(id!, { sessionId: p.sessionId, deleted: true }));
           }
           case "models.list": {
-            const session = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
-            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : (session?.meta.cwd ?? opts.cwd);
-            const discoveredModels = deps.listModels ? await deps.listModels(targetCwd).catch(() => []) : [];
-            const defaultRuntime = runtimeInfo(targetCwd);
-            const current = session?.meta.model ?? defaultRuntime.model;
-            const currentRuntime = runtimeInfo(targetCwd, current);
+            const requestedSessionId = typeof p.sessionId === "string" ? p.sessionId : undefined;
+            const session = requestedSessionId ? hub.get(requestedSessionId) : undefined;
+            const savedMeta = requestedSessionId ? (session?.meta ?? hub.peekMeta(requestedSessionId)) : undefined;
+            if (requestedSessionId && !savedMeta) {
+              return reply(rpcError(id, ERR.NO_SESSION, `no session ${requestedSessionId}`));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : (savedMeta?.cwd ?? opts.cwd);
+            const profileId = savedMeta?.profileId;
+            const discoveredModels = deps.listModels ? await deps.listModels(targetCwd, profileId).catch(() => []) : [];
+            const defaultRuntime = runtimeInfo(targetCwd, undefined, profileId);
+            const current = savedMeta?.model ?? defaultRuntime.model;
+            const currentRuntime = runtimeInfo(targetCwd, current, profileId);
             const models = defaultRuntime.availableModels?.length
               ? [...defaultRuntime.availableModels]
               : discoveredModels;
-            return reply(rpcResult(id!, { models, current, effort: session?.effort ?? null, effortLevels: currentRuntime.effortLevels }));
+            return reply(rpcResult(id!, {
+              models,
+              current,
+              profileId: savedMeta?.profileId ?? defaultRuntime.profileId,
+              effort: session?.effort ?? savedMeta?.effort ?? null,
+              effortLevels: currentRuntime.effortLevels,
+            }));
           }
           case "settings.providers.list": {
             if (!deps.providerSettings) return reply(rpcError(id, ERR.METHOD, "provider settings not supported by this server"));
@@ -1381,7 +1414,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const model = typeof p.model === "string" && p.model ? p.model : s.meta.model;
             const effort = typeof p.effort === "string" && p.effort ? p.effort : undefined;
             if (!deps.buildProviderFor) return reply(rpcError(id, ERR.METHOD, "model switching not supported by this server"));
-            const requestedRuntime = runtimeInfo(s.meta.cwd, model);
+            const requestedRuntime = runtimeInfo(s.meta.cwd, model, s.meta.profileId);
             if (requestedRuntime.availableModels?.length && !requestedRuntime.availableModels.includes(model)) {
               return reply(rpcError(id, ERR.PARAMS, `model '${model}' is not authorized for the active organization connection`));
             }
@@ -1390,7 +1423,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             s.configuring = true;
             try {
-              const provider = await deps.buildProviderFor(model, effort, s.meta.cwd);
+              const provider = await deps.buildProviderFor(model, effort, s.meta.cwd, s.meta.profileId);
               if (closing) return;
               if (!provider) return reply(rpcError(id, ERR.INTERNAL, `could not build provider for ${model}`));
               if (provider.model !== model) return reply(rpcError(id, ERR.INTERNAL, `provider did not honor requested model ${model}`));

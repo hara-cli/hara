@@ -61,6 +61,7 @@ import {
   heartbeat,
   gatewayBaseURL,
   syncOrgRoles,
+  syncOrgRolesForProfile,
   deviceTokenExpired,
   deviceTokenExpiryWarning,
 } from "./org-fleet/enroll.js";
@@ -85,6 +86,7 @@ import {
   pinFilePath,
   DEFAULT_ORG_ID,
   PERSONAL_ID,
+  isValidProfileId,
   type Profile,
   type ActiveResolution,
 } from "./profile/profile.js";
@@ -143,6 +145,7 @@ import { allowsEvolutionTool, EVOLUTION_SYSTEM, evolutionStatus, shouldAutoEvolv
 import { EXPLORE_SYSTEM } from "./tools/agent.js";
 import {
   overrideProviderTarget,
+  profileByIdForConfig,
   profileForConfig,
   resolveByokProviderTarget,
   resolveGatewayModel,
@@ -228,7 +231,7 @@ import {
 } from "./session/transfer.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
 import { createPhysicalOperationDrain } from "./session/operation-drain.js";
-import { loadGlobalRoles, loadRoles, roleToolFilter, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
+import { loadGlobalRoles, loadRoles, orgRolesDir, roleToolFilter, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
 import { buildAgentsIndex, canonicalProjectPath, resolveAgent, loadProjects, addProject, removeProject, type AgentIndexEntry } from "./org/projects.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks, haraBinDir } from "./plugins/plugins.js";
@@ -297,15 +300,31 @@ const displayConfigValue = (key: string, value: unknown): string => {
   return value === undefined ? "(unset)" : String(value);
 };
 
+// One mutable HaraConfig object owns one foreground run. Once that run is attached to a persisted
+// session, every auxiliary provider built from the same config (role, guardian, routing, vision, or an
+// interactive /model switch) must stay on the session's identity route. A WeakMap keeps this runtime-only
+// binding out of config serialization and lets explicit callback bindings override it for hara serve.
+const runtimeProfileBindings = new WeakMap<HaraConfig, string>();
+
 async function buildProvider(
   cfg: HaraConfig,
   targetOverride?: ProviderTargetOverride,
+  boundProfileId?: string,
 ): Promise<Provider | null> {
   // Identity-profile is the source of truth for routing. `cfg` is the *merged* HaraConfig (env +
   // project + global) and still drives non-routing concerns (model overrides, baseURL fallbacks
   // for things like vision/route/fallback sidecars). The active profile decides "where to send
   // requests" — gateway (deviceToken at the gateway) vs BYOK (user's key direct to the provider).
-  const { profile: ap } = profileForConfig(cfg);
+  const effectiveProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
+  const ap = effectiveProfileId
+    ? profileByIdForConfig(cfg, effectiveProfileId)
+    : profileForConfig(cfg).profile;
+  if (!ap) {
+    throw new Error(`session profile '${effectiveProfileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
+  }
+  if (!isValidProfileId(ap.id)) {
+    throw new Error("the selected profile uses a legacy invalid id; re-add it with 1-64 letters, numbers, dots, underscores, or dashes");
+  }
   if (ap.kind === "gateway") {
     if (!ap.gatewayUrl || !ap.deviceToken || deviceTokenExpired(ap.tokenExpiresAt)) return null;
     const baseURL = ap.baseURL || `${ap.gatewayUrl.replace(/\/$/, "")}/v1`;
@@ -341,21 +360,61 @@ async function buildProvider(
 /** Wrap the main provider with per-turn model routing when `routeModel` is configured: trivial/non-coding
  *  turns go to the alternate (cheap/general) model, real coding/action work stays on the primary. No-op when
  *  routeModel is unset or equals the primary model. routeBaseURL/routeApiKey default to the primary's. */
-async function withRouting(primary: Provider | null, cfg: HaraConfig): Promise<Provider | null> {
+async function withRouting(primary: Provider | null, cfg: HaraConfig, boundProfileId?: string): Promise<Provider | null> {
   if (!primary || !cfg.routeModel || cfg.routeModel === primary.model) return primary;
   const alt = await buildProvider(cfg, {
     model: cfg.routeModel,
     ...(cfg.routeBaseURL ? { baseURL: cfg.routeBaseURL } : {}),
     ...(cfg.routeApiKey ? { apiKey: cfg.routeApiKey } : {}),
-  });
+  }, boundProfileId);
   return alt ? routingProvider(primary, alt) : primary;
+}
+
+/** Build the main provider for a persisted conversation and synchronize the mutable runtime config with
+ * that exact identity route. This is deliberately separate from sidecar overrides: a resumed session's
+ * profile/model are primary runtime state, while vision/route/fallback providers must not overwrite it. */
+async function buildSessionBoundRuntime(
+  cfg: HaraConfig,
+  profileId: string,
+  model: string,
+  effort?: string,
+): Promise<{ provider: Provider; profile: Profile } | null> {
+  const profile = profileByIdForConfig(cfg, profileId);
+  if (!profile) {
+    throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
+  }
+  // Validate the session's durable model independently of process-local HARA_MODEL. The gateway target
+  // resolver intentionally lets the environment override the provider used by this process, but that
+  // temporary override must neither conceal a revoked saved pin nor become the session's new durable pin.
+  if (profile.kind === "gateway" && profile.availableModels?.length && !profile.availableModels.includes(model)) {
+    throw new Error(`model '${model}' is not authorized for organization connection '${profile.id}'`);
+  }
+  runtimeProfileBindings.set(cfg, profileId);
+  if (effort) cfg.reasoningEffort = effort as HaraConfig["reasoningEffort"];
+  const primary = await buildProvider(cfg, { model }, profileId);
+  if (!primary) return null;
+  cfg.provider = primary.id as ProviderId;
+  cfg.model = primary.model;
+  if (profile.kind === "gateway") {
+    cfg.baseURL = profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined);
+    cfg.apiKey = undefined;
+  } else {
+    const target = overrideProviderTarget(resolveByokProviderTarget(cfg, profile, false), { model: primary.model });
+    cfg.baseURL = target.baseURL;
+    cfg.apiKey = target.apiKey;
+  }
+  return { provider: (await withRouting(primary, cfg, profileId)) ?? primary, profile };
 }
 
 /** Guardian veto model: the CHEAP tier if `routeModel` is configured (a small classifier call, not real
  *  work), else the primary provider. Never blocks startup — any build failure just yields the fallback (and
  *  the guardian fails open when even that is absent). Returns the `{ provider, enabled }` shape runAgent wants,
  *  or undefined when guardian is off in config/env. */
-async function buildGuardian(cfg: HaraConfig, primary: Provider | null): Promise<{ provider: Provider | null; enabled: boolean } | undefined> {
+async function buildGuardian(
+  cfg: HaraConfig,
+  primary: Provider | null,
+  boundProfileId?: string,
+): Promise<{ provider: Provider | null; enabled: boolean } | undefined> {
   if (cfg.guardian === "off") return undefined;
   let gp: Provider | null = primary;
   if (cfg.routeModel && cfg.routeModel !== primary?.model) {
@@ -363,13 +422,13 @@ async function buildGuardian(cfg: HaraConfig, primary: Provider | null): Promise
       model: cfg.routeModel,
       ...(cfg.routeBaseURL ? { baseURL: cfg.routeBaseURL } : {}),
       ...(cfg.routeApiKey ? { apiKey: cfg.routeApiKey } : {}),
-    })) ?? primary;
+    }, boundProfileId)) ?? primary;
   }
   return { provider: gp, enabled: true };
 }
 
-function authHint(cfg: HaraConfig): string {
-  const { profile: ap } = profileForConfig(cfg);
+function authHint(cfg: HaraConfig, boundProfile?: Profile | null): string {
+  const ap = boundProfile ?? profileForConfig(cfg).profile;
   if (ap.kind === "gateway") {
     if (deviceTokenExpired(ap.tokenExpiresAt)) {
       return `Active profile '${ap.id}' has expired organization access — re-enroll with \`hara profile add ${ap.id} --gateway ${ap.gatewayUrl || "<url>"} --code <code>\`.`;
@@ -766,15 +825,29 @@ function agentRunLimits(cfg: Pick<HaraConfig, "runTimeoutMs" | "maxAgentRounds">
   return { timeoutMs: cfg.runTimeoutMs, maxRounds: cfg.maxAgentRounds };
 }
 
-async function runInit(provider: Provider, cwd: string, sandbox: SandboxMode = "off", cfg?: HaraConfig): Promise<void> {
+async function runInit(
+  provider: Provider,
+  cwd: string,
+  sandbox: SandboxMode = "off",
+  cfg?: HaraConfig,
+  profileId?: string,
+): Promise<void> {
   if (isUnsafeProjectWorkspace(cwd)) throw new Error(homeWorkspaceActionError("initialize AGENTS.md"));
   const history: NeutralMsg[] = [{ role: "user", content: INIT_PROMPT }];
-  await runAgent(history, { provider, ctx: { cwd, sandbox }, approval: "full-auto", confirm: async () => true, ...(cfg ? agentRunLimits(cfg) : {}) });
+  await runAgent(history, {
+    provider,
+    ctx: { cwd, sandbox, ...(profileId ? { profileId } : {}) },
+    approval: "full-auto",
+    confirm: async () => true,
+    ...(cfg ? agentRunLimits(cfg) : {}),
+  });
 }
 
 interface OrgOpts {
   cfg: HaraConfig;
   baseProvider: Provider;
+  /** Exact identity route for every managed role, role model, nested agent, and control-plane request. */
+  profileId: string;
   cwd: string;
   sandbox: SandboxMode;
   approval: ApprovalMode;
@@ -861,7 +934,7 @@ function runFailureDetail(outcome: RunOutcome): string | null {
 }
 
 async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
-  const roles = loadRoles(o.cwd);
+  const roles = loadRoles(o.cwd, o.profileId);
   if (!roles.length) {
     out(c.yellow("No roles defined — run ") + c.bold("hara roles init") + c.yellow(" to scaffold some.\n"));
     return { status: "error", error: "no roles are defined" };
@@ -898,7 +971,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   // Role-model resolution: respect role.model by default; --force collapses everything to cfg.model.
   const __roleModel = effectiveRoleModel(role.model, o.cfg.model);
   const roleProvider = __roleModel
-    ? ((await buildProvider(o.cfg, { model: __roleModel })) ?? o.baseProvider)
+    ? ((await buildProvider(o.cfg, { model: __roleModel }, o.profileId)) ?? o.baseProvider)
     : o.baseProvider;
   const toolFilter = roleToolFilter(role);
 
@@ -906,7 +979,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   const runImplementer = async (): Promise<RunOutcome> => {
     return runAgent(history, {
       provider: roleProvider,
-      ctx: { cwd: o.cwd, sandbox: o.sandbox },
+      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId },
       approval: o.approval,
       confirm: o.confirm,
       projectContext: o.projectContext,
@@ -936,7 +1009,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   // Review chain: a reviewer role inspects the diff and APPROVES or sends it back, looping until clean.
   const reviewer = roles.find((r) => r.id === "reviewer");
   const __revModel = effectiveRoleModel(reviewer?.model, o.cfg.model);
-  const revProvider = __revModel ? ((await buildProvider(o.cfg, { model: __revModel })) ?? o.baseProvider) : o.baseProvider;
+  const revProvider = __revModel ? ((await buildProvider(o.cfg, { model: __revModel }, o.profileId)) ?? o.baseProvider) : o.baseProvider;
   const revSystem = reviewer?.system ?? REVIEWER_SYSTEM;
   const revTools = roleToolFilter(reviewer ? { ...reviewer, readOnly: true } : undefined) ?? ((n: string) => READONLY_TOOLS.has(n));
   const maxRounds = Math.max(1, o.rounds ?? 3);
@@ -955,7 +1028,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
     const rHist: NeutralMsg[] = [{ role: "user", content: reviewPrompt(task, changes) }];
     const reviewerOutcome = await runAgent(rHist, {
       provider: revProvider,
-      ctx: { cwd: o.cwd, sandbox: o.sandbox },
+      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId },
       approval: "full-auto", // reviewer is read-only via revTools, so nothing to confirm
       confirm: o.confirm,
       projectContext: o.projectContext,
@@ -1007,13 +1080,13 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
     return false;
   }
   const __atomModel = effectiveRoleModel(role?.model, o.cfg.model);
-  const roleProvider = __atomModel ? ((await buildProvider(o.cfg, { model: __atomModel })) ?? o.baseProvider) : o.baseProvider;
+  const roleProvider = __atomModel ? ((await buildProvider(o.cfg, { model: __atomModel }, o.profileId)) ?? o.baseProvider) : o.baseProvider;
   const toolFilter = roleToolFilter(role);
   const history: NeutralMsg[] = [{ role: "user", content: atomPrompt(atom, plan, done) }];
   try {
     const outcome = await runAgent(history, {
       provider: roleProvider,
-      ctx: { cwd: o.cwd, sandbox: o.sandbox },
+      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId },
       approval: o.approval,
       confirm: o.confirm,
       projectContext: o.projectContext,
@@ -1112,7 +1185,7 @@ async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<RunOu
 /** Decompose a task into atoms, sequence them (DAG), and execute each with a verify gate.
  *  With `parallel`, independent atoms (the same dependency wave) run concurrently. */
 async function runPlan(task: string, o: OrgOpts): Promise<RunOutcome> {
-  const roles = loadRoles(o.cwd);
+  const roles = loadRoles(o.cwd, o.profileId);
   out(c.dim("Planning…\n"));
   const plan = await decompose(o.baseProvider, task, roles);
   if (!plan.atoms.length) {
@@ -1141,7 +1214,7 @@ async function runPlan(task: string, o: OrgOpts): Promise<RunOutcome> {
 
 /** Resume the saved plan (.hara/org/plan.json): re-run atoms that aren't done; completed atoms are skipped. */
 async function runResume(o: OrgOpts): Promise<RunOutcome> {
-  const roles = loadRoles(o.cwd);
+  const roles = loadRoles(o.cwd, o.profileId);
   const plan = loadPlan(o.cwd);
   if (!plan) {
     out(c.red('No saved plan at .hara/org/plan.json — run `hara plan "<task>"` first.\n'));
@@ -1381,13 +1454,15 @@ async function runSubagent(
   roleId?: string,
   signal?: AbortSignal,
   observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun">,
+  boundProfileId?: string,
 ): Promise<string> {
-  const roles = loadRoles(cwd);
+  const executionProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
+  const roles = loadRoles(cwd, executionProfileId);
   const roleRef = roleId?.trim();
   if (roleId !== undefined && !roleRef) return "Error: sub-agent role cannot be blank.";
   let role: Role | undefined;
   if (roleRef?.includes(":")) {
-    const hit = resolveAgent(roleRef, cwd);
+    const hit = resolveAgent(roleRef, cwd, executionProfileId);
     if (hit && "ambiguous" in hit) {
       return `Error: sub-agent role '${roleRef}' is ambiguous; use one of: ${hit.ambiguous.map((entry) => `${entry.project}:${entry.name}`).join(", ")}.`;
     }
@@ -1397,7 +1472,7 @@ async function runSubagent(
     if (hit && !("ambiguous" in hit)) {
       role = hit.project
         ? roles.find((candidate) => candidate.id === hit.name)
-        : loadGlobalRoles().find((candidate) => candidate.id === hit.name);
+        : loadGlobalRoles(executionProfileId).find((candidate) => candidate.id === hit.name);
     }
   } else if (roleRef) {
     role = roles.find((candidate) => candidate.id === roleRef);
@@ -1410,7 +1485,7 @@ async function runSubagent(
   }
   const __subModel = effectiveRoleModel(role?.model, baseProvider.model);
   const provider = __subModel && __subModel !== baseProvider.model
-    ? ((await buildProvider(cfg, { model: __subModel })) ?? baseProvider)
+    ? ((await buildProvider(cfg, { model: __subModel }, executionProfileId)) ?? baseProvider)
     : baseProvider;
   // A sub-agent runs full-auto + UNCONFIRMED + parallel, so it is ALWAYS read-only — a role may narrow
   // further but can never GRANT write/exec to a fan-out sub-agent (that would bypass the approval gate).
@@ -1422,7 +1497,7 @@ async function runSubagent(
   try {
     outcome = await runAgent(subHistory, {
       provider,
-      ctx: { cwd, sandbox, todoScope }, // isolated checklist; no spawn → no recursion
+      ctx: { cwd, sandbox, todoScope, profileId: executionProfileId }, // isolated checklist; no spawn → no recursion
       approval: "full-auto", // read-only tools, so no prompts (can't prompt in parallel)
       confirm: async () => true,
       projectContext,
@@ -1683,18 +1758,19 @@ program
   .description("analyze the project and (re)generate AGENTS.md")
   .action(async () => {
     const cfg = loadConfig();
+    const profileId = profileForConfig(cfg).profile.id;
     if (isUnsafeProjectWorkspace(cfg.cwd)) {
       out(c.red(homeWorkspaceActionError("initialize AGENTS.md")) + "\n");
       process.exitCode = 2;
       return;
     }
-    const provider = await buildProvider(cfg);
+    const provider = await buildProvider(cfg, undefined, profileId);
     if (!provider) {
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
       process.exit(1);
     }
     out(c.dim("Analyzing project to generate AGENTS.md…\n"));
-    await runInit(provider, cfg.cwd, cfg.sandbox, cfg);
+    await runInit(provider, cfg.cwd, cfg.sandbox, cfg, profileId);
   });
 
 program
@@ -1769,13 +1845,14 @@ program
     // Without it, flow-approved `hara org --role ...` children silently fell back to model dispatching.
     const opts2 = command.optsWithGlobals() as { role?: string; review?: boolean; rounds?: number; commit?: boolean };
     let cfg = loadConfig();
+    let orgProfileId = profileForConfig(cfg).profile.id;
     // Home dispatch (globally addressable, executes at home): a --role of "project:name" — or a bare name
     // that only exists in a REGISTERED project — resolves via the global agent index and runs with cwd =
     // that project (its AGENTS.md/data context), instead of failing or running context-blind here.
     let orgCwd = cfg.cwd;
     let forceRole = opts2.role;
-    if (opts2.role && (opts2.role.includes(":") || !loadRoles(cfg.cwd).some((r) => r.id === opts2.role))) {
-      const hit = resolveAgent(opts2.role);
+    if (opts2.role && (opts2.role.includes(":") || !loadRoles(cfg.cwd, orgProfileId).some((r) => r.id === opts2.role))) {
+      const hit = resolveAgent(opts2.role, cfg.cwd, orgProfileId);
       if (hit && "ambiguous" in hit) {
         out(c.yellow(`'${opts2.role}' exists in several projects — qualify it:\n`) + hit.ambiguous.map((e) => `  ${e.project}:${e.name}`).join("\n") + "\n");
         process.exit(1);
@@ -1784,6 +1861,7 @@ program
         orgCwd = hit.home;
         forceRole = hit.name;
         cfg = loadConfig({ cwd: hit.home });
+        orgProfileId = profileForConfig(cfg).profile.id;
         out(c.dim(`(dispatching to ${hit.project}:${hit.name} · home ${hit.home})\n`));
       } else if (hit) {
         // Explicit `global:name` is an address, not the literal role id. Global roles intentionally run
@@ -1795,7 +1873,7 @@ program
         process.exit(1);
       }
     }
-    const provider = await buildProvider(cfg);
+    const provider = await buildProvider(cfg, undefined, orgProfileId);
     if (!provider) {
       out(c.red(`Not authenticated for provider '${cfg.provider}' at ${orgCwd}.\n`) + authHint(cfg) + "\n");
       process.exit(1);
@@ -1804,6 +1882,7 @@ program
     const outcome = await runOrg(taskParts.join(" "), {
       cfg,
       baseProvider: provider,
+      profileId: orgProfileId,
       cwd: orgCwd,
       sandbox: cfg.sandbox,
       approval: "full-auto",
@@ -1859,7 +1938,8 @@ program
   .option("--parallel", "run independent atoms (same dependency wave) concurrently")
   .action(async (taskParts: string[], opts: { parallel?: boolean }) => {
     const cfg = loadConfig();
-    const provider = await buildProvider(cfg);
+    const profileId = profileForConfig(cfg).profile.id;
+    const provider = await buildProvider(cfg, undefined, profileId);
     if (!provider) {
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
       process.exit(1);
@@ -1868,6 +1948,7 @@ program
     const o: OrgOpts = {
       cfg,
       baseProvider: provider,
+      profileId,
       cwd: cfg.cwd,
       sandbox: cfg.sandbox,
       approval: "full-auto",
@@ -2511,6 +2592,16 @@ program
     const { startServe } = await import("./serve/server.js");
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const gatewayLogins = new GatewayLoginManager();
+    const controlPlaneRefreshAt = new Map<string, number>();
+    const refreshSessionControlPlane = (profile: Profile): void => {
+      const enrollment = enrollmentFromProfile(profile);
+      if (!enrollment) return;
+      const now = Date.now();
+      if (now - (controlPlaneRefreshAt.get(profile.id) ?? 0) < 60_000) return;
+      controlPlaneRefreshAt.set(profile.id, now);
+      void heartbeatEnrollment(enrollment, undefined, { profileId: profile.id });
+      void syncOrgRolesForProfile(profile);
+    };
     const handle = await startServe(
       { host: o.host, port: Number(o.port) || 8790, token: o.token, cwd },
       {
@@ -2520,13 +2611,18 @@ program
         // `hara serve` is persistent, but config.json is user-editable at any time. Re-read it for every
         // new/resumed session and model operation so a repaired/rotated key takes effect without restarting
         // the desktop server (and, critically, never ask for a key that is already on disk).
-        buildSessionProvider: async (targetCwd) => {
+        buildSessionProvider: async (targetCwd, profileId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
-          return withRouting(await buildProvider(live), live);
+          const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
+          if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
+          refreshSessionControlPlane(profile);
+          return withRouting(await buildProvider(live, undefined, profileId), live, profileId);
         },
-        buildProviderFor: async (model, effort, targetCwd) => {
+        buildProviderFor: async (model, effort, targetCwd, profileId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
-          const { profile } = profileForConfig(live);
+          const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
+          if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
+          refreshSessionControlPlane(profile);
           if (
             profile.kind === "gateway"
             && profile.availableModels?.length
@@ -2541,13 +2637,16 @@ program
                 reasoningEffort: (effort as HaraConfig["reasoningEffort"]) ?? live.reasoningEffort,
               },
               { model },
+              profileId,
             ),
             live,
+            profileId,
           );
         },
-        listModels: (targetCwd) => {
+        listModels: (targetCwd, profileId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
-          const { profile } = profileForConfig(live);
+          const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
+          if (!profile) return Promise.reject(new Error(`session profile '${profileId}' is no longer available`));
           if (profile.kind === "gateway") {
             if (profile.availableModels?.length) return Promise.resolve([...profile.availableModels]);
             const baseURL = profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined);
@@ -2602,7 +2701,9 @@ program
           const profile = getProfile(id);
           if (!profile || profile.kind !== "gateway") throw new Error("organization connection was not found");
           const enrollment = enrollmentFromProfile(profile);
-          const ok = !!enrollment && !deviceTokenExpired(enrollment.expiresAt) && await heartbeatEnrollment(enrollment, AbortSignal.timeout(15_000));
+          const ok = !!enrollment
+            && !deviceTokenExpired(enrollment.expiresAt)
+            && await heartbeatEnrollment(enrollment, AbortSignal.timeout(15_000), { profileId: id });
           return { id, ok, checkedAt: Date.now() };
         },
         testProviderSettings: (input) => testProviderSettingsCandidate(input),
@@ -2651,10 +2752,19 @@ program
           ).reasoning,
           cfg.model,
         ).filter((e): e is NonNullable<typeof e> => !!e),
-        runtimeInfo: (targetCwd, selectedModel) => {
+        runtimeInfo: (targetCwd, selectedModel, profileId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
-          const { profile } = profileForConfig(live);
-          const current = providerSettingsSnapshot(targetCwd ?? cwd).current;
+          const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
+          if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
+          const current = profileId
+            ? profile.kind === "gateway"
+              ? {
+                  provider: "hara-gateway",
+                  model: process.env.HARA_MODEL || effectiveModel(profile) || live.model,
+                  baseURL: profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined),
+                }
+              : resolveByokProviderTarget(live, profile, false)
+            : providerSettingsSnapshot(targetCwd ?? cwd).current;
           const model = selectedModel ?? current.model;
           const inferredEfforts = levelsFor(
             resolvePlatform(current.provider, current.baseURL, undefined, model).reasoning,
@@ -2666,6 +2776,7 @@ program
           return {
             providerId: current.provider,
             model,
+            profileId: profile.id,
             effortLevels: advertisedEfforts ?? inferredEfforts,
             ...(profile.kind === "gateway" && profile.availableModels?.length
               ? { availableModels: [...profile.availableModels] }
@@ -2673,15 +2784,15 @@ program
           };
         },
         runLimits: (targetCwd) => agentRunLimits(loadConfig({ cwd: targetCwd ?? cwd })),
-        spawnSubagent: (provider, scwd, projectContext, stats, task, role, signal, observers) => {
+        spawnSubagent: (provider, scwd, projectContext, stats, task, role, signal, observers, profileId) => {
           const live = loadConfig({ cwd: scwd });
-          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role, signal, observers);
+          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role, signal, observers, profileId);
         },
         guardian: guardianOpt,
-        buildGuardian: async (targetCwd) => {
+        buildGuardian: async (targetCwd, profileId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
-          const base = await withRouting(await buildProvider(live), live);
-          return buildGuardian(live, base);
+          const base = await withRouting(await buildProvider(live, undefined, profileId), live, profileId);
+          return buildGuardian(live, base, profileId);
         },
         sandbox,
         approval,
@@ -3603,9 +3714,25 @@ program.action(async (opts) => {
   let requestedHeadlessAgent: AgentIndexEntry | undefined;
   if (opts.print && opts.role) {
     const ref = String(opts.role).trim();
-    const isLocalRole = !ref.includes(":") && loadRoles(process.cwd()).some((role) => role.id === ref);
+    const explicitResumeId = startupWorkspaceTransferId
+      ?? (opts.resume
+        ? resolveSessionId(String(opts.resume))
+        : opts.continue
+          ? latestForCwd(process.cwd())?.meta.id ?? null
+          : null);
+    const explicitResume = explicitResumeId ? loadSession(explicitResumeId) : null;
+    const roleRouteProfileId = explicitResume?.meta.profileId ?? resolveActive(process.cwd()).id;
+    // 0.134.1 stored managed role bundles in one unscoped directory. Do not guess which organization
+    // owned those files: refresh the exact authenticated profile before the first post-upgrade lookup so
+    // an explicit `--role` can seed its new identity-scoped directory and start on the first attempt.
+    const roleRouteProfile = getProfile(roleRouteProfileId);
+    if (roleRouteProfile?.kind === "gateway" && !existsSync(orgRolesDir(roleRouteProfile.id))) {
+      await syncOrgRolesForProfile(roleRouteProfile);
+    }
+    const isLocalRole = !ref.includes(":")
+      && loadRoles(process.cwd(), roleRouteProfileId).some((role) => role.id === ref);
     if (!isLocalRole) {
-      const hit = resolveAgent(ref, process.cwd());
+      const hit = resolveAgent(ref, process.cwd(), roleRouteProfileId);
       if (hit && "ambiguous" in hit) {
         process.stderr.write(
           `hara: role '${ref}' is ambiguous; choose one of: ${hit.ambiguous.map((entry) => `${entry.project}:${entry.name}`).join(", ")}\n`,
@@ -3624,6 +3751,14 @@ program.action(async (opts) => {
   const cfg = loadConfig({ overlay: opts.overlay, ...(requestedHeadlessAgent?.home ? { cwd: requestedHeadlessAgent.home } : {}) });
   const cwd = cfg.cwd;
   const homeWorkspace = isUnsafeProjectWorkspace(cwd);
+  const machineOutput = !!opts.print && !!opts.schema;
+  if (opts.model) cfg.model = opts.model;
+  // Resolve a persisted session's identity before role bodies, providers, or MCP transports are loaded.
+  // This read is only an early routing hint; the authoritative snapshot is re-read under the lock below.
+  const launchResumeId = startupWorkspaceTransferId
+    ?? (opts.resume ? resolveSessionId(String(opts.resume)) : opts.continue ? latestForCwd(cwd)?.meta.id ?? null : null);
+  const launchResume = launchResumeId ? loadSession(launchResumeId) : null;
+  let sessionRouteProfileId = launchResume?.meta.profileId ?? profileForConfig(cfg).profile.id;
   // Resolve the concrete role before constructing any user/plugin MCP transport. MCP servers are arbitrary
   // stdio subprocesses, so a read-only persona must not start them merely by launching a turn. Reusing this
   // object later also closes the resolve→connect→re-resolve race where a role could disappear or change policy.
@@ -3631,56 +3766,34 @@ program.action(async (opts) => {
   if (opts.print && opts.role) {
     const requestedRole = String(opts.role).trim();
     requestedHeadlessRole = requestedHeadlessAgent?.project
-      ? loadRoles(requestedHeadlessAgent.home).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+      ? loadRoles(requestedHeadlessAgent.home, sessionRouteProfileId).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
       : requestedHeadlessAgent
-        ? loadGlobalRoles().find((candidate) => candidate.id === requestedHeadlessAgent!.name)
-        : loadRoles(cwd).find((candidate) => candidate.id === requestedRole);
+        ? loadGlobalRoles(sessionRouteProfileId).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+        : loadRoles(cwd, sessionRouteProfileId).find((candidate) => candidate.id === requestedRole);
     if (!requestedHeadlessRole) {
       process.stderr.write(`hara: role '${opts.role}' disappeared from its declared home (${cwd}); refusing to start providers or MCP servers under the wrong persona.\n`);
       process.exitCode = 2;
       return;
     }
   }
-  const machineOutput = !!opts.print && !!opts.schema;
-  if (opts.model) cfg.model = opts.model;
-  const provider0 = await withRouting(
-    await buildProvider(cfg, opts.model ? { model: cfg.model } : undefined),
-    cfg,
-  );
-  if (provider0) {
-    cfg.provider = provider0.id as ProviderId;
-    cfg.model = provider0.model;
+  const launchProfile = profileByIdForConfig(cfg, sessionRouteProfileId);
+  const freshProfileModel = launchProfile
+    ? launchProfile.kind === "gateway"
+      ? process.env.HARA_MODEL || effectiveModel(launchProfile) || cfg.model
+      : resolveByokProviderTarget(cfg, launchProfile, false).model
+    : cfg.model;
+  const launchModel = opts.model ? cfg.model : launchResume?.meta.model || freshProfileModel;
+  let initialRuntime: { provider: Provider; profile: Profile } | null = null;
+  try {
+    initialRuntime = await buildSessionBoundRuntime(cfg, sessionRouteProfileId, launchModel, launchResume?.meta.effort);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (machineOutput) process.stderr.write(`hara: ${message}\n`);
+    else out(c.red(`Cannot open session: ${message}.\n`));
+    process.exitCode = 2;
+    return;
   }
-  // Fallback provider, built correctly for CROSS-PROVIDER failover. The old `baseURL: fallbackBaseURL ??
-  // baseURL` sent the fallback model to the PRIMARY endpoint when no fallbackBaseURL was set — e.g.
-  // deepseek-v4-pro posted to coding.dashscope → 400. Now: `fallbackProvider` routes to that vendor's
-  // endpoint + its own key (fallbackBaseURL/fallbackApiKey still override); without it we stay on the
-  // primary endpoint (correct only for a same-endpoint fallback).
-  let fallbackProv: Provider | null = null;
-  if (provider0 && cfg.fallbackModel && cfg.fallbackModel !== provider0.model) {
-    const fp = cfg.fallbackProvider;
-    const cross = !!fp && fp !== provider0.id;
-    const family = (m: string): string => m.toLowerCase().split(/[-.:/]/)[0];
-    const fallbackEnvKey = fp ? providerEnvKey(fp) : "";
-    const crossKey = cfg.fallbackApiKey ?? (fallbackEnvKey ? process.env[fallbackEnvKey] : undefined);
-    if (fp === "hara-gateway") {
-      process.stderr.write("hara: fallbackProvider cannot be hara-gateway; select an enrolled gateway profile instead. Fallback disabled.\n");
-    } else if (cross && providerRequiresApiKey(fp!) && !crossKey) {
-      process.stderr.write(`hara: fallbackProvider '${fp}' needs its own key — set fallbackApiKey. Fallback disabled.\n`);
-    } else if (!fp && !cfg.fallbackBaseURL && family(cfg.fallbackModel) !== family(provider0.model)) {
-      // A different-looking vendor with no routing set would hit the primary endpoint and 400 on failover.
-      process.stderr.write(`hara: fallbackModel '${cfg.fallbackModel}' looks like a different vendor than '${provider0.model}', but no fallbackProvider/fallbackBaseURL is set — it would hit the PRIMARY endpoint (likely 400). Set fallbackProvider (+ fallbackApiKey). Fallback disabled.\n`);
-    } else {
-      fallbackProv = await buildProvider(cfg, {
-        ...(fp ? { provider: fp } : {}),
-        model: cfg.fallbackModel,
-        ...(cfg.fallbackBaseURL ? { baseURL: cfg.fallbackBaseURL } : {}),
-        ...(cross ? { apiKey: crossKey } : cfg.fallbackApiKey ? { apiKey: cfg.fallbackApiKey } : {}),
-      });
-    }
-  }
-  const fbOpt = fallbackProv ? { provider: fallbackProv } : undefined; // app-failover for the main chat turns
-  const guardianOpt = await buildGuardian(cfg, provider0); // internal safety layer (high-risk actions only)
+  const provider0 = initialRuntime?.provider ?? null;
   if (!provider0) {
     // First-run friendliness: offer the setup wizard instead of just erroring (interactive TTY only).
     if (stdin.isTTY && !opts.print) {
@@ -3693,16 +3806,54 @@ program.action(async (opts) => {
         process.exit(0);
       }
     }
-    const message = `Not authenticated for provider '${cfg.provider}'.\n${authHint(cfg)}\n`;
+    const boundProfile = profileByIdForConfig(cfg, sessionRouteProfileId);
+    const message = `Not authenticated for profile '${sessionRouteProfileId}' (provider '${cfg.provider}').\n${authHint(cfg, boundProfile)}\n`;
     if (machineOutput) process.stderr.write(message);
-    else out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
+    else out(c.red(`Not authenticated for profile '${sessionRouteProfileId}' (provider '${cfg.provider}').\n`) + authHint(cfg, boundProfile) + "\n");
     process.exit(1);
   }
   let provider: Provider = provider0;
-  // Active profile is the source of truth for gateway-side concerns (heartbeat / role sync).
-  // Legacy: cfg.provider==='hara-gateway' kept for users still pointing config.json at the old
-  // sentinel — but profile.kind is what the rest of the CLI now reasons about.
-  const __activeP = loadActiveProfile();
+  // The session-bound profile is the source of truth for every gateway-side concern too. The globally
+  // active profile may change independently while an older conversation is being resumed.
+  let __activeP = initialRuntime?.profile ?? loadActiveProfile();
+  // These objects can make independent model/control-plane requests. They are intentionally constructed
+  // only after the session lock establishes the authoritative profile; pre-lock copies could retain a
+  // credential or managed role from whichever connection happened to be active during startup.
+  let fbOpt: { provider: Provider } | undefined;
+  let guardianOpt: Awaited<ReturnType<typeof buildGuardian>>;
+  const bindAuxiliaryRuntime = async (primary: Provider, profile: Profile): Promise<void> => {
+    // Fallback provider, built correctly for CROSS-PROVIDER failover. Passing profile.id is essential:
+    // every sidecar request of a persisted session stays inside the same identity boundary.
+    let fallbackProv: Provider | null = null;
+    if (cfg.fallbackModel && cfg.fallbackModel !== primary.model) {
+      const fp = cfg.fallbackProvider;
+      const cross = !!fp && fp !== primary.id;
+      const family = (model: string): string => model.toLowerCase().split(/[-.:/]/)[0];
+      const fallbackEnvKey = fp ? providerEnvKey(fp) : "";
+      const crossKey = cfg.fallbackApiKey ?? (fallbackEnvKey ? process.env[fallbackEnvKey] : undefined);
+      if (fp === "hara-gateway") {
+        process.stderr.write("hara: fallbackProvider cannot be hara-gateway; select an enrolled gateway profile instead. Fallback disabled.\n");
+      } else if (cross && providerRequiresApiKey(fp!) && !crossKey) {
+        process.stderr.write(`hara: fallbackProvider '${fp}' needs its own key — set fallbackApiKey. Fallback disabled.\n`);
+      } else if (!fp && !cfg.fallbackBaseURL && family(cfg.fallbackModel) !== family(primary.model)) {
+        process.stderr.write(`hara: fallbackModel '${cfg.fallbackModel}' looks like a different vendor than '${primary.model}', but no fallbackProvider/fallbackBaseURL is set — it would hit the PRIMARY endpoint (likely 400). Set fallbackProvider (+ fallbackApiKey). Fallback disabled.\n`);
+      } else {
+        fallbackProv = await buildProvider(cfg, {
+          ...(fp ? { provider: fp } : {}),
+          model: cfg.fallbackModel,
+          ...(cfg.fallbackBaseURL ? { baseURL: cfg.fallbackBaseURL } : {}),
+          ...(cross ? { apiKey: crossKey } : cfg.fallbackApiKey ? { apiKey: cfg.fallbackApiKey } : {}),
+        }, profile.id);
+      }
+    }
+    fbOpt = fallbackProv ? { provider: fallbackProv } : undefined;
+    guardianOpt = await buildGuardian(cfg, primary, profile.id);
+    if (profile.kind === "gateway" || primary.id === "hara-gateway") {
+      const boundEnrollment = enrollmentFromProfile(profile);
+      if (boundEnrollment) void heartbeatEnrollment(boundEnrollment, undefined, { profileId: profile.id });
+      void syncOrgRolesForProfile(profile);
+    }
+  };
   // Safety UX: first line of stdout = "where am I sending requests right now". Stable, scriptable,
   // and reassuring at the start of every session. Suppressed in pure -p print mode to keep that
   // path clean stdout-only (the user wants the model output, not banner noise). Set HARA_QUIET=1
@@ -3713,10 +3864,6 @@ program.action(async (opts) => {
       ? deviceTokenExpiryWarning(__activeP.tokenExpiresAt)
       : null;
     if (expiryWarning) out(c.yellow(`⚠ ${expiryWarning}\n`));
-  }
-  if (__activeP.kind === "gateway" || cfg.provider === "hara-gateway") {
-    void heartbeat(); // fleet visibility — fire-and-forget, never blocks startup
-    void syncOrgRoles(); // refresh governed org-role bundle (B3) in the background; best-effort, never blocks
   }
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
   let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it
@@ -3735,12 +3882,34 @@ program.action(async (opts) => {
   // through the ordinary interactive grant, and the newly discovered tools appear on the next model round.
   // Read-only headless roles do not receive the launcher at all.
   const mcpAll = { ...pluginMcpServers(), ...cfg.mcpServers }; // user config wins over plugin-contributed servers
-  if (!requestedHeadlessRole?.readOnly && Object.keys(mcpAll).length) {
+  let lazyMcpRegistered = false;
+  const registerRunMcp = (): void => {
+    if (lazyMcpRegistered || requestedHeadlessRole?.readOnly || !Object.keys(mcpAll).length) return;
+    lazyMcpRegistered = true;
     registerLazyMcpServers(
       mcpAll,
       (message) => machineOutput ? process.stderr.write(message + "\n") : out(c.dim(message + "\n")),
     );
-  }
+  };
+  const reloadRequestedHeadlessRole = async (profile: Profile): Promise<boolean> => {
+    if (!opts.print || !opts.role) return true;
+    // The role body and its tool policy are organization-controlled input. Refresh and reload them only
+    // after identity is authoritative so an early active-profile hint cannot leak another tenant's prompt
+    // or accidentally grant MCP access to a role that is read-only in the saved session's organization.
+    if (profile.kind === "gateway" && !existsSync(orgRolesDir(profile.id))) {
+      await syncOrgRolesForProfile(profile);
+    }
+    const requestedRole = String(opts.role).trim();
+    requestedHeadlessRole = requestedHeadlessAgent?.project
+      ? loadRoles(requestedHeadlessAgent.home, profile.id).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+      : requestedHeadlessAgent
+        ? loadGlobalRoles(profile.id).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+        : loadRoles(cwd, profile.id).find((candidate) => candidate.id === requestedRole);
+    if (requestedHeadlessRole) return true;
+    process.stderr.write(`hara: role '${opts.role}' is not available for session profile '${profile.id}'; refusing to reuse a persona from another connection.\n`);
+    process.exitCode = 2;
+    return false;
+  };
 
   // one-shot
   if (opts.print) {
@@ -3838,9 +4007,16 @@ program.action(async (opts) => {
       // Stamp who created this session (cron runner sets HARA_CRON, gateway sets HARA_GATEWAY) and give
       // automated sessions a "name · time" title UP FRONT — the raw prompt must never become the title.
       const src = sessionSourceFromEnv();
+      if (prior?.meta.profileId && prior.meta.profileId !== sessionRouteProfileId) {
+        process.stderr.write(`hara: session ${shortId(rid)} changed identity while it was being opened; retry the resume.\n`);
+        process.exitCode = 2;
+        return;
+      }
+      const authoritativeProfileId = prior?.meta.profileId ?? profileForConfig(cfg).profile.id;
       meta = prior?.meta ?? {
         id: rid,
         cwd,
+        profileId: authoritativeProfileId,
         provider: cfg.provider,
         model: cfg.model,
         title: src.source === "interactive" ? "" : automatedTitle(src.source, src.sourceName),
@@ -3848,35 +4024,33 @@ program.action(async (opts) => {
         updatedAt: "",
         ...(src.source !== "interactive" ? { source: src.source, sourceName: src.sourceName } : { source: "interactive" as const }),
       };
+      meta.profileId = authoritativeProfileId;
       // Checklist continuity remains in meta; execution identity is restored independently in top-level
       // SessionData.task so transcript/interaction changes cannot silently replace the active objective.
       restoreTodos(meta.todos);
       onTodosChange((list) => {
         if (meta) meta.todos = [...list];
       });
-      // Apply per-session pinned model on headless resume (mirrors the interactive path).
-      // --model flag wins (already on cfg.model) and is written back; otherwise restore meta.model.
-      if (prior) {
-        if (opts.model) {
-          meta.model = cfg.model;
-        } else if (meta.model && meta.model !== cfg.model) {
-          const __allowed = __activeP.kind === "gateway" && __activeP.availableModels && __activeP.availableModels.length > 0;
-          if (__allowed && !__activeP.availableModels!.includes(meta.model)) {
-            const __fb = __activeP.defaultModel || cfg.model;
-            // headless: log to stderr so it doesn't pollute the captured stdout reply
-            try { process.stderr.write(`hara: resumed session pinned '${meta.model}' not in availableModels — falling back to '${__fb}'.\n`); } catch { /* ignore */ }
-            cfg.model = __fb;
-            meta.model = __fb;
-            const __rb = await buildProvider(cfg, { model: cfg.model });
-            if (__rb) provider = __rb;
-          } else {
-            cfg.model = meta.model;
-            const __rb = await buildProvider(cfg, { model: cfg.model });
-            if (__rb) provider = __rb;
-          }
-        }
+      // The saved profile is an identity boundary. Rebuild from the authoritative under-lock snapshot;
+      // never reinterpret an old conversation through whatever organization happens to be active now.
+      const desiredModel = opts.model ? String(opts.model) : meta.model || cfg.model;
+      try {
+        const bound = await buildSessionBoundRuntime(cfg, authoritativeProfileId, desiredModel, meta.effort);
+        if (!bound) throw new Error(`profile '${authoritativeProfileId}' is not authenticated`);
+        provider = bound.provider;
+        __activeP = bound.profile;
+        sessionRouteProfileId = authoritativeProfileId;
+        meta.provider = provider.id;
+        meta.model = desiredModel;
+      } catch (error) {
+        process.stderr.write(`hara: cannot resume session ${shortId(rid)} — ${error instanceof Error ? error.message : String(error)}.\n`);
+        process.exitCode = 2;
+        return;
       }
     }
+    if (!(await reloadRequestedHeadlessRole(__activeP))) return;
+    await bindAuxiliaryRuntime(provider, __activeP);
+    registerRunMcp();
     // --schema: schema-enforced structured output. The schema (inline JSON or a file path) becomes a run-scoped
     // structured_output tool the model MUST call; stdout is then exactly that JSON (streaming suppressed), so
     // scripts / gateway flows / cron parse a guaranteed shape instead of regex-fishing prose.
@@ -3979,7 +4153,7 @@ program.action(async (opts) => {
       if (requestedHeadlessRole.readOnly) headlessHooks = false;
       const roleModel = effectiveRoleModel(requestedHeadlessRole.model, cfg.model);
       if (roleModel && roleModel !== provider.model) {
-        const selected = await buildProvider(cfg, { model: roleModel });
+        const selected = await buildProvider(cfg, { model: roleModel }, meta?.profileId ?? sessionRouteProfileId);
         if (!selected) {
           process.stderr.write(`hara: role '${opts.role}' requires model '${roleModel}', but that provider is not authenticated.\n`);
           process.exitCode = 2;
@@ -3996,6 +4170,7 @@ program.action(async (opts) => {
       ctx: {
         cwd,
         sandbox,
+        profileId: meta?.profileId ?? sessionRouteProfileId,
         ...(meta ? { sessionId: meta.id } : {}),
         spawn: (t: string, role?: string, signal?: AbortSignal) => runSubagent(
           cfg,
@@ -4175,7 +4350,7 @@ program.action(async (opts) => {
     if (ans === "" || ans.startsWith("y")) {
       out(c.dim("Analyzing project…\n"));
       try {
-        await runInit(provider, cwd, sandbox, cfg);
+        await runInit(provider, cwd, sandbox, cfg, __activeP.id);
       } catch (e: any) {
         out(c.red(`[init error] ${e.message}\n`));
       }
@@ -4223,9 +4398,16 @@ program.action(async (opts) => {
     );
     process.exit(2);
   }
+  if (resumed?.meta.profileId && resumed.meta.profileId !== sessionRouteProfileId) {
+    releaseSessionLock(sessionId);
+    out(c.red(`Session ${shortId(sessionId)} changed identity while it was being opened; retry the resume.\n`));
+    process.exit(2);
+  }
+  const legacyProfileBinding = Boolean(resumed && !resumed.meta.profileId);
   const meta: SessionMeta = resumed?.meta ?? {
     id: sessionId,
     cwd,
+    profileId: sessionRouteProfileId,
     provider: cfg.provider,
     model: cfg.model,
     title: "",
@@ -4233,6 +4415,8 @@ program.action(async (opts) => {
     updatedAt: "",
     source: "interactive",
   };
+  const authoritativeProfileId = meta.profileId ?? profileForConfig(cfg).profile.id;
+  meta.profileId = authoritativeProfileId;
   // Conversation transcript and task execution are restored independently. A process that disappeared
   // mid-run leaves `running`; recovery turns it into an explicit paused/interrupted task.
   let task: TaskExecution | undefined = recoverTaskExecution(resumed?.task);
@@ -4242,34 +4426,38 @@ program.action(async (opts) => {
   onTodosChange((list) => {
     meta.todos = [...list];
   });
-  // Per-session model precedence on resume:
-  //   1. --model flag (already applied to cfg.model up-top) → wins and is written back to meta.model.
-  //   2. resumed meta.model → restored into cfg.model (the user's last /model choice).
-  //   3. otherwise leave cfg.model as the profile-resolved default.
-  // Safety: if we're on a gateway profile with a finite availableModels list and the resumed
-  // meta.model isn't in it (e.g. user switched profiles between sessions), warn and degrade to
-  // profile.defaultModel — a stale pinned model shouldn't brick the resume.
+  // Per-session route/model precedence on resume: explicit --model wins inside the session's saved
+  // profile; otherwise restore the saved model. Missing/expired/unauthorized routes fail closed instead
+  // of degrading to the currently active organization or Personal.
   if (resumed) {
-    if (opts.model) {
-      // explicit --model on the command line wins; persist it onto the session.
-      meta.model = cfg.model;
-    } else if (meta.model && meta.model !== cfg.model) {
-      const __ap = __activeP;
-      const __allowed = __ap.kind === "gateway" && __ap.availableModels && __ap.availableModels.length > 0;
-      if (__allowed && !__ap.availableModels!.includes(meta.model)) {
-        const __fallback = __ap.defaultModel || cfg.model;
-        out(c.yellow(`⚠ resumed session was pinned to '${meta.model}', which isn't in this profile's availableModels (${__ap.availableModels!.join(", ")}). Falling back to '${__fallback}'.\n`));
-        cfg.model = __fallback;
-        meta.model = __fallback;
-        const __rebuilt = await buildProvider(cfg, { model: cfg.model });
-        if (__rebuilt) provider = __rebuilt;
-      } else {
-        cfg.model = meta.model;
-        const __rebuilt = await buildProvider(cfg, { model: cfg.model });
-        if (__rebuilt) provider = __rebuilt;
-      }
+    const desiredModel = opts.model ? String(opts.model) : meta.model || cfg.model;
+    try {
+      const bound = await buildSessionBoundRuntime(cfg, authoritativeProfileId, desiredModel, meta.effort);
+      if (!bound) throw new Error(`profile '${authoritativeProfileId}' is not authenticated`);
+      provider = bound.provider;
+      __activeP = bound.profile;
+      sessionRouteProfileId = authoritativeProfileId;
+      meta.provider = provider.id;
+      meta.model = desiredModel;
+    } catch (error) {
+      releaseSessionLock(sessionId);
+      out(c.red(`Cannot resume session ${shortId(sessionId)}: ${error instanceof Error ? error.message : String(error)}.\n`));
+      process.exit(2);
     }
   }
+  if (legacyProfileBinding) {
+    // Migration is an identity decision, not a turn side effect. Persist it as soon as the selected
+    // provider has validated so opening and immediately exiting cannot leave the transcript unbound.
+    saveSession(meta, resumed?.history ?? [], task);
+  }
+  try {
+    await bindAuxiliaryRuntime(provider, __activeP);
+  } catch (error) {
+    releaseSessionLock(sessionId);
+    out(c.red(`Cannot initialize session ${shortId(sessionId)}: ${error instanceof Error ? error.message : String(error)}.\n`));
+    process.exit(2);
+  }
+  registerRunMcp();
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
   const persistSession = (): void => saveSession(meta, history, task);
   const taskIntakeForRun = () => task
@@ -4429,7 +4617,7 @@ program.action(async (opts) => {
       run: async () => {
         out(c.dim("Analyzing project…\n"));
         try {
-          await runInit(provider, cwd, sandbox, cfg);
+          await runInit(provider, cwd, sandbox, cfg, authoritativeProfileId);
           projectContext = loadAgentContext(cwd) || undefined;
           out(c.green("AGENTS.md updated.\n"));
         } catch (e: any) {
@@ -4463,7 +4651,7 @@ program.action(async (opts) => {
           } else {
             __lines.push(c.dim(`session pinned: ${meta.model || "(none)"}${__force ? c.yellow(" · forced (all roles use session model)") : ""}`));
           }
-          const __roles = loadRoles(cwd);
+          const __roles = loadRoles(cwd, authoritativeProfileId);
           if (__roles.length) {
             __lines.push(c.dim("roles:"));
             for (const r of __roles) {
@@ -4519,7 +4707,7 @@ program.action(async (opts) => {
       name: "roles",
       desc: "list org roles",
       run: () => {
-        const rs = loadRoles(cwd);
+        const rs = loadRoles(cwd, authoritativeProfileId);
         if (!rs.length) return void out(c.dim("No roles. Run `hara roles init`.\n"));
         for (const r of rs) out(`  ${r.id}  ${c.dim(`[${roleMeta(r)}] owns: ${r.owns.join(", ")}`)}\n`);
       },
@@ -4549,7 +4737,17 @@ program.action(async (opts) => {
       desc: "dispatch a task to the owning role: /org <task>",
       run: async (a) => {
         if (!a) return void out(c.dim("usage: /org <task>\n"));
-        await runOrg(a, { cfg, baseProvider: provider, cwd, sandbox, approval, confirm, projectContext, stats });
+        await runOrg(a, {
+          cfg,
+          baseProvider: provider,
+          profileId: authoritativeProfileId,
+          cwd,
+          sandbox,
+          approval,
+          confirm,
+          projectContext,
+          stats,
+        });
         out(statusLine(cfg.model, stats.input, stats.output) + "\n");
       },
     },
@@ -4558,7 +4756,17 @@ program.action(async (opts) => {
       desc: "decompose + execute a task as atoms (DAG + verify): /plan <task>",
       run: async (a) => {
         if (!a) return void out(c.dim("usage: /plan <task>\n"));
-        await runPlan(a, { cfg, baseProvider: provider, cwd, sandbox, approval, confirm, projectContext, stats });
+        await runPlan(a, {
+          cfg,
+          baseProvider: provider,
+          profileId: authoritativeProfileId,
+          cwd,
+          sandbox,
+          approval,
+          confirm,
+          projectContext,
+          stats,
+        });
         if (bar.isActive()) bar.update({ input: stats.input, output: stats.output, ctxPct: bar.ctxPctFor(cfg.model, stats.lastInput ?? 0) });
         else out(statusLine(cfg.model, stats.input, stats.output) + "\n");
       },
@@ -4772,7 +4980,7 @@ program.action(async (opts) => {
       if (await askConfirm("No AGENTS.md here — analyze this project and create one?")) {
         out(c.dim("Analyzing project…\n"));
         try {
-          await runInit(provider, cwd, sandbox, cfg);
+          await runInit(provider, cwd, sandbox, cfg, authoritativeProfileId);
         } catch (e: any) {
           out(c.red(`[init error] ${e.message}\n`));
         }
@@ -5199,7 +5407,7 @@ program.action(async (opts) => {
           if (nm === "doctor") return void h.sink.notice(runDoctor(cfg).replace(/\[[0-9;]*m/g, ""));
           if (nm === "vision") return void h.sink.notice(applyVision(arg));
           if (nm === "roles") {
-            const rs = loadRoles(cwd);
+            const rs = loadRoles(cwd, authoritativeProfileId);
             return void h.sink.notice(rs.length ? rs.map((r) => `  ${r.id} [${roleMeta(r)}] — owns: ${r.owns.join(", ")}`).join("\n") : "No roles. Run `hara roles init`.");
           }
           if (nm === "skills") {
@@ -5248,7 +5456,7 @@ program.action(async (opts) => {
             const xout = stats.output;
             await runAgent([{ role: "user", content: standaloneReviewPrompt(changes) }], {
               provider,
-              ctx: { cwd, sandbox, ui: rui },
+              ctx: { cwd, sandbox, profileId: authoritativeProfileId, ui: rui },
               approval: "full-auto", // read-only via the tool filter, so nothing prompts
               confirm: h.confirm,
               toolFilter: (n) => READONLY_TOOLS.has(n),
@@ -5293,7 +5501,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -5376,7 +5584,7 @@ program.action(async (opts) => {
           };
           let planOutcome = await runAgent(history, {
             provider,
-            ctx: { cwd, sandbox, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+            ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
             approval: "suggest",
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n) || n === "memory_search" || n === "memory_get" || n === "session_search",
@@ -5433,7 +5641,7 @@ program.action(async (opts) => {
             const xout = stats.output;
             planOutcome = await runAgent(history, {
               provider,
-              ctx: { cwd, sandbox, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+              ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
               approval: choice as ApprovalMode,
               memory: buildMemory(),
               confirm: h.confirm,
@@ -5477,7 +5685,7 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         const turnOutcome = await runAgent(history, {
           provider,
-          ctx: { cwd, sandbox, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+          ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
           approval: appr,
           memory: buildMemory(),
           confirm: h.confirm,
@@ -5575,7 +5783,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -5639,7 +5847,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

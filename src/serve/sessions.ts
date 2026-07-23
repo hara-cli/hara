@@ -80,10 +80,11 @@ export class SessionHub {
     }
   }
 
-  create(o: { cwd: string; provider: Provider; providerId: string; model: string; approval: ApprovalMode; projectContext?: string }): ServeSession {
+  create(o: { cwd: string; profileId?: string; provider: Provider; providerId: string; model: string; approval: ApprovalMode; projectContext?: string }): ServeSession {
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: o.cwd,
+      profileId: o.profileId ?? "personal",
       provider: o.providerId,
       model: o.model,
       title: "",
@@ -119,7 +120,8 @@ export class SessionHub {
     try {
       const prior = this.store.load(id); // lock-before-load: this is the authoritative latest snapshot
       if (!prior) return { missing: true };
-      // Credential/provider routing is live, while the model remains the session's explicit pin.
+      // Credentials are refreshed live inside the session's persisted identity route; the model remains
+      // the session's explicit pin.
       prior.meta.provider = o.provider.id;
       const task = recoverTaskExecution(prior.task);
       const s: ServeSession = { meta: prior.meta, history: [...prior.history], task, provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
@@ -213,7 +215,7 @@ export class SessionHub {
    *  sibling of rewind. Source may be live or on-disk; the fork is always a fresh live session. */
   fork(
     id: string,
-    o: { provider: Provider; providerId: string; approval: ApprovalMode; projectContext?: string },
+    o: { profileId?: string; provider: Provider; providerId: string; approval: ApprovalMode; projectContext?: string },
   ): { session: ServeSession } | { missing: true } | { busy: true } {
     const live = this.sessions.get(id);
     if (live?.busy || live?.configuring) return { busy: true };
@@ -222,6 +224,7 @@ export class SessionHub {
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: src.meta.cwd,
+      profileId: src.meta.profileId ?? o.profileId ?? "personal",
       provider: o.providerId,
       model: src.meta.model,
       title: src.meta.title ? `${src.meta.title} ⑂` : "",

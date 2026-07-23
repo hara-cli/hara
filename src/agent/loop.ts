@@ -205,11 +205,12 @@ export function composeSystem(
   continuationSession = false,
   executionContext?: string,
   intake?: { enabled: boolean; brief?: TaskBrief },
+  profileId?: string,
 ): AssembledSystemPrompt {
   const assembler = new PromptAssembler();
   assembler.add("core", "static", "core", override || HARA_SYSTEM());
   const skills = skillsDigest(cwd);
-  const roles = override ? "" : rolesDigest(cwd);
+  const roles = override ? "" : rolesDigest(cwd, profileId);
   const intakeContext = !intake?.enabled
     ? ""
     : intake.brief
@@ -787,6 +788,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       opts.continuationSession,
       opts.executionContext,
       { enabled: !!opts.taskIntake, brief: intakeTask?.brief },
+      ctx.profileId,
     );
     const system = assembledSystem.text;
     const prepared = prepareHistoryForModel(history, {

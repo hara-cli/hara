@@ -70,8 +70,8 @@ export interface Profile {
   defaultModel?: string;
   /** the user's per-profile override of `defaultModel`. Cleared by `model reset`. */
   model?: string;
-  /** P0: gateway populates with [defaultModel] (or empty if the gateway didn't say);
-   *  byok stays empty (no list constraint). P1 may pull this from /v1/models. */
+  /** Server-authorized catalog for a gateway connection; byok stays empty (no list constraint).
+   *  Control may refresh this in place during heartbeat without rotating the credential. */
   availableModels?: string[];
   /** Server-advertised thinking dial for the scoped gateway model. */
   thinkingEfforts?: string[];
@@ -88,6 +88,14 @@ export interface ProfilesFile {
 const PERSONAL_ID = "personal";
 const DEFAULT_ORG_ID = "default-org";
 const MAX_PROFILE_STATE_BYTES = 4 * 1024 * 1024;
+export const PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+export const PROFILE_ID_ERROR = "profile id must use 1-64 letters, numbers, dots, underscores, or dashes";
+
+/** Profile ids cross persistence, filesystem, and routing boundaries. Keep one validator for every
+ * producer and consumer so an id accepted at setup can always be resumed safely later. */
+export function isValidProfileId(value: unknown): value is string {
+  return typeof value === "string" && PROFILE_ID_PATTERN.test(value);
+}
 
 interface PrivateJsonState<T> {
   binding: PrivateStateFileBinding;
@@ -464,7 +472,7 @@ export function useProfile(id: string): { ok: true; profile: Profile } | { ok: f
 }
 
 export function addProfile(p: Profile): { ok: true } | { ok: false; reason: string } {
-  if (!p.id || /[\s/]/.test(p.id)) return { ok: false, reason: "profile id must be non-empty and contain no whitespace or '/'" };
+  if (!isValidProfileId(p.id)) return { ok: false, reason: PROFILE_ID_ERROR };
   const f = maybeMigrate();
   if (f.profiles.some((x) => x.id === p.id)) return { ok: false, reason: `profile '${p.id}' already exists` };
   if (p.kind === "gateway" && (!p.gatewayUrl || !p.deviceToken)) return { ok: false, reason: "gateway profile needs gatewayUrl + deviceToken" };
@@ -477,6 +485,7 @@ export function addProfile(p: Profile): { ok: true } | { ok: false; reason: stri
 /** Replace an existing profile (same id) — used by `hara enroll <url> --code` when the
  *  default-org profile already exists (re-enrollment / token rotation). */
 export function upsertProfile(p: Profile): void {
+  if (!isValidProfileId(p.id)) throw new Error(PROFILE_ID_ERROR);
   const f = maybeMigrate();
   const i = f.profiles.findIndex((x) => x.id === p.id);
   if (i >= 0) f.profiles[i] = p;
@@ -501,7 +510,7 @@ export function removeProfile(id: string): { ok: true; activeChanged: boolean; r
 }
 
 /** Override the effective model within a profile. For "personal" this writes to config.json
- *  (the storage of record). For others it writes to profiles.json. P0: when availableModels
+ *  (the storage of record). For others it writes to profiles.json. When availableModels
  *  is non-empty on a gateway profile we validate the choice is in the set. */
 export function setModel(id: string, model: string): { ok: true } | { ok: false; reason: string } {
   if (id === PERSONAL_ID) {

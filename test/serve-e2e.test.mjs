@@ -478,6 +478,64 @@ test("serve e2e: models.list derives reasoning controls from the session-pinned 
   }
 });
 
+test("serve e2e: models.list honors a persisted session profile before that session is live", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-persisted-model-profile-"));
+  const store = memStore();
+  const sessionId = "persisted-flash-session";
+  store.saved.set(sessionId, {
+    meta: {
+      id: sessionId,
+      cwd: dir,
+      profileId: "flash-org",
+      provider: "hara-gateway",
+      model: "deepseek-v4-flash",
+      effort: "high",
+      title: "Persisted Flash session",
+      createdAt: "2026-07-23T00:00:00.000Z",
+      updatedAt: "2026-07-23T00:00:00.000Z",
+      source: "interactive",
+    },
+    history: [],
+  });
+  const runtimeRequests = [];
+  const deps = {
+    ...baseDeps(textProvider, store),
+    listModels: async (_cwd, profileId) =>
+      profileId === "flash-org" ? ["deepseek-v4-flash"] : ["deepseek-v4-pro"],
+    runtimeInfo: (cwd, model, profileId) => {
+      runtimeRequests.push({ cwd, model, profileId });
+      const selectedProfile = profileId ?? "pro-org";
+      const selectedModel = model ?? (selectedProfile === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro");
+      return {
+        providerId: "hara-gateway",
+        profileId: selectedProfile,
+        model: selectedModel,
+        availableModels: [selectedProfile === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro"],
+        effortLevels: ["off", "high", "max"],
+      };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    runtimeRequests.length = 0;
+    const listed = await client.call("models.list", { sessionId });
+    assert.deepEqual(listed.result.models, ["deepseek-v4-flash"]);
+    assert.equal(listed.result.current, "deepseek-v4-flash");
+    assert.equal(listed.result.profileId, "flash-org");
+    assert.equal(listed.result.effort, "high");
+    assert.ok(runtimeRequests.every((request) => request.profileId === "flash-org"));
+
+    const missing = await client.call("models.list", { sessionId: "missing-session" });
+    assert.equal(missing.error.code, -32003);
+  } finally {
+    client.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: managed gateway enforces its model scope and advertised DeepSeek thinking levels", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-managed-model-scope-"));
   const store = memStore();
@@ -524,6 +582,178 @@ test("serve e2e: managed gateway enforces its model scope and advertised DeepSee
   } finally {
     c.close();
     await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: persisted sessions keep their organization profile across active-profile switches", { timeout: 15000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-profile-binding-"));
+  const store = memStore();
+  const availableProfiles = new Set(["flash-org", "pro-org"]);
+  const models = { "flash-org": "deepseek-v4-flash", "pro-org": "deepseek-v4-pro" };
+  const providerRequests = [];
+  const auxiliaryRequests = [];
+  let auxiliaryRound = 0;
+  const auxiliaryProvider = {
+    ...textProvider,
+    async turn({ onText }) {
+      if (auxiliaryRound++ === 0) {
+        return {
+          text: "",
+          toolUses: [{ id: "agent-1", name: "agent", input: { task: "inspect the bound route" } }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      onText("bound");
+      return { text: "bound", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  let activeProfile = "flash-org";
+  const profileFor = (profileId) => profileId ?? activeProfile;
+  const requireProfile = (profileId) => {
+    const selected = profileFor(profileId);
+    if (!availableProfiles.has(selected)) throw new Error(`session profile '${selected}' is no longer available; choose an existing profile before continuing`);
+    return selected;
+  };
+  const deps = {
+    ...baseDeps(auxiliaryProvider, store),
+    buildSessionProvider: async (_cwd, profileId) => {
+      const selected = requireProfile(profileId);
+      providerRequests.push({ operation: "create", profileId: selected });
+      return { ...auxiliaryProvider, model: models[selected] };
+    },
+    buildProviderFor: async (model, _effort, _cwd, profileId) => {
+      const selected = requireProfile(profileId);
+      providerRequests.push({ operation: "resume", profileId: selected, model });
+      return { ...auxiliaryProvider, model };
+    },
+    listModels: async (_cwd, profileId) => [models[requireProfile(profileId)]],
+    runtimeInfo: (_cwd, model, profileId) => {
+      const selected = requireProfile(profileId);
+      const selectedModel = model ?? models[selected];
+      return {
+        providerId: "hara-gateway",
+        profileId: selected,
+        model: selectedModel,
+        effortLevels: ["off", "high", "max"],
+        availableModels: [models[selected]],
+      };
+    },
+    buildGuardian: async (_cwd, profileId) => {
+      auxiliaryRequests.push({ operation: "guardian", profileId });
+      return undefined;
+    },
+    spawnSubagent: async (_provider, _cwd, _projectContext, _stats, _task, _role, _signal, _observers, profileId) => {
+      auxiliaryRequests.push({ operation: "subagent", profileId });
+      return "subagent stayed bound";
+    },
+  };
+
+  let sessionId;
+  const first = await startServe({ host: "127.0.0.1", port: 0, token: "tok-1", cwd: dir }, deps);
+  let client = await connect(first.port);
+  try {
+    await client.call("initialize", { token: "tok-1" });
+    const created = await client.call("session.create", {});
+    sessionId = created.result.sessionId;
+    assert.equal(created.result.profileId, "flash-org");
+    assert.equal(store.saved.get(sessionId).meta.profileId, "flash-org", "new session persists its identity route");
+  } finally {
+    client.close();
+    await first.close();
+  }
+
+  activeProfile = "pro-org";
+  const second = await startServe({ host: "127.0.0.1", port: 0, token: "tok-2", cwd: dir }, deps);
+  client = await connect(second.port);
+  try {
+    await client.call("initialize", { token: "tok-2" });
+    const resumed = await client.call("session.resume", { sessionId });
+    assert.equal(resumed.result.profileId, "flash-org", "resume ignores the newly active organization");
+    assert.equal(resumed.result.model, "deepseek-v4-flash");
+    assert.ok(providerRequests.some((request) => request.operation === "resume" && request.profileId === "flash-org"));
+    const listed = await client.call("models.list", { sessionId });
+    assert.deepEqual(listed.result.models, ["deepseek-v4-flash"], "the model picker remains scoped to the session's organization");
+    const forbidden = await client.call("session.set-model", { sessionId, model: "deepseek-v4-pro" });
+    assert.match(forbidden.error.message, /not authorized/);
+    const sent = await client.call("session.send", { sessionId, text: "exercise auxiliary routes" });
+    assert.equal(sent.result.reply, "bound");
+    assert.ok(auxiliaryRequests.some((request) => request.operation === "guardian" && request.profileId === "flash-org"));
+    assert.ok(auxiliaryRequests.some((request) => request.operation === "subagent" && request.profileId === "flash-org"));
+    assert.equal(auxiliaryRequests.some((request) => request.profileId === "pro-org"), false);
+  } finally {
+    client.close();
+    await second.close();
+  }
+
+  availableProfiles.delete("flash-org");
+  const third = await startServe({ host: "127.0.0.1", port: 0, token: "tok-3", cwd: dir }, deps);
+  client = await connect(third.port);
+  try {
+    await client.call("initialize", { token: "tok-3" });
+    const refused = await client.call("session.resume", { sessionId });
+    assert.match(refused.error.message, /profile 'flash-org' is no longer available/, "removed profile fails closed instead of using the active Pro connection");
+  } finally {
+    client.close();
+    await third.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: resume refuses an identity changed between provider preflight and the locked reload", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-profile-race-"));
+  const store = memStore();
+  const sessionId = "profile-race-session";
+  store.saved.set(sessionId, {
+    meta: {
+      id: sessionId,
+      cwd: dir,
+      profileId: "flash-org",
+      provider: "hara-gateway",
+      model: "deepseek-v4-flash",
+      title: "Profile race",
+      createdAt: "2026-07-23T00:00:00.000Z",
+      updatedAt: "2026-07-23T00:00:00.000Z",
+      source: "interactive",
+    },
+    history: [],
+  });
+  let changed = false;
+  const deps = {
+    ...baseDeps(textProvider, store),
+    buildProviderFor: async (model, _effort, _cwd, profileId) => {
+      assert.equal(profileId, changed ? "pro-org" : "flash-org");
+      if (!changed) {
+        changed = true;
+        store.saved.get(sessionId).meta.profileId = "pro-org";
+        store.saved.get(sessionId).meta.model = "deepseek-v4-pro";
+      }
+      return { ...textProvider, model };
+    },
+    runtimeInfo: (_cwd, model, profileId) => ({
+      providerId: "hara-gateway",
+      profileId: profileId ?? "pro-org",
+      model: model ?? (profileId === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro"),
+      availableModels: [profileId === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro"],
+      effortLevels: ["off", "high", "max"],
+    }),
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(server.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const raced = await client.call("session.resume", { sessionId });
+    assert.equal(raced.error.code, -32002);
+    assert.match(raced.error.message, /identity changed/);
+    assert.equal(store.saved.get(sessionId).meta.profileId, "pro-org", "the locked identity is never overwritten by the stale preflight");
+
+    const resumed = await client.call("session.resume", { sessionId });
+    assert.equal(resumed.result.profileId, "pro-org");
+    assert.equal(resumed.result.model, "deepseek-v4-pro");
+  } finally {
+    client.close();
+    await server.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

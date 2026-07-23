@@ -64,13 +64,15 @@ test("session-model: --force collapses every role to the session model", () => {
   }
 });
 
-test("session-model: SessionMeta.model round-trips through save/load (the resume substrate)", () => {
+test("session-model: SessionMeta model and identity profile round-trip through save/load", () => {
   const id = newSessionId();
   const cwd = "/tmp/hara-session-model-" + id;
+  const tokenShapedProfileId = "sk-abcdefghijklmnopqrstuvwxyz1234567890";
   try {
     const meta = {
       id,
       cwd,
+      profileId: tokenShapedProfileId,
       provider: "qwen",
       model: "claude-4-opus", // ← the per-session pinned model
       title: "pin test",
@@ -82,6 +84,11 @@ test("session-model: SessionMeta.model round-trips through save/load (the resume
     const loaded = loadSession(id);
     assert.ok(loaded);
     assert.equal(loaded.meta.model, "claude-4-opus", "resume restores the pinned model — the whole point");
+    assert.equal(
+      loaded.meta.profileId,
+      tokenShapedProfileId,
+      "a valid token-shaped profile id remains structural identity instead of being redacted",
+    );
   } finally {
     rmSync(join(homedir(), ".hara", "sessions", `${id}.json`), { force: true });
   }

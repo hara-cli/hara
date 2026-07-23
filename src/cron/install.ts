@@ -1,5 +1,5 @@
 // Register `hara cron tick` with the OS scheduler so jobs fire without a hara daemon running:
-// launchd (macOS, every 60s) or crontab (Linux, every minute). Survives reboots; nothing to babysit.
+// launchd calendar minutes (macOS) or crontab (Linux, every minute). Survives reboots; nothing to babysit.
 import { platform, homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { writeFileSync, existsSync, rmSync, mkdirSync } from "node:fs";
@@ -10,6 +10,25 @@ const CRON_TAG = "# hara-cron";
 const xmlEscape = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`; // safe single-quote for /bin/sh
 const plistFile = (): string => join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
+
+/** launchd's StartInterval may drop or heavily coalesce background timer firings. Calendar events retain
+ * wall-clock semantics and coalesce missed wake events into one launch, which is exactly what `cron tick`
+ * needs. Spell out all 60 minute values instead of relying on an empty wildcard dictionary. */
+export function renderLaunchdPlist(argv: readonly string[]): string {
+  const calendarMinutes = Array.from(
+    { length: 60 },
+    (_, minute) => `<dict><key>Minute</key><integer>${minute}</integer></dict>`,
+  ).join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key><array>${argv.map((a) => `<string>${xmlEscape(a)}</string>`).join("")}</array>
+  <key>StartCalendarInterval</key><array>${calendarMinutes}</array>
+  <key>RunAtLoad</key><false/>
+</dict></plist>
+`;
+}
 
 function currentCrontab(): string {
   try {
@@ -34,15 +53,7 @@ export function installScheduler(cmd: string[]): { ok: boolean; msg: string } {
   if (argv.some((a) => a.includes("\n"))) return { ok: false, msg: "refusing to install — a path contains a newline" };
   if (os === "darwin") {
     const p = plistFile();
-    const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array>${argv.map((a) => `<string>${xmlEscape(a)}</string>`).join("")}</array>
-  <key>StartInterval</key><integer>60</integer>
-  <key>RunAtLoad</key><false/>
-</dict></plist>
-`;
+    const plist = renderLaunchdPlist(argv);
     mkdirSync(dirname(p), { recursive: true });
     writeFileSync(p, plist, "utf8");
     try {
@@ -55,7 +66,7 @@ export function installScheduler(cmd: string[]): { ok: boolean; msg: string } {
     } catch (e) {
       return { ok: false, msg: `wrote ${p} but launchctl load failed (${e instanceof Error ? e.message : e})` };
     }
-    return { ok: true, msg: `launchd agent installed (${p}) — runs every 60s` };
+    return { ok: true, msg: `launchd agent installed (${p}) — runs every calendar minute` };
   }
   if (os === "linux") {
     const kept = currentCrontab()

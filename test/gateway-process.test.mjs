@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { gatewayRunTimeoutMs, runHara } from "../dist/gateway/serve.js";
+import { gatewayRunTimeoutMs, resolveGatewayAgent, runHara } from "../dist/gateway/serve.js";
 import { approvedOrgTimeoutMs, runApprovedOrgProcess } from "../dist/gateway/flows-pending.js";
+import { orgRolesDir } from "../dist/org/roles.js";
+import { newSessionId, saveSession } from "../dist/session/store.js";
 
 async function waitForPath(path, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
@@ -95,6 +97,58 @@ test("gateway run timeout is configurable but clamped to a hard ceiling", () => 
   assert.equal(gatewayRunTimeoutMs(1), 50);
   assert.equal(gatewayRunTimeoutMs(60_000), 60_000);
   assert.equal(gatewayRunTimeoutMs(Number.MAX_SAFE_INTEGER), 30 * 60_000);
+});
+
+test("gateway /agent discovery uses the persisted chat session profile", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-gateway-agent-profile-"));
+  const cwd = mkdtempSync(join(tmpdir(), "hara-gateway-agent-cwd-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  const sessionId = newSessionId();
+  try {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    writeFileSync(join(home, ".hara", "profiles.json"), JSON.stringify({
+      active: "org-b",
+      profiles: [
+        { id: "personal", kind: "byok", provider: "openai" },
+        { id: "org-a", kind: "gateway", gatewayUrl: "https://a.invalid", deviceToken: "fixture-a" },
+        { id: "org-b", kind: "gateway", gatewayUrl: "https://b.invalid", deviceToken: "fixture-b" },
+      ],
+    }), { mode: 0o600 });
+    for (const [profileId, roleName] of [["org-a", "agent-a"], ["org-b", "agent-b"]]) {
+      const dir = orgRolesDir(profileId);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${roleName}.md`), [
+        "---",
+        `name: ${roleName}`,
+        `description: Managed role for ${profileId}.`,
+        "---",
+        "",
+        `You belong to ${profileId}.`,
+        "",
+      ].join("\n"));
+    }
+    saveSession({
+      id: sessionId,
+      cwd,
+      profileId: "org-a",
+      provider: "hara-gateway",
+      model: "model-a",
+      title: "Gateway profile test",
+      createdAt: new Date().toISOString(),
+      updatedAt: "",
+    }, []);
+
+    const bound = await resolveGatewayAgent("agent-a", cwd, sessionId);
+    assert.ok(bound && !("ambiguous" in bound));
+    assert.equal(bound.name, "agent-a");
+    assert.equal(await resolveGatewayAgent("agent-b", cwd, sessionId), null);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("approved org subprocesses retain output on normal completion", async () => {

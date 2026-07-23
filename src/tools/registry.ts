@@ -16,6 +16,9 @@ export interface UiSink {
 export interface ToolContext {
   cwd: string;
   sandbox?: SandboxMode;
+  /** Identity route that owns the current persisted conversation. Auxiliary prompts/providers must use
+   * this instead of consulting whichever profile is globally active at the moment. */
+  profileId?: string;
   /** Current durable conversation, when this run has one. Transcript recall uses it to exclude the active
    * session and enforce interactive/gateway/cron audience boundaries. */
   sessionId?: string;

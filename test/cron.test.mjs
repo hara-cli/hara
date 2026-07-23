@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { durationToMs, parseSchedule, parseCron, cronMatches, isDue, nextRun } from "../dist/cron/schedule.js";
 import { dueJobs, selfArgv, selfInvocation } from "../dist/cron/runner.js";
 import { addJob, cronDir, findJob, loadJobs, recordRunStart, resolveJob, saveJobs, setEnabled } from "../dist/cron/store.js";
+import { renderLaunchdPlist } from "../dist/cron/install.js";
 import { defaultProcessIdentity } from "../dist/process-identity.js";
 
 test("durationToMs", () => {
@@ -15,6 +16,17 @@ test("durationToMs", () => {
   assert.equal(durationToMs("2h"), 7_200_000);
   assert.equal(durationToMs("1d"), 86_400_000);
   assert.equal(durationToMs("nope"), null);
+});
+
+test("macOS cron uses calendar-minute events instead of a coalescible StartInterval timer", () => {
+  const plist = renderLaunchdPlist(["/Applications/Hara & Tools/hara", "cron", "tick"]);
+  assert.doesNotMatch(plist, /<key>StartInterval<\/key>/);
+  assert.match(plist, /<key>StartCalendarInterval<\/key><array>/);
+  assert.equal((plist.match(/<key>Minute<\/key>/g) ?? []).length, 60);
+  for (let minute = 0; minute < 60; minute++) {
+    assert.match(plist, new RegExp(`<key>Minute</key><integer>${minute}</integer>`));
+  }
+  assert.match(plist, /<string>\/Applications\/Hara &amp; Tools\/hara<\/string>/);
 });
 
 test("parseSchedule: the three forms + errors", () => {

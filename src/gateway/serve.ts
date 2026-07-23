@@ -44,6 +44,12 @@ export function parseCommand(text: string): { cmd: string; arg: string } | null 
   return m ? { cmd: m[1].toLowerCase(), arg: m[2].trim() } : null;
 }
 
+/** Resolve a chat-thread agent through the same profile identity as its persisted Hara session. */
+export async function resolveGatewayAgent(ref: string, cwd: string, sessionId: string) {
+  const { resolveAgent } = await import("../org/projects.js");
+  return resolveAgent(ref, cwd, loadSession(sessionId)?.meta.profileId);
+}
+
 /** Whether a user may drive the gateway. Empty allowlist = nobody (safe default — never wide-open). */
 export function isAllowed(userId: number | string, allowlist: Set<string>): boolean {
   return allowlist.size > 0 && allowlist.has(String(userId));
@@ -1184,11 +1190,10 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
           const restored = chatContext(adapter.name, m.chatId, cwd, who);
           return sendMessage(m.chatId, `🤖 back to the main agent.\n📂 ${restored.cwd}`);
         }
-        const { resolveAgent } = await import("../org/projects.js");
         // A bare name means the override in the thread's current project when one exists; explicit
         // `global:name` and `project:name` remain deterministic. This avoids making a local reviewer
         // ambiguous merely because several other registered projects also define one.
-        const hit = resolveAgent(cmd.arg, ctx.cwd);
+        const hit = await resolveGatewayAgent(cmd.arg, ctx.cwd, ctx.sessionId);
         if (!hit) return sendMessage(m.chatId, `✗ no agent '${cmd.arg}' — see \`hara agents\` on the host.`);
         if ("ambiguous" in hit) return sendMessage(m.chatId, `'${cmd.arg}' exists in several projects — pick one:\n${hit.ambiguous.map((e) => `${e.project}:${e.name}`).join("\n")}`);
         const agentRef = hit.project ? `${hit.project}:${hit.name}` : `global:${hit.name}`;

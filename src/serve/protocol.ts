@@ -7,9 +7,9 @@
 //                                                   capabilities:{methods:[…]}}  (feature detection)
 //   server.shutdown   {}                         → {accepted:true} (authenticated graceful local shutdown;
 //                                                   BUSY while any client work/approval is active)
-//   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,updatedAt}]}
-//   session.create    {cwd?,approval?}           → {sessionId,model}
-//   session.resume    {sessionId}                → {sessionId,model,history:[{role,text}]}
+//   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,profileId?,updatedAt}]}
+//   session.create    {cwd?,approval?}           → {sessionId,model,profileId}
+//   session.resume    {sessionId}                → {sessionId,model,profileId,history:[{role,text}]}
 //   session.send      {sessionId,text,images?,newTask?} → (streams events, then) {reply,usage,taskId,turnId,status?,stopReason?}
 //   session.steer     {sessionId,text,expectedTurnId} → {accepted,taskId,turnId}
 //                      images: [{path,mediaType?}] — pasted screenshots etc., inlined for vision models
@@ -20,7 +20,7 @@
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}
 //   automation.list   {}                          → {jobs:[{id,name,mode,enabled,lastRunAt,lastStatus,…}],
 //                                                    sessions:[{id,title,source,sourceName,updatedAt,…}]}
-//   models.list       {sessionId?}                → {models:[…], current, effortLevels:[…]}
+//   models.list       {sessionId?}                → {models:[…], current,profileId?,effortLevels:[…]}
 //   settings.providers.list {}                    → redacted provider catalog + current profile state
 //   settings.providers.test {provider,model,…}     → {ok,models,error?} (credential is ephemeral)
 //   settings.providers.save {provider,model,…}     → redacted state (credential is never returned)

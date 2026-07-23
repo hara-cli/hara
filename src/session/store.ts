@@ -1,6 +1,6 @@
 // Session persistence — conversations saved as JSON under ~/.hara/sessions, resumable.
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   chmodSync,
   closeSync,
@@ -10,6 +10,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -18,6 +19,7 @@ import { randomUUID } from "node:crypto";
 import type { NeutralMsg } from "../providers/types.js";
 import { redactSensitiveValue } from "../security/secrets.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
+import { isValidProfileId } from "../profile/profile.js";
 import { isTaskExecution, type TaskExecution } from "./task.js";
 
 /** Durable transcripts are local input on resume. Bound both allocation and post-parse traversal so a
@@ -51,6 +53,9 @@ export function automatedTitle(source: SessionSource, sourceName: string | undef
 export interface SessionMeta {
   id: string;
   cwd: string;
+  /** Identity route that owns this conversation. New sessions always persist it; legacy sessions may
+   * omit it and bind to the active profile once on their next successful resume/save. */
+  profileId?: string;
   provider: string;
   /** Per-session pinned model. Set at session creation from cfg.model, **updated by `/model X`**,
    *  and restored into cfg.model on resume so a session keeps the model the user picked.
@@ -397,6 +402,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   // deeply redacted. The live objects are not modified by the redaction walk.
   safe.meta.id = data.meta.id;
   safe.meta.cwd = data.meta.cwd;
+  if (data.meta.profileId !== undefined) safe.meta.profileId = data.meta.profileId;
   safe.meta.provider = data.meta.provider;
   safe.meta.model = data.meta.model;
   safe.meta.createdAt = data.meta.createdAt;
@@ -534,6 +540,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
   return (
     validSessionId(meta.id) &&
     typeof meta.cwd === "string" &&
+    (meta.profileId === undefined || isValidProfileId(meta.profileId)) &&
     typeof meta.provider === "string" &&
     typeof meta.model === "string" &&
     typeof meta.title === "string" &&
@@ -611,7 +618,18 @@ export function listSessions(cwd?: string): SessionMeta[] {
     const d = readSessionFile(join(sessionsDir(), f));
     if (d?.meta.id && validSessionId(d.meta.id) && f === `${d.meta.id}.json` && d.meta.updatedAt) metas.push(d.meta); // skip spoofed/metalless/corrupt; never mutate while listing
   }
-  if (cwd) metas = metas.filter((m) => m.cwd === cwd);
+  if (cwd) {
+    const canonical = (value: string): string => {
+      const absolute = resolve(value);
+      try {
+        return realpathSync.native(absolute);
+      } catch {
+        return absolute;
+      }
+    };
+    const selected = canonical(cwd);
+    metas = metas.filter((m) => canonical(m.cwd) === selected);
+  }
   return metas.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 }
 

@@ -5,6 +5,40 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.2 — 2026-07-24 — session-bound enterprise identities
+
+- New CLI and Serve sessions persist the exact Personal or enterprise profile that owns the
+  conversation. Resuming an older thread keeps that route even after another Hara Control connection
+  becomes active, while credential rotations for the same profile still take effect live.
+- The identity binding now covers the main provider, model changes, routing, guardian, role, vision,
+  and other auxiliary model work from the same run. A removed, expired, or model-restricted profile
+  fails closed instead of silently moving an existing conversation to another organization.
+- Heartbeats and managed-role sync now use the session-bound gateway, and managed role bundles are
+  stored in collision-resistant per-profile directories. Guardian checks, independently modeled
+  subagents, gateway specialist discovery, and `--continue --role` use the same profile, so another
+  active organization cannot inject a provider route or role prompt.
+- An existing Hara Control connection now refreshes its server-authorized model catalog on heartbeat.
+  The same device Token can gain Flash/Pro switching without re-enrollment; a late response is ignored
+  if that profile was rotated meanwhile, and legacy 204 heartbeat servers remain compatible.
+- Profile IDs now share one filesystem-safe 1–64 character validator across BYOK, enrollment, and
+  session loading. Valid IDs remain exact structural metadata during transcript redaction, including
+  IDs that happen to resemble credentials. Session lookup also canonicalizes equivalent workspace
+  paths, so macOS `/var` and `/private/var` aliases cannot make a continued thread lose its identity.
+- Serve exposes the effective `profileId` in session and model responses so Desktop can show which
+  connection a conversation is using. Legacy session files bind once after a successful locked resume;
+  a concurrent identity change is detected and retried rather than overwritten.
+- A fresh CLI session now selects its model from the active profile rather than the Personal fallback.
+  Existing sessions continue to prefer their saved model, and explicit `--model` remains authoritative.
+- macOS cron installation now uses one `StartCalendarInterval` event for every wall-clock minute instead
+  of `StartInterval=60`, whose background timer could be coalesced until `:00`/`:30` and silently skip
+  jobs such as 06:40 or 07:10. Existing macOS cron users should run `hara cron install` once after the
+  upgrade to replace the old LaunchAgent; job definitions and history remain unchanged.
+- Regression coverage uses two real local gateway fixtures to prove a Flash session never sends chat,
+  heartbeat, or role-sync requests to the newly active Pro connection; it also covers managed-role
+  isolation, guardian/subagent binding, token-shaped profile persistence, the preflight-to-lock race,
+  and the generated calendar-minute LaunchAgent.
+  Upgrade with `npm i -g @nanhara/hara@0.134.2`.
+
 ## 0.134.1 — 2026-07-23 — managed DeepSeek V4 model controls
 
 - Hara Control enrollment now preserves the server-authorized model list and thinking levels in the
