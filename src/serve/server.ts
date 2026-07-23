@@ -43,6 +43,7 @@ import { listProjectFilesAsync } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
 import type { Provider, NeutralMsg } from "../providers/types.js";
 import type { GatewayStatus } from "../gateway/serve.js";
+import type { GatewayLoginSnapshot } from "../gateway/login.js";
 import type { UiSink } from "../tools/registry.js";
 import type { ApprovalMode } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
@@ -110,6 +111,12 @@ export interface ServeDeps {
   testProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
   /** Read-only, redacted connector health for Desktop settings. */
   gatewayStatuses?: () => Promise<GatewayStatus[]>;
+  /** In-process interactive connector login. Only a short-lived QR payload and lifecycle phase cross the
+   * authenticated loopback protocol; confirmed credentials stay inside the gateway private-state writer. */
+  startGatewayLogin?: (platform: string) => Promise<GatewayLoginSnapshot>;
+  gatewayLoginStatus?: (platform: string, id?: string) => GatewayLoginSnapshot | undefined;
+  cancelGatewayLogin?: (platform: string, id: string) => GatewayLoginSnapshot | undefined;
+  closeGatewayLogins?: () => Promise<void>;
   /** Redacted organization/profile control plane. One-time codes are accepted only by enroll and are
    * never returned. Device tokens remain inside the CLI's private profile store. */
   organizationConnections?: (cwd?: string) => OrganizationConnectionsState;
@@ -1027,6 +1034,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.gateways.list",
+            "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
             "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
             "settings.organizations.remove", "settings.organizations.check",
             "automation.list", "automation.add", "automation.toggle", "automation.delete",
@@ -1239,6 +1247,45 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!deps.gatewayStatuses) return reply(rpcError(id, ERR.METHOD, "gateway status not supported by this server"));
             const gateways = await deps.gatewayStatuses();
             return reply(rpcResult(id!, { gateways: redactSensitiveValue(gateways).value }));
+          }
+          case "settings.gateways.login.start": {
+            if (!deps.startGatewayLogin) return reply(rpcError(id, ERR.METHOD, "gateway login not supported by this server"));
+            if (typeof p.platform !== "string" || p.platform.trim().toLowerCase() !== "weixin") {
+              return reply(rpcError(id, ERR.PARAMS, "platform must be 'weixin'"));
+            }
+            const login = await deps.startGatewayLogin("weixin");
+            return reply(rpcResult(id!, { login: redactSensitiveValue(login).value }));
+          }
+          case "settings.gateways.login.status": {
+            if (!deps.gatewayLoginStatus) return reply(rpcError(id, ERR.METHOD, "gateway login status not supported by this server"));
+            if (
+              typeof p.platform !== "string" ||
+              p.platform.trim().toLowerCase() !== "weixin" ||
+              (
+                p.id !== undefined
+                && (typeof p.id !== "string" || p.id.length < 1 || p.id.length > 128)
+              )
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "platform must be 'weixin'; optional id must be 1-128 characters"));
+            }
+            const login = deps.gatewayLoginStatus("weixin", p.id);
+            if (!login) return reply(rpcError(id, ERR.PARAMS, "gateway login session was not found"));
+            return reply(rpcResult(id!, { login: redactSensitiveValue(login).value }));
+          }
+          case "settings.gateways.login.cancel": {
+            if (!deps.cancelGatewayLogin) return reply(rpcError(id, ERR.METHOD, "gateway login cancellation not supported by this server"));
+            if (
+              typeof p.platform !== "string" ||
+              p.platform.trim().toLowerCase() !== "weixin" ||
+              typeof p.id !== "string" ||
+              p.id.length < 1 ||
+              p.id.length > 128
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "platform must be 'weixin' and id must be 1-128 characters"));
+            }
+            const login = deps.cancelGatewayLogin("weixin", p.id);
+            if (!login) return reply(rpcError(id, ERR.PARAMS, "gateway login session was not found"));
+            return reply(rpcResult(id!, { login: redactSensitiveValue(login).value }));
           }
           case "settings.organizations.list": {
             if (!deps.organizationConnections) return reply(rpcError(id, ERR.METHOD, "organization settings not supported by this server"));
@@ -1658,6 +1705,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       for (const resolve of pendingApprovals.values()) resolve(false);
       pendingApprovals.clear();
       for (const session of hub.active()) session.abort?.abort();
+      await deps.closeGatewayLogins?.().catch(() => {});
 
       for (const client of wss.clients) {
         try {

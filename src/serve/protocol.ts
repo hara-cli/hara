@@ -25,6 +25,10 @@
 //   settings.providers.test {provider,model,…}     → {ok,models,error?} (credential is ephemeral)
 //   settings.providers.save {provider,model,…}     → redacted state (credential is never returned)
 //   settings.gateways.list {}                      → {gateways:[redacted configuration/runtime health]}
+//   settings.gateways.login.start {platform:"weixin"} → {login:{id,phase,qrPayload?,qrRevision,…}}
+//   settings.gateways.login.status {platform:"weixin",id?} → {login:{id,phase,qrPayload?,…}}
+//   settings.gateways.login.cancel {platform:"weixin",id} → {login:{id,phase:"cancelled",…}}
+//                                                    QR data stays on authenticated loopback; tokens never return
 //   settings.organizations.list {cwd?}              → {activeId,activeSource,switchLocked,connections:[redacted]}
 //   settings.organizations.enroll {id,label?,gatewayUrl,code,activate?,cwd?}
 //                                                    → organization state (code/token never returned)

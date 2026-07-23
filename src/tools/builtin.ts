@@ -53,6 +53,23 @@ export function isNgrokTunnelCommand(command: string): boolean {
   return /(?:^|[;&|]\s*)ngrok\s+(?:http|tcp|tls|start)\b/i.test(command.trim());
 }
 
+/**
+ * Interactive WeChat login needs a real terminal or Desktop's owned QR surface. An agent shell is
+ * headless, so launching it there can strand a login process after the task finishes.
+ */
+export function isHeadlessWeixinLoginCommand(command: string): boolean {
+  const parts = splitCompound(command) ?? [command];
+  return parts.some((part) => {
+    const normalized = part.replace(/["']/g, " ").replace(/\s+/g, " ").trim();
+    return (
+      /(?:^|[\s\\/])hara(?:\.exe)?(?=\s|$)/i.test(normalized)
+      && /\bgateway\b/i.test(normalized)
+      && /(?:^|\s)--login(?=\s|$)/i.test(normalized)
+      && /(?:^|\s)--platform(?:=|\s+)weixin(?=\s|$)/i.test(normalized)
+    );
+  });
+}
+
 /** Read only the presence of ngrok auth — never return or print its value. */
 export function ngrokAuthConfigured(env: NodeJS.ProcessEnv = process.env, home = homedir()): boolean {
   if (env.NGROK_AUTHTOKEN || env.NGROK_API_KEY) return true;
@@ -298,6 +315,13 @@ registerTool({
   async run(input, ctx) {
     if (input.background !== undefined && typeof input.background !== "boolean") {
       return "Error: `background` must be a boolean (true or false), not a string or another truthy value.";
+    }
+    if (isHeadlessWeixinLoginCommand(String(input.command ?? ""))) {
+      return (
+        "Blocked interactive WeChat login in the agent shell: this shell has no durable QR surface and " +
+        "could leave an orphaned login process. Use Hara Desktop → Settings → Chat bots → WeChat → Log in, " +
+        "or run `hara gateway --platform weixin --login` yourself in a real terminal."
+      );
     }
     const packageInstall = isPackageInstallCommand(String(input.command ?? ""));
     if (input.registry !== undefined && typeof input.registry !== "string") {

@@ -225,6 +225,13 @@ hara gateway --platform weixin --login     # scan the QR with WeChat; stores cre
 hara gateway --platform weixin             # run the daemon (the scanner is auto-allowed as owner)
 ```
 
+Hara Desktop 0.1.36+ can own the same login from **Settings → Chat bots → WeChat → Log in**. It
+renders the QR locally, shows waiting/scanned/error state, and cancels the poll when the panel or
+app closes; the confirmed credential stays in Hara's private state and never enters the renderer.
+Do not ask an agent task to run the interactive login command: Hara's headless `bash` tool rejects
+that form because it has no durable QR surface. Run it yourself in a real terminal when not using
+Desktop.
+
 DMs only. Voice in is auto-transcribed; voice out via `/voice` / `/say`. Stable iLink
 `message_id`/`create_time_ms` metadata feeds Hara's cross-restart stale-event, deduplication, and no-rerun
 boundary; messages from older endpoints that omit those optional fields continue normally.

@@ -2506,6 +2506,8 @@ program
     const sandbox = (process.env.HARA_SANDBOX ?? cfg.sandbox ?? "off") as SandboxMode;
     const approval = (APPROVAL_MODES as readonly string[]).includes(o.approval) ? (o.approval as ApprovalMode) : "auto-edit";
     const { startServe } = await import("./serve/server.js");
+    const { GatewayLoginManager } = await import("./gateway/login.js");
+    const gatewayLogins = new GatewayLoginManager();
     const handle = await startServe(
       { host: o.host, port: Number(o.port) || 8790, token: o.token, cwd },
       {
@@ -2547,6 +2549,10 @@ program
           const gateway = await import("./gateway/serve.js");
           return gateway.listGatewayStatuses(["weixin", "feishu"]);
         },
+        startGatewayLogin: (platform) => gatewayLogins.start(platform),
+        gatewayLoginStatus: (platform, id) => gatewayLogins.status(platform, id),
+        cancelGatewayLogin: (platform, id) => gatewayLogins.cancel(platform, id),
+        closeGatewayLogins: () => gatewayLogins.close(),
         organizationConnections: (targetCwd) => organizationConnectionsSnapshot(targetCwd ?? cwd),
         enrollOrganizationConnection: async (input, targetCwd) => {
           const settingsCwd = targetCwd ?? cwd;

@@ -5,6 +5,27 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.0 — 2026-07-23 — Desktop-owned WeChat QR login
+
+- `hara serve` now exposes an authenticated, loopback-only WeChat login lifecycle for Desktop:
+  start, status, and cancel return only a short-lived QR payload plus redacted phase/timestamps.
+  Confirmed iLink credentials go directly to Hara's private state writer and never enter the Serve
+  protocol, renderer, logs, or task transcript.
+- One in-process login manager owns polling, QR refresh, cancellation, runtime lease/status, retry,
+  and Serve shutdown. Duplicate starts share the same active session; expired QR codes refresh
+  within a bounded session; terminal retries wait for cleanup; closing Desktop cancels the active
+  poll and releases its runtime lease without leaving a child process.
+- The agent `bash` tool now refuses `hara gateway --platform weixin --login` in its headless shell
+  regardless of flag order or executable path. It directs users to Desktop's Chat bots settings or
+  a real terminal instead of launching an interactive process whose QR cannot be shown after the
+  task ends.
+- Regression coverage proves QR phase delivery, credential non-disclosure, private persistence,
+  bounded QR payloads, local-state write failures, cancellation, retry, lease cleanup, Serve protocol
+  redaction, shutdown cleanup, and the headless command guard.
+- Project skills are now placed before global and plugin skills in the bounded model digest. A large
+  installed plugin catalog can no longer push workspace-specific instructions past the context cap.
+  Upgrade with `npm i -g @nanhara/hara@0.134.0`.
+
 ## 0.133.0 — 2026-07-22 — field-feedback closure: documents, web, recall, and setup
 
 - A new approval-gated `python` tool sends Python 3 source directly over stdin, so one-shot APIs such as

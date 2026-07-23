@@ -17,8 +17,9 @@ import { parseSignalMessage, signalAdapter } from "../dist/gateway/signal.js";
 import { parseWecomMessage } from "../dist/gateway/wecom.js";
 import { pickRoute, outputDelta } from "../dist/gateway/tmux-routes.js";
 import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, gatewayAdmissionKey, gatewayStatus, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
+import { GatewayLoginManager } from "../dist/gateway/login.js";
 import { chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
-import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs } from "../dist/gateway/weixin.js";
+import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs, startWeixinLoginSession } from "../dist/gateway/weixin.js";
 import { synthesize, ttsConfigFromEnv, ttsCleanText, ttsTimeoutMs } from "../dist/gateway/tts.js";
 import { deliverResult } from "../dist/cron/deliver.js";
 
@@ -1101,6 +1102,222 @@ test("weixin randomWechatUin: base64 of the decimal string of a uint32", () => {
   const decoded = Buffer.from(uin, "base64").toString("utf8");
   assert.match(decoded, /^\d+$/); // pure decimal
   assert.ok(Number(decoded) >= 0 && Number(decoded) <= 0xffffffff);
+});
+
+test("weixin structured login exposes QR phases but never returns confirmed credentials", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-weixin-login-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  let statusCalls = 0;
+  try {
+    const session = await startWeixinLoginSession({
+      pollMs: 10,
+      timeoutMs: 1_000,
+      transport: {
+        requestQr: async () => ({ qrcode: "qr-id-1", qrcode_img_content: "weixin://login/qr-one" }),
+        requestStatus: async () => statusCalls++ === 0
+          ? { status: "scaned" }
+          : {
+              status: "confirmed",
+              ilink_bot_id: "bot-account",
+              bot_token: "opaque-confirmed-token",
+              baseurl: "https://ilink.example.test",
+              ilink_user_id: "owner-user",
+            },
+      },
+    });
+    const initial = session.snapshot();
+    assert.ok(["waiting", "scanned"].includes(initial.phase), "the platform may report a scan before start() returns");
+    assert.equal(initial.qrPayload, "weixin://login/qr-one");
+    assert.equal(initial.qrRevision, 1);
+
+    const confirmed = await session.done;
+    assert.equal(confirmed.phase, "confirmed");
+    assert.equal(confirmed.qrPayload, undefined, "terminal snapshots discard the QR payload");
+    assert.equal(JSON.stringify(confirmed).includes("opaque-confirmed-token"), false);
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(home, ".hara", "weixin", "creds.json"), "utf8")),
+      {
+        account_id: "bot-account",
+        token: "opaque-confirmed-token",
+        base_url: "https://ilink.example.test",
+        user_id: "owner-user",
+      },
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gateway login manager deduplicates active starts, permits retry after settlement, and cancels on close", async () => {
+  const sessions = [];
+  let starts = 0;
+  let releases = 0;
+  let stopped = 0;
+  const makeSession = () => {
+    const id = `login-${++starts}`;
+    let snapshot = {
+      id,
+      platform: "weixin",
+      phase: "waiting",
+      qrPayload: `weixin://login/${id}`,
+      qrRevision: 1,
+      startedAt: 100,
+      updatedAt: 100,
+      deadlineAt: 1_000,
+    };
+    let settle;
+    const done = new Promise((resolve) => { settle = resolve; });
+    const session = {
+      snapshot: () => ({ ...snapshot }),
+      cancel: () => {
+        if (["confirmed", "cancelled", "timed-out", "failed"].includes(snapshot.phase)) return;
+        snapshot = { ...snapshot, phase: "cancelled", updatedAt: 200 };
+        delete snapshot.qrPayload;
+        settle({ ...snapshot });
+      },
+      done,
+    };
+    sessions.push(session);
+    return session;
+  };
+  const manager = new GatewayLoginManager({
+    acquire: () => () => { releases += 1; },
+    openReporter: async () => ({
+      error: () => {},
+      stopped: () => { stopped += 1; },
+      flush: async () => {},
+    }),
+    startWeixin: async () => makeSession(),
+  });
+
+  const first = await manager.start("weixin");
+  const duplicate = await manager.start("weixin");
+  assert.equal(duplicate.id, first.id);
+  assert.equal(starts, 1, "one active QR session is shared by duplicate start requests");
+
+  assert.equal(manager.cancel("weixin", first.id).phase, "cancelled");
+  const retried = await manager.start("weixin");
+  assert.notEqual(retried.id, first.id, "retry waits for terminal cleanup and creates a fresh session");
+  assert.equal(starts, 2);
+
+  await manager.close();
+  assert.equal(sessions[1].snapshot().phase, "cancelled");
+  assert.equal(releases, 2, "every runtime lease is released exactly once");
+  assert.equal(stopped, 2, "every reporter receives a terminal state");
+});
+
+test("weixin structured login cancellation aborts the owned poll and settles without credentials", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-weixin-login-cancel-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const session = await startWeixinLoginSession({
+      pollMs: 10,
+      timeoutMs: 1_000,
+      transport: {
+        requestQr: async () => ({ qrcode: "qr-id-1", qrcode_img_content: "weixin://login/qr-one" }),
+        requestStatus: async (_baseUrl, _qrcode, signal) => new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            const error = new Error("cancelled");
+            error.name = "AbortError";
+            reject(error);
+          }, { once: true });
+        }),
+      },
+    });
+    session.cancel();
+    const cancelled = await session.done;
+    assert.equal(cancelled.phase, "cancelled");
+    assert.equal(existsSync(join(home, ".hara", "weixin", "creds.json")), false);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("weixin structured login refreshes an expired QR within the same owned session", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-weixin-login-refresh-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  let qrCalls = 0;
+  let statusCalls = 0;
+  try {
+    const session = await startWeixinLoginSession({
+      pollMs: 10,
+      timeoutMs: 1_000,
+      transport: {
+        requestQr: async () => {
+          qrCalls += 1;
+          return { qrcode: `qr-id-${qrCalls}`, qrcode_img_content: `weixin://login/qr-${qrCalls}` };
+        },
+        requestStatus: async () => statusCalls++ === 0
+          ? { status: "expired" }
+          : {
+              status: "confirmed",
+              ilink_bot_id: "bot-account",
+              bot_token: "opaque-confirmed-token",
+              ilink_user_id: "owner-user",
+            },
+      },
+    });
+    const confirmed = await session.done;
+    assert.equal(confirmed.phase, "confirmed");
+    assert.equal(confirmed.qrRevision, 2);
+    assert.equal(qrCalls, 2);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("weixin structured login bounds QR payloads and reports private-state write failures", async () => {
+  await assert.rejects(
+    startWeixinLoginSession({
+      transport: {
+        requestQr: async () => ({
+          qrcode: "qr-id-oversized",
+          qrcode_img_content: "x".repeat(16 * 1024 + 1),
+        }),
+        requestStatus: async () => ({ status: "wait" }),
+      },
+    }),
+    /invalid WeChat QR response/,
+  );
+
+  const home = mkdtempSync(join(tmpdir(), "hara-weixin-login-state-failure-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  writeFileSync(join(home, ".hara"), "not a directory");
+  try {
+    const session = await startWeixinLoginSession({
+      pollMs: 10,
+      timeoutMs: 1_000,
+      transport: {
+        requestQr: async () => ({ qrcode: "qr-id-1", qrcode_img_content: "weixin://login/qr-one" }),
+        requestStatus: async () => ({
+          status: "confirmed",
+          ilink_bot_id: "bot-account",
+          bot_token: "opaque-confirmed-token",
+          baseurl: "https://ilink.example.test",
+          ilink_user_id: "owner-user",
+        }),
+      },
+    });
+    const failed = await session.done;
+    assert.equal(failed.phase, "failed");
+    assert.equal(failed.errorCode, "local-state");
+    assert.equal(failed.qrPayload, undefined);
+    assert.equal(JSON.stringify(failed).includes("opaque-confirmed-token"), false);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("weixin envelope: merges base_info.channel_version, compact JSON", () => {

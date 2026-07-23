@@ -506,6 +506,17 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
   };
   let savedInput;
   let enrolledOrganizationInput;
+  let closeGatewayLoginsCalled = false;
+  const loginSnapshot = {
+    id: "weixin-login-1",
+    platform: "weixin",
+    phase: "waiting",
+    qrPayload: "weixin://login/local-only-qr",
+    qrRevision: 1,
+    startedAt: 100,
+    updatedAt: 100,
+    deadlineAt: 1_000,
+  };
   const organizationState = {
     activeId: "personal",
     activeSource: "default",
@@ -543,6 +554,19 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       recommendation: "start it",
       token: "gateway-secret-must-not-leak",
     }],
+    startGatewayLogin: async () => ({
+      ...loginSnapshot,
+      bot_token: "login-token-must-not-leak",
+    }),
+    gatewayLoginStatus: (_platform, id) => id === loginSnapshot.id
+      ? { ...loginSnapshot, phase: "scanned", updatedAt: 200 }
+      : undefined,
+    cancelGatewayLogin: (_platform, id) => id === loginSnapshot.id
+      ? { ...loginSnapshot, phase: "cancelled", qrPayload: undefined, updatedAt: 300 }
+      : undefined,
+    closeGatewayLogins: async () => {
+      closeGatewayLoginsCalled = true;
+    },
     organizationConnections: () => ({ ...organizationState, deviceToken: "org-device-secret-must-not-leak" }),
     enrollOrganizationConnection: async (input) => {
       enrolledOrganizationInput = input;
@@ -561,6 +585,9 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.ok(init.result.capabilities.methods.includes("settings.providers.save"));
     assert.ok(init.result.capabilities.methods.includes("settings.gateways.list"));
     for (const method of [
+      "settings.gateways.login.start",
+      "settings.gateways.login.status",
+      "settings.gateways.login.cancel",
       "settings.organizations.list",
       "settings.organizations.enroll",
       "settings.organizations.use",
@@ -585,6 +612,20 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.equal(gateways.result.gateways[0].platform, "weixin");
     assert.equal(JSON.stringify(gateways.result).includes("gateway-secret-must-not-leak"), false);
 
+    const startedLogin = await c.call("settings.gateways.login.start", { platform: "weixin" });
+    assert.equal(startedLogin.result.login.qrPayload, loginSnapshot.qrPayload);
+    assert.equal(JSON.stringify(startedLogin.result).includes("login-token-must-not-leak"), false);
+    const scannedLogin = await c.call("settings.gateways.login.status", {
+      platform: "weixin",
+      id: loginSnapshot.id,
+    });
+    assert.equal(scannedLogin.result.login.phase, "scanned");
+    const cancelledLogin = await c.call("settings.gateways.login.cancel", {
+      platform: "weixin",
+      id: loginSnapshot.id,
+    });
+    assert.equal(cancelledLogin.result.login.phase, "cancelled");
+
     const organizations = await c.call("settings.organizations.list", {});
     assert.equal(organizations.result.connections[0].gatewayHost, "control.example.com");
     assert.equal(JSON.stringify(organizations.result).includes("org-device-secret-must-not-leak"), false);
@@ -607,6 +648,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
   } finally {
     c.close();
     await srv.close();
+    assert.equal(closeGatewayLoginsCalled, true, "serve shutdown closes every owned interactive login");
     rmSync(dir, { recursive: true, force: true });
   }
 });

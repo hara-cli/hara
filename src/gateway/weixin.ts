@@ -39,6 +39,7 @@ const EP = {
 const LONG_POLL_TIMEOUT_MS = 35_000;
 const API_TIMEOUT_MS = 15_000;
 const QR_TIMEOUT_MS = 35_000;
+const MAX_QR_VALUE_BYTES = 16 * 1024;
 const SESSION_EXPIRED = -14;
 const RATE_LIMIT = -2;
 const MSG_TYPE_BOT = 2;
@@ -70,6 +71,45 @@ export interface WeixinCreds {
 export type WeixinCredentialInspection =
   | { state: "ready"; credentials: WeixinCreds }
   | { state: "missing" | "unreadable" };
+
+export type WeixinLoginPhase =
+  | "waiting"
+  | "scanned"
+  | "confirmed"
+  | "cancelled"
+  | "timed-out"
+  | "failed";
+
+export interface WeixinLoginSnapshot {
+  id: string;
+  platform: "weixin";
+  phase: WeixinLoginPhase;
+  qrPayload?: string;
+  qrRevision: number;
+  startedAt: number;
+  updatedAt: number;
+  deadlineAt: number;
+  errorCode?: "network" | "invalid-response" | "qr-expired" | "local-state";
+}
+
+export interface WeixinLoginSession {
+  snapshot(): WeixinLoginSnapshot;
+  cancel(): void;
+  done: Promise<WeixinLoginSnapshot>;
+}
+
+interface WeixinLoginTransport {
+  requestQr(signal: AbortSignal): Promise<unknown>;
+  requestStatus(baseUrl: string, qrcode: string, signal: AbortSignal): Promise<unknown>;
+}
+
+interface WeixinLoginSessionOptions {
+  timeoutMs?: number;
+  pollMs?: number;
+  signal?: AbortSignal;
+  now?: () => number;
+  transport?: WeixinLoginTransport;
+}
 
 const num = (v: unknown): number => (typeof v === "number" ? v : 0);
 const str = (v: unknown): string => (v == null ? "" : String(v));
@@ -233,10 +273,10 @@ async function apiPost(baseUrl: string, endpoint: string, payload: Record<string
   return JSON.parse(raw);
 }
 
-async function apiGet(baseUrl: string, endpoint: string, timeoutMs: number): Promise<any> {
+async function apiGet(baseUrl: string, endpoint: string, timeoutMs: number, external?: AbortSignal): Promise<any> {
   const url = `${baseUrl.replace(/\/+$/, "")}/${endpoint}`;
   const headers = { "iLink-App-Id": ILINK_APP_ID, "iLink-App-ClientVersion": ILINK_APP_CLIENT_VERSION };
-  const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+  const res = await fetch(url, { headers, signal: combineSignals(timeoutMs, external) });
   const raw = await res.text();
   if (!res.ok) throw new Error(`iLink GET ${endpoint} HTTP ${res.status}: ${raw.slice(0, 200)}`);
   return JSON.parse(raw);
@@ -385,6 +425,190 @@ async function renderQr(data: string): Promise<void> {
   } catch {
     console.error(`\nScan this as a QR with WeChat — install 'qrcode-terminal' to render it inline, or paste this URL into any QR generator:\n${data}\n`);
   }
+}
+
+const WEIXIN_LOGIN_TERMINAL_PHASES = new Set<WeixinLoginPhase>([
+  "confirmed",
+  "cancelled",
+  "timed-out",
+  "failed",
+]);
+
+function cloneLoginSnapshot(snapshot: WeixinLoginSnapshot): WeixinLoginSnapshot {
+  return { ...snapshot };
+}
+
+function aborted(error: unknown): boolean {
+  return Boolean(
+    error
+    && typeof error === "object"
+    && "name" in error
+    && String((error as { name?: unknown }).name) === "AbortError",
+  );
+}
+
+/**
+ * Start one structured WeChat login owned by the current Hara process.
+ *
+ * The QR payload crosses only the authenticated loopback serve protocol. Credentials are persisted by the
+ * existing private-state writer after confirmation and are never included in a snapshot.
+ */
+export async function startWeixinLoginSession(
+  options: WeixinLoginSessionOptions = {},
+): Promise<WeixinLoginSession> {
+  const now = options.now ?? Date.now;
+  const timeoutMs = Math.min(Math.max(Math.trunc(options.timeoutMs ?? 480_000), 1_000), 15 * 60_000);
+  const pollMs = Math.min(Math.max(Math.trunc(options.pollMs ?? 1_000), 10), 5_000);
+  const controller = new AbortController();
+  const abortFromParent = (): void => controller.abort();
+  options.signal?.addEventListener("abort", abortFromParent, { once: true });
+  if (options.signal?.aborted) controller.abort();
+
+  const transport: WeixinLoginTransport = options.transport ?? {
+    requestQr: (signal) => apiGet(ILINK_BASE_URL, `${EP.getBotQr}?bot_type=3`, QR_TIMEOUT_MS, signal),
+    requestStatus: (baseUrl, qrcode, signal) => (
+      apiGet(baseUrl, `${EP.getQrStatus}?qrcode=${encodeURIComponent(qrcode)}`, QR_TIMEOUT_MS, signal)
+    ),
+  };
+  const startedAt = now();
+  const deadlineAt = startedAt + timeoutMs;
+  let qrcodeValue = "";
+  let baseUrl = ILINK_BASE_URL;
+  let refreshes = 0;
+  let snapshot: WeixinLoginSnapshot = {
+    id: randomUUID(),
+    platform: "weixin",
+    phase: "waiting",
+    qrRevision: 0,
+    startedAt,
+    updatedAt: startedAt,
+    deadlineAt,
+  };
+
+  const update = (
+    phase: WeixinLoginPhase,
+    fields: Partial<Pick<WeixinLoginSnapshot, "qrPayload" | "errorCode">> = {},
+  ): void => {
+    snapshot = {
+      ...snapshot,
+      phase,
+      updatedAt: now(),
+      ...(fields.qrPayload ? { qrPayload: fields.qrPayload } : {}),
+      ...(fields.errorCode ? { errorCode: fields.errorCode } : {}),
+    };
+    if (!fields.qrPayload && WEIXIN_LOGIN_TERMINAL_PHASES.has(phase)) delete snapshot.qrPayload;
+    if (!fields.errorCode) delete snapshot.errorCode;
+  };
+
+  const loadQr = async (): Promise<void> => {
+    const raw = await transport.requestQr(controller.signal);
+    const qr = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    qrcodeValue = str(qr.qrcode);
+    const qrPayload = str(qr.qrcode_img_content) || qrcodeValue;
+    if (
+      !qrcodeValue
+      || !qrPayload
+      || Buffer.byteLength(qrcodeValue, "utf8") > MAX_QR_VALUE_BYTES
+      || Buffer.byteLength(qrPayload, "utf8") > MAX_QR_VALUE_BYTES
+    ) {
+      throw new Error("invalid WeChat QR response");
+    }
+    baseUrl = ILINK_BASE_URL;
+    snapshot.qrRevision += 1;
+    update("waiting", { qrPayload });
+  };
+
+  try {
+    await loadQr();
+  } catch (error) {
+    options.signal?.removeEventListener("abort", abortFromParent);
+    if (controller.signal.aborted || aborted(error)) {
+      update("cancelled");
+      return {
+        snapshot: () => cloneLoginSnapshot(snapshot),
+        cancel: () => {},
+        done: Promise.resolve(cloneLoginSnapshot(snapshot)),
+      };
+    }
+    throw error;
+  }
+
+  const done = (async (): Promise<WeixinLoginSnapshot> => {
+    try {
+      while (now() < deadlineAt && !controller.signal.aborted) {
+        let raw: unknown;
+        try {
+          raw = await transport.requestStatus(baseUrl, qrcodeValue, controller.signal);
+        } catch (error) {
+          if (controller.signal.aborted || aborted(error)) break;
+          update(snapshot.phase, { qrPayload: snapshot.qrPayload, errorCode: "network" });
+          await sleep(pollMs, controller.signal);
+          continue;
+        }
+        const status = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+        const phase = str(status.status) || "wait";
+        if (phase === "confirmed") {
+          const credentials: WeixinCreds = {
+            account_id: str(status.ilink_bot_id),
+            token: str(status.bot_token),
+            base_url: str(status.baseurl) || ILINK_BASE_URL,
+            user_id: str(status.ilink_user_id),
+          };
+          if (!credentials.account_id || !credentials.token) {
+            update("failed", { errorCode: "invalid-response" });
+            break;
+          }
+          try {
+            saveWeixinCreds(credentials);
+          } catch {
+            update("failed", { errorCode: "local-state" });
+            break;
+          }
+          update("confirmed");
+          break;
+        }
+        if (phase === "scaned" || phase === "scaned_but_redirect") {
+          update("scanned", { qrPayload: snapshot.qrPayload });
+          if (phase === "scaned_but_redirect") {
+            const host = str(status.redirect_host);
+            if (host) baseUrl = `https://${host}`;
+          }
+        } else if (phase === "expired") {
+          refreshes += 1;
+          if (refreshes > 3) {
+            update("failed", { errorCode: "qr-expired" });
+            break;
+          }
+          try {
+            await loadQr();
+          } catch (error) {
+            if (controller.signal.aborted || aborted(error)) break;
+            update("failed", { errorCode: "network" });
+            break;
+          }
+        } else {
+          update("waiting", { qrPayload: snapshot.qrPayload });
+        }
+        await sleep(pollMs, controller.signal);
+      }
+      if (!WEIXIN_LOGIN_TERMINAL_PHASES.has(snapshot.phase)) {
+        update(controller.signal.aborted ? "cancelled" : "timed-out");
+      }
+      return cloneLoginSnapshot(snapshot);
+    } finally {
+      options.signal?.removeEventListener("abort", abortFromParent);
+    }
+  })();
+
+  return {
+    snapshot: () => cloneLoginSnapshot(snapshot),
+    cancel: () => {
+      if (WEIXIN_LOGIN_TERMINAL_PHASES.has(snapshot.phase)) return;
+      update("cancelled");
+      controller.abort();
+    },
+    done,
+  };
 }
 
 /** Interactive QR login → saves {account_id, token, base_url, user_id} to ~/.hara/weixin/creds.json. */

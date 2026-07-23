@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSyn
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { capHeadTail, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
+import { capHeadTail, isHeadlessWeixinLoginCommand, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
 import { atomicWriteText } from "../dist/fs-write.js";
 import { readRegularFileSnapshot } from "../dist/fs-read.js";
@@ -46,6 +46,31 @@ test("package installs and ngrok tunnels are classified for safe timeout/preflig
   assert.equal(shellTimeoutMs("npm ci", 42_000), 42_000);
   assert.equal(shellTimeoutMs("npm ci", -1), 900_000, "invalid requested timeout falls back safely");
   assert.equal(shellTimeoutMs("npm ci", 9_999_999), 3_600_000, "requested timeouts are bounded");
+});
+
+test("headless agent shells refuse interactive WeChat QR login regardless of flag order or executable path", async () => {
+  for (const command of [
+    "hara gateway --platform weixin --login",
+    "hara gateway --login --platform=weixin",
+    String.raw`C:\Users\tester\AppData\Roaming\npm\hara.exe gateway --login --platform weixin`,
+    "npx @nanhara/hara gateway --platform weixin --login",
+    "echo preparing && hara gateway --platform weixin --login",
+  ]) {
+    assert.equal(isHeadlessWeixinLoginCommand(command), true, command);
+  }
+  for (const command of [
+    "hara gateway --platform weixin",
+    "hara gateway --platform feishu --login",
+  ]) {
+    assert.equal(isHeadlessWeixinLoginCommand(command), false, command);
+  }
+
+  const result = await getTool("bash").run(
+    { command: "hara gateway --platform weixin --login" },
+    { cwd: process.cwd(), sandbox: "off" },
+  );
+  assert.match(result, /Blocked interactive WeChat login/);
+  assert.match(result, /Hara Desktop/);
 });
 
 test("package registry switching is explicit, normalized, and injected without shell interpolation", () => {
