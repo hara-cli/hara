@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.4 — 2026-07-24 — stable interactive Darwin gates
+
+- Confirmation and plan-selection regressions now wait for each committed Ink selection before sending
+  the next key, and always unmount their component on assertion failure. Slow macOS Intel runners no
+  longer miss a fixed render window or leave the test process open until its file timeout.
+- Includes the session-bound enterprise identity, live managed-model catalog refresh, and macOS cron
+  calendar fixes from 0.134.2. Upgrade with `npm i -g @nanhara/hara@0.134.4`.
+
 ## 0.134.3 — 2026-07-24 — deterministic Darwin release gate
 
 - The terminal input regression now waits for Ink's committed frame and submission state instead of

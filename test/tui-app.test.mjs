@@ -266,18 +266,27 @@ test("App confirm is a selectable list: ↓ then Enter picks 'don't ask again' �
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  stdin.write("clean");
-  await tick();
-  stdin.write("\r");
-  await tick();
-  assert.ok(strip(lastFrame()).includes("❯ 1. Yes"), "Yes is selected by default (numbered)");
-  stdin.write("\x1b[B"); // ↓
-  await tick();
-  stdin.write("\r"); // Enter
-  await tick(80);
-  assert.equal(reply, "always", "↓ + Enter selects the don't-ask-again option");
-  unmount();
+  try {
+    stdin.write("clean");
+    await waitUntil(() => strip(lastFrame()).includes("clean"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(
+      () => strip(lastFrame()).includes("❯ 1. Yes"),
+      "numbered confirmation did not mount with Yes selected",
+    );
+    stdin.write("\x1b[B"); // ↓
+    await waitUntil(
+      () => strip(lastFrame()).includes("❯ 2."),
+      "Down did not select the don't-ask-again option",
+    );
+    stdin.write("\r"); // Enter
+    await waitUntil(
+      () => reply === "always",
+      "selected don't-ask-again option did not resolve",
+    );
+  } finally {
+    unmount();
+  }
 });
 
 test("App Esc aborts the turn and actively removes a pending confirmation", async () => {
@@ -317,20 +326,23 @@ test("App select (plan-proceed): ↓↓ + Enter picks the third option", async (
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  stdin.write("go");
-  await tick();
-  stdin.write("\r");
-  await tick();
-  assert.ok(strip(lastFrame()).includes("❯ 1. Yes, and auto-apply edits"), "first option selected by default (numbered)");
-  stdin.write("\x1b[B");
-  await tick();
-  stdin.write("\x1b[B");
-  await tick();
-  stdin.write("\r");
-  await tick(80);
-  assert.equal(choice, "no", "↓↓ + Enter selects the third option");
-  unmount();
+  try {
+    stdin.write("go");
+    await waitUntil(() => strip(lastFrame()).includes("go"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(
+      () => strip(lastFrame()).includes("❯ 1. Yes, and auto-apply edits"),
+      "numbered plan selector did not mount with its first option selected",
+    );
+    stdin.write("\x1b[B");
+    await waitUntil(() => strip(lastFrame()).includes("❯ 2."), "first Down did not select option 2");
+    stdin.write("\x1b[B");
+    await waitUntil(() => strip(lastFrame()).includes("❯ 3."), "second Down did not select option 3");
+    stdin.write("\r");
+    await waitUntil(() => choice === "no", "selected third plan option did not resolve");
+  } finally {
+    unmount();
+  }
 });
 
 test("App select: numbered options — typing a number picks it directly", async () => {
