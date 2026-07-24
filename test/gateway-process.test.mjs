@@ -227,12 +227,15 @@ test("runHara times out, escalates TERM to KILL, and settles promptly", async ()
 
 test("runHara still force-kills a quiet TERM-resistant grandchild after its direct child closes", { skip: process.platform === "win32" }, async () => {
   const started = Date.now();
-  const result = await withChild("quiet-resistant-grandchild", { timeoutMs: 250, killGraceMs: 50 });
+  // Give release-class Intel runners enough time to schedule the fixture and create its grandchild.
+  // The behavior under test is the forced process-group cleanup after a real timeout, not whether a
+  // second Node process can cold-start and print its PID inside an arbitrary 250 ms window.
+  const result = await withChild("quiet-resistant-grandchild", { timeoutMs: 5_000, killGraceMs: 50 });
   const pid = Number(/grandchild:(\d+)/.exec(result.reply)?.[1]);
   try {
-    assert.match(result.reply, /^✗ hara timed out after 250ms; the run was stopped\./);
+    assert.match(result.reply, /^✗ hara timed out after 5s; the run was stopped\./);
     assert.ok(Number.isSafeInteger(pid) && pid > 0, result.reply);
-    assert.ok(Date.now() - started < 1_500, "quiet descendants cannot extend the gateway timeout indefinitely");
+    assert.ok(Date.now() - started < 8_000, "quiet descendants cannot extend the gateway timeout indefinitely");
     await assertProcessGone(pid, "runHara quiet grandchild");
   } finally {
     if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) {
