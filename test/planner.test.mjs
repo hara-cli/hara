@@ -138,15 +138,17 @@ test("savePlan rejects symlink and hard-link aliases without changing .env", asy
 
 test("runCheck: exit 0 passes, nonzero fails", async () => {
   const previous = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  const checkCwd = mkdtempSync(join(process.env.HOME, "planner-check-"));
   process.env.HARA_ALLOW_SENSITIVE_FILES = "1"; // safe echo/exit fixtures; avoids nested sandbox-exec in CI
   try {
-    const ok = await runCheck("echo hi", tmpdir(), "off");
+    const ok = await runCheck("echo hi", checkCwd, "off");
     assert.ok(ok.ok);
     assert.match(ok.reason, /hi/);
-    const bad = await runCheck("exit 3", tmpdir(), "off");
+    const bad = await runCheck("exit 3", checkCwd, "off");
     assert.ok(!bad.ok);
   } finally {
     if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
     else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
+    rmSync(checkCwd, { recursive: true, force: true });
   }
 });

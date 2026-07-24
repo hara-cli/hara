@@ -22,7 +22,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { cronMatches, parseCron, validTz, type Schedule } from "./schedule.js";
+import { cronExpressionsEqual, cronMatches, parseCron, validTz, type Schedule } from "./schedule.js";
 import { compareProcessIdentity, defaultProcessIdentity } from "../process-identity.js";
 import { sleepSync } from "../sync-sleep.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
@@ -78,6 +78,11 @@ export interface CronJob {
   alertAfter?: number;
   enabled: boolean;
   createdAt: number;
+  /** Monotonic editable-definition revision. A scheduler snapshot may launch only the exact revision it
+   * selected as due, so an edit racing the minute tick can never execute stale task content. */
+  definitionRevision?: number;
+  /** Last schedule/timezone definition change. Runs before this boundary belong to the old schedule. */
+  scheduleUpdatedAt?: number;
   /** One explicit creation-minute occurrence waiting for the next OS tick. Disable/start clears it. */
   pendingDueAt?: number;
   lastRunAt?: number;
@@ -99,6 +104,23 @@ export interface CronJob {
   /** Durable result/alarm effects awaiting confirmed transport acknowledgement. */
   pendingNotifications?: CronPendingNotification[];
 }
+
+export interface CronJobDefinition {
+  name: string;
+  schedule: Schedule;
+  task: string;
+  mode: CronJob["mode"];
+  cwd: string;
+  tz?: string;
+  alertAfter?: number;
+}
+
+export type CronDeliveryUpdate =
+  | { kind: "preserve"; mode?: CronDeliverMode }
+  | { kind: "replace"; deliver: string; mode?: CronDeliverMode }
+  | { kind: "clear" };
+
+export type CronJobUpdateResult = CronJob | "running" | "missing-deliver" | undefined;
 
 export class CronStoreCorruptError extends Error {
   readonly code = "HARA_CRON_STORE_CORRUPT";
@@ -461,6 +483,14 @@ function validCronJob(value: unknown): value is CronJob {
     && typeof job.cwd === "string" && !!job.cwd
     && typeof job.enabled === "boolean"
     && validFinite(job.createdAt)
+    && (
+      job.definitionRevision === undefined
+      || (
+        Number.isSafeInteger(job.definitionRevision)
+        && job.definitionRevision >= 0
+      )
+    )
+    && (job.scheduleUpdatedAt === undefined || validFinite(job.scheduleUpdatedAt))
     && (job.pendingDueAt === undefined || (job.schedule.kind === "cron" && validFinite(job.pendingDueAt)))
     && (job.tz === undefined || (typeof job.tz === "string" && validTz(job.tz)))
     && (job.deliver === undefined || (typeof job.deliver === "string" && job.deliver.length > 0 && job.deliver.length <= 4_096))
@@ -585,13 +615,96 @@ function mutateJobs<T>(mutate: (jobs: CronJob[]) => T): T {
 export function addJob(j: Omit<CronJob, "id" | "createdAt" | "enabled"> & { enabled?: boolean; createdAt: number }): CronJob {
   return mutateJobs((jobs) => {
     const enabled = j.enabled ?? true;
-    const job: CronJob = { ...j, id: randomUUID().slice(0, 8), enabled };
+    const job: CronJob = {
+      ...j,
+      id: randomUUID().slice(0, 8),
+      enabled,
+      definitionRevision: 0,
+    };
     delete job.pendingDueAt;
     delete job.pendingNotifications;
     if (enabled && job.schedule.kind === "cron" && cronMatches(job.schedule.expr, new Date(job.createdAt), job.tz)) {
       job.pendingDueAt = job.createdAt;
     }
     jobs.push(job);
+    return job;
+  });
+}
+
+function schedulesEqual(left: Schedule, right: Schedule): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "cron" && right.kind === "cron") return cronExpressionsEqual(left.expr, right.expr);
+  // `display` is presentation metadata and can legitimately change after parsing the same Desktop spec.
+  // Only fields that alter actual trigger times define schedule identity.
+  if (left.kind === "every" && right.kind === "every") return left.everyMs === right.everyMs;
+  return left.kind === "once"
+    && right.kind === "once"
+    && left.runAt === right.runAt;
+}
+
+/** Replace a job's editable definition under the cron-store mutex. Runtime outcome fields remain visible;
+ * `scheduleUpdatedAt` makes an older run ineligible to suppress the newly edited schedule. Delivery
+ * destinations are write-only at the Serve boundary, so preserve/update/clear is expressed explicitly. */
+export function updateJob(
+  id: string,
+  definition: CronJobDefinition,
+  delivery: CronDeliveryUpdate,
+  updatedAt = Date.now(),
+): CronJobUpdateResult {
+  return mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === id);
+    if (!job) return undefined;
+    if (job.lastStatus === "running") return "running";
+
+    if (delivery.kind === "preserve" && delivery.mode !== undefined && !job.deliver) {
+      return "missing-deliver";
+    }
+
+    const scheduleChanged = !schedulesEqual(job.schedule, definition.schedule) || job.tz !== definition.tz;
+    const previousDeliver = job.deliver;
+    const previousDeliverMode = job.deliverMode;
+
+    job.name = definition.name;
+    job.schedule = definition.schedule;
+    job.task = definition.task;
+    job.mode = definition.mode;
+    job.cwd = definition.cwd;
+    if (definition.tz === undefined) delete job.tz;
+    else job.tz = definition.tz;
+    // RPC callers may omit the optional alert field while editing unrelated definition fields. Preserve the
+    // existing threshold unless the caller supplies a replacement (the default is represented explicitly).
+    if (definition.alertAfter !== undefined) job.alertAfter = definition.alertAfter;
+
+    if (delivery.kind === "clear") {
+      delete job.deliver;
+      delete job.deliverMode;
+    } else if (delivery.kind === "replace") {
+      job.deliver = delivery.deliver;
+      if (delivery.mode === undefined) delete job.deliverMode;
+      else job.deliverMode = delivery.mode;
+    } else if (delivery.mode !== undefined) {
+      job.deliverMode = delivery.mode;
+    }
+
+    if (scheduleChanged) {
+      job.scheduleUpdatedAt = updatedAt;
+      delete job.pendingDueAt;
+      if (
+        job.enabled
+        && job.schedule.kind === "cron"
+        && cronMatches(job.schedule.expr, new Date(updatedAt), job.tz)
+      ) {
+        job.pendingDueAt = updatedAt;
+      }
+    }
+    job.definitionRevision = (job.definitionRevision ?? 0) + 1;
+
+    if (job.deliver !== previousDeliver || job.deliverMode !== previousDeliverMode) {
+      // Queued notifications capture their old raw destination. An explicit delivery edit must not send
+      // them to a channel the user has just replaced or disabled.
+      delete job.pendingNotifications;
+      delete job.lastAlertAt;
+    }
     return job;
   });
 }
@@ -618,6 +731,9 @@ export function removeJob(id: string): boolean {
   return mutateJobs((jobs) => {
     const index = jobs.findIndex((x) => x.id === id);
     if (index < 0) return false;
+    // Never orphan a child process by deleting the persisted owner record while it is running. Manual
+    // recovery must first produce a terminal state; ordinary UI/CLI deletion can then retry safely.
+    if (jobs[index].lastStatus === "running") return false;
     jobs.splice(index, 1);
     return true;
   });
@@ -636,11 +752,21 @@ export function setEnabled(id: string, on: boolean): boolean {
   });
 }
 
-/** Persist a run before any child process/provider work starts. */
-export function recordRunStart(id: string, at: number, requireEnabled = false): string | null {
+/** Persist a run before any child process/provider work starts. When `expectedDefinitionRevision` is
+ * supplied, the selected scheduler/manual snapshot must still be current under the same store mutex. */
+export function recordRunStart(
+  id: string,
+  at: number,
+  requireEnabled = false,
+  expectedDefinitionRevision?: number,
+): string | null {
   return mutateJobs((jobs) => {
     const job = jobs.find((x) => x.id === id);
     if (!job || (requireEnabled && !job.enabled)) return null;
+    if (
+      expectedDefinitionRevision !== undefined
+      && (job.definitionRevision ?? 0) !== expectedDefinitionRevision
+    ) return null;
     // Never overwrite an unresolved attempt merely because its recorded parent PID is gone. The parent may
     // have launched a detached child before crashing, so a second manual run could duplicate file/network
     // side effects. Scheduler ticks call `recoverInterruptedRuns` first; manual callers receive a focused

@@ -51,6 +51,7 @@ export function workspaceSessionFork(
   meta.updatedAt = "";
   meta.source = "interactive";
   delete meta.sourceName;
+  delete meta.jobId;
   delete meta.archived;
   delete meta.gatewayOwner;
 

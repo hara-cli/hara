@@ -20,7 +20,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { runAgent, type RunOpts } from "../agent/loop.js";
@@ -52,9 +52,27 @@ import { expandMentionsAsync } from "../context/mentions.js";
 import { memoryDigest } from "../memory/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled, panelsForProject } from "../plugins/plugins.js";
 import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
-import { loadJobs, addJob, removeJob, setEnabled } from "../cron/store.js";
-import { parseSchedule, describeSchedule } from "../cron/schedule.js";
+import {
+  loadJobs,
+  addJob,
+  findJob,
+  removeJob,
+  setEnabled,
+  updateJob,
+  type CronDeliverMode,
+  type CronDeliveryUpdate,
+  type CronJob,
+} from "../cron/store.js";
+import {
+  parseSchedule,
+  describeSchedule,
+  nextRun,
+  validTz,
+  type Schedule,
+} from "../cron/schedule.js";
 import { parseDeliver } from "../cron/deliver.js";
+import { installScheduler, isInstalled } from "../cron/install.js";
+import { runJobTracked, selfArgv } from "../cron/runner.js";
 import { loadTasks } from "../tools/task.js";
 import { listPending, resolvePending } from "../gateway/flows-pending.js";
 import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from "../tools/todo.js";
@@ -480,6 +498,145 @@ export function historyForClient(history: NeutralMsg[]): { role: string; text: s
   return out;
 }
 
+const AUTOMATION_DELIVERY_MODES = ["always", "on-output", "on-error"] as const;
+
+function isAutomationDeliveryMode(value: unknown): value is CronDeliverMode {
+  return typeof value === "string"
+    && (AUTOMATION_DELIVERY_MODES as readonly string[]).includes(value);
+}
+
+function automationScheduleSpec(schedule: Schedule): string {
+  if (schedule.kind === "cron") return schedule.expr;
+  if (schedule.kind === "every") return schedule.display;
+  return new Date(schedule.runAt).toISOString();
+}
+
+function automationDeliverySummary(job: CronJob): {
+  kind: "none" | "feishu" | "weixin" | "telegram" | "webhook" | "other";
+  label: string;
+  mode?: CronDeliverMode;
+} {
+  if (!job.deliver) return { kind: "none", label: "Saved only in Hara" };
+  const parsed = parseDeliver(job.deliver);
+  const mode = job.deliverMode ?? "always";
+  if ("error" in parsed) return { kind: "other", label: "External delivery · configured", mode };
+  const labels = {
+    feishu: "Feishu · configured",
+    weixin: "WeChat · configured",
+    telegram: "Telegram · configured",
+    webhook: "Webhook · configured",
+  } as const;
+  return { kind: parsed.platform, label: labels[parsed.platform], mode };
+}
+
+function automationSchedulerInfo(): {
+  installed: boolean;
+  supported: boolean;
+  platform: string;
+  detail: string;
+} {
+  const currentPlatform = platform();
+  const supported = currentPlatform === "darwin" || currentPlatform === "linux";
+  if (!supported) {
+    return {
+      installed: false,
+      supported: false,
+      platform: currentPlatform,
+      detail: `Automatic scheduler installation is not supported on ${currentPlatform}.`,
+    };
+  }
+  try {
+    const installed = isInstalled();
+    return {
+      installed,
+      supported: true,
+      platform: currentPlatform,
+      detail: installed
+        ? "The local scheduler is installed."
+        : "Install the local scheduler once so enabled tasks can run while Desktop is closed.",
+    };
+  } catch {
+    return {
+      installed: false,
+      supported: true,
+      platform: currentPlatform,
+      detail: "Hara could not verify the local scheduler state.",
+    };
+  }
+}
+
+function automationJobForClient(
+  job: CronJob,
+  now: number,
+  nextRunDeadline?: number,
+): Record<string, unknown> {
+  const upcoming = nextRun(job, now, {
+    ...(nextRunDeadline === undefined ? {} : { deadlineMs: nextRunDeadline }),
+  });
+  const nextRunDeferred =
+    job.enabled
+    && job.schedule.kind === "cron"
+    && upcoming === null
+    && nextRunDeadline !== undefined
+    && Date.now() >= nextRunDeadline;
+  const taskPreview = job.task.replace(/\s+/g, " ").trim().slice(0, 180);
+  return {
+    id: job.id,
+    name: job.name,
+    mode: job.mode,
+    cwd: job.cwd,
+    enabled: job.enabled,
+    task: job.task,
+    taskPreview,
+    scheduleSpec: automationScheduleSpec(job.schedule),
+    schedule: describeSchedule(job.schedule),
+    ...(job.tz ? { tz: job.tz } : {}),
+    ...(upcoming === null ? {} : { nextRunAt: upcoming }),
+    ...(nextRunDeferred ? { nextRunDeferred: true } : {}),
+    createdAt: job.createdAt,
+    ...(job.runningSince === undefined ? {} : { runningSince: job.runningSince }),
+    ...(job.lastDurationMs === undefined ? {} : { lastDurationMs: job.lastDurationMs }),
+    ...(job.consecutiveErrors === undefined ? {} : { consecutiveErrors: job.consecutiveErrors }),
+    delivery: automationDeliverySummary(job),
+    ...(job.deliver ? { deliverMode: job.deliverMode ?? "always" } : {}),
+    alertAfter: job.alertAfter ?? 3,
+    ...(job.lastRunAt === undefined ? {} : { lastRunAt: job.lastRunAt }),
+    ...(job.lastStatus === undefined ? {} : { lastStatus: job.lastStatus }),
+    ...(job.lastError === undefined
+      ? {}
+      : { lastError: redactSensitiveText(job.lastError).text }),
+  };
+}
+
+function automationScheduleValidation(
+  schedule: Schedule,
+  timezone: string | undefined,
+  now: number,
+): { schedule: string; description: string; nextRuns: number[] } {
+  const timing: {
+    schedule: Schedule;
+    createdAt: number;
+    lastRunAt?: number;
+    tz?: string;
+  } = {
+    schedule,
+    createdAt: now,
+    ...(timezone ? { tz: timezone } : {}),
+  };
+  const nextRuns: number[] = [];
+  for (let count = 0; count < 3; count++) {
+    const upcoming = nextRun(timing, count === 0 ? now : nextRuns[nextRuns.length - 1]);
+    if (upcoming === null) break;
+    nextRuns.push(upcoming);
+    timing.lastRunAt = upcoming;
+  }
+  return {
+    schedule: automationScheduleSpec(schedule),
+    description: describeSchedule(schedule),
+    nextRuns,
+  };
+}
+
 export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<ServeHandle> {
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
@@ -519,6 +676,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const authed = new Set<WebSocket>();
   const pendingApprovals = new Map<string, (v: boolean | "always") => void>();
   const inFlightRequests = new Set<Promise<void>>();
+  const automationRunControllers = new Set<AbortController>();
   // Physical provider/tool work can outlive its logical timeout. Keep a process-level ledger independent
   // of SessionHub membership so detach/delete cannot make an updater believe the old engine is quiescent.
   const activeOperations = new Set<Promise<unknown>>();
@@ -578,6 +736,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
    * turns, compaction, provider reconfiguration, and physically late provider/tool promises. */
   const hasActiveClientWork = (): boolean =>
     inFlightRequests.size > 0 ||
+    automationRunControllers.size > 0 ||
     activeOperations.size > 0 ||
     pendingApprovals.size > 0 ||
     hub.active().some((session) =>
@@ -1058,7 +1217,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
             "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
             "settings.organizations.remove", "settings.organizations.check",
-            "automation.list", "automation.add", "automation.toggle", "automation.delete",
+            "automation.list", "automation.validate", "automation.add", "automation.update",
+            "automation.run", "automation.toggle", "automation.delete", "automation.scheduler.install",
             "artifact.import", "artifact.commit", "artifact.revert",
             "artifact.list", "artifact.get", "artifact.revisions",
             "tasks.list", "approvals.list", "approvals.resolve",
@@ -1096,7 +1256,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return;
           }
           case "session.list":
-            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, profileId: m.profileId, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, archived: m.archived ?? false })) }));
+            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, profileId: m.profileId, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, jobId: m.jobId, archived: m.archived ?? false })) }));
           case "session.create": {
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const activeRuntime = runtimeInfo(cwd);
@@ -1441,23 +1601,45 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           case "automation.list": {
             // The automation timeline's data: cron jobs with their last outcome, plus this machine's
             // automated sessions (source=cron/gateway) so the desktop can render results and "continue
-            // as conversation". Read-only.
-            const jobs = loadJobs().map((j) => ({
-              id: j.id,
-              name: j.name,
-              mode: j.mode,
-              cwd: j.cwd,
-              enabled: j.enabled,
-              deliver: j.deliver,
-              deliverMode: j.deliverMode ?? "always",
-              alertAfter: j.alertAfter ?? 3,
-              lastRunAt: j.lastRunAt,
-              lastStatus: j.lastStatus,
-              lastError: j.lastError,
-              schedule: describeSchedule(j.schedule),
+            // as conversation". Raw delivery targets are deliberately excluded from this renderer-facing
+            // response: webhook paths/query strings and channel ids can themselves be credentials.
+            const now = Date.now();
+            const nextRunDeadline = Date.now() + 40;
+            const jobs = loadJobs().map((job) => automationJobForClient(
+              job,
+              now,
+              Math.min(nextRunDeadline, Date.now() + 8),
+            ));
+            const automated = hub.list().filter((m) => m.source === "cron" || m.source === "gateway").map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, source: m.source, sourceName: m.sourceName, jobId: m.jobId, updatedAt: m.updatedAt }));
+            return reply(rpcResult(id!, {
+              jobs,
+              sessions: automated,
+              scheduler: automationSchedulerInfo(),
             }));
-            const automated = hub.list().filter((m) => m.source === "cron" || m.source === "gateway").map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, source: m.source, sourceName: m.sourceName, updatedAt: m.updatedAt }));
-            return reply(rpcResult(id!, { jobs, sessions: automated }));
+          }
+          case "automation.validate": {
+            if (typeof p.schedule !== "string" || !p.schedule.trim()) {
+              return reply(rpcError(id, ERR.PARAMS, "schedule required"));
+            }
+            if (p.tz !== undefined && typeof p.tz !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "tz must be an IANA timezone name"));
+            }
+            const now = Date.now();
+            const schedule = parseSchedule(p.schedule, now);
+            if ("error" in schedule) {
+              return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${schedule.error}`));
+            }
+            const requestedTimezone = typeof p.tz === "string" && p.tz.trim()
+              ? p.tz.trim()
+              : undefined;
+            if (requestedTimezone && !validTz(requestedTimezone)) {
+              return reply(rpcError(id, ERR.PARAMS, `invalid timezone "${requestedTimezone}"`));
+            }
+            const timezone = schedule.kind === "cron" ? requestedTimezone : undefined;
+            return reply(rpcResult(
+              id!,
+              automationScheduleValidation(schedule, timezone, now),
+            ));
           }
           case "tasks.list": {
             // The project's persistent task pool (the `task` tool's file store) — desktop's tasks panel.
@@ -1481,50 +1663,256 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcResult(id!, { outcome }));
           }
           case "automation.add": {
-            if (typeof p.name !== "string" || !p.name || typeof p.schedule !== "string" || typeof p.task !== "string" || !p.task) {
+            if (
+              typeof p.name !== "string"
+              || !p.name.trim()
+              || typeof p.schedule !== "string"
+              || !p.schedule.trim()
+              || typeof p.task !== "string"
+              || !p.task.trim()
+            ) {
               return reply(rpcError(id, ERR.PARAMS, "name + schedule + task required"));
+            }
+            if (
+              p.mode !== undefined
+              && p.mode !== "print"
+              && p.mode !== "org"
+              && p.mode !== "command"
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "mode must be print, org, or command"));
+            }
+            if (p.cwd !== undefined && (typeof p.cwd !== "string" || !p.cwd.trim())) {
+              return reply(rpcError(id, ERR.PARAMS, "cwd must be a non-empty path"));
+            }
+            if (p.tz !== undefined && typeof p.tz !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "tz must be an IANA timezone name"));
+            }
+            if (p.clearDeliver !== undefined) {
+              return reply(rpcError(id, ERR.PARAMS, "clearDeliver only applies when updating a task"));
             }
             const sched = parseSchedule(p.schedule, Date.now());
             if ("error" in sched) return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${sched.error}`));
-            const deliver = typeof p.deliver === "string" && p.deliver ? p.deliver : undefined;
+            const requestedTimezone = typeof p.tz === "string" && p.tz.trim()
+              ? p.tz.trim()
+              : undefined;
+            if (requestedTimezone && !validTz(requestedTimezone)) {
+              return reply(rpcError(id, ERR.PARAMS, `invalid timezone "${requestedTimezone}"`));
+            }
+            const timezone = sched.kind === "cron" ? requestedTimezone : undefined;
+            if (p.deliver !== undefined && (typeof p.deliver !== "string" || !p.deliver.trim())) {
+              return reply(rpcError(id, ERR.PARAMS, "deliver must be a non-empty delivery target"));
+            }
+            const deliver = typeof p.deliver === "string" ? p.deliver.trim() : undefined;
             if (deliver) {
               const parsed = parseDeliver(deliver);
               if ("error" in parsed) return reply(rpcError(id, ERR.PARAMS, parsed.error));
             }
-            const deliverMode = typeof p.deliverMode === "string" && p.deliverMode
+            if (p.deliverMode !== undefined && !isAutomationDeliveryMode(p.deliverMode)) {
+              return reply(rpcError(id, ERR.PARAMS, "deliverMode must be always, on-output, or on-error"));
+            }
+            const deliverMode = isAutomationDeliveryMode(p.deliverMode)
               ? p.deliverMode
               : undefined;
             if (deliverMode && !deliver) return reply(rpcError(id, ERR.PARAMS, "deliverMode requires deliver"));
-            if (deliverMode && !["always", "on-output", "on-error"].includes(deliverMode)) {
-              return reply(rpcError(id, ERR.PARAMS, "deliverMode must be always, on-output, or on-error"));
-            }
             const alertAfter = p.alertAfter === undefined ? undefined : Number(p.alertAfter);
             if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
               return reply(rpcError(id, ERR.PARAMS, "alertAfter must be an integer from 1 to 1000"));
             }
             const job = addJob({
-              name: p.name.slice(0, 60),
+              name: p.name.trim().slice(0, 60),
               schedule: sched,
               task: p.task,
-              mode: (["print", "org", "command"] as const).includes(p.mode) ? p.mode : "print",
-              cwd: typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd,
-              ...(typeof p.tz === "string" && p.tz ? { tz: p.tz } : {}),
+              mode: p.mode === "org" || p.mode === "command" ? p.mode : "print",
+              cwd: typeof p.cwd === "string" ? p.cwd.trim() : opts.cwd,
+              ...(timezone ? { tz: timezone } : {}),
               ...(deliver ? { deliver } : {}),
-              ...(deliverMode ? { deliverMode: deliverMode as "always" | "on-output" | "on-error" } : {}),
+              ...(deliverMode ? { deliverMode } : {}),
               ...(alertAfter !== undefined ? { alertAfter } : {}),
               createdAt: Date.now(),
             });
-            return reply(rpcResult(id!, { id: job.id, name: job.name, schedule: describeSchedule(job.schedule) }));
+            return reply(rpcResult(id!, {
+              id: job.id,
+              name: job.name,
+              schedule: describeSchedule(job.schedule),
+              scheduleSpec: automationScheduleSpec(job.schedule),
+            }));
+          }
+          case "automation.update": {
+            if (
+              typeof p.id !== "string"
+              || !p.id.trim()
+              || typeof p.name !== "string"
+              || !p.name.trim()
+              || typeof p.schedule !== "string"
+              || !p.schedule.trim()
+              || typeof p.task !== "string"
+              || !p.task.trim()
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "id + name + schedule + task required"));
+            }
+            const existing = findJob(p.id);
+            if (!existing) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            if (existing.lastStatus === "running") {
+              return reply(rpcError(id, ERR.BUSY, `job ${existing.id} is currently running`));
+            }
+            if (p.mode !== "print" && p.mode !== "org" && p.mode !== "command") {
+              return reply(rpcError(id, ERR.PARAMS, "mode must be print, org, or command"));
+            }
+            if (p.cwd !== undefined && (typeof p.cwd !== "string" || !p.cwd.trim())) {
+              return reply(rpcError(id, ERR.PARAMS, "cwd must be a non-empty path"));
+            }
+            if (p.tz !== undefined && typeof p.tz !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "tz must be an IANA timezone name"));
+            }
+            const now = Date.now();
+            const parsedSchedule = parseSchedule(p.schedule, now);
+            const requestedPastOneShot = existing.schedule.kind === "once"
+              && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(p.schedule.trim())
+              && Date.parse(p.schedule.trim()) === existing.schedule.runAt;
+            if ("error" in parsedSchedule && !requestedPastOneShot) {
+              return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${parsedSchedule.error}`));
+            }
+            // A completed one-shot's canonical scheduleSpec is necessarily in the past. Permit that exact
+            // instant to round-trip while editing unrelated fields, but keep rejecting a newly selected
+            // past instant.
+            const schedule: Schedule = requestedPastOneShot
+              ? existing.schedule
+              : parsedSchedule as Schedule;
+            const requestedTimezone = typeof p.tz === "string" && p.tz.trim()
+              ? p.tz.trim()
+              : undefined;
+            if (requestedTimezone && !validTz(requestedTimezone)) {
+              return reply(rpcError(id, ERR.PARAMS, `invalid timezone "${requestedTimezone}"`));
+            }
+            // Omission preserves the current cron timezone. An explicit empty string clears it; changing
+            // to a non-cron schedule also drops timezone metadata because it no longer affects execution.
+            const timezone = schedule.kind === "cron"
+              ? p.tz === undefined
+                ? existing.tz
+                : requestedTimezone
+              : undefined;
+            if (p.clearDeliver !== undefined && typeof p.clearDeliver !== "boolean") {
+              return reply(rpcError(id, ERR.PARAMS, "clearDeliver must be a boolean"));
+            }
+            if (
+              p.clearDeliver === true
+              && (p.deliver !== undefined || p.deliverMode !== undefined)
+            ) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                "clearDeliver cannot be combined with deliver or deliverMode",
+              ));
+            }
+            if (p.deliver !== undefined && (typeof p.deliver !== "string" || !p.deliver.trim())) {
+              return reply(rpcError(id, ERR.PARAMS, "deliver must be a non-empty delivery target"));
+            }
+            const deliver = typeof p.deliver === "string" ? p.deliver.trim() : undefined;
+            if (deliver) {
+              const parsed = parseDeliver(deliver);
+              if ("error" in parsed) return reply(rpcError(id, ERR.PARAMS, parsed.error));
+            }
+            if (p.deliverMode !== undefined && !isAutomationDeliveryMode(p.deliverMode)) {
+              return reply(rpcError(id, ERR.PARAMS, "deliverMode must be always, on-output, or on-error"));
+            }
+            const deliverMode = isAutomationDeliveryMode(p.deliverMode)
+              ? p.deliverMode
+              : undefined;
+            const delivery: CronDeliveryUpdate = p.clearDeliver === true
+              ? { kind: "clear" }
+              : deliver
+                ? { kind: "replace", deliver, ...(deliverMode ? { mode: deliverMode } : {}) }
+                : { kind: "preserve", ...(deliverMode ? { mode: deliverMode } : {}) };
+            const alertAfter = p.alertAfter === undefined ? undefined : Number(p.alertAfter);
+            if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
+              return reply(rpcError(id, ERR.PARAMS, "alertAfter must be an integer from 1 to 1000"));
+            }
+            const updated = updateJob(existing.id, {
+              name: p.name.trim().slice(0, 60),
+              schedule,
+              task: p.task,
+              mode: p.mode,
+              cwd: typeof p.cwd === "string" ? p.cwd.trim() : existing.cwd,
+              ...(timezone ? { tz: timezone } : {}),
+              ...(alertAfter !== undefined ? { alertAfter } : {}),
+            }, delivery, now);
+            if (updated === "running") {
+              return reply(rpcError(id, ERR.BUSY, `job ${existing.id} started running before the update`));
+            }
+            if (updated === "missing-deliver") {
+              return reply(rpcError(id, ERR.PARAMS, "deliverMode requires an existing or replacement delivery target"));
+            }
+            if (!updated) return reply(rpcError(id, ERR.PARAMS, `no job ${existing.id}`));
+            return reply(rpcResult(id!, {
+              id: updated.id,
+              name: updated.name,
+              schedule: describeSchedule(updated.schedule),
+              scheduleSpec: automationScheduleSpec(updated.schedule),
+            }));
+          }
+          case "automation.run": {
+            if (typeof p.id !== "string" || !p.id.trim()) {
+              return reply(rpcError(id, ERR.PARAMS, "id required"));
+            }
+            const job = findJob(p.id);
+            if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            if (job.lastStatus === "running") {
+              return reply(rpcError(id, ERR.BUSY, `job ${job.id} is already running`));
+            }
+            const controller = new AbortController();
+            automationRunControllers.add(controller);
+            let result;
+            try {
+              result = await runJobTracked(job, { signal: controller.signal });
+            } finally {
+              automationRunControllers.delete(controller);
+            }
+            return reply(rpcResult(id!, {
+              id: job.id,
+              ok: result.ok,
+              ...(result.error
+                ? { error: redactSensitiveText(result.error).text }
+                : {}),
+            }));
           }
           case "automation.toggle": {
-            if (typeof p.id !== "string" || typeof p.enabled !== "boolean") return reply(rpcError(id, ERR.PARAMS, "id + enabled required"));
-            if (!setEnabled(p.id, p.enabled)) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
-            return reply(rpcResult(id!, { id: p.id, enabled: p.enabled }));
+            if (typeof p.id !== "string" || !p.id.trim() || typeof p.enabled !== "boolean") return reply(rpcError(id, ERR.PARAMS, "id + enabled required"));
+            const job = findJob(p.id);
+            if (!job || !setEnabled(job.id, p.enabled)) {
+              return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            }
+            return reply(rpcResult(id!, { id: job.id, enabled: p.enabled }));
           }
           case "automation.delete": {
-            if (typeof p.id !== "string") return reply(rpcError(id, ERR.PARAMS, "id required"));
-            if (!removeJob(p.id)) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
-            return reply(rpcResult(id!, { id: p.id, deleted: true }));
+            if (typeof p.id !== "string" || !p.id.trim()) return reply(rpcError(id, ERR.PARAMS, "id required"));
+            const job = findJob(p.id);
+            if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            if (job.lastStatus === "running") {
+              return reply(rpcError(id, ERR.BUSY, `job ${job.id} is currently running`));
+            }
+            if (!removeJob(job.id)) {
+              const current = findJob(job.id);
+              if (current?.lastStatus === "running") {
+                return reply(rpcError(id, ERR.BUSY, `job ${job.id} started running before deletion`));
+              }
+              return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            }
+            return reply(rpcResult(id!, { id: job.id, deleted: true }));
+          }
+          case "automation.scheduler.install": {
+            const before = automationSchedulerInfo();
+            if (!before.supported) {
+              return reply(rpcError(id, ERR.PARAMS, before.detail));
+            }
+            const installed = installScheduler(selfArgv());
+            if (!installed.ok) {
+              return reply(rpcError(
+                id,
+                ERR.INTERNAL,
+                redactSensitiveText(installed.msg).text,
+              ));
+            }
+            return reply(rpcResult(id!, { scheduler: automationSchedulerInfo() }));
           }
           case "artifact.import": {
             if (typeof p.sourcePath !== "string" || !p.sourcePath) {
@@ -1759,6 +2147,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
       for (const resolve of pendingApprovals.values()) resolve(false);
       pendingApprovals.clear();
+      for (const controller of automationRunControllers) {
+        controller.abort(new Error("Hara Serve is shutting down"));
+      }
       for (const session of hub.active()) session.abort?.abort();
       await deps.closeGatewayLogins?.().catch(() => {});
 

@@ -35,10 +35,19 @@ export const MAX_SESSION_STRING_CHARS = 8 * 1024 * 1024;
  *  (automated sessions get "name · time", NEVER the raw prompt). */
 export type SessionSource = "interactive" | "gateway" | "cron";
 
+const AUTOMATION_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
 /** Derive the session source from the spawn environment — the gateway subprocess runs with
- *  HARA_GATEWAY=<platform>, the cron runner with HARA_CRON=1 (+ HARA_CRON_NAME=<job name>). */
-export function sessionSourceFromEnv(): { source: SessionSource; sourceName?: string } {
-  if (process.env.HARA_CRON) return { source: "cron", sourceName: process.env.HARA_CRON_NAME || undefined };
+ *  HARA_GATEWAY=<platform>, the cron runner with HARA_CRON=1 plus its name and stable job id. */
+export function sessionSourceFromEnv(): { source: SessionSource; sourceName?: string; jobId?: string } {
+  if (process.env.HARA_CRON) {
+    const jobId = process.env.HARA_CRON_ID;
+    return {
+      source: "cron",
+      sourceName: process.env.HARA_CRON_NAME || undefined,
+      ...(jobId && AUTOMATION_JOB_ID.test(jobId) ? { jobId } : {}),
+    };
+  }
   if (process.env.HARA_GATEWAY) return { source: "gateway", sourceName: process.env.HARA_GATEWAY };
   return { source: "interactive" };
 }
@@ -73,6 +82,8 @@ export interface SessionMeta {
   source?: SessionSource;
   /** human tag for automated sessions: cron job name / gateway platform */
   sourceName?: string;
+  /** Stable cron job identity for automation history association; absent for gateways and legacy runs. */
+  jobId?: string;
   /** Per-session reasoning effort pin used by persistent Serve clients. */
   effort?: string;
   /** archived sessions are hidden from pickers/lists but kept on disk (codex thread/archive) */
@@ -408,6 +419,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   safe.meta.createdAt = data.meta.createdAt;
   safe.meta.updatedAt = data.meta.updatedAt;
   if (data.meta.source !== undefined) safe.meta.source = data.meta.source;
+  if (data.meta.jobId !== undefined) safe.meta.jobId = data.meta.jobId;
   if (data.meta.effort !== undefined) safe.meta.effort = data.meta.effort;
   if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
@@ -550,6 +562,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
     (meta.todos === undefined || (Array.isArray(meta.todos) && meta.todos.every(isPersistedTodo))) &&
     (meta.source === undefined || meta.source === "interactive" || meta.source === "gateway" || meta.source === "cron") &&
     (meta.sourceName === undefined || typeof meta.sourceName === "string") &&
+    (meta.jobId === undefined || (typeof meta.jobId === "string" && AUTOMATION_JOB_ID.test(meta.jobId))) &&
     (meta.effort === undefined || typeof meta.effort === "string") &&
     (meta.archived === undefined || typeof meta.archived === "boolean") &&
     (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string")

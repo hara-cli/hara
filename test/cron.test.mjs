@@ -4,9 +4,9 @@ import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync }
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { durationToMs, parseSchedule, parseCron, cronMatches, isDue, nextRun } from "../dist/cron/schedule.js";
-import { dueJobs, selfArgv, selfInvocation } from "../dist/cron/runner.js";
-import { addJob, cronDir, findJob, loadJobs, recordRunStart, resolveJob, saveJobs, setEnabled } from "../dist/cron/store.js";
+import { cronExpressionsEqual, durationToMs, parseSchedule, parseCron, cronMatches, isDue, nextRun } from "../dist/cron/schedule.js";
+import { cronAgentArgs, dueJobs, selfArgv, selfInvocation } from "../dist/cron/runner.js";
+import { addJob, cronDir, findJob, loadJobs, recordRunStart, removeJob, resolveJob, saveJobs, setEnabled, updateJob } from "../dist/cron/store.js";
 import { renderLaunchdPlist } from "../dist/cron/install.js";
 import { defaultProcessIdentity } from "../dist/process-identity.js";
 
@@ -45,6 +45,19 @@ test("parseCron: validity", () => {
   assert.equal(parseCron("* * * *"), null, "needs 5 fields");
   assert.equal(parseCron("60 * * * *"), null, "minute out of range");
   assert.equal(parseCron("* 24 * * *"), null, "hour out of range");
+});
+
+test("cron expression identity is semantic, not formatting-sensitive", () => {
+  assert.equal(cronExpressionsEqual("0 9 * * *", "00 09 * * *"), true);
+  assert.equal(cronExpressionsEqual("0,15,30,45 * * * *", "*/15 * * * *"), true);
+  assert.equal(cronExpressionsEqual("0 9 * * *", "0 9 1-31 * *"), true);
+  assert.equal(cronExpressionsEqual("0 9 * * *", "0 9 * * 0-6"), true);
+  assert.equal(
+    cronExpressionsEqual("0 9 * * 1", "0 9 1-31 * 1"),
+    false,
+    "an explicit full DOM plus a restricted DOW keeps Vixie's OR semantics",
+  );
+  assert.equal(cronExpressionsEqual("0 9 * * 1", "0 10 * * 1"), false);
 });
 
 test("cronMatches: minute/hour/step + day-of-week", () => {
@@ -90,6 +103,17 @@ test("nextRun: cron scans forward; interval/once compute directly", () => {
   assert.equal(nextRun({ schedule: { kind: "once", runAt: 9000, display: "x" }, createdAt: 0 }, from), from, "overdue persisted one-shot is due now, never displayed in the past");
 });
 
+test("nextRun honors a renderer-facing shared scan deadline", () => {
+  const started = Date.now();
+  const result = nextRun(
+    { schedule: { kind: "cron", expr: "0 0 31 2 *" }, createdAt: 0 },
+    started,
+    { deadlineMs: started },
+  );
+  assert.equal(result, null);
+  assert.ok(Date.now() - started < 100, "an exhausted UI budget cannot scan a full year");
+});
+
 test("nextRun: a matching current cron minute stays due now instead of jumping to tomorrow", () => {
   const from = new Date(2026, 0, 5, 9, 0, 37).getTime();
   const job = { schedule: { kind: "cron", expr: "0 9 * * *" }, createdAt: from, pendingDueAt: from };
@@ -126,6 +150,149 @@ test("creation-minute catch-up is explicit, consumed on start, and abandoned on 
     assert.equal(bornDisabled.pendingDueAt, undefined);
     setEnabled(bornDisabled.id, true);
     assert.equal(isDue(findJob(bornDisabled.id), later), false, "disabled creation never mints catch-up debt");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("cron definition updates preserve identity/history while the new schedule and delivery take effect", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-cron-update-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const job = addJob({
+      name: "old",
+      schedule: { kind: "once", runAt: 2_000, display: "once, old" },
+      task: "old task",
+      mode: "command",
+      cwd: home,
+      deliver: "webhook:https://example.invalid/old-secret?token=private",
+      deliverMode: "always",
+      createdAt: 1_000,
+    });
+    saveJobs([{ ...job, lastRunAt: 3_000, lastStatus: "ok", lastDurationMs: 25 }]);
+
+    const updated = updateJob(job.id, {
+      name: "new",
+      schedule: { kind: "once", runAt: 6_000, display: "once, new" },
+      task: "new task",
+      mode: "print",
+      cwd: home,
+      alertAfter: 4,
+    }, { kind: "preserve", mode: "on-error" }, 5_000);
+    assert.equal(updated.id, job.id);
+    assert.equal(updated.createdAt, 1_000);
+    assert.equal(updated.lastRunAt, 3_000, "last outcome remains visible");
+    assert.equal(updated.lastStatus, "ok");
+    assert.equal(updated.lastDurationMs, 25);
+    assert.equal(updated.scheduleUpdatedAt, 5_000);
+    assert.equal(updated.definitionRevision, 1);
+    assert.equal(updated.deliver, "webhook:https://example.invalid/old-secret?token=private");
+    assert.equal(updated.deliverMode, "on-error");
+    assert.equal(isDue(updated, 5_999), false);
+    assert.equal(isDue(updated, 6_000), true, "the old run cannot complete the edited one-shot");
+
+    const cleared = updateJob(job.id, {
+      name: updated.name,
+      schedule: updated.schedule,
+      task: updated.task,
+      mode: updated.mode,
+      cwd: updated.cwd,
+      alertAfter: updated.alertAfter,
+    }, { kind: "clear" }, 5_100);
+    assert.equal(cleared.deliver, undefined);
+    assert.equal(cleared.deliverMode, undefined);
+    assert.equal(cleared.alertAfter, 4, "omitting the optional alert field preserves its current threshold");
+    assert.equal(cleared.definitionRevision, 2);
+
+    assert.equal(
+      recordRunStart(job.id, 5_150, true, updated.definitionRevision),
+      null,
+      "a stale scheduler snapshot cannot launch after another definition edit",
+    );
+    assert.equal(findJob(job.id).lastStatus, "ok");
+
+    saveJobs([{ ...cleared, lastStatus: "running", runningSince: 5_200, runningPid: process.pid, runningToken: "active" }]);
+    assert.equal(removeJob(job.id), false, "deletion cannot orphan a running attempt");
+    assert.equal(
+      updateJob(job.id, {
+        name: "must not change",
+        schedule: cleared.schedule,
+        task: cleared.task,
+        mode: cleared.mode,
+        cwd: cleared.cwd,
+      }, { kind: "preserve" }, 5_300),
+      "running",
+    );
+    assert.equal(findJob(job.id).name, "new");
+
+    const completedOnce = addJob({
+      name: "completed once",
+      schedule: { kind: "once", runAt: 7_000, display: "once, original label" },
+      task: "done",
+      mode: "command",
+      cwd: home,
+      createdAt: 6_000,
+    });
+    saveJobs([
+      findJob(job.id),
+      { ...completedOnce, lastRunAt: 7_000, lastStatus: "ok" },
+    ]);
+    const relabeledOnce = updateJob(completedOnce.id, {
+      name: "completed once renamed",
+      schedule: { kind: "once", runAt: 7_000, display: "once at 1970-01-01T00:00:07.000Z" },
+      task: "done",
+      mode: "command",
+      cwd: home,
+    }, { kind: "preserve" }, 8_000);
+    assert.equal(relabeledOnce.scheduleUpdatedAt, undefined);
+    assert.equal(isDue(relabeledOnce, 8_000), false, "presentation-only relabeling cannot replay a completed one-shot");
+
+    const matchedAt = new Date(2026, 0, 5, 9, 0).getTime();
+    const formattedCron = addJob({
+      name: "formatted cron",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      task: "done",
+      mode: "command",
+      cwd: home,
+      createdAt: matchedAt - 60_000,
+    });
+    saveJobs([
+      findJob(job.id),
+      relabeledOnce,
+      { ...formattedCron, lastRunAt: matchedAt, lastStatus: "ok" },
+    ]);
+    const equivalentCron = updateJob(formattedCron.id, {
+      name: formattedCron.name,
+      schedule: { kind: "cron", expr: "00 09 * * *" },
+      task: formattedCron.task,
+      mode: formattedCron.mode,
+      cwd: formattedCron.cwd,
+    }, { kind: "preserve" }, matchedAt + 1_000);
+    assert.equal(equivalentCron.scheduleUpdatedAt, undefined);
+    assert.equal(equivalentCron.pendingDueAt, undefined);
+    assert.equal(isDue(equivalentCron, matchedAt + 1_000), false, "format-only edit cannot replay the current minute");
+
+    const fullRangeCron = updateJob(formattedCron.id, {
+      name: formattedCron.name,
+      schedule: { kind: "cron", expr: "0 9 1-31 * *" },
+      task: formattedCron.task,
+      mode: formattedCron.mode,
+      cwd: formattedCron.cwd,
+    }, { kind: "preserve" }, matchedAt + 2_000);
+    assert.equal(fullRangeCron.scheduleUpdatedAt, undefined);
+    assert.equal(fullRangeCron.pendingDueAt, undefined);
+    assert.equal(
+      isDue(fullRangeCron, matchedAt + 2_000),
+      false,
+      "a wildcard-to-full-range edit cannot replay the current minute",
+    );
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -388,6 +555,17 @@ test("selfArgv: under node re-invokes the entry (script OR bin symlink); compile
     process.argv[1] = savedArgv;
     process.execPath = savedExec;
   }
+});
+
+test("print automations launch as fresh persisted sessions for Desktop run history", () => {
+  assert.deepEqual(
+    cronAgentArgs({ mode: "print", task: "daily brief" }, "cron-run-session"),
+    ["-p", "daily brief", "--approval", "full-auto", "--resume", "cron-run-session"],
+  );
+  assert.deepEqual(
+    cronAgentArgs({ mode: "org", task: "ship release" }, "unused"),
+    ["org", "ship release"],
+  );
 });
 
 test("dueJobs: only enabled + due", () => {

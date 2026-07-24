@@ -5,6 +5,34 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.7 — 2026-07-24 — secure Desktop automation control
+
+- Serve automation listings now expose only a structured, redacted delivery description. Webhook
+  paths, query signatures, Feishu/WeChat targets, and other write-only delivery credentials never
+  cross into the Desktop renderer, returned errors, or structured list responses.
+- Desktop can now validate schedules, edit task definitions, run a task immediately, install the
+  local scheduler, and read structured schedule, next-run, status, duration, and failure metadata
+  through authenticated automation RPCs. Every print-task occurrence now creates its own durable
+  session with a stable job ID, so Desktop run history is complete and survives task renames. Delivery
+  targets are preserved without being read back, replaced only when explicitly supplied, and cleared
+  only by an explicit request. Editing unrelated fields preserves an existing cron timezone, while an
+  explicit empty timezone still clears it; completed one-shot schedules can round-trip for metadata edits
+  without allowing a different past timestamp.
+- Editing a schedule creates a fresh due boundary without discarding job identity or run history;
+  stale queued delivery notifications cannot retain a replaced target, and running jobs reject
+  conflicting edits or deletion. A monotonic definition fence also prevents a scheduler snapshot from
+  launching stale task content when an edit races the minute tick. Semantically equivalent cron
+  formatting does not replay the current occurrence, empty task IDs cannot resolve as prefixes, and
+  full-range day fields are also recognized as wildcard-equivalent where their effective Vixie day
+  predicate matches, and bulk next-run previews share a bounded event-loop budget.
+- Graceful Serve shutdown now cancels and reaps an in-flight “run now” process tree before closing its
+  persisted attempt, rather than leaving an orphaned child and a permanent `running` marker.
+- Test processes now receive an isolated canonical home directory before application modules load,
+  preventing integration tests from reading or writing a developer's real Hara profile. External
+  CLI availability caching follows the effective `PATH` and never caches a miss, so a tool installed
+  while Desktop remains open is detected on the next attempt.
+- Upgrade with `npm i -g @nanhara/hara@0.134.7`.
+
 ## 0.134.6 — 2026-07-24 — deterministic process-tree release gate
 
 - The POSIX process-tree regression now gives its nested Node fixture a real startup window before

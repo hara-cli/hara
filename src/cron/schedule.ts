@@ -74,6 +74,41 @@ export function parseCron(expr: string): CronFields | null {
   return { m, h, dom, mon, dow, domStar: f[2] === "*", dowStar: f[4] === "*" };
 }
 
+function sameNumberSet(left: Set<number>, right: Set<number>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
+}
+
+function cronDayPredicate(fields: CronFields, dom: number, dow: number): boolean {
+  const domOk = fields.dom.has(dom);
+  const dowOk = fields.dow.has(dow);
+  if (fields.domStar && fields.dowStar) return true;
+  if (!fields.domStar && !fields.dowStar) return domOk || dowOk;
+  return fields.domStar ? dowOk : domOk;
+}
+
+function sameCronDayPredicate(left: CronFields, right: CronFields): boolean {
+  for (let dom = 1; dom <= 31; dom++) {
+    for (let dow = 0; dow <= 6; dow++) {
+      if (cronDayPredicate(left, dom, dow) !== cronDayPredicate(right, dom, dow)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/** Compare the schedule semantics Hara actually executes, rather than the user's formatting. This keeps
+ * harmless edits such as `0 9 * * *` → `00 09 * * *` from minting a new schedule occurrence. */
+export function cronExpressionsEqual(left: string, right: string): boolean {
+  const a = parseCron(left);
+  const b = parseCron(right);
+  return !!a && !!b
+    && sameNumberSet(a.m, b.m)
+    && sameNumberSet(a.h, b.h)
+    && sameNumberSet(a.mon, b.mon)
+    && sameCronDayPredicate(a, b);
+}
+
 /** Offset (ms) of IANA zone `tz` from UTC at instant `atMs`. Cached per (tz, hour) — offsets only move
  *  at DST transitions, so hour-bucket caching keeps nextRun's minute-by-minute scan fast. */
 const offsetCache = new Map<string, number>();
@@ -112,10 +147,7 @@ function wallParts(d: Date, tz?: string): { min: number; hour: number; dom: numb
   return { min: z.getUTCMinutes(), hour: z.getUTCHours(), dom: z.getUTCDate(), mon: z.getUTCMonth() + 1, dow: z.getUTCDay() };
 }
 
-/** Does `expr` fire at the given minute (in `tz` when set, else local)? Vixie dom/dow OR rule. */
-export function cronMatches(expr: string, d: Date, tz?: string): boolean {
-  const p = parseCron(expr);
-  if (!p) return false;
+function cronFieldsMatch(p: CronFields, d: Date, tz?: string): boolean {
   const w = wallParts(d, tz);
   if (!p.m.has(w.min) || !p.h.has(w.hour) || !p.mon.has(w.mon)) return false;
   const domOk = p.dom.has(w.dom);
@@ -123,6 +155,12 @@ export function cronMatches(expr: string, d: Date, tz?: string): boolean {
   if (p.domStar && p.dowStar) return true; // both unrestricted → any day
   if (!p.domStar && !p.dowStar) return domOk || dowOk; // both restricted → OR
   return p.domStar ? dowOk : domOk; // one restricted → that one
+}
+
+/** Does `expr` fire at the given minute (in `tz` when set, else local)? Vixie dom/dow OR rule. */
+export function cronMatches(expr: string, d: Date, tz?: string): boolean {
+  const parsed = parseCron(expr);
+  return parsed ? cronFieldsMatch(parsed, d, tz) : false;
 }
 
 /** Parse a user schedule string into a Schedule (or an error). `nowMs` anchors relative one-shots. */
@@ -157,6 +195,9 @@ export function describeSchedule(sched: Schedule): string {
 interface JobTiming {
   schedule: Schedule;
   createdAt: number;
+  /** Definition change boundary. A run before this instant belongs to the previous schedule and must not
+   * suppress the first occurrence of the edited one. */
+  scheduleUpdatedAt?: number;
   lastRunAt?: number;
   /** Explicit one-shot catch-up for a cron job created after this minute's OS tick. */
   pendingDueAt?: number;
@@ -177,24 +218,44 @@ export function isDue(job: JobTiming, nowMs: number): boolean {
       && (job.lastRunAt === undefined || job.lastRunAt < job.pendingDueAt)
     ) return true;
     if (cronMatches(s.expr, new Date(nowMs), job.tz)) {
-      return job.lastRunAt === undefined || Math.floor(job.lastRunAt / 60_000) < Math.floor(nowMs / 60_000);
+      const lastRunAt =
+        job.lastRunAt !== undefined
+        && (job.scheduleUpdatedAt === undefined || job.lastRunAt >= job.scheduleUpdatedAt)
+          ? job.lastRunAt
+          : undefined;
+      return lastRunAt === undefined || Math.floor(lastRunAt / 60_000) < Math.floor(nowMs / 60_000);
     }
     return false;
   }
   // interval: fire once per grid slot of width everyMs — a tick landing slightly early still counts the
   // slot (a plain `now >= last+everyMs` deadline loses ~half the fires of `every 1m` at 60s tick granularity).
-  if (s.kind === "every") return Math.floor(nowMs / s.everyMs) > Math.floor((job.lastRunAt ?? job.createdAt) / s.everyMs);
-  return job.lastRunAt === undefined && nowMs >= s.runAt; // once
+  if (s.kind === "every") {
+    const scheduleAnchor = job.scheduleUpdatedAt ?? job.createdAt;
+    const runAnchor = job.lastRunAt === undefined ? scheduleAnchor : Math.max(scheduleAnchor, job.lastRunAt);
+    return Math.floor(nowMs / s.everyMs) > Math.floor(runAnchor / s.everyMs);
+  }
+  const completed =
+    job.lastRunAt !== undefined
+    && (job.scheduleUpdatedAt === undefined || job.lastRunAt >= job.scheduleUpdatedAt);
+  return !completed && nowMs >= s.runAt; // once
 }
 
 /** Next actionable fire time at/after `fromMs` (for display). A currently-due cron or overdue persisted
  *  one-shot returns `fromMs` instead of lying with tomorrow/a past timestamp. Cron scans minute-by-minute
  *  up to a year; null means the job has already completed or has no match in the scan window. */
-export function nextRun(job: JobTiming, fromMs: number): number | null {
+export interface NextRunOptions {
+  /** Optional shared wall-clock budget for renderer-facing bulk queries. Core scheduler calls omit it. */
+  deadlineMs?: number;
+}
+
+export function nextRun(job: JobTiming, fromMs: number, options: NextRunOptions = {}): number | null {
   const s = job.schedule;
   if (s.kind === "every") return (Math.floor(fromMs / s.everyMs) + 1) * s.everyMs; // next grid boundary (always > fromMs)
   if (s.kind === "once") {
-    if (job.lastRunAt !== undefined) return null;
+    const completed =
+      job.lastRunAt !== undefined
+      && (job.scheduleUpdatedAt === undefined || job.lastRunAt >= job.scheduleUpdatedAt);
+    if (completed) return null;
     return s.runAt <= fromMs ? fromMs : s.runAt;
   }
   const p = parseCron(s.expr);
@@ -202,7 +263,14 @@ export function nextRun(job: JobTiming, fromMs: number): number | null {
   if (isDue(job, fromMs)) return fromMs;
   const start = Math.floor(fromMs / 60_000) * 60_000 + 60_000; // next minute boundary
   for (let t = start, i = 0; i < 366 * 24 * 60; t += 60_000, i++) {
-    if (cronMatches(s.expr, new Date(t), job.tz)) return t;
+    // A Desktop list can contain thousands of independently valid but extremely sparse schedules. Share
+    // one small response budget so an authenticated local query cannot monopolize Serve's event loop.
+    if (
+      options.deadlineMs !== undefined
+      && (i & 255) === 0
+      && Date.now() >= options.deadlineMs
+    ) return null;
+    if (cronFieldsMatch(p, new Date(t), job.tz)) return t;
   }
   return null;
 }

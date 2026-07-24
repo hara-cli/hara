@@ -4022,7 +4022,13 @@ program.action(async (opts) => {
         title: src.source === "interactive" ? "" : automatedTitle(src.source, src.sourceName),
         createdAt: new Date().toISOString(),
         updatedAt: "",
-        ...(src.source !== "interactive" ? { source: src.source, sourceName: src.sourceName } : { source: "interactive" as const }),
+        ...(src.source !== "interactive"
+          ? {
+              source: src.source,
+              sourceName: src.sourceName,
+              ...(src.jobId ? { jobId: src.jobId } : {}),
+            }
+          : { source: "interactive" as const }),
       };
       meta.profileId = authoritativeProfileId;
       // Checklist continuity remains in meta; execution identity is restored independently in top-level

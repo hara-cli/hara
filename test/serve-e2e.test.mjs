@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
 import { historyForClient, startServe } from "../dist/serve/server.js";
+import { addJob, findJob, removeJob } from "../dist/cron/store.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
 
@@ -271,6 +272,8 @@ test("serve e2e: auth gate → create → send streams text events and returns t
   );
   const c = await connect(srv.port);
   let automationId;
+  let timezoneAutomationId;
+  let pastOneShotId;
   try {
     // unauthenticated calls bounce; bad token bounces
     const denied = await c.call("session.list", {});
@@ -281,6 +284,14 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(init.result.protocol, 1);
     assert.equal(init.result.model, "fake-1");
     assert.ok(init.result.capabilities.methods.includes("automation.list"), "capabilities advertised");
+    for (const method of [
+      "automation.validate",
+      "automation.update",
+      "automation.run",
+      "automation.scheduler.install",
+    ]) {
+      assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
+    }
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
     for (const method of [
@@ -392,25 +403,98 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(Array.isArray(skills.result.skills), "skills.list returns an array");
     const auto = await c.call("automation.list", {});
     assert.ok(Array.isArray(auto.result.jobs) && Array.isArray(auto.result.sessions), "automation.list returns jobs + sessions");
+    assert.equal(typeof auto.result.scheduler?.installed, "boolean");
+    assert.equal(typeof auto.result.scheduler?.supported, "boolean");
     // sessions created through serve are stamped interactive → never leak into the automation timeline
     assert.equal(auto.result.sessions.some((s) => s.id === sid), false, "serve session not in automation list");
 
+    const validSchedule = await c.call("automation.validate", {
+      schedule: "0 9 * * 1-5",
+      tz: "Asia/Shanghai",
+    });
+    assert.equal(validSchedule.result.schedule, "0 9 * * 1-5");
+    assert.match(validSchedule.result.description, /cron/);
+    assert.equal(validSchedule.result.nextRuns.length, 3);
+    assert.ok(validSchedule.result.nextRuns.every((value) => Number.isFinite(value)));
+    const invalidTimezone = await c.call("automation.validate", {
+      schedule: "0 9 * * *",
+      tz: "Not/A_Timezone",
+    });
+    assert.equal(invalidTimezone.error.code, -32602);
+
+    const privateDelivery = "webhook:https://example.invalid/hooks/SECRET_PATH?token=PRIVATE_QUERY";
     const quietAutomation = await c.call("automation.add", {
       name: `quiet monitor ${Date.now()}`,
       schedule: "every 5m",
       task: "check",
       mode: "command",
-      deliver: "feishu:oc_test",
+      deliver: privateDelivery,
       deliverMode: "on-output",
       alertAfter: 2,
     });
     automationId = quietAutomation.result.id;
     assert.ok(automationId, "automation.add returns the created id");
+    const emptyToggle = await c.call("automation.toggle", { id: "", enabled: false });
+    assert.equal(emptyToggle.error.code, -32602, "an empty prefix cannot toggle the only task");
+    const emptyRun = await c.call("automation.run", { id: "" });
+    assert.equal(emptyRun.error.code, -32602, "an empty prefix cannot run the only task");
+    const emptyDelete = await c.call("automation.delete", { id: "" });
+    assert.equal(emptyDelete.error.code, -32602, "an empty prefix cannot delete the only task");
     const autoWithQuiet = await c.call("automation.list", {});
     const quietJob = autoWithQuiet.result.jobs.find((job) => job.id === automationId);
-    assert.equal(quietJob.deliver, "feishu:oc_test");
+    assert.equal("deliver" in quietJob, false, "raw delivery target never crosses into the renderer");
+    assert.deepEqual(quietJob.delivery, {
+      kind: "webhook",
+      label: "Webhook · configured",
+      mode: "on-output",
+    });
     assert.equal(quietJob.deliverMode, "on-output");
     assert.equal(quietJob.alertAfter, 2);
+    assert.equal(quietJob.scheduleSpec, "every 5m");
+    assert.equal(quietJob.task, "check");
+    assert.ok(Number.isFinite(quietJob.nextRunAt));
+    assert.doesNotMatch(JSON.stringify(autoWithQuiet.result), /SECRET_PATH|PRIVATE_QUERY|example\.invalid/);
+
+    const updatedAutomation = await c.call("automation.update", {
+      id: automationId,
+      name: "quiet monitor edited",
+      schedule: "every 10m",
+      task: "check again",
+      mode: "command",
+      deliverMode: "on-error",
+      alertAfter: 4,
+    });
+    assert.equal(updatedAutomation.result.id, automationId);
+    const autoWithUpdate = await c.call("automation.list", {});
+    const updatedJob = autoWithUpdate.result.jobs.find((job) => job.id === automationId);
+    assert.equal(updatedJob.name, "quiet monitor edited");
+    assert.equal(updatedJob.scheduleSpec, "every 10m");
+    assert.equal(updatedJob.task, "check again");
+    assert.deepEqual(updatedJob.delivery, {
+      kind: "webhook",
+      label: "Webhook · configured",
+      mode: "on-error",
+    });
+    assert.doesNotMatch(JSON.stringify(autoWithUpdate.result), /SECRET_PATH|PRIVATE_QUERY|example\.invalid/);
+
+    const clearedAutomation = await c.call("automation.update", {
+      id: automationId,
+      name: "quiet monitor edited",
+      schedule: "every 10m",
+      task: "check again",
+      mode: "command",
+      clearDeliver: true,
+      alertAfter: 4,
+    });
+    assert.equal(clearedAutomation.result.id, automationId);
+    const autoAfterClear = await c.call("automation.list", {});
+    const clearedJob = autoAfterClear.result.jobs.find((job) => job.id === automationId);
+    assert.deepEqual(clearedJob.delivery, {
+      kind: "none",
+      label: "Saved only in Hara",
+    });
+    assert.equal("deliver" in clearedJob, false);
+    assert.equal("deliverMode" in clearedJob, false);
 
     const missingDeliver = await c.call("automation.add", {
       name: "missing delivery",
@@ -427,11 +511,93 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       deliverMode: "sometimes",
     });
     assert.equal(invalidDeliverMode.error.code, -32602);
+    const missingExistingDeliver = await c.call("automation.update", {
+      id: automationId,
+      name: "quiet monitor edited",
+      schedule: "every 10m",
+      task: "check again",
+      mode: "command",
+      deliverMode: "on-error",
+    });
+    assert.equal(missingExistingDeliver.error.code, -32602);
+
+    const zonedAutomation = await c.call("automation.add", {
+      name: "Shanghai morning",
+      schedule: "0 9 * * *",
+      task: "prepare brief",
+      mode: "print",
+      tz: "Asia/Shanghai",
+    });
+    timezoneAutomationId = zonedAutomation.result.id;
+    const renamedZonedAutomation = await c.call("automation.update", {
+      id: timezoneAutomationId,
+      name: "Shanghai morning renamed",
+      schedule: "0 9 * * *",
+      task: "prepare brief",
+      mode: "print",
+    });
+    assert.equal(renamedZonedAutomation.result.id, timezoneAutomationId);
+    const zonedAfterRename = (await c.call("automation.list", {})).result.jobs.find(
+      (job) => job.id === timezoneAutomationId,
+    );
+    assert.equal(zonedAfterRename.tz, "Asia/Shanghai", "omitting tz preserves the cron timezone");
+    const clearedTimezone = await c.call("automation.update", {
+      id: timezoneAutomationId,
+      name: "Local morning",
+      schedule: "0 9 * * *",
+      task: "prepare brief",
+      mode: "print",
+      tz: "",
+    });
+    assert.equal(clearedTimezone.result.id, timezoneAutomationId);
+    const localAfterClear = (await c.call("automation.list", {})).result.jobs.find(
+      (job) => job.id === timezoneAutomationId,
+    );
+    assert.equal("tz" in localAfterClear, false, "an explicit empty tz clears the cron timezone");
+
+    const pastRunAt = Date.now() - 60_000;
+    const pastOneShot = addJob({
+      name: "Completed one-shot",
+      schedule: { kind: "once", runAt: pastRunAt, display: "once, original label" },
+      task: "already done",
+      mode: "print",
+      cwd: dir,
+      createdAt: pastRunAt - 60_000,
+      enabled: false,
+      lastRunAt: pastRunAt,
+      lastStatus: "ok",
+    });
+    pastOneShotId = pastOneShot.id;
+    const listedPastOneShot = (await c.call("automation.list", {})).result.jobs.find(
+      (job) => job.id === pastOneShotId,
+    );
+    const renamedPastOneShot = await c.call("automation.update", {
+      id: pastOneShotId,
+      name: "Completed one-shot renamed",
+      schedule: listedPastOneShot.scheduleSpec,
+      task: "already done",
+      mode: "print",
+    });
+    assert.equal(renamedPastOneShot.result.id, pastOneShotId);
+    const changedPastOneShot = await c.call("automation.update", {
+      id: pastOneShotId,
+      name: "Must stay unchanged",
+      schedule: new Date(pastRunAt - 60_000).toISOString(),
+      task: "already done",
+      mode: "print",
+    });
+    assert.equal(
+      changedPastOneShot.error.code,
+      -32602,
+      "a different past one-shot remains invalid",
+    );
 
     const listed2 = await c.call("session.list", {});
     assert.equal(listed2.result.sessions[0].source, "interactive", "session.list carries source");
   } finally {
     if (automationId) await c.call("automation.delete", { id: automationId });
+    if (timezoneAutomationId) await c.call("automation.delete", { id: timezoneAutomationId });
+    if (pastOneShotId) await c.call("automation.delete", { id: pastOneShotId });
     c.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });
@@ -1312,6 +1478,41 @@ test("serve e2e: graceful close aborts turns, closes clients, releases settled l
     await srv.close(); // repeat callers share the completed close promise
   } finally {
     await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: graceful close aborts an automation.run child and closes its persisted running state", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-close-automation-"));
+  const job = addJob({
+    name: "close-owned automation",
+    schedule: { kind: "once", runAt: Date.now() + 60_000, display: "once later" },
+    task: `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setInterval(() => {}, 1000)")}`,
+    mode: "command",
+    cwd: dir,
+    createdAt: Date.now(),
+  });
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(textProvider, memStore()),
+  );
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    void c.call("automation.run", { id: job.id });
+    const startedBy = Date.now() + 2_000;
+    while (findJob(job.id)?.lastStatus !== "running" && Date.now() < startedBy) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(findJob(job.id)?.lastStatus, "running");
+    await srv.close();
+    const settled = findJob(job.id);
+    assert.notEqual(settled?.lastStatus, "running");
+    assert.match(settled?.lastError ?? "", /interrupted|shutting down|cancellation/i);
+  } finally {
+    c.close();
+    await srv.close();
+    removeJob(job.id);
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -18,8 +18,11 @@
 //   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
 //   plugins.set       {name,enabled}              → {name,enabled}   (applies to future sessions/turns)
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}
-//   automation.list   {}                          → {jobs:[{id,name,mode,enabled,lastRunAt,lastStatus,…}],
-//                                                    sessions:[{id,title,source,sourceName,updatedAt,…}]}
+//   automation.list   {}                          → {jobs:[{id,name,mode,enabled,task,scheduleSpec,
+//                                                    delivery:{kind,label,mode?},nextRunAt?,nextRunDeferred?,…}],
+//                                                    sessions:[{id,title,source,sourceName,jobId?,updatedAt,…}],
+//                                                    scheduler:{installed,supported,platform,detail}}
+//                                                    Raw delivery targets are write-only and never returned.
 //   models.list       {sessionId?}                → {models:[…], current,profileId?,effortLevels:[…]}
 //   settings.providers.list {}                    → redacted provider catalog + current profile state
 //   settings.providers.test {provider,model,…}     → {ok,models,error?} (credential is ephemeral)
@@ -35,10 +38,16 @@
 //   settings.organizations.use {id,cwd?}             → organization state
 //   settings.organizations.remove {id,cwd?}          → organization state (local removal; no remote revoke)
 //   settings.organizations.check {id,cwd?}           → {id,ok,checkedAt}
+//   automation.validate {schedule,tz?}             → {schedule,description,nextRuns:[…]}
 //   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?}
 //                                                               → {id,name,schedule}
+//   automation.update {id,name,schedule,task,mode,cwd?,tz?,deliver?,deliverMode?,clearDeliver?,alertAfter?}
+//                                                               → {id,name,schedule,scheduleSpec}
+//                                                    Omit deliver to preserve it; clearDeliver removes it.
+//   automation.run    {id}                         → {id,ok,error?}
 //   automation.toggle {id,enabled}                → {id,enabled}
 //   automation.delete {id}                        → {id,deleted}
+//   automation.scheduler.install {}               → {scheduler:{installed,supported,platform,detail}}
 //   artifact.import   {sourcePath,title?,kind?}    → {artifact,currentRevision,content}
 //   artifact.commit   {artifactId,baseRevisionId,sourcePath,taskRunId?,changedPaths?}
 //                                                   → {artifact,currentRevision,content}

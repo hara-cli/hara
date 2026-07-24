@@ -22,14 +22,24 @@ const withEnv = (env, fn) => {
 };
 
 test("sessionSourceFromEnv: cron > gateway > interactive", () => {
-  withEnv({ HARA_CRON: "1", HARA_CRON_NAME: "晨间简报", HARA_GATEWAY: undefined }, () => {
-    assert.deepEqual(sessionSourceFromEnv(), { source: "cron", sourceName: "晨间简报" });
+  withEnv({ HARA_CRON: "1", HARA_CRON_ID: "abc123ef", HARA_CRON_NAME: "晨间简报", HARA_GATEWAY: undefined }, () => {
+    assert.deepEqual(sessionSourceFromEnv(), {
+      source: "cron",
+      sourceName: "晨间简报",
+      jobId: "abc123ef",
+    });
   });
-  withEnv({ HARA_CRON: undefined, HARA_CRON_NAME: undefined, HARA_GATEWAY: "weixin" }, () => {
+  withEnv({ HARA_CRON: undefined, HARA_CRON_ID: undefined, HARA_CRON_NAME: undefined, HARA_GATEWAY: "weixin" }, () => {
     assert.deepEqual(sessionSourceFromEnv(), { source: "gateway", sourceName: "weixin" });
   });
-  withEnv({ HARA_CRON: undefined, HARA_CRON_NAME: undefined, HARA_GATEWAY: undefined }, () => {
+  withEnv({ HARA_CRON: undefined, HARA_CRON_ID: undefined, HARA_CRON_NAME: undefined, HARA_GATEWAY: undefined }, () => {
     assert.deepEqual(sessionSourceFromEnv(), { source: "interactive" });
+  });
+});
+
+test("sessionSourceFromEnv drops an invalid cron job id instead of persisting ambient text", () => {
+  withEnv({ HARA_CRON: "1", HARA_CRON_ID: "../not-a-job", HARA_CRON_NAME: "safe", HARA_GATEWAY: undefined }, () => {
+    assert.deepEqual(sessionSourceFromEnv(), { source: "cron", sourceName: "safe" });
   });
 });
 

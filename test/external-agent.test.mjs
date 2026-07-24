@@ -1,6 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +22,49 @@ function providerWithToolUses(toolUses) {
     },
   };
 }
+
+test("external_agent re-probes a CLI installed after a miss in the same Serve process", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-external-agent-refresh-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const bin = join(root, "bin");
+  mkdirSync(home);
+  mkdirSync(project);
+  mkdirSync(bin);
+  const previous = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    PATH: process.env.PATH,
+    HARA_EXTERNAL_AGENT_TRUST: process.env.HARA_EXTERNAL_AGENT_TRUST,
+  };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  process.env.PATH = bin;
+  process.env.HARA_EXTERNAL_AGENT_TRUST = "full";
+  try {
+    const tool = getTool("external_agent");
+    assert.ok(tool);
+    const ctx = { cwd: project, sandbox: "off", ask: async () => true };
+    const missing = await tool.run({ task: "test", backend: "claude" }, ctx);
+    assert.match(missing, /not found on PATH/i);
+
+    const executable = join(bin, "claude");
+    writeFileSync(
+      executable,
+      "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf 'installed-now\\n'\n",
+      { mode: 0o700 },
+    );
+    chmodSync(executable, 0o700);
+    const installed = await tool.run({ task: "test", backend: "claude" }, ctx);
+    assert.match(installed, /installed-now/);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("buildExternalArgv: claude permission-mode maps from sandbox/trust", () => {
   const plan = buildExternalArgv("claude", "do x", { cwd: "/w", sandbox: "read-only", trust: "gated" });

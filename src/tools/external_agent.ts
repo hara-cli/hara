@@ -57,10 +57,15 @@ export function appendBoundedExternalOutput(current: string, chunk: string, limi
   return combined.slice(0, head) + marker.slice(0, limit - head - tail) + (tail ? combined.slice(-tail) : "");
 }
 
-/** Probe a CLI's availability via `<bin> --version` (cached per process). */
-const availCache = new Map<string, boolean>();
+/** Probe a CLI's availability via `<bin> --version`. Successful probes are cached only for the current PATH;
+ * misses are deliberately not cached because Desktop can install a CLI while its Serve process stays alive. */
+const availCache = new Set<string>();
 async function available(bin: string, signal?: AbortSignal): Promise<boolean> {
-  if (availCache.has(bin)) return availCache.get(bin)!;
+  // PATH can legitimately change in a long-running Serve process (for example after the user installs an
+  // agent CLI or Desktop refreshes its launch environment). A bin-only cache would keep a stale "missing"
+  // result forever and also makes concurrent isolated-path tests order-dependent.
+  const cacheKey = `${bin}\0${process.env.PATH ?? ""}`;
+  if (availCache.has(cacheKey)) return true;
   if (signal?.aborted) throw new Error("external agent interrupted before availability probe");
   const ok = await new Promise<boolean>((resolve, reject) => {
     const processGroup = platform() !== "win32";
@@ -102,7 +107,7 @@ async function available(bin: string, signal?: AbortSignal): Promise<boolean> {
     child.once("error", () => settle(false));
     child.once("close", (code) => settle(code === 0));
   });
-  availCache.set(bin, ok);
+  if (ok) availCache.add(cacheKey);
   return ok;
 }
 

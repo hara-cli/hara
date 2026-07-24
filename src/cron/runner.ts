@@ -53,6 +53,17 @@ export interface SelfInvocation {
   args: string[];
 }
 
+/** User-facing arguments for one agent-backed automation occurrence. Print jobs get a fresh durable session
+ * so Desktop can show each run independently and associate it through the HARA_CRON_ID metadata. */
+export function cronAgentArgs(
+  job: Pick<CronJob, "mode" | "task">,
+  sessionId = randomUUID(),
+): string[] {
+  return job.mode === "org"
+    ? ["org", job.task]
+    : ["-p", job.task, "--approval", "full-auto", "--resume", sessionId];
+}
+
 /** Add user-facing arguments to the runtime-aware self command. Exported separately so Node and compiled
  *  argv construction can be unit-tested without launching a second CLI. */
 export function selfInvocation(args: readonly string[]): SelfInvocation {
@@ -407,12 +418,25 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
     }
     const [cmd, argv] = shell
       ? [shell.cmd, shell.args]
-      : [self[0], [...self.slice(1), ...(job.mode === "org" ? ["org", job.task] : ["-p", job.task, "--approval", "full-auto"])]];
-    // HARA_CRON_NAME rides along so the child session's meta gets a human title ("job name · time")
-    // instead of the raw prompt (session store's automated-title strategy).
+      : [
+          self[0],
+          [
+            ...self.slice(1),
+            // Plain `hara -p` is intentionally stateless. Give every automation occurrence its own persisted
+            // session, then associate the independent run with the durable job via HARA_CRON_ID.
+            ...cronAgentArgs(job),
+          ],
+        ];
+    // The child persists both a human title and the stable job id. Desktop can then associate runs after a
+    // rename without guessing from free-form names, while the raw prompt never becomes a title.
     const env = job.mode === "command"
       ? toolSubprocessEnv(process.env, { HARA_CRON: "1" })
-      : { ...process.env, HARA_CRON: "1", HARA_CRON_NAME: job.name };
+      : {
+          ...process.env,
+          HARA_CRON: "1",
+          HARA_CRON_ID: job.id,
+          HARA_CRON_NAME: job.name,
+        };
     const processGroup = platform() !== "win32";
     if (options.signal?.aborted) {
       resolve({ ok: false, error: "interrupted before cron job start by agent run deadline or cancellation", output: "", interrupted: true });
@@ -559,7 +583,7 @@ export async function runJobTracked(job: CronJob, options: CronRunOptions = {}):
   const startedAt = Date.now();
   let runningToken: string | null;
   try {
-    runningToken = recordRunStart(job.id, startedAt);
+    runningToken = recordRunStart(job.id, startedAt, false, job.definitionRevision ?? 0);
   } catch (error) {
     return { ok: false, error: `failed to persist cron running state: ${safeRunFailure(error).error}` };
   }
@@ -878,9 +902,14 @@ export async function runTick(
       const startedAt = Date.now();
       let runningToken: string | null;
       try {
-        // Re-check enabled/existence under the store mutex. A disable/remove racing the earlier due snapshot
-        // wins cleanly and is never overwritten by this tick.
-        runningToken = recordRunStart(job.id, startedAt, true);
+        // Re-check enabled/existence/definition revision under the store mutex. A disable, remove, or edit
+        // racing the earlier due snapshot wins cleanly; stale task content is never launched.
+        runningToken = recordRunStart(
+          job.id,
+          startedAt,
+          true,
+          job.definitionRevision ?? 0,
+        );
       } catch (error) {
         stopped = `could not persist running state for ${job.id}: ${safeRunFailure(error).error}`;
         break; // fail closed: never launch a job whose running state was not durably recorded
