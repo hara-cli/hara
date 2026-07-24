@@ -62,13 +62,20 @@ test("InputBox: carries no working/mode chrome of its own (lives in App's consta
 test("InputBox accepts typed text and submits on Enter", async () => {
   let submitted = null;
   const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5", onSubmit: (v) => (submitted = v) }));
-  stdin.write("fix the null check");
-  await tick();
-  assert.ok(strip(lastFrame()).includes("fix the null check"), "typed text shows");
-  stdin.write("\r");
-  await tick();
-  assert.equal(submitted, "fix the null check", "submitted on Enter");
-  unmount();
+  try {
+    stdin.write("fix the null check");
+    await waitUntil(
+      () => strip(lastFrame()).includes("fix the null check"),
+      "typed text was not rendered",
+    );
+    stdin.write("\r");
+    await waitUntil(
+      () => submitted === "fix the null check",
+      "typed text was not submitted on Enter",
+    );
+  } finally {
+    unmount();
+  }
 });
 
 test("InputBox: Up/Down recalls submissions and restores the unsent draft", async () => {

@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.3 — 2026-07-24 — deterministic Darwin release gate
+
+- The terminal input regression now waits for Ink's committed frame and submission state instead of
+  assuming a fixed 60 ms render time. This removes the macOS Intel runner race that could fail an
+  otherwise healthy tagged release before signed standalone assets were assembled.
+- Includes the session-bound enterprise identity, live managed-model catalog refresh, and macOS cron
+  calendar fixes from 0.134.2. Upgrade with `npm i -g @nanhara/hara@0.134.3`.
+
 ## 0.134.2 — 2026-07-24 — session-bound enterprise identities
 
 - New CLI and Serve sessions persist the exact Personal or enterprise profile that owns the
