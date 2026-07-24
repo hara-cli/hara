@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.5 — 2026-07-24 — reliable Windows standalone smoke
+
+- The Windows native Serve smoke now gives authenticated initialization a bounded 15-second window
+  after discovery, matching slower baseline runners instead of assuming a five-second cold start.
+- Failure cleanup terminates and awaits the standalone process before removing its temporary profile,
+  then retries only Windows lock-related removal errors. The original startup failure remains visible
+  without an `EBUSY` cleanup exception replacing it.
+- Includes the session-bound enterprise identity, live managed-model catalog refresh, and macOS cron
+  calendar fixes from 0.134.2. Upgrade with `npm i -g @nanhara/hara@0.134.5`.
+
 ## 0.134.4 — 2026-07-24 — stable interactive Darwin gates
 
 - Confirmation and plan-selection regressions now wait for each committed Ink selection before sending

@@ -41,8 +41,40 @@ const waitFor = async (condition, timeoutMs, message) => {
   throw new Error(message);
 };
 
-const call = (ws, id, method, params) => new Promise((resolveCall, reject) => {
-  const timeout = setTimeout(() => reject(new Error(`${method} response timed out`)), 5_000);
+const waitForChildExit = (processHandle, timeoutMs) => {
+  if (processHandle.exitCode !== null || processHandle.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolveExit) => {
+    const onExit = () => {
+      clearTimeout(timeout);
+      resolveExit(true);
+    };
+    const timeout = setTimeout(() => {
+      processHandle.off("exit", onExit);
+      resolveExit(false);
+    }, timeoutMs);
+    processHandle.once("exit", onExit);
+  });
+};
+
+const removeTreeWithRetry = async (path, attempts = 5) => {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      rmSync(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const retryable = ["EBUSY", "ENOTEMPTY", "EPERM"].includes(error?.code);
+      if (!retryable || attempt === attempts) throw error;
+      await new Promise((resolveWait) => setTimeout(resolveWait, attempt * 200));
+    }
+  }
+};
+
+const call = (ws, id, method, params, timeoutMs = 15_000) => new Promise((resolveCall, reject) => {
+  const onTimeout = () => {
+    ws.off("message", onMessage);
+    reject(new Error(`${method} response timed out`));
+  };
+  const timeout = setTimeout(onTimeout, timeoutMs);
   const onMessage = (raw) => {
     let message;
     try {
@@ -106,7 +138,7 @@ try {
     } catch {
       return null;
     }
-  }, 15_000, `serve discovery timed out: ${(stderr || stdout).trim().slice(-4_000)}`);
+  }, 30_000, `serve discovery timed out: ${(stderr || stdout).trim().slice(-4_000)}`);
 
   if (
     record.version !== expectedVersion
@@ -125,7 +157,7 @@ try {
 
   ws = new WebSocket(`ws://127.0.0.1:${port}`);
   await new Promise((resolveOpen, reject) => {
-    const timeout = setTimeout(() => reject(new Error("serve WebSocket open timed out")), 5_000);
+    const timeout = setTimeout(() => reject(new Error("serve WebSocket open timed out")), 15_000);
     ws.once("open", () => {
       clearTimeout(timeout);
       resolveOpen();
@@ -143,7 +175,7 @@ try {
 
   await waitFor(
     () => child.exitCode !== null,
-    10_000,
+    15_000,
     `serve did not exit after authenticated shutdown: ${(stderr || stdout).trim().slice(-4_000)}`,
   );
   if (child.exitCode !== 0) throw new Error(`serve exited ${child.exitCode}: ${(stderr || stdout).trim().slice(-4_000)}`);
@@ -154,10 +186,28 @@ try {
   process.exitCode = 1;
 } finally {
   try {
-    ws?.close();
+    ws?.terminate();
   } catch {
     // best effort
   }
-  if (child && child.exitCode === null) child.kill();
-  rmSync(root, { recursive: true, force: true });
+  let childStopped = !child || child.exitCode !== null || child.signalCode !== null;
+  if (child && !childStopped) {
+    child.kill();
+    childStopped = await waitForChildExit(child, 10_000);
+    if (!childStopped) {
+      child.kill("SIGKILL");
+      childStopped = await waitForChildExit(child, 5_000);
+    }
+  }
+  if (!childStopped) {
+    console.error("standalone serve smoke cleanup: child did not exit; preserving its temporary directory");
+    process.exitCode = 1;
+  } else {
+    try {
+      await removeTreeWithRetry(root);
+    } catch (error) {
+      console.error(`standalone serve smoke cleanup: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  }
 }
