@@ -1,18 +1,24 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, statSync, readdirSync, truncateSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, statSync, readdirSync, truncateSync, utimesSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
+import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   acquireSessionLock,
   releaseSessionLock,
+  isGeneratedSessionId,
   newSessionId,
   shortId,
   resolveSessionId,
   saveSession,
   loadSession,
+  deleteSession,
+  ensureSessionMetadataIndex,
+  findSessionMetadataByFragment,
+  listSessionMetadataPage,
   listSessions,
   latestForCwd,
   titleFrom,
@@ -25,7 +31,10 @@ import {
 import { SessionHub } from "../dist/serve/sessions.js";
 
 test("session id is a full UUID", () => {
-  assert.match(newSessionId(), /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  const id = newSessionId();
+  assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.equal(isGeneratedSessionId(id), true);
+  assert.equal(isGeneratedSessionId("short-prefix"), false);
 });
 
 test("session ids cannot escape the private session directory", () => {
@@ -44,6 +53,1041 @@ test("deriveTitle: auto-summarizes the first message, keeps CJK, drops slash-com
   assert.equal(deriveTitle("  fix   the  null  check  "), "fix the null check"); // whitespace collapsed
   assert.equal(deriveTitle(""), ""); // blank → empty (caller falls back to short id)
   assert.ok(deriveTitle("x".repeat(80)).endsWith("…")); // long input capped
+});
+
+test("automation metadata history is cursor-paged without returning every transcript", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-page-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const dir = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const created = [];
+    for (let index = 0; index < 8; index++) {
+      const id = `paged-cron-${index}`;
+      saveSession({
+        id,
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: `run ${index}`,
+        createdAt: "2026-07-24T00:00:00.000Z",
+        updatedAt: "",
+        source: index < 6 ? "cron" : "interactive",
+        ...(index < 6 ? { sourceName: "paged job", jobId: "paged-job" } : {}),
+      }, [
+        { role: "user", content: `full transcript ${index}` },
+      ]);
+      const stamp = new Date(Date.UTC(2026, 6, 24, 0, 0, index));
+      utimesSync(join(dir, `${id}.json`), stamp, stamp);
+      if (index < 6) created.push(id);
+    }
+
+    const seen = [];
+    let cursor;
+    do {
+      const page = listSessionMetadataPage({
+        sources: ["cron"],
+        cursor,
+        limit: 2,
+      });
+      assert.ok(page.sessions.length <= 2, "one response is server-bounded");
+      seen.push(...page.sessions.map((session) => session.id));
+      cursor = page.nextCursor;
+      if (!page.hasMore) break;
+      assert.ok(cursor, "a non-terminal page has an opaque continuation cursor");
+    } while (seen.length < 20);
+    assert.deepEqual(new Set(seen), new Set(created));
+    assert.equal(seen.length, created.length, "pagination never duplicates a transcript");
+    assert.throws(
+      () => listSessionMetadataPage({ cursor: "not-a-valid-cursor" }),
+      /invalid session metadata cursor/i,
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session metadata sidecars cannot overwrite or delete a legal transcript id", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-sidecar-namespace-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const meta = (id, title) => ({
+      id,
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title,
+      createdAt: "2026-07-24T00:00:00.000Z",
+      updatedAt: "",
+    });
+
+    saveSession(meta("foo.meta", "authoritative transcript"), [
+      { role: "user", content: "history that must survive" },
+    ]);
+    saveSession(meta("foo", "neighbor session"), [
+      { role: "user", content: "neighbor history" },
+    ]);
+
+    assert.equal(loadSession("foo.meta")?.history[0]?.content, "history that must survive");
+    assert.deepEqual(
+      new Set(listSessions().map((session) => session.id)),
+      new Set(["foo.meta", "foo"]),
+    );
+    assert.equal(deleteSession("foo"), true);
+    assert.equal(
+      loadSession("foo.meta")?.history[0]?.content,
+      "history that must survive",
+      "deleting a neighboring session cannot unlink this transcript",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session metadata cursor uses one stable order when transcript mtimes are equal", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-page-ties-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const dir = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const ids = ["_a", "-a", "10", "2"];
+    const stamp = new Date(Date.now() - 1_000);
+    for (const id of ids) {
+      saveSession({
+        id,
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: id,
+        createdAt: "2026-07-24T00:00:00.000Z",
+        updatedAt: "",
+        source: "cron",
+        sourceName: "tie order",
+        jobId: "tie-order",
+      }, []);
+      utimesSync(join(dir, `${id}.json`), stamp, stamp);
+    }
+
+    const seen = [];
+    let cursor;
+    do {
+      const page = listSessionMetadataPage({ sources: ["cron"], cursor, limit: 1 });
+      seen.push(...page.sessions.map((session) => session.id));
+      cursor = page.nextCursor;
+      if (!page.hasMore) break;
+      assert.ok(cursor);
+    } while (seen.length < 10);
+
+    assert.deepEqual(
+      seen,
+      [...ids].reverse(),
+      "the append-only index has one deterministic newest-first order independent of locale collation",
+    );
+    assert.equal(new Set(seen).size, ids.length, "equal-mtime pagination skips and duplicates nothing");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a future-dated stale sidecar never overrides the authoritative transcript generation", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-sidecar-tie-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const id = "sidecar-generation-tie";
+    const meta = {
+      id,
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title: "old title",
+      createdAt: "2026-07-24T00:00:00.000Z",
+      updatedAt: "",
+      source: "cron",
+      sourceName: "sidecar test",
+      jobId: "sidecar-test",
+    };
+    saveSession(meta, [{ role: "user", content: "old transcript" }]);
+    const sessions = join(home, ".hara", "sessions");
+    const transcript = join(sessions, `${id}.json`);
+    const sidecar = join(sessions, `${id}.metadata`);
+    const staleSidecar = readFileSync(sidecar);
+
+    meta.title = "new authoritative title";
+    saveSession(meta, [{ role: "user", content: "new transcript" }]);
+    writeFileSync(sidecar, staleSidecar);
+    const transcriptStamp = new Date(Date.now() - 1_000);
+    const futureSidecarStamp = new Date(Date.now() + 86_400_000);
+    utimesSync(transcript, transcriptStamp, transcriptStamp);
+    utimesSync(sidecar, futureSidecarStamp, futureSidecarStamp);
+
+    assert.equal(listSessions().find((session) => session.id === id)?.title, "new authoritative title");
+    assert.equal(
+      listSessionMetadataPage({ sources: ["cron"], limit: 10 }).sessions
+        .find((session) => session.id === id)?.title,
+      "new authoritative title",
+      "the paged index verifies the storage generation instead of trusting a restored/future mtime",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("legacy metadata migration stays incomplete while a transcript is locked and retries after release", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-held-lock-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const indexRoot = join(home, ".hara", "session-index", "v1");
+    const project = join(home, "project");
+    const id = "legacy-held-lock";
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+      meta: {
+        id,
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: "held legacy",
+        createdAt: "2026-07-24T00:00:00.000Z",
+        updatedAt: "2026-07-24T00:00:00.000Z",
+        source: "interactive",
+      },
+      history: [],
+    }));
+    writeFileSync(join(sessions, `${id}.lock`), JSON.stringify({
+      pid: process.pid,
+      startedAt: Date.now(),
+      token: "foreign-live-session-owner",
+    }));
+
+    await ensureSessionMetadataIndex({ force: true });
+    assert.equal(
+      existsSync(join(indexRoot, "legacy-migration.complete")),
+      false,
+      "a skipped live transcript cannot be hidden behind a completion marker",
+    );
+    assert.equal(loadSession(id)?.storageGeneration, undefined);
+
+    rmSync(join(sessions, `${id}.lock`));
+    await ensureSessionMetadataIndex();
+    assert.ok(loadSession(id)?.storageGeneration, "the next ordinary call retries the skipped transcript");
+    assert.equal(existsSync(join(indexRoot, "legacy-migration.complete")), true);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a waiter reclaims a migration lock when its owner exits without publishing a marker", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-dead-wait-owner-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  let owner;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const indexRoot = join(home, ".hara", "session-index", "v1");
+    const project = join(home, "project");
+    const id = "legacy-after-owner-exit";
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(indexRoot, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+      meta: {
+        id,
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: "owner exit",
+        createdAt: "2026-07-24T00:00:00.000Z",
+        updatedAt: "2026-07-24T00:00:00.000Z",
+        source: "interactive",
+      },
+      history: [],
+    }));
+    owner = spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    assert.ok(owner.pid);
+    writeFileSync(join(indexRoot, "legacy-migration.lock"), JSON.stringify({
+      pid: owner.pid,
+      startedAt: Date.now(),
+      token: "owner-that-will-exit",
+    }));
+
+    const migration = ensureSessionMetadataIndex({ force: true });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    owner.kill();
+    await once(owner, "exit");
+    owner = undefined;
+    await Promise.race([
+      migration,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("migration waiter did not reclaim the dead owner")),
+        3_000,
+      )),
+    ]);
+    assert.ok(loadSession(id)?.storageGeneration);
+    assert.equal(existsSync(join(indexRoot, "legacy-migration.complete")), true);
+  } finally {
+    owner?.kill();
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("an unsupported extended-year transcript is isolated while healthy legacy sessions migrate", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-year-boundary-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    const writeLegacy = (id, updatedAt) => writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+      meta: {
+        id,
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: id,
+        createdAt: updatedAt,
+        updatedAt,
+        source: "interactive",
+      },
+      history: [],
+    }));
+    writeLegacy("legacy-year-10000", "+010000-01-01T00:00:00.000Z");
+    writeLegacy("legacy-healthy-year", "2026-07-24T00:00:00.000Z");
+
+    await assert.doesNotReject(ensureSessionMetadataIndex({ force: true }));
+    assert.ok(loadSession("legacy-healthy-year")?.storageGeneration);
+    assert.equal(loadSession("legacy-year-10000"), null, "unsupported timestamps never enter an index bucket");
+    assert.deepEqual(
+      listSessionMetadataPage({ sources: ["interactive"], limit: 10 }).sessions.map((meta) => meta.id),
+      ["legacy-healthy-year"],
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("legacy metadata migration is retryable and reclaims a complete dead-owner lock", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-migration-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const indexRoot = join(home, ".hara", "session-index", "v1");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(indexRoot, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(sessions, "legacy-indexed.json"), JSON.stringify({
+      meta: {
+        id: "legacy-indexed",
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: "legacy indexed session",
+        createdAt: "2026-07-23T00:00:00.000Z",
+        updatedAt: "2026-07-24T00:00:00.000Z",
+        source: "cron",
+        sourceName: "legacy cron",
+      },
+      history: [],
+    }));
+    writeFileSync(join(indexRoot, "legacy-migration.lock"), JSON.stringify({
+      pid: 2_147_483_647,
+      startedAt: Date.now() - 60_000,
+      token: "dead-migration-owner",
+    }));
+
+    await ensureSessionMetadataIndex();
+    assert.equal(
+      listSessionMetadataPage({ sources: ["cron"], limit: 10 }).sessions[0]?.id,
+      "legacy-indexed",
+    );
+    assert.equal(existsSync(join(indexRoot, "legacy-migration.complete")), true);
+    assert.equal(existsSync(join(indexRoot, "legacy-migration.lock")), false);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("legacy metadata migration rediscovers mixed-version writes and invalidates duplicate partial imports", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-mixed-writer-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const indexRoot = join(home, ".hara", "session-index", "v1");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(indexRoot, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    const writeLegacy = (id, updatedAt) => writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+      meta: {
+        id,
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: id,
+        createdAt: updatedAt,
+        updatedAt,
+        source: "cron",
+        sourceName: "mixed writer",
+        jobId: "mixed-writer",
+      },
+      history: [],
+    }));
+
+    const firstAt = "2026-07-23T10:00:00.000Z";
+    writeLegacy("legacy-before-marker", firstAt);
+    const firstBucketDir = join(indexRoot, "2026", "07", "23");
+    mkdirSync(firstBucketDir, { recursive: true });
+    const duplicate = `${JSON.stringify({
+      v: 1,
+      id: "legacy-before-marker",
+      generation: "legacy",
+      at: Date.parse(firstAt),
+    })}\n`;
+    writeFileSync(join(firstBucketDir, "10.ndjson"), duplicate + duplicate);
+
+    await ensureSessionMetadataIndex();
+    assert.ok(
+      loadSession("legacy-before-marker")?.storageGeneration,
+      "the compatibility import upgrades the authoritative transcript instead of appending another legacy record",
+    );
+
+    const afterAt = "2026-07-24T11:00:00.000Z";
+    writeLegacy("legacy-after-marker", afterAt);
+    const child = spawnSync(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      "import { ensureSessionMetadataIndex } from './dist/session/store.js'; await ensureSessionMetadataIndex();",
+    ], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.ok(loadSession("legacy-after-marker")?.storageGeneration, "a later old-writer transcript is rediscovered");
+
+    const seen = [];
+    let cursor;
+    do {
+      const page = listSessionMetadataPage({ sources: ["cron"], cursor, limit: 1 });
+      seen.push(...page.sessions.map((session) => session.id));
+      cursor = page.nextCursor;
+      if (!page.hasMore) break;
+    } while (seen.length < 10);
+    assert.deepEqual(
+      seen.sort(),
+      ["legacy-after-marker", "legacy-before-marker"],
+      "partial legacy imports cannot duplicate a session across cursor pages after conversion",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("legacy metadata migration publishes same-hour sessions in updatedAt order", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-migration-order-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    const writeLegacy = (id, updatedAt) => writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+      meta: {
+        id,
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: id,
+        createdAt: updatedAt,
+        updatedAt,
+        source: "interactive",
+      },
+      history: [],
+    }));
+    writeLegacy("migration-order-a", "2026-07-24T03:10:00.000Z");
+    writeLegacy("migration-order-b", "2026-07-24T03:20:00.000Z");
+    const enumeration = readdirSync(sessions)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => name.slice(0, -".json".length));
+    assert.equal(enumeration.length, 2);
+    // Make the first directory entry newer. An unsorted import appends it first and then incorrectly treats
+    // the second entry as newest because cursor paging reads append-only shards backwards.
+    const newerId = enumeration[0];
+    const olderId = enumeration[1];
+    writeLegacy(newerId, "2026-07-24T03:59:00.000Z");
+    writeLegacy(olderId, "2026-07-24T03:01:00.000Z");
+
+    await ensureSessionMetadataIndex();
+
+    assert.deepEqual(
+      listSessionMetadataPage({ sources: ["interactive"], limit: 2 }).sessions.map((meta) => meta.id),
+      [newerId, olderId],
+    );
+    assert.equal(latestForCwd(project)?.meta.id, newerId);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("legacy metadata migration cannot move an older session ahead of a concurrent current save", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-concurrent-migration-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    const now = new Date();
+    const hourStart = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+      now.getUTCHours(),
+    )).toISOString();
+    for (let index = 0; index < 32; index += 1) {
+      const id = `concurrent-legacy-${String(index).padStart(2, "0")}`;
+      writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+        meta: {
+          id,
+          cwd: project,
+          provider: "test",
+          model: "test",
+          title: id,
+          createdAt: hourStart,
+          updatedAt: hourStart,
+          source: "interactive",
+        },
+        history: [],
+      }));
+    }
+
+    const migration = ensureSessionMetadataIndex({ force: true });
+    await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+    saveSession({
+      id: "concurrent-current",
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title: "current save",
+      createdAt: new Date().toISOString(),
+      updatedAt: "",
+      source: "interactive",
+    }, []);
+    await migration;
+
+    assert.equal(
+      latestForCwd(project)?.meta.id,
+      "concurrent-current",
+      "the route shard stays chronological even when migration yields to a current writer",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("latestForCwd continues past a full filtered index window", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-filter-window-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const indexDir = join(home, ".hara", "session-index", "v1", "2026", "07", "24");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(indexDir, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    const updatedAt = "2026-07-24T03:30:00.000Z";
+    const writeLegacy = (id, source) => {
+      writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+        meta: {
+          id,
+          cwd: project,
+          provider: "test",
+          model: "test",
+          title: id,
+          createdAt: updatedAt,
+          updatedAt,
+          source,
+          ...(source === "cron"
+            ? { sourceName: "filter window", jobId: "filter-window" }
+            : {}),
+        },
+        history: [],
+      }));
+      return JSON.stringify({
+        v: 1,
+        id,
+        generation: "legacy",
+        at: Date.parse(updatedAt),
+      });
+    };
+    const records = [writeLegacy("interactive-behind-automation", "interactive")];
+    for (let index = 0; index < 1_001; index += 1) {
+      records.push(writeLegacy(`filtered-cron-${String(index).padStart(4, "0")}`, "cron"));
+    }
+    writeFileSync(join(indexDir, "03.ndjson"), `${records.join("\n")}\n`);
+
+    const first = listSessionMetadataPage({
+      cwd: project,
+      sources: ["interactive"],
+      limit: 1,
+    });
+    assert.deepEqual(first.sessions, []);
+    assert.equal(first.hasMore, true);
+    assert.equal(
+      latestForCwd(project)?.meta.id,
+      "interactive-behind-automation",
+      "implicit resume follows bounded cursors instead of treating a filtered page as exhaustive",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("latestForCwd is independent of more than sixteen global automation pages", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-partitioned-resume-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    saveSession({
+      id: "partitioned-interactive-target",
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title: "interactive target",
+      createdAt: new Date().toISOString(),
+      updatedAt: "",
+      source: "interactive",
+    }, []);
+    const at = Date.now();
+    const stamp = new Date(at);
+    const year = String(stamp.getUTCFullYear()).padStart(4, "0");
+    const month = String(stamp.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(stamp.getUTCDate()).padStart(2, "0");
+    const hour = String(stamp.getUTCHours()).padStart(2, "0");
+    const global = join(home, ".hara", "session-index", "v1", year, month, day, `${hour}.ndjson`);
+    const noise = [];
+    for (let index = 0; index < 16_001; index += 1) {
+      noise.push(JSON.stringify({
+        v: 1,
+        id: `partition-noise-${String(index).padStart(5, "0")}`,
+        generation: "legacy",
+        at: at + index + 1,
+      }));
+    }
+    writeFileSync(global, `${noise.join("\n")}\n`, { flag: "a" });
+
+    assert.equal(
+      latestForCwd(project)?.meta.id,
+      "partitioned-interactive-target",
+      "implicit resume uses the complete source+cwd route instead of paging unrelated global records",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a durable migration marker prevents a new CLI process from sweeping transcripts again", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-marker-fast-path-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(sessions, "marker-legacy.json"), JSON.stringify({
+      meta: {
+        id: "marker-legacy",
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: "marker",
+        createdAt: "2026-07-24T03:00:00.000Z",
+        updatedAt: "2026-07-24T03:00:00.000Z",
+        source: "interactive",
+      },
+      history: [],
+    }));
+    await ensureSessionMetadataIndex({ force: true });
+    const marker = join(home, ".hara", "session-index", "v1", "legacy-migration.complete");
+    const before = readFileSync(marker, "utf8");
+    saveSession({
+      id: "current-writer-after-marker",
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title: "current writer",
+      createdAt: "2026-07-24T03:01:00.000Z",
+      updatedAt: "",
+      source: "interactive",
+    }, []);
+    const lockedId = "locked-current-writer-after-marker";
+    assert.equal(acquireSessionLock(lockedId).ok, true);
+    saveSession({
+      id: lockedId,
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title: "locked current writer",
+      createdAt: "2026-07-24T03:02:00.000Z",
+      updatedAt: "",
+      source: "interactive",
+    }, []);
+    releaseSessionLock(lockedId);
+    const child = spawnSync(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      "import { ensureSessionMetadataIndex } from './dist/session/store.js'; await ensureSessionMetadataIndex();",
+    ], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(
+      readFileSync(marker, "utf8"),
+      before,
+      "current saves and lock lifecycle advance the trusted watermark instead of forcing another sweep",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gateway startup imports legacy history before opening the transport", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-gateway-startup-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    const id = "feishu-oc_startup-u0123456789abcdef01234567-abcdef";
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+      meta: {
+        id,
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: "legacy gateway",
+        createdAt: "2026-07-24T03:00:00.000Z",
+        updatedAt: "2026-07-24T03:00:00.000Z",
+        source: "gateway",
+        sourceName: "feishu",
+      },
+      history: [],
+    }));
+    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    delete env.HARA_FEISHU_APP_ID;
+    delete env.HARA_FEISHU_APP_SECRET;
+    const child = spawnSync(process.execPath, [
+      "dist/index.js",
+      "gateway",
+      "--platform",
+      "feishu",
+      "--cwd",
+      project,
+    ], {
+      cwd: process.cwd(),
+      env,
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 1, "the transport exits only because test credentials are intentionally absent");
+    assert.match(child.stderr, /HARA_FEISHU_APP_ID/u);
+    assert.ok(
+      loadSession(id)?.storageGeneration,
+      "legacy gateway history is migrated before transport configuration can end startup",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("gateway fragment lookup finds an owned session older than the previous 100-session window", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-gateway-fragment-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    const prefix = "feishu-oc_test-u0123456789abcdef01234567-";
+    const route = `gateway-prefix-${createHash("sha256").update(prefix).digest("hex").slice(0, 32)}`;
+    const routeDir = join(home, ".hara", "session-index", "v1", "routes", route, "2026", "07", "24");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    mkdirSync(routeDir, { recursive: true });
+    const records = [];
+    for (let index = 0; index < 101; index += 1) {
+      const id = `${prefix}abcdef${index ? `-${index}` : ""}`;
+      const updatedAt = new Date(Date.UTC(2026, 6, 24, 3, 0, index)).toISOString();
+      writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+        meta: {
+          id,
+          cwd: project,
+          provider: "test",
+          model: "test",
+          title: id,
+          createdAt: updatedAt,
+          updatedAt,
+          source: "gateway",
+          sourceName: "feishu",
+        },
+        history: [],
+      }));
+      records.push(JSON.stringify({
+        v: 1,
+        id,
+        generation: "legacy",
+        at: Date.parse(updatedAt),
+      }));
+    }
+    writeFileSync(join(routeDir, "03.ndjson"), `${records.join("\n")}\n`);
+
+    const matches = findSessionMetadataByFragment("abcdef", {
+      sources: ["gateway"],
+      sourceName: "feishu",
+      idPrefix: prefix,
+      includeArchived: true,
+    });
+    assert.deepEqual(matches.map((meta) => meta.id), [`${prefix}abcdef`]);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("metadata paging remains resumable across more empty shards than one request may inspect", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-index-empty-shards-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const indexRoot = join(home, ".hara", "session-index", "v1");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    const newest = Date.UTC(2026, 6, 24, 12);
+    for (let offset = 0; offset < 300; offset++) {
+      const date = new Date(newest - offset * 3_600_000);
+      const year = String(date.getUTCFullYear()).padStart(4, "0");
+      const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+      const day = String(date.getUTCDate()).padStart(2, "0");
+      const hour = String(date.getUTCHours()).padStart(2, "0");
+      const dir = join(indexRoot, year, month, day);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${hour}.ndjson`), "");
+    }
+
+    const oldest = new Date(newest - 300 * 3_600_000);
+    const updatedAt = oldest.toISOString();
+    writeFileSync(join(sessions, "oldest-valid.json"), JSON.stringify({
+      meta: {
+        id: "oldest-valid",
+        cwd: project,
+        provider: "test",
+        model: "test",
+        title: "oldest valid",
+        createdAt: updatedAt,
+        updatedAt,
+        source: "cron",
+        sourceName: "empty shard test",
+      },
+      history: [],
+    }));
+    const year = String(oldest.getUTCFullYear()).padStart(4, "0");
+    const month = String(oldest.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(oldest.getUTCDate()).padStart(2, "0");
+    const hour = String(oldest.getUTCHours()).padStart(2, "0");
+    const oldestDir = join(indexRoot, year, month, day);
+    mkdirSync(oldestDir, { recursive: true });
+    writeFileSync(join(oldestDir, `${hour}.ndjson`), `${JSON.stringify({
+      v: 1,
+      id: "oldest-valid",
+      generation: "legacy",
+      at: oldest.getTime(),
+    })}\n`);
+
+    const first = listSessionMetadataPage({ sources: ["cron"], limit: 1 });
+    assert.deepEqual(first.sessions, []);
+    assert.equal(first.hasMore, true);
+    assert.ok(first.nextCursor, "the shard budget yields an opaque continuation instead of hiding older data");
+    const second = listSessionMetadataPage({ sources: ["cron"], limit: 1, cursor: first.nextCursor });
+    assert.equal(second.sessions[0]?.id, "oldest-valid");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("latestForCwd ignores a newer automation occurrence", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-latest-interactive-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    saveSession({
+      id: "interactive-before-cron",
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title: "manual work",
+      createdAt: new Date().toISOString(),
+      updatedAt: "",
+      source: "interactive",
+    }, []);
+    saveSession({
+      id: "newer-cron-occurrence",
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title: "scheduled work",
+      createdAt: new Date().toISOString(),
+      updatedAt: "",
+      source: "cron",
+      sourceName: "scheduled work",
+      jobId: "scheduled-work",
+    }, []);
+
+    assert.equal(
+      latestForCwd(project)?.meta.id,
+      "interactive-before-cron",
+      "implicit continue/resume never crosses into an automation audience",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("session: corrupt / malformed files don't crash load or list (audit M4)", () => {
@@ -118,11 +1162,78 @@ test("resolveSessionId prefers an exact id and rejects ambiguous prefixes", () =
       }, []);
     }
     assert.equal(resolveSessionId(first), first, "an exact id wins even when it prefixes another id");
+    assert.equal(
+      resolveSessionId(first, { allowPrefix: false }),
+      first,
+      "exact-only resolution still finds an existing exact session",
+    );
     assert.equal(resolveSessionId("shared-prefix-l"), second, "a unique prefix resolves");
+    assert.equal(
+      resolveSessionId("shared-prefix-l", { allowPrefix: false }),
+      null,
+      "generated exact session ids can bypass historical prefix scans",
+    );
     assert.equal(resolveSessionId("shared"), null, "an ambiguous prefix fails closed");
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("every displayed eight-character id remains resolvable past 8,000 obsolete generations", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-sess-short-route-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const id = "1234abcd-0000-4000-8000-000000000001";
+    saveSession({
+      id,
+      cwd: join(home, "project"),
+      provider: "test",
+      model: "test",
+      title: "short route target",
+      createdAt: "2026-07-24T00:00:00.000Z",
+      updatedAt: "",
+      source: "interactive",
+    }, [{ role: "user", content: "short route target" }]);
+    const data = loadSession(id);
+    assert.ok(data?.storageGeneration);
+    const at = Date.parse(data.meta.updatedAt);
+    const date = new Date(at);
+    const route = `id-short-${createHash("sha256").update(id.slice(0, 8)).digest("hex").slice(0, 32)}`;
+    const routeDir = join(
+      home,
+      ".hara",
+      "session-index",
+      "v1",
+      "routes",
+      route,
+      String(date.getUTCFullYear()).padStart(4, "0"),
+      String(date.getUTCMonth() + 1).padStart(2, "0"),
+      String(date.getUTCDate()).padStart(2, "0"),
+    );
+    const shard = join(routeDir, `${String(date.getUTCHours()).padStart(2, "0")}.ndjson`);
+    const stale = JSON.stringify({
+      v: 1,
+      id,
+      generation: "00000000-0000-4000-8000-000000000002",
+      at,
+    });
+    writeFileSync(shard, `${Array(8_001).fill(stale).join("\n")}\n`, { flag: "a" });
+
+    assert.equal(
+      resolveSessionId(id.slice(0, 8)),
+      id,
+      "short-id lookup exhausts its dedicated collision route instead of stopping after eight pages",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });

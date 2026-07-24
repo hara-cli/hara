@@ -22,7 +22,16 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { cronExpressionsEqual, cronMatches, parseCron, validTz, type Schedule } from "./schedule.js";
+import {
+  cronExpressionsEqual,
+  cronMatches,
+  isDue,
+  MAX_DATE_TIMESTAMP_MS,
+  parseCron,
+  validDateTimestamp,
+  validTz,
+  type Schedule,
+} from "./schedule.js";
 import { compareProcessIdentity, defaultProcessIdentity } from "../process-identity.js";
 import { sleepSync } from "../sync-sleep.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
@@ -83,6 +92,10 @@ export interface CronJob {
   definitionRevision?: number;
   /** Last schedule/timezone definition change. Runs before this boundary belong to the old schedule. */
   scheduleUpdatedAt?: number;
+  /** Logical schedule generation, independent of wall-clock ordering. */
+  scheduleRevision?: number;
+  /** Schedule generation captured when lastRunAt was committed. */
+  lastRunScheduleRevision?: number;
   /** One explicit creation-minute occurrence waiting for the next OS tick. Disable/start clears it. */
   pendingDueAt?: number;
   lastRunAt?: number;
@@ -121,6 +134,14 @@ export type CronDeliveryUpdate =
   | { kind: "clear" };
 
 export type CronJobUpdateResult = CronJob | "running" | "missing-deliver" | undefined;
+
+/** A due cron snapshot selected by the scheduler before it attempts the atomic running-state commit. */
+export interface CronSelectedOccurrence {
+  schedule: Schedule;
+  tz?: string;
+  dueAt: number;
+  scheduleRevision?: number;
+}
 
 export class CronStoreCorruptError extends Error {
   readonly code = "HARA_CRON_STORE_CORRUPT";
@@ -437,12 +458,58 @@ function validFinite(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+/** Versions through 0.134.6 accepted any finite one-shot timestamp, including values that JavaScript could
+ * persist numerically but neither Serve nor Desktop could format. Quarantine only that known legacy shape:
+ * keep the job visible/editable/removable, disable it, and move its inert timestamp to the latest supported
+ * editable instant. New writes still pass through the strict schema below and cannot create this state. */
+function quarantineLegacyOutOfRangeOneShot(value: unknown): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return;
+  const job = value as Partial<CronJob> & Record<string, unknown>;
+  const schedule = job.schedule;
+  if (
+    !schedule
+    || typeof schedule !== "object"
+    || Array.isArray(schedule)
+    || (schedule as Partial<Schedule>).kind !== "once"
+  ) return;
+  const once = schedule as Partial<Extract<Schedule, { kind: "once" }>> & Record<string, unknown>;
+  if (
+    !validFinite(once.runAt)
+    || validDateTimestamp(once.runAt)
+    || typeof once.display !== "string"
+    || typeof job.enabled !== "boolean"
+  ) return;
+
+  job.schedule = {
+    ...once,
+    kind: "once",
+    runAt: MAX_DATE_TIMESTAMP_MS,
+    display: once.display,
+  };
+  job.enabled = false;
+  // A live/manual run may be upgrading while this migration is first observed. Disable future scheduling,
+  // but never erase the token that fences its eventual terminal write or make a concurrent second run
+  // appear safe. The unified live/dead-owner recovery path will settle that ownership.
+  if (job.lastStatus !== "running") {
+    job.lastStatus = "error";
+    delete job.runningSince;
+    delete job.runningPid;
+    delete job.runningToken;
+    delete job.lastDurationMs;
+    job.lastError =
+      "legacy one-shot timestamp is outside Hara's editable year 0000–9999 range; the job was disabled and "
+      + "quarantined at 9999-12-31. Edit its schedule or remove it before re-enabling.";
+  }
+}
+
 function validSchedule(value: unknown): value is Schedule {
   if (!value || typeof value !== "object") return false;
   const schedule = value as Partial<Schedule> & Record<string, unknown>;
   if (schedule.kind === "cron") return typeof schedule.expr === "string" && !!parseCron(schedule.expr);
   if (schedule.kind === "every") return validFinite(schedule.everyMs) && schedule.everyMs > 0 && typeof schedule.display === "string";
-  return schedule.kind === "once" && validFinite(schedule.runAt) && typeof schedule.display === "string";
+  return schedule.kind === "once"
+    && validDateTimestamp(schedule.runAt)
+    && typeof schedule.display === "string";
 }
 
 function validPendingNotification(value: unknown): value is CronPendingNotification {
@@ -491,6 +558,14 @@ function validCronJob(value: unknown): value is CronJob {
       )
     )
     && (job.scheduleUpdatedAt === undefined || validFinite(job.scheduleUpdatedAt))
+    && (
+      job.scheduleRevision === undefined
+      || (Number.isSafeInteger(job.scheduleRevision) && job.scheduleRevision >= 0)
+    )
+    && (
+      job.lastRunScheduleRevision === undefined
+      || (Number.isSafeInteger(job.lastRunScheduleRevision) && job.lastRunScheduleRevision >= 0)
+    )
     && (job.pendingDueAt === undefined || (job.schedule.kind === "cron" && validFinite(job.pendingDueAt)))
     && (job.tz === undefined || (typeof job.tz === "string" && validTz(job.tz)))
     && (job.deliver === undefined || (typeof job.deliver === "string" && job.deliver.length > 0 && job.deliver.length <= 4_096))
@@ -559,6 +634,7 @@ export function loadJobs(): CronJob[] {
   const ids = new Set<string>();
   for (let index = 0; index < parsed.length; index++) {
     const job = parsed[index];
+    quarantineLegacyOutOfRangeOneShot(job);
     if (!validCronJob(job)) {
       const detail = `entry ${index + 1} has an invalid schema`;
       recordStoreError(detail);
@@ -620,6 +696,7 @@ export function addJob(j: Omit<CronJob, "id" | "createdAt" | "enabled"> & { enab
       id: randomUUID().slice(0, 8),
       enabled,
       definitionRevision: 0,
+      scheduleRevision: 0,
     };
     delete job.pendingDueAt;
     delete job.pendingNotifications;
@@ -631,7 +708,7 @@ export function addJob(j: Omit<CronJob, "id" | "createdAt" | "enabled"> & { enab
   });
 }
 
-function schedulesEqual(left: Schedule, right: Schedule): boolean {
+export function schedulesEqual(left: Schedule, right: Schedule): boolean {
   if (left.kind !== right.kind) return false;
   if (left.kind === "cron" && right.kind === "cron") return cronExpressionsEqual(left.expr, right.expr);
   // `display` is presentation metadata and can legitimately change after parsing the same Desktop spec.
@@ -660,9 +737,12 @@ export function updateJob(
       return "missing-deliver";
     }
 
+    const dueCronBeforeEdit =
+      job.enabled
+      && job.schedule.kind === "cron"
+      && isDue(job, updatedAt);
     const scheduleChanged = !schedulesEqual(job.schedule, definition.schedule) || job.tz !== definition.tz;
     const previousDeliver = job.deliver;
-    const previousDeliverMode = job.deliverMode;
 
     job.name = definition.name;
     job.schedule = definition.schedule;
@@ -688,6 +768,7 @@ export function updateJob(
 
     if (scheduleChanged) {
       job.scheduleUpdatedAt = updatedAt;
+      job.scheduleRevision = (job.scheduleRevision ?? 0) + 1;
       delete job.pendingDueAt;
       if (
         job.enabled
@@ -696,12 +777,18 @@ export function updateJob(
       ) {
         job.pendingDueAt = updatedAt;
       }
+    } else if (dueCronBeforeEdit && job.pendingDueAt === undefined) {
+      // A scheduler may already have selected this revision as due before the edit acquired the store
+      // lock. The revision fence correctly rejects that stale snapshot; persist the same occurrence so
+      // the next tick launches the edited definition instead of silently losing the current minute.
+      job.pendingDueAt = updatedAt;
     }
     job.definitionRevision = (job.definitionRevision ?? 0) + 1;
 
-    if (job.deliver !== previousDeliver || job.deliverMode !== previousDeliverMode) {
-      // Queued notifications capture their old raw destination. An explicit delivery edit must not send
-      // them to a channel the user has just replaced or disabled.
+    if (job.deliver !== previousDeliver) {
+      // Queued notifications capture their old raw destination. Replacing or clearing that destination
+      // invalidates them and their alert cooldown. A mode-only edit controls future outcome noise; it
+      // must not discard an independent alert that is already waiting for delivery.
       delete job.pendingNotifications;
       delete job.lastAlertAt;
     }
@@ -759,6 +846,7 @@ export function recordRunStart(
   at: number,
   requireEnabled = false,
   expectedDefinitionRevision?: number,
+  selectedOccurrence?: CronSelectedOccurrence,
 ): string | null {
   return mutateJobs((jobs) => {
     const job = jobs.find((x) => x.id === id);
@@ -766,7 +854,38 @@ export function recordRunStart(
     if (
       expectedDefinitionRevision !== undefined
       && (job.definitionRevision ?? 0) !== expectedDefinitionRevision
-    ) return null;
+    ) {
+      if (
+        selectedOccurrence
+        && job.enabled
+        && job.schedule.kind === "cron"
+        && selectedOccurrence.schedule.kind === "cron"
+        && validFinite(selectedOccurrence.dueAt)
+        && schedulesEqual(job.schedule, selectedOccurrence.schedule)
+        && job.tz === selectedOccurrence.tz
+        && (
+          (
+            selectedOccurrence.scheduleRevision !== undefined
+            || job.scheduleRevision !== undefined
+          )
+            ? (selectedOccurrence.scheduleRevision ?? 0) === (job.scheduleRevision ?? 0)
+            // Legacy snapshots lack a logical revision. Preserve their old conservative wall-clock fence.
+            : job.scheduleUpdatedAt === undefined
+              || job.scheduleUpdatedAt <= selectedOccurrence.dueAt
+        )
+        && (
+          job.lastRunAt === undefined
+          || Math.floor(job.lastRunAt / 60_000) < Math.floor(selectedOccurrence.dueAt / 60_000)
+        )
+        && job.pendingDueAt === undefined
+      ) {
+        // The selected snapshot is stale, so it must not launch its old task. Preserve its occurrence in
+        // the same locked commit; the next tick will execute the current definition even when delivery
+        // draining or earlier jobs carried this attempt beyond the original matching minute.
+        job.pendingDueAt = selectedOccurrence.dueAt;
+      }
+      return null;
+    }
     // Never overwrite an unresolved attempt merely because its recorded parent PID is gone. The parent may
     // have launched a detached child before crashing, so a second manual run could duplicate file/network
     // side effects. Scheduler ticks call `recoverInterruptedRuns` first; manual callers receive a focused
@@ -794,6 +913,7 @@ export function recordRunStart(
     }
     const token = randomUUID();
     job.lastRunAt = at;
+    job.lastRunScheduleRevision = job.scheduleRevision ?? 0;
     delete job.pendingDueAt;
     job.lastStatus = "running";
     job.runningSince = at;
@@ -1033,6 +1153,21 @@ export function recoverInterruptedRuns(at: number, jobId?: string): RecoveredCro
     }
     return recovered;
   });
+}
+
+/** Shared mutation preflight for Desktop, CLI, and the cronjob tool. Live owners remain immutable; a dead
+ * owner is closed and disabled, and callers require a deliberate retry before the requested mutation. */
+export function recoverJobRunningState(
+  id: string,
+  at = Date.now(),
+): { current: CronJob | undefined; recovered: boolean } {
+  const job = findJob(id);
+  if (!job || job.lastStatus !== "running") {
+    return { current: job, recovered: false };
+  }
+  const recovered = recoverInterruptedRuns(at, job.id)
+    .some((entry) => entry.job.id === job.id);
+  return { current: findJob(job.id), recovered };
 }
 
 /** Stamp the failure-alert time (cooldown gate). */

@@ -6,10 +6,13 @@ import type { ApprovalMode } from "../config.js";
 import {
   type SessionMeta,
   type SessionData,
+  type SessionMetadataPage,
+  type SessionMetadataPageOptions,
   newSessionId,
   saveSession,
   loadSession,
   listSessions,
+  listSessionMetadataPage,
   acquireSessionLock,
   releaseSessionLock,
   deleteSession,
@@ -21,6 +24,9 @@ export interface SessionStore {
   load(id: string): SessionData | null;
   save(meta: SessionMeta, history: NeutralMsg[], task?: TaskExecution): void;
   list(cwd?: string): SessionMeta[];
+  /** Optional bounded metadata path. Real persistence provides it; small injected test stores may fall
+   * back to an in-memory page without changing their transcript semantics. */
+  listPage?(options?: SessionMetadataPageOptions): SessionMetadataPage;
   acquire(id: string): { ok: boolean; pid?: number };
   release(id: string): void;
   /** permanent removal (codex thread/delete); false = missing or held by a live other process */
@@ -32,6 +38,7 @@ export const realStore: SessionStore = {
   load: loadSession,
   save: saveSession,
   list: listSessions,
+  listPage: listSessionMetadataPage,
   acquire: acquireSessionLock,
   release: releaseSessionLock,
   delete: deleteSession,
@@ -164,6 +171,32 @@ export class SessionHub {
     return this.store.list(cwd);
   }
 
+  listPage(options: SessionMetadataPageOptions = {}): SessionMetadataPage {
+    if (this.store.listPage) return this.store.listPage(options);
+    const limit = Math.min(100, Math.max(1, Math.trunc(options.limit ?? 50)));
+    const offsetMatch = options.cursor === undefined
+      ? null
+      : /^memory:(\d{1,9})$/.exec(options.cursor);
+    if (options.cursor !== undefined && !offsetMatch) {
+      throw new Error("invalid session metadata cursor");
+    }
+    const offset = offsetMatch ? Number(offsetMatch[1]) : 0;
+    const sources = options.sources?.length ? new Set(options.sources) : undefined;
+    const filtered = this.store.list(options.cwd)
+      .filter((meta) => !sources || sources.has(meta.source ?? "interactive"))
+      .filter((meta) => options.includeArchived || !meta.archived)
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+    const sessions = filtered.slice(offset, offset + limit);
+    const nextOffset = offset + sessions.length;
+    const hasMore = nextOffset < filtered.length;
+    return {
+      sessions,
+      hasMore,
+      ...(hasMore ? { nextCursor: `memory:${nextOffset}` } : {}),
+      limit,
+    };
+  }
+
   /** Persist a session after a turn (sets a title from the first user message once). */
   save(s: ServeSession): void {
     if (!s.meta.title) {
@@ -226,7 +259,7 @@ export class SessionHub {
       cwd: src.meta.cwd,
       profileId: src.meta.profileId ?? o.profileId ?? "personal",
       provider: o.providerId,
-      model: src.meta.model,
+      model: src.meta.model || o.provider.model,
       title: src.meta.title ? `${src.meta.title} ⑂` : "",
       createdAt: new Date().toISOString(),
       updatedAt: "",

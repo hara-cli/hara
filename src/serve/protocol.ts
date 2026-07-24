@@ -7,7 +7,10 @@
 //                                                   capabilities:{methods:[…]}}  (feature detection)
 //   server.shutdown   {}                         → {accepted:true} (authenticated graceful local shutdown;
 //                                                   BUSY while any client work/approval is active)
-//   session.list      {cwd?}                     → {sessions:[{id,title,cwd,model,profileId?,updatedAt}]}
+//   session.list      {cwd?,cursor?,limit?,archived?} → {sessions:[{id,title,cwd,model,profileId?,updatedAt}],
+//                                                        page:{hasMore,limit,nextCursor?}}
+//                                                        Interactive sessions only; automation history has
+//                                                        its own cursor under automation.list.
 //   session.create    {cwd?,approval?}           → {sessionId,model,profileId}
 //   session.resume    {sessionId}                → {sessionId,model,profileId,history:[{role,text}]}
 //   session.send      {sessionId,text,images?,newTask?} → (streams events, then) {reply,usage,taskId,turnId,status?,stopReason?}
@@ -18,9 +21,10 @@
 //   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
 //   plugins.set       {name,enabled}              → {name,enabled}   (applies to future sessions/turns)
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}
-//   automation.list   {}                          → {jobs:[{id,name,mode,enabled,task,scheduleSpec,
+//   automation.list   {sessionCursor?,sessionLimit?} → {jobs:[{id,name,mode,enabled,task,scheduleSpec,
 //                                                    delivery:{kind,label,mode?},nextRunAt?,nextRunDeferred?,…}],
 //                                                    sessions:[{id,title,source,sourceName,jobId?,updatedAt,…}],
+//                                                    sessionPage:{hasMore,limit,nextCursor?},
 //                                                    scheduler:{installed,supported,platform,detail}}
 //                                                    Raw delivery targets are write-only and never returned.
 //   models.list       {sessionId?}                → {models:[…], current,profileId?,effortLevels:[…]}
@@ -38,7 +42,7 @@
 //   settings.organizations.use {id,cwd?}             → organization state
 //   settings.organizations.remove {id,cwd?}          → organization state (local removal; no remote revoke)
 //   settings.organizations.check {id,cwd?}           → {id,ok,checkedAt}
-//   automation.validate {schedule,tz?}             → {schedule,description,nextRuns:[…]}
+//   automation.validate {schedule,tz?,id?}         → {schedule,description,nextRuns:[…],nextRunDeferred?}
 //   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?}
 //                                                               → {id,name,schedule}
 //   automation.update {id,name,schedule,task,mode,cwd?,tz?,deliver?,deliverMode?,clearDeliver?,alertAfter?}

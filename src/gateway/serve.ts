@@ -7,13 +7,18 @@ import { createHash } from "node:crypto";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import { dispatchFlows, flowSourceKey } from "./flows.js";
 import { handleOwnerReply, runNoToolModel } from "./flows-pending.js";
-import { chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, toggleVoice } from "./sessions.js";
+import { chatContext, chatCd, chatSessionIdPrefix, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, toggleVoice } from "./sessions.js";
 import { plainChat } from "../cron/deliver.js";
 import { pickPaneForReply, capturePane, injectTmux, outputDelta } from "./tmux-routes.js";
 import { synthesize } from "./tts.js";
 import { cleanupTransientMedia, pruneStaleMedia } from "./media.js";
 import { selfArgv } from "../cron/runner.js";
-import { listSessions, loadSession } from "../session/store.js";
+import {
+  ensureSessionMetadataIndex,
+  findSessionMetadataByFragment,
+  recentSessionMetadata,
+  loadSession,
+} from "../session/store.js";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chmodSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync, rmSync } from "node:fs";
@@ -938,6 +943,9 @@ export function defaultWorkspace(): string {
 export async function runGateway(opts: { cwd?: string; platform?: string }): Promise<void> {
   const requestedPlatform = opts.platform || "telegram";
   const cwd = opts.cwd ?? defaultWorkspace(); // dir-free default: hara's own ~/.hara/workspace, like Hermes' ~/.hermes
+  // A user may upgrade and launch only the long-lived gateway. Import legacy transcripts before accepting
+  // `/sessions`, `/resume`, or recall commands so their old chat history is immediately addressable.
+  await ensureSessionMetadataIndex();
   const built = await buildAdapter(requestedPlatform);
   if (!built) process.exit(1);
   const { adapter, ownerId, runtimeScope } = built;
@@ -1223,11 +1231,36 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         }));
       }
       if (cmd.cmd === "sessions") {
-        const list = listSessions(ctx.cwd).filter((session) => ownsChatSession(adapter.name, m.chatId, session.id, who)).slice(0, 10).map((x) => `${x.id.slice(-18)}  ${x.title || "(untitled)"}`).join("\n");
-        return sendMessage(m.chatId, `📂 ${ctx.cwd}\n${list || "(no threads in this dir yet)"}`);
+        const idPrefix = chatSessionIdPrefix(adapter.name, m.chatId, who);
+        const list = recentSessionMetadata({
+          cwd: ctx.cwd,
+          sources: ["gateway"],
+          sourceName: adapter.name,
+          idPrefix,
+          limit: 10,
+        }).filter((session) => ownsChatSession(adapter.name, m.chatId, session.id, who))
+          .map((x) => `${x.id}  ${x.title || "(untitled)"}`)
+          .join("\n");
+        return sendMessage(
+          m.chatId,
+          `📂 ${ctx.cwd}\n${list || "(no threads in this dir yet)"}\nUse /resume <full id>; a unique displayed suffix also works.`,
+        );
       }
       if (cmd.cmd === "resume") {
-        const match = resolveOwnedSessionId(adapter.name, m.chatId, cmd.arg, listSessions().map((session) => session.id), who);
+        const exactOwned =
+          loadSession(cmd.arg)?.meta.id === cmd.arg
+          && ownsChatSession(adapter.name, m.chatId, cmd.arg, who)
+            ? [cmd.arg]
+            : [];
+        const candidates = exactOwned.length
+          ? exactOwned
+          : findSessionMetadataByFragment(cmd.arg, {
+              sources: ["gateway"],
+              sourceName: adapter.name,
+              idPrefix: chatSessionIdPrefix(adapter.name, m.chatId, who),
+              includeArchived: true,
+            }).map((session) => session.id);
+        const match = resolveOwnedSessionId(adapter.name, m.chatId, cmd.arg, candidates, who);
         if (!match) return sendMessage(m.chatId, `no session '${cmd.arg}' in this chat thread`);
         if ("ambiguous" in match) return sendMessage(m.chatId, `ambiguous session '${cmd.arg}' — use more characters`);
         const id = match.id;

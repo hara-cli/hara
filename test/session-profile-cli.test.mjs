@@ -233,13 +233,17 @@ test("real headless resume keeps its saved organization profile after the active
       "",
     ].join("\n"));
     const previousHome = process.env.HOME;
+    const previousUserProfile = process.env.USERPROFILE;
     process.env.HOME = home;
+    process.env.USERPROFILE = home;
     try {
       assert.equal(latestForCwd(project)?.meta.profileId, "flash-org");
       assert.ok(loadRoles(project, "flash-org").some((role) => role.id === "flash-auditor"));
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
+      if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = previousUserProfile;
     }
     const continued = await runCli(
       ["-p", "continue through the managed role", "--continue", "--role", "flash-auditor"],
@@ -314,7 +318,9 @@ test("a fresh named-BYOK session uses the temporary provider's default model", {
     assert.ok(request);
     assert.equal(JSON.parse(request.body).model, "qwen3", "the temporary Ollama route keeps its own default model");
 
-    const savedFiles = readdirSync(sessions).filter((name) => name.endsWith(".json"));
+    const savedFiles = readdirSync(sessions).filter(
+      (name) => name.endsWith(".json") && !name.endsWith(".meta.json"),
+    );
     assert.equal(savedFiles.length, 1);
     const saved = JSON.parse(readFileSync(join(sessions, savedFiles[0]), "utf8"));
     assert.equal(saved.meta.profileId, "work");

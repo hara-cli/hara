@@ -56,7 +56,9 @@ import {
   loadJobs,
   addJob,
   findJob,
+  recoverJobRunningState,
   removeJob,
+  schedulesEqual,
   setEnabled,
   updateJob,
   type CronDeliverMode,
@@ -67,6 +69,7 @@ import {
   parseSchedule,
   describeSchedule,
   nextRun,
+  validDateTimestamp,
   validTz,
   type Schedule,
 } from "../cron/schedule.js";
@@ -78,6 +81,7 @@ import { listPending, resolvePending } from "../gateway/flows-pending.js";
 import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from "../tools/todo.js";
 import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
+import { ensureSessionMetadataIndex } from "../session/store.js";
 import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
 import {
   taskLifecycleEvent,
@@ -570,15 +574,21 @@ function automationJobForClient(
   now: number,
   nextRunDeadline?: number,
 ): Record<string, unknown> {
-  const upcoming = nextRun(job, now, {
+  const rawUpcoming = nextRun(job, now, {
     ...(nextRunDeadline === undefined ? {} : { deadlineMs: nextRunDeadline }),
   });
+  const upcoming = validDateTimestamp(rawUpcoming) ? rawUpcoming : null;
   const nextRunDeferred =
     job.enabled
-    && job.schedule.kind === "cron"
-    && upcoming === null
-    && nextRunDeadline !== undefined
-    && Date.now() >= nextRunDeadline;
+    && (
+      (rawUpcoming !== null && upcoming === null)
+      || (
+        job.schedule.kind === "cron"
+        && rawUpcoming === null
+        && nextRunDeadline !== undefined
+        && Date.now() >= nextRunDeadline
+      )
+    );
   const taskPreview = job.task.replace(/\s+/g, " ").trim().slice(0, 180);
   return {
     id: job.id,
@@ -612,35 +622,122 @@ function automationScheduleValidation(
   schedule: Schedule,
   timezone: string | undefined,
   now: number,
-): { schedule: string; description: string; nextRuns: number[] } {
+  existing?: CronJob,
+): { schedule: string; description: string; nextRuns: number[]; nextRunDeferred?: boolean } {
+  const sameTiming =
+    existing !== undefined
+    && schedulesEqual(schedule, existing.schedule)
+    && timezone === existing.tz;
   const timing: {
     schedule: Schedule;
     createdAt: number;
+    scheduleUpdatedAt?: number;
+    scheduleRevision?: number;
+    lastRunScheduleRevision?: number;
     lastRunAt?: number;
+    pendingDueAt?: number;
     tz?: string;
   } = {
     schedule,
-    createdAt: now,
+    createdAt: sameTiming ? existing.createdAt : now,
+    ...(sameTiming && existing.scheduleUpdatedAt !== undefined
+      ? { scheduleUpdatedAt: existing.scheduleUpdatedAt }
+      : {}),
+    ...(sameTiming && existing.scheduleRevision !== undefined
+      ? { scheduleRevision: existing.scheduleRevision }
+      : {}),
+    ...(sameTiming && existing.lastRunScheduleRevision !== undefined
+      ? { lastRunScheduleRevision: existing.lastRunScheduleRevision }
+      : {}),
+    ...(sameTiming && existing.lastRunAt !== undefined
+      ? { lastRunAt: existing.lastRunAt }
+      : {}),
+    ...(sameTiming && existing.pendingDueAt !== undefined
+      ? { pendingDueAt: existing.pendingDueAt }
+      : {}),
     ...(timezone ? { tz: timezone } : {}),
   };
   const nextRuns: number[] = [];
+  const deadlineMs = Date.now() + 40;
+  let nextRunDeferred = false;
   for (let count = 0; count < 3; count++) {
-    const upcoming = nextRun(timing, count === 0 ? now : nextRuns[nextRuns.length - 1]);
-    if (upcoming === null) break;
+    const upcoming = nextRun(
+      timing,
+      count === 0 ? now : nextRuns[nextRuns.length - 1],
+      { deadlineMs },
+    );
+    if (upcoming === null) {
+      nextRunDeferred = schedule.kind === "cron" && Date.now() >= deadlineMs;
+      break;
+    }
+    if (!validDateTimestamp(upcoming)) {
+      nextRunDeferred = true;
+      break;
+    }
     nextRuns.push(upcoming);
     timing.lastRunAt = upcoming;
+    if (timing.scheduleRevision !== undefined || timing.lastRunScheduleRevision !== undefined) {
+      timing.lastRunScheduleRevision = timing.scheduleRevision ?? 0;
+    }
   }
   return {
     schedule: automationScheduleSpec(schedule),
     description: describeSchedule(schedule),
     nextRuns,
+    ...(nextRunDeferred ? { nextRunDeferred: true } : {}),
   };
+}
+
+/** Parse an automation schedule while permitting an existing completed one-shot's exact canonical
+ * timestamp to round-trip through validation/update. A different past timestamp remains invalid. */
+function automationScheduleForRequest(
+  input: string,
+  now: number,
+  existing?: CronJob,
+): ReturnType<typeof parseSchedule> {
+  const parsed = parseSchedule(input, now);
+  if (!("error" in parsed)) return parsed;
+  // 0.134.6 accepted safe-integer intervals longer than the new renderer-facing date horizon. Preserve
+  // exact list → validate/update round-trips for those existing jobs without reopening that range to adds
+  // or allowing a different oversized interval to be substituted.
+  if (
+    existing?.schedule.kind === "every"
+    && input.trim() === existing.schedule.display
+  ) {
+    return existing.schedule;
+  }
+  if (
+    existing?.schedule.kind === "once"
+    && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(input.trim())
+    && Date.parse(input.trim()) === existing.schedule.runAt
+  ) {
+    return existing.schedule;
+  }
+  return parsed;
 }
 
 export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<ServeHandle> {
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
   const hub = new SessionHub(deps.store ?? realStore);
+  // Existing pre-index transcripts are imported in yielding batches. The server can accept health/init
+  // traffic immediately; only metadata listing waits for the one-time compatibility view to be complete.
+  const sessionIndexReady = (): Promise<void> =>
+    deps.store && deps.store !== realStore
+      ? Promise.resolve()
+      : ensureSessionMetadataIndex();
+  // Start the yielding legacy import immediately, but keep the accessor retryable if another process
+  // crashes or holds the migration lock beyond one request's bounded wait.
+  void sessionIndexReady().catch(() => {});
+  const sessionIndexRefreshTimer =
+    deps.store && deps.store !== realStore
+      ? undefined
+      : setInterval(() => {
+          // Mixed-version installations can still have an older CLI/Desktop writer. Recheck in yielding
+          // batches so those sessions become visible without restarting this long-lived Serve process.
+          void ensureSessionMetadataIndex({ audit: true }).catch(() => {});
+        }, 60_000);
+  sessionIndexRefreshTimer?.unref();
   const runtimeInfo = (cwd?: string, model?: string, profileId?: string): {
     providerId: string;
     model: string;
@@ -676,7 +773,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const authed = new Set<WebSocket>();
   const pendingApprovals = new Map<string, (v: boolean | "always") => void>();
   const inFlightRequests = new Set<Promise<void>>();
-  const automationRunControllers = new Set<AbortController>();
+  const automationRuns = new Map<AbortController, ReturnType<typeof runJobTracked>>();
   // Physical provider/tool work can outlive its logical timeout. Keep a process-level ledger independent
   // of SessionHub membership so detach/delete cannot make an updater believe the old engine is quiescent.
   const activeOperations = new Set<Promise<unknown>>();
@@ -736,7 +833,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
    * turns, compaction, provider reconfiguration, and physically late provider/tool promises. */
   const hasActiveClientWork = (): boolean =>
     inFlightRequests.size > 0 ||
-    automationRunControllers.size > 0 ||
+    automationRuns.size > 0 ||
     activeOperations.size > 0 ||
     pendingApprovals.size > 0 ||
     hub.active().some((session) =>
@@ -1255,8 +1352,43 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             shutdown.unref();
             return;
           }
-          case "session.list":
-            return reply(rpcResult(id!, { sessions: hub.list(typeof p.cwd === "string" ? p.cwd : undefined).filter((m) => !m.archived || p.archived === true).map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, model: m.model, profileId: m.profileId, updatedAt: m.updatedAt, source: m.source ?? "interactive", sourceName: m.sourceName, jobId: m.jobId, archived: m.archived ?? false })) }));
+          case "session.list": {
+            if (
+              p.cursor !== undefined
+              && (typeof p.cursor !== "string" || !p.cursor)
+            ) return reply(rpcError(id, ERR.PARAMS, "cursor must be a non-empty opaque cursor"));
+            if (
+              p.limit !== undefined
+              && (!Number.isInteger(p.limit) || p.limit < 1 || p.limit > 100)
+            ) return reply(rpcError(id, ERR.PARAMS, "limit must be an integer from 1 to 100"));
+            await sessionIndexReady();
+            const page = hub.listPage({
+              sources: ["interactive"],
+              ...(typeof p.cwd === "string" && p.cwd ? { cwd: p.cwd } : {}),
+              ...(typeof p.cursor === "string" ? { cursor: p.cursor } : {}),
+              ...(typeof p.limit === "number" ? { limit: p.limit } : {}),
+              ...(p.archived === true ? { includeArchived: true } : {}),
+            });
+            return reply(rpcResult(id!, {
+              sessions: page.sessions.map((m) => ({
+                id: m.id,
+                title: m.title,
+                cwd: m.cwd,
+                model: m.model,
+                profileId: m.profileId,
+                updatedAt: m.updatedAt,
+                source: m.source ?? "interactive",
+                sourceName: m.sourceName,
+                jobId: m.jobId,
+                archived: m.archived ?? false,
+              })),
+              page: {
+                hasMore: page.hasMore,
+                limit: page.limit,
+                ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+              },
+            }));
+          }
           case "session.create": {
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const activeRuntime = runtimeInfo(cwd);
@@ -1274,8 +1406,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
             const priorMeta = hub.peekMeta(p.sessionId);
             const boundProfileId = priorMeta?.profileId ?? runtimeInfo(priorMeta?.cwd).profileId ?? "personal";
+            const resumeModel = priorMeta?.model || runtimeInfo(priorMeta?.cwd, undefined, boundProfileId).model;
             const provider = priorMeta && deps.buildProviderFor
-              ? await deps.buildProviderFor(priorMeta.model, undefined, priorMeta.cwd, boundProfileId)
+              ? await deps.buildProviderFor(resumeModel, undefined, priorMeta.cwd, boundProfileId)
               : await deps.buildSessionProvider(priorMeta?.cwd, boundProfileId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
@@ -1288,7 +1421,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.BUSY, "session identity changed while resume was starting — retry resume"));
             }
             const migratedProfileBinding = !r.session.meta.profileId;
+            const migratedRuntimeDefaults = !r.session.meta.model;
             r.session.meta.profileId = boundProfileId;
+            if (migratedRuntimeDefaults) {
+              r.session.meta.model = provider.model;
+              r.session.meta.provider = provider.id;
+            }
             r.session.configuring = true;
             let refreshed = false;
             try {
@@ -1300,7 +1438,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               hub.detach(r.session.meta.id);
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
-            if (migratedProfileBinding) hub.save(r.session);
+            if (migratedProfileBinding || migratedRuntimeDefaults) hub.save(r.session);
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
             broadcastTaskState(r.session, { phase: "restored" });
             return reply(rpcResult(id!, {
@@ -1388,14 +1526,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const sourceMeta = hub.peekMeta(p.sessionId);
             const boundProfileId = sourceMeta?.profileId ?? runtimeInfo(sourceMeta?.cwd).profileId ?? "personal";
+            const sourceModel = sourceMeta?.model || runtimeInfo(sourceMeta?.cwd, undefined, boundProfileId).model;
             const provider = sourceMeta && deps.buildProviderFor
-              ? await deps.buildProviderFor(sourceMeta.model, undefined, sourceMeta.cwd, boundProfileId)
+              ? await deps.buildProviderFor(sourceModel, undefined, sourceMeta.cwd, boundProfileId)
               : await deps.buildSessionProvider(sourceMeta?.cwd, boundProfileId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const r = hub.fork(p.sessionId, { profileId: boundProfileId, provider, providerId: provider.id, approval: deps.approval, projectContext: undefined });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "source session is mid-turn — fork after it completes"));
+            if (!r.session.meta.model) {
+              r.session.meta.model = provider.model;
+              r.session.meta.provider = provider.id;
+            }
             r.session.configuring = true;
             let refreshed = false;
             try {
@@ -1603,6 +1746,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             // automated sessions (source=cron/gateway) so the desktop can render results and "continue
             // as conversation". Raw delivery targets are deliberately excluded from this renderer-facing
             // response: webhook paths/query strings and channel ids can themselves be credentials.
+            if (
+              p.sessionCursor !== undefined
+              && (typeof p.sessionCursor !== "string" || !p.sessionCursor)
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionCursor must be a non-empty opaque cursor"));
+            }
+            if (
+              p.sessionLimit !== undefined
+              && (
+                !Number.isInteger(p.sessionLimit)
+                || p.sessionLimit < 1
+                || p.sessionLimit > 100
+              )
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionLimit must be an integer from 1 to 100"));
+            }
             const now = Date.now();
             const nextRunDeadline = Date.now() + 40;
             const jobs = loadJobs().map((job) => automationJobForClient(
@@ -1610,10 +1769,44 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               now,
               Math.min(nextRunDeadline, Date.now() + 8),
             ));
-            const automated = hub.list().filter((m) => m.source === "cron" || m.source === "gateway").map((m) => ({ id: m.id, title: m.title, cwd: m.cwd, source: m.source, sourceName: m.sourceName, jobId: m.jobId, updatedAt: m.updatedAt }));
+            let automatedPage: ReturnType<SessionHub["listPage"]>;
+            try {
+              await sessionIndexReady();
+              automatedPage = hub.listPage({
+                sources: ["cron", "gateway"],
+                ...(typeof p.sessionCursor === "string"
+                  ? { cursor: p.sessionCursor }
+                  : {}),
+                ...(typeof p.sessionLimit === "number"
+                  ? { limit: p.sessionLimit }
+                  : {}),
+              });
+            } catch (error) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                error instanceof Error ? error.message : "invalid automation history page",
+              ));
+            }
+            const automated = automatedPage.sessions.map((m) => ({
+              id: m.id,
+              title: m.title,
+              cwd: m.cwd,
+              source: m.source,
+              sourceName: m.sourceName,
+              jobId: m.jobId,
+              updatedAt: m.updatedAt,
+            }));
             return reply(rpcResult(id!, {
               jobs,
               sessions: automated,
+              sessionPage: {
+                hasMore: automatedPage.hasMore,
+                limit: automatedPage.limit,
+                ...(automatedPage.nextCursor
+                  ? { nextCursor: automatedPage.nextCursor }
+                  : {}),
+              },
               scheduler: automationSchedulerInfo(),
             }));
           }
@@ -1621,11 +1814,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.schedule !== "string" || !p.schedule.trim()) {
               return reply(rpcError(id, ERR.PARAMS, "schedule required"));
             }
+            if (p.id !== undefined && (typeof p.id !== "string" || !p.id.trim())) {
+              return reply(rpcError(id, ERR.PARAMS, "id must be a non-empty automation id"));
+            }
             if (p.tz !== undefined && typeof p.tz !== "string") {
               return reply(rpcError(id, ERR.PARAMS, "tz must be an IANA timezone name"));
             }
+            const existing = typeof p.id === "string" ? findJob(p.id) : undefined;
+            if (typeof p.id === "string" && !existing) {
+              return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+            }
             const now = Date.now();
-            const schedule = parseSchedule(p.schedule, now);
+            const schedule = automationScheduleForRequest(p.schedule, now, existing);
             if ("error" in schedule) {
               return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${schedule.error}`));
             }
@@ -1635,10 +1835,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (requestedTimezone && !validTz(requestedTimezone)) {
               return reply(rpcError(id, ERR.PARAMS, `invalid timezone "${requestedTimezone}"`));
             }
-            const timezone = schedule.kind === "cron" ? requestedTimezone : undefined;
+            const timezone = schedule.kind === "cron"
+              ? p.tz === undefined
+                ? existing?.tz
+                : requestedTimezone
+              : undefined;
             return reply(rpcResult(
               id!,
-              automationScheduleValidation(schedule, timezone, now),
+              automationScheduleValidation(schedule, timezone, now, existing),
             ));
           }
           case "tasks.list": {
@@ -1750,10 +1954,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             ) {
               return reply(rpcError(id, ERR.PARAMS, "id + name + schedule + task required"));
             }
-            const existing = findJob(p.id);
+            let existing = findJob(p.id);
             if (!existing) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
             if (existing.lastStatus === "running") {
-              return reply(rpcError(id, ERR.BUSY, `job ${existing.id} is currently running`));
+              const state = recoverJobRunningState(existing.id);
+              if (state.recovered) {
+                return reply(rpcError(
+                  id,
+                  ERR.CONFLICT,
+                  `job ${existing.id}'s previous owner exited; Hara recovered and disabled the attempt. Inspect the workspace, then retry the edit.`,
+                ));
+              }
+              existing = state.current;
+              if (!existing) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+              if (existing.lastStatus === "running") {
+                return reply(rpcError(id, ERR.BUSY, `job ${existing.id} is currently running`));
+              }
             }
             if (p.mode !== "print" && p.mode !== "org" && p.mode !== "command") {
               return reply(rpcError(id, ERR.PARAMS, "mode must be print, org, or command"));
@@ -1765,19 +1981,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.PARAMS, "tz must be an IANA timezone name"));
             }
             const now = Date.now();
-            const parsedSchedule = parseSchedule(p.schedule, now);
-            const requestedPastOneShot = existing.schedule.kind === "once"
-              && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(p.schedule.trim())
-              && Date.parse(p.schedule.trim()) === existing.schedule.runAt;
-            if ("error" in parsedSchedule && !requestedPastOneShot) {
+            const parsedSchedule = automationScheduleForRequest(p.schedule, now, existing);
+            if ("error" in parsedSchedule) {
               return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${parsedSchedule.error}`));
             }
-            // A completed one-shot's canonical scheduleSpec is necessarily in the past. Permit that exact
-            // instant to round-trip while editing unrelated fields, but keep rejecting a newly selected
-            // past instant.
-            const schedule: Schedule = requestedPastOneShot
-              ? existing.schedule
-              : parsedSchedule as Schedule;
+            const schedule: Schedule = parsedSchedule;
             const requestedTimezone = typeof p.tz === "string" && p.tz.trim()
               ? p.tz.trim()
               : undefined;
@@ -1854,18 +2062,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.id !== "string" || !p.id.trim()) {
               return reply(rpcError(id, ERR.PARAMS, "id required"));
             }
-            const job = findJob(p.id);
+            let job = findJob(p.id);
             if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
             if (job.lastStatus === "running") {
-              return reply(rpcError(id, ERR.BUSY, `job ${job.id} is already running`));
+              const state = recoverJobRunningState(job.id);
+              if (state.recovered) {
+                return reply(rpcResult(id!, {
+                  id: job.id,
+                  ok: false,
+                  error: `The previous owner exited; Hara recovered and disabled the attempt. Inspect the workspace, then run ${job.id} again explicitly.`,
+                }));
+              }
+              job = state.current;
+              if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+              if (job.lastStatus === "running") {
+                return reply(rpcError(id, ERR.BUSY, `job ${job.id} is already running`));
+              }
             }
             const controller = new AbortController();
-            automationRunControllers.add(controller);
+            const run = runJobTracked(job, { signal: controller.signal });
+            automationRuns.set(controller, run);
             let result;
             try {
-              result = await runJobTracked(job, { signal: controller.signal });
+              result = await run;
             } finally {
-              automationRunControllers.delete(controller);
+              automationRuns.delete(controller);
             }
             return reply(rpcResult(id!, {
               id: job.id,
@@ -1885,10 +2106,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }
           case "automation.delete": {
             if (typeof p.id !== "string" || !p.id.trim()) return reply(rpcError(id, ERR.PARAMS, "id required"));
-            const job = findJob(p.id);
+            let job = findJob(p.id);
             if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
             if (job.lastStatus === "running") {
-              return reply(rpcError(id, ERR.BUSY, `job ${job.id} is currently running`));
+              const state = recoverJobRunningState(job.id);
+              if (state.recovered) {
+                return reply(rpcError(
+                  id,
+                  ERR.CONFLICT,
+                  `job ${job.id}'s previous owner exited; Hara recovered and disabled the attempt. Inspect the workspace, then retry deletion.`,
+                ));
+              }
+              job = state.current;
+              if (!job) return reply(rpcError(id, ERR.PARAMS, `no job ${p.id}`));
+              if (job.lastStatus === "running") {
+                return reply(rpcError(id, ERR.BUSY, `job ${job.id} is currently running`));
+              }
             }
             if (!removeJob(job.id)) {
               const current = findJob(job.id);
@@ -2135,8 +2368,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const close = (): Promise<void> => {
     if (closePromise) return closePromise;
     closing = true; // message handlers check this before parsing, so no new work enters the hub
+    if (sessionIndexRefreshTimer) clearInterval(sessionIndexRefreshTimer);
     closePromise = (async () => {
-      const deadline = Date.now() + SHUTDOWN_GRACE_MS;
       const serverClosed = new Promise<void>((resolve) => {
         try {
           wss.close(() => resolve()); // stop accepting sockets immediately
@@ -2147,7 +2380,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
       for (const resolve of pendingApprovals.values()) resolve(false);
       pendingApprovals.clear();
-      for (const controller of automationRunControllers) {
+      const ownedAutomationRuns = [...automationRuns.entries()];
+      for (const [controller] of ownedAutomationRuns) {
         controller.abort(new Error("Hara Serve is shutting down"));
       }
       for (const session of hub.active()) session.abort?.abort();
@@ -2167,6 +2401,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
       if (!deps.quietDiscovery) await removeOwnedDiscovery(discoveryDir, discoveryPath, discovery).catch(() => {});
 
+      // `runJobTracked` bounds child cancellation and terminal persistence itself. Unlike ordinary
+      // non-cooperative provider work, a Serve-owned automation must be durable before an updater may
+      // treat close() as complete; otherwise process exit can strand a false `running` marker.
+      await Promise.allSettled(ownedAutomationRuns.map(([, run]) => run));
+
+      const deadline = Date.now() + SHUTDOWN_GRACE_MS;
       let quiet = false;
       while (Date.now() < deadline) {
         if (

@@ -2,8 +2,9 @@
 // and the model-facing cronjob tool with its recursion guard. Hermetic via $HOME.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -40,6 +41,7 @@ const {
 } = await import("../dist/cron/runner.js");
 const { parseDeliver } = await import("../dist/cron/deliver.js");
 const { defaultProcessIdentity } = await import("../dist/process-identity.js");
+const { listSessions } = await import("../dist/session/store.js");
 const { getTool } = await import("../dist/tools/registry.js");
 await import("../dist/tools/cron.js");
 const processBirthIdentityAvailable = defaultProcessIdentity(process.pid) !== null;
@@ -84,6 +86,30 @@ test("command mode: runs the task as a shell command — deterministic, exit cod
     if (previous === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
     else process.env.HARA_ALLOW_SENSITIVE_FILES = previous;
   }
+});
+
+test("print mode persists an occurrence before a missing cwd can make spawn fail", async () => {
+  const missingCwd = join(process.env.HOME, `missing-cron-cwd-${Date.now()}`);
+  const job = addJob({
+    name: "pre-spawn occurrence",
+    schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+    task: "this child must not start",
+    mode: "print",
+    cwd: missingCwd,
+    createdAt: Date.now(),
+  });
+  const before = new Set(listSessions().map((session) => session.id));
+  const result = await runJobOnce(job, { timeoutMs: 1_000 });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /ENOENT|no such file|failed to start/i);
+  const occurrence = listSessions().find(
+    (session) =>
+      !before.has(session.id)
+      && session.source === "cron"
+      && session.jobId === job.id,
+  );
+  assert.ok(occurrence, "the failed launch remains visible as a distinct automation-history occurrence");
+  assert.equal(occurrence.sourceName, job.name);
 });
 
 test("command mode turns protected-file preflight exceptions into a recorded task failure", async () => {
@@ -285,6 +311,59 @@ test("manual run refuses to overwrite an interrupted running marker and requires
     else process.env.HOME = savedHome;
     if (savedUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = savedUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("manual run retries a transient terminal-state store lock instead of leaving running behind", {
+  skip: process.platform === "win32",
+  timeout: 10_000,
+}, async () => {
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  const savedSensitiveFiles = process.env.HARA_ALLOW_SENSITIVE_FILES;
+  const home = mkdtempSync(join(tmpdir(), "hara-cron-terminal-retry-"));
+  const project = join(home, "project");
+  mkdirSync(project);
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  process.env.HARA_ALLOW_SENSITIVE_FILES = "1";
+  let blocker;
+  try {
+    const job = addJob({
+      name: "terminal retry",
+      schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+      task: "sleep 0.4",
+      mode: "command",
+      cwd: project,
+      createdAt: Date.now(),
+    });
+    blocker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 2600)"], {
+      stdio: "ignore",
+    });
+    await once(blocker, "spawn");
+    const publishBlocker = setTimeout(() => {
+      writeFileSync(
+        join(cronDir(), ".jobs.lock"),
+        JSON.stringify({ pid: blocker.pid, token: "terminal-retry-blocker" }),
+      );
+    }, 100);
+    const result = await runJobTracked(job, { timeoutMs: 5_000 });
+    clearTimeout(publishBlocker);
+    assert.equal(result.ok, true, JSON.stringify(result));
+    const terminal = findJob(job.id);
+    assert.equal(terminal.lastStatus, "ok");
+    assert.equal(terminal.runningPid, undefined);
+    assert.equal(terminal.runningToken, undefined);
+  } finally {
+    if (blocker?.exitCode === null) blocker.kill("SIGKILL");
+    if (blocker?.exitCode === null) await once(blocker, "exit");
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    if (savedSensitiveFiles === undefined) delete process.env.HARA_ALLOW_SENSITIVE_FILES;
+    else process.env.HARA_ALLOW_SENSITIVE_FILES = savedSensitiveFiles;
     rmSync(home, { recursive: true, force: true });
   }
 });
@@ -1086,6 +1165,49 @@ test("cronjob tool: add/list/remove work; cron-run sessions are refused (recursi
     /always, on-output, or on-error/,
   );
   assert.match(await tool.run({ action: "remove", id: quietId }, { cwd: process.cwd() }), /✓ removed/);
+});
+
+test("cronjob removal recovers a dead owner and requires one deliberate retry", async () => {
+  const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
+  const home = mkdtempSync(join(tmpdir(), "hara-cron-tool-remove-recovery-"));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const job = addJob({
+      name: "tool dead owner",
+      schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+      task: "x",
+      mode: "command",
+      cwd: home,
+      createdAt: Date.now(),
+    });
+    const storeUrl = new URL("../dist/cron/store.js", import.meta.url).href;
+    const child = spawnSync(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `const s=await import(${JSON.stringify(storeUrl)});if(!s.recordRunStart(${JSON.stringify(job.id)},Date.now()))process.exit(2);`,
+    ], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      encoding: "utf8",
+    });
+    assert.equal(child.status, 0, child.stderr);
+
+    const tool = getTool("cronjob");
+    const first = await tool.run({ action: "remove", id: job.id }, { cwd: home });
+    assert.match(first, /recovered and disabled.*retry removal/i);
+    assert.equal(findJob(job.id).lastStatus, "error");
+    const second = await tool.run({ action: "remove", id: job.id }, { cwd: home });
+    assert.match(second, /✓ removed/);
+    assert.equal(findJob(job.id), undefined);
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("cronjob at Home keeps management actions but refuses to persist a new Home-root job", async () => {

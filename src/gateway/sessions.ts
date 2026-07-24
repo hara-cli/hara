@@ -332,15 +332,22 @@ function deriveId(platform: string, chatId: number | string, cwd: string, fork: 
   return `${platform}-${chatId}${u}-${cwdTag(cwd)}${fork ? `-${fork}` : ""}`;
 }
 
+/** Stable index prefix for one chat actor's derived session ids. */
+export function chatSessionIdPrefix(platform: string, chatId: number | string, who?: ChatWho): string {
+  const userId = scopedUser(who);
+  const user = userId === undefined
+    ? ""
+    : `-u${createHash("sha256").update(String(userId)).digest("hex").slice(0, 24)}`;
+  return `${platform}-${chatId}${user}-`;
+}
+
 /** A gateway thread may resume/list only ids derived for its own chat identity. This blocks an allowlisted
  * operator from using `/sessions` or `/resume` to cross into another chat/user's persisted transcript. */
 export function ownsChatSession(platform: string, chatId: number | string, sessionId: string, who?: ChatWho): boolean {
   try {
-    const userId = scopedUser(who);
-    const user = userId === undefined
-      ? ""
-      : `-u${createHash("sha256").update(String(userId)).digest("hex").slice(0, 24)}`;
-    const namespace = `${platform}-${chatId}${user}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const namespace = chatSessionIdPrefix(platform, chatId, who)
+      .slice(0, -1)
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     // Anchor the complete derived-id grammar. A raw startsWith check lets chat "room" accidentally own
     // chat "room-extra"; the cwd hash + optional numeric fork make the namespace boundary unambiguous.
     return new RegExp(`^${namespace}-[a-f0-9]{6}(?:-[1-9]\\d*)?$`).test(sessionId);

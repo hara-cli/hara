@@ -151,12 +151,25 @@ registerTool({
     const task = typeof input.task === "string" ? input.task.trim() : "";
     if (!task) return "external_agent needs a non-empty `task`.";
 
-    const availability = await Promise.all(BUILTIN_BACKENDS.map((candidate) => available(candidate, ctx.signal)));
+    const requestedBackend = String(input.backend ?? "").trim();
+    if (requestedBackend && !BUILTIN_BACKENDS.includes(requestedBackend)) {
+      return `Unknown backend '${requestedBackend}'. Supported: ${BUILTIN_BACKENDS.join(", ")}.`;
+    }
+    // An explicit choice must not wait for an unrelated CLI's slow or broken `--version` command.
+    // Discovery still probes all built-ins concurrently only when the caller asks Hara to choose.
+    const candidates = requestedBackend ? [requestedBackend] : BUILTIN_BACKENDS;
+    const availability = await Promise.all(candidates.map((candidate) => available(candidate, ctx.signal)));
     if (ctx.signal?.aborted) return "[external agent] interrupted before start by agent run deadline or cancellation";
-    const installed = BUILTIN_BACKENDS.filter((_candidate, index) => availability[index]);
-    const backend = String(input.backend ?? "").trim() || installed[0] || "";
-    if (!BUILTIN_BACKENDS.includes(backend)) return `Unknown backend '${backend || "(none)"}'. Supported: ${BUILTIN_BACKENDS.join(", ")}.`;
-    if (!(await available(backend, ctx.signal))) return `'${backend}' CLI not found on PATH. Installed external agents: ${installed.join(", ") || "none"}.`;
+    const installed = candidates.filter((_candidate, index) => availability[index]);
+    const backend = requestedBackend || installed[0] || "";
+    if (!backend) return `Unknown backend '(none)'. Supported: ${BUILTIN_BACKENDS.join(", ")}.`;
+    // Misses stay uncached across calls so Desktop notices a later installation, but this invocation has
+    // already probed its candidate set. Reuse that result instead of repeating a five-second miss.
+    if (!availability[candidates.indexOf(backend)]) {
+      return requestedBackend
+        ? `'${backend}' CLI not found on PATH. Other external-agent CLIs were not probed because you explicitly selected ${backend}.`
+        : `'${backend}' CLI not found on PATH. Installed external agents: ${installed.join(", ") || "none"}.`;
+    }
     if (ctx.signal?.aborted) return "[external agent] interrupted before start by agent run deadline or cancellation";
 
     const built = buildExternalArgv(backend, task, { cwd: ctx.cwd, model: input.model ? String(input.model) : undefined, sandbox: ctx.sandbox ?? "off", trust });

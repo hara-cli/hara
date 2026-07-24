@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.134.7 — 2026-07-24 — secure Desktop automation control
+## 0.134.7 — 2026-07-25 — secure Desktop automation control
 
 - Serve automation listings now expose only a structured, redacted delivery description. Webhook
   paths, query signatures, Feishu/WeChat targets, and other write-only delivery credentials never
@@ -14,6 +14,12 @@ All notable changes to `@nanhara/hara`.
   local scheduler, and read structured schedule, next-run, status, duration, and failure metadata
   through authenticated automation RPCs. Every print-task occurrence now creates its own durable
   session with a stable job ID, so Desktop run history is complete and survives task renames. Delivery
+  history is served through bounded cursor pages backed by small redacted metadata sidecars instead of
+  reopening and returning every full transcript. Sidecars occupy a collision-free filename namespace,
+  and equal-mtime cursor pages use one locale-independent ordering for sort and continuation, so legal
+  session IDs cannot be overwritten, skipped, or duplicated. Cron-session recall also keys its audience
+  by the stable job ID, preventing same-named tasks from reading each other's history while retaining a
+  fail-closed compatibility path for two legacy runs that both predate job IDs. Delivery
   targets are preserved without being read back, replaced only when explicitly supplied, and cleared
   only by an explicit request. Editing unrelated fields preserves an existing cron timezone, while an
   explicit empty timezone still clears it; completed one-shot schedules can round-trip for metadata edits
@@ -21,16 +27,50 @@ All notable changes to `@nanhara/hara`.
 - Editing a schedule creates a fresh due boundary without discarding job identity or run history;
   stale queued delivery notifications cannot retain a replaced target, and running jobs reject
   conflicting edits or deletion. A monotonic definition fence also prevents a scheduler snapshot from
-  launching stale task content when an edit races the minute tick. Semantically equivalent cron
-  formatting does not replay the current occurrence, empty task IDs cannot resolve as prefixes, and
-  full-range day fields are also recognized as wildcard-equivalent where their effective Vixie day
-  predicate matches, and bulk next-run previews share a bounded event-loop budget.
+  launching stale task content when an edit races the minute tick, while re-queuing that current-minute
+  occurrence for the edited definition. Delivery-mode-only edits preserve already queued alerts and
+  their cooldown. Semantically equivalent cron formatting does not replay the current occurrence;
+  calendar identity compares the combined month/day predicate only across real dates (including leap day,
+  excluding impossible dates and inert months).
+  A selected occurrence remains recoverable even if the revision fence is reached after its minute ends.
+  Empty task IDs cannot resolve as prefixes, one-shot dates outside the editable ISO year 0000–9999 range
+  are rejected before persistence (including four-digit timestamps whose timezone offset resolves into
+  year 10000), and both list previews and explicit schedule validation share bounded
+  event-loop scan budgets. Older finite one-shots beyond that range are quarantined and disabled rather
+  than making the entire cron store unreadable, while an already running legacy attempt retains its owner
+  token until the shared recovery/terminal path settles it. Existing pre-0.134.7 oversized intervals remain
+  round-trippable for metadata edits without allowing new oversized definitions; renderer responses omit
+  unsupported/overflowing next-run timestamps, and validation preserves the completed state of unchanged
+  one-shots instead of falsely previewing another immediate run.
 - Graceful Serve shutdown now cancels and reaps an in-flight “run now” process tree before closing its
-  persisted attempt, rather than leaving an orphaned child and a permanent `running` marker.
+  persisted attempt, rather than leaving an orphaned child and a permanent `running` marker. Desktop
+  actions also recover and disable dead-owner markers while preserving BUSY for a live owner; a deliberate
+  retry is required before editing, running, or deleting a possibly orphaned attempt. The same recovery
+  now protects CLI and model-tool deletion, and terminal run persistence retries transient store-lock
+  contention. Serve shutdown waits for each owned automation's bounded terminal commit before returning,
+  so an updater cannot exit the process with a stranded `running` marker.
 - Test processes now receive an isolated canonical home directory before application modules load,
   preventing integration tests from reading or writing a developer's real Hara profile. External
+  profile/session fixtures also switch and restore `HOME` and Windows `USERPROFILE` together, so Windows
+  release runners read the intended isolated archive instead of the real user directory. External
   CLI availability caching follows the effective `PATH` and never caches a miss, so a tool installed
-  while Desktop remains open is detected on the next attempt.
+  while Desktop remains open is detected on the next attempt without repeating a failed probe within
+  one call; explicitly choosing Claude or Codex no longer waits for the other CLI's probe. Fresh
+  cron-session UUIDs also bypass historical prefix scans as run history grows.
+- Interactive resume, session menus, gateway threads, automation history, and cross-session search now
+  use the bounded metadata index instead of reopening every transcript. Pre-index and mixed-version
+  sessions are migrated under their normal writer locks, retain their true update order, and are visible
+  on the first ordinary interactive launch after upgrade. A durable current-writer watermark preserves
+  the normal startup fast path while a later old CLI/Desktop transcript invalidates the compatibility
+  marker and is imported by the next process or Serve audit; current generations are rejected through a
+  small verified prefix instead of reparsing entire transcripts during that audit. Filtered lookups follow
+  opaque continuation pages rather than mistaking a page full of automation records for “no manual
+  history,” while each page walks the shard hierarchy once and preserves a bounded continuation for sparse
+  history. If obsolete generations consume four complete pages, menus and `session_search` fall back once
+  to current authoritative metadata, preventing both unbounded index traversal and false “no match”
+  results. Implicit `--continue` and workspace transfer remain restricted to the latest eligible
+  interactive session, so newer Cron/gateway activity cannot hide it; Cron recall remains scoped to its
+  stable job.
 - Upgrade with `npm i -g @nanhara/hara@0.134.7`.
 
 ## 0.134.6 — 2026-07-24 — deterministic process-tree release gate

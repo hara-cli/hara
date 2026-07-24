@@ -1,11 +1,15 @@
 // Cross-session transcript recall. This is deliberately separate from curated memory_search:
 // durable memory is trusted, compact, and intentionally promoted; session_search returns bounded,
 // explicitly untrusted excerpts from prior local conversations when the user refers to an old chat.
-import { canonicalWorkspacePath } from "../context/workspace-scope.js";
 import type { NeutralMsg } from "../providers/types.js";
 import { lexicalSearchTerms } from "../recall.js";
 import { redactSensitiveText } from "../security/secrets.js";
-import { listSessions, loadSession, type SessionMeta } from "../session/store.js";
+import {
+  ensureSessionMetadataIndex,
+  loadSession,
+  recentSessionMetadata,
+  type SessionMeta,
+} from "../session/store.js";
 import { registerTool, type ToolContext } from "./registry.js";
 
 export const MAX_SESSION_SEARCH_CANDIDATES = 120;
@@ -99,7 +103,13 @@ function sameAudience(candidate: SessionMeta, current: SessionMeta | null): bool
   if (source === "gateway") {
     return !!current.gatewayOwner && candidate.gatewayOwner === current.gatewayOwner && candidate.sourceName === current.sourceName;
   }
-  return candidate.sourceName === current.sourceName;
+  // Cron task names are mutable and non-unique. New runs carry the stable job identity, so never let a
+  // same-named task cross that boundary. Only two legacy sessions that both predate jobId may fall back
+  // to their old sourceName audience.
+  if (current.jobId !== undefined || candidate.jobId !== undefined) {
+    return !!current.jobId && candidate.jobId === current.jobId;
+  }
+  return !!current.sourceName && candidate.sourceName === current.sourceName;
 }
 
 function rankText(text: string, title: string, query: string, terms: string[]): number {
@@ -145,6 +155,9 @@ export async function searchSessionHistory(
   if (query.length > 512) return "Error: session_search query is too long (maximum 512 characters).";
   const scope = scopeValue === "all" ? "all" : scopeValue === "project" ? "project" : "auto";
   const limit = Math.max(1, Math.min(10, Math.floor(Number(limitValue) || 5)));
+  // A stateless `hara -p` intentionally skips ordinary interactive startup migration. The tool itself is
+  // nevertheless an index-only public reader, so first-use legacy history must be imported here.
+  await ensureSessionMetadataIndex();
   const current = ctx.sessionId ? loadSession(ctx.sessionId) : null;
   const currentMeta = current?.meta ?? null;
   if (!currentMeta && (process.env.HARA_GATEWAY || process.env.HARA_CRON)) {
@@ -155,13 +168,51 @@ export async function searchSessionHistory(
     return "Blocked: cross-project session search is available only in an interactive Hara session.";
   }
 
-  const project = canonicalWorkspacePath(ctx.cwd);
   const terms = sessionSearchTerms(query);
-  const audience = listSessions()
-    .filter((meta) => meta.id !== ctx.sessionId)
-    .filter((meta) => sameAudience(meta, currentMeta));
-  const projectCandidates = audience.filter((meta) => canonicalWorkspacePath(meta.cwd) === project);
-  const otherCandidates = audience.filter((meta) => canonicalWorkspacePath(meta.cwd) !== project);
+  const collectAudience = (
+    candidateLimit: number,
+    workspace: { cwd?: string; excludeCwd?: string } = {},
+  ): SessionMeta[] => {
+    if (
+      (currentSource === "gateway" && (!currentMeta?.gatewayOwner || !currentMeta.sourceName))
+      || (currentSource === "cron" && !currentMeta?.jobId && !currentMeta?.sourceName)
+    ) return [];
+    const candidates = recentSessionMetadata({
+      sources: [currentSource],
+      ...workspace,
+      ...(currentSource === "gateway"
+        ? {
+            sourceName: currentMeta!.sourceName,
+            gatewayOwner: currentMeta!.gatewayOwner,
+          }
+        : {}),
+      ...(currentSource === "cron"
+        ? currentMeta?.jobId
+          ? { jobId: currentMeta.jobId }
+          : { jobId: null, sourceName: currentMeta!.sourceName }
+        : {}),
+      // Reserve one slot for the current durable session, which is excluded below.
+      limit: candidateLimit + (ctx.sessionId ? 1 : 0),
+    });
+    return candidates
+      .filter((meta) => meta.id !== ctx.sessionId && sameAudience(meta, currentMeta))
+      .slice(0, candidateLimit);
+  };
+
+  let audience: SessionMeta[] = [];
+  let projectCandidates: SessionMeta[] = [];
+  let otherCandidates: SessionMeta[] = [];
+  if (scope === "project" || (scope === "auto" && currentSource !== "interactive")) {
+    projectCandidates = collectAudience(MAX_SESSION_SEARCH_CANDIDATES, { cwd: ctx.cwd });
+  } else if (scope === "all") {
+    audience = collectAudience(MAX_SESSION_SEARCH_CANDIDATES);
+  } else {
+    projectCandidates = collectAudience(MAX_AUTO_PROJECT_CANDIDATES, { cwd: ctx.cwd });
+    otherCandidates = collectAudience(
+      MAX_SESSION_SEARCH_CANDIDATES - MAX_AUTO_PROJECT_CANDIDATES,
+      { excludeCwd: ctx.cwd },
+    );
+  }
 
   let scannedChars = 0;
   let scannedCandidates = 0;

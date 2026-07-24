@@ -9,12 +9,25 @@ export type Schedule =
   | { kind: "once"; runAt: number; display: string };
 
 const UNIT_MS: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+/** Inclusive editable ISO range. Four-digit years round-trip through both Serve and Desktop controls. */
+export const MIN_DATE_TIMESTAMP_MS = -62_167_219_200_000; // 0000-01-01T00:00:00.000Z
+export const MAX_DATE_TIMESTAMP_MS = 253_402_300_799_999; // 9999-12-31T23:59:59.999Z
+
+export function validDateTimestamp(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && value >= MIN_DATE_TIMESTAMP_MS
+    && value <= MAX_DATE_TIMESTAMP_MS;
+}
 
 /** "45s" | "30m" | "2h" | "1d" → milliseconds, or null. */
 export function durationToMs(s: string): number | null {
   const m = /^(\d+)\s*([smhd])$/.exec(s.trim());
   if (!m) return null;
-  return Number(m[1]) * UNIT_MS[m[2]];
+  const milliseconds = Number(m[1]) * UNIT_MS[m[2]];
+  return Number.isSafeInteger(milliseconds) && milliseconds <= MAX_DATE_TIMESTAMP_MS
+    ? milliseconds
+    : null;
 }
 
 interface CronFields {
@@ -86,11 +99,24 @@ function cronDayPredicate(fields: CronFields, dom: number, dow: number): boolean
   return fields.domStar ? dowOk : domOk;
 }
 
-function sameCronDayPredicate(left: CronFields, right: CronFields): boolean {
-  for (let dom = 1; dom <= 31; dom++) {
-    for (let dow = 0; dow <= 6; dow++) {
-      if (cronDayPredicate(left, dom, dow) !== cronDayPredicate(right, dom, dow)) {
-        return false;
+// The largest day-of-month that can exist in each month. February includes 29 because the semantic
+// comparison must remain correct in leap years; impossible dates such as February 30/31 must not make
+// two schedules look different when they match every real calendar instant.
+const MAX_POSSIBLE_DOM_BY_MONTH = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
+
+function sameCronCalendarPredicate(left: CronFields, right: CronFields): boolean {
+  // Compare the combined month + Vixie DOM/DOW predicate. A month present only on one side can still be
+  // semantically inert (for example February in `31 1,2 *`), so comparing month sets independently would
+  // replay an occurrence after a formatting-only edit. Across the Gregorian cycle each real
+  // (month, day-of-month) occurs on every weekday, making this truth table exact.
+  for (let month = 1; month <= 12; month++) {
+    for (let dom = 1; dom <= MAX_POSSIBLE_DOM_BY_MONTH[month]; dom++) {
+      for (let dow = 0; dow <= 6; dow++) {
+        const leftMatches = left.mon.has(month) && cronDayPredicate(left, dom, dow);
+        const rightMatches = right.mon.has(month) && cronDayPredicate(right, dom, dow);
+        if (leftMatches !== rightMatches) {
+          return false;
+        }
       }
     }
   }
@@ -105,8 +131,7 @@ export function cronExpressionsEqual(left: string, right: string): boolean {
   return !!a && !!b
     && sameNumberSet(a.m, b.m)
     && sameNumberSet(a.h, b.h)
-    && sameNumberSet(a.mon, b.mon)
-    && sameCronDayPredicate(a, b);
+    && sameCronCalendarPredicate(a, b);
 }
 
 /** Offset (ms) of IANA zone `tz` from UTC at instant `atMs`. Cached per (tz, hour) — offsets only move
@@ -176,12 +201,19 @@ export function parseSchedule(input: string, nowMs: number): Schedule | { error:
   if (m) {
     const ms = durationToMs(m[1]);
     if (!ms) return { error: `bad delay: ${m[1]}` };
-    return { kind: "once", runAt: nowMs + ms, display: `once, in ${m[1].replace(/\s+/g, "")}` };
+    const runAt = nowMs + ms;
+    if (!validDateTimestamp(runAt)) {
+      return { error: `delay is outside the supported date range: ${m[1]}` };
+    }
+    return { kind: "once", runAt, display: `once, in ${m[1].replace(/\s+/g, "")}` };
   }
   if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s)) {
     const t = Date.parse(s);
     if (Number.isNaN(t)) return { error: `bad timestamp: ${s}` };
     if (t <= nowMs) return { error: `timestamp is in the past: ${s}` };
+    if (!validDateTimestamp(t)) {
+      return { error: `timestamp is outside the supported year 0000–9999 range: ${s}` };
+    }
     return { kind: "once", runAt: t, display: `once, at ${s}` };
   }
   if (parseCron(s)) return { kind: "cron", expr: s };
@@ -198,10 +230,25 @@ interface JobTiming {
   /** Definition change boundary. A run before this instant belongs to the previous schedule and must not
    * suppress the first occurrence of the edited one. */
   scheduleUpdatedAt?: number;
+  /** Logical schedule generation. Unlike wall time, this remains ordered across equal timestamps and clock
+   * rollback. Legacy jobs omit both revision fields and use scheduleUpdatedAt as a compatibility fallback. */
+  scheduleRevision?: number;
+  lastRunScheduleRevision?: number;
   lastRunAt?: number;
   /** Explicit one-shot catch-up for a cron job created after this minute's OS tick. */
   pendingDueAt?: number;
   tz?: string;
+}
+
+function lastRunBelongsToCurrentSchedule(job: JobTiming): boolean {
+  if (job.lastRunAt === undefined) return false;
+  if (
+    job.scheduleRevision !== undefined
+    || job.lastRunScheduleRevision !== undefined
+  ) {
+    return (job.lastRunScheduleRevision ?? 0) === (job.scheduleRevision ?? 0);
+  }
+  return job.scheduleUpdatedAt === undefined || job.lastRunAt >= job.scheduleUpdatedAt;
 }
 
 /** Is this job due to run at `nowMs`? Cron jobs fire once per matching minute (deduped via lastRunAt);
@@ -215,14 +262,13 @@ export function isDue(job: JobTiming, nowMs: number): boolean {
     if (
       job.pendingDueAt !== undefined
       && job.pendingDueAt <= nowMs
-      && (job.lastRunAt === undefined || job.lastRunAt < job.pendingDueAt)
+      && (
+        !lastRunBelongsToCurrentSchedule(job)
+        || job.lastRunAt! < job.pendingDueAt
+      )
     ) return true;
     if (cronMatches(s.expr, new Date(nowMs), job.tz)) {
-      const lastRunAt =
-        job.lastRunAt !== undefined
-        && (job.scheduleUpdatedAt === undefined || job.lastRunAt >= job.scheduleUpdatedAt)
-          ? job.lastRunAt
-          : undefined;
+      const lastRunAt = lastRunBelongsToCurrentSchedule(job) ? job.lastRunAt : undefined;
       return lastRunAt === undefined || Math.floor(lastRunAt / 60_000) < Math.floor(nowMs / 60_000);
     }
     return false;
@@ -231,12 +277,12 @@ export function isDue(job: JobTiming, nowMs: number): boolean {
   // slot (a plain `now >= last+everyMs` deadline loses ~half the fires of `every 1m` at 60s tick granularity).
   if (s.kind === "every") {
     const scheduleAnchor = job.scheduleUpdatedAt ?? job.createdAt;
-    const runAnchor = job.lastRunAt === undefined ? scheduleAnchor : Math.max(scheduleAnchor, job.lastRunAt);
+    const runAnchor = lastRunBelongsToCurrentSchedule(job)
+      ? Math.max(scheduleAnchor, job.lastRunAt!)
+      : scheduleAnchor;
     return Math.floor(nowMs / s.everyMs) > Math.floor(runAnchor / s.everyMs);
   }
-  const completed =
-    job.lastRunAt !== undefined
-    && (job.scheduleUpdatedAt === undefined || job.lastRunAt >= job.scheduleUpdatedAt);
+  const completed = lastRunBelongsToCurrentSchedule(job);
   return !completed && nowMs >= s.runAt; // once
 }
 
@@ -252,9 +298,7 @@ export function nextRun(job: JobTiming, fromMs: number, options: NextRunOptions 
   const s = job.schedule;
   if (s.kind === "every") return (Math.floor(fromMs / s.everyMs) + 1) * s.everyMs; // next grid boundary (always > fromMs)
   if (s.kind === "once") {
-    const completed =
-      job.lastRunAt !== undefined
-      && (job.scheduleUpdatedAt === undefined || job.lastRunAt >= job.scheduleUpdatedAt);
+    const completed = lastRunBelongsToCurrentSchedule(job);
     if (completed) return null;
     return s.runAt <= fromMs ? fromMs : s.runAt;
   }

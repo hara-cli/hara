@@ -135,7 +135,16 @@ import {
 } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun, validTz } from "./cron/schedule.js";
 import { parseDeliver } from "./cron/deliver.js";
-import { addJob, removeJob, setEnabled, resolveJob, loadJobs, logPath, type CronJob } from "./cron/store.js";
+import {
+  addJob,
+  recoverJobRunningState,
+  removeJob,
+  setEnabled,
+  resolveJob,
+  loadJobs,
+  logPath,
+  type CronJob,
+} from "./cron/store.js";
 import { runTick, runJobTracked, runSelfAttached, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools, type Tool, type ToolContext } from "./tools/registry.js";
@@ -189,6 +198,7 @@ import { collectRepoChunksAsync, collectDirChunksAsync, buildIndex, indexPath, i
 import { searchHybrid } from "./search/hybrid.js";
 import { expandMentionsAsync, fileCandidates, isSlashCommand, inlineLeadingPath } from "./context/mentions.js";
 import {
+  isGeneratedSessionId,
   newSessionId,
   shortId,
   resolveSessionId,
@@ -198,10 +208,13 @@ import {
   loadSession,
   acquireSessionLock,
   releaseSessionLock,
-  listSessions,
+  ensureSessionMetadataIndex,
+  findSessionMetadataByPrefix,
+  recentSessionMetadata,
   latestForCwd,
   titleFrom,
   sessionSourceFromEnv,
+  gatewayOwnerFromSessionId,
   automatedTitle,
   slugify,
   type SessionMeta,
@@ -1776,8 +1789,9 @@ program
 program
   .command("sessions")
   .description("list saved sessions")
-  .action(() => {
-    const metas = listSessions();
+  .action(async () => {
+    await ensureSessionMetadataIndex();
+    const metas = recentSessionMetadata({ sources: ["interactive"], limit: 100 });
     if (!metas.length) {
       out(c.dim("No sessions yet.\n"));
       return;
@@ -1786,6 +1800,7 @@ program
       out(`${c.bold(shortId(m.id))}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${c.dim(m.provider + ":" + m.model)}  ${m.title || c.dim("(untitled)")}\n`);
       out(`          ${c.dim(displaySessionCwd(m.cwd))}\n`);
     }
+    if (metas.length === 100) out(c.dim("(showing the 100 most recent interactive sessions)\n"));
     out(c.dim("\nResume:  hara resume <id>\n"));
   });
 
@@ -1793,6 +1808,7 @@ program
   .command("resume [id]")
   .description("resume a session in its saved project — no id resumes the most recent here")
   .action(async (id?: string) => {
+    await ensureSessionMetadataIndex();
     const target = resolveSessionResumeTarget(id, process.cwd());
     if (!target.ok) {
       if (target.reason === "not-found") {
@@ -2863,7 +2879,8 @@ program
   .command("export [session]")
   .description("export a session to a Markdown transcript (default: the latest in this directory)")
   .option("--out <file>", "write to a file instead of stdout")
-  .action((sessionArg: string | undefined, opts: { out?: string }) => {
+  .action(async (sessionArg: string | undefined, opts: { out?: string }) => {
+    await ensureSessionMetadataIndex();
     const data = sessionArg ? (() => { const id = resolveSessionId(sessionArg); return id ? loadSession(id) : null; })() : latestForCwd(process.cwd());
     if (!data) return void out(c.red(sessionArg ? `No session matching '${sessionArg}'.\n` : "No session for this directory — pass an id (see `hara sessions`).\n"));
     const md = renderSessionMarkdown(data);
@@ -3135,7 +3152,22 @@ cronCmd
   .description("delete a job (by id or unique prefix)")
   .action((id: string) => {
     const j = cronResolve(id);
-    if (j) out(removeJob(j.id) ? c.green(`✓ removed ${j.id}\n`) : c.red("no such job\n"));
+    if (!j) return;
+    const state = recoverJobRunningState(j.id);
+    if (state.recovered) {
+      out(c.yellow(
+        `Recovered and disabled interrupted run ${j.id}; an orphaned child may still exist. `
+        + "Inspect the process/workspace, then run the remove command again.\n",
+      ));
+      return;
+    }
+    if (state.current?.lastStatus === "running") {
+      out(c.yellow(`Job ${j.id} is still owned by a live Hara process; wait for it to finish before removal.\n`));
+      return;
+    }
+    out(removeJob(j.id)
+      ? c.green(`✓ removed ${j.id}\n`)
+      : c.red("job changed concurrently; retry removal\n"));
   });
 cronCmd.command("enable <id>").description("enable a job").action((id: string) => {
   const j = cronResolve(id);
@@ -3274,8 +3306,9 @@ program
     }
     let tail: string | undefined;
     if (o.session) {
-      const { listSessions, loadSession } = await import("./session/store.js");
-      const metas = listSessions();
+      const { ensureSessionMetadataIndex, recentSessionMetadata, loadSession } = await import("./session/store.js");
+      await ensureSessionMetadataIndex();
+      const metas = recentSessionMetadata({ sources: ["interactive"], limit: 1 });
       const last = metas[0] ? loadSession(metas[0].id) : null;
       if (last) {
         tail = last.history
@@ -3578,6 +3611,11 @@ config
 
 // default action (interactive REPL / one-shot)
 program.action(async (opts) => {
+  if (
+    (!opts.print || opts.continue || opts.resume)
+    && process.env.HARA_CRON !== "1"
+    && !process.env.HARA_GATEWAY
+  ) await ensureSessionMetadataIndex();
   let startupWorkspaceTransferId: string | undefined;
   // Identity-profile selection (--profile flag) is now handled by the program-level preAction
   // hook above — see setFlagOverride() + resolveActive() in profile.ts. activeId() / loadActiveProfile()
@@ -3596,8 +3634,8 @@ program.action(async (opts) => {
   ) {
     let candidate: string | undefined;
     try {
-      const recent = listSessions()
-        .filter((session) => session.source === undefined || session.source === "interactive")
+      await ensureSessionMetadataIndex();
+      const recent = recentSessionMetadata({ sources: ["interactive"], limit: 100 })
         .map((session) => session.cwd);
       candidate = suggestedProjectWorkspace(recent);
       if (!candidate) {
@@ -3950,6 +3988,7 @@ program.action(async (opts) => {
     let meta: SessionMeta | null = null;
     let continuationSession = false;
     let task: TaskExecution | undefined;
+    let requiresAudienceBindingSave = false;
     const history: NeutralMsg[] = [];
     if (opts.resume || opts.continue) {
       const resumeArg = opts.resume ? String(opts.resume) : undefined;
@@ -3958,10 +3997,19 @@ program.action(async (opts) => {
         process.exitCode = 2;
         return;
       }
-      const resolvedResume = resumeArg ? resolveSessionId(resumeArg) : null;
-      if (resumeArg && !resolvedResume) {
-        const prefixMatches = listSessions().filter((session) => session.id.startsWith(resumeArg));
-        if (prefixMatches.length > 1) {
+      // Cron print runs receive a freshly generated full UUID. It is an exact new-session identity, not a
+      // user-entered prefix; scanning and parsing every historical transcript would make recurring jobs
+      // progressively slower as their run history grows.
+      const exactGeneratedCronSession =
+        process.env.HARA_CRON === "1"
+        && !!resumeArg
+        && isGeneratedSessionId(resumeArg);
+      const resolvedResume = resumeArg
+        ? resolveSessionId(resumeArg, { allowPrefix: !exactGeneratedCronSession })
+        : null;
+      if (resumeArg && !resolvedResume && !exactGeneratedCronSession) {
+        const prefixMatches = findSessionMetadataByPrefix(resumeArg);
+        if (prefixMatches.sessions.length > 1 || !prefixMatches.exhaustive) {
           process.stderr.write(`hara: session prefix '${resumeArg}' is ambiguous; use more characters.\n`);
           process.exitCode = 2;
           return;
@@ -4030,6 +4078,27 @@ program.action(async (opts) => {
             }
           : { source: "interactive" as const }),
       };
+      requiresAudienceBindingSave = !prior;
+      if (src.source === "gateway") {
+        const gatewayOwner = gatewayOwnerFromSessionId(rid, src.sourceName ?? "");
+        if (meta.source !== "gateway") {
+          meta.source = "gateway";
+          requiresAudienceBindingSave = true;
+        }
+        if (meta.sourceName !== src.sourceName) {
+          meta.sourceName = src.sourceName;
+          requiresAudienceBindingSave = true;
+        }
+        if (gatewayOwner && meta.gatewayOwner !== gatewayOwner) {
+          meta.gatewayOwner = gatewayOwner;
+          requiresAudienceBindingSave = true;
+        }
+      } else if (src.source === "cron" && src.jobId && meta.jobId !== src.jobId) {
+        meta.source = "cron";
+        meta.sourceName = src.sourceName;
+        meta.jobId = src.jobId;
+        requiresAudienceBindingSave = true;
+      }
       meta.profileId = authoritativeProfileId;
       // Checklist continuity remains in meta; execution identity is restored independently in top-level
       // SessionData.task so transcript/interaction changes cannot silently replace the active objective.
@@ -4097,6 +4166,12 @@ program.action(async (opts) => {
     // Let the agent actually SEE them — attached inline for a vision-capable main model, else described via the
     // visionModel sidecar and folded into the message (text-only models can't take image blocks).
     const printText = String(opts.print);
+    if (meta && requiresAudienceBindingSave) {
+      // Automated recall must first be able to reload the exact durable audience identity. This is especially
+      // important for a brand-new gateway thread: without the pre-prompt snapshot, session_search correctly
+      // fails closed because no persisted owner exists yet.
+      saveSession(meta, history, task);
+    }
     const automaticRecall = meta
       ? await automaticSessionRecall(printText, { cwd, sessionId: meta.id })
       : "";
@@ -4600,7 +4675,7 @@ program.action(async (opts) => {
       desc: "switch to a saved session: /resume <id>",
       run: (a) => {
         if (!a.trim()) {
-          const ms = listSessions().slice(0, 12);
+          const ms = recentSessionMetadata({ sources: ["interactive"], limit: 12 });
           if (!ms.length) return void out(c.dim("No sessions yet.\n"));
           for (const m of ms) {
             out(`  ${shortId(m.id)}  ${c.dim(displaySessionCwd(m.cwd))}  ${m.title || "(untitled)"}\n`);
@@ -4781,7 +4856,7 @@ program.action(async (opts) => {
       name: "sessions",
       desc: "list saved sessions",
       run: () => {
-        const ms = listSessions();
+        const ms = recentSessionMetadata({ sources: ["interactive"], limit: 100 });
         if (!ms.length) return void out(c.dim("No sessions yet.\n"));
         for (const m of ms) out(`  ${shortId(m.id)}  ${c.dim(m.updatedAt.slice(0, 16).replace("T", " "))}  ${c.dim(displaySessionCwd(m.cwd))}  ${m.title || "(untitled)"}\n`);
       },
@@ -5198,7 +5273,7 @@ program.action(async (opts) => {
           }
           if (nm === "resume") {
             if (!arg) {
-              const ms = listSessions().slice(0, 12);
+              const ms = recentSessionMetadata({ sources: ["interactive"], limit: 12 });
               return void h.sink.notice(ms.length
                 ? "Saved sessions — /resume <id>:\n" + ms.map((m) => `  ${shortId(m.id)}  ${displaySessionCwd(m.cwd)}  ${m.title || "(untitled)"}`).join("\n")
                 : "No sessions yet.");
@@ -5398,7 +5473,7 @@ program.action(async (opts) => {
             return void h.sink.notice(summary ? `(compacted — kept ${meta.workingSet?.length ?? 0} working-memory notes)` : "(nothing to compact / compact failed)");
           }
           if (nm === "sessions") {
-            const ms = listSessions();
+            const ms = recentSessionMetadata({ sources: ["interactive"], limit: 12 });
             return void h.sink.notice(
               ms.length ? ms.slice(0, 12).map((m) => `  ${shortId(m.id)}  ${m.updatedAt.slice(0, 16).replace("T", " ")}  ${displaySessionCwd(m.cwd)}  ${m.title || "(untitled)"}`).join("\n") : "No sessions yet.",
             );

@@ -57,7 +57,11 @@ test("direct --cwd continuity only offers a recent interactive source-directory 
     );
 
     seedSession(realpathSync.native(sourceCwd), { source: "gateway" });
-    assert.equal(recentWorkspaceTransferCandidate(sourceCwd, targetCwd), null, "automated threads are never migrated into the interactive CLI");
+    assert.equal(
+      recentWorkspaceTransferCandidate(sourceCwd, targetCwd)?.meta.id,
+      source.meta.id,
+      "newer automated activity does not hide the latest eligible interactive thread",
+    );
     seedSession(realpathSync.native(sourceCwd), { history: [] });
     assert.equal(recentWorkspaceTransferCandidate(sourceCwd, targetCwd), null, "an empty latest session has no context to carry");
   } finally {

@@ -5,7 +5,14 @@
 // Recursion guard (hermes's rule): a session SPAWNED BY a cron job runs with HARA_CRON=1 and is
 // refused here — a scheduled task must never schedule more tasks, or one bad prompt snowballs.
 import { registerTool } from "./registry.js";
-import { addJob, loadJobs, resolveJob, removeJob, setEnabled } from "../cron/store.js";
+import {
+  addJob,
+  loadJobs,
+  recoverJobRunningState,
+  resolveJob,
+  removeJob,
+  setEnabled,
+} from "../cron/store.js";
 import { parseSchedule, describeSchedule, nextRun, validTz } from "../cron/schedule.js";
 import { runJobTracked } from "../cron/runner.js";
 import { parseDeliver } from "../cron/deliver.js";
@@ -145,7 +152,19 @@ registerTool({
     try { j = resolveJob(idArg); } catch (error) { return `Error: ${error instanceof Error ? error.message : String(error)}`; }
     if (j === "ambiguous") return `Error: id "${idArg}" matches multiple jobs — use more characters.`;
     if (!j) return `Error: no job matching "${idArg}".`;
-    if (action === "remove") return removeJob(j.id) ? `✓ removed ${j.id} (${j.name})` : "Error: remove failed.";
+    if (action === "remove") {
+      const state = recoverJobRunningState(j.id);
+      if (state.recovered) {
+        return (
+          `Error: recovered and disabled interrupted run ${j.id}; an orphaned child may still exist. `
+          + "Inspect the process/workspace, then retry removal explicitly."
+        );
+      }
+      if (state.current?.lastStatus === "running") {
+        return `Error: ${j.id} is still owned by a live Hara process; wait for it to finish before removal.`;
+      }
+      return removeJob(j.id) ? `✓ removed ${j.id} (${j.name})` : "Error: remove failed because the job changed concurrently.";
+    }
     if (action === "enable" || action === "disable") {
       setEnabled(j.id, action === "enable");
       return `✓ ${j.id} ${action}d`;

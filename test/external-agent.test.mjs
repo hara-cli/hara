@@ -1,6 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,18 +45,60 @@ test("external_agent re-probes a CLI installed after a miss in the same Serve pr
     const tool = getTool("external_agent");
     assert.ok(tool);
     const ctx = { cwd: project, sandbox: "off", ask: async () => true };
+    const unrelatedExecutable = join(bin, "codex");
+    const installedCodexWasProbed = join(home, "installed-codex-was-probed");
+    writeFileSync(
+      unrelatedExecutable,
+      `#!/bin/sh\nprintf 'x' > ${JSON.stringify(installedCodexWasProbed)}\nexit 0\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(unrelatedExecutable, 0o700);
     const missing = await tool.run({ task: "test", backend: "claude" }, ctx);
     assert.match(missing, /not found on PATH/i);
+    assert.match(missing, /other external-agent CLIs were not probed/i);
+    assert.doesNotMatch(missing, /installed external agents: none/i);
+    assert.equal(
+      existsSync(installedCodexWasProbed),
+      false,
+      "a missing explicit Claude selection neither probes nor misreports an installed Codex CLI",
+    );
 
     const executable = join(bin, "claude");
+    const probes = join(home, "failed-probes");
+    writeFileSync(
+      executable,
+      `#!/bin/sh\nprintf 'x' >> ${JSON.stringify(probes)}\nexit 1\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(executable, 0o700);
+    const unavailable = await tool.run({ task: "test", backend: "claude" }, ctx);
+    assert.match(unavailable, /not found on PATH/i);
+    assert.equal(
+      readFileSync(probes, "utf8"),
+      "x",
+      "one invocation reuses its first failed probe instead of waiting for a duplicate",
+    );
+
     writeFileSync(
       executable,
       "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf 'installed-now\\n'\n",
       { mode: 0o700 },
     );
     chmodSync(executable, 0o700);
+    const unrelatedProbe = join(home, "codex-was-probed");
+    writeFileSync(
+      unrelatedExecutable,
+      `#!/bin/sh\nprintf 'x' > ${JSON.stringify(unrelatedProbe)}\n/bin/sleep 10\n`,
+      { mode: 0o700 },
+    );
+    chmodSync(unrelatedExecutable, 0o700);
     const installed = await tool.run({ task: "test", backend: "claude" }, ctx);
     assert.match(installed, /installed-now/);
+    assert.equal(
+      existsSync(unrelatedProbe),
+      false,
+      "an explicit Claude run never waits for or starts an unrelated Codex probe",
+    );
   } finally {
     for (const [name, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[name];
@@ -109,20 +151,32 @@ test("external_agent output stop still force-kills a quiet SIGTERM-resistant gra
   const bin = mkdtempSync(join(tmpdir(), "hara-external-agent-bin-"));
   const pidFile = join(bin, "grandchild.pid");
   const fake = join(bin, "claude");
+  const fakeAgent = join(bin, "fake-claude.cjs");
   const previousPath = process.env.PATH;
   const previousPidFile = process.env.HARA_EXTERNAL_TEST_PID_FILE;
   const previousTrust = process.env.HARA_EXTERNAL_AGENT_TRUST;
   let grandchildPid;
   try {
-    writeFileSync(fake, `#!/usr/bin/env node
+    // Keep the availability probe a cheap shell builtin. In the complete parallel suite, cold-starting
+    // another Node runtime merely to answer `--version` can exceed the product's intentional 5s probe cap.
+    writeFileSync(fakeAgent, `
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
-if (process.argv[2] === "--version") { console.log("fake-claude 1"); process.exit(0); }
 const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: "ignore" });
 fs.writeFileSync(process.env.HARA_EXTERNAL_TEST_PID_FILE, String(child.pid));
 process.stdout.write("x".repeat(4 * 1024 * 1024 + 1024));
 setInterval(() => {}, 1000);
 `);
+    writeFileSync(
+      fake,
+      `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf 'fake-claude 1\\n'
+  exit 0
+fi
+exec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgent)} "$@"
+`,
+    );
     chmodSync(fake, 0o755);
     process.env.PATH = `${bin}:${previousPath ?? ""}`;
     process.env.HARA_EXTERNAL_TEST_PID_FILE = pidFile;

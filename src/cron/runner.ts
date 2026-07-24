@@ -27,6 +27,11 @@ import { shellCommand } from "../sandbox.js";
 import { sensitiveShellCommandReason } from "../security/sensitive-files.js";
 import { createToolOutputLineRedactor, redactToolSubprocessOutput, terminateSubprocessTree, toolSubprocessEnv } from "../security/subprocess-env.js";
 import { compareProcessIdentity, defaultProcessIdentity } from "../process-identity.js";
+import {
+  automatedTitle,
+  saveSession,
+  type SessionMeta,
+} from "../session/store.js";
 
 /** Jobs that are enabled AND due at `nowMs` (pure — for the tick and for testing). */
 export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
@@ -57,11 +62,35 @@ export interface SelfInvocation {
  * so Desktop can show each run independently and associate it through the HARA_CRON_ID metadata. */
 export function cronAgentArgs(
   job: Pick<CronJob, "mode" | "task">,
-  sessionId = randomUUID(),
+  sessionId: string = randomUUID(),
 ): string[] {
   return job.mode === "org"
     ? ["org", job.task]
     : ["-p", job.task, "--approval", "full-auto", "--resume", sessionId];
+}
+
+/** Persist the automation identity before cwd/provider/profile/spawn work can fail. The empty model/provider
+ * deliberately tell the child to resolve the current bound profile defaults; a successful child replaces
+ * them under the session lock, while an early failure still remains visible in Desktop run history. */
+export function persistPrintAutomationOccurrence(
+  job: Pick<CronJob, "id" | "name" | "cwd">,
+  sessionId = randomUUID(),
+  at = new Date(),
+): string {
+  const meta: SessionMeta = {
+    id: sessionId,
+    cwd: job.cwd,
+    provider: "",
+    model: "",
+    title: automatedTitle("cron", job.name, at),
+    createdAt: at.toISOString(),
+    updatedAt: "",
+    source: "cron",
+    sourceName: job.name,
+    jobId: job.id,
+  };
+  saveSession(meta, []);
+  return sessionId;
 }
 
 /** Add user-facing arguments to the runtime-aware self command. Exported separately so Node and compiled
@@ -110,6 +139,8 @@ const DEFAULT_RUN_LOG_BYTES = 1_000_000;
 const TERMINATE_GRACE_MS = 2_000;
 const ABORT_SETTLE_MS = 750;
 const FINAL_DELIVERY_TIMEOUT_MS = 5_000;
+const FINAL_STATE_PERSIST_TIMEOUT_MS = 35_000;
+const FINAL_STATE_RETRY_DELAY_MS = 50;
 
 function configuredTimeoutMs(
   explicit: number | undefined,
@@ -377,6 +408,18 @@ function capLog(log: string): void {
 /** Run one job's task in a fresh hara process (full-auto, no prompts), appending output to its log.
  *  Exported so `hara cron run <id>` can fire a job on demand, ignoring its schedule. */
 export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<CronRunResult> {
+  let occurrenceSessionId: string | undefined;
+  if (job.mode === "print") {
+    try {
+      occurrenceSessionId = persistPrintAutomationOccurrence(job);
+    } catch (error) {
+      return Promise.resolve({
+        ok: false,
+        error: `failed to persist automation occurrence: ${redactToolSubprocessOutput(error instanceof Error ? error.message : String(error))}`,
+        output: "",
+      });
+    }
+  }
   if (options.signal?.aborted) {
     return Promise.resolve({ ok: false, error: "interrupted before cron job start by agent run deadline or cancellation", output: "", interrupted: true });
   }
@@ -424,7 +467,7 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
             ...self.slice(1),
             // Plain `hara -p` is intentionally stateless. Give every automation occurrence its own persisted
             // session, then associate the independent run with the durable job via HARA_CRON_ID.
-            ...cronAgentArgs(job),
+            ...cronAgentArgs(job, occurrenceSessionId),
           ],
         ];
     // The child persists both a human title and the stable job id. Desktop can then associate runs after a
@@ -578,6 +621,43 @@ function safeRunFailure(error: unknown): CronRunResult {
   };
 }
 
+async function persistTerminalRun(
+  job: CronJob,
+  finishedAt: number,
+  result: CronRunResult,
+  startedAt: number,
+  runningToken: string,
+  delivery?: CronDeliveryOutcome,
+): Promise<{ recorded: boolean; error?: string }> {
+  const deadline = Date.now() + FINAL_STATE_PERSIST_TIMEOUT_MS;
+  let lastError = "cron job store remained unavailable";
+  do {
+    try {
+      return {
+        recorded: recordRun(
+          job.id,
+          finishedAt,
+          terminalStatus(result),
+          result.error,
+          finishedAt - startedAt,
+          runningToken,
+          delivery,
+        ),
+      };
+    } catch (error) {
+      lastError = safeRunFailure(error).error ?? lastError;
+      if (Date.now() >= deadline) break;
+      await new Promise<void>((resolveRetry) => {
+        setTimeout(resolveRetry, FINAL_STATE_RETRY_DELAY_MS);
+      });
+    }
+  } while (Date.now() < deadline);
+  return {
+    recorded: false,
+    error: `failed to persist cron terminal state after bounded retries: ${lastError}`,
+  };
+}
+
 /** Manual-run lifecycle wrapper: persistence happens before the child starts and is always closed out. */
 export async function runJobTracked(job: CronJob, options: CronRunOptions = {}): Promise<CronRunResult> {
   const startedAt = Date.now();
@@ -630,7 +710,22 @@ export async function runJobTracked(job: CronJob, options: CronRunOptions = {}):
     result = safeRunFailure(error);
   }
   const finishedAt = Date.now();
-  recordRun(job.id, finishedAt, terminalStatus(result), result.error, finishedAt - startedAt, runningToken);
+  const persisted = await persistTerminalRun(
+    job,
+    finishedAt,
+    result,
+    startedAt,
+    runningToken,
+  );
+  if (persisted.error) {
+    return {
+      ok: false,
+      error: `${result.error ? `${result.error}; ` : ""}${persisted.error}`,
+      output: result.output,
+      ...(result.timedOut ? { timedOut: true } : {}),
+      ...(result.interrupted ? { interrupted: true } : {}),
+    };
+  }
   return result;
 }
 
@@ -909,6 +1004,14 @@ export async function runTick(
           startedAt,
           true,
           job.definitionRevision ?? 0,
+          {
+            schedule: job.schedule,
+            ...(job.tz ? { tz: job.tz } : {}),
+            dueAt: nowMs,
+            ...(job.scheduleRevision === undefined
+              ? {}
+              : { scheduleRevision: job.scheduleRevision }),
+          },
         );
       } catch (error) {
         stopped = `could not persist running state for ${job.id}: ${safeRunFailure(error).error}`;
@@ -918,8 +1021,20 @@ export async function runTick(
       const bounded = await runOneWithinTick(job, run, jobTimeoutMs, tickTimeoutMs, tickSignal, tickDeadline.signal);
       const r = bounded.result;
       const finishedAt = Date.now();
-      const recorded = recordRun(job.id, finishedAt, terminalStatus(r), r.error, finishedAt - startedAt, runningToken, r);
+      const terminal = await persistTerminalRun(
+        job,
+        finishedAt,
+        r,
+        startedAt,
+        runningToken,
+        r,
+      );
       ran.push(job.id);
+      if (terminal.error) {
+        stopped = `${job.id} finished but ${terminal.error}`;
+        break;
+      }
+      const recorded = terminal.recorded;
       // Even the total watchdog/caller cancellation must produce the promised visible failure alert. Give
       // that final delivery its own small hard boundary instead of skipping it or extending the tick forever.
       const deliverySignal = tickSignal.aborted ? AbortSignal.timeout(FINAL_DELIVERY_TIMEOUT_MS) : tickSignal;

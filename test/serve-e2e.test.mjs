@@ -4,13 +4,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
 import { historyForClient, startServe } from "../dist/serve/server.js";
-import { addJob, findJob, removeJob } from "../dist/cron/store.js";
+import { addJob, cronDir, findJob, loadJobs, removeJob, saveJobs } from "../dist/cron/store.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
 
@@ -274,6 +275,9 @@ test("serve e2e: auth gate → create → send streams text events and returns t
   let automationId;
   let timezoneAutomationId;
   let pastOneShotId;
+  let legacyIntervalId;
+  let unchangedCronId;
+  let pendingCronId;
   try {
     // unauthenticated calls bounce; bad token bounces
     const denied = await c.call("session.list", {});
@@ -403,10 +407,45 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(Array.isArray(skills.result.skills), "skills.list returns an array");
     const auto = await c.call("automation.list", {});
     assert.ok(Array.isArray(auto.result.jobs) && Array.isArray(auto.result.sessions), "automation.list returns jobs + sessions");
+    assert.equal(auto.result.sessionPage.hasMore, false);
+    assert.equal(auto.result.sessionPage.limit, 50);
     assert.equal(typeof auto.result.scheduler?.installed, "boolean");
     assert.equal(typeof auto.result.scheduler?.supported, "boolean");
     // sessions created through serve are stamped interactive → never leak into the automation timeline
     assert.equal(auto.result.sessions.some((s) => s.id === sid), false, "serve session not in automation list");
+    for (let index = 0; index < 55; index++) {
+      store.save({
+        id: `automation-history-${String(index).padStart(2, "0")}`,
+        cwd: dir,
+        provider: "fake",
+        model: "fake-1",
+        title: `automation run ${index}`,
+        createdAt: new Date(Date.UTC(2026, 6, 24, 0, 0, index)).toISOString(),
+        updatedAt: new Date(Date.UTC(2026, 6, 24, 0, 0, index)).toISOString(),
+        source: "cron",
+        sourceName: "paged automation",
+        jobId: "paged-automation",
+      }, []);
+    }
+    const firstHistoryPage = await c.call("automation.list", { sessionLimit: 20 });
+    assert.equal(firstHistoryPage.result.sessions.length, 20);
+    assert.equal(firstHistoryPage.result.sessionPage.hasMore, true);
+    assert.ok(firstHistoryPage.result.sessionPage.nextCursor);
+    const secondHistoryPage = await c.call("automation.list", {
+      sessionLimit: 20,
+      sessionCursor: firstHistoryPage.result.sessionPage.nextCursor,
+    });
+    assert.equal(secondHistoryPage.result.sessions.length, 20);
+    assert.equal(
+      firstHistoryPage.result.sessions.some((first) =>
+        secondHistoryPage.result.sessions.some((second) => second.id === first.id)),
+      false,
+      "automation history pages do not repeat sessions",
+    );
+    const badHistoryCursor = await c.call("automation.list", {
+      sessionCursor: "forged-cursor",
+    });
+    assert.equal(badHistoryCursor.error.code, -32602);
 
     const validSchedule = await c.call("automation.validate", {
       schedule: "0 9 * * 1-5",
@@ -416,6 +455,127 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.match(validSchedule.result.description, /cron/);
     assert.equal(validSchedule.result.nextRuns.length, 3);
     assert.ok(validSchedule.result.nextRuns.every((value) => Number.isFinite(value)));
+    const unchangedCronLastRunAt = Date.now();
+    const unchangedCron = addJob({
+      name: "unchanged cron validation",
+      schedule: { kind: "cron", expr: "* * * * *" },
+      task: "do not replay the same minute",
+      mode: "command",
+      cwd: dir,
+      createdAt: unchangedCronLastRunAt - 60_000,
+      lastRunAt: unchangedCronLastRunAt,
+      lastStatus: "ok",
+    });
+    unchangedCronId = unchangedCron.id;
+    const unchangedCronValidation = await c.call("automation.validate", {
+      id: unchangedCron.id,
+      schedule: "* * * * *",
+    });
+    assert.ok(
+      Math.floor(unchangedCronValidation.result.nextRuns[0] / 60_000)
+        > Math.floor(unchangedCronLastRunAt / 60_000),
+      "validating an unchanged cron keeps lastRunAt and never previews the completed current minute",
+    );
+    const pendingAt = Date.now() - 1_000;
+    const pendingCron = addJob({
+      name: "pending cron validation",
+      schedule: { kind: "cron", expr: "* * * * *" },
+      task: "show the durable catch-up",
+      mode: "command",
+      cwd: dir,
+      createdAt: pendingAt,
+    });
+    pendingCronId = pendingCron.id;
+    const pendingValidationStartedAt = Date.now();
+    const pendingCronValidation = await c.call("automation.validate", {
+      id: pendingCron.id,
+      schedule: "* * * * *",
+    });
+    const pendingValidationFinishedAt = Date.now();
+    assert.ok(
+      pendingCronValidation.result.nextRuns[0] >= pendingValidationStartedAt
+        && pendingCronValidation.result.nextRuns[0] <= pendingValidationFinishedAt,
+      "validating an unchanged cron preserves an already-due pending occurrence",
+    );
+    const validationStartedAt = Date.now();
+    const boundedSchedule = await c.call("automation.validate", {
+      schedule: "0 0 31 2 *",
+      tz: "Asia/Shanghai",
+    });
+    assert.equal(boundedSchedule.result.nextRunDeferred, true);
+    assert.ok(
+      Date.now() - validationStartedAt < 1_000,
+      "sparse zoned schedule validation cannot monopolize Serve's event loop",
+    );
+    const outOfRangeOneShot = await c.call("automation.add", {
+      name: "must not persist",
+      schedule: "in 100000000d",
+      task: "never",
+      mode: "command",
+    });
+    assert.equal(outOfRangeOneShot.error.code, -32602);
+    assert.equal(
+      (await c.call("automation.list", {})).result.jobs.some((job) => job.name === "must not persist"),
+      false,
+      "an unserializable one-shot is rejected before it can poison later list calls",
+    );
+    const extendedYearOneShot = await c.call("automation.validate", {
+      schedule: "in 3000000d",
+    });
+    assert.equal(
+      extendedYearOneShot.error.code,
+      -32602,
+      "Serve rejects one-shots that would emit a Desktop-incompatible signed six-digit ISO year",
+    );
+    const offsetExtendedYearOneShot = await c.call("automation.validate", {
+      schedule: "9999-12-31T23:59:59-01:00",
+    });
+    assert.equal(
+      offsetExtendedYearOneShot.error.code,
+      -32602,
+      "an ISO timezone offset cannot move an accepted four-digit timestamp into year 10000",
+    );
+    const legacyInterval = addJob({
+      name: "legacy long interval",
+      schedule: {
+        kind: "every",
+        everyMs: 3_000_000 * 86_400_000,
+        display: "every 3000000d",
+      },
+      task: "legacy check",
+      mode: "command",
+      cwd: dir,
+      createdAt: Date.now(),
+    });
+    legacyIntervalId = legacyInterval.id;
+    const listedLegacyInterval = (await c.call("automation.list", {})).result.jobs.find(
+      (job) => job.id === legacyIntervalId,
+    );
+    assert.equal(
+      "nextRunAt" in listedLegacyInterval,
+      false,
+      "legacy intervals cannot emit timestamps outside Desktop's supported year range",
+    );
+    assert.equal(listedLegacyInterval.nextRunDeferred, true);
+    const validatedLegacyInterval = await c.call("automation.validate", {
+      id: legacyIntervalId,
+      schedule: listedLegacyInterval.scheduleSpec,
+    });
+    assert.equal(validatedLegacyInterval.result.schedule, "every 3000000d");
+    assert.deepEqual(validatedLegacyInterval.result.nextRuns, []);
+    assert.equal(validatedLegacyInterval.result.nextRunDeferred, true);
+    const editedLegacyInterval = await c.call("automation.update", {
+      id: legacyIntervalId,
+      name: "legacy long interval renamed",
+      schedule: listedLegacyInterval.scheduleSpec,
+      task: "legacy check",
+      mode: "command",
+    });
+    assert.equal(
+      editedLegacyInterval.result.id,
+      legacyIntervalId,
+      "a pre-0.134.7 oversized interval can round-trip for metadata edits",
+    );
     const invalidTimezone = await c.call("automation.validate", {
       schedule: "0 9 * * *",
       tz: "Not/A_Timezone",
@@ -571,6 +731,25 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     const listedPastOneShot = (await c.call("automation.list", {})).result.jobs.find(
       (job) => job.id === pastOneShotId,
     );
+    const validatedPastOneShot = await c.call("automation.validate", {
+      id: pastOneShotId,
+      schedule: listedPastOneShot.scheduleSpec,
+    });
+    assert.equal(validatedPastOneShot.result.schedule, listedPastOneShot.scheduleSpec);
+    assert.deepEqual(
+      validatedPastOneShot.result.nextRuns,
+      [],
+      "validation reflects that an unchanged completed one-shot will not run again",
+    );
+    const rejectedPastOneShotValidation = await c.call("automation.validate", {
+      id: pastOneShotId,
+      schedule: new Date(pastRunAt - 60_000).toISOString(),
+    });
+    assert.equal(
+      rejectedPastOneShotValidation.error.code,
+      -32602,
+      "validation still rejects a different past one-shot",
+    );
     const renamedPastOneShot = await c.call("automation.update", {
       id: pastOneShotId,
       name: "Completed one-shot renamed",
@@ -594,10 +773,19 @@ test("serve e2e: auth gate → create → send streams text events and returns t
 
     const listed2 = await c.call("session.list", {});
     assert.equal(listed2.result.sessions[0].source, "interactive", "session.list carries source");
+    assert.ok(
+      listed2.result.sessions.every((session) => session.source === "interactive"),
+      "ordinary session.list excludes cron/gateway history even when automation history is large",
+    );
+    assert.equal(typeof listed2.result.page.hasMore, "boolean");
+    assert.ok(listed2.result.sessions.length <= listed2.result.page.limit);
   } finally {
     if (automationId) await c.call("automation.delete", { id: automationId });
     if (timezoneAutomationId) await c.call("automation.delete", { id: timezoneAutomationId });
     if (pastOneShotId) await c.call("automation.delete", { id: pastOneShotId });
+    if (legacyIntervalId) await c.call("automation.delete", { id: legacyIntervalId });
+    if (unchangedCronId) await c.call("automation.delete", { id: unchangedCronId });
+    if (pendingCronId) await c.call("automation.delete", { id: pendingCronId });
     c.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });
@@ -639,6 +827,53 @@ test("serve e2e: models.list derives reasoning controls from the session-pinned 
     assert.ok(runtimeRequests.some((request) => request.model === "qwen3-coder-next"));
   } finally {
     c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: an early-failed cron occurrence resumes with current runtime defaults", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-cron-placeholder-"));
+  const store = memStore();
+  const sessionId = randomUUID();
+  store.save({
+    id: sessionId,
+    cwd: dir,
+    provider: "",
+    model: "",
+    title: "failed scheduled run",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    source: "cron",
+    sourceName: "failed task",
+    jobId: "failed-task",
+  }, []);
+  const requestedModels = [];
+  const deps = {
+    ...baseDeps(textProvider, store),
+    buildProviderFor: async (model) => {
+      requestedModels.push(model);
+      return { ...textProvider, model };
+    },
+    runtimeInfo: (_cwd, model) => ({
+      providerId: "fake",
+      model: model || "fake-1",
+      profileId: "personal",
+      effortLevels: [],
+    }),
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const resumed = await client.call("session.resume", { sessionId });
+    assert.equal(resumed.result.model, "fake-1");
+    assert.ok(requestedModels.length >= 1);
+    assert.ok(requestedModels.every((model) => model === "fake-1"), "the empty placeholder is never passed as a pinned model");
+    assert.equal(store.saved.get(sessionId).meta.model, "fake-1", "the repaired runtime identity is persisted");
+    assert.equal(store.saved.get(sessionId).meta.provider, "fake");
+  } finally {
+    client.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1484,6 +1719,8 @@ test("serve e2e: graceful close aborts turns, closes clients, releases settled l
 
 test("serve e2e: graceful close aborts an automation.run child and closes its persisted running state", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-close-automation-"));
+  const storeLock = join(cronDir(), ".jobs.lock");
+  let unlocker;
   const job = addJob({
     name: "close-owned automation",
     schedule: { kind: "once", runAt: Date.now() + 60_000, display: "once later" },
@@ -1505,14 +1742,120 @@ test("serve e2e: graceful close aborts an automation.run child and closes its pe
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(findJob(job.id)?.lastStatus, "running");
+    writeFileSync(
+      storeLock,
+      JSON.stringify({ pid: process.pid, token: "shutdown-terminal-persistence-blocker" }),
+      { mode: 0o600 },
+    );
+    const closeStartedAt = Date.now();
+    unlocker = spawn(
+      process.execPath,
+      [
+        "-e",
+        "setTimeout(() => require('node:fs').rmSync(process.argv[1], { force: true }), 3500)",
+        storeLock,
+      ],
+      { stdio: "ignore" },
+    );
     await srv.close();
+    assert.ok(
+      Date.now() - closeStartedAt >= 3_000,
+      "close waits beyond its ordinary grace period while terminal cron persistence is blocked",
+    );
     const settled = findJob(job.id);
     assert.notEqual(settled?.lastStatus, "running");
     assert.match(settled?.lastError ?? "", /interrupted|shutting down|cancellation/i);
   } finally {
+    unlocker?.kill();
+    rmSync(storeLock, { force: true });
     c.close();
     await srv.close();
     removeJob(job.id);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: Desktop actions recover dead automation owners but keep live owners busy", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-recover-automation-"));
+  const makeJob = (name) => addJob({
+    name,
+    schedule: { kind: "every", everyMs: 3_600_000, display: "every 1h" },
+    task: "exit 0",
+    mode: "command",
+    cwd: dir,
+    createdAt: Date.now(),
+  });
+  const runJob = makeJob("recover before run");
+  const updateJob = makeJob("recover before update");
+  const deleteJob = makeJob("recover before delete");
+  const liveJob = makeJob("live owner");
+  const ownedIds = new Set([runJob.id, updateJob.id, deleteJob.id, liveJob.id]);
+  const startedAt = Date.now() - 1_000;
+  saveJobs(loadJobs().map((job) => ownedIds.has(job.id)
+    ? {
+        ...job,
+        lastStatus: "running",
+        runningSince: startedAt,
+        lastRunAt: startedAt,
+        runningPid: job.id === liveJob.id ? process.pid : 2_147_483_647,
+        runningToken: `owner-${job.id}`,
+      }
+    : job));
+
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(textProvider, memStore()),
+  );
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+
+    const recoveredRun = await c.call("automation.run", { id: runJob.id });
+    assert.equal(recoveredRun.result.ok, false);
+    assert.match(recoveredRun.result.error, /previous owner exited|recovered and disabled/i);
+    assert.equal(findJob(runJob.id).lastStatus, "error");
+    assert.equal(findJob(runJob.id).enabled, false);
+
+    const firstUpdate = await c.call("automation.update", {
+      id: updateJob.id,
+      name: "updated after recovery",
+      schedule: "every 1h",
+      task: "exit 0",
+      mode: "command",
+    });
+    assert.equal(firstUpdate.error.code, -32005, "the recovery action requires one informed retry");
+    assert.equal(findJob(updateJob.id).enabled, false);
+    const retriedUpdate = await c.call("automation.update", {
+      id: updateJob.id,
+      name: "updated after recovery",
+      schedule: "every 1h",
+      task: "exit 0",
+      mode: "command",
+    });
+    assert.equal(retriedUpdate.result.id, updateJob.id);
+
+    const firstDelete = await c.call("automation.delete", { id: deleteJob.id });
+    assert.equal(firstDelete.error.code, -32005, "deletion does not erase a possible orphan without warning");
+    const retriedDelete = await c.call("automation.delete", { id: deleteJob.id });
+    assert.equal(retriedDelete.result.deleted, true);
+
+    const liveRun = await c.call("automation.run", { id: liveJob.id });
+    assert.equal(liveRun.error.code, -32002, "a live owner remains protected by BUSY");
+  } finally {
+    c.close();
+    await srv.close();
+    saveJobs(loadJobs().map((job) => job.id === liveJob.id
+      ? {
+          ...job,
+          enabled: false,
+          lastStatus: "error",
+          lastError: "test cleanup",
+          runningSince: undefined,
+          runningPid: undefined,
+          runningToken: undefined,
+        }
+      : job));
+    for (const id of ownedIds) removeJob(id);
     rmSync(dir, { recursive: true, force: true });
   }
 });

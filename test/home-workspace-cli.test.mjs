@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +55,82 @@ test("CLI --cwd explicitly selects a child project without weakening the Home bo
     const missing = runAtHome(home, ["--cwd", "missing-project", "sessions"]);
     assert.equal(missing.status, 2);
     assert.match(missing.stdout + missing.stderr, /Cannot use --cwd.*missing-project/i);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("ordinary interactive startup imports legacy sessions before exposing session menus", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-cli-session-index-startup-"));
+  const project = join(home, "project");
+  const sessions = join(home, ".hara", "sessions");
+  mkdirSync(project, { recursive: true });
+  mkdirSync(sessions, { recursive: true });
+  writeFileSync(join(project, "package.json"), "{}\n");
+  writeFileSync(join(sessions, "legacy-interactive-startup.json"), JSON.stringify({
+    meta: {
+      id: "legacy-interactive-startup",
+      cwd: project,
+      provider: "anthropic",
+      model: "claude-test",
+      title: "legacy startup",
+      createdAt: "2026-07-24T03:00:00.000Z",
+      updatedAt: "2026-07-24T03:30:00.000Z",
+      source: "interactive",
+    },
+    history: [],
+  }));
+  try {
+    const launch = runAtHome(home, ["--cwd", "project"]);
+    assert.equal(launch.status, 1, launch.stderr || launch.stdout);
+    assert.match(launch.stdout + launch.stderr, /not authenticated/i);
+    const migrated = JSON.parse(
+      readFileSync(join(sessions, "legacy-interactive-startup.json"), "utf8"),
+    );
+    assert.match(
+      migrated.storageGeneration,
+      /^[0-9a-f-]{36}$/i,
+      "the default interactive action completes compatibility migration before provider startup",
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("CLI export imports a legacy transcript before resolving its displayed id", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-cli-session-export-migration-"));
+  const project = join(home, "project");
+  const sessions = join(home, ".hara", "sessions");
+  mkdirSync(project, { recursive: true });
+  mkdirSync(sessions, { recursive: true });
+  writeFileSync(join(project, "package.json"), "{}\n");
+  writeFileSync(join(sessions, "legacy-export-session.json"), JSON.stringify({
+    meta: {
+      id: "legacy-export-session",
+      cwd: project,
+      provider: "anthropic",
+      model: "claude-test",
+      title: "legacy export",
+      createdAt: "2026-07-24T03:00:00.000Z",
+      updatedAt: "2026-07-24T03:30:00.000Z",
+      source: "interactive",
+    },
+    history: [{ role: "user", content: "export migration marker" }],
+  }));
+  try {
+    const exported = runAtHome(home, [
+      "--cwd",
+      "project",
+      "export",
+      "legacy-export",
+    ]);
+    assert.equal(exported.status, 0, exported.stderr || exported.stdout);
+    assert.match(exported.stdout, /export migration marker/);
+    assert.match(
+      JSON.parse(readFileSync(join(sessions, "legacy-export-session.json"), "utf8")).storageGeneration,
+      /^[0-9a-f-]{36}$/i,
+      "export resolves against the migrated route index",
+    );
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

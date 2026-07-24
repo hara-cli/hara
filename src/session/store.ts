@@ -4,22 +4,31 @@ import { join, resolve } from "node:path";
 import {
   chmodSync,
   closeSync,
+  constants,
   existsSync,
+  fstatSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   realpathSync,
   renameSync,
   rmSync,
+  type Stats,
   writeFileSync,
 } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { opendir as openDirAsync } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import type { NeutralMsg } from "../providers/types.js";
 import { redactSensitiveValue } from "../security/secrets.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
+import { sameOpenedFileIdentity } from "../fs-identity.js";
+import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { isValidProfileId } from "../profile/profile.js";
+import { sleepSync } from "../sync-sleep.js";
 import { isTaskExecution, type TaskExecution } from "./task.js";
 
 /** Durable transcripts are local input on resume. Bound both allocation and post-parse traversal so a
@@ -29,6 +38,7 @@ export const MAX_SESSION_JSON_DEPTH = 64;
 export const MAX_SESSION_JSON_NODES = 250_000;
 export const MAX_SESSION_ARRAY_ITEMS = 50_000;
 export const MAX_SESSION_STRING_CHARS = 8 * 1024 * 1024;
+export const MAX_SESSION_METADATA_FILE_BYTES = 4 * 1024 * 1024;
 
 /** Who created a session. Absent = legacy/interactive. Drives UI segregation (desktop: automated
  *  sessions render as a status timeline, never mixed into the manual list) and the title strategy
@@ -96,6 +106,108 @@ export interface SessionData {
   history: NeutralMsg[];
   /** Active/most-recent task execution, deliberately separate from the conversational transcript. */
   task?: TaskExecution;
+  /** Internal storage generation. Callers must treat it as opaque; it binds acceleration data to the
+   * atomically replaced transcript so an interrupted sidecar/index update can never expose stale metadata. */
+  storageGeneration?: string;
+}
+
+export interface SessionMetadataPageOptions {
+  cwd?: string;
+  excludeCwd?: string;
+  sources?: readonly SessionSource[];
+  sourceName?: string;
+  jobId?: string | null;
+  gatewayOwner?: string;
+  idPrefix?: string;
+  /** Match an exact id, prefix, or displayed suffix inside an already audience-partitioned route. */
+  idFragment?: string;
+  includeArchived?: boolean;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface SessionMetadataPage {
+  sessions: SessionMeta[];
+  hasMore: boolean;
+  nextCursor?: string;
+  limit: number;
+}
+
+export const DEFAULT_SESSION_METADATA_PAGE_SIZE = 50;
+export const MAX_SESSION_METADATA_PAGE_SIZE = 100;
+const MAX_SESSION_INDEX_RECORDS_PER_PAGE = 1_000;
+const MAX_SESSION_INDEX_BYTES_PER_PAGE = 1024 * 1024;
+const MAX_SESSION_INDEX_LINE_BYTES = 2_048;
+const MAX_SESSION_INDEX_SHARDS_PER_PAGE = 256;
+const MAX_SESSION_INDEX_BUCKET_BYTES = 16 * 1024 * 1024;
+const SESSION_INDEX_BUCKET_LOCK_WAIT_MS = 5_000;
+const SESSION_INDEX_COMPATIBILITY_AUDIT_MS = 24 * 60 * 60_000;
+const MAX_RECENT_SESSION_METADATA_SIZE = 500;
+const MAX_RECENT_SESSION_INDEX_PAGES = 4;
+const MAX_SESSION_PREFIX_LOOKUP_PAGES = 8;
+const SESSION_INDEX_VERSION = 1;
+const SESSION_INDEX_ROUTE_SCHEMA = 2;
+const SESSION_GENERATION_PREFIX_BYTES = 512;
+const MAX_SESSION_AUTHORITY_CACHE_ENTRIES = 2_048;
+const SESSION_STORAGE_GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const SESSION_INDEX_BUCKET = /^\d{10}$/u;
+const SESSION_INDEX_ROUTE = /^(?:all|source-(?:interactive|gateway|cron)|cwd-[0-9a-f]{32}|source-cwd-(?:interactive|gateway|cron)-[0-9a-f]{32}|id-short-[0-9a-f]{32}|gateway-prefix-[0-9a-f]{32}|gateway-prefix-cwd-[0-9a-f]{32}|cron-job-[0-9a-f]{32}|gateway-owner-[0-9a-f]{32})$/u;
+
+interface SessionIndexRecord {
+  v: 1;
+  id: string;
+  generation: string | "legacy";
+  at: number;
+}
+
+interface SessionIndexCursor {
+  v: 1;
+  bucket: string;
+  offset: number;
+  route?: string;
+}
+
+interface SessionMetadataSidecar {
+  v: 1;
+  generation: string;
+  /** Route schema 2 includes source/cwd, automation-audience, gateway-prefix, and short-id partitions. */
+  routes?: 2;
+  meta: SessionMeta;
+}
+
+function encodeSessionIndexCursor(cursor: SessionIndexCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeSessionIndexCursor(value: string): SessionIndexCursor | null {
+  try {
+    if (!value || value.length > 1_024) return null;
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<SessionIndexCursor>;
+    return parsed.v === SESSION_INDEX_VERSION
+      && typeof parsed.bucket === "string"
+      && SESSION_INDEX_BUCKET.test(parsed.bucket)
+      && Number.isSafeInteger(parsed.offset)
+      && parsed.offset! >= 0
+      && (parsed.route === undefined || (typeof parsed.route === "string" && SESSION_INDEX_ROUTE.test(parsed.route)))
+      ? {
+          v: 1,
+          bucket: parsed.bucket,
+          offset: parsed.offset!,
+          ...(parsed.route ? { route: parsed.route } : {}),
+        }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function canonicalSessionCwd(value: string): string {
+  const absolute = resolve(value);
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    return absolute;
+  }
 }
 
 function sessionsDir(): string {
@@ -105,6 +217,456 @@ function sessionsDir(): string {
   // private conversation history, so inheriting a permissive umask (typically 0755) is not acceptable.
   chmodSync(d, 0o700);
   return d;
+}
+
+function sessionIndexDir(): string {
+  const d = join(homedir(), ".hara", "session-index", `v${SESSION_INDEX_VERSION}`);
+  mkdirSync(d, { recursive: true, mode: 0o700 });
+  chmodSync(d, 0o700);
+  return d;
+}
+
+function sessionIndexBucket(at: number): string {
+  const date = new Date(at);
+  const yearNumber = date.getUTCFullYear();
+  if (
+    !Number.isFinite(date.getTime())
+    || yearNumber < 0
+    || yearNumber > 9_999
+  ) throw new Error("invalid session index timestamp");
+  const year = String(yearNumber).padStart(4, "0");
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  const hour = String(date.getUTCHours()).padStart(2, "0");
+  return `${year}${month}${day}${hour}`;
+}
+
+function sessionIndexRouteRoot(route = "all", create = false): string {
+  if (!SESSION_INDEX_ROUTE.test(route)) throw new Error("invalid session index route");
+  const root = sessionIndexDir();
+  if (route === "all") return root;
+  const routes = join(root, "routes");
+  const selected = join(routes, route);
+  if (create) {
+    mkdirSync(selected, { recursive: true, mode: 0o700 });
+    for (const path of [routes, selected]) {
+      try {
+        chmodSync(path, 0o700);
+      } catch {
+        // The subsequent private index write remains authoritative.
+      }
+    }
+  }
+  return selected;
+}
+
+function sessionIndexBucketFile(bucket: string, create = false, route = "all"): string {
+  if (!SESSION_INDEX_BUCKET.test(bucket)) throw new Error("invalid session index bucket");
+  const root = sessionIndexRouteRoot(route, create);
+  const year = bucket.slice(0, 4);
+  const month = bucket.slice(4, 6);
+  const day = bucket.slice(6, 8);
+  const hour = bucket.slice(8, 10);
+  const dayDir = join(root, year, month, day);
+  if (create) {
+    mkdirSync(dayDir, { recursive: true, mode: 0o700 });
+    for (const path of [join(root, year), join(root, year, month), dayDir]) {
+      try {
+        chmodSync(path, 0o700);
+      } catch {
+        // The subsequent private append is authoritative; a permission failure there fails the save.
+      }
+    }
+  }
+  return join(dayDir, `${hour}.ndjson`);
+}
+
+function sessionIndexRouteHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
+
+function gatewaySessionPrefix(id: string): string | null {
+  const match = /^(.*-)[a-f0-9]{6}(?:-[1-9]\d*)?$/u.exec(id);
+  return match?.[1] ?? null;
+}
+
+/** Stable, opaque audience marker for one gateway actor. The derived session id already carries the
+ * platform/chat namespace; hashing it prevents duplicating that raw namespace in session metadata. */
+export function gatewayOwnerFromSessionId(id: string, sourceName = ""): string | undefined {
+  const prefix = gatewaySessionPrefix(id);
+  return prefix
+    ? createHash("sha256").update(`${sourceName}\0${prefix}`).digest("hex")
+    : undefined;
+}
+
+/** Write each generation to a global timeline plus bounded audience/project routes. Query selection uses
+ * the narrowest complete route available, so high-volume cron traffic cannot starve interactive resume. */
+function sessionIndexRoutesForMeta(meta: SessionMeta): string[] {
+  const source = meta.source ?? "interactive";
+  const cwdHash = sessionIndexRouteHash(canonicalSessionCwd(meta.cwd));
+  const routes = new Set<string>([
+    "all",
+    `source-${source}`,
+    `cwd-${cwdHash}`,
+    `source-cwd-${source}-${cwdHash}`,
+    `id-short-${sessionIndexRouteHash(meta.id.slice(0, 8))}`,
+  ]);
+  if (source === "gateway") {
+    const prefix = gatewaySessionPrefix(meta.id);
+    if (prefix) {
+      const prefixHash = sessionIndexRouteHash(prefix);
+      routes.add(`gateway-prefix-${prefixHash}`);
+      routes.add(`gateway-prefix-cwd-${sessionIndexRouteHash(`${prefix}\0${canonicalSessionCwd(meta.cwd)}`)}`);
+    }
+    if (meta.gatewayOwner) {
+      routes.add(`gateway-owner-${sessionIndexRouteHash(`${meta.sourceName ?? ""}\0${meta.gatewayOwner}`)}`);
+    }
+  }
+  if (source === "cron" && meta.jobId) {
+    routes.add(`cron-job-${sessionIndexRouteHash(meta.jobId)}`);
+  }
+  return [...routes].sort();
+}
+
+function preferredSessionIndexRoute(options: SessionMetadataPageOptions): string {
+  const sources = options.sources?.length === 1 ? options.sources[0] : undefined;
+  if (sources === "gateway" && options.idPrefix) {
+    return options.cwd
+      ? `gateway-prefix-cwd-${sessionIndexRouteHash(`${options.idPrefix}\0${canonicalSessionCwd(options.cwd)}`)}`
+      : `gateway-prefix-${sessionIndexRouteHash(options.idPrefix)}`;
+  }
+  if (sources === "cron" && options.jobId) {
+    return `cron-job-${sessionIndexRouteHash(options.jobId)}`;
+  }
+  if (sources === "gateway" && options.gatewayOwner) {
+    return `gateway-owner-${sessionIndexRouteHash(`${options.sourceName ?? ""}\0${options.gatewayOwner}`)}`;
+  }
+  if (options.idPrefix && options.idPrefix.length >= 8) {
+    return `id-short-${sessionIndexRouteHash(options.idPrefix.slice(0, 8))}`;
+  }
+  if (sources && options.cwd) {
+    return `source-cwd-${sources}-${sessionIndexRouteHash(canonicalSessionCwd(options.cwd))}`;
+  }
+  if (options.cwd) return `cwd-${sessionIndexRouteHash(canonicalSessionCwd(options.cwd))}`;
+  return sources ? `source-${sources}` : "all";
+}
+
+function validSessionIndexRecord(value: unknown): value is SessionIndexRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<SessionIndexRecord>;
+  return record.v === SESSION_INDEX_VERSION
+    && validSessionId(record.id)
+    && (record.generation === "legacy"
+      || (typeof record.generation === "string" && SESSION_STORAGE_GENERATION.test(record.generation)))
+    && typeof record.at === "number"
+    && Number.isFinite(record.at);
+}
+
+function acquireSessionIndexBucketLock(path: string): { claim: LockRecord & { token: string }; lock: string } {
+  const lock = `${path}.lock`;
+  const reclaim = `${lock}.reclaim`;
+  const deadline = Date.now() + SESSION_INDEX_BUCKET_LOCK_WAIT_MS;
+  for (;;) {
+    const claim = newLockRecord();
+    try {
+      writeExclusive(lock, claim);
+      return { claim, lock };
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+
+    const observed = readLockRecord(lock);
+    if (observed?.token && !pidAlive(observed.pid)) {
+      const guard = newLockRecord();
+      try {
+        writeExclusive(reclaim, guard);
+        const current = readLockRecord(lock);
+        if (
+          current?.token
+          && current.pid === observed.pid
+          && current.startedAt === observed.startedAt
+          && current.token === observed.token
+          && !pidAlive(current.pid)
+        ) {
+          rmSync(lock);
+        }
+      } catch (error: any) {
+        if (error?.code !== "EEXIST") throw error;
+      } finally {
+        const currentGuard = readLockRecord(reclaim);
+        if (
+          currentGuard?.pid === guard.pid
+          && currentGuard.startedAt === guard.startedAt
+          && currentGuard.token === guard.token
+        ) {
+          try {
+            rmSync(reclaim);
+          } catch {
+            // A surviving guard makes all contenders fail closed until it can be inspected.
+          }
+        }
+      }
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("timed out waiting for a session metadata index shard");
+    }
+    sleepSync(10);
+  }
+}
+
+function releaseSessionIndexBucketLock(held: { claim: LockRecord & { token: string }; lock: string }): void {
+  const current = readLockRecord(held.lock);
+  if (
+    current?.pid === held.claim.pid
+    && current.startedAt === held.claim.startedAt
+    && current.token === held.claim.token
+  ) {
+    rmSync(held.lock);
+  }
+}
+
+function writeSessionIndexBytes(path: string, encoded: string, append: boolean): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, append ? "a" : "w", 0o600);
+    writeFileSync(fd, encoded, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    chmodSync(path, 0o600);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Insert one or more intents into a route shard while preserving chronological physical order. Current
+ * writes normally take the append fast path; an old migration record performs one bounded atomic merge.
+ * The per-shard lock covers separate Hara processes as well as a mixed-version import. */
+function insertSessionIndexRecords(
+  path: string,
+  records: readonly SessionIndexRecord[],
+  forceMerge = false,
+): void {
+  if (!records.length) return;
+  const additions = records.map((record) => {
+    const encoded = JSON.stringify(record);
+    if (Buffer.byteLength(`${encoded}\n`, "utf8") > MAX_SESSION_INDEX_LINE_BYTES) {
+      throw new Error("session metadata index record is too large");
+    }
+    return { record, encoded };
+  }).sort((left, right) =>
+    left.record.at - right.record.at
+    || left.record.id.localeCompare(right.record.id)
+    || left.record.generation.localeCompare(right.record.generation));
+  const held = acquireSessionIndexBucketLock(path);
+  try {
+    let size = 0;
+    try {
+      size = lstatSync(path).size;
+    } catch {
+      // The route directory exists, but this is its first record in the hour.
+    }
+    if (size <= 0) {
+      writeSessionIndexBytes(path, `${additions.map((item) => item.encoded).join("\n")}\n`, false);
+      return;
+    }
+
+    const tail = previousSessionIndexLines(path, size).lines[0]?.text;
+    let last: SessionIndexRecord | null = null;
+    try {
+      const parsed: unknown = tail ? JSON.parse(tail) : null;
+      last = validSessionIndexRecord(parsed) ? parsed : null;
+    } catch {
+      last = null;
+    }
+    if (
+      !forceMerge
+      && last
+      && additions[0]!.record.at >= last.at
+    ) {
+      writeSessionIndexBytes(path, `${additions.map((item) => item.encoded).join("\n")}\n`, true);
+      return;
+    }
+    if (size > MAX_SESSION_INDEX_BUCKET_BYTES) {
+      throw new Error(
+        "session metadata index shard is too large to reorder safely; finish the older Hara migration first",
+      );
+    }
+
+    const existingText = readFileSync(path, "utf8");
+    const valid: Array<{ record: SessionIndexRecord; encoded: string }> = [];
+    const invalid: string[] = [];
+    for (const line of existingText.split("\n")) {
+      if (!line) continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (validSessionIndexRecord(parsed)) valid.push({ record: parsed, encoded: line });
+        else invalid.push(line);
+      } catch {
+        invalid.push(line);
+      }
+    }
+    valid.push(...additions);
+    valid.sort((left, right) =>
+      left.record.at - right.record.at
+      || left.record.id.localeCompare(right.record.id)
+      || left.record.generation.localeCompare(right.record.generation));
+    const deduplicated = valid.filter((item, index, all) => {
+      const prior = all[index - 1];
+      return !prior
+        || prior.record.at !== item.record.at
+        || prior.record.id !== item.record.id
+        || prior.record.generation !== item.record.generation;
+    });
+    const merged = [...invalid, ...deduplicated.map((item) => item.encoded)];
+    const encoded = `${merged.join("\n")}\n`;
+    if (Buffer.byteLength(encoded, "utf8") > MAX_SESSION_INDEX_BUCKET_BYTES + MAX_SESSION_INDEX_LINE_BYTES) {
+      throw new Error("session metadata index shard exceeded its bounded reorder size");
+    }
+    const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeSessionIndexBytes(tmp, encoded, false);
+      renameSync(tmp, path);
+      chmodSync(path, 0o600);
+    } finally {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        // A unique unpublished temp file is inert.
+      }
+    }
+  } finally {
+    releaseSessionIndexBucketLock(held);
+  }
+}
+
+/** The records are intents written and fsynced before the transcript rename. A failed transcript write
+ * leaves inert generation-mismatched entries; a crash after rename leaves every complete query route able
+ * to find the authoritative generation without walking unrelated audiences. */
+function appendSessionIndexRecord(record: SessionIndexRecord, meta: SessionMeta, forceMerge = false): void {
+  for (const route of sessionIndexRoutesForMeta(meta)) {
+    const path = sessionIndexBucketFile(sessionIndexBucket(record.at), true, route);
+    insertSessionIndexRecords(path, [record], forceMerge);
+  }
+}
+
+function numericEntries(path: string, expression: RegExp): string[] {
+  try {
+    return readdirSync(path, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && expression.test(entry.name))
+      .map((entry) => entry.name)
+      .sort()
+      .reverse();
+  } catch {
+    return [];
+  }
+}
+
+/** Collect at most `limit` hourly shards newest-first and strictly before `before` when supplied.
+ * One metadata page builds this iterator once, rather than restarting at the index root for every empty
+ * or exhausted shard. The hierarchy still stops as soon as the page plus one continuation shard is known. */
+function sessionIndexBucketsBefore(
+  before?: string,
+  limit = MAX_SESSION_INDEX_SHARDS_PER_PAGE + 1,
+  route = "all",
+): string[] {
+  const root = sessionIndexRouteRoot(route);
+  const buckets: string[] = [];
+  const beforeYear = before?.slice(0, 4);
+  const beforeMonth = before?.slice(4, 6);
+  const beforeDay = before?.slice(6, 8);
+  const beforeHour = before?.slice(8, 10);
+  const years = numericEntries(root, /^\d{4}$/u);
+  for (const year of years) {
+    if (beforeYear && year > beforeYear) continue;
+    const months = numericEntries(join(root, year), /^(?:0[1-9]|1[0-2])$/u);
+    for (const month of months) {
+      const sameYear = beforeYear === year;
+      if (sameYear && beforeMonth && month > beforeMonth) continue;
+      const days = numericEntries(join(root, year, month), /^(?:0[1-9]|[12]\d|3[01])$/u);
+      for (const day of days) {
+        const sameMonth = sameYear && beforeMonth === month;
+        if (sameMonth && beforeDay && day > beforeDay) continue;
+        let hours: string[];
+        try {
+          hours = readdirSync(join(root, year, month, day), { withFileTypes: true })
+            .filter((entry) => entry.isFile() && /^(?:[01]\d|2[0-3])\.ndjson$/u.test(entry.name))
+            .map((entry) => entry.name.slice(0, 2))
+            .sort()
+            .reverse();
+        } catch {
+          hours = [];
+        }
+        for (const hour of hours) {
+          const sameDay = sameMonth && beforeDay === day;
+          if (sameDay && beforeHour && hour >= beforeHour) continue;
+          buckets.push(`${year}${month}${day}${hour}`);
+          if (buckets.length >= limit) return buckets;
+        }
+      }
+    }
+  }
+  return buckets;
+}
+
+interface SessionIndexLine {
+  text: string;
+  start: number;
+}
+
+/** Read a bounded tail window and return complete lines newest-first. The extra line allowance aligns the
+ * first record without making one corrupt, unbounded line consume memory or stall cursor progress. */
+function previousSessionIndexLines(path: string, endOffset: number): {
+  lines: SessionIndexLine[];
+  nextOffset: number;
+  bytesRead: number;
+} {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size <= 0) return { lines: [], nextOffset: 0, bytesRead: 0 };
+    const end = Math.min(Math.max(0, endOffset), info.size);
+    if (end === 0) return { lines: [], nextOffset: 0, bytesRead: 0 };
+    const window = Math.min(end, MAX_SESSION_INDEX_BYTES_PER_PAGE + MAX_SESSION_INDEX_LINE_BYTES);
+    const start = end - window;
+    const buffer = Buffer.allocUnsafe(window);
+    const read = readSync(fd, buffer, 0, window, start);
+    const bytes = buffer.subarray(0, read);
+    const lines: SessionIndexLine[] = [];
+    let lineEndExclusive = bytes.length;
+    if (lineEndExclusive > 0 && bytes[lineEndExclusive - 1] === 0x0a) lineEndExclusive -= 1;
+    let oldestStart = end;
+    while (lineEndExclusive > 0 && lines.length < MAX_SESSION_INDEX_RECORDS_PER_PAGE) {
+      const previousNewline = bytes.lastIndexOf(0x0a, lineEndExclusive - 1);
+      if (previousNewline < 0 && start > 0) break; // leading partial record; the next cursor begins after it
+      const lineStart = previousNewline + 1;
+      const absoluteStart = start + lineStart;
+      const text = bytes.subarray(lineStart, lineEndExclusive).toString("utf8");
+      lines.push({ text, start: absoluteStart });
+      oldestStart = absoluteStart;
+      if (previousNewline < 0) break;
+      lineEndExclusive = previousNewline;
+    }
+    return {
+      lines,
+      nextOffset: lines.length ? oldestStart : start,
+      bytesRead: read,
+    };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function isSessionTranscriptFileName(name: string): boolean {
+  return name.endsWith(".json");
+}
+
+function sessionMetadataFile(id: string): string {
+  // Session ids may legally end in ".meta", so `<id>.meta.json` collides with the authoritative
+  // transcript for that id. Keep acceleration files outside the transcript `.json` namespace.
+  return join(sessionsDir(), `${checkedSessionId(id)}.metadata`);
 }
 
 /** Session ids become filenames. Gateway/platform ids are not always UUIDs, so allow printable filename
@@ -139,6 +701,10 @@ interface LockRecord {
 // A pid alone is not ownership: pids are reused, and another writer could replace a lock between read and
 // release. Keep the random token for every lock this module actually created and require both on release.
 const ownedLocks = new Map<string, string>();
+// A lock file itself changes the sessions-directory mtime. Remember whether the directory was already
+// entirely explained by current writers before acquisition, then advance the current-writer watermark only
+// after our lock and all protected mutations have left the directory.
+const ownedLockKnownDirectoryState = new Map<string, boolean>();
 
 function readLockRecord(path: string): LockRecord | null {
   try {
@@ -220,6 +786,7 @@ export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
   } catch {
     return { ok: false };
   }
+  const knownDirectoryState = sessionDirectoryMatchesCurrentState();
 
   // A stale-lock recovery is changing the primary lock. New contenders wait/fail instead of creating a
   // primary lock in the short remove→create window.
@@ -249,6 +816,7 @@ export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
   try {
     writeExclusive(f, claim);
     ownedLocks.set(id, claim.token);
+    ownedLockKnownDirectoryState.set(id, knownDirectoryState);
     return { ok: true };
   } catch (error: any) {
     if (error?.code !== "EEXIST") return { ok: false };
@@ -277,6 +845,7 @@ export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
     const replacement = newLockRecord();
     writeExclusive(f, replacement);
     ownedLocks.set(id, replacement.token);
+    ownedLockKnownDirectoryState.set(id, knownDirectoryState);
     return { ok: true };
   } catch {
     return { ok: false };
@@ -300,8 +869,11 @@ export function releaseSessionLock(id: string): void {
   try {
     const f = lockFile(id);
     const held = readLockRecord(f);
-    if (held?.pid === process.pid && held.token === token) rmSync(f);
+    const removedOwnLock = held?.pid === process.pid && held.token === token;
+    if (removedOwnLock) rmSync(f);
     ownedLocks.delete(id);
+    if (removedOwnLock && ownedLockKnownDirectoryState.get(id)) writeCurrentWriterDirectoryMarker();
+    ownedLockKnownDirectoryState.delete(id);
   } catch {
     // Keep the ownership token so a later cleanup attempt can still prove ownership. Never unlink blindly.
   }
@@ -324,6 +896,12 @@ export function deleteSession(id: string): boolean {
   let deleted = false;
   try {
     rmSync(f);
+    try {
+      rmSync(sessionMetadataFile(id), { force: true });
+    } catch {
+      // The transcript is authoritative. A stale sidecar cannot resume a deleted session and paged
+      // listing requires the transcript filename, so cleanup failure is safe and can be retried later.
+    }
     deleted = true;
     return true;
   } catch {
@@ -337,15 +915,24 @@ export function deleteSession(id: string): boolean {
 
 /** A full UUID per session (the stable identity). */
 export const newSessionId = (): string => randomUUID();
+const GENERATED_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isGeneratedSessionId(id: unknown): id is string {
+  return typeof id === "string" && GENERATED_SESSION_ID.test(id);
+}
 /** First segment of the UUID — a compact label for the status bar / `/sessions`. */
 export const shortId = (id: string): string => id.slice(0, 8);
 
-/** Resolve a full id OR a unique prefix (e.g. the short id) to a session id, for `--resume`. */
-export function resolveSessionId(idOrPrefix: string): string | null {
+/** Resolve a full id OR a unique prefix (e.g. the short id) to a session id, for `--resume`.
+ * Internal callers that already own a generated exact UUID can disable the O(n) prefix scan. */
+export function resolveSessionId(
+  idOrPrefix: string,
+  options: { allowPrefix?: boolean } = {},
+): string | null {
   if (!validSessionId(idOrPrefix)) return null;
   if (existsSync(sessionFile(idOrPrefix))) return idOrPrefix;
-  const hits = listSessions().filter((m) => m.id.startsWith(idOrPrefix));
-  return hits.length === 1 ? hits[0]!.id : null;
+  if (options.allowPrefix === false) return null;
+  const result = findSessionMetadataByPrefix(idOrPrefix);
+  return result.exhaustive && result.sessions.length === 1 ? result.sessions[0]!.id : null;
 }
 
 const STOP = new Set(
@@ -452,20 +1039,16 @@ function redactedSessionCopy(data: SessionData): SessionData {
   return safe;
 }
 
-export function saveSession(meta: SessionMeta, history: NeutralMsg[], task?: TaskExecution): void {
-  checkedSessionId(meta.id);
-  meta.updatedAt = new Date().toISOString();
-  const data: SessionData = { meta, history, ...(task ? { task } : {}) };
-  if (!sessionValueWithinLimits(data)) {
-    throw new Error("session exceeds Hara's safe persistence complexity limit; compact or start a new session");
-  }
-  const safe = redactedSessionCopy(data);
-  const encoded = JSON.stringify(safe, null, 2);
-  if (Buffer.byteLength(encoded, "utf8") > MAX_SESSION_FILE_BYTES) {
-    throw new Error("session exceeds Hara's 64 MiB persistence limit; compact or start a new session");
-  }
-
-  const target = sessionFile(meta.id);
+function writeSessionMetadataSidecar(meta: SessionMeta, generation: string): void {
+  const sidecar: SessionMetadataSidecar = {
+    v: 1,
+    generation,
+    routes: SESSION_INDEX_ROUTE_SCHEMA,
+    meta,
+  };
+  const encoded = JSON.stringify(sidecar);
+  if (Buffer.byteLength(encoded, "utf8") > MAX_SESSION_METADATA_FILE_BYTES) return;
+  const target = sessionMetadataFile(meta.id);
   const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
   let fd: number | undefined;
   try {
@@ -474,9 +1057,79 @@ export function saveSession(meta: SessionMeta, history: NeutralMsg[], task?: Tas
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
+    renameSync(tmp, target);
+    chmodSync(target, 0o600);
+  } catch {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* metadata acceleration is best effort; the transcript remains authoritative */
+      }
+    }
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* stale uniquely named temp files are inert */
+    }
+  }
+}
+
+function persistSessionSnapshot(
+  meta: SessionMeta,
+  history: NeutralMsg[],
+  task: TaskExecution | undefined,
+  updatedAt: string,
+): void {
+  checkedSessionId(meta.id);
+  const owned = ownedLocks.has(meta.id);
+  const knownDirectoryState = !owned && sessionDirectoryMatchesCurrentState();
+  if (!isTimestamp(updatedAt)) throw new Error("invalid session update timestamp");
+  meta.updatedAt = updatedAt;
+  const generation = randomUUID();
+  const data: SessionData = { meta, history, ...(task ? { task } : {}), storageGeneration: generation };
+  if (!sessionValueWithinLimits(data)) {
+    throw new Error("session exceeds Hara's safe persistence complexity limit; compact or start a new session");
+  }
+  const safe = redactedSessionCopy(data);
+  safe.storageGeneration = generation;
+  // Keep the generation first so metadata readers can verify a sidecar against a tiny, descriptor-checked
+  // prefix instead of parsing a transcript that may be tens of MiB. Existing tail-generation transcripts
+  // remain readable and take the bounded full-read fallback until their next save.
+  const encoded = JSON.stringify({
+    storageGeneration: generation,
+    meta: safe.meta,
+    history: safe.history,
+    ...(safe.task ? { task: safe.task } : {}),
+  } satisfies SessionData, null, 2);
+  if (Buffer.byteLength(encoded, "utf8") > MAX_SESSION_FILE_BYTES) {
+    throw new Error("session exceeds Hara's 64 MiB persistence limit; compact or start a new session");
+  }
+
+  const target = sessionFile(meta.id);
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    // Persist the new generation's ordered intent first. If anything below fails, readers reject this entry
+    // because the authoritative transcript still carries another generation.
+    appendSessionIndexRecord({
+      v: 1,
+      id: meta.id,
+      generation,
+      at: Date.parse(meta.updatedAt),
+    }, meta);
+    fd = openSync(tmp, "wx", 0o600);
+    writeFileSync(fd, encoded, "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
     // Same directory/filesystem: readers observe the complete old JSON or complete new JSON, never a prefix.
     renameSync(tmp, target);
     chmodSync(target, 0o600);
+    // A small redacted sidecar lets paged timelines avoid reopening full transcripts. The transcript is
+    // already durable and remains authoritative if this best-effort acceleration write is unavailable.
+    writeSessionMetadataSidecar(safe.meta, generation);
+    if (knownDirectoryState) writeCurrentWriterDirectoryMarker();
   } catch (error) {
     if (fd !== undefined) {
       try {
@@ -494,8 +1147,16 @@ export function saveSession(meta: SessionMeta, history: NeutralMsg[], task?: Tas
   }
 }
 
+export function saveSession(meta: SessionMeta, history: NeutralMsg[], task?: TaskExecution): void {
+  persistSessionSnapshot(meta, history, task, new Date().toISOString());
+}
+
 function isTimestamp(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && Number.isFinite(Date.parse(value));
+  if (typeof value !== "string" || value.length === 0) return false;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return false;
+  const year = new Date(timestamp).getUTCFullYear();
+  return year >= 0 && year <= 9_999;
 }
 
 function isStringArray(value: unknown): value is string[] {
@@ -593,10 +1254,12 @@ function sessionValueWithinLimits(value: unknown): boolean {
 
 /** True if a parsed object has the SessionData shape we can safely use. */
 function isSessionData(d: unknown): d is SessionData {
-  const o = d as { meta?: unknown; history?: unknown; task?: unknown } | null;
+  const o = d as { meta?: unknown; history?: unknown; task?: unknown; storageGeneration?: unknown } | null;
   return !!o && typeof o === "object" && !Array.isArray(o) && isSessionMeta(o.meta) &&
     Array.isArray(o.history) && o.history.every(isNeutralMessage) &&
-    (o.task === undefined || isTaskExecution(o.task));
+    (o.task === undefined || isTaskExecution(o.task)) &&
+    (o.storageGeneration === undefined
+      || (typeof o.storageGeneration === "string" && SESSION_STORAGE_GENERATION.test(o.storageGeneration)));
 }
 
 /** Read only. Legacy plaintext is redacted in the returned in-memory copy but intentionally not migrated
@@ -615,6 +1278,170 @@ function readSessionFile(p: string): SessionData | null {
   }
 }
 
+function readSessionMetadataSidecar(
+  id: string,
+  transcriptMtimeMs: number,
+): { meta: SessionMeta; generation?: string; routed?: boolean } | null {
+  try {
+    const path = sessionMetadataFile(id);
+    const info = lstatSync(path);
+    if (
+      !info.isFile()
+      || info.isSymbolicLink()
+      || info.size > MAX_SESSION_METADATA_FILE_BYTES
+    ) return null;
+    const raw = readVerifiedRegularFileSnapshotSync(path, MAX_SESSION_METADATA_FILE_BYTES, {
+      action: "read Hara session metadata",
+      protectSensitive: false,
+      rejectHardLinks: true,
+    }).text;
+    const parsed: unknown = JSON.parse(raw);
+    if (!sessionValueWithinLimits(parsed) || !parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    const wrapped = parsed as Partial<SessionMetadataSidecar>;
+    if (
+      wrapped.v === SESSION_INDEX_VERSION
+      && typeof wrapped.generation === "string"
+      && SESSION_STORAGE_GENERATION.test(wrapped.generation)
+      && isSessionMeta(wrapped.meta)
+      && wrapped.meta.id === id
+    ) {
+      return {
+        meta: wrapped.meta,
+        generation: wrapped.generation,
+        ...(wrapped.routes === SESSION_INDEX_ROUTE_SCHEMA ? { routed: true } : {}),
+      };
+    }
+    // Candidate builds wrote raw metadata sidecars before the generation wrapper existed. They remain a
+    // safe best-effort cache only under the old strict-newer rule; wrapped sidecars are instead verified
+    // against the authoritative transcript generation below and therefore do not trust wall-clock mtimes.
+    return info.mtimeMs > transcriptMtimeMs && isSessionMeta(parsed) && parsed.id === id
+      ? { meta: parsed }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+interface SessionAuthority {
+  meta: SessionMeta;
+  generation?: string;
+}
+
+interface CachedSessionAuthority {
+  signature: string;
+  authority: SessionAuthority | null;
+}
+
+const sessionAuthorityCache = new Map<string, CachedSessionAuthority>();
+
+function sessionTranscriptSignature(info: Stats): string {
+  return `${String(info.dev)}:${String(info.ino)}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+}
+
+function cacheSessionAuthority(
+  id: string,
+  signature: string,
+  authority: SessionAuthority | null,
+): SessionAuthority | null {
+  sessionAuthorityCache.delete(id);
+  sessionAuthorityCache.set(id, { signature, authority });
+  if (sessionAuthorityCache.size > MAX_SESSION_AUTHORITY_CACHE_ENTRIES) {
+    const oldest = sessionAuthorityCache.keys().next().value;
+    if (typeof oldest === "string") sessionAuthorityCache.delete(oldest);
+  }
+  return authority;
+}
+
+/** Read only the generation prefix from a verified descriptor. New session files deliberately serialize
+ * this field first. The before/open/after identity fence keeps a rename race from pairing a sidecar with a
+ * different transcript; old tail-generation files return null and use one cached full parse. */
+function readSessionGenerationPrefix(path: string, expected: Stats): string | null {
+  let fd: number | undefined;
+  try {
+    if (
+      !expected.isFile()
+      || expected.isSymbolicLink()
+      || expected.nlink > 1
+      || expected.size > MAX_SESSION_FILE_BYTES
+    ) return null;
+    fd = openSync(
+      path,
+      constants.O_RDONLY
+        | optionalPosixOpenFlag("O_NONBLOCK")
+        | optionalPosixOpenFlag("O_NOFOLLOW"),
+    );
+    const opened = fstatSync(fd);
+    if (
+      !opened.isFile()
+      || opened.nlink > 1
+      || !sameOpenedFileIdentity(expected, opened)
+      || opened.size !== expected.size
+      || opened.mtimeMs !== expected.mtimeMs
+      || opened.ctimeMs !== expected.ctimeMs
+    ) return null;
+    const bytes = Buffer.allocUnsafe(Math.min(SESSION_GENERATION_PREFIX_BYTES, opened.size));
+    const count = bytes.length ? readSync(fd, bytes, 0, bytes.length, 0) : 0;
+    const latest = fstatSync(fd);
+    const current = lstatSync(path);
+    if (
+      current.isSymbolicLink()
+      || !sameOpenedFileIdentity(opened, latest)
+      || !sameOpenedFileIdentity(latest, current)
+      || latest.size !== opened.size
+      || latest.mtimeMs !== opened.mtimeMs
+      || latest.ctimeMs !== opened.ctimeMs
+    ) return null;
+    const match = /^\s*\{\s*"storageGeneration"\s*:\s*"([^"]+)"/u.exec(
+      bytes.subarray(0, count).toString("utf8"),
+    );
+    return match && SESSION_STORAGE_GENERATION.test(match[1]) ? match[1] : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** Resolve one transcript's authoritative generation and metadata once per immutable file identity. A
+ * generation-matching sidecar keeps timeline reads small; obsolete index entries compare against the cached
+ * current generation instead of reparsing the same potentially large transcript on every line/page. */
+function authoritativeSessionMetadata(
+  id: string,
+  transcript: string,
+  info: Stats,
+): SessionAuthority | null {
+  const signature = sessionTranscriptSignature(info);
+  const cached = sessionAuthorityCache.get(id);
+  if (cached?.signature === signature) {
+    sessionAuthorityCache.delete(id);
+    sessionAuthorityCache.set(id, cached);
+    return cached.authority;
+  }
+
+  const sidecar = readSessionMetadataSidecar(id, info.mtimeMs);
+  const generation = readSessionGenerationPrefix(transcript, info);
+  if (
+    generation
+    && sidecar?.generation === generation
+  ) {
+    return cacheSessionAuthority(id, signature, {
+      meta: sidecar.meta,
+      generation,
+    });
+  }
+
+  const data = readSessionFile(transcript);
+  const authority = data?.meta.id === id
+    ? {
+        meta: data.meta,
+        ...(data.storageGeneration ? { generation: data.storageGeneration } : {}),
+      }
+    : null;
+  return cacheSessionAuthority(id, signature, authority);
+}
+
 export function loadSession(id: string): SessionData | null {
   if (!validSessionId(id)) return null;
   const p = sessionFile(id);
@@ -627,26 +1454,758 @@ export function loadSession(id: string): SessionData | null {
 export function listSessions(cwd?: string): SessionMeta[] {
   let metas: SessionMeta[] = [];
   for (const f of readdirSync(sessionsDir())) {
-    if (!f.endsWith(".json")) continue;
-    const d = readSessionFile(join(sessionsDir(), f));
-    if (d?.meta.id && validSessionId(d.meta.id) && f === `${d.meta.id}.json` && d.meta.updatedAt) metas.push(d.meta); // skip spoofed/metalless/corrupt; never mutate while listing
+    if (!isSessionTranscriptFileName(f)) continue;
+    const id = f.slice(0, -".json".length);
+    if (!validSessionId(id)) continue;
+    let transcriptInfo: Stats;
+    try {
+      transcriptInfo = lstatSync(join(sessionsDir(), f));
+      if (!transcriptInfo.isFile() || transcriptInfo.isSymbolicLink()) continue;
+    } catch {
+      continue;
+    }
+    const meta = authoritativeSessionMetadata(
+      id,
+      join(sessionsDir(), f),
+      transcriptInfo,
+    )?.meta;
+    if (meta?.id && f === `${meta.id}.json` && meta.updatedAt) metas.push(meta); // skip spoofed/metalless/corrupt; never mutate while listing
   }
   if (cwd) {
-    const canonical = (value: string): string => {
-      const absolute = resolve(value);
-      try {
-        return realpathSync.native(absolute);
-      } catch {
-        return absolute;
-      }
-    };
-    const selected = canonical(cwd);
-    metas = metas.filter((m) => canonical(m.cwd) === selected);
+    const selected = canonicalSessionCwd(cwd);
+    metas = metas.filter((m) => canonicalSessionCwd(m.cwd) === selected);
   }
   return metas.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 }
 
+function sessionMetadataMatchesOptions(
+  meta: SessionMeta,
+  options: Omit<SessionMetadataPageOptions, "cursor" | "limit">,
+): boolean {
+  const source = meta.source ?? "interactive";
+  if (options.sources?.length && !options.sources.includes(source)) return false;
+  if (options.sourceName !== undefined && meta.sourceName !== options.sourceName) return false;
+  if (options.jobId !== undefined && (meta.jobId ?? null) !== options.jobId) return false;
+  if (options.gatewayOwner !== undefined && meta.gatewayOwner !== options.gatewayOwner) return false;
+  if (!options.includeArchived && meta.archived) return false;
+  if (options.idPrefix !== undefined && !meta.id.startsWith(options.idPrefix)) return false;
+  if (
+    options.idFragment !== undefined
+    && meta.id !== options.idFragment
+    && !meta.id.startsWith(options.idFragment)
+    && !meta.id.endsWith(options.idFragment)
+  ) return false;
+  const cwd = canonicalSessionCwd(meta.cwd);
+  if (options.cwd && cwd !== canonicalSessionCwd(options.cwd)) return false;
+  if (options.excludeCwd && cwd === canonicalSessionCwd(options.excludeCwd)) return false;
+  return true;
+}
+
+/** Obsolete generations can consume several append-only pages even when only a handful of current
+ * transcripts exist. Once the bounded fast path is exhausted, read each authoritative transcript metadata
+ * at most once instead of either walking generations without bound or returning a false negative. */
+function authoritativeRecentSessionMetadata(
+  options: Omit<SessionMetadataPageOptions, "cursor" | "limit">,
+  limit: number,
+): SessionMeta[] {
+  return listSessions()
+    .filter((meta) => sessionMetadataMatchesOptions(meta, options))
+    .slice(0, limit);
+}
+
+function metadataForSessionIndexRecord(record: SessionIndexRecord): SessionMeta | null {
+  const transcript = sessionFile(record.id);
+  let info;
+  try {
+    info = lstatSync(transcript);
+    if (
+      !info.isFile()
+      || info.isSymbolicLink()
+      || info.size > MAX_SESSION_FILE_BYTES
+      || !Number.isFinite(info.mtimeMs)
+    ) return null;
+  } catch {
+    return null;
+  }
+
+  const authority = authoritativeSessionMetadata(record.id, transcript, info);
+  if (!authority) return null;
+  if (record.generation === "legacy") {
+    return authority.generation === undefined ? authority.meta : null;
+  }
+  return authority.generation === record.generation ? authority.meta : null;
+}
+
+/** Bounded metadata page for renderer timelines. The cursor walks small hourly append-only shards in
+ * reverse order and validates at most a fixed number of generation-bound records. No request enumerates,
+ * stats, parses, or sorts the complete transcript directory. */
+export function listSessionMetadataPage(
+  options: SessionMetadataPageOptions = {},
+): SessionMetadataPage {
+  const limit = Math.min(
+    MAX_SESSION_METADATA_PAGE_SIZE,
+    Math.max(1, Math.trunc(options.limit ?? DEFAULT_SESSION_METADATA_PAGE_SIZE)),
+  );
+  const cursor = options.cursor === undefined ? undefined : decodeSessionIndexCursor(options.cursor);
+  if (options.cursor !== undefined && !cursor) throw new Error("invalid session metadata cursor");
+
+  const selectedCwd = options.cwd ? canonicalSessionCwd(options.cwd) : undefined;
+  const excludedCwd = options.excludeCwd ? canonicalSessionCwd(options.excludeCwd) : undefined;
+  const sources = options.sources?.length ? new Set(options.sources) : undefined;
+  const sessions: SessionMeta[] = [];
+  const returnedIds = new Set<string>();
+  let inspected = 0;
+  let bytesRead = 0;
+  let shardsVisited = 0;
+  const preferredRoute = preferredSessionIndexRoute(options);
+  let route = cursor?.route ?? (cursor ? "all" : preferredRoute);
+  // Keep one extra bucket as the next opaque continuation after the per-request shard budget. A cursor's
+  // current shard is explicit; all predecessors are collected in one bounded hierarchy traversal.
+  let buckets = cursor
+    ? [
+        cursor.bucket,
+        ...sessionIndexBucketsBefore(cursor.bucket, MAX_SESSION_INDEX_SHARDS_PER_PAGE, route),
+      ]
+    : sessionIndexBucketsBefore(undefined, MAX_SESSION_INDEX_SHARDS_PER_PAGE + 1, route);
+  // Candidate builds and hand-authored fixtures may have only the original global route. A completely
+  // absent partition falls back without weakening a populated partition's audience boundary.
+  if (!cursor && route !== "all" && buckets.length === 0) {
+    route = "all";
+    buckets = sessionIndexBucketsBefore(undefined, MAX_SESSION_INDEX_SHARDS_PER_PAGE + 1, route);
+  }
+  let bucketPosition = 0;
+  let bucket = buckets[bucketPosition];
+  let offset = cursor?.offset;
+
+  // A forged cursor cannot make Hara open an arbitrary path. Missing/rotated shards simply continue with
+  // the next older valid bucket.
+  const boundedBucketOffset = (candidate: string, requested?: number): number => {
+    try {
+      const size = lstatSync(sessionIndexBucketFile(candidate, false, route)).size;
+      return requested === undefined ? size : Math.min(requested, size);
+    } catch {
+      return 0;
+    }
+  };
+  if (bucket) offset = boundedBucketOffset(bucket, offset);
+
+  const advanceBucket = (): void => {
+    bucketPosition += 1;
+    bucket = buckets[bucketPosition];
+    offset = bucket ? boundedBucketOffset(bucket) : 0;
+  };
+
+  while (
+    bucket
+    && sessions.length < limit
+    && inspected < MAX_SESSION_INDEX_RECORDS_PER_PAGE
+    && bytesRead < MAX_SESSION_INDEX_BYTES_PER_PAGE + MAX_SESSION_INDEX_LINE_BYTES
+    && shardsVisited < MAX_SESSION_INDEX_SHARDS_PER_PAGE
+  ) {
+    shardsVisited += 1;
+    if (!offset || offset <= 0) {
+      advanceBucket();
+      continue;
+    }
+    const page = previousSessionIndexLines(sessionIndexBucketFile(bucket, false, route), offset);
+    bytesRead += page.bytesRead;
+    offset = page.nextOffset;
+    for (const line of page.lines) {
+      if (
+        sessions.length >= limit
+        || inspected >= MAX_SESSION_INDEX_RECORDS_PER_PAGE
+      ) {
+        offset = line.start + Buffer.byteLength(line.text, "utf8") + 1;
+        break;
+      }
+      inspected += 1;
+      let record: unknown;
+      try {
+        record = JSON.parse(line.text);
+      } catch {
+        continue;
+      }
+      if (!validSessionIndexRecord(record) || returnedIds.has(record.id)) continue;
+      if (options.idPrefix !== undefined && !record.id.startsWith(options.idPrefix)) continue;
+      if (
+        options.idFragment !== undefined
+        && record.id !== options.idFragment
+        && !record.id.startsWith(options.idFragment)
+        && !record.id.endsWith(options.idFragment)
+      ) continue;
+      const meta = metadataForSessionIndexRecord(record);
+      if (!meta?.updatedAt) continue;
+      if (sources && !sources.has(meta.source ?? "interactive")) continue;
+      if (options.sourceName !== undefined && meta.sourceName !== options.sourceName) continue;
+      if (options.jobId !== undefined && (meta.jobId ?? null) !== options.jobId) continue;
+      if (options.gatewayOwner !== undefined && meta.gatewayOwner !== options.gatewayOwner) continue;
+      if (!options.includeArchived && meta.archived) continue;
+      if (selectedCwd && canonicalSessionCwd(meta.cwd) !== selectedCwd) continue;
+      if (excludedCwd && canonicalSessionCwd(meta.cwd) === excludedCwd) continue;
+      returnedIds.add(meta.id);
+      sessions.push(meta);
+    }
+    if (page.lines.length === 0 && page.nextOffset === offset && offset > 0) {
+      // A corrupt overlong record cannot pin the cursor forever.
+      offset = Math.max(0, offset - MAX_SESSION_INDEX_BYTES_PER_PAGE);
+    }
+    if ((offset ?? 0) <= 0) advanceBucket();
+  }
+
+  const nextBucket = bucket;
+  const nextOffset = offset ?? 0;
+  // An existing zero-length/corrupt shard is still a continuation point: the next bounded request will
+  // walk past it. Treating offset 0 as terminal could hide an older valid shard after a run of empty files.
+  const hasMore = nextBucket !== undefined;
+  return {
+    sessions,
+    hasMore,
+    ...(hasMore
+      ? { nextCursor: encodeSessionIndexCursor({ v: 1, bucket: nextBucket!, offset: nextOffset, route }) }
+      : {}),
+    limit,
+  };
+}
+
+/** Small source-aware metadata slice for menus and implicit resume. The route selector partitions ordinary
+ * automation noise before paging, so a complete lookup does not mistake an arbitrary page cap for absence. */
+export function recentSessionMetadata(
+  options: Omit<SessionMetadataPageOptions, "cursor" | "limit"> & { limit?: number } = {},
+): SessionMeta[] {
+  const limit = Math.min(
+    MAX_RECENT_SESSION_METADATA_SIZE,
+    Math.max(1, Math.trunc(options.limit ?? DEFAULT_SESSION_METADATA_PAGE_SIZE)),
+  );
+  const sessions: SessionMeta[] = [];
+  const seen = new Set<string>();
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  for (let pageNumber = 0; pageNumber < MAX_RECENT_SESSION_INDEX_PAGES; pageNumber += 1) {
+    const page = listSessionMetadataPage({
+      ...options,
+      cursor,
+      limit: Math.min(MAX_SESSION_METADATA_PAGE_SIZE, Math.max(1, limit - sessions.length)),
+    });
+    for (const meta of page.sessions) {
+      if (seen.has(meta.id)) continue;
+      seen.add(meta.id);
+      sessions.push(meta);
+      if (sessions.length >= limit) return sessions;
+    }
+    if (!page.hasMore || !page.nextCursor) return sessions;
+    if (seenCursors.has(page.nextCursor)) {
+      return authoritativeRecentSessionMetadata(options, limit);
+    }
+    seenCursors.add(page.nextCursor);
+    cursor = page.nextCursor;
+  }
+  return authoritativeRecentSessionMetadata(options, limit);
+}
+
+/** Exhaustive fragment lookup inside a caller-supplied audience route. Each page is resource-bounded and
+ * the search stops as soon as ambiguity is proven; no unrelated source/cwd history is opened. */
+export function findSessionMetadataByFragment(
+  idFragment: string,
+  options: Omit<SessionMetadataPageOptions, "cursor" | "limit" | "idFragment">,
+): SessionMeta[] {
+  const fragment = idFragment.trim();
+  if (!validSessionId(fragment)) return [];
+  const sessions = new Map<string, SessionMeta>();
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  for (;;) {
+    const page = listSessionMetadataPage({
+      ...options,
+      idFragment: fragment,
+      cursor,
+      limit: 2,
+    });
+    for (const meta of page.sessions) sessions.set(meta.id, meta);
+    if (sessions.size > 1 || !page.hasMore || !page.nextCursor) return [...sessions.values()];
+    if (seenCursors.has(page.nextCursor)) {
+      throw new Error("session metadata fragment lookup stopped making progress");
+    }
+    seenCursors.add(page.nextCursor);
+    cursor = page.nextCursor;
+  }
+}
+
+/** A prefix must be proven unique. Search a fixed number of bounded index pages; if older records remain,
+ * fail closed and ask for the full id instead of scanning every transcript or guessing uniqueness. */
+export function findSessionMetadataByPrefix(
+  idPrefix: string,
+): { sessions: SessionMeta[]; exhaustive: boolean } {
+  if (!validSessionId(idPrefix)) return { sessions: [], exhaustive: true };
+  const sessions = new Map<string, SessionMeta>();
+  const seenCursors = new Set<string>();
+  // Every current writer and compatibility migration publishes an eight-character short-id partition.
+  // Search that small collision domain to completion so every ID printed by Hara remains resolvable even
+  // after one long-lived session has accumulated many thousands of obsolete generation records.
+  const exhaustiveShortRoute = idPrefix.length >= 8;
+  let cursor: string | undefined;
+  for (
+    let pageNumber = 0;
+    exhaustiveShortRoute || pageNumber < MAX_SESSION_PREFIX_LOOKUP_PAGES;
+    pageNumber += 1
+  ) {
+    const page = listSessionMetadataPage({
+      idPrefix,
+      cursor,
+      limit: 2,
+      includeArchived: true,
+    });
+    for (const meta of page.sessions) sessions.set(meta.id, meta);
+    if (sessions.size > 1) return { sessions: [...sessions.values()], exhaustive: true };
+    if (!page.hasMore) return { sessions: [...sessions.values()], exhaustive: true };
+    cursor = page.nextCursor;
+    if (!cursor) break;
+    if (seenCursors.has(cursor)) {
+      throw new Error("session metadata prefix lookup stopped making progress");
+    }
+    seenCursors.add(cursor);
+  }
+  return { sessions: [...sessions.values()], exhaustive: false };
+}
+
+const activeSessionIndexMigrations = new Map<string, Promise<void>>();
+const initializedSessionIndexes = new Set<string>();
+
+function migrationMarker(): string {
+  return join(sessionIndexDir(), "legacy-migration.complete");
+}
+
+function migrationLock(): string {
+  return join(sessionIndexDir(), "legacy-migration.lock");
+}
+
+function currentWriterDirectoryMarker(): string {
+  return join(sessionIndexDir(), "current-writer-directory.json");
+}
+
+interface SessionIndexMigrationMarker {
+  version: number;
+  routeSchema: number;
+  completedAt: string;
+  sessionsDirectoryMtimeMs: number;
+  sessionsDirectoryCtimeMs: number;
+  inspected: number;
+  migrated: number;
+}
+
+interface CurrentWriterDirectoryMarker {
+  version: number;
+  routeSchema: number;
+  recordedAt: string;
+  sessionsDirectoryMtimeMs: number;
+}
+
+function readMigrationMarker(): SessionIndexMigrationMarker | null {
+  try {
+    const raw = readFileSync(migrationMarker(), "utf8");
+    if (Buffer.byteLength(raw, "utf8") > 16 * 1024) return null;
+    const marker = JSON.parse(raw) as Partial<SessionIndexMigrationMarker>;
+    return marker.version === SESSION_INDEX_VERSION
+      && marker.routeSchema === SESSION_INDEX_ROUTE_SCHEMA
+      && Number.isFinite(Date.parse(marker.completedAt ?? ""))
+      && typeof marker.sessionsDirectoryMtimeMs === "number"
+      && Number.isFinite(marker.sessionsDirectoryMtimeMs)
+      && typeof marker.sessionsDirectoryCtimeMs === "number"
+      && Number.isFinite(marker.sessionsDirectoryCtimeMs)
+      && Number.isSafeInteger(marker.inspected)
+      && marker.inspected! >= 0
+      && Number.isSafeInteger(marker.migrated)
+      && marker.migrated! >= 0
+      ? marker as SessionIndexMigrationMarker
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readCurrentWriterDirectoryMarker(): CurrentWriterDirectoryMarker | null {
+  try {
+    const raw = readFileSync(currentWriterDirectoryMarker(), "utf8");
+    if (Buffer.byteLength(raw, "utf8") > 4 * 1024) return null;
+    const marker = JSON.parse(raw) as Partial<CurrentWriterDirectoryMarker>;
+    return marker.version === SESSION_INDEX_VERSION
+      && marker.routeSchema === SESSION_INDEX_ROUTE_SCHEMA
+      && Number.isFinite(Date.parse(marker.recordedAt ?? ""))
+      && typeof marker.sessionsDirectoryMtimeMs === "number"
+      && Number.isFinite(marker.sessionsDirectoryMtimeMs)
+      ? marker as CurrentWriterDirectoryMarker
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function sessionDirectoryInfo(): Stats | null {
+  try {
+    const directory = lstatSync(sessionsDir());
+    return directory.isDirectory() && !directory.isSymbolicLink() ? directory : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True only when every directory-entry mutation since the last compatibility sweep was acknowledged by a
+ * current writer. An old writer that ran before this operation makes the precondition false, so a later
+ * current save cannot accidentally bless and hide that transcript. */
+function sessionDirectoryMatchesCurrentState(): boolean {
+  const marker = readMigrationMarker();
+  const directory = sessionDirectoryInfo();
+  if (!marker || !directory) return false;
+  if (directory.mtimeMs === marker.sessionsDirectoryMtimeMs) return true;
+  const current = readCurrentWriterDirectoryMarker();
+  return !!current
+    && Date.parse(current.recordedAt) >= Date.parse(marker.completedAt)
+    && directory.mtimeMs === current.sessionsDirectoryMtimeMs;
+}
+
+/** Best-effort acceleration only. A failed write leaves the next compatibility check conservative. */
+function writeCurrentWriterDirectoryMarker(): void {
+  const directory = sessionDirectoryInfo();
+  if (!directory) return;
+  const target = currentWriterDirectoryMarker();
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(tmp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify({
+      version: SESSION_INDEX_VERSION,
+      routeSchema: SESSION_INDEX_ROUTE_SCHEMA,
+      recordedAt: new Date().toISOString(),
+      sessionsDirectoryMtimeMs: directory.mtimeMs,
+    } satisfies CurrentWriterDirectoryMarker), "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, target);
+    chmodSync(target, 0o600);
+  } catch {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Keep the compatibility path conservative.
+      }
+    }
+  } finally {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // A unique unpublished temp file is inert.
+    }
+  }
+}
+
+/** Current Hara writers publish route intents themselves. A stable directory plus a durable completion
+ * marker makes ordinary launches O(1). Directory changes detect mixed-version writers promptly, while
+ * the daily interval remains a backstop for filesystems that do not expose a useful directory timestamp. */
+function sessionIndexCompatibilitySweepRequired(force = false): boolean {
+  if (force) return true;
+  const marker = readMigrationMarker();
+  if (!marker) return true;
+  const age = Date.now() - Date.parse(marker.completedAt);
+  if (age < 0 || age >= SESSION_INDEX_COMPATIBILITY_AUDIT_MS) return true;
+  return !sessionDirectoryMatchesCurrentState();
+}
+
+function sameLockRecord(left: LockRecord, right: LockRecord | null): boolean {
+  return !!right
+    && left.pid === right.pid
+    && left.startedAt === right.startedAt
+    && left.token === right.token;
+}
+
+/** Acquire the one-time import lock, reclaiming only a complete lock whose owner PID is proven dead.
+ * The token check prevents a late cleanup from unlinking a successor's lock. */
+function acquireSessionIndexMigrationLock(): (LockRecord & { token: string }) | null {
+  const lock = migrationLock();
+  const claim = newLockRecord();
+  try {
+    writeExclusive(lock, claim);
+    return claim;
+  } catch (error: any) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+
+  const observed = readLockRecord(lock);
+  if (!observed || pidAlive(observed.pid)) return null;
+  const reclaim = `${lock}.reclaim`;
+  const reclaimClaim = newLockRecord();
+  try {
+    writeExclusive(reclaim, reclaimClaim);
+  } catch {
+    return null;
+  }
+  try {
+    const current = readLockRecord(lock);
+    if (!sameLockRecord(observed, current) || !current || pidAlive(current.pid)) return null;
+    rmSync(lock);
+    writeExclusive(lock, claim);
+    return claim;
+  } finally {
+    const currentReclaim = readLockRecord(reclaim);
+    if (sameLockRecord(reclaimClaim, currentReclaim)) {
+      try {
+        rmSync(reclaim);
+      } catch {
+        // A surviving transition guard fails closed on the next attempt.
+      }
+    }
+  }
+}
+
+function releaseSessionIndexMigrationLock(claim: LockRecord & { token: string }): void {
+  const lock = migrationLock();
+  if (sameLockRecord(claim, readLockRecord(lock))) {
+    try {
+      rmSync(lock);
+    } catch {
+      // A later retry can reclaim this complete lock after the current process exits.
+    }
+  }
+}
+
+async function waitForMigrationOwner(): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const lock = migrationLock();
+    if (!existsSync(lock)) return;
+    const owner = readLockRecord(lock);
+    // A complete record whose owner exited can be reclaimed by the caller's next acquisition attempt.
+    // Requiring the dead process to have removed its lock would turn an ordinary crash into a 30s stall.
+    if (owner?.token && !pidAlive(owner.pid)) return;
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  throw new Error("session metadata index migration is still running; retry shortly");
+}
+
+function clearMigrationMarker(): void {
+  const marker = migrationMarker();
+  rmSync(marker, { force: true });
+  if (existsSync(marker)) {
+    throw new Error("could not invalidate the incomplete session metadata migration marker");
+  }
+}
+
+function legacySessionCandidate(id: string): SessionData | null {
+  const transcript = sessionFile(id);
+  let info: Stats;
+  try {
+    info = lstatSync(transcript);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_SESSION_FILE_BYTES) return null;
+  } catch {
+    return null;
+  }
+  // Route-aware current writers leave a generation-bound sidecar. Verify that generation against the
+  // small transcript prefix before parsing the full conversation. This keeps a mixed-writer directory
+  // audit proportional to metadata rather than transcript size.
+  const sidecar = readSessionMetadataSidecar(id, info.mtimeMs);
+  if (
+    sidecar?.generation
+    && readSessionGenerationPrefix(transcript, info) === sidecar.generation
+    && sidecar.routed
+  ) return null;
+  const data = readSessionFile(transcript);
+  if (data?.meta.id !== id) return null;
+  return data;
+}
+
+/** Convert a legacy transcript under its ordinary single-writer lock. Reusing the normal
+ * intent-before-rename generation protocol makes the conversion crash-idempotent: a pre-rename record is
+ * inert, and after the rename every older duplicate `legacy` record stops matching the authoritative file. */
+function migrateLegacySession(id: string): boolean {
+  if (!legacySessionCandidate(id)) return false;
+  const alreadyOwned = ownedLocks.has(id);
+  const lock = acquireSessionLock(id);
+  if (!lock.ok) return false;
+  try {
+    const data = legacySessionCandidate(id);
+    if (!data) return false;
+    const gatewayOwner =
+      (data.meta.source === "gateway" || (!data.meta.source && data.meta.sourceName))
+        ? gatewayOwnerFromSessionId(data.meta.id, data.meta.sourceName ?? "")
+        : undefined;
+    const needsGatewayOwner = !!gatewayOwner && data.meta.gatewayOwner !== gatewayOwner;
+    if (needsGatewayOwner) data.meta.gatewayOwner = gatewayOwner;
+    if (data.storageGeneration && !needsGatewayOwner) {
+      // The transcript is already generation-bound (for example, a candidate build that only had the
+      // global timeline). Merge the existing intent into every route without rewriting conversation data.
+      appendSessionIndexRecord({
+        v: 1,
+        id: data.meta.id,
+        generation: data.storageGeneration,
+        at: Date.parse(data.meta.updatedAt),
+      }, data.meta, true);
+      writeSessionMetadataSidecar(data.meta, data.storageGeneration);
+    } else {
+      persistSessionSnapshot(data.meta, data.history, data.task, data.meta.updatedAt);
+    }
+    return true;
+  } finally {
+    if (!alreadyOwned) releaseSessionLock(id);
+  }
+}
+
+/** A migration may race a live old writer or skip a transcript whose ordinary session lock is held. Make
+ * completion depend on a second authoritative candidate pass, not merely on finishing the first directory
+ * enumeration. Current route-aware writers are ignored by legacySessionCandidate and do not keep this open. */
+async function hasRemainingLegacySession(): Promise<boolean> {
+  const dir = await openDirAsync(sessionsDir());
+  let inspected = 0;
+  try {
+    for await (const entry of dir) {
+      if (!entry.isFile() || !isSessionTranscriptFileName(entry.name)) continue;
+      const id = entry.name.slice(0, -".json".length);
+      if (!validSessionId(id)) continue;
+      if (legacySessionCandidate(id)) return true;
+      inspected += 1;
+      if ((inspected & 15) === 0) {
+        await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+      }
+    }
+    return false;
+  } finally {
+    await dir.close().catch(() => {});
+  }
+}
+
+function writeMigrationMarker(inspected: number, migrated: number): void {
+  const target = migrationMarker();
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    const directory = lstatSync(sessionsDir());
+    fd = openSync(tmp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify({
+      version: SESSION_INDEX_VERSION,
+      routeSchema: SESSION_INDEX_ROUTE_SCHEMA,
+      completedAt: new Date().toISOString(),
+      sessionsDirectoryMtimeMs: directory.mtimeMs,
+      sessionsDirectoryCtimeMs: directory.ctimeMs,
+      inspected,
+      migrated,
+    }), "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, target);
+    chmodSync(target, 0o600);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // The marker is diagnostic; the generated transcript/index records are authoritative.
+    }
+  }
+}
+
+/** Compatibility import for pre-index and mixed-version writers. A durable marker makes normal launches
+ * O(1); persistent Serve calls `audit` frequently, but only the first check after the daily interval sweeps.
+ * `force` is reserved for an operator/test requesting an immediate complete compatibility import. */
+export function ensureSessionMetadataIndex(options: { force?: boolean; audit?: boolean } = {}): Promise<void> {
+  const root = sessionIndexDir();
+  const existing = activeSessionIndexMigrations.get(root);
+  if (existing) return existing;
+  if (
+    !options.force
+    && !options.audit
+    && initializedSessionIndexes.has(root)
+    && !sessionIndexCompatibilitySweepRequired()
+  ) return Promise.resolve();
+  const operation = (async (): Promise<boolean> => {
+    if (!sessionIndexCompatibilitySweepRequired(options.force)) return true;
+    for (;;) {
+      const claim = acquireSessionIndexMigrationLock();
+      if (!claim) {
+        await waitForMigrationOwner();
+        // A successful owner publishes a valid marker. If it exited after an error, do not bless this
+        // process as initialized: acquire the now-free lock and complete the migration ourselves.
+        if (!sessionIndexCompatibilitySweepRequired(options.force)) return true;
+        continue;
+      }
+      try {
+        const dir = await openDirAsync(sessionsDir());
+        let inspected = 0;
+        let migrated = 0;
+        const legacyCandidates: Array<{ id: string; at: number }> = [];
+        try {
+          for await (const entry of dir) {
+            if (!entry.isFile() || !isSessionTranscriptFileName(entry.name)) continue;
+            const id = entry.name.slice(0, -".json".length);
+            if (!validSessionId(id)) continue;
+            const candidate = legacySessionCandidate(id);
+            if (candidate) {
+              legacyCandidates.push({ id, at: Date.parse(candidate.meta.updatedAt) });
+            }
+            inspected += 1;
+            if ((inspected & 15) === 0) {
+              await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+            }
+          }
+        } finally {
+          await dir.close().catch(() => {});
+        }
+        // Reverse-tail paging relies on append order within one hourly shard. Directory enumeration has no
+        // timestamp guarantee, so publish legacy generations oldest-first; equal timestamps use id as a
+        // stable tie-breaker. Each migration rechecks under the session lock in case a current writer won.
+        legacyCandidates.sort((left, right) => left.at - right.at || left.id.localeCompare(right.id));
+        for (let index = 0; index < legacyCandidates.length; index += 1) {
+          if (migrateLegacySession(legacyCandidates[index]!.id)) migrated += 1;
+          if ((index & 15) === 15) {
+            await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+          }
+        }
+        if (await hasRemainingLegacySession()) {
+          // A live old writer or held session lock kept at least one candidate unsafe to rewrite. Remove any
+          // prior marker so the next call retries immediately instead of hiding it for the daily audit window.
+          clearMigrationMarker();
+          return false;
+        }
+        writeMigrationMarker(inspected, migrated);
+        return true;
+      } catch (error) {
+        try {
+          clearMigrationMarker();
+        } catch (markerError) {
+          throw new AggregateError(
+            [error, markerError],
+            "session metadata migration failed and its completion marker could not be invalidated",
+          );
+        }
+        throw error;
+      } finally {
+        releaseSessionIndexMigrationLock(claim);
+      }
+    }
+  })();
+  let tracked: Promise<void>;
+  tracked = operation.then(
+    (complete) => {
+      if (complete) initializedSessionIndexes.add(root);
+      else initializedSessionIndexes.delete(root);
+      if (activeSessionIndexMigrations.get(root) === tracked) activeSessionIndexMigrations.delete(root);
+    },
+    (error) => {
+      if (activeSessionIndexMigrations.get(root) === tracked) activeSessionIndexMigrations.delete(root);
+      throw error;
+    },
+  );
+  activeSessionIndexMigrations.set(root, tracked);
+  return tracked;
+}
+
 export function latestForCwd(cwd: string): SessionData | null {
-  const [m] = listSessions(cwd);
+  const [m] = recentSessionMetadata({ cwd, sources: ["interactive"], limit: 1 });
+  return m ? loadSession(m.id) : null;
+}
+
+/** Latest session of any source. Use only where the newest activity itself is the signal; implicit human
+ * resume must use `latestForCwd`, which deliberately cannot cross into an automation audience. */
+export function latestAnyForCwd(cwd: string): SessionData | null {
+  const [m] = recentSessionMetadata({ cwd, limit: 1 });
   return m ? loadSession(m.id) : null;
 }
