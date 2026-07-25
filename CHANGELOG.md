@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.8 — 2026-07-25 — stable single-line status footer
+
+- The interactive status footer now derives its workspace-path budget from the actual terminal width,
+  model, route, usage, and context fields. Long worktree paths are shortened before layout, so the
+  atomic `ctx N%` indicator stays on one row instead of splitting at the right edge.
+- Adds a deterministic regression using the macOS release-runner workspace path. This supersedes
+  0.134.7, whose npm package was published but whose signed binaries and container were blocked by the
+  footer-layout release gate.
+- Includes the secure Desktop automation controls, bounded session index, Windows profile isolation,
+  and mixed-version session migration from 0.134.7.
+- Upgrade with `npm i -g @nanhara/hara@0.134.8`.
+
 ## 0.134.7 — 2026-07-25 — secure Desktop automation control
 
 - Serve automation listings now expose only a structured, redacted delivery description. Webhook

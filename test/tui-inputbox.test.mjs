@@ -50,6 +50,22 @@ test("InputBox: active mode reads from the footer + usage is formatted", () => {
   unmount();
 });
 
+test("InputBox: a long workspace path cannot split the ctx field across footer rows", () => {
+  const status = { sessionName: "s", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
+  const { lastFrame, unmount } = render(
+    React.createElement(InputBox, {
+      status,
+      cwd: "/Users/runner/work/hara/hara",
+      model: "glm-5",
+      width: 64,
+    }),
+  );
+  const footer = strip(lastFrame()).split("\n").find((line) => line.includes("glm-5 · suggest"));
+  assert.ok(footer, "status footer rendered");
+  assert.ok(footer.includes("ctx 0%"), "ctx field stays intact on the status footer row");
+  unmount();
+});
+
 test("InputBox: carries no working/mode chrome of its own (lives in App's constant status slot)", () => {
   const status = { sessionName: "s", approval: "suggest", input: 0, output: 0, ctxPct: 0, agents: 0 };
   const { lastFrame, unmount } = render(React.createElement(InputBox, { status, cwd, model: "glm-5", width: 72 }));

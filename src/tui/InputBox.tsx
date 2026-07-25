@@ -773,7 +773,13 @@ export function InputBox({
   // with `borderTop={false}` so the hand-drawn TopBorder (with the session title) supplies the top edge
   // + corners and everything aligns column-for-column.
   const innerW = Math.max(1, w - 4);
-  const cwdShort = footerCwd(cwd);
+  // Keep the status footer on one row for ordinary model/route names. `footerCwd` has a generous
+  // standalone default, but the available room is narrower once model, usage, and ctx are present.
+  // Derive the cwd budget from the actual footer width so a long CI/worktree path cannot split an
+  // atomic field such as `ctx 0%` across rows.
+  const footerFixedCells = cells(footerLine(model, status, "", route));
+  const cwdMaxCells = Math.max(4, Math.min(28, w - footerFixedCells));
+  const cwdShort = footerCwd(cwd, process.env.HOME ?? "", cwdMaxCells);
   return (
     <Box flexDirection="column" width={w}>
       <TopBorder name={status.sessionName || "session"} width={w} />
