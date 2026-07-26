@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { describeImages, locateImage, DESCRIBE_SYSTEM, SCREENSHOT_SYSTEM, classifyVision, parseLocate } from "../dist/vision.js";
+import {
+  describeImages,
+  effectiveAttachmentCapabilities,
+  locateImage,
+  DESCRIBE_SYSTEM,
+  SCREENSHOT_SYSTEM,
+  classifyVision,
+  parseLocate,
+} from "../dist/vision.js";
 
 test("parseLocate: grounding coords (per-mille / percent / fraction) → 0..1 fractions", () => {
   assert.deepEqual(parseLocate('{"x": 500, "y": 250}'), { x: 0.5, y: 0.25 }); // per-mille
@@ -69,6 +77,35 @@ test("classifyVision: per-model overrides win and don't leak across models", () 
   assert.equal(classifyVision("openai", "glm-5", { "glm-5": "yes" }), "vision");
   assert.equal(classifyVision("openai", "glm-5", { "glm-5": "no" }), "text");
   assert.equal(classifyVision("openai", "deepseek-chat", { "glm-5": "yes" }), "text");
+});
+
+test("effective attachment capabilities distinguish native, sidecar, unsupported, and unknown image routes", () => {
+  assert.deepEqual(
+    effectiveAttachmentCapabilities("openai", "gpt-5.4"),
+    {
+      image: { mode: "native" },
+      textFile: "inline-text",
+      directory: "bounded-inventory-and-tools",
+      binaryFile: "agent-tool",
+    },
+  );
+  assert.deepEqual(
+    effectiveAttachmentCapabilities("openai", "deepseek-v4-pro", {}, "qwen3.7-plus"),
+    {
+      image: { mode: "vision-sidecar", viaModel: "qwen3.7-plus" },
+      textFile: "inline-text",
+      directory: "bounded-inventory-and-tools",
+      binaryFile: "agent-tool",
+    },
+  );
+  assert.equal(
+    effectiveAttachmentCapabilities("openai", "deepseek-v4-pro").image.mode,
+    "unsupported",
+  );
+  assert.equal(
+    effectiveAttachmentCapabilities("openai", "unlisted-private-model").image.mode,
+    "unknown",
+  );
 });
 
 function fakeProvider(result) {

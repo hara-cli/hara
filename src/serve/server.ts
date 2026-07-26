@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { basename, isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { runAgent, type RunOpts } from "../agent/loop.js";
 import {
@@ -41,14 +41,23 @@ import { resetRepeatGuard } from "../agent/repeat-guard.js";
 import { contextWindow, ctxPctFor } from "../statusbar.js";
 import { listProjectFilesAsync } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
-import type { Provider, NeutralMsg } from "../providers/types.js";
+import type {
+  ImageAttachment,
+  NeutralMsg,
+  Provider,
+  UserAttachmentView,
+} from "../providers/types.js";
 import type { GatewayStatus } from "../gateway/serve.js";
 import type { GatewayLoginSnapshot } from "../gateway/login.js";
 import type { UiSink } from "../tools/registry.js";
 import type { ApprovalMode } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
 import { loadAgentContext } from "../context/agents-md.js";
-import { expandMentionsAsync } from "../context/mentions.js";
+import {
+  expandExplicitAttachmentsAsync,
+  expandMentionsAsync,
+} from "../context/mentions.js";
+import type { EffectiveAttachmentCapabilities } from "../vision.js";
 import { memoryDigest } from "../memory/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled, panelsForProject } from "../plugins/plugins.js";
 import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
@@ -115,6 +124,11 @@ import {
   taskExecutionContext,
   type TaskInteraction,
 } from "../session/task.js";
+import {
+  validateSessionAttachments,
+  type SessionAttachmentIntent,
+  type ValidatedSessionAttachments,
+} from "./attachments.js";
 
 /** What the CLI entry injects (built in index.ts, where config/providers/guardian already live). */
 export interface ServeDeps {
@@ -126,6 +140,17 @@ export interface ServeDeps {
   buildProviderFor?: (model: string, effort?: string, cwd?: string, profileId?: string) => Promise<Provider | null>;
   /** live model list from the endpoint (may be empty — not every endpoint enumerates) */
   listModels?: (cwd?: string, profileId?: string) => Promise<string[]>;
+  /** Normalize image input for the session's pinned model: keep native images or translate them
+   * through a configured vision sidecar. The callback is identity-aware and must never reroute profiles. */
+  prepareImages?: (
+    images: ImageAttachment[],
+    opts: {
+      cwd: string;
+      model: string;
+      profileId?: string;
+      signal: AbortSignal;
+    },
+  ) => Promise<{ images?: ImageAttachment[]; description?: string; viaModel?: string }>;
   /** Redacted provider/local-model control plane for Desktop settings. Credentials are accepted only by
    * save/test and must never be returned by these callbacks. */
   providerSettings?: (cwd?: string) => ProviderSettingsState;
@@ -158,6 +183,8 @@ export interface ServeDeps {
     effortLevels?: string[];
     /** Finite server-authorized set for a scoped gateway token. Missing means unconstrained discovery. */
     availableModels?: string[];
+    /** Effective Hara input chain, including a configured vision sidecar when present. */
+    attachmentCapabilities?: EffectiveAttachmentCapabilities;
   };
   /** Per-project lifecycle limits, read at turn start so persistent Desktop sessions pick up config edits. */
   runLimits?: (cwd?: string) => { timeoutMs: number; maxRounds: number };
@@ -483,17 +510,32 @@ export function lastAssistantText(history: NeutralMsg[]): string {
   return "";
 }
 
+export interface ClientHistoryMessage {
+  role: string;
+  text: string;
+  attachments?: UserAttachmentView[];
+}
+
 /** Compact history for session.resume — enough for a client to render the transcript. */
-export function historyForClient(history: NeutralMsg[]): { role: string; text: string }[] {
-  const out: { role: string; text: string }[] = [];
+export function historyForClient(history: NeutralMsg[]): ClientHistoryMessage[] {
+  const out: ClientHistoryMessage[] = [];
   for (const m of history) {
     if (m.role === "user") {
       const steeringPrefix = `${INTERJECT_PREFIX}\n\n`;
+      const attachments = m.attachments ?? m.images?.map((image): UserAttachmentView => ({
+        kind: "image",
+        name: basename(image.path),
+        mediaType: image.mediaType,
+        strategy: "native-image",
+      }));
       out.push({
         role: "user",
-        text: m.content.startsWith(steeringPrefix)
-          ? m.content.slice(steeringPrefix.length)
-          : m.content,
+        text: m.displayContent ?? (
+          m.content.startsWith(steeringPrefix)
+            ? m.content.slice(steeringPrefix.length)
+            : m.content
+        ),
+        ...(attachments?.length ? { attachments } : {}),
       });
     }
     else if (m.role === "assistant" && m.text) out.push({ role: "assistant", text: m.text });
@@ -744,6 +786,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     profileId?: string;
     effortLevels: string[];
     availableModels?: string[];
+    attachmentCapabilities?: EffectiveAttachmentCapabilities;
   } => {
     const live = deps.runtimeInfo?.(cwd, model, profileId);
     return {
@@ -752,6 +795,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       ...(live?.profileId ? { profileId: live.profileId } : profileId ? { profileId } : {}),
       effortLevels: live?.effortLevels ?? deps.effortLevels ?? [],
       ...(live?.availableModels ? { availableModels: live.availableModels } : {}),
+      ...(live?.attachmentCapabilities
+        ? { attachmentCapabilities: live.attachmentCapabilities }
+        : {}),
     };
   };
   const refreshSessionProvider = async (session: ServeSession): Promise<boolean> => {
@@ -919,8 +965,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const runTurn = async (
     s: ServeSession,
     text: string,
-    images?: { path: string; mediaType: string }[],
+    attachments: ValidatedSessionAttachments = { images: [], contexts: [], views: [] },
     forceNewTask = false,
+    displayText = text,
   ): Promise<{
     reply: string;
     usage: { input: number; output: number };
@@ -1063,6 +1110,44 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       // desktop composer's "/" popup triggers the exact behavior the terminal gets. Unknown ids fall
       // through as plain text (the model sees what the user typed).
       let content = text;
+      let preparedImages = attachments.images;
+      let attachmentViews = attachments.views;
+      let imageDescription: string | undefined;
+      let imageContext = "";
+      if (preparedImages.length) {
+        const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId);
+        const imageMode = runtime.attachmentCapabilities?.image.mode;
+        if (deps.prepareImages) {
+          const prepared = await deps.prepareImages(preparedImages, {
+            cwd: s.meta.cwd,
+            model: s.meta.model,
+            profileId: s.meta.profileId,
+            signal: turnAbort.signal,
+          });
+          preparedImages = prepared.images ?? [];
+          imageDescription = prepared.description?.trim() || undefined;
+          if (imageDescription) {
+            const viaModel = prepared.viaModel
+              ?? runtime.attachmentCapabilities?.image.viaModel
+              ?? "vision model";
+            attachmentViews = attachmentViews.map((attachment) =>
+              attachment.kind === "image"
+                ? { ...attachment, strategy: "vision-sidecar" }
+                : attachment,
+            );
+            imageContext = (
+              `\n\n[Attached image description — read by ${viaModel} for ` +
+              `${s.meta.model}]\n${imageDescription}`
+            );
+          }
+        } else if (imageMode === "unsupported" || imageMode === "unknown") {
+          throw new Error(
+            imageMode === "unsupported"
+              ? `model '${s.meta.model}' cannot read images and no vision sidecar is configured`
+              : `image capability for model '${s.meta.model}' is unknown; configure a vision model or a modelVision override before sending images`,
+          );
+        }
+      }
       const slash = /^\/([a-z0-9][\w-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());
       if (slash) {
         const sk = loadSkillIndex(s.meta.cwd).find((k) => k.id === slash[1]);
@@ -1071,9 +1156,24 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           content = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest ? ` — request: ${rest}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
         }
       }
+      // A recognized slash skill replaces the user's raw command with its instructions. Append translated
+      // image context afterwards so a text-only main model does not lose the sidecar description.
+      content += imageContext;
+      content += await expandExplicitAttachmentsAsync(
+        attachments.contexts,
+        s.meta.cwd,
+        { signal: turnAbort.signal },
+      );
       // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works).
       // Pasted images ride along as NeutralMsg.images — a vision-capable model sees them inline.
-      s.history.push({ role: "user", content: await expandMentionsAsync(content, s.meta.cwd, { signal: turnAbort.signal }), ...(images && images.length ? { images } : {}) });
+      s.history.push({
+        role: "user",
+        content: await expandMentionsAsync(content, s.meta.cwd, { signal: turnAbort.signal }),
+        displayContent: displayText,
+        ...(preparedImages.length ? { images: preparedImages } : {}),
+        ...(attachmentViews.length ? { attachments: attachmentViews } : {}),
+        ...(imageDescription ? { imageDescription } : {}),
+      });
       let outcome;
       do {
         outcome = await runAgent(s.history, {
@@ -1332,7 +1432,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             provider: runtime.providerId,
             model: runtime.model,
             setupState,
-            capabilities: { methods, events: ["event.task_state"] },
+            capabilities: {
+              methods,
+              events: ["event.task_state"],
+              features: ["composer.attachments.v1", "models.capabilities.v1"],
+            },
           }));
         }
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
@@ -1456,14 +1560,39 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }));
           }
           case "session.send": {
-            if (typeof p.sessionId !== "string" || typeof p.text !== "string" || !p.text) return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
+            if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
+            }
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId} — session.create/resume first`));
             if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "this session is busy or changing configuration"));
-            const images = Array.isArray(p.images)
-              ? p.images.filter((im: any) => im && typeof im.path === "string").map((im: any) => ({ path: im.path, mediaType: typeof im.mediaType === "string" ? im.mediaType : "image/png" }))
-              : undefined;
-            const r = await runTurn(s, p.text, images, p.newTask === true);
+            if (p.images !== undefined && !Array.isArray(p.images)) {
+              return reply(rpcError(id, ERR.PARAMS, "images must be an array"));
+            }
+            if (p.attachments !== undefined && !Array.isArray(p.attachments)) {
+              return reply(rpcError(id, ERR.PARAMS, "attachments must be an array"));
+            }
+            const intents: SessionAttachmentIntent[] = [
+              ...((p.attachments ?? []) as SessionAttachmentIntent[]),
+              ...((p.images ?? []).map((image: any) => ({
+                kind: "image" as const,
+                path: image?.path,
+                ...(typeof image?.mediaType === "string" ? { mediaType: image.mediaType } : {}),
+              }))),
+            ];
+            if (!p.text.trim() && intents.length === 0) {
+              return reply(rpcError(id, ERR.PARAMS, "text or at least one attachment is required"));
+            }
+            let validated: ValidatedSessionAttachments;
+            try {
+              validated = validateSessionAttachments(s.meta.cwd, intents);
+            } catch (error: any) {
+              return reply(rpcError(id, ERR.PARAMS, String(error?.message ?? error)));
+            }
+            const text = p.text.trim()
+              ? p.text
+              : "Please inspect the attached context and tell me what you find.";
+            const r = await runTurn(s, text, validated, p.newTask === true, p.text);
             return reply(rpcResult(id!, r));
           }
           case "session.steer": {
@@ -1581,12 +1710,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const models = defaultRuntime.availableModels?.length
               ? [...defaultRuntime.availableModels]
               : discoveredModels;
+            const entries = [...new Set([current, ...models])].map((model) => {
+              const modelRuntime = runtimeInfo(targetCwd, model, profileId);
+              return {
+                id: model,
+                providerId: modelRuntime.providerId,
+                effortLevels: modelRuntime.effortLevels ?? [],
+                attachmentCapabilities: modelRuntime.attachmentCapabilities,
+              };
+            });
             return reply(rpcResult(id!, {
               models,
+              entries,
               current,
               profileId: savedMeta?.profileId ?? defaultRuntime.profileId,
               effort: session?.effort ?? savedMeta?.effort ?? null,
               effortLevels: currentRuntime.effortLevels,
+              attachmentCapabilities: currentRuntime.attachmentCapabilities,
             }));
           }
           case "settings.providers.list": {
@@ -1723,6 +1863,24 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             if (effort && !requestedRuntime.effortLevels.includes(effort)) {
               return reply(rpcError(id, ERR.PARAMS, `thinking effort '${effort}' is not supported by model '${model}'`));
+            }
+            const hasRawImageHistory = s.history.some(
+              (message) => message.role === "user" && Boolean(message.images?.length),
+            );
+            const requestedImageMode = requestedRuntime.attachmentCapabilities?.image.mode;
+            if (
+              hasRawImageHistory
+              && requestedImageMode !== undefined
+              && requestedImageMode !== "native"
+            ) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                (
+                  `model '${model}' cannot continue this session because its history contains ` +
+                  "native image attachments; start a new session or choose an image-native model"
+                ),
+              ));
             }
             s.configuring = true;
             try {

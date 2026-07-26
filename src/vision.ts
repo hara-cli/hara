@@ -6,6 +6,21 @@ import type { ImageAttachment, Provider } from "./providers/types.js";
 import { boundedProviderTurn } from "./providers/bounded-turn.js";
 
 export type VisionCap = "vision" | "text" | "unknown";
+export type ImageInputMode = "native" | "vision-sidecar" | "unsupported" | "unknown";
+
+export interface EffectiveAttachmentCapabilities {
+  image: {
+    mode: ImageInputMode;
+    /** Present only when a configured vision sidecar will translate images for the main model. */
+    viaModel?: string;
+  };
+  /** Text/code attachments are expanded locally before the provider request. */
+  textFile: "inline-text";
+  /** Directories contribute a bounded inventory; the agent reads individual files with local tools. */
+  directory: "bounded-inventory-and-tools";
+  /** Binary documents need a document/artifact tool rather than pretending the model received bytes. */
+  binaryFile: "agent-tool";
+}
 
 // Built-in capability map for the major model families. First matching rule wins, so each family's
 // vision pattern is listed BEFORE its text catch-all. Anything that matches nothing → "unknown"
@@ -58,6 +73,33 @@ export function classifyVision(provider: string, model: string, overrides: Recor
   const m = model || "";
   for (const r of MODEL_VISION_MAP) if (r.rx.test(m)) return r.cap;
   return "unknown";
+}
+
+/**
+ * Resolve the complete image-processing route exposed to persistent clients.
+ * This is deliberately different from a model-only `vision` boolean: a text-only
+ * main model can still accept an image when Hara has a configured vision sidecar.
+ */
+export function effectiveAttachmentCapabilities(
+  provider: string,
+  model: string,
+  overrides: Record<string, "yes" | "no"> = {},
+  visionModel?: string,
+): EffectiveAttachmentCapabilities {
+  const native = classifyVision(provider, model, overrides);
+  const image = native === "vision"
+    ? { mode: "native" as const }
+    : visionModel
+      ? { mode: "vision-sidecar" as const, viaModel: visionModel }
+      : native === "text"
+        ? { mode: "unsupported" as const }
+        : { mode: "unknown" as const };
+  return {
+    image,
+    textFile: "inline-text",
+    directory: "bounded-inventory-and-tools",
+    binaryFile: "agent-tool",
+  };
 }
 
 export const DESCRIBE_SYSTEM = [

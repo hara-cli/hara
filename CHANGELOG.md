@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.135.0 — 2026-07-26 — capability-aware Desktop attachments
+
+- Serve now negotiates a structured attachment protocol for images, files, and one-turn directory
+  context. Attachment-only turns work without a placeholder typed by the user, filenames with spaces
+  and non-ASCII characters remain exact, and old clients keep their legacy image contract.
+- The engine is authoritative for attachment safety: it rejects protected files and symlinks, derives
+  PNG/JPEG/GIF/WebP types from file bytes instead of trusting the renderer, bounds item/image sizes,
+  limits directory inventories, and enforces one aggregate text-context budget. Binary documents remain
+  honest local tool references rather than being presented to the model as already read.
+- Model discovery now describes the effective image route as native, vision-sidecar, unsupported, or
+  unknown. Text-only models can use a configured, session-bound vision helper without moving the
+  conversation to another organization connection; native image history cannot be switched into a
+  model that cannot continue it.
+- Persisted renderer history contains only display text and path-free attachment metadata. Expanded
+  local paths and file contents stay on the private engine/model boundary, while a vision-sidecar turn
+  persists its description instead of retaining raw image input.
+- Upgrade with `npm i -g @nanhara/hara@0.135.0`.
+
 ## 0.134.9 — 2026-07-26 — reliable Windows external-agent launch
 
 - External-agent availability probes and task execution now use a cross-platform process launcher,

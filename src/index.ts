@@ -4,7 +4,13 @@ import { createInterface } from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
 import { runTui, askConfirm } from "./tui/run.js";
 import { readClipboardImage, mediaTypeFor } from "./images.js";
-import { describeImages, locateImage, classifyVision, SCREENSHOT_SYSTEM } from "./vision.js";
+import {
+  describeImages,
+  effectiveAttachmentCapabilities,
+  locateImage,
+  classifyVision,
+  SCREENSHOT_SYSTEM,
+} from "./vision.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir, readRecentLogs, scaffoldMemory, type Scope } from "./memory/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
@@ -2671,6 +2677,50 @@ program
           const target = resolveByokProviderTarget(live, profile, false);
           return listModels(target.baseURL, target.apiKey ?? "");
         },
+        prepareImages: async (images, opts) => {
+          const live = loadConfig({ cwd: opts.cwd });
+          const profile = opts.profileId
+            ? profileByIdForConfig(live, opts.profileId)
+            : profileForConfig(live).profile;
+          if (!profile) {
+            throw new Error(
+              `session profile '${opts.profileId}' is no longer available; ` +
+              "re-enroll that connection or start a new session with an existing profile",
+            );
+          }
+          const target = profile.kind === "gateway"
+            ? { provider: "hara-gateway", model: opts.model }
+            : { ...resolveByokProviderTarget(live, profile, false), model: opts.model };
+          const native = classifyVision(target.provider, opts.model, live.modelVision);
+          if (native === "vision") return { images };
+          if (!live.visionModel) {
+            throw new Error(
+              native === "text"
+                ? `model '${opts.model}' cannot read images and no vision sidecar is configured`
+                : (
+                    `image capability for model '${opts.model}' is unknown; ` +
+                    "configure a vision model or a modelVision override before sending images"
+                  ),
+            );
+          }
+          const visionProvider = await buildProvider(live, {
+            model: live.visionModel,
+            ...(live.visionBaseURL ? { baseURL: live.visionBaseURL } : {}),
+            ...(live.visionApiKey ? { apiKey: live.visionApiKey } : {}),
+          }, opts.profileId);
+          if (!visionProvider) {
+            throw new Error(
+              `vision sidecar '${live.visionModel}' is not authenticated for profile '${profile.id}'`,
+            );
+          }
+          const description = await describeImages(visionProvider, images, {
+            signal: opts.signal,
+          });
+          return {
+            description,
+            viaModel: live.visionModel,
+          };
+        },
         providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
         gatewayStatuses: async () => {
           const gateway = await import("./gateway/serve.js");
@@ -2794,6 +2844,12 @@ program
             model,
             profileId: profile.id,
             effortLevels: advertisedEfforts ?? inferredEfforts,
+            attachmentCapabilities: effectiveAttachmentCapabilities(
+              current.provider,
+              model,
+              live.modelVision,
+              live.visionModel,
+            ),
             ...(profile.kind === "gateway" && profile.availableModels?.length
               ? { availableModels: [...profile.availableModels] }
               : {}),

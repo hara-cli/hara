@@ -298,6 +298,11 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     }
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
+    assert.deepEqual(
+      init.result.capabilities.features,
+      ["composer.attachments.v1", "models.capabilities.v1"],
+      "persistent clients can negotiate structured attachments and model capability descriptors",
+    );
     for (const method of [
       "artifact.import",
       "artifact.commit",
@@ -810,6 +815,12 @@ test("serve e2e: models.list derives reasoning controls from the session-pinned 
         providerId: "qwen",
         model: selected,
         effortLevels: selected === "qwen3-coder-next" ? [] : ["low", "medium", "high"],
+        attachmentCapabilities: {
+          image: { mode: selected === "qwen3-coder-next" ? "unknown" : "native" },
+          textFile: "inline-text",
+          directory: "bounded-inventory-and-tools",
+          binaryFile: "agent-tool",
+        },
       };
     },
   };
@@ -824,7 +835,198 @@ test("serve e2e: models.list derives reasoning controls from the session-pinned 
     const listed = await c.call("models.list", { sessionId: sid });
     assert.equal(listed.result.current, "qwen3-coder-next");
     assert.deepEqual(listed.result.effortLevels, [], "a coder model without thinking controls must not inherit the configured default model's dial");
+    assert.equal(listed.result.attachmentCapabilities.image.mode, "unknown");
+    assert.equal(
+      listed.result.entries.find((entry) => entry.id === "qwen3.7-plus").attachmentCapabilities.image.mode,
+      "native",
+    );
+    assert.equal(
+      listed.result.entries.find((entry) => entry.id === "qwen3-coder-next").attachmentCapabilities.image.mode,
+      "unknown",
+    );
     assert.ok(runtimeRequests.some((request) => request.model === "qwen3-coder-next"));
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: structured attachments support image-only turns and expose path-free history", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-attachments-"));
+  const store = memStore();
+  const imagePath = join(dir, "界面 截图.png");
+  const filePath = join(dir, "需求 说明.txt");
+  const folderPath = join(dir, "参考 目录");
+  writeFileSync(
+    imagePath,
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]),
+  );
+  writeFileSync(filePath, "attachment text");
+  mkdirSync(folderPath);
+  writeFileSync(join(folderPath, "notes.md"), "# Folder note");
+  let providerHistory = [];
+  const provider = {
+    ...textProvider,
+    model: "image-native",
+    async turn({ history, onText }) {
+      providerHistory = structuredClone(history);
+      onText("inspected");
+      return {
+        text: "inspected",
+        toolUses: [],
+        stop: "end",
+        usage: { input: 1, output: 1 },
+      };
+    },
+  };
+  const capabilitiesFor = (model) => ({
+    image: { mode: model === "image-native" ? "native" : "unsupported" },
+    textFile: "inline-text",
+    directory: "bounded-inventory-and-tools",
+    binaryFile: "agent-tool",
+  });
+  const deps = {
+    ...baseDeps(provider, store),
+    buildProviderFor: async (model) => ({ ...provider, model }),
+    prepareImages: async (images) => ({ images }),
+    runtimeInfo: (_cwd, model) => ({
+      providerId: "fake",
+      model: model ?? "image-native",
+      effortLevels: [],
+      attachmentCapabilities: capabilitiesFor(model ?? "image-native"),
+    }),
+  };
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    deps,
+  );
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const sid = (await c.call("session.create", {})).result.sessionId;
+    const sent = await c.call("session.send", {
+      sessionId: sid,
+      text: "",
+      attachments: [
+        { kind: "image", path: imagePath, mediaType: "image/jpeg" },
+        { kind: "file", path: filePath },
+        { kind: "directory", path: folderPath },
+      ],
+    });
+    assert.equal(sent.result.reply, "inspected");
+    const user = providerHistory.findLast((message) => message.role === "user");
+    assert.equal(user.images[0].mediaType, "image/png", "Serve trusts image bytes, not client MIME");
+    assert.match(user.content, /Please inspect the attached context/);
+    assert.match(user.content, /attachment text/);
+    assert.match(user.content, /notes\.md/);
+
+    const persistedUser = store.saved.get(sid).history.findLast((message) => message.role === "user");
+    assert.equal(persistedUser.displayContent, "");
+    assert.deepEqual(
+      persistedUser.attachments.map((attachment) => attachment.kind),
+      ["image", "file", "directory"],
+      "display-only metadata stays in Hara history instead of leaking into provider payloads",
+    );
+    const clientHistory = historyForClient([persistedUser]);
+    assert.deepEqual(
+      clientHistory[0].attachments.map((attachment) => attachment.name),
+      ["界面 截图.png", "需求 说明.txt", "参考 目录"],
+    );
+    assert.equal(
+      JSON.stringify(clientHistory).includes(dir),
+      false,
+      "absolute attachment paths never cross the renderer boundary",
+    );
+
+    const incompatible = await c.call("session.set-model", {
+      sessionId: sid,
+      model: "text-only",
+    });
+    assert.equal(incompatible.error.code, -32602);
+    assert.match(incompatible.error.message, /history contains native image attachments/);
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: a vision sidecar persists its description instead of raw images", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-sidecar-image-"));
+  const store = memStore();
+  mkdirSync(join(dir, ".git"));
+  const skillDir = join(dir, ".hara", "skills", "inspect-image");
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(
+    join(skillDir, "SKILL.md"),
+    "---\nname: inspect-image\ndescription: Inspect an attached image\n---\n\nUse all supplied visual evidence.",
+  );
+  const imagePath = join(dir, "diagram.png");
+  writeFileSync(
+    imagePath,
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]),
+  );
+  let providerHistory = [];
+  const provider = {
+    ...textProvider,
+    model: "text-main",
+    async turn({ history, onText }) {
+      providerHistory = structuredClone(history);
+      onText("understood");
+      return {
+        text: "understood",
+        toolUses: [],
+        stop: "end",
+        usage: { input: 1, output: 1 },
+      };
+    },
+  };
+  const deps = {
+    ...baseDeps(provider, store),
+    prepareImages: async (images, opts) => {
+      assert.equal(images.length, 1);
+      assert.equal(opts.model, "text-main");
+      return {
+        description: "A sequence diagram with three participants.",
+        viaModel: "vision-helper",
+      };
+    },
+    runtimeInfo: (_cwd, model) => ({
+      providerId: "fake",
+      model: model ?? "text-main",
+      effortLevels: [],
+      attachmentCapabilities: {
+        image: { mode: "vision-sidecar", viaModel: "vision-helper" },
+        textFile: "inline-text",
+        directory: "bounded-inventory-and-tools",
+        binaryFile: "agent-tool",
+      },
+    }),
+  };
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    deps,
+  );
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const sid = (await c.call("session.create", {})).result.sessionId;
+    const sent = await c.call("session.send", {
+      sessionId: sid,
+      text: "/inspect-image",
+      images: [{ path: imagePath, mediaType: "image/jpeg" }],
+    });
+    assert.equal(sent.result.reply, "understood");
+    const user = providerHistory.findLast((message) => message.role === "user");
+    assert.equal(user.images, undefined);
+    assert.match(user.content, /Use all supplied visual evidence/);
+    assert.match(user.content, /read by vision-helper/);
+    assert.match(user.content, /three participants/);
+    const persistedUser = store.saved.get(sid).history.findLast((message) => message.role === "user");
+    assert.equal(persistedUser.images, undefined);
+    assert.equal(persistedUser.imageDescription, "A sequence diagram with three participants.");
+    assert.equal(persistedUser.attachments[0].strategy, "vision-sidecar");
   } finally {
     c.close();
     await srv.close();

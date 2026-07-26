@@ -5,9 +5,29 @@ export type ToolResult = { id: string; name: string; content: string; isError?: 
 /** An image the user attached to a turn. Only the path rides in history (sessions stay small); the
  *  bytes are read + base64-encoded by each provider at request time. */
 export type ImageAttachment = { path: string; mediaType: string };
+/** Safe, display-only attachment metadata. Absolute local paths never cross back to a renderer. */
+export type UserAttachmentView = {
+  kind: "image" | "file" | "directory";
+  name: string;
+  mediaType?: string;
+  byteSize?: number;
+  strategy:
+    | "native-image"
+    | "vision-sidecar"
+    | "inline-or-agent-tool"
+    | "directory-inventory";
+};
 
 export type NeutralMsg =
-  | { role: "user"; content: string; images?: ImageAttachment[] }
+  | {
+      role: "user";
+      content: string;
+      /** Original renderer-safe text before @mentions, skills, and attachment context are expanded. */
+      displayContent?: string;
+      images?: ImageAttachment[];
+      attachments?: UserAttachmentView[];
+      imageDescription?: string;
+    }
   | { role: "assistant"; text: string; toolUses: ToolUse[] }
   | { role: "tool"; results: ToolResult[] };
 

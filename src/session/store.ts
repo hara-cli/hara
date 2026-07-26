@@ -1179,14 +1179,44 @@ function isNeutralMessage(value: unknown): value is NeutralMsg {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const message = value as Record<string, unknown>;
   if (message.role === "user") {
-    return typeof message.content === "string" && (
-      message.images === undefined || (
+    const validImages = message.images === undefined || (
         Array.isArray(message.images) && message.images.every((image) => {
           if (!image || typeof image !== "object" || Array.isArray(image)) return false;
           const attachment = image as Record<string, unknown>;
           return typeof attachment.path === "string" && typeof attachment.mediaType === "string";
         })
-      )
+      );
+    const validAttachments = message.attachments === undefined || (
+      Array.isArray(message.attachments) && message.attachments.every((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+        const attachment = item as Record<string, unknown>;
+        return (
+          (attachment.kind === "image" || attachment.kind === "file" || attachment.kind === "directory")
+          && typeof attachment.name === "string"
+          && (
+            attachment.strategy === "native-image"
+            || attachment.strategy === "vision-sidecar"
+            || attachment.strategy === "inline-or-agent-tool"
+            || attachment.strategy === "directory-inventory"
+          )
+          && (attachment.mediaType === undefined || typeof attachment.mediaType === "string")
+          && (
+            attachment.byteSize === undefined
+            || (
+              typeof attachment.byteSize === "number"
+              && Number.isSafeInteger(attachment.byteSize)
+              && attachment.byteSize >= 0
+            )
+          )
+        );
+      })
+    );
+    return (
+      typeof message.content === "string"
+      && (message.displayContent === undefined || typeof message.displayContent === "string")
+      && validImages
+      && validAttachments
+      && (message.imageDescription === undefined || typeof message.imageDescription === "string")
     );
   }
   if (message.role === "assistant") {

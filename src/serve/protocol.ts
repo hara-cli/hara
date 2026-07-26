@@ -4,7 +4,8 @@
 //
 // Client → server requests:
 //   initialize        {token,capabilities?}      → {name,version,protocol,cwd,provider,model,setupState,
-//                                                   capabilities:{methods:[…]}}  (feature detection)
+//                                                   capabilities:{methods:[…],events:[…],features:[…]}}
+//                                                   (additive feature detection)
 //   server.shutdown   {}                         → {accepted:true} (authenticated graceful local shutdown;
 //                                                   BUSY while any client work/approval is active)
 //   session.list      {cwd?,cursor?,limit?,archived?} → {sessions:[{id,title,cwd,model,profileId?,updatedAt}],
@@ -13,9 +14,12 @@
 //                                                        its own cursor under automation.list.
 //   session.create    {cwd?,approval?}           → {sessionId,model,profileId}
 //   session.resume    {sessionId}                → {sessionId,model,profileId,history:[{role,text}]}
-//   session.send      {sessionId,text,images?,newTask?} → (streams events, then) {reply,usage,taskId,turnId,status?,stopReason?}
+//   session.send      {sessionId,text,images?,attachments?,newTask?} → (streams events, then)
+//                                                             {reply,usage,taskId,turnId,status?,stopReason?}
 //   session.steer     {sessionId,text,expectedTurnId} → {accepted,taskId,turnId}
 //                      images: [{path,mediaType?}] — pasted screenshots etc., inlined for vision models
+//                      attachments: [{kind:"image"|"file"|"directory",path,mediaType?}]
+//                      File-picker paths avoid lossy @mention encoding; Serve enforces type/security limits.
 //   session.interrupt {sessionId}                → {}
 //   approval.reply    {approvalId,allow,always?}  → {}
 //   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
@@ -27,7 +31,9 @@
 //                                                    sessionPage:{hasMore,limit,nextCursor?},
 //                                                    scheduler:{installed,supported,platform,detail}}
 //                                                    Raw delivery targets are write-only and never returned.
-//   models.list       {sessionId?}                → {models:[…], current,profileId?,effortLevels:[…]}
+//   models.list       {sessionId?}                → {models:[…],entries:[{id,providerId,effortLevels,
+//                                                    attachmentCapabilities}],current,profileId?,
+//                                                    effortLevels:[…],attachmentCapabilities}
 //   settings.providers.list {}                    → redacted provider catalog + current profile state
 //   settings.providers.test {provider,model,…}     → {ok,models,error?} (credential is ephemeral)
 //   settings.providers.save {provider,model,…}     → redacted state (credential is never returned)

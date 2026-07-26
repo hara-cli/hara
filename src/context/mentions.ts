@@ -1,7 +1,7 @@
 // @file mentions — expand `@path` references in user input into appended file contents,
 // and provide fuzzy file candidates for REPL tab-completion.
 import { existsSync, lstatSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { listProjectFiles, dirPrefixes, walkFiles, walkFilesAsync, type FileWalkOptions } from "../fs-walk.js";
 import { fuzzyRank } from "../fuzzy.js";
 import { mediaTypeFor } from "../images.js";
@@ -15,6 +15,7 @@ import {
 } from "./workspace-scope.js";
 
 const MAX_FILE = 50_000;
+export const MAX_EXPLICIT_ATTACHMENT_CONTEXT_CHARS = 200_000;
 // @ at start-of-string or after whitespace; capture a path with no spaces/@ (avoids emails like a@b.com)
 const MENTION_RE = /(?:^|\s)@([^\s@]+)/g;
 
@@ -100,7 +101,74 @@ export async function expandMentionsAsync(
   return output + input.slice(copiedThrough);
 }
 
-async function expandRefAsync(ref: string, cwd: string, options: FileWalkOptions): Promise<string | null> {
+export interface ExplicitContextAttachment {
+  kind: "file" | "directory";
+  path: string;
+}
+
+/**
+ * Expand file-picker attachments without encoding their path into `@mention`
+ * syntax. This keeps spaces and non-ASCII names lossless while preserving the
+ * same sensitive-file, directory-budget, and cancellation boundaries.
+ */
+export async function expandExplicitAttachmentsAsync(
+  attachments: ExplicitContextAttachment[],
+  cwd: string,
+  options: FileWalkOptions = {},
+): Promise<string> {
+  if (!attachments.length) return "";
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.max(0, Math.floor(options.timeoutMs!))
+    : 2_000;
+  const startedAt = Date.now();
+  const blocks: string[] = [];
+  let contextChars = 0;
+  for (const attachment of attachments) {
+    if (options.signal?.aborted) {
+      throw options.signal.reason instanceof Error
+        ? options.signal.reason
+        : new Error("attachment expansion cancelled");
+    }
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) {
+      blocks.push(
+        `Attached \`${basename(attachment.path)}\` was not inserted because the ${timeoutMs}ms attachment budget was exhausted.`,
+      );
+      continue;
+    }
+    const block = await expandRefAsync(attachment.path, cwd, {
+      ...options,
+      timeoutMs: remainingMs,
+      maxFiles: Math.min(options.maxFiles ?? 300, 300),
+    }, true);
+    if (!block) continue;
+    const normalized = block.trim();
+    const separatorChars = blocks.length ? 2 : 0;
+    const remainingChars = MAX_EXPLICIT_ATTACHMENT_CONTEXT_CHARS - contextChars - separatorChars;
+    if (remainingChars <= 0) {
+      blocks.push(
+        `Additional attachments were not inserted because the ${MAX_EXPLICIT_ATTACHMENT_CONTEXT_CHARS}-character aggregate context limit was reached.`,
+      );
+      break;
+    }
+    if (normalized.length > remainingChars) {
+      blocks.push(
+        `${normalized.slice(0, remainingChars)}\n…[attachment context stopped at the ${MAX_EXPLICIT_ATTACHMENT_CONTEXT_CHARS}-character aggregate limit]`,
+      );
+      break;
+    }
+    blocks.push(normalized);
+    contextChars += separatorChars + normalized.length;
+  }
+  return blocks.length ? `\n\n${blocks.join("\n\n")}` : "";
+}
+
+async function expandRefAsync(
+  ref: string,
+  cwd: string,
+  options: FileWalkOptions,
+  explicitAttachment = false,
+): Promise<string | null> {
   const abs = isAbsolute(ref) ? ref : resolve(cwd, ref);
   const denied = sensitiveFileError(abs, "attach");
   if (denied) return `\nProtected file \`${ref}\` was not inserted into model context. ${denied}\n`;
@@ -110,7 +178,15 @@ async function expandRefAsync(ref: string, cwd: string, options: FileWalkOptions
     if (st.isFile()) {
       if (mediaTypeFor(abs)) return `Referenced \`${ref}\` is an image — paste it with Ctrl+V to attach it visually.`;
       const prefix = readModelContextPrefixSync(abs, MAX_FILE);
-      if (prefix.binary) return `Referenced \`${ref}\` appears to be binary — it was not inserted into the model context.`;
+      if (prefix.binary) {
+        return explicitAttachment
+          ? (
+              `Attached binary file \`${basename(abs)}\` is available locally at \`${abs}\`. ` +
+              "Its bytes were not inserted into model context. Use an appropriate document, artifact, " +
+              "or file tool to inspect it, and do not claim to have read it until that tool succeeds."
+            )
+          : `Referenced \`${ref}\` appears to be binary — it was not inserted into the model context.`;
+      }
       const txt = prefix.text + (prefix.truncated ? "\n…[truncated]" : "");
       return `\nReferenced file \`${ref}\`:\n\`\`\`\n${txt}\n\`\`\`\n`;
     }
