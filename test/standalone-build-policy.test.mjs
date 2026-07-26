@@ -24,6 +24,11 @@ test("standalone releases use baseline x64 targets and runtime boundary smoke", 
   assert.match(ci, /standalone-boundary-smoke\.mjs/);
   assert.match(release, /standalone-boundary-smoke\.mjs/);
   assert.match(serveSmoke, /"session\.list"/, "native serve smoke must exercise session index initialization");
+  assert.doesNotMatch(
+    serveSmoke,
+    /from\s+["']ws["']/,
+    "public-asset verification must not require dependencies that its job does not install",
+  );
   assert.ok(
     (ci.match(/standalone-serve-smoke\.mjs/g) ?? []).length >= 2,
     "Windows and the four-platform standalone matrix must run the native session smoke",

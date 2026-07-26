@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.135.2 — 2026-07-26 — complete standalone session verification
+
+- Carry forward the Bun standalone session-startup fix from 0.135.1.
+- Make the authenticated native Serve smoke self-contained on Node 22, so public release verification
+  can exercise `session.list` without relying on an uninstalled WebSocket package. This restores the
+  complete immutable binary and container release train while preserving the new five-platform gate.
+- Upgrade with `npm i -g @nanhara/hara@0.135.2`.
+
 ## 0.135.1 — 2026-07-26 — restore standalone session startup
 
 - Fix the Bun standalone runtime crash that prevented Hara Desktop 0.1.39 from listing sessions and

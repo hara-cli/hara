@@ -7,7 +7,6 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:f
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import WebSocket from "ws";
 
 const [binaryArg, expectedVersion] = process.argv.slice(2);
 if (!binaryArg || !expectedVersion) {
@@ -71,23 +70,23 @@ const removeTreeWithRetry = async (path, attempts = 5) => {
 
 const call = (ws, id, method, params, timeoutMs = 15_000) => new Promise((resolveCall, reject) => {
   const onTimeout = () => {
-    ws.off("message", onMessage);
+    ws.removeEventListener("message", onMessage);
     reject(new Error(`${method} response timed out`));
   };
   const timeout = setTimeout(onTimeout, timeoutMs);
-  const onMessage = (raw) => {
+  const onMessage = (event) => {
     let message;
     try {
-      message = JSON.parse(String(raw));
+      message = JSON.parse(typeof event.data === "string" ? event.data : String(event.data));
     } catch {
       return;
     }
     if (message.id !== id) return;
     clearTimeout(timeout);
-    ws.off("message", onMessage);
+    ws.removeEventListener("message", onMessage);
     resolveCall(message);
   };
-  ws.on("message", onMessage);
+  ws.addEventListener("message", onMessage);
   ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
 });
 
@@ -157,12 +156,25 @@ try {
 
   ws = new WebSocket(`ws://127.0.0.1:${port}`);
   await new Promise((resolveOpen, reject) => {
-    const timeout = setTimeout(() => reject(new Error("serve WebSocket open timed out")), 15_000);
-    ws.once("open", () => {
+    const cleanup = () => {
       clearTimeout(timeout);
+      ws.removeEventListener("open", onOpen);
+      ws.removeEventListener("error", onError);
+    };
+    const onOpen = () => {
+      cleanup();
       resolveOpen();
-    });
-    ws.once("error", reject);
+    };
+    const onError = (event) => {
+      cleanup();
+      reject(event.error instanceof Error ? event.error : new Error("serve WebSocket open failed"));
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("serve WebSocket open timed out"));
+    }, 15_000);
+    ws.addEventListener("open", onOpen);
+    ws.addEventListener("error", onError);
   });
   const initialized = await call(ws, 1, "initialize", { token: record.token });
   if (initialized.error || initialized.result?.version !== expectedVersion) {
@@ -192,7 +204,7 @@ try {
   process.exitCode = 1;
 } finally {
   try {
-    ws?.terminate();
+    ws?.close();
   } catch {
     // best effort
   }
