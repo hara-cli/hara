@@ -168,7 +168,13 @@ try {
   if (initialized.error || initialized.result?.version !== expectedVersion) {
     throw new Error(`serve initialize failed: ${JSON.stringify(initialized.error ?? initialized.result)}`);
   }
-  const stopped = await call(ws, 2, "server.shutdown", {});
+  // Exercise the real session-index path used by Desktop immediately after initialize. Simple
+  // --version/--help probes cannot catch runtime API differences such as Bun's synchronous Dir.close().
+  const listed = await call(ws, 2, "session.list", { limit: 50 });
+  if (listed.error || !Array.isArray(listed.result?.sessions)) {
+    throw new Error(`serve session list failed: ${JSON.stringify(listed.error ?? listed.result)}`);
+  }
+  const stopped = await call(ws, 3, "server.shutdown", {});
   if (stopped.error || stopped.result?.accepted !== true) {
     throw new Error(`serve shutdown failed: ${JSON.stringify(stopped.error ?? stopped.result)}`);
   }
@@ -180,7 +186,7 @@ try {
   );
   if (child.exitCode !== 0) throw new Error(`serve exited ${child.exitCode}: ${(stderr || stdout).trim().slice(-4_000)}`);
   if (existsSync(discoveryPath)) throw new Error("serve.json remained after authenticated shutdown");
-  console.log(`✓ native serve discovery + authenticated shutdown (${expectedVersion})`);
+  console.log(`✓ native serve discovery + session listing + authenticated shutdown (${expectedVersion})`);
 } catch (error) {
   console.error(`standalone serve smoke: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;

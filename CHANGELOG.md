@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.135.1 — 2026-07-26 — restore standalone session startup
+
+- Fix the Bun standalone runtime crash that prevented Hara Desktop 0.1.39 from listing sessions and
+  opening a conversation. Session-index directory handles now close safely under both Node's
+  Promise-returning API and Bun 1.3.9's synchronous return contract.
+- Native release smoke tests now exercise authenticated session listing on Windows, Linux, and both
+  macOS architectures. Desktop package smoke also initializes an empty session index, so final
+  sidecars and installers cannot pass by checking only version/help commands.
+- Upgrade with `npm i -g @nanhara/hara@0.135.1`.
+
 ## 0.135.0 — 2026-07-26 — capability-aware Desktop attachments
 
 - Serve now negotiates a structured attachment protocol for images, files, and one-turn directory

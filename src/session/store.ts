@@ -2098,7 +2098,13 @@ async function hasRemainingLegacySession(): Promise<boolean> {
     }
     return false;
   } finally {
-    await dir.close().catch(() => {});
+    // Node returns a Promise here, while Bun 1.3.9 closes synchronously and returns undefined.
+    // Awaiting either contract is safe; chaining `.catch()` is not.
+    try {
+      await dir.close();
+    } catch {
+      // The async iterator may already have closed the handle.
+    }
   }
 }
 
@@ -2177,7 +2183,12 @@ export function ensureSessionMetadataIndex(options: { force?: boolean; audit?: b
             }
           }
         } finally {
-          await dir.close().catch(() => {});
+          // Keep this compatible with both Node's Promise-returning close and Bun's synchronous close.
+          try {
+            await dir.close();
+          } catch {
+            // The async iterator may already have closed the handle.
+          }
         }
         // Reverse-tail paging relies on append order within one hourly shard. Directory enumeration has no
         // timestamp guarantee, so publish legacy generations oldest-first; equal timestamps use id as a

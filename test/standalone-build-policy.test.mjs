@@ -6,6 +6,7 @@ const build = readFileSync(new URL("../scripts/build-binary.ts", import.meta.url
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const release = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+const serveSmoke = readFileSync(new URL("../scripts/standalone-serve-smoke.mjs", import.meta.url), "utf8");
 
 test("standalone compile disables every ambient project config loader", () => {
   for (const loader of ["autoloadBunfig", "autoloadDotenv", "autoloadPackageJson", "autoloadTsconfig"]) {
@@ -22,6 +23,15 @@ test("standalone releases use baseline x64 targets and runtime boundary smoke", 
   }
   assert.match(ci, /standalone-boundary-smoke\.mjs/);
   assert.match(release, /standalone-boundary-smoke\.mjs/);
+  assert.match(serveSmoke, /"session\.list"/, "native serve smoke must exercise session index initialization");
+  assert.ok(
+    (ci.match(/standalone-serve-smoke\.mjs/g) ?? []).length >= 2,
+    "Windows and the four-platform standalone matrix must run the native session smoke",
+  );
+  assert.ok(
+    (release.match(/standalone-serve-smoke\.mjs/g) ?? []).length >= 3,
+    "Linux, Darwin, and public Darwin release assets must run the native session smoke",
+  );
 });
 
 test("Darwin release assets are native-built, signed, immutable, and publicly re-executed", () => {

@@ -139,3 +139,4 @@ jobs:
           [[ "$actual" == "$expected" ]] || { echo "standalone version mismatch: $actual != $expected" >&2; exit 1; }
           ./dist/bin/hara --help >/dev/null
           node scripts/standalone-boundary-smoke.mjs ./dist/bin/hara "$expected"
+          node scripts/standalone-serve-smoke.mjs ./dist/bin/hara "$expected"
