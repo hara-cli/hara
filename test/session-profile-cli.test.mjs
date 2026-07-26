@@ -86,7 +86,9 @@ async function gatewayFixture(label, roles = []) {
   };
 }
 
-test("real headless resume keeps its saved organization profile after the active profile changes", { timeout: 20_000 }, async () => {
+// This integration intentionally launches seven complete CLI processes. Release-class Intel runners can
+// take more than 20 seconds under the parallel full-suite load even though each bounded child completes.
+test("real headless resume keeps its saved organization profile after the active profile changes", { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-session-profile-cli-"));
   const home = join(root, "home");
   const project = join(root, "project");
