@@ -6,8 +6,9 @@
 // Safety: kind:"exec" → inherits the loop's approval gate. It can read/write/run on the host, so it is the most
 // privileged tool — and because fan-out sub-agents only get the read-only allow-list (READONLY_TOOLS), they
 // never see this tool. Trust tiers (off|gated|full) gate the dangerous bypass/full-access sub-modes.
-import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { platform } from "node:os";
+import crossSpawn from "cross-spawn";
 import { registerTool, type ToolContext } from "./registry.js";
 import { capHeadTail } from "./builtin.js";
 import { loadConfig } from "../config.js";
@@ -69,9 +70,9 @@ async function available(bin: string, signal?: AbortSignal): Promise<boolean> {
   if (signal?.aborted) throw new Error("external agent interrupted before availability probe");
   const ok = await new Promise<boolean>((resolve, reject) => {
     const processGroup = platform() !== "win32";
-    let child: ReturnType<typeof spawn>;
+    let child: ChildProcess;
     try {
-      child = spawn(bin, ["--version"], {
+      child = crossSpawn(bin, ["--version"], {
         stdio: "ignore",
         env: toolSubprocessEnv(),
         detached: processGroup,
@@ -178,9 +179,9 @@ registerTool({
 
     return await new Promise<string>((resolve) => {
       const processGroup = platform() !== "win32";
-      let child: ReturnType<typeof spawn>;
+      let child: ChildProcess;
       try {
-        child = spawn(built.cmd, built.args, {
+        child = crossSpawn(built.cmd, built.args, {
           cwd: ctx.cwd,
           env: toolSubprocessEnv(),
           detached: processGroup,

@@ -54,12 +54,13 @@ jobs:
       - name: Build TypeScript
         id: windows-build
         run: npm run build
-      # Keep this lane focused on the Windows contracts that differ from POSIX: portable/Git-Bash HOME
-      # selection and deterministic shell discovery outside PATH. The complete suite remains in build-test.
+      # Keep this lane focused on Windows contracts that differ from POSIX: portable/Git-Bash HOME,
+      # command-shim resolution, and deterministic shell discovery outside PATH. The complete suite
+      # remains in build-test.
       - name: Run Windows contract tests
         shell: pwsh
         run: |
-          node --test --test-timeout=120000 test/runtime.test.mjs test/windows-shell.test.mjs test/private-state-portable.test.mjs 2>&1 |
+          node --test --test-timeout=120000 test/runtime.test.mjs test/windows-shell.test.mjs test/private-state-portable.test.mjs test/external-agent.test.mjs 2>&1 |
             Tee-Object -Variable captured
           $code = $LASTEXITCODE
           if ($code -ne 0) {

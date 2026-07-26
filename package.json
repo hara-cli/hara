@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.134.8",
+  "version": "0.134.9",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -56,6 +56,7 @@
     "@larksuiteoapi/node-sdk": "^1.68.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "commander": "^15.0.0",
+    "cross-spawn": "^7.0.6",
     "ink": "^6.8.0",
     "openai": "^6.44.0",
     "react": "^19.2.7",

@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.134.9 — 2026-07-26 — reliable Windows external-agent launch
+
+- External-agent availability probes and task execution now use a cross-platform process launcher,
+  so npm-installed Claude/Codex `.cmd` shims work on Windows while ordinary POSIX executables and
+  shebang scripts retain their existing process-group and cancellation behavior.
+- The hot-install regression now creates a real `.cmd` fixture on Windows and a shebang fixture on
+  POSIX. Windows CI runs this external-agent contract directly, preventing a platform-specific
+  fixture or command-resolution regression from passing only on Linux/macOS.
+- Upgrade with `npm i -g @nanhara/hara@0.134.9`.
+
 ## 0.134.8 — 2026-07-25 — stable single-line status footer
 
 - The interactive status footer now derives its workspace-path budget from the actual terminal width,

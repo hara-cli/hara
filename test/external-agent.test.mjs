@@ -11,6 +11,27 @@ const { runAgent } = await import("../dist/agent/loop.js");
 const { getTool } = await import("../dist/tools/registry.js");
 after(() => rmSync(isolatedHome, { recursive: true, force: true }));
 
+function commandPath(bin, name) {
+  return join(bin, process.platform === "win32" ? `${name}.cmd` : name);
+}
+
+function cmdPath(path) {
+  return `"${path.replaceAll("%", "%%")}"`;
+}
+
+function writeCommand(bin, name, posixBody, windowsBody) {
+  const executable = commandPath(bin, name);
+  writeFileSync(
+    executable,
+    process.platform === "win32"
+      ? `@echo off\r\n${windowsBody.replaceAll("\n", "\r\n")}\r\n`
+      : `#!/bin/sh\n${posixBody}\n`,
+    { mode: 0o700 },
+  );
+  if (process.platform !== "win32") chmodSync(executable, 0o700);
+  return executable;
+}
+
 function providerWithToolUses(toolUses) {
   let calls = 0;
   return {
@@ -35,24 +56,25 @@ test("external_agent re-probes a CLI installed after a miss in the same Serve pr
     HOME: process.env.HOME,
     USERPROFILE: process.env.USERPROFILE,
     PATH: process.env.PATH,
+    PATHEXT: process.env.PATHEXT,
     HARA_EXTERNAL_AGENT_TRUST: process.env.HARA_EXTERNAL_AGENT_TRUST,
   };
   process.env.HOME = home;
   process.env.USERPROFILE = home;
   process.env.PATH = bin;
+  if (process.platform === "win32") process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
   process.env.HARA_EXTERNAL_AGENT_TRUST = "full";
   try {
     const tool = getTool("external_agent");
     assert.ok(tool);
     const ctx = { cwd: project, sandbox: "off", ask: async () => true };
-    const unrelatedExecutable = join(bin, "codex");
     const installedCodexWasProbed = join(home, "installed-codex-was-probed");
-    writeFileSync(
-      unrelatedExecutable,
-      `#!/bin/sh\nprintf 'x' > ${JSON.stringify(installedCodexWasProbed)}\nexit 0\n`,
-      { mode: 0o700 },
+    writeCommand(
+      bin,
+      "codex",
+      `printf 'x' > ${JSON.stringify(installedCodexWasProbed)}\nexit 0`,
+      `> ${cmdPath(installedCodexWasProbed)} <nul set /p "=x"\nexit /b 0`,
     );
-    chmodSync(unrelatedExecutable, 0o700);
     const missing = await tool.run({ task: "test", backend: "claude" }, ctx);
     assert.match(missing, /not found on PATH/i);
     assert.match(missing, /other external-agent CLIs were not probed/i);
@@ -63,14 +85,13 @@ test("external_agent re-probes a CLI installed after a miss in the same Serve pr
       "a missing explicit Claude selection neither probes nor misreports an installed Codex CLI",
     );
 
-    const executable = join(bin, "claude");
     const probes = join(home, "failed-probes");
-    writeFileSync(
-      executable,
-      `#!/bin/sh\nprintf 'x' >> ${JSON.stringify(probes)}\nexit 1\n`,
-      { mode: 0o700 },
+    writeCommand(
+      bin,
+      "claude",
+      `printf 'x' >> ${JSON.stringify(probes)}\nexit 1`,
+      `>> ${cmdPath(probes)} <nul set /p "=x"\nexit /b 1`,
     );
-    chmodSync(executable, 0o700);
     const unavailable = await tool.run({ task: "test", backend: "claude" }, ctx);
     assert.match(unavailable, /not found on PATH/i);
     assert.equal(
@@ -79,19 +100,19 @@ test("external_agent re-probes a CLI installed after a miss in the same Serve pr
       "one invocation reuses its first failed probe instead of waiting for a duplicate",
     );
 
-    writeFileSync(
-      executable,
-      "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf 'installed-now\\n'\n",
-      { mode: 0o700 },
+    writeCommand(
+      bin,
+      "claude",
+      "if [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf 'installed-now\\n'",
+      "if \"%~1\" == \"--version\" exit /b 0\necho installed-now",
     );
-    chmodSync(executable, 0o700);
     const unrelatedProbe = join(home, "codex-was-probed");
-    writeFileSync(
-      unrelatedExecutable,
-      `#!/bin/sh\nprintf 'x' > ${JSON.stringify(unrelatedProbe)}\n/bin/sleep 10\n`,
-      { mode: 0o700 },
+    writeCommand(
+      bin,
+      "codex",
+      `printf 'x' > ${JSON.stringify(unrelatedProbe)}\n/bin/sleep 10`,
+      `> ${cmdPath(unrelatedProbe)} <nul set /p "=x"\nping -n 11 127.0.0.1 >nul`,
     );
-    chmodSync(unrelatedExecutable, 0o700);
     const installed = await tool.run({ task: "test", backend: "claude" }, ctx);
     assert.match(installed, /installed-now/);
     assert.equal(
