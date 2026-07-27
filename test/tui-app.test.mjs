@@ -405,21 +405,31 @@ test("App ask_user (h.ask) free-text: no options → input box captures the type
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  stdin.write("go");
-  await tick();
-  stdin.write("\r");
-  await tick();
-  const asking = strip(lastFrame());
-  assert.ok(asking.includes("Where should migrations live?"), "free-text question shown");
-  assert.ok(asking.includes("waiting for your answer · task timer paused"), "status distinguishes human wait from active work");
-  assert.ok(!asking.includes("waiting for the model"), "human wait is not described as model work");
-  stdin.write("db/migrations");
-  await tick();
-  stdin.write("\r");
-  await tick(80);
-  assert.equal(answer, "db/migrations", "the typed answer is returned as the tool's result");
-  unmount();
+  try {
+    stdin.write("go");
+    await waitUntil(() => strip(lastFrame()).includes("go"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(() => {
+      const frame = strip(lastFrame());
+      return frame.includes("Where should migrations live?")
+        && frame.includes("waiting for your answer · task timer paused");
+    }, "free-text question and human-wait status did not mount");
+    const asking = strip(lastFrame());
+    assert.ok(!asking.includes("waiting for the model"), "human wait is not described as model work");
+    stdin.write("db/migrations");
+    await waitUntil(
+      () => strip(lastFrame()).includes("db/migrations"),
+      "free-text answer was not rendered before submit",
+    );
+    stdin.write("\r");
+    await waitUntil(
+      () => answer === "db/migrations",
+      "the typed answer did not resolve the tool",
+    );
+  } finally {
+    setTurnPhase("idle");
+    unmount();
+  }
 });
 
 test("App Esc aborts the turn and removes a pending free-text ask", async () => {
@@ -903,28 +913,36 @@ test("App type-ahead: queued message is dropped when a later free-text ask is ca
 // ── Constant-height status slot (anti-bob): StatusRow ⇄ ModeLine, always exactly one row + margin ──
 
 test("App status slot: idle shows key hints; working swaps in the spinner (no ⌨ working row, no height pop)", async () => {
+  let releaseTurn = () => {};
+  const holdTurn = new Promise((resolve) => { releaseTurn = resolve; });
   const onSubmit = async (line, h) => {
     h.sink.assistantDelta("hi");
-    await tick(200); // hold the turn open so we can sample the working state
+    await holdTurn;
   };
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  const idle = strip(lastFrame());
-  assert.ok(idle.includes("⏎ send") && idle.includes("shift+tab mode"), "idle → key-hints row present (slot occupied)");
-  stdin.write("go");
-  await tick();
-  stdin.write("\r");
-  await tick(90); // mid-turn
-  const mid = strip(lastFrame());
-  assert.ok(/working \d+s/.test(mid) || mid.includes("⏎ steers task"), "working → spinner row in the same slot");
-  assert.ok(!mid.includes("⏎ send · @ file"), "hints swapped OUT while working (one row at a time)");
-  assert.ok(!mid.includes("⌨ working"), "the old extra working-hint row is gone");
-  await tick(250); // turn ends
-  const done = strip(lastFrame());
-  assert.ok(done.includes("⏎ send"), "idle hints return after the turn — slot never empties");
-  unmount();
+  try {
+    await waitUntil(() => {
+      const frame = strip(lastFrame());
+      return frame.includes("⏎ send") && frame.includes("shift+tab mode");
+    }, "idle key-hints row did not mount");
+    stdin.write("go");
+    await waitUntil(() => strip(lastFrame()).includes("go"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(() => {
+      const frame = strip(lastFrame());
+      return /working \d+s/.test(frame) || frame.includes("⏎ steers task");
+    }, "working status slot did not mount");
+    const mid = strip(lastFrame());
+    assert.ok(!mid.includes("⏎ send · @ file"), "hints swapped OUT while working (one row at a time)");
+    assert.ok(!mid.includes("⌨ working"), "the old extra working-hint row is gone");
+    releaseTurn();
+    await waitUntil(() => strip(lastFrame()).includes("⏎ send"), "idle hints did not return after the turn");
+  } finally {
+    releaseTurn();
+    unmount();
+  }
 });
 
 test("App shift+tab: ModeLine swaps into the status slot (equal height), cycles the mode, then auto-hides", async () => {

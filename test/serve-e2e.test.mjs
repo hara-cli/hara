@@ -458,7 +458,15 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     });
     assert.equal(validSchedule.result.schedule, "0 9 * * 1-5");
     assert.match(validSchedule.result.description, /cron/);
-    assert.equal(validSchedule.result.nextRuns.length, 3);
+    assert.ok(
+      validSchedule.result.nextRuns.length >= 1 && validSchedule.result.nextRuns.length <= 3,
+      "validation returns the bounded preview that fits its latency budget",
+    );
+    assert.equal(
+      validSchedule.result.nextRuns.length < 3,
+      validSchedule.result.nextRunDeferred === true,
+      "a partial cron preview explicitly advertises deferred calculation",
+    );
     assert.ok(validSchedule.result.nextRuns.every((value) => Number.isFinite(value)));
     const unchangedCronLastRunAt = Date.now();
     const unchangedCron = addJob({
