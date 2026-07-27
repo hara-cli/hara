@@ -3496,7 +3496,10 @@ skillsCmd.action(() => {
   }
 });
 
-const pluginCmd = program.command("plugin").description("manage plugins (bundle skills/roles/MCP servers)");
+const pluginCmd = program
+  .command("plugin")
+  .alias("plugins")
+  .description("manage plugins (bundle skills/roles/MCP servers)");
 pluginCmd
   .command("add <source>")
   .description("install a plugin from file:<path> | github:<owner/repo> | git:<url>")

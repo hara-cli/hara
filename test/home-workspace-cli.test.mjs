@@ -176,3 +176,17 @@ test("CLI exposes safe per-run proxy and language controls", () => {
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("CLI accepts the familiar plural plugins alias", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-cli-plugins-alias-"));
+  try {
+    const singular = runAtHome(home, ["plugin"]);
+    const plural = runAtHome(home, ["plugins"]);
+    assert.equal(singular.status, 0, singular.stderr || singular.stdout);
+    assert.equal(plural.status, 0, plural.stderr || plural.stdout);
+    assert.equal(plural.stdout, singular.stdout);
+    assert.match(plural.stdout, /No plugins/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
