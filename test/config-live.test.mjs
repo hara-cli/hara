@@ -58,6 +58,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
   writeFileSync(join(project, ".hara", "config.json"), JSON.stringify({
     apiKey: " ", model: "", fallbackApiKey: "", fallbackModel: " ", visionApiKey: "", visionModel: " ",
     embedApiKey: " ", embedModel: "", routeApiKey: "", routeModel: " ",
+    proxy: "http://project-must-not-route-credentials.example:8080",
   }));
 
   const saved = {
@@ -127,7 +128,11 @@ test("loadConfig: blank env/project routing values do not hide global credential
     assert.equal(cfg.routeApiKey, "route-key");
     assert.equal(cfg.routeModel, "route-model");
     assert.equal(cfg.routeBaseURL, "https://route.example/v1");
-    assert.equal(cfg.proxy, "http://127.0.0.1:7890");
+    assert.equal(
+      cfg.proxy,
+      "http://127.0.0.1:7890",
+      "project config cannot choose the credential-bearing proxy route",
+    );
     assert.equal(cfg.packageRegistry, "https://packages.example/repository/npm/");
     assert.equal(cfg.runTimeoutMs, 45 * 60_000);
     assert.equal(cfg.maxAgentRounds, 96);

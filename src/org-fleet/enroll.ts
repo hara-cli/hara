@@ -29,6 +29,7 @@ import {
   removePrivateStateFile,
   writePrivateStateFileSync,
 } from "../security/private-state.js";
+import { userModelFetch } from "../network/model-fetch.js";
 
 export interface Enrollment {
   gatewayUrl: string; // e.g. https://hara-gw.acme.internal  (no trailing slash)
@@ -279,7 +280,7 @@ export async function exchangeEnrollment(gatewayUrl: string, code: string, signa
   }
   let res: Response;
   try {
-    res = await fetch(`${base}/v1/enroll`, {
+    res = await userModelFetch(`${base}/v1/enroll`, {
       method: "POST",
       redirect: "error",
       signal,
@@ -440,7 +441,7 @@ export async function heartbeatEnrollment(
   persistence: HeartbeatPersistence = {},
 ): Promise<boolean> {
   try {
-    const res = await fetch(`${e.gatewayUrl}/v1/heartbeat`, {
+    const res = await userModelFetch(`${e.gatewayUrl}/v1/heartbeat`, {
       method: "POST",
       redirect: "error",
       signal,
@@ -552,7 +553,7 @@ async function syncOrgRolesEnrollment(
   signal?: AbortSignal,
 ): Promise<number> {
   try {
-    const res = await fetch(`${e.gatewayUrl}/v1/roles`, { signal, headers: { authorization: `Bearer ${e.deviceToken}` } });
+    const res = await userModelFetch(`${e.gatewayUrl}/v1/roles`, { signal, headers: { authorization: `Bearer ${e.deviceToken}` } });
     if (!res.ok) return 0;
     const bundle = (await res.json()) as RoleBundle;
     const roles = Array.isArray(bundle.roles)

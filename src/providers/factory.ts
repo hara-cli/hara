@@ -1,6 +1,7 @@
 // Shared provider construction for the interactive CLI, Desktop serve, gateway approval/judge calls, and
 // connection tests. Every path must interpret auth:none/OAuth/wire-protocol targets identically.
 import { providerIsLocal, type HaraConfig } from "../config.js";
+import { createModelFetch, userModelFetch } from "../network/model-fetch.js";
 import { getValidQwenAuth } from "./qwen-oauth.js";
 import { createAnthropicProvider } from "./anthropic.js";
 import { createOpenAIProvider } from "./openai.js";
@@ -12,7 +13,8 @@ export async function createProviderForTarget(
   target: ProviderTarget,
   reasoningEffort?: HaraConfig["reasoningEffort"],
 ): Promise<Provider | null> {
-  const { provider, apiKey, model, baseURL } = target;
+  const { provider, apiKey, model, baseURL, proxy } = target;
+  const fetch = proxy === undefined ? userModelFetch : createModelFetch(proxy);
   if (provider === "qwen-oauth") {
     const auth = await getValidQwenAuth();
     if (!auth) return null;
@@ -22,6 +24,7 @@ export async function createProviderForTarget(
       model,
       label: provider,
       reasoningEffort,
+      fetch,
     });
   }
 
@@ -32,7 +35,7 @@ export async function createProviderForTarget(
   if (!transportKey) return null;
   const wire = resolvePlatform(provider, baseURL, undefined, model).wireApi;
   if (wire === "anthropic") {
-    return createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort });
+    return createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort, fetch });
   }
   if (wire === "responses") {
     return {
@@ -56,5 +59,6 @@ export async function createProviderForTarget(
     label: provider,
     reasoningEffort,
     omitAuthorization: providerIsLocal(provider),
+    fetch,
   });
 }

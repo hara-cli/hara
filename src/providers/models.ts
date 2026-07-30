@@ -1,3 +1,5 @@
+import { userModelFetch } from "../network/model-fetch.js";
+
 // Alibaba Coding Plan's documented exact ids (verified 2026-07-18). Live `/models` remains authoritative;
 // this list is only a usability fallback because the coding endpoint/key combinations do not all enumerate.
 // Keep exact casing: Coding Plan explicitly forbids guessing compatible/version-like aliases.
@@ -31,7 +33,11 @@ export function codingPlanFallbackModels(baseURL: string | undefined): string[] 
 // arrow keys, not by memorizing ids. Live results win. A bounded request falls back to Alibaba's documented
 // exact Coding Plan ids only on the two official coding hosts; other endpoints keep the existing [] →
 // type-an-id behavior. `fetchImpl` is injected so this stays pure/testable.
-export async function listModels(baseURL: string | undefined, apiKey: string, fetchImpl: typeof fetch = fetch): Promise<string[]> {
+export async function listModels(
+  baseURL: string | undefined,
+  apiKey: string,
+  fetchImpl: typeof fetch = userModelFetch,
+): Promise<string[]> {
   if (!baseURL) return []; // SDK-default hosts (anthropic/openai) — no custom endpoint to enumerate
   const fallback = codingPlanFallbackModels(baseURL);
   try {

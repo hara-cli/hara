@@ -610,6 +610,7 @@ async function buildNoToolProvider(): Promise<Provider | null> {
       apiKey: profile.deviceToken,
       baseURL: profile.baseURL || `${profile.gatewayUrl.replace(/\/$/, "")}/v1`,
       model: resolveGatewayModel(cfg, profile),
+      ...(cfg.proxy ? { proxy: cfg.proxy } : {}),
     }, cfg.reasoningEffort);
   }
   return createProviderForTarget(

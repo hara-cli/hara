@@ -127,7 +127,8 @@ hara config set apiKey   ...
 hara config set model    ...
 ```
 
-**Proxy for web tools in mainland/restricted networks** — only `web_fetch` and `web_search` use it:
+**Proxy for mainland/restricted networks** — provider/model requests, organization enrollment and web
+tools can share one user-controlled HTTP(S) proxy:
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:7890
 # or for one Hara launch (do not put credentials in command-line arguments):
@@ -135,10 +136,13 @@ hara --proxy http://127.0.0.1:7890
 # or persist the same endpoint privately:
 hara config set proxy http://127.0.0.1:7890
 ```
-`HTTP_PROXY`, lowercase variants, `NO_PROXY`, and `HARA_WEB_PROXY` are supported. Model/provider calls,
-organization enrollment, and chat gateways are not silently redirected. Even through a proxy, `web_fetch`
-pins each DNS-approved public IP and rechecks redirects; authenticated proxy URLs are masked by
-`hara config get`.
+`HTTP_PROXY`, `HTTPS_PROXY`, lowercase variants, and `NO_PROXY` are supported. `HARA_MODEL_PROXY`
+targets model/provider and organization traffic; `HARA_WEB_PROXY` remains web-tool-only. On Windows,
+Hara also follows an enabled static WinINET system proxy (including its bypass list) when no explicit
+proxy is configured; PAC-only and SOCKS-only settings still require an explicit HTTP(S) proxy. Loopback
+models such as Ollama and LM Studio always bypass the proxy. Chat gateways are not silently redirected.
+Even through a proxy, `web_fetch` pins each DNS-approved public IP and rechecks redirects; authenticated
+proxy URLs and transport errors are masked.
 
 When `web_fetch` receives only a JavaScript SPA shell, it tells the agent to retry with `render:true`.
 That path asks for computer-use approval, uses an installed Chrome/Chromium/Edge with a fresh temporary

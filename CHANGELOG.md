@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.135.3 — 2026-07-31 — Windows and explicit proxy support for model gateways
+
+- Route model/provider SDK traffic, model discovery, remote embeddings, Qwen OAuth and organization
+  enrollment through the user's explicit proxy or standard proxy environment. On Windows, fall back to
+  an enabled static WinINET system proxy and bypass list when no explicit route is configured.
+- Keep loopback models direct, prevent project config from choosing the credential-bearing proxy route,
+  and redact proxy credentials and destination URLs from transport failures.
+- Upgrade with `npm i -g @nanhara/hara@0.135.3`.
+
 ## 0.135.2 — 2026-07-26 — complete standalone session verification
 
 - Carry forward the Bun standalone session-startup fix from 0.135.1.

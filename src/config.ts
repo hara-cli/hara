@@ -78,7 +78,8 @@ export interface HaraConfig {
   fileCheckpoints: boolean;
   /** startup update check (cached daily npm probe → one-line notice on launch). default on. */
   updateCheck: boolean;
-  /** Optional HTTP(S) proxy used only by web_fetch/web_search. Standard HTTP(S)_PROXY env vars take precedence. */
+  /** User-owned HTTP(S) proxy for model/provider, organization and web-tool traffic. Standard proxy env
+   * variables take precedence; project config is deliberately not allowed to choose this route. */
   proxy: string | undefined;
   /** Optional user-selected package registry for npm/pnpm/yarn/bun install commands. Never selected from
    * repository config, because changing an install source is a software supply-chain trust decision. */
@@ -644,7 +645,12 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   const autoCompact = !(process.env.HARA_AUTO_COMPACT === "0" || merged.autoCompact === false || merged.autoCompact === "false"); // default ON
   const fileCheckpoints = !(process.env.HARA_CHECKPOINTS === "0" || merged.fileCheckpoints === false || merged.fileCheckpoints === "false"); // default ON
   const updateCheck = !(process.env.HARA_UPDATE_CHECK === "0" || merged.updateCheck === false || merged.updateCheck === "false"); // default ON
-  const proxy = typeof merged.proxy === "string" && merged.proxy.trim() ? merged.proxy.trim() : undefined;
+  const userProxy = typeof overlay.proxy === "string" && overlay.proxy.trim()
+    ? overlay.proxy.trim()
+    : typeof globalBase.proxy === "string" && globalBase.proxy.trim()
+      ? globalBase.proxy.trim()
+      : undefined;
+  const proxy = userProxy;
   const packageRegistry = nonBlankEnv(process.env.HARA_PACKAGE_REGISTRY)
     ?? (typeof merged.packageRegistry === "string" && merged.packageRegistry.trim() ? merged.packageRegistry.trim() : undefined);
   const fallbackModel = nonBlankEnv(process.env.HARA_FALLBACK_MODEL) ?? merged.fallbackModel;

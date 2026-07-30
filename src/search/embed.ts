@@ -2,6 +2,7 @@
 // OpenAI-compatible /embeddings endpoint. Returns null when embeddings aren't configured → callers stay
 // lexical. Uses global fetch (Node ≥20). No new dependency.
 import type { HaraConfig } from "../config.js";
+import { createModelFetch } from "../network/model-fetch.js";
 import type { Embedder } from "./semindex.js";
 
 const DEFAULT_MODEL: Record<string, string> = {
@@ -20,6 +21,7 @@ export function getEmbedder(cfg: HaraConfig): Embedder | null {
   const provider = cfg.embedProvider;
   if (!provider || provider === "off") return null;
   const model = cfg.embedModel || DEFAULT_MODEL[provider] || "embed";
+  const modelFetch = createModelFetch(cfg.proxy);
 
   if (provider === "ollama") {
     const base = (cfg.embedBaseURL || "http://localhost:11434").replace(/\/$/, "");
@@ -27,7 +29,7 @@ export function getEmbedder(cfg: HaraConfig): Embedder | null {
       const out: number[][] = [];
       for (const input of texts) {
         if (signal?.aborted) throw new Error("embedding request interrupted");
-        const r = await fetch(`${base}/api/embeddings`, {
+        const r = await modelFetch(`${base}/api/embeddings`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ model, prompt: input }),
@@ -45,7 +47,7 @@ export function getEmbedder(cfg: HaraConfig): Embedder | null {
   const key = cfg.embedApiKey || cfg.apiKey || "";
   return async (texts, signal) => {
     if (signal?.aborted) throw new Error("embedding request interrupted");
-    const r = await fetch(`${base}/embeddings`, {
+    const r = await modelFetch(`${base}/embeddings`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
       body: JSON.stringify({ model, input: texts }),

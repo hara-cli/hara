@@ -129,8 +129,13 @@ export function buildThinkingParam(model: string, effort?: "off" | "low" | "medi
   return { type: "enabled", budget_tokens: 24000 };
 }
 
-export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: "off" | "low" | "medium" | "high" | "max" }): Provider {
-  const client = new Anthropic({ apiKey: opts.apiKey, maxRetries: 4, ...(opts.baseURL ? { baseURL: opts.baseURL } : {}) });
+export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: "off" | "low" | "medium" | "high" | "max"; fetch?: typeof fetch }): Provider {
+  const client = new Anthropic({
+    apiKey: opts.apiKey,
+    maxRetries: 4,
+    ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
+    ...(opts.fetch ? { fetch: opts.fetch } : {}),
+  });
   return {
     id: "anthropic",
     model: opts.model,

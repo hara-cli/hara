@@ -7,6 +7,7 @@ import {
   readPrivateStateFileSnapshotSync,
   writePrivateStateFileSync,
 } from "../security/private-state.js";
+import { userModelFetch } from "../network/model-fetch.js";
 
 const BASE = "https://chat.qwen.ai";
 const DEVICE_CODE_URL = `${BASE}/api/v1/oauth2/device/code`;
@@ -58,7 +59,7 @@ export function normalizeBaseUrl(v?: string): string {
 export async function qwenDeviceLogin(log: (m: string) => void): Promise<QwenToken> {
   const { verifier, challenge } = pkce();
 
-  const dc = await fetch(DEVICE_CODE_URL, {
+  const dc = await userModelFetch(DEVICE_CODE_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
     body: new URLSearchParams({
@@ -79,7 +80,7 @@ export async function qwenDeviceLogin(log: (m: string) => void): Promise<QwenTok
   const deadline = Date.now() + (dev.expires_in || 300) * 1000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, wait));
-    const tr = await fetch(TOKEN_URL, {
+    const tr = await userModelFetch(TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
       body: new URLSearchParams({
@@ -120,7 +121,7 @@ export async function qwenDeviceLogin(log: (m: string) => void): Promise<QwenTok
 }
 
 async function refreshToken(tok: QwenToken): Promise<QwenToken> {
-  const r = await fetch(TOKEN_URL, {
+  const r = await userModelFetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
     body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tok.refresh, client_id: CLIENT_ID }),

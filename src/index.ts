@@ -171,6 +171,7 @@ import { resolvePlatform } from "./providers/registry.js";
 import { boundedProviderTurn } from "./providers/bounded-turn.js";
 import { levelsFor } from "./tui/model-picker.js";
 import { listModels } from "./providers/models.js";
+import { createModelFetch } from "./network/model-fetch.js";
 import { listJobs, tailJob, killJob } from "./exec/jobs.js";
 import { readModelContextFileSync } from "./fs-read.js";
 import { MIN_NODE_VERSION, unsupportedNodeMessage } from "./runtime.js";
@@ -351,7 +352,13 @@ async function buildProvider(
     if (ap.availableModels?.length && !ap.availableModels.includes(model)) {
       throw new Error(`model '${model}' is not authorized for organization connection '${ap.id}'`);
     }
-    const target = { provider: "hara-gateway" as const, apiKey: ap.deviceToken, baseURL, model };
+    const target = {
+      provider: "hara-gateway" as const,
+      apiKey: ap.deviceToken,
+      baseURL,
+      model,
+      ...(cfg.proxy ? { proxy: cfg.proxy } : {}),
+    };
     const built = await createProviderForTarget(target, cfg.reasoningEffort);
     if (!targetOverride && built) {
       cfg.provider = target.provider;
@@ -605,7 +612,13 @@ async function testProviderSettingsCandidate(input: {
       error: "A new API key is required when the provider or endpoint changes",
     };
   }
-  const models = await listModels(candidate.baseURL, apiKey ?? "");
+  const configuredProxy =
+    typeof raw.proxy === "string" && raw.proxy.trim() ? raw.proxy.trim() : undefined;
+  const models = await listModels(
+    candidate.baseURL,
+    apiKey ?? "",
+    createModelFetch(configuredProxy),
+  );
   const probeModel =
     providerIsLocal(candidate.provider) &&
     models.length > 0 &&
@@ -618,6 +631,7 @@ async function testProviderSettingsCandidate(input: {
     apiKey,
     model: probeModel,
     baseURL: candidate.baseURL,
+    ...(configuredProxy ? { proxy: configuredProxy } : {}),
   });
   if (!provider) {
     const error = candidate.provider === "qwen-oauth"
@@ -1701,7 +1715,7 @@ program
   .option("--profile <id>", "use this identity profile for this run (personal / org id) — see `hara profile list`")
   .option("--overlay <name>", "apply a named config overlay from ~/.hara/config.json (legacy: --profile)")
   .option("--cwd <dir>", "run from this explicit project directory (alternative to cd)")
-  .option("--proxy <url>", "HTTP(S) proxy for web_fetch/web_search in this run (credentials belong in config/env)")
+  .option("--proxy <url>", "HTTP(S) proxy for model, organization, and web-tool traffic in this run")
   .option("--registry <url>", "package registry for installs in this run: npmjs, npmmirror, or an HTTP(S) URL")
   .option("--lang <tag>", "reply language for this run, for example zh-CN or en (default: follow latest message)")
   .option("-c, --continue", "resume the most recent session in this directory")
@@ -1739,6 +1753,7 @@ program.hook("preAction", (thisCmd) => {
         || parsed.password
       ) throw new Error("invalid or credential-bearing proxy URL");
       process.env.HARA_WEB_PROXY = parsed.origin;
+      process.env.HARA_MODEL_PROXY = parsed.origin;
     } catch {
       out(c.red("Cannot use --proxy: provide an HTTP(S) origin such as http://127.0.0.1:7890. Put authenticated proxy URLs in `hara config set proxy …` or HTTPS_PROXY so credentials do not enter the process list.\n"));
       process.exit(2);
@@ -2672,10 +2687,18 @@ program
           if (profile.kind === "gateway") {
             if (profile.availableModels?.length) return Promise.resolve([...profile.availableModels]);
             const baseURL = profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined);
-            return listModels(baseURL, profile.deviceToken ?? "");
+            return listModels(
+              baseURL,
+              profile.deviceToken ?? "",
+              createModelFetch(live.proxy),
+            );
           }
           const target = resolveByokProviderTarget(live, profile, false);
-          return listModels(target.baseURL, target.apiKey ?? "");
+          return listModels(
+            target.baseURL,
+            target.apiKey ?? "",
+            createModelFetch(live.proxy),
+          );
         },
         prepareImages: async (images, opts) => {
           const live = loadConfig({ cwd: opts.cwd });
@@ -5417,7 +5440,11 @@ program.action(async (opts) => {
               // level (←→, per the registry's reasoning style). Falls back to typing an id if the endpoint
               // doesn't enumerate models.
               const bURL = cfg.baseURL ?? providerDefaultBaseURL(cfg.provider);
-              const models = await listModels(bURL, cfg.apiKey ?? "");
+              const models = await listModels(
+                bURL,
+                cfg.apiKey ?? "",
+                createModelFetch(cfg.proxy),
+              );
               const style = resolvePlatform(cfg.provider, bURL, undefined, cfg.model).reasoning;
               const chosen = await h.pickModel({ models, style, current: cfg.model, effort: cfg.reasoningEffort });
               if (!chosen) return; // esc — no change

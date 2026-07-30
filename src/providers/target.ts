@@ -20,6 +20,8 @@ export interface ProviderTarget {
   apiKey?: string;
   baseURL?: string;
   model: string;
+  /** User-owned proxy endpoint. Environment and Windows system proxy discovery still take precedence. */
+  proxy?: string;
 }
 
 export interface ProviderTargetOverride {
@@ -111,7 +113,13 @@ export function resolveByokProviderTarget(
     : env.HARA_MODEL
       || (namedProviderChanged ? "" : profileModel)
       || providerDefaultModel(provider);
-  return { provider, apiKey, baseURL, model };
+  return {
+    provider,
+    apiKey,
+    baseURL,
+    model,
+    ...(cfg.proxy ? { proxy: cfg.proxy } : {}),
+  };
 }
 
 /**
@@ -146,7 +154,13 @@ export function overrideProviderTarget(
     : providerChanged
       ? providerDefaultModel(provider)
       : base.model;
-  return { provider, apiKey, baseURL, model };
+  return {
+    provider,
+    apiKey,
+    baseURL,
+    model,
+    ...(base.proxy ? { proxy: base.proxy } : {}),
+  };
 }
 
 /** Gateway profiles own their default, while an explicit session/role model remains selectable. */

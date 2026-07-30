@@ -23,12 +23,16 @@ provider is required; everything else has a sane default.
 - **Local Agent capability roadmap**: calendar, semantic desktop automation, platform permissions,
   and the Desktop capability broker are defined in
   [`local-agent-capabilities.md`](local-agent-capabilities.md).
-- **Web-tool proxy**: `web_fetch` / `web_search` honor `HTTPS_PROXY`, `HTTP_PROXY` (and lowercase forms),
-  `NO_PROXY`, or `hara config set proxy http://127.0.0.1:7890`. `HARA_WEB_PROXY` is the Hara-specific
-  process override. This is deliberately scoped to web tools: provider/model, organization enrollment, and
-  chat gateway traffic are not redirected. Authenticated proxy URLs are accepted but always masked by
-  `hara config get`; do not paste them into chat or logs. `web_fetch` keeps its public-DNS/IP pin and private
-  address rejection across every redirect even through CONNECT.
+- **Network proxy**: provider/model calls, model discovery, remote embeddings, Qwen OAuth,
+  organization enrollment/heartbeat and `web_fetch` / `web_search` honor `HTTPS_PROXY`, `HTTP_PROXY`
+  (and lowercase forms), `NO_PROXY`, or `hara config set proxy http://127.0.0.1:7890`.
+  `hara --proxy …` applies to both model and web-tool traffic for one launch. `HARA_MODEL_PROXY`
+  is the model/organization-only override; `HARA_WEB_PROXY` remains web-tool-only. On Windows, Hara
+  also reads an enabled static WinINET proxy and its bypass list when no explicit proxy exists. PAC-only
+  and SOCKS-only configurations require an explicit HTTP(S) proxy. Loopback endpoints always bypass
+  proxies, chat gateways are not redirected, and project `.hara/config.json` cannot choose the credential
+  route. Authenticated proxy URLs and transport errors are masked; do not paste them into chat or logs.
+  `web_fetch` keeps its public-DNS/IP pin and private-address rejection across every redirect.
 - **Agent lifecycle**: `runTimeoutMs` defaults to `30m` (accepts `ms`/`s`/`m`/`h`, hard max `2h`) and
   `maxAgentRounds` defaults to `64` (hard max `256`). `runTimeoutMs` measures active model/tool execution:
   activity cannot renew it, while time spent waiting for an engine-owned human question or approval is
