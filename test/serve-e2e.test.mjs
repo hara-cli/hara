@@ -264,6 +264,97 @@ test("serve discovery: a write failure closes the already-listening socket", { t
   }
 });
 
+test("serve Desk RPCs advertise only with complete support and pin every remote read to profileId", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-desk-"));
+  const calls = [];
+  const now = 1_700_000_000_000;
+  const agent = {
+    id: "agent-a",
+    name: "Desk A",
+    owner: "owner-a",
+    client: "hara-cli",
+    role: "member",
+    createdAt: now,
+    lastSeen: now,
+    revoked: false,
+  };
+  const task = {
+    id: "t_abcd",
+    kind: "dispatch",
+    title: "Ship",
+    excerpt: "Deploy",
+    risk: "low",
+    state: "open",
+    createdBy: "agent-a",
+    claimedBy: null,
+    ackedBy: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const deps = {
+    ...baseDeps(textProvider, memStore()),
+    deskConnections: () => ({
+      connections: [{
+        profileId: "org-a",
+        configured: true,
+        bindingRevision: "binding-revision-a",
+        host: "desk.example.test",
+        agentId: "agent-a",
+        owner: "owner-a",
+      }],
+      legacyUnbound: false,
+    }),
+    deskSnapshot: async (profileId, state) => {
+      calls.push({ method: "snapshot", profileId, state });
+      return {
+        profileId,
+        fetchedAt: now,
+        me: agent,
+        tasks: [task],
+        agents: [agent],
+        events: [],
+        circles: [],
+        truncated: false,
+      };
+    },
+    deskTask: async (profileId, taskId) => {
+      calls.push({ method: "task", profileId, taskId });
+      return { profileId, task: { ...task, id: taskId, body: "Deploy" }, events: [] };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(srv.port);
+  try {
+    const init = await client.call("initialize", { token: "tok" });
+    for (const method of ["desk.connections.list", "desk.snapshot", "desk.task.get"]) {
+      assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
+    }
+    assert.ok(init.result.capabilities.features.includes("collaboration.remote.v1"));
+    assert.equal(calls.length, 0, "initialize performs no Desk remote read");
+
+    const connections = await client.call("desk.connections.list", {});
+    assert.equal(connections.result.connections[0].profileId, "org-a");
+    assert.equal(connections.result.connections[0].bindingRevision, "binding-revision-a");
+    assert.equal(calls.length, 0, "connection discovery remains local");
+
+    const snapshot = await client.call("desk.snapshot", { profileId: "org-a", state: "claimed" });
+    assert.equal(snapshot.result.profileId, "org-a");
+    assert.deepEqual(calls[0], { method: "snapshot", profileId: "org-a", state: "claimed" });
+
+    const details = await client.call("desk.task.get", { profileId: "org-a", taskId: "t_abcd" });
+    assert.equal(details.result.task.id, "t_abcd");
+    assert.deepEqual(calls[1], { method: "task", profileId: "org-a", taskId: "t_abcd" });
+
+    assert.equal((await client.call("desk.snapshot", { profileId: "../org-b" })).error.code, -32602);
+    assert.equal((await client.call("desk.task.get", { profileId: "org-a", taskId: "../whoami" })).error.code, -32602);
+    assert.doesNotMatch(JSON.stringify({ snapshot, details, connections }), /token|secret/i);
+  } finally {
+    client.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: auth gate → create → send streams text events and returns the reply", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-"));
   const store = memStore();

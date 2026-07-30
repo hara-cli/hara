@@ -48,6 +48,15 @@
 //   settings.organizations.use {id,cwd?}             → organization state
 //   settings.organizations.remove {id,cwd?}          → organization state (local removal; no remote revoke)
 //   settings.organizations.check {id,cwd?}           → {id,ok,checkedAt}
+//   desk.connections.list {}                         → {connections:[{profileId,configured,needsRebind?,
+//                                                        bindingRevision?,host?,agentId?,owner?}],legacyUnbound}
+//                                                        Pure local read; Desk credentials are never returned.
+//   desk.snapshot    {profileId,state?}               → {profileId,fetchedAt,me,tasks,agents,events,
+//                                                        circles,truncated}
+//                                                        Task summaries contain a short excerpt, not body.
+//   desk.task.get    {profileId,taskId}               → {profileId,task:{...,body},events}
+//                                                        Remote Desk reads are explicit and profile-pinned;
+//                                                        changing the active organization cannot reroute them.
 //   automation.validate {schedule,tz?,id?}         → {schedule,description,nextRuns:[…],nextRunDeferred?}
 //   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?}
 //                                                               → {id,name,schedule}

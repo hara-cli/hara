@@ -61,7 +61,7 @@ import {
   clearEnrollment,
   enrollDevice,
   enrollGatewayProfile,
-  gatewayProfileFromEnrollment,
+  upsertGatewayProfileFromEnrollment,
   enrollmentFromProfile,
   heartbeatEnrollment,
   heartbeat,
@@ -76,7 +76,6 @@ import {
   listProfiles,
   useProfile,
   addProfile,
-  upsertProfile,
   removeProfile,
   setModel as setProfileModel,
   resetModel as resetProfileModel,
@@ -177,6 +176,16 @@ import { readModelContextFileSync } from "./fs-read.js";
 import { MIN_NODE_VERSION, unsupportedNodeMessage } from "./runtime.js";
 import { redactKnownSecrets, redactSensitiveText } from "./security/secrets.js";
 import { normalizePackageRegistry } from "./package-registry.js";
+import {
+  DeskClientError,
+  deskOrganizationIdentityMatches,
+  deskConnectionsSnapshot as localDeskConnectionsSnapshot,
+  fetchDeskSnapshot,
+  fetchDeskTask,
+  removeProfileCreds,
+  type DeskOrganizationIdentity,
+  type DeskTaskState,
+} from "./desk.js";
 
 /** Render the background-job list for /jobs (user-facing view of what the agent has running in the
  *  background — dev servers, watchers, long tasks). Mirrors codex/Claude-Code process visibility. */
@@ -584,6 +593,56 @@ function assertOrganizationId(value: string): string {
     throw new Error("invalid organization connection id");
   }
   return id;
+}
+
+function deskOrganizationIdentity(profile: Profile): DeskOrganizationIdentity {
+  if (profile.kind !== "gateway" || !profile.gatewayUrl) {
+    throw new DeskClientError("NOT_CONFIGURED", "organization connection is not available");
+  }
+  return {
+    profileId: profile.id,
+    gatewayUrl: profile.gatewayUrl,
+    ...(profile.deviceId ? { deviceId: profile.deviceId } : {}),
+    ...(profile.enrolledAt ? { enrolledAt: profile.enrolledAt } : {}),
+  };
+}
+
+function assertDeskOrganizationProfile(value: string): DeskOrganizationIdentity {
+  const id = assertOrganizationId(value);
+  const profile = getProfile(id);
+  if (!profile || profile.kind !== "gateway") {
+    throw new DeskClientError("NOT_CONFIGURED", `organization connection '${id}' was not found`);
+  }
+  return deskOrganizationIdentity(profile);
+}
+
+async function fetchDeskSnapshotForProfile(
+  profileId: string,
+  state?: DeskTaskState,
+) {
+  const identity = assertDeskOrganizationProfile(profileId);
+  const result = await fetchDeskSnapshot(identity, state);
+  const current = assertDeskOrganizationProfile(profileId);
+  if (!deskOrganizationIdentityMatches(identity, current)) {
+    throw new DeskClientError(
+      "CONFLICT",
+      "organization connection changed during the Desk read",
+    );
+  }
+  return result;
+}
+
+async function fetchDeskTaskForProfile(profileId: string, taskId: string) {
+  const identity = assertDeskOrganizationProfile(profileId);
+  const result = await fetchDeskTask(identity, taskId);
+  const current = assertDeskOrganizationProfile(profileId);
+  if (!deskOrganizationIdentityMatches(identity, current)) {
+    throw new DeskClientError(
+      "CONFLICT",
+      "organization connection changed during the Desk read",
+    );
+  }
+  return result;
 }
 
 async function testProviderSettingsCandidate(input: {
@@ -2375,6 +2434,7 @@ profileCmd
     // Capture the profile before removal so we can mention the gateway host in the token-hint
     // line (5 below). After removeProfile, getProfile(id) is gone.
     const before = getProfile(id);
+    if (before?.kind === "gateway") removeProfileCreds(id);
     const r = removeProfile(id);
     if (!r.ok) {
       out(c.red(r.reason + "\n"));
@@ -2506,8 +2566,7 @@ program
     if (!opts.code) return void out(c.red("Need --code <code> — ask your hara-control admin to issue an enrollment code.\n"));
     try {
       const e = await enrollDevice(gatewayUrl, opts.code);
-      const p = gatewayProfileFromEnrollment(DEFAULT_ORG_ID, "Default Org", e);
-      upsertProfile(p);
+      upsertGatewayProfileFromEnrollment(DEFAULT_ORG_ID, "Default Org", e);
       useProfile(DEFAULT_ORG_ID);
       out(c.green(`✓ enrolled with ${e.gatewayUrl}`) + c.dim(` · device ${e.deviceId || "?"} · model ${e.model || "(gateway default)"} · profile ${DEFAULT_ORG_ID}\n`) + c.dim("hara routes through the gateway now — the real provider key stays server-side.\n"));
       const nRoles = await syncOrgRoles();
@@ -2781,6 +2840,7 @@ program
           const id = assertOrganizationId(inputId);
           const target = getProfile(id);
           if (!target || target.kind !== "gateway") throw new Error("organization connection was not found");
+          removeProfileCreds(id);
           const removed = removeProfile(id);
           if (!removed.ok) throw new Error("organization connection could not be removed");
           return organizationConnectionsSnapshot(settingsCwd);
@@ -2795,6 +2855,13 @@ program
             && await heartbeatEnrollment(enrollment, AbortSignal.timeout(15_000), { profileId: id });
           return { id, ok, checkedAt: Date.now() };
         },
+        deskConnections: () => localDeskConnectionsSnapshot(
+          listProfiles()
+            .filter((profile) => profile.kind === "gateway")
+            .map(deskOrganizationIdentity),
+        ),
+        deskSnapshot: fetchDeskSnapshotForProfile,
+        deskTask: fetchDeskTaskForProfile,
         testProviderSettings: (input) => testProviderSettingsCandidate(input),
         saveProviderSettings: async (input, targetCwd) => {
           const settingsCwd = targetCwd ?? cwd;
@@ -3420,18 +3487,64 @@ program
 // `hara desk` — connect to a hara-desk coordination server (identity registry + task board).
 // The desk is the closed-source enterprise piece; this is the open-source client side.
 const deskCmd = program.command("desk").description("coordinate with a hara-desk server (register · post · board · claim · complete)");
+
+const resolveDeskProfile = (requested?: string): {
+  profileId: string;
+  identity: DeskOrganizationIdentity;
+} | null => {
+  const profileId = requested?.trim() || resolveActive(process.cwd()).id;
+  if (!isValidProfileId(profileId)) throw new Error("invalid organization connection id");
+  const profile = getProfile(profileId);
+  if (!profile || profile.kind !== "gateway") {
+    if (!requested) return null;
+    throw new Error(
+      `organization connection '${profileId}' was not found`,
+    );
+  }
+  return {
+    profileId,
+    identity: deskOrganizationIdentity(profile),
+  };
+};
+
+const loadDeskCliCreds = async (requested?: string) => {
+  const resolved = resolveDeskProfile(requested);
+  const { loadCreds, loadProfileCreds } = await import("./desk.js");
+  return {
+    profileId: resolved?.profileId,
+    creds: resolved
+      ? loadProfileCreds(resolved.identity)
+      : loadCreds(),
+  };
+};
+
+const missingDeskRegistration = (profileId?: string): string =>
+  profileId
+    ? `Desk is not configured for '${profileId}' — run \`hara desk register --profile ${profileId} --url … --key …\`\n`
+    : "Desk is not configured — run `hara desk register --url … --key …` first\n";
+
 deskCmd
   .command("register")
-  .description("register this agent with a desk and save credentials to ~/.hara/desk.json")
+  .description("register with the active organization's Desk (or a standalone Desk when no organization is active)")
   .requiredOption("--url <url>", "desk base URL (e.g. http://127.0.0.1:4200)")
   .requiredOption("--key <enrollKey>", "the desk's enroll key")
+  .option("--profile <id>", "organization connection id (default: active organization)")
   .option("--name <name>", "agent name shown in the registry", "hara-cli")
   .option("--owner <owner>", "the human this agent belongs to", "me")
-  .action(async (o: { url: string; key: string; name: string; owner: string }) => {
+  .action(async (o: { url: string; key: string; profile?: string; name: string; owner: string }) => {
     const { registerAgent } = await import("./desk.js");
     try {
-      const creds = await registerAgent(o.url, o.key, o.name, o.owner);
-      out(c.green("✓ registered ") + `${creds.agentId} (owner ${creds.owner}) → ${creds.url}\n`);
+      const resolved = resolveDeskProfile(o.profile);
+      const creds = await registerAgent(
+        o.url,
+        o.key,
+        o.name,
+        o.owner,
+        "hara-cli",
+        resolved?.identity,
+      );
+      const scope = resolved ? ` [${resolved.profileId}]` : " [standalone]";
+      out(c.green("✓ registered ") + `${creds.agentId} (owner ${creds.owner}) → ${creds.url}${scope}\n`);
     } catch (e: any) {
       out(c.red(`register failed: ${e.message}\n`));
     }
@@ -3439,17 +3552,24 @@ deskCmd
 deskCmd
   .command("post [title...]")
   .description("post a task or feedback report to the board")
+  .option("--profile <id>", "organization connection id (default: active organization)")
   .option("--dispatch", "a dispatch task (someone does work) instead of a feedback report")
   .option("--high", "high-risk dispatch (needs an owner ack before it can complete)")
   .option("--body <text>", "task body / details", "")
-  .action(async (parts: string[], o: { dispatch?: boolean; high?: boolean; body: string }) => {
-    const { loadCreds, deskCall } = await import("./desk.js");
-    const creds = loadCreds();
-    if (!creds) return void out(c.red("not registered — run `hara desk register --url … --key …` first\n"));
+  .action(async (parts: string[], o: { profile?: string; dispatch?: boolean; high?: boolean; body: string }) => {
+    const { deskCall } = await import("./desk.js");
+    let profileId: string | undefined;
+    let creds;
+    try {
+      ({ profileId, creds } = await loadDeskCliCreds(o.profile));
+    } catch (e: any) {
+      return void out(c.red(`${e.message}\n`));
+    }
+    if (!creds) return void out(c.red(missingDeskRegistration(profileId)));
     const title = (parts ?? []).join(" ").trim();
     if (!title) return void out("Usage: hara desk post <title> [--dispatch] [--high] [--body …]\n");
     try {
-      const r = await deskCall(creds.url, "POST", "/tasks", { token: creds.token, body: { kind: o.dispatch ? "dispatch" : "feedback", risk: o.high ? "high" : "low", title, body: o.body } });
+      const r = await deskCall(creds.url, "POST", "/tasks", { token: creds.token, body: { kind: o.dispatch ? "dispatch" : "feedback", risk: o.high ? "high" : "low", title, body: o.body } }) as any;
       out(c.green("✓ posted ") + `${r.task.id} (${r.task.kind}/${r.task.state})\n`);
     } catch (e: any) {
       out(c.red(`post failed: ${e.message}\n`));
@@ -3458,15 +3578,22 @@ deskCmd
 deskCmd
   .command("board")
   .description("list the board (default: open tasks)")
+  .option("--profile <id>", "organization connection id (default: active organization)")
   .option("--state <state>", "open | claimed | done | cancelled", "open")
   .option("--kind <kind>", "feedback | dispatch")
-  .action(async (o: { state: string; kind?: string }) => {
-    const { loadCreds, deskCall } = await import("./desk.js");
-    const creds = loadCreds();
-    if (!creds) return void out(c.red("not registered — run `hara desk register` first\n"));
+  .action(async (o: { profile?: string; state: string; kind?: string }) => {
+    const { deskCall } = await import("./desk.js");
+    let profileId: string | undefined;
+    let creds;
+    try {
+      ({ profileId, creds } = await loadDeskCliCreds(o.profile));
+    } catch (e: any) {
+      return void out(c.red(`${e.message}\n`));
+    }
+    if (!creds) return void out(c.red(missingDeskRegistration(profileId)));
     try {
       const q = `/tasks?state=${encodeURIComponent(o.state)}${o.kind ? `&kind=${encodeURIComponent(o.kind)}` : ""}`;
-      const r = await deskCall(creds.url, "GET", q, { token: creds.token });
+      const r = await deskCall(creds.url, "GET", q, { token: creds.token }) as any;
       if (!r.tasks.length) return void out(c.dim("(board empty)\n"));
       for (const t of r.tasks) out(`${t.id}  ${c.bold(t.kind)}${t.risk === "high" ? c.red("!") : " "} ${t.state.padEnd(8)} ${t.title}\n`);
     } catch (e: any) {
@@ -3482,13 +3609,20 @@ for (const [verb, path, ok] of [
   deskCmd
     .command(`${verb} <taskId>`)
     .description(`${verb} a task`)
+    .option("--profile <id>", "organization connection id (default: active organization)")
     .option("--detail <text>", "note (complete)", "")
-    .action(async (taskId: string, o: { detail: string }) => {
-      const { loadCreds, deskCall } = await import("./desk.js");
-      const creds = loadCreds();
-      if (!creds) return void out(c.red("not registered — run `hara desk register` first\n"));
+    .action(async (taskId: string, o: { profile?: string; detail: string }) => {
+      const { deskCall } = await import("./desk.js");
+      let profileId: string | undefined;
+      let creds;
       try {
-        const r = await deskCall(creds.url, "POST", `/tasks/${taskId}/${path}`, { token: creds.token, body: verb === "complete" ? { detail: o.detail } : {} });
+        ({ profileId, creds } = await loadDeskCliCreds(o.profile));
+      } catch (e: any) {
+        return void out(c.red(`${e.message}\n`));
+      }
+      if (!creds) return void out(c.red(missingDeskRegistration(profileId)));
+      try {
+        const r = await deskCall(creds.url, "POST", `/tasks/${encodeURIComponent(taskId)}/${path}`, { token: creds.token, body: verb === "complete" ? { detail: o.detail } : {} }) as any;
         out(c.green(`✓ ${ok} `) + `${r.task?.id ?? taskId}${r.task ? ` (${r.task.state})` : ""}\n`);
       } catch (e: any) {
         out(c.red(`${verb} failed: ${e.message}\n`));

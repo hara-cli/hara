@@ -103,6 +103,13 @@ import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 import {
+  DeskClientError,
+  type DeskConnectionsSnapshot,
+  type DeskSnapshot,
+  type DeskTaskDetails,
+  type DeskTaskState,
+} from "../desk.js";
+import {
   ArtifactStoreError,
   commitArtifact,
   getArtifact,
@@ -171,6 +178,12 @@ export interface ServeDeps {
   useOrganizationConnection?: (id: string, cwd?: string) => OrganizationConnectionsState;
   removeOrganizationConnection?: (id: string, cwd?: string) => OrganizationConnectionsState;
   checkOrganizationConnection?: (id: string, cwd?: string) => Promise<OrganizationConnectionCheck>;
+  /** Organization-scoped Desk data. Connections are a private local read; snapshot/detail are explicit,
+   * bounded remote reads. Every remote call carries a captured profileId so an in-flight request cannot
+   * cross organizations if the global default changes. Desk bearer credentials never enter these DTOs. */
+  deskConnections?: () => DeskConnectionsSnapshot;
+  deskSnapshot?: (profileId: string, state?: DeskTaskState) => Promise<DeskSnapshot>;
+  deskTask?: (profileId: string, taskId: string) => Promise<DeskTaskDetails>;
   /** thinking-dial levels valid for this endpoint's reasoning style (from the provider registry) */
   effortLevels?: string[];
   /** Live defaults advertised to persistent clients after config/profile edits. `model` lets a session
@@ -306,6 +319,9 @@ const COMPACT_TIMEOUT_MS = 60_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 const SOCKET_CLOSE_GRACE_MS = 250;
 const DISCOVERY_LOCK_WAIT_MS = 2_000;
+const SERVE_PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const SERVE_DESK_TASK_ID_PATTERN = /^t_[a-f0-9]+$/;
+const SERVE_DESK_STATES = new Set<DeskTaskState>(["open", "claimed", "done", "cancelled"]);
 
 const artifactRpcError = (
   id: number | string | null,
@@ -329,6 +345,24 @@ const artifactRpcError = (
         ? "Artifact revert failed safely; no current revision was replaced"
         : `Artifact ${action} failed safely; local Artifact data was not changed`,
   );
+};
+
+const deskRpcError = (id: number | string | null, error: unknown): string => {
+  if (error instanceof DeskClientError) {
+    const code =
+      error.code === "UNAUTHORIZED"
+      || error.code === "FORBIDDEN"
+        ? ERR.UNAUTHORIZED
+        : error.code === "INVALID_CONFIGURATION"
+          || error.code === "NOT_CONFIGURED"
+          || error.code === "NOT_FOUND"
+          ? ERR.PARAMS
+          : error.code === "CONFLICT"
+            ? ERR.CONFLICT
+            : ERR.INTERNAL;
+    return rpcError(id, code, redactSensitiveText(error.message).text);
+  }
+  return rpcError(id, ERR.INTERNAL, "Desk request failed safely; no credential or remote response was exposed");
 };
 
 interface DiscoveryRecord {
@@ -1420,6 +1454,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "artifact.list", "artifact.get", "artifact.revisions",
             "tasks.list", "approvals.list", "approvals.resolve",
           ];
+          const collaborationRemote =
+            !!deps.deskConnections
+            && !!deps.deskSnapshot
+            && !!deps.deskTask;
+          if (collaborationRemote) {
+            methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
+          }
+          const features = ["composer.attachments.v1", "models.capabilities.v1"];
+          if (collaborationRemote) features.push("collaboration.remote.v1");
           const runtime = runtimeInfo();
           const setupState = deps.providerSettings
             ? (deps.providerSettings(opts.cwd).current.authenticated ? "ready" : "needs-credentials")
@@ -1435,7 +1478,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             capabilities: {
               methods,
               events: ["event.task_state"],
-              features: ["composer.attachments.v1", "models.capabilities.v1"],
+              features,
             },
           }));
         }
@@ -1820,6 +1863,54 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             if (!deps.checkOrganizationConnection) return reply(rpcError(id, ERR.METHOD, "organization connection check not supported by this server"));
             return reply(rpcResult(id!, redactSensitiveValue(await deps.checkOrganizationConnection(p.id, targetCwd)).value));
+          }
+          case "desk.connections.list": {
+            if (!deps.deskConnections) return reply(rpcError(id, ERR.METHOD, "organization Desk is not supported by this server"));
+            try {
+              return reply(rpcResult(id!, redactSensitiveValue(deps.deskConnections()).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
+          }
+          case "desk.snapshot": {
+            if (!deps.deskSnapshot) return reply(rpcError(id, ERR.METHOD, "organization Desk snapshots are not supported by this server"));
+            if (
+              typeof p.profileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || (
+                p.state !== undefined
+                && (typeof p.state !== "string" || !SERVE_DESK_STATES.has(p.state as DeskTaskState))
+              )
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId required; optional state must be open, claimed, done, or cancelled"));
+            }
+            const profileId = p.profileId;
+            const state = p.state as DeskTaskState | undefined;
+            try {
+              const result = await deps.deskSnapshot(profileId, state);
+              return reply(rpcResult(id!, redactSensitiveValue(result).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
+          }
+          case "desk.task.get": {
+            if (!deps.deskTask) return reply(rpcError(id, ERR.METHOD, "organization Desk task details are not supported by this server"));
+            if (
+              typeof p.profileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || typeof p.taskId !== "string"
+              || !SERVE_DESK_TASK_ID_PATTERN.test(p.taskId)
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId and taskId required"));
+            }
+            const profileId = p.profileId;
+            const taskId = p.taskId;
+            try {
+              const result = await deps.deskTask(profileId, taskId);
+              return reply(rpcResult(id!, redactSensitiveValue(result).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
           }
           case "settings.providers.test":
           case "settings.providers.save": {

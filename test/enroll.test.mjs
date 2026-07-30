@@ -17,9 +17,16 @@ import {
   deviceTokenExpiryWarning,
   normalizeGatewayUrl,
   enrollGatewayProfile,
+  upsertGatewayProfileFromEnrollment,
 } from "../dist/org-fleet/enroll.js";
+import {
+  deskConnectionsSnapshot,
+  loadProfileCreds,
+  saveProfileCreds,
+} from "../dist/desk.js";
 import { orgRolesDir, loadRoles } from "../dist/org/roles.js";
 import { addProfile, listProfiles, loadActiveProfile, upsertProfile } from "../dist/profile/profile.js";
+import { resetPrivateHaraStateForTests } from "../dist/security/private-state.js";
 
 test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry, requires a token", () => {
   const e = parseEnrollResponse(
@@ -203,6 +210,69 @@ test("profile-native enrollment stores only the scoped token in private profiles
     server.close();
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("every gateway profile replacement retires a Desk binding pinned to the prior enrollment", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-profile-replace-"));
+  const previousHome = process.env.HOME;
+  const previousDeskHome = process.env.HARA_DESK_STATE_HOME;
+  process.env.HOME = home;
+  process.env.HARA_DESK_STATE_HOME = home;
+  resetPrivateHaraStateForTests();
+  const firstEnrollment = {
+    gatewayUrl: "https://control-a.example.test",
+    deviceToken: "device-token-a",
+    deviceId: "device-a",
+    model: "glm-5",
+    enrolledAt: "2026-07-30T10:00:00.000Z",
+  };
+  const firstIdentity = {
+    profileId: "default-org",
+    gatewayUrl: firstEnrollment.gatewayUrl,
+    deviceId: firstEnrollment.deviceId,
+    enrolledAt: firstEnrollment.enrolledAt,
+  };
+  try {
+    upsertGatewayProfileFromEnrollment("default-org", "Default Org", firstEnrollment);
+    saveProfileCreds({
+      url: "https://desk-a.example.test",
+      agentId: "agent-a",
+      owner: "owner-a",
+      token: "desk-secret-a",
+    }, firstIdentity);
+    assert.equal(loadProfileCreds(firstIdentity)?.agentId, "agent-a");
+
+    const replacement = {
+      ...firstEnrollment,
+      gatewayUrl: "https://control-b.example.test",
+      deviceToken: "device-token-b",
+      deviceId: "device-b",
+      enrolledAt: "2026-07-31T10:00:00.000Z",
+    };
+    upsertGatewayProfileFromEnrollment("default-org", "Default Org", replacement);
+    assert.equal(loadProfileCreds({
+      profileId: "default-org",
+      gatewayUrl: replacement.gatewayUrl,
+      deviceId: replacement.deviceId,
+      enrolledAt: replacement.enrolledAt,
+    }), null);
+    assert.deepEqual(deskConnectionsSnapshot([{
+      profileId: "default-org",
+      gatewayUrl: replacement.gatewayUrl,
+      deviceId: replacement.deviceId,
+      enrolledAt: replacement.enrolledAt,
+    }]), {
+      connections: [{ profileId: "default-org", configured: false }],
+      legacyUnbound: false,
+    });
+  } finally {
+    resetPrivateHaraStateForTests();
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousDeskHome === undefined) delete process.env.HARA_DESK_STATE_HOME;
+    else process.env.HARA_DESK_STATE_HOME = previousDeskHome;
     rmSync(home, { recursive: true, force: true });
   }
 });

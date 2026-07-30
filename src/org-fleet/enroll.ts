@@ -13,6 +13,7 @@
 import { homedir, hostname, platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { removeMismatchedProfileCreds } from "../desk.js";
 import { invalidateRolesCache, orgRolesDir } from "../org/roles.js";
 import {
   loadActiveProfile,
@@ -334,6 +335,25 @@ export function gatewayProfileFromEnrollment(id: string, label: string | undefin
   };
 }
 
+/** Persist a gateway enrollment and retire any Desk bearer pinned to the prior identity at this id.
+ * All enrollment entry points use this helper so legacy aliases cannot leave an old organization
+ * binding behind after a device-token rotation or tenant replacement. */
+export function upsertGatewayProfileFromEnrollment(
+  id: string,
+  label: string | undefined,
+  enrollment: Enrollment,
+): Profile {
+  const profile = gatewayProfileFromEnrollment(id, label, enrollment);
+  upsertProfile(profile);
+  removeMismatchedProfileCreds({
+    profileId: profile.id,
+    gatewayUrl: enrollment.gatewayUrl,
+    deviceId: enrollment.deviceId,
+    enrolledAt: enrollment.enrolledAt,
+  });
+  return profile;
+}
+
 /** Desktop/profile-native enrollment: no legacy file is written, and the one-time code is never
  * stored. An existing id is intentionally replaced so re-enrollment rotates the scoped token. */
 export async function enrollGatewayProfile(
@@ -344,8 +364,7 @@ export async function enrollGatewayProfile(
   const existing = getProfile(validated.id);
   if (existing && existing.kind !== "gateway") throw new Error("connection id already belongs to a personal provider profile");
   const enrollment = await exchangeEnrollment(validated.gatewayUrl, validated.code, signal);
-  const profile = gatewayProfileFromEnrollment(validated.id, validated.label, enrollment);
-  upsertProfile(profile);
+  upsertGatewayProfileFromEnrollment(validated.id, validated.label, enrollment);
   if (validated.activate !== false) {
     const switched = useProfile(validated.id);
     if (!switched.ok) throw new Error("organization connection was saved but could not be activated");

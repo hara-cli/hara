@@ -188,13 +188,33 @@ try {
   if (initialized.error || initialized.result?.version !== expectedVersion) {
     throw new Error(`serve initialize failed: ${JSON.stringify(initialized.error ?? initialized.result)}`);
   }
+  const methods = new Set(initialized.result?.capabilities?.methods ?? []);
+  const features = new Set(initialized.result?.capabilities?.features ?? []);
+  for (const method of ["desk.connections.list", "desk.snapshot", "desk.task.get"]) {
+    if (!methods.has(method)) throw new Error(`serve capability is missing ${method}`);
+  }
+  if (!features.has("collaboration.remote.v1")) {
+    throw new Error("serve capability is missing collaboration.remote.v1");
+  }
+  const deskConnections = await call(ws, 2, "desk.connections.list", {});
+  if (
+    deskConnections.error
+    || !Array.isArray(deskConnections.result?.connections)
+    || typeof deskConnections.result?.legacyUnbound !== "boolean"
+  ) {
+    throw new Error(
+      `serve Desk connection inventory failed: ${JSON.stringify(
+        deskConnections.error ?? deskConnections.result,
+      )}`,
+    );
+  }
   // Exercise the real session-index path used by Desktop immediately after initialize. Simple
   // --version/--help probes cannot catch runtime API differences such as Bun's synchronous Dir.close().
-  const listed = await call(ws, 2, "session.list", { limit: 50 });
+  const listed = await call(ws, 3, "session.list", { limit: 50 });
   if (listed.error || !Array.isArray(listed.result?.sessions)) {
     throw new Error(`serve session list failed: ${JSON.stringify(listed.error ?? listed.result)}`);
   }
-  const stopped = await call(ws, 3, "server.shutdown", {});
+  const stopped = await call(ws, 4, "server.shutdown", {});
   if (stopped.error || stopped.result?.accepted !== true) {
     throw new Error(`serve shutdown failed: ${JSON.stringify(stopped.error ?? stopped.result)}`);
   }
@@ -206,7 +226,7 @@ try {
   );
   if (child.exitCode !== 0) throw new Error(`serve exited ${child.exitCode}: ${(stderr || stdout).trim().slice(-4_000)}`);
   if (existsSync(discoveryPath)) throw new Error("serve.json remained after authenticated shutdown");
-  console.log(`✓ native serve discovery + session listing + authenticated shutdown (${expectedVersion})`);
+  console.log(`✓ native Serve Desk capabilities + session listing + authenticated shutdown (${expectedVersion})`);
 } catch (error) {
   console.error(`standalone serve smoke: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;

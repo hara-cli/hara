@@ -24,6 +24,18 @@ test("standalone releases use baseline x64 targets and runtime boundary smoke", 
   assert.match(ci, /standalone-boundary-smoke\.mjs/);
   assert.match(release, /standalone-boundary-smoke\.mjs/);
   assert.match(serveSmoke, /"session\.list"/, "native serve smoke must exercise session index initialization");
+  for (const capability of [
+    "desk.connections.list",
+    "desk.snapshot",
+    "desk.task.get",
+    "collaboration.remote.v1",
+  ]) {
+    assert.match(
+      serveSmoke,
+      new RegExp(capability.replaceAll(".", "\\.")),
+      `native serve smoke must require ${capability}`,
+    );
+  }
   assert.doesNotMatch(
     serveSmoke,
     /from\s+["']ws["']/,

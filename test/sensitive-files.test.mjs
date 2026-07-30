@@ -26,6 +26,7 @@ import {
   existingSensitiveReadPaths,
   existingSensitiveSeatbeltMasks,
   isSensitiveFilePath,
+  SENSITIVE_SEARCH_GLOBS,
   sensitiveFileReason,
   sensitiveShellCommandReason,
   sensitiveStructuredInputReason,
@@ -119,6 +120,7 @@ test("sensitive path policy covers Hara control-plane state, NTFS aliases, and n
       "profiles.json",
       "serve.json",
       "desk.json",
+      "desk-connections.json",
       "desk-collector.json",
       "org.json",
       "org.json.legacy",
@@ -142,6 +144,10 @@ test("sensitive path policy covers Hara control-plane state, NTFS aliases, and n
     for (const path of protectedPaths) {
       assert.match(sensitiveFileReason(join(state, path)) ?? "", /private Hara|credential/i, path);
     }
+    assert.ok(
+      SENSITIVE_SEARCH_GLOBS.includes("**/.hara/desk-connections.json"),
+      "broad searches exclude the native multi-organization bearer store before walking it",
+    );
 
     assert.equal(sensitiveFileReason(join(home, "project", ".env::$DATA")), "environment file");
     assert.equal(sensitiveFileReason(join(home, "project", ".env:stream")), "environment file");
