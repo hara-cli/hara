@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.136.0 — 2026-07-31 — profile-scoped organization Desk
+
+- Add authenticated Serve capabilities for listing local Desk bindings, explicitly reading a bounded
+  organization board, and opening one task dossier. Every remote read is pinned to the requested
+  organization profile; board summaries carry excerpts only, while full content is fetched only for
+  the selected task.
+- Keep native multi-organization Desk bearers in a private store independent from the legacy MCP
+  credential. Bind each bearer to the exact gateway enrollment, rotate an opaque cache revision when
+  credentials change, and retire the binding on organization removal or same-ID re-enrollment.
+- Harden Desk URLs, redirects, response sizes, task identities, enum/timestamp decoding, concurrent
+  credential rotation, and aggregate payload limits. The new bearer store is blocked by Hara's file
+  and search safety boundary, and standalone release smoke now verifies all three Desk RPCs.
+- Upgrade with `npm i -g @nanhara/hara@0.136.0`.
+
 ## 0.135.4 — 2026-07-31 — reliable proxy startup in Windows standalone builds
 
 - Keep Node's Undici proxy transport lazy and use Bun's native proxy transport inside standalone
