@@ -176,7 +176,15 @@ try {
     ws.addEventListener("open", onOpen);
     ws.addEventListener("error", onError);
   });
-  const initialized = await call(ws, 1, "initialize", { token: record.token });
+  let initialized;
+  try {
+    initialized = await call(ws, 1, "initialize", { token: record.token });
+  } catch (error) {
+    const childOutput = (stderr || stdout).trim().slice(-4_000);
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}${childOutput ? `: ${childOutput}` : ""}`,
+    );
+  }
   if (initialized.error || initialized.result?.version !== expectedVersion) {
     throw new Error(`serve initialize failed: ${JSON.stringify(initialized.error ?? initialized.result)}`);
   }

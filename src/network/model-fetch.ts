@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
 import { isIP } from "node:net";
-import { fetch as undiciFetch, ProxyAgent } from "undici";
 import { readRawConfig } from "../config.js";
 
 export type ModelProxySource = "hara-env" | "environment" | "config" | "windows-system";
@@ -27,7 +26,10 @@ interface ModelProxyResolutionOptions {
 
 const WINDOWS_INTERNET_SETTINGS =
   "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
-const proxyAgents = new Map<string, ProxyAgent>();
+type UndiciModule = typeof import("undici");
+type UndiciProxyAgent = InstanceType<UndiciModule["ProxyAgent"]>;
+const proxyAgents = new Map<string, UndiciProxyAgent>();
+let undiciModulePromise: Promise<UndiciModule> | undefined;
 let cachedWindowsProxy: { at: number; value?: WindowsProxySettings } | undefined;
 
 function nonBlank(value: string | undefined): string | undefined {
@@ -206,13 +208,25 @@ export function selectModelProxy(
   return uri ? { uri, source: "windows-system" } : undefined;
 }
 
-function proxyAgent(uri: string): ProxyAgent {
+function isBunRuntime(): boolean {
+  return typeof (globalThis as { Bun?: unknown }).Bun === "object";
+}
+
+async function loadUndici(): Promise<UndiciModule> {
+  undiciModulePromise ??= import("undici");
+  return undiciModulePromise;
+}
+
+async function proxyAgent(
+  uri: string,
+): Promise<{ undici: UndiciModule; agent: UndiciProxyAgent }> {
+  const undici = await loadUndici();
   let agent = proxyAgents.get(uri);
   if (!agent) {
-    agent = new ProxyAgent({ uri, proxyTunnel: true });
+    agent = new undici.ProxyAgent({ uri, proxyTunnel: true });
     proxyAgents.set(uri, agent);
   }
-  return agent;
+  return { undici, agent };
 }
 
 function networkErrorCode(error: unknown): string | undefined {
@@ -251,12 +265,23 @@ export function createModelFetch(
     const url = new URL(rawUrl);
     const proxy = selectModelProxy(url, { ...resolutionDefaults, configuredProxy });
     try {
-      const response = proxy
-        ? await undiciFetch(input as Parameters<typeof undiciFetch>[0], {
-            ...(init as Parameters<typeof undiciFetch>[1]),
-            dispatcher: proxyAgent(proxy.uri),
-          })
-        : await globalThis.fetch(input, init);
+      let response: Response;
+      if (!proxy) {
+        response = await globalThis.fetch(input, init);
+      } else if (isBunRuntime()) {
+        // Bun standalone binaries have a native proxy transport. Keep Node's Undici package unloaded
+        // during CLI/serve startup: eagerly initializing it can stall Bun's Windows WebSocket loop.
+        response = await globalThis.fetch(input, {
+          ...init,
+          proxy: proxy.uri,
+        } as RequestInit & { proxy: string });
+      } else {
+        const { undici, agent } = await proxyAgent(proxy.uri);
+        response = await undici.fetch(input as Parameters<UndiciModule["fetch"]>[0], {
+          ...(init as Parameters<UndiciModule["fetch"]>[1]),
+          dispatcher: agent,
+        }) as unknown as Response;
+      }
       return response as unknown as Response;
     } catch (error) {
       throw safeModelNetworkError(error, proxy);

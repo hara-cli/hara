@@ -54,6 +54,9 @@ jobs:
       - name: Build TypeScript
         id: windows-build
         run: npm run build
+      - name: Exercise Bun model proxy transport
+        if: ${{ !cancelled() && steps.windows-build.outcome == 'success' }}
+        run: bun scripts/model-proxy-runtime-smoke.mjs
       # Keep this lane focused on Windows contracts that differ from POSIX: portable/Git-Bash HOME,
       # command-shim resolution, and deterministic shell discovery outside PATH. The complete suite
       # remains in build-test.
