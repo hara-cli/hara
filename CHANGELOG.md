@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.135.4 — 2026-07-31 — reliable proxy startup in Windows standalone builds
+
+- Keep Node's Undici proxy transport lazy and use Bun's native proxy transport inside standalone
+  binaries. This prevents the eager Node transport from stalling the Windows Bun Serve handshake while
+  retaining authenticated HTTP(S) proxy support for model and organization traffic.
+- Windows CI now exercises a real authenticated Bun proxy request before compiling the standalone, then
+  verifies Serve initialization, session listing, and authenticated shutdown on that compiled binary.
+- Upgrade with `npm i -g @nanhara/hara@0.135.4`.
+
 ## 0.135.3 — 2026-07-31 — Windows and explicit proxy support for model gateways
 
 - Route model/provider SDK traffic, model discovery, remote embeddings, Qwen OAuth and organization
