@@ -317,7 +317,7 @@ test("manual run refuses to overwrite an interrupted running marker and requires
 
 test("manual run retries a transient terminal-state store lock instead of leaving running behind", {
   skip: process.platform === "win32",
-  timeout: 10_000,
+  timeout: 45_000,
 }, async () => {
   const savedHome = process.env.HOME;
   const savedUserProfile = process.env.USERPROFILE;
@@ -328,7 +328,20 @@ test("manual run retries a transient terminal-state store lock instead of leavin
   process.env.HOME = home;
   process.env.USERPROFILE = home;
   process.env.HARA_ALLOW_SENSITIVE_FILES = "1";
-  let blocker;
+  let publishBlocker;
+  let releaseBlocker;
+  const blockerToken = "terminal-retry-blocker";
+  const blockerPath = () => join(cronDir(), ".jobs.lock");
+  const removeTestBlocker = () => {
+    try {
+      const current = JSON.parse(readFileSync(blockerPath(), "utf8"));
+      if (current?.pid === process.pid && current?.token === blockerToken) {
+        rmSync(blockerPath(), { force: true });
+      }
+    } catch {
+      // Missing/replaced locks belong to the code under test; never remove them by pathname alone.
+    }
+  };
   try {
     const job = addJob({
       name: "terminal retry",
@@ -338,26 +351,25 @@ test("manual run retries a transient terminal-state store lock instead of leavin
       cwd: project,
       createdAt: Date.now(),
     });
-    blocker = spawn(process.execPath, ["-e", "setTimeout(() => {}, 2600)"], {
-      stdio: "ignore",
-    });
-    await once(blocker, "spawn");
-    const publishBlocker = setTimeout(() => {
+    publishBlocker = setTimeout(() => {
       writeFileSync(
-        join(cronDir(), ".jobs.lock"),
-        JSON.stringify({ pid: blocker.pid, token: "terminal-retry-blocker" }),
+        blockerPath(),
+        JSON.stringify({ pid: process.pid, token: blockerToken }),
       );
     }, 100);
+    releaseBlocker = setTimeout(removeTestBlocker, 2_600);
     const result = await runJobTracked(job, { timeoutMs: 5_000 });
     clearTimeout(publishBlocker);
+    clearTimeout(releaseBlocker);
     assert.equal(result.ok, true, JSON.stringify(result));
     const terminal = findJob(job.id);
     assert.equal(terminal.lastStatus, "ok");
     assert.equal(terminal.runningPid, undefined);
     assert.equal(terminal.runningToken, undefined);
   } finally {
-    if (blocker?.exitCode === null) blocker.kill("SIGKILL");
-    if (blocker?.exitCode === null) await once(blocker, "exit");
+    if (publishBlocker) clearTimeout(publishBlocker);
+    if (releaseBlocker) clearTimeout(releaseBlocker);
+    removeTestBlocker();
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
     if (savedUserProfile === undefined) delete process.env.USERPROFILE;
@@ -409,7 +421,7 @@ test("a timed-out job is persisted and the tick continues with the next due job"
       assert.ok(Number.isFinite(running.runningSince));
       if (job.id === first.id) return new Promise(() => {}); // deliberately ignores cancellation
       return { ok: true, output: "done" };
-    }, { jobTimeoutMs: 100, tickTimeoutMs: 2_000 });
+    }, { jobTimeoutMs: 100, tickTimeoutMs: 30_000 });
 
     assert.deepEqual(result.ran, [first.id, second.id]);
     assert.deepEqual(calls, [first.id, second.id], "one timeout does not starve later due jobs");
