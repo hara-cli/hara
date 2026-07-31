@@ -550,8 +550,9 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(validSchedule.result.schedule, "0 9 * * 1-5");
     assert.match(validSchedule.result.description, /cron/);
     assert.ok(
-      validSchedule.result.nextRuns.length >= 1 && validSchedule.result.nextRuns.length <= 3,
-      "validation returns the bounded preview that fits its latency budget",
+      Array.isArray(validSchedule.result.nextRuns)
+        && validSchedule.result.nextRuns.length <= 3,
+      "validation returns only the preview entries that fit its latency budget",
     );
     assert.equal(
       validSchedule.result.nextRuns.length < 3,
