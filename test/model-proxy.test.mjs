@@ -7,6 +7,7 @@ import {
   bypassesModelProxy,
   createModelFetch,
   parseWindowsProxyRegistry,
+  safeModelNetworkFailureMessage,
   selectModelProxy,
   windowsProxyUri,
 } from "../dist/network/model-fetch.js";
@@ -206,6 +207,46 @@ test("model transport errors redact proxy credentials and destination URLs", asy
     (error) => {
       assert.match(error.message, /model network request failed through the configured proxy/i);
       assert.doesNotMatch(error.message, /private-user|private-password|secret-gateway/i);
+      return true;
+    },
+  );
+});
+
+test("provider SDK wrappers preserve only Hara's redacted model-network diagnosis", () => {
+  const safe = "model network request failed through the Windows system proxy (ECONNREFUSED); verify the Windows static HTTP(S) proxy listener, bypass list, and VPN";
+  const wrapped = new Error("Connection error.", {
+    cause: new Error("SDK transport failed", { cause: new Error(safe) }),
+  });
+  assert.equal(safeModelNetworkFailureMessage(wrapped), safe);
+  assert.equal(
+    safeModelNetworkFailureMessage(
+      new Error("Connection error.", {
+        cause: new Error("request to https://user:password@secret.example failed"),
+      }),
+    ),
+    undefined,
+    "arbitrary SDK causes are never exposed",
+  );
+});
+
+test("Windows without a supported HTTP(S) proxy receives an actionable PAC/SOCKS diagnostic", async () => {
+  const modelFetch = createModelFetch(undefined, {
+    env: {},
+    platform: "win32",
+    windowsProxy: {
+      enabled: false,
+      autoConfigUrl: "http://wpad.example/proxy.pac",
+    },
+  });
+  await assert.rejects(
+    () => modelFetch("http://127.0.0.1:1/v1/chat/completions", {
+      signal: AbortSignal.timeout(2_000),
+    }),
+    (error) => {
+      assert.match(error.message, /without a supported HTTP\(S\) proxy/i);
+      assert.match(error.message, /PAC-only or SOCKS-only/i);
+      assert.match(error.message, /hara config set proxy/i);
+      assert.doesNotMatch(error.message, /wpad\\.example/i);
       return true;
     },
   );

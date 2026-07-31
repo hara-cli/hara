@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.137.0 — 2026-07-31 — one-step organization model and Desk enrollment
+
+- Accept an optional separately scoped Hara Desk binding from Hara Control during normal organization
+  enrollment. Employees still enter one Control URL and one-time code; the selected organization then
+  receives its managed model catalog and Desk connection together.
+- Keep the model device token in the private organization profile and the Desk bearer in its independent,
+  profile-pinned protected store. The Desk secret never enters `profiles.json`, `org.json`, Desktop RPC,
+  or logs.
+- Make the local activation atomic from the user's perspective: if the protected Desk credential cannot
+  be saved, restore the prior organization profile instead of attaching an old Desk binding to a newly
+  enrolled identity.
+- Preserve Hara's redacted network-route diagnosis when provider SDKs wrap it as a generic connection
+  error. Windows now states whether a static system proxy or explicit proxy was selected, and gives a
+  concrete HTTP(S) proxy command when the machine exposes only PAC/SOCKS settings.
+- Upgrade with `npm i -g @nanhara/hara@0.137.0`.
+
 ## 0.136.0 — 2026-07-31 — profile-scoped organization Desk
 
 - Add authenticated Serve capabilities for listing local Desk bindings, explicitly reading a bounded

@@ -32,8 +32,23 @@ cloud models  /  internal vLLM·Ollama
 
 ## Protocol (device ↔ gateway)
 
-- `POST {gateway}/v1/enroll`  `{code, device:{name,os,hara_version}}` → `{device_token, device_id, model, available_models?, thinking_efforts?, base_url?}`
+- `POST {gateway}/v1/enroll`  `{code, device:{name,os,hara_version}}` → `{device_token, device_id, model, available_models?, thinking_efforts?, base_url?, expires_at?, desk?}`
 - `POST {gateway}/v1/heartbeat`  Bearer `<device_token>`  `{device_id, name, os, hara_version}` → current servers return `200 {model, available_models?, thinking_efforts?, expires_at?}`; legacy servers may return `204`
+
+`desk`, when present, is a separately scoped organization binding:
+
+```json
+{
+  "url": "https://desk.example.com",
+  "agent_id": "desk-member-…",
+  "owner": "member@example.com",
+  "token": "hdk_…"
+}
+```
+
+The one-time Control code is still the only user input. The model device token is stored in the
+selected profile, while the Desk bearer is written to the profile-pinned protected Desk store.
+Neither is reused as the other service's credential, and neither is exposed through Desktop RPC.
 - `POST {gateway}/v1/chat/completions`  — the normal agent traffic, OpenAI-compatible, Bearer `<device_token>`
 - Revocation: the gateway 401s a revoked token; hara surfaces it as an auth error → re-enroll.
 

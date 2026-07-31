@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import type { Provider, NeutralMsg, ToolUse, TurnArgs, TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
+import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { reasoningParams } from "./reasoning.js";
 import { resolvePlatform } from "./registry.js";
 
@@ -161,7 +162,13 @@ export function createOpenAIProvider(opts: {
         }
       } catch (e: any) {
         if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
-        return { text: "", toolUses: [], stop: "error", errorMsg: `${e?.status ?? ""} ${e?.message ?? e}` };
+        const networkFailure = safeModelNetworkFailureMessage(e);
+        return {
+          text: "",
+          toolUses: [],
+          stop: "error",
+          errorMsg: networkFailure ?? `${e?.status ?? ""} ${e?.message ?? e}`,
+        };
       }
 
       const { toolUses, error: argsError } = assembleToolCalls([...acc.values()], finish);

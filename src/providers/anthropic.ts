@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Provider, NeutralMsg, SystemPromptPart, TurnArgs, TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
+import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 
 export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
   const msgs: Anthropic.MessageParam[] = [];
@@ -161,7 +162,8 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
         msg = await stream.finalMessage();
       } catch (e) {
         if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
-        const errorMsg = e instanceof Anthropic.APIError ? `${e.status ?? ""} ${e.message}` : String(e);
+        const errorMsg = safeModelNetworkFailureMessage(e)
+          ?? (e instanceof Anthropic.APIError ? `${e.status ?? ""} ${e.message}` : String(e));
         return { text: "", toolUses: [], stop: "error", errorMsg };
       }
 

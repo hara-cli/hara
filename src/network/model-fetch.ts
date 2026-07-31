@@ -240,16 +240,54 @@ function networkErrorCode(error: unknown): string | undefined {
   );
 }
 
-function safeModelNetworkError(error: unknown, proxy?: ModelProxySelection): Error {
+const SAFE_MODEL_NETWORK_ERROR_PREFIX = "model network request failed";
+
+/** Recover only the bounded diagnostic Hara itself created before a provider SDK wrapped it.
+ * Provider SDK connection errors commonly replace this message with a generic "Connection error".
+ * Never surface an arbitrary nested cause: it may contain a credential-bearing URL. */
+export function safeModelNetworkFailureMessage(error: unknown): string | undefined {
+  const visited = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 6 && current && !visited.has(current); depth += 1) {
+    visited.add(current);
+    if (current instanceof Error) {
+      const message = current.message.trim();
+      if (
+        message.startsWith(SAFE_MODEL_NETWORK_ERROR_PREFIX)
+        && message.length <= 1024
+        && !/[\r\n\u0000-\u001f\u007f]/u.test(message)
+      ) {
+        return message;
+      }
+    }
+    current = typeof current === "object"
+      ? (current as { cause?: unknown }).cause
+      : undefined;
+  }
+  return undefined;
+}
+
+function safeModelNetworkError(
+  error: unknown,
+  proxy: ModelProxySelection | undefined,
+  platform: NodeJS.Platform,
+): Error {
   if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) return error;
   const code = networkErrorCode(error);
   const networkPath = proxy
     ? proxy.source === "windows-system"
       ? " through the Windows system proxy"
       : " through the configured proxy"
-    : "";
+    : platform === "win32"
+      ? " without a supported HTTP(S) proxy"
+      : "";
+  const guidance = proxy?.source === "windows-system"
+    ? "verify the Windows static HTTP(S) proxy listener, bypass list, and VPN"
+    : !proxy && platform === "win32"
+      ? "PAC-only or SOCKS-only settings need an HTTP(S) proxy entry; run 'hara config set proxy http://127.0.0.1:<port>' or fix VPN/TUN routing"
+      : "check the endpoint, VPN, and proxy settings";
   return new Error(
-    `model network request failed${networkPath}${code ? ` (${code})` : ""}; check the endpoint, VPN, and proxy settings`,
+    `${SAFE_MODEL_NETWORK_ERROR_PREFIX}${networkPath}${code ? ` (${code})` : ""}; ${guidance}`,
   );
 }
 
@@ -284,7 +322,11 @@ export function createModelFetch(
       }
       return response as unknown as Response;
     } catch (error) {
-      throw safeModelNetworkError(error, proxy);
+      throw safeModelNetworkError(
+        error,
+        proxy,
+        resolutionDefaults.platform ?? process.platform,
+      );
     }
   };
 }

@@ -70,6 +70,17 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
     }, "t"),
     /invalid thinking_efforts/,
   );
+  assert.throws(
+    () => parseEnrollResponse("https://gw", {
+      device_token: "t1",
+      desk: {
+        url: "https://desk.example.test",
+        agent_id: "agent",
+        token: "",
+      },
+    }, "t"),
+    /invalid desk binding/,
+  );
 });
 
 test("organization URL validation requires HTTPS outside loopback and rejects embedded credentials or paths", () => {
@@ -155,7 +166,9 @@ test("enroll → store (0600) → heartbeat → clear, against a stub control pl
 test("profile-native enrollment stores only the scoped token in private profiles and activates the user-added connection", async () => {
   const home = mkdtempSync(join(tmpdir(), "hara-profile-enroll-"));
   const previousHome = process.env.HOME;
+  const previousDeskHome = process.env.HARA_DESK_STATE_HOME;
   process.env.HOME = home;
+  process.env.HARA_DESK_STATE_HOME = home;
   let heartbeatSeen = false;
   const server = createServer((req, res) => {
     if (req.url === "/v1/enroll") {
@@ -167,6 +180,12 @@ test("profile-native enrollment stores only the scoped token in private profiles
         available_models: ["deepseek-v4-pro"],
         thinking_efforts: ["off", "high", "max"],
         expires_at: "2099-01-01T00:00:00Z",
+        desk: {
+          url: "https://desk.example.test",
+          agent_id: "desk-team-a",
+          owner: "member@example.test",
+          token: "separate-desk-token",
+        },
       }));
     } else if (req.url === "/v1/heartbeat") {
       heartbeatSeen = req.headers.authorization === "Bearer scoped-device-token";
@@ -197,10 +216,21 @@ test("profile-native enrollment stores only the scoped token in private profiles
     assert.equal(storedProfile?.deviceToken, "scoped-device-token");
     assert.deepEqual(storedProfile?.availableModels, ["deepseek-v4-flash", "deepseek-v4-pro"]);
     assert.deepEqual(storedProfile?.thinkingEfforts, ["off", "high", "max"]);
+    assert.equal(
+      loadProfileCreds({
+        profileId: "team-a",
+        gatewayUrl: url,
+        deviceId: "device-one",
+        enrolledAt: storedProfile?.enrolledAt,
+      })?.agentId,
+      "desk-team-a",
+      "one enrollment stores the separately scoped Desk binding for the same organization identity",
+    );
     const profilesPath = join(home, ".hara", "profiles.json");
     assert.equal(statSync(profilesPath).mode & 0o777, 0o600);
     const stored = readFileSync(profilesPath, "utf8");
     assert.equal(stored.includes("one-time-code"), false, "the registration code is never persisted");
+    assert.equal(stored.includes("separate-desk-token"), false, "the Desk bearer never enters the model profile store");
     assert.equal(existsSync(join(home, ".hara", "org.json")), false, "Desktop/profile enrollment does not create legacy state");
     await assert.rejects(
       () => enrollGatewayProfile({ id: "personal", gatewayUrl: url, code: "another-code" }),
@@ -210,6 +240,8 @@ test("profile-native enrollment stores only the scoped token in private profiles
     server.close();
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    if (previousDeskHome === undefined) delete process.env.HARA_DESK_STATE_HOME;
+    else process.env.HARA_DESK_STATE_HOME = previousDeskHome;
     rmSync(home, { recursive: true, force: true });
   }
 });

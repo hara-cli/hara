@@ -5,7 +5,9 @@
 // plane fleet visibility. Token + endpoint live in ~/.hara/org.json (0600).
 //
 // Protocol (what `hara-control` implements on the other end):
-//   POST {gateway}/v1/enroll      {code, device:{name,os,hara_version}} -> {device_token, device_id, model, available_models?, thinking_efforts?, base_url?, expires_at?}
+//   POST {gateway}/v1/enroll      {code, device:{name,os,hara_version}} -> {device_token,
+//     device_id, model, available_models?, thinking_efforts?, base_url?, expires_at?,
+//     desk?:{url,agent_id,owner,token}}
 //   POST {gateway}/v1/heartbeat   Bearer <device_token> {device_id, name, os, hara_version}
 //     -> 200 {model, available_models?, thinking_efforts?, expires_at?} or legacy 204
 //   GET  {gateway}/v1/roles       Bearer <device_token> -> {version, org_policy, roles:[…]}  (B3 digital-employee push-down)
@@ -13,10 +15,16 @@
 import { homedir, hostname, platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
-import { removeMismatchedProfileCreds } from "../desk.js";
+import {
+  normalizeDeskBaseUrl,
+  removeMismatchedProfileCreds,
+  saveProfileCreds,
+  type DeskCreds,
+} from "../desk.js";
 import { invalidateRolesCache, orgRolesDir } from "../org/roles.js";
 import {
   loadActiveProfile,
+  removeProfile,
   upsertProfile,
   useProfile,
   getProfile,
@@ -45,6 +53,9 @@ export interface Enrollment {
   enrolledAt: string;
   /** Device-token expiry shared by Hara Control and the model gateway. Missing on legacy servers. */
   expiresAt?: string;
+  /** Optional separately scoped Desk credential provisioned by Control during the same enrollment.
+   * It is consumed into desk-connections.json and is never persisted in the gateway profile. */
+  desk?: DeskCreds;
 }
 
 export interface GatewayProfileEnrollmentInput {
@@ -186,9 +197,50 @@ function inferredGatewayThinkingEfforts(model: string): string[] {
     : [];
 }
 
+function parseDeskBinding(value: unknown): DeskCreds | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("enroll response contains an invalid desk binding");
+  }
+  const record = value as Record<string, unknown>;
+  const rawUrl = record.url ?? record.base_url ?? record.baseURL;
+  const rawAgentId = record.agent_id ?? record.agentId;
+  const rawOwner = record.owner ?? "";
+  const rawToken = record.token;
+  if (
+    typeof rawUrl !== "string"
+    || typeof rawAgentId !== "string"
+    || typeof rawOwner !== "string"
+    || typeof rawToken !== "string"
+    || !rawAgentId
+    || rawAgentId.length > 256
+    || rawOwner.length > 256
+    || !rawToken
+    || rawToken.length > 4096
+    || CONTROL_CHARACTERS.test(rawAgentId)
+    || CONTROL_CHARACTERS.test(rawOwner)
+    || CONTROL_CHARACTERS.test(rawToken)
+  ) {
+    throw new Error("enroll response contains an invalid desk binding");
+  }
+  let url: string;
+  try {
+    url = normalizeDeskBaseUrl(rawUrl);
+  } catch {
+    throw new Error("enroll response contains an invalid desk binding");
+  }
+  return {
+    url,
+    agentId: rawAgentId,
+    owner: rawOwner,
+    token: rawToken,
+  };
+}
+
 function saveEnrollment(e: Enrollment): void {
   const binding = bindPrivateHaraStateFile(homedir(), [], "org.json");
-  writePrivateStateFileSync(binding, JSON.stringify(e, null, 2) + "\n");
+  const { desk: _desk, ...gatewayEnrollment } = e;
+  writePrivateStateFileSync(binding, JSON.stringify(gatewayEnrollment, null, 2) + "\n");
 }
 
 export function clearEnrollment(): boolean {
@@ -244,6 +296,7 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     baseURL: normalizeGatewayBaseUrl(j.base_url ?? j.baseURL),
     enrolledAt: now,
     expiresAt,
+    desk: parseDeskBinding(j.desk ?? j.desk_binding ?? j.deskBinding),
   };
 }
 
@@ -344,13 +397,25 @@ export function upsertGatewayProfileFromEnrollment(
   enrollment: Enrollment,
 ): Profile {
   const profile = gatewayProfileFromEnrollment(id, label, enrollment);
-  upsertProfile(profile);
-  removeMismatchedProfileCreds({
+  const identity = {
     profileId: profile.id,
     gatewayUrl: enrollment.gatewayUrl,
     deviceId: enrollment.deviceId,
     enrolledAt: enrollment.enrolledAt,
-  });
+  };
+  const previous = getProfile(profile.id);
+  upsertProfile(profile);
+  try {
+    if (enrollment.desk) saveProfileCreds(enrollment.desk, identity);
+    else removeMismatchedProfileCreds(identity);
+  } catch (error) {
+    // Keep the local model profile and Desk binding as one user-visible unit. A failed protected
+    // Desk write restores the previous profile so an older credential cannot suddenly appear
+    // attached to a replacement organization identity.
+    if (previous) upsertProfile(previous);
+    else removeProfile(profile.id);
+    throw error;
+  }
   return profile;
 }
 
