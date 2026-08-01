@@ -1182,12 +1182,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           );
         }
       }
+      let slashSkillPolicy: { id: string; allowedTools: readonly string[] } | undefined;
       const slash = /^\/([a-z0-9][\w-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());
       if (slash) {
         const sk = loadSkillIndex(s.meta.cwd).find((k) => k.id === slash[1]);
         if (sk) {
           const rest = slash[2]?.trim();
           content = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest ? ` — request: ${rest}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
+          if (sk.allowedTools !== undefined) slashSkillPolicy = { id: sk.id, allowedTools: sk.allowedTools };
         }
       }
       // A recognized slash skill replaces the user's raw command with its instructions. Append translated
@@ -1241,6 +1243,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         memory: memoryDigest(s.meta.cwd),
         continuationSession: s.continuationSession,
         executionContext,
+        ...(slashSkillPolicy ? { skillPolicies: [slashSkillPolicy] } : {}),
         taskIntake: {
           task: s.task,
           current: () => s.task,

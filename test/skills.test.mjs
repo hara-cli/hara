@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, skillsDigest, invalidateSkillsCache } from "../dist/skills/skills.js";
 import { searchAssets, assetSearchRoots } from "../dist/recall.js";
 import { getTool } from "../dist/tools/registry.js";
+import { activateSkillToolPolicy, skillToolAllowed } from "../dist/skills/tool-policy.js";
 import "../dist/tools/memory.js";
 import "../dist/tools/skill.js";
 
@@ -40,6 +41,44 @@ test("loadSkillIndex: agentskills <name>/SKILL.md, hyphenated frontmatter, body 
     assert.equal(sk.modelInvocable, true);
     assert.equal(sk.source, "project");
     assert.match(loadSkillBody(sk), /step one/); // body read on demand, not in the index entry
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
+});
+
+test("skill tool policies use exact names and compose by intersection", () => {
+  const first = activateSkillToolPolicy(undefined, {
+    id: "writer",
+    allowedTools: ["read_file", "edit_file", "read_file"],
+  });
+  assert.equal(first.ok, true);
+  const second = activateSkillToolPolicy(first.policy, {
+    id: "reviewer",
+    allowedTools: ["read_file", "bash"],
+  });
+  assert.equal(second.ok, true);
+  assert.deepEqual([...second.policy.allowedTools], ["read_file"]);
+  assert.equal(skillToolAllowed(second.policy, "read_file"), true);
+  assert.equal(skillToolAllowed(second.policy, "edit_file"), false);
+  assert.equal(skillToolAllowed(second.policy, "task_intake"), true, "engine safety helpers remain available");
+
+  const wildcard = activateSkillToolPolicy(undefined, { id: "unsafe", allowedTools: ["mcp.*"] });
+  assert.deepEqual(wildcard, { ok: false, reason: "invalid exact tool name \"mcp.*\"" });
+});
+
+test("skill tool refuses a declared allowlist when the caller cannot enforce it", async () => {
+  const proj = tmpProject();
+  try {
+    writeSkill(
+      proj,
+      "restricted",
+      "name: restricted\ndescription: restricted helper\nallowed-tools: [read_file]",
+      "Read the requested file.",
+    );
+    invalidateSkillsCache();
+    const result = await getTool("skill").run({ id: "restricted" }, { cwd: proj });
+    assert.match(result, /blocked: this caller cannot enforce its allowed-tools policy/i);
   } finally {
     rmSync(proj, { recursive: true, force: true });
     invalidateSkillsCache();

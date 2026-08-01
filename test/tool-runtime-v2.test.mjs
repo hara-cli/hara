@@ -1,6 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { lstatSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,7 +20,9 @@ const {
   limitToolResultBatch,
 } = await import("../dist/tools/result-limit.js");
 await import("../dist/tools/runtime.js");
+await import("../dist/tools/skill.js");
 const { runAgent } = await import("../dist/agent/loop.js");
+const { invalidateSkillsCache } = await import("../dist/skills/skills.js");
 
 after(() => {
   if (ORIGINAL_HOME === undefined) delete process.env.HOME;
@@ -259,6 +261,129 @@ test("runtime helpers survive role filters while activated targets still obey th
     toolFilter: (name) => name === allowed,
   });
   assert.equal(outcome.status, "completed");
+});
+
+test("skill allowed-tools filters schemas and denies retained disallowed calls at dispatch", async () => {
+  const allowed = "fixture_skill_allowed";
+  const denied = "fixture_skill_denied";
+  let allowedRuns = 0;
+  let deniedRuns = 0;
+  registerTool({
+    name: allowed,
+    description: "allowed skill fixture",
+    input_schema: { type: "object", properties: {} },
+    kind: "read",
+    async run() { allowedRuns++; return "allowed"; },
+  });
+  registerTool({
+    name: denied,
+    description: "denied skill fixture",
+    input_schema: { type: "object", properties: {} },
+    kind: "read",
+    async run() { deniedRuns++; return "denied"; },
+  });
+
+  let turn = 0;
+  const history = [{ role: "user", content: "use the restricted skill" }];
+  const outcome = await runAgent(history, {
+    provider: {
+      id: "fixture",
+      model: "fixture",
+      async turn({ tools }) {
+        assert.equal(tools.some((tool) => tool.name === allowed), true);
+        assert.equal(tools.some((tool) => tool.name === denied), false);
+        assert.equal(tools.some((tool) => tool.name === "task_intake"), false);
+        assert.equal(tools.some((tool) => tool.name === "skill"), true);
+        if (turn++ === 0) {
+          return { text: "", toolUses: [{ id: "denied-1", name: denied, input: {} }], stop: "tool_use" };
+        }
+        if (turn === 2) {
+          return { text: "", toolUses: [{ id: "allowed-1", name: allowed, input: {} }], stop: "tool_use" };
+        }
+        return { text: "done", toolUses: [], stop: "end" };
+      },
+    },
+    ctx: { cwd: TEST_HOME },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    skillPolicies: [{ id: "restricted", allowedTools: [allowed] }],
+  });
+  assert.equal(outcome.status, "completed");
+  assert.equal(deniedRuns, 0);
+  assert.equal(allowedRuns, 1);
+  assert.match(JSON.stringify(history), /Skill tool policy denied/);
+});
+
+test("loading a skill is a round boundary before its tool floor becomes active", async () => {
+  const proj = mkdtempSync(join(tmpdir(), "hara-skill-boundary-"));
+  const allowed = "fixture_boundary_allowed";
+  const denied = "fixture_boundary_denied";
+  let allowedRuns = 0;
+  let deniedRuns = 0;
+  try {
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    const skillDir = join(proj, ".hara", "skills", "bounded");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      `---\nname: bounded\ndescription: bounded fixture\nallowed-tools: [${allowed}]\n---\n\nUse only the fixture tool.\n`,
+    );
+    invalidateSkillsCache();
+    registerTool({
+      name: allowed,
+      description: "allowed boundary fixture",
+      input_schema: { type: "object", properties: {} },
+      kind: "read",
+      async run() { allowedRuns++; return "allowed"; },
+    });
+    registerTool({
+      name: denied,
+      description: "denied boundary fixture",
+      input_schema: { type: "object", properties: {} },
+      kind: "read",
+      async run() { deniedRuns++; return "denied"; },
+    });
+
+    let turn = 0;
+    const history = [{ role: "user", content: "load bounded" }];
+    const outcome = await runAgent(history, {
+      provider: {
+        id: "fixture",
+        model: "fixture",
+        async turn({ tools }) {
+          if (turn++ === 0) {
+            assert.equal(tools.some((tool) => tool.name === denied), true, "the pre-load schema is still broad");
+            return {
+              text: "",
+              toolUses: [
+                { id: "skill-1", name: "skill", input: { id: "bounded" } },
+                { id: "denied-1", name: denied, input: {} },
+              ],
+              stop: "tool_use",
+            };
+          }
+          assert.equal(tools.some((tool) => tool.name === allowed), true);
+          assert.equal(tools.some((tool) => tool.name === denied), false);
+          if (turn === 2) {
+            return { text: "", toolUses: [{ id: "allowed-1", name: allowed, input: {} }], stop: "tool_use" };
+          }
+          return { text: "done", toolUses: [], stop: "end" };
+        },
+      },
+      ctx: { cwd: proj },
+      approval: "full-auto",
+      confirm: async () => true,
+      quiet: true,
+    });
+    assert.equal(outcome.status, "completed");
+    assert.equal(deniedRuns, 0, "the call batched beside skill loading never executes");
+    assert.equal(allowedRuns, 1);
+    assert.match(JSON.stringify(history), /Skill policy boundary/);
+  } finally {
+    rmSync(proj, { recursive: true, force: true });
+    invalidateSkillsCache();
+  }
 });
 
 test("tool_search activates no more than max_results", async () => {

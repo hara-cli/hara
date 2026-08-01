@@ -282,6 +282,10 @@ Code / codex / openclaw). Drop a `~/.hara/skills/<name>/SKILL.md` (or project `.
 a skill's full body only when it's relevant (progressive disclosure). `hara skills init` scaffolds one, `hara
 skills` lists them, `/skill <id>` loads one into your next message, and the agent saves its own with
 `skill_create` (`scope: project|personal`). Optional frontmatter: `when_to_use`, `allowed-tools`, `context: fork` (run as a sub-agent), `paths`.
+`allowed-tools` is an engine-enforced exact allowlist, not a prompt hint: disallowed schemas disappear and
+retained/hallucinated calls are rejected at dispatch. Loading multiple restricted skills intersects their
+lists, so a later skill cannot widen authority. Hara keeps only its non-task safety helpers available. A
+forked skill that declares `allowed-tools` currently fails closed until the child-run policy receipt is wired.
 When the agent saves a skill, secrets are **redacted** and local paths/emails **generalized** (`<project>` / `~` / `<email>`),
 and a near-duplicate is flagged so it updates instead of piling up. `assetCapture: off|ask|auto` controls proactive end-of-session capture.
 

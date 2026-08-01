@@ -41,6 +41,13 @@ import { rolesDigest } from "../org/roles.js";
 import { applyTaskBrief, type TaskBrief, type TaskExecution } from "../session/task.js";
 import { askUserTool } from "../tools/ask_user.js";
 import { PromptAssembler, type AssembledSystemPrompt } from "./prompt.js";
+import {
+  activateSkillToolPolicy,
+  skillToolAllowed,
+  skillToolPolicyLabel,
+  type SkillToolPolicy,
+  type SkillToolPolicyInput,
+} from "../skills/tool-policy.js";
 
 /** File tools whose `path` input marks the file as "recently worked with" (post-compaction restore). */
 const FILE_TOUCH_TOOLS = new Set(["read_file", "edit_file", "write_file"]);
@@ -282,6 +289,9 @@ export interface RunOpts {
   systemOverride?: string;
   /** restrict which tools this run may use (by name) */
   toolFilter?: (name: string) => boolean;
+  /** Skills explicitly loaded before this run (for example `/design` or `/skill foo`). A declared
+   * allowed-tools list is enforced by the engine and multiple lists intersect. */
+  skillPolicies?: readonly SkillToolPolicyInput[];
   /** Disable every user/plugin shell hook for a genuinely read-only run. Both PreToolUse and PostToolUse
    *  commands are arbitrary shell and can mutate state even when the model only receives read tools. */
   hooks?: boolean;
@@ -599,6 +609,18 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   const { provider, ctx } = opts;
   const runSignal = life.signal;
   const activatedDeferredTools = new Set<string>();
+  let activeSkillToolPolicy: SkillToolPolicy | undefined;
+  const restrictToolsForSkill = (skillId: string, allowedTools: readonly string[]) => {
+    const activation = activateSkillToolPolicy(activeSkillToolPolicy, { id: skillId, allowedTools });
+    if (activation.ok) activeSkillToolPolicy = activation.policy;
+    return activation;
+  };
+  for (const policy of opts.skillPolicies ?? []) {
+    const activation = restrictToolsForSkill(policy.id, policy.allowedTools);
+    if (!activation.ok) {
+      return { status: "error", error: `Skill '${policy.id}' blocked: ${activation.reason}.` };
+    }
+  }
   const askWithRunCancellation = ctx.ask
     ? (question: string, options?: string[], signal?: AbortSignal): Promise<string> => {
         const combined = signal && signal !== runSignal
@@ -617,11 +639,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         const tool = getTool(name);
         if (!tool || tool.visibility !== "deferred") continue;
         if (opts.toolFilter && !opts.toolFilter(name)) continue;
+        if (!skillToolAllowed(activeSkillToolPolicy, name)) continue;
         activatedDeferredTools.add(name);
         accepted.push(name);
       }
       return accepted;
     },
+    restrictToolsForSkill,
   };
   let intakeTask = opts.taskIntake?.task;
   let intakeDirty = false;
@@ -771,12 +795,14 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       const reminders = drainReminders(ctx.todoScope);
       if (reminders.length) history.push({ role: "user", content: wrapReminders(reminders) });
     }
-    const visibleSpecs = toolSpecs({ activatedDeferred: activatedDeferredTools });
+    const visibleSpecs = toolSpecs({ activatedDeferred: activatedDeferredTools })
+      .filter((tool) => skillToolAllowed(activeSkillToolPolicy, tool.name));
     const baseSpecs = opts.toolFilter
       ? visibleSpecs.filter((t) => RUNTIME_HELPER_TOOLS.has(t.name) || opts.toolFilter!(t.name))
       : visibleSpecs;
-    let specs = runExtraTools.length
-      ? [...baseSpecs, ...runExtraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
+    const visibleExtraTools = runExtraTools.filter((tool) => skillToolAllowed(activeSkillToolPolicy, tool.name));
+    let specs = visibleExtraTools.length
+      ? [...baseSpecs, ...visibleExtraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
       : baseSpecs;
     if (recallExhausted) specs = specs.filter((tool) => !RECALL_TOOLS.has(tool.name));
     const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
@@ -1132,12 +1158,33 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // transaction boundary for the whole response: accept/checkpoint the interpretation first, then let
     // the next model round act against the newly authoritative brief.
     const taskBriefTransitionInRound = r.toolUses.some((tu) => tu.name === "task_intake");
+    // Loading instructions and changing their execution authority is one transaction boundary. Do not let a
+    // provider batch work beside `skill` using the wider schema it saw before the allowlist became active.
+    const skillPolicyTransitionInRound = r.toolUses.some((tu) => tu.name === "skill");
     for (const tu of r.toolUses) {
       if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
       if (breakerHalt) {
         // Circuit-breaker halted the run: refuse every remaining call in this round with a clear message
         // (no hang, no further tools) so the model + user get a definitive stop.
         plans.push({ tu, tool: resolveTool(tu.name), denied: "Guardian circuit-breaker halted this run (too many high-risk actions blocked). Ask the user to review and re-run." });
+        continue;
+      }
+      if (skillPolicyTransitionInRound && tu.name !== "skill") {
+        plans.push({
+          tu,
+          tool: resolveTool(tu.name),
+          denied:
+            "Skill policy boundary: load the skill in this tool round first. This batched call was NOT " +
+            "executed; use the next model round after Hara applies the skill's tool floor.",
+        });
+        continue;
+      }
+      if (!skillToolAllowed(activeSkillToolPolicy, tu.name)) {
+        plans.push({
+          tu,
+          tool: resolveTool(tu.name),
+          denied: `Skill tool policy denied '${tu.name}'. Active floor: ${skillToolPolicyLabel(activeSkillToolPolicy!)}.`,
+        });
         continue;
       }
       const tool = resolveTool(tu.name);

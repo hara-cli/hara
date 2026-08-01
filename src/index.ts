@@ -4123,6 +4123,7 @@ program.action(async (opts) => {
   let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it
   const autoApprove = new Set<string>(); // tools the user chose "don't ask again" for, this session
   let recalledContext = ""; // snippets queued by /recall, prepended to the next message
+  let recalledSkillPolicies: NonNullable<RunOpts["skillPolicies"]> = [];
   const sandbox: SandboxMode = (opts.sandbox as SandboxMode) || cfg.sandbox;
   if (sandbox !== "off" && !sandboxSupported()) {
     const message = `(sandbox '${sandbox}' is macOS-only; shell runs unsandboxed here)\n`;
@@ -5026,6 +5027,9 @@ program.action(async (opts) => {
         const sk = loadSkillIndex(cwd).find((s) => s.id === a.trim());
         if (!sk) return void out(c.dim(`(no skill '${a.trim()}')\n`));
         recalledContext += (recalledContext ? "\n\n" : "") + `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}`;
+        if (sk.allowedTools !== undefined) {
+          recalledSkillPolicies = [...recalledSkillPolicies, { id: sk.id, allowedTools: sk.allowedTools }];
+        }
         out(c.green(`↗ loaded skill ${sk.id} (added to your next message)\n`));
       },
     },
@@ -5235,6 +5239,7 @@ program.action(async (opts) => {
         task = undefined;
         resumeTaskPending = false;
         recalledContext = "";
+        recalledSkillPolicies = [];
         clearTodos();
         meta.todos = [];
         resetReachability();
@@ -5553,6 +5558,7 @@ program.action(async (opts) => {
             resumeTaskPending = false;
             continuationSession = false;
             recalledContext = "";
+            recalledSkillPolicies = [];
             resetReachability(); // fresh start — drop any "host unreachable" marks (network may be fixed)
             resetRepeatGuard(); // …and the repeated-failure streaks (the user may have fixed the cause)
             clearTouched();
@@ -5720,6 +5726,9 @@ program.action(async (opts) => {
             const sk = loadSkillIndex(cwd).find((s) => s.id === arg.trim());
             if (!sk) return void h.sink.notice(`(no skill '${arg.trim()}')`);
             recalledContext += (recalledContext ? "\n\n" : "") + `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}`;
+            if (sk.allowedTools !== undefined) {
+              recalledSkillPolicies = [...recalledSkillPolicies, { id: sk.id, allowedTools: sk.allowedTools }];
+            }
             return void h.sink.notice(`↗ loaded skill ${sk.id} (added to your next message)`);
           }
           if (nm === "approval") {
@@ -5802,7 +5811,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -5859,12 +5868,14 @@ program.action(async (opts) => {
           if (planImg.skip) return;
           const automaticRecall = await automaticSessionRecall(line, { cwd, sessionId: meta.id, signal: h.signal });
           const recallPrefix = [recalledContext, automaticRecall].filter(Boolean).join("\n\n");
+          const turnSkillPolicies = recalledSkillPolicies;
           const planContent = (recallPrefix ? `${recallPrefix}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (planImg.extraText ?? "");
           const executionContext = beginExecution(line);
           if (!executionContext) return;
           history.push({ role: "user", content: planContent, ...(planImg.attach?.length ? { images: planImg.attach } : {}) });
           persistSession();
           recalledContext = "";
+          recalledSkillPolicies = [];
           const pin = stats.input;
           const pout = stats.output;
           // Run-scoped tool (never in the registry, so no other mode can see it): captures the proposed
@@ -5896,6 +5907,7 @@ program.action(async (opts) => {
             projectContext,
             continuationSession,
             executionContext,
+            skillPolicies: turnSkillPolicies,
             taskIntake: taskIntakeForRun(),
             stats,
             signal: h.signal,
@@ -5950,6 +5962,7 @@ program.action(async (opts) => {
               projectContext,
               continuationSession,
               executionContext,
+              skillPolicies: turnSkillPolicies,
               taskIntake: taskIntakeForRun(),
               stats,
               signal: h.signal,
@@ -5975,8 +5988,10 @@ program.action(async (opts) => {
         if (ri.skip) return;
         const automaticRecall = await automaticSessionRecall(line, { cwd, sessionId: meta.id, signal: h.signal });
         const recallPrefix = [recalledContext, automaticRecall].filter(Boolean).join("\n\n");
+        const turnSkillPolicies = recalledSkillPolicies;
         const userContent = (recallPrefix ? `${recallPrefix}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd, { signal: h.signal }) + (ri.extraText ?? "");
         recalledContext = "";
+        recalledSkillPolicies = [];
         const executionContext = beginExecution(line);
         if (!executionContext) return;
         history.push({ role: "user", content: userContent, ...(ri.attach?.length ? { images: ri.attach } : {}) });
@@ -5994,6 +6009,7 @@ program.action(async (opts) => {
           projectContext,
           continuationSession,
           executionContext,
+          skillPolicies: turnSkillPolicies,
           taskIntake: taskIntakeForRun(),
           stats,
           signal: h.signal,
@@ -6084,7 +6100,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -6112,8 +6128,10 @@ program.action(async (opts) => {
     line = inlineLeadingPath(line, existsSync); // leading dropped file path → @-mention so it's read in
     const automaticRecall = await automaticSessionRecall(line, { cwd, sessionId: meta.id });
     const recallPrefix = [recalledContext, automaticRecall].filter(Boolean).join("\n\n");
+    const turnSkillPolicies = recalledSkillPolicies;
     const userContent = (recallPrefix ? `${recallPrefix}\n\n---\n\n` : "") + await expandMentionsAsync(line, cwd);
     recalledContext = "";
+    recalledSkillPolicies = [];
     const recoveredClassicSteering = consumePendingTaskSteering(task);
     if (recoveredClassicSteering) {
       task = recoveredClassicSteering.task;
@@ -6148,7 +6166,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

@@ -2,6 +2,7 @@ import type { ToolSpec } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
 import { prepareToolResult } from "./result-limit.js";
 import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
+import type { SkillToolPolicyActivation } from "../skills/tool-policy.js";
 
 /** Where agent-side output goes. In the TUI it drives ink state; in plain mode it's absent and
  *  the loop/tools fall back to writing the terminal directly. */
@@ -29,6 +30,9 @@ export interface ToolContext {
   /** Activate provider-neutral deferred tools for the next model round. Returns the subset accepted by
    * this run's role/tool filter; absent for direct tool callers outside the agent loop. */
   activateTools?: (names: string[]) => string[];
+  /** Narrow this run to a skill's declared allowed-tools. Repeated activations intersect and can never
+   * widen the current floor. Absent for direct callers that cannot enforce a run-wide restriction. */
+  restrictToolsForSkill?: (skillId: string, allowedTools: readonly string[]) => SkillToolPolicyActivation;
   /** spawn a sub-agent for a sub-task (set by the REPL/-p; absent inside sub-agents) */
   spawn?: (task: string, role?: string, signal?: AbortSignal) => Promise<string>;
   /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */
