@@ -83,7 +83,7 @@ test("effective attachment capabilities distinguish native, sidecar, unsupported
   assert.deepEqual(
     effectiveAttachmentCapabilities("openai", "gpt-5.4"),
     {
-      image: { mode: "native" },
+      image: { mode: "native", maxBytes: 3_600_000 },
       textFile: "inline-text",
       directory: "bounded-inventory-and-tools",
       binaryFile: "agent-tool",
@@ -92,7 +92,7 @@ test("effective attachment capabilities distinguish native, sidecar, unsupported
   assert.deepEqual(
     effectiveAttachmentCapabilities("openai", "deepseek-v4-pro", {}, "qwen3.7-plus"),
     {
-      image: { mode: "vision-sidecar", viaModel: "qwen3.7-plus" },
+      image: { mode: "vision-sidecar", maxBytes: 3_600_000, viaModel: "qwen3.7-plus" },
       textFile: "inline-text",
       directory: "bounded-inventory-and-tools",
       binaryFile: "agent-tool",

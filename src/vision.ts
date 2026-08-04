@@ -7,10 +7,14 @@ import { boundedProviderTurn } from "./providers/bounded-turn.js";
 
 export type VisionCap = "vision" | "text" | "unknown";
 export type ImageInputMode = "native" | "vision-sidecar" | "unsupported" | "unknown";
+/** Keeps base64-encoded provider payloads below the common 5 MB request-item boundary. */
+export const MAX_NATIVE_IMAGE_BYTES = 3_600_000;
 
 export interface EffectiveAttachmentCapabilities {
   image: {
     mode: ImageInputMode;
+    /** Maximum bytes accepted by Hara before any model or vision sidecar is called. */
+    maxBytes: number;
     /** Present only when a configured vision sidecar will translate images for the main model. */
     viaModel?: string;
   };
@@ -88,12 +92,12 @@ export function effectiveAttachmentCapabilities(
 ): EffectiveAttachmentCapabilities {
   const native = classifyVision(provider, model, overrides);
   const image = native === "vision"
-    ? { mode: "native" as const }
+    ? { mode: "native" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES }
     : visionModel
-      ? { mode: "vision-sidecar" as const, viaModel: visionModel }
+      ? { mode: "vision-sidecar" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES, viaModel: visionModel }
       : native === "text"
-        ? { mode: "unsupported" as const }
-        : { mode: "unknown" as const };
+        ? { mode: "unsupported" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES }
+        : { mode: "unknown" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES };
   return {
     image,
     textFile: "inline-text",

@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -83,7 +84,8 @@ test("serve attachment boundary rejects fake images, sensitive files, symlinks, 
     writeFileSync(secret, "TOKEN=redacted");
     writeFileSync(target, "ok");
     symlinkSync(target, alias);
-    writeFileSync(huge, Buffer.concat([png, Buffer.alloc(MAX_IMAGE_BYTES)]));
+    writeFileSync(huge, png);
+    truncateSync(huge, 42_000_000);
 
     assert.throws(
       () => validateSessionAttachments(fx.root, [{ kind: "image", path: fake }]),
@@ -99,7 +101,7 @@ test("serve attachment boundary rejects fake images, sensitive files, symlinks, 
     );
     assert.throws(
       () => validateSessionAttachments(fx.root, [{ kind: "image", path: huge }]),
-      /must be between/,
+      /42\.0 MB.*3\.6 MB.*not sent to the model.*OCR fallback.*compress or crop/i,
     );
   } finally {
     fx.done();

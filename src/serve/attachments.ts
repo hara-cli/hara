@@ -7,11 +7,11 @@ import {
 import { basename, isAbsolute, resolve } from "node:path";
 import type { ImageAttachment, UserAttachmentView } from "../providers/types.js";
 import { sensitiveFileError } from "../security/sensitive-files.js";
+import { MAX_NATIVE_IMAGE_BYTES } from "../vision.js";
 
 export const MAX_TURN_ATTACHMENTS = 16;
 export const MAX_TURN_IMAGES = 8;
-/** Keeps base64 payloads below the common 5 MB provider limit. */
-export const MAX_IMAGE_BYTES = 3_600_000;
+export const MAX_IMAGE_BYTES = MAX_NATIVE_IMAGE_BYTES;
 const MAX_ATTACHMENT_PATH = 4_096;
 
 export type SessionAttachmentKind = "image" | "file" | "directory";
@@ -67,6 +67,10 @@ function normalizedPath(raw: string, cwd: string): string {
     throw new Error("attachment path is empty or too long");
   }
   return isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw);
+}
+
+function decimalMegabytes(bytes: number): string {
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
 }
 
 /**
@@ -125,9 +129,14 @@ export function validateSessionAttachments(
       throw new Error(`selected image has an unsupported or invalid format: ${basename(path)}`);
     }
     if (detectedImage) {
-      if (stat.size === 0 || stat.size > MAX_IMAGE_BYTES) {
+      if (stat.size === 0) {
+        throw new Error(`image '${basename(path)}' is empty and was not sent to the model`);
+      }
+      if (stat.size > MAX_IMAGE_BYTES) {
         throw new Error(
-          `image '${basename(path)}' must be between 1 byte and ${MAX_IMAGE_BYTES} bytes`,
+          `image '${basename(path)}' is ${decimalMegabytes(stat.size)}; Hara image attachments are `
+          + `limited to ${decimalMegabytes(MAX_IMAGE_BYTES)} (${MAX_IMAGE_BYTES} bytes). This image `
+          + "was not sent to the model or to an OCR fallback. Compress or crop it, then attach it again.",
         );
       }
       images.push({ path, mediaType: detectedImage });

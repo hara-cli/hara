@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.138.2 — 2026-08-05 — explicit oversized-image preflight
+
+- Advertise the authoritative 3.6 MB image-attachment limit to persistent clients together with each
+  model's native, vision-helper, unsupported, or unknown image route.
+- Reject an oversized structured image before the selected model or vision helper is called, and say
+  explicitly that Hara did not silently route the image to an OCR fallback. The error reports both the
+  actual size and accepted limit, then asks the user to compress or crop the image.
+- Keep `qwen3.7-plus` on its native multimodal route. A 42 MB image now fails with the actionable size
+  explanation instead of leaving the user to infer model routing from later agent actions.
+- Upgrade with `npm i -g @nanhara/hara@0.138.2`.
+
 ## 0.138.1 — 2026-08-05 — explicit project-route recovery
 
 - Add an authenticated Serve action that removes the project profile pin actually governing a
