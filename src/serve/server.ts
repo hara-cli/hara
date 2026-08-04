@@ -163,6 +163,9 @@ export interface ServeDeps {
   providerSettings?: (cwd?: string) => ProviderSettingsState;
   saveProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
   testProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
+  /** Explicitly remove the project profile pin governing cwd. Existing sessions retain their stored
+   * profile; the returned snapshots describe only the route used by future sessions. */
+  unpinProjectProfile?: (cwd?: string) => ProjectProfileUnpinResult;
   /** Read-only, redacted connector health for Desktop settings. */
   gatewayStatuses?: () => Promise<GatewayStatus[]>;
   /** In-process interactive connector login. Only a short-lived QR payload and lifecycle phase cross the
@@ -299,6 +302,12 @@ export interface OrganizationConnectionCheck {
   id: string;
   ok: boolean;
   checkedAt: number;
+}
+
+export interface ProjectProfileUnpinResult {
+  removed: boolean;
+  providers: ProviderSettingsState;
+  organizations: OrganizationConnectionsState;
 }
 
 export interface ServeOpts {
@@ -1464,6 +1473,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (collaborationRemote) {
             methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
           }
+          if (deps.unpinProjectProfile) methods.push("settings.profiles.unpin");
           const features = ["composer.attachments.v1", "models.capabilities.v1"];
           if (collaborationRemote) features.push("collaboration.remote.v1");
           const runtime = runtimeInfo();
@@ -1779,6 +1789,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!deps.providerSettings) return reply(rpcError(id, ERR.METHOD, "provider settings not supported by this server"));
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             return reply(rpcResult(id!, redactSensitiveValue(deps.providerSettings(targetCwd)).value));
+          }
+          case "settings.profiles.unpin": {
+            if (!deps.unpinProjectProfile) return reply(rpcError(id, ERR.METHOD, "project profile recovery not supported by this server"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, redactSensitiveValue(deps.unpinProjectProfile(targetCwd)).value));
           }
           case "settings.gateways.list": {
             if (!deps.gatewayStatuses) return reply(rpcError(id, ERR.METHOD, "gateway status not supported by this server"));

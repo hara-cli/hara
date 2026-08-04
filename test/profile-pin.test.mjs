@@ -25,6 +25,7 @@ const {
   findPinnedProfile,
   writePin,
   removePin,
+  unpinResolvedProjectProfile,
   removeProfile,
   useProfile,
 } = await import("../dist/profile/profile.js");
@@ -391,6 +392,23 @@ test("writePin / removePin: round trip", async () => {
     assert.equal(existsSync(file), false);
     assert.equal(removePin(work), false, "double-unpin is a no-op");
     assert.equal(resolveActive().source, "default");
+  });
+});
+
+test("unpinResolvedProjectProfile removes the inherited pin governing a nested workspace", async () => {
+  await withHomeAsync(async (home) => {
+    const project = join(home, "work");
+    const nested = join(project, "nested", "workspace");
+    mkdirSync(nested, { recursive: true });
+    const { file } = await writePin(project, "org-x");
+
+    assert.equal(resolveActive(nested).source, "pin");
+    assert.equal(resolveActive(nested).pinFile, file);
+    assert.equal(unpinResolvedProjectProfile(nested), true);
+    assert.equal(existsSync(file), false);
+    assert.equal(resolveActive(nested).id, "personal");
+    assert.equal(resolveActive(nested).source, "default");
+    assert.equal(unpinResolvedProjectProfile(nested), false, "unpin recovery is idempotent after the override is gone");
   });
 });
 

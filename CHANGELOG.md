@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.138.1 — 2026-08-05 — explicit project-route recovery
+
+- Add an authenticated Serve action that removes the project profile pin actually governing a
+  workspace, including an inherited pin from a parent directory. The returned provider and
+  organization snapshots remain redacted.
+- Let Desktop recover future conversations from a stale organization route without asking users to
+  find or edit `.hara-profile` manually. Existing conversations remain pinned to their original
+  connection and are never migrated implicitly.
+- Upgrade with `npm i -g @nanhara/hara@0.138.1`.
+
 ## 0.138.0 — 2026-08-04 — runtime-safe skills and honest local gateway recovery
 
 - Enforce each installed skill's runtime tool allowlist at the agent loop and tool registry instead of

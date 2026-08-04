@@ -1489,6 +1489,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
   };
   let savedInput;
   let enrolledOrganizationInput;
+  let unpinnedCwd;
   let closeGatewayLoginsCalled = false;
   const loginSnapshot = {
     id: "weixin-login-1",
@@ -1558,6 +1559,18 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     useOrganizationConnection: () => ({ ...organizationState, activeId: "acme" }),
     removeOrganizationConnection: () => ({ ...organizationState, connections: [] }),
     checkOrganizationConnection: async (id) => ({ id, ok: true, checkedAt: 123 }),
+    unpinProjectProfile: (cwd) => {
+      unpinnedCwd = cwd;
+      return {
+        removed: true,
+        providers: {
+          ...state,
+          current: { ...state.current, profileId: "personal", profileKind: "byok", profileSource: "default" },
+          accidentalApiKey: "unpin-result-secret-must-not-leak",
+        },
+        organizations: { ...organizationState, activeId: "personal", activeSource: "default", switchLocked: false },
+      };
+    },
   };
   const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
   const c = await connect(srv.port);
@@ -1576,6 +1589,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       "settings.organizations.use",
       "settings.organizations.remove",
       "settings.organizations.check",
+      "settings.profiles.unpin",
     ]) assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
 
     const listed = await c.call("settings.providers.list", {});
@@ -1628,6 +1642,14 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.deepEqual(checked.result, { id: "acme", ok: true, checkedAt: 123 });
     assert.equal((await c.call("settings.organizations.use", { id: "acme" })).result.activeId, "acme");
     assert.equal((await c.call("settings.organizations.remove", { id: "acme" })).result.connections.length, 0);
+
+    const projectCwd = join(dir, "project");
+    const unpinned = await c.call("settings.profiles.unpin", { cwd: projectCwd });
+    assert.equal(unpinnedCwd, projectCwd);
+    assert.equal(unpinned.result.removed, true);
+    assert.equal(unpinned.result.providers.current.profileId, "personal");
+    assert.equal(unpinned.result.organizations.switchLocked, false);
+    assert.equal(JSON.stringify(unpinned.result).includes("unpin-result-secret-must-not-leak"), false);
   } finally {
     c.close();
     await srv.close();

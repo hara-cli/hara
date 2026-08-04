@@ -385,6 +385,15 @@ export function removePin(dir: string): boolean {
   }
 }
 
+/** Remove the project pin that actually governs `startDir`, including a pin inherited from one of
+ * its parent directories. Callers must expose this as an explicit user action: removing an identity
+ * pin changes only the route used by future sessions and must never migrate an existing session. */
+export function unpinResolvedProjectProfile(startDir: string): boolean {
+  const resolution = resolveActive(startDir);
+  if (resolution.source !== "pin" || !resolution.pinFile) return false;
+  return removePin(dirname(resolution.pinFile));
+}
+
 // ────────────────────────────────────────────────────────────────────────────────
 // Active profile resolution — single chain, transparent provenance.
 //

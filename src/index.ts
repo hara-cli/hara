@@ -88,6 +88,7 @@ import {
   setFlagOverride,
   writePin,
   removePin,
+  unpinResolvedProjectProfile,
   pinFilePath,
   DEFAULT_ORG_ID,
   PERSONAL_ID,
@@ -2804,6 +2805,15 @@ program
           };
         },
         providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
+        unpinProjectProfile: (targetCwd) => {
+          const settingsCwd = targetCwd ?? cwd;
+          const removed = unpinResolvedProjectProfile(settingsCwd);
+          return {
+            removed,
+            providers: providerSettingsSnapshot(settingsCwd),
+            organizations: organizationConnectionsSnapshot(settingsCwd),
+          };
+        },
         gatewayStatuses: async () => {
           const gateway = await import("./gateway/serve.js");
           return gateway.listGatewayStatuses(["weixin", "feishu"]);
