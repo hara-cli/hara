@@ -398,6 +398,8 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       "artifact.import",
       "artifact.commit",
       "artifact.revert",
+      "artifact.validate",
+      "artifact.export",
       "artifact.list",
       "artifact.get",
       "artifact.revisions",
@@ -421,6 +423,28 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     const artifactRevisions = await c.call("artifact.revisions", { artifactId });
     assert.equal(artifactRevisions.result.revisions.length, 1);
     const firstRevisionId = artifactDetails.result.currentRevision.revisionId;
+    const artifactValidation = await c.call("artifact.validate", {
+      artifactId,
+      revisionId: firstRevisionId,
+    });
+    assert.equal(artifactValidation.result.report.status, "pass");
+    assert.equal(artifactValidation.result.report.revisionId, firstRevisionId);
+    const artifactExportPath = join(dir, "brief-export.docx");
+    const artifactExport = await c.call("artifact.export", {
+      artifactId,
+      revisionId: firstRevisionId,
+      validationReportId: artifactValidation.result.report.reportId,
+      destinationPath: artifactExportPath,
+    });
+    assert.equal(artifactExport.result.receipt.fidelity, "roundtrip");
+    assert.deepEqual(readFileSync(artifactExportPath), readFileSync(artifactSource));
+    const duplicateArtifactExport = await c.call("artifact.export", {
+      artifactId,
+      revisionId: firstRevisionId,
+      validationReportId: artifactValidation.result.report.reportId,
+      destinationPath: artifactExportPath,
+    });
+    assert.equal(duplicateArtifactExport.error.code, -32005);
     const artifactEdit = join(dir, "brief-edited.docx");
     writeFileSync(artifactEdit, Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x02]));
     const committedArtifact = await c.call("artifact.commit", {

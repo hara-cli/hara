@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.139.0 — 2026-08-05 — verified Office artifact delivery
+
+- Add authenticated `artifact.validate` support that binds an integrity report to the exact current
+  revision, immutable bytes, SHA-256 digest, size, and declared Office format. A changed or mismatched
+  revision cannot inherit an earlier pass result.
+- Add create-only, same-format `artifact.export` delivery. Export requires a matching persisted pass
+  report, never overwrites an existing path, activates the copy atomically when the filesystem permits,
+  reopens and hashes the output, and persists a path-redacted export receipt.
+- Clean only Hara's strictly named stale Artifact staging directories, clean failed import/commit
+  staging immediately, and cover byte-identical PPTX, XLSX, and DOCX round trips plus authenticated
+  Serve validation/export and conflict paths.
+- Upgrade with `npm i -g @nanhara/hara@0.139.0`.
+
 ## 0.138.2 — 2026-08-05 — explicit oversized-image preflight
 
 - Advertise the authoritative 3.6 MB image-attachment limit to persistent clients together with each

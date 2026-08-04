@@ -4,15 +4,19 @@ import {
   constants,
   fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   openSync,
   readSync,
   readdirSync,
   realpathSync,
   renameSync,
+  rmSync,
   type Stats,
+  unlinkSync,
+  writeFileSync,
 } from "node:fs";
-import { basename, extname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import {
   openVerifiedRegularFileNoFollow,
   verifyOpenedRegularFileSync,
@@ -36,7 +40,12 @@ const MAX_REVISIONS = 10_000;
 const JSON_LIMIT = 512 * 1024;
 const ARTIFACT_ID = /^art_[a-f0-9]{32}$/;
 const REVISION_ID = /^rev_[a-f0-9]{32}$/;
+const VALIDATION_ID = /^val_[a-f0-9]{32}$/;
 const SAFE_CONTENT_REF = /^content\.[a-z0-9]{1,12}$/;
+const STAGING_NAME = /^\.staging-(?:art|rev)_[a-f0-9]{32}-[a-f0-9]{32}$/;
+const ARTIFACT_STAGING_MAX_AGE_MS = 6 * 60 * 60 * 1_000;
+const INTEGRITY_VALIDATOR_ID = "hara.office.integrity";
+const INTEGRITY_VALIDATOR_VERSION = "1.0.0";
 
 export type ArtifactKind = "presentation" | "spreadsheet" | "document";
 
@@ -103,6 +112,61 @@ export interface ArtifactListResult {
   truncated: boolean;
 }
 
+export interface ArtifactFinding {
+  code: string;
+  severity: "error" | "warning" | "info";
+  message: string;
+  path?: string;
+  suggestion?: string;
+}
+
+export interface ArtifactValidationReport {
+  reportId: string;
+  revisionId: string;
+  validatorId: string;
+  validatorVersion: string;
+  createdAt: string;
+  snapshotDigest?: string;
+  status: "pass" | "revise" | "blocked";
+  findings: ArtifactFinding[];
+}
+
+export interface ArtifactExportWarning {
+  code: string;
+  severity: "warning";
+  message: string;
+  path?: string;
+  suggestion?: string;
+}
+
+export interface ArtifactExportReceipt {
+  receiptId: string;
+  artifactId: string;
+  revisionId: string;
+  createdAt: string;
+  format: string;
+  fidelity: "visual-fidelity" | "template-editable" | "semantic-editable" | "roundtrip";
+  validationReportId: string;
+  output: {
+    mediaType: string;
+    byteSize: number;
+    sha256: string;
+  };
+  warnings: ArtifactExportWarning[];
+}
+
+export interface ArtifactExportInput {
+  artifactId: string;
+  revisionId: string;
+  validationReportId: string;
+  destinationPath: string;
+}
+
+export interface ArtifactStagingCleanupResult {
+  removed: number;
+  retained: number;
+}
+
 export interface ArtifactCommitInput {
   artifactId: string;
   baseRevisionId: string;
@@ -126,7 +190,8 @@ export type ArtifactStoreErrorCode =
   | "ARTIFACT_SOURCE_REJECTED"
   | "ARTIFACT_TOO_LARGE"
   | "ARTIFACT_CONFLICT"
-  | "ARTIFACT_CORRUPT";
+  | "ARTIFACT_CORRUPT"
+  | "ARTIFACT_EXPORT_FAILED";
 
 export class ArtifactStoreError extends Error {
   constructor(
@@ -186,6 +251,84 @@ function verifyDirectory(identity: PrivateStateDirectoryIdentity): void {
 
 function artifactRoot(home: string): PrivateStateDirectoryIdentity {
   return ensurePrivateStateSubdirectory(home, [".hara", "artifacts"]);
+}
+
+function discardOwnedStaging(
+  parent: PrivateStateDirectoryIdentity,
+  staging: PrivateStateDirectoryIdentity,
+): void {
+  verifyDirectory(parent);
+  verifyDirectory(staging);
+  if (dirname(staging.path) !== parent.path || !STAGING_NAME.test(basename(staging.path))) {
+    throw storeError("ARTIFACT_CORRUPT", "refusing to remove an unrecognized Artifact staging directory");
+  }
+  rmSync(staging.path, { recursive: true, force: false });
+  verifyDirectory(parent);
+}
+
+function discardOwnedStagingBestEffort(
+  parent: PrivateStateDirectoryIdentity,
+  staging: PrivateStateDirectoryIdentity,
+): void {
+  try {
+    discardOwnedStaging(parent, staging);
+  } catch {
+    // Preserve the operation's original failure. A strictly named old directory is retried by stale cleanup.
+  }
+}
+
+function cleanupStagingChildren(
+  parent: PrivateStateDirectoryIdentity,
+  cutoffMs: number,
+): ArtifactStagingCleanupResult {
+  verifyDirectory(parent);
+  let removed = 0;
+  let retained = 0;
+  for (const entry of readdirSync(parent.path, { withFileTypes: true })) {
+    if (!entry.name.startsWith(".staging-")) continue;
+    if (!entry.isDirectory() || !STAGING_NAME.test(entry.name)) {
+      retained += 1;
+      continue;
+    }
+    const path = join(parent.path, entry.name);
+    const info = lstatSync(path);
+    if (
+      !info.isDirectory()
+      || info.isSymbolicLink()
+      || realpathSync.native(path) !== path
+      || Math.max(info.mtimeMs, info.ctimeMs) > cutoffMs
+    ) {
+      retained += 1;
+      continue;
+    }
+    const staging = { path, dev: info.dev, ino: info.ino } satisfies PrivateStateDirectoryIdentity;
+    discardOwnedStaging(parent, staging);
+    removed += 1;
+  }
+  verifyDirectory(parent);
+  return { removed, retained };
+}
+
+/** Remove only old, strictly named private staging directories left by a crashed Artifact operation. */
+export function cleanupArtifactStaging(
+  home: string,
+  nowMs = Date.now(),
+): ArtifactStagingCleanupResult {
+  if (!Number.isFinite(nowMs) || nowMs < ARTIFACT_STAGING_MAX_AGE_MS) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "cleanup clock is invalid");
+  }
+  const root = artifactRoot(home);
+  const cutoffMs = nowMs - ARTIFACT_STAGING_MAX_AGE_MS;
+  const result = cleanupStagingChildren(root, cutoffMs);
+  for (const entry of readdirSync(root.path, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !ARTIFACT_ID.test(entry.name)) continue;
+    const artifact = childDirectory(root, entry.name, `no artifact ${entry.name}`);
+    const nested = cleanupStagingChildren(artifact, cutoffMs);
+    result.removed += nested.removed;
+    result.retained += nested.retained;
+  }
+  verifyDirectory(root);
+  return result;
 }
 
 function parseJsonFile(path: string): unknown {
@@ -309,6 +452,64 @@ function isContentInfo(value: unknown): value is ArtifactContentInfo {
     && /^[a-f0-9]{64}$/.test(value.sha256);
 }
 
+function isArtifactFinding(value: unknown): value is ArtifactFinding {
+  if (!plainRecord(value) || !exactKeys(value, ["code", "severity", "message"], ["path", "suggestion"])) {
+    return false;
+  }
+  return typeof value.code === "string"
+    && /^[A-Z][A-Z0-9_]{2,63}$/.test(value.code)
+    && (value.severity === "error" || value.severity === "warning" || value.severity === "info")
+    && typeof value.message === "string"
+    && value.message.length >= 1
+    && value.message.length <= 4_096
+    && (value.path === undefined || (
+      typeof value.path === "string"
+      && value.path.length >= 1
+      && value.path.length <= 1_024
+      && isSafeArtifactPath(value.path)
+    ))
+    && (value.suggestion === undefined || (
+      typeof value.suggestion === "string"
+      && value.suggestion.length >= 1
+      && value.suggestion.length <= 4_096
+    ));
+}
+
+function isSafeArtifactPath(value: string): boolean {
+  try {
+    return normalizeArtifactPath(value) === value;
+  } catch {
+    return false;
+  }
+}
+
+function isValidationReport(value: unknown): value is ArtifactValidationReport {
+  if (!plainRecord(value) || !exactKeys(
+    value,
+    ["reportId", "revisionId", "validatorId", "validatorVersion", "createdAt", "status", "findings"],
+    ["snapshotDigest"],
+  )) return false;
+  return typeof value.reportId === "string"
+    && VALIDATION_ID.test(value.reportId)
+    && typeof value.revisionId === "string"
+    && REVISION_ID.test(value.revisionId)
+    && typeof value.validatorId === "string"
+    && value.validatorId.length >= 1
+    && value.validatorId.length <= 256
+    && typeof value.validatorVersion === "string"
+    && value.validatorVersion.length >= 1
+    && value.validatorVersion.length <= 128
+    && typeof value.createdAt === "string"
+    && Number.isFinite(Date.parse(value.createdAt))
+    && (value.snapshotDigest === undefined || (
+      typeof value.snapshotDigest === "string" && /^[a-f0-9]{64}$/.test(value.snapshotDigest)
+    ))
+    && (value.status === "pass" || value.status === "revise" || value.status === "blocked")
+    && Array.isArray(value.findings)
+    && value.findings.length <= 10_000
+    && value.findings.every(isArtifactFinding);
+}
+
 function checkedArtifactId(value: string): string {
   if (!ARTIFACT_ID.test(value)) {
     throw storeError("ARTIFACT_INVALID_INPUT", "artifactId is not a valid opaque Artifact id");
@@ -326,6 +527,13 @@ function checkedRevisionId(value: string): string {
 function checkedInputRevisionId(value: unknown, field: string): string {
   if (typeof value !== "string" || !REVISION_ID.test(value)) {
     throw storeError("ARTIFACT_INVALID_INPUT", `${field} is not a valid opaque Revision id`);
+  }
+  return value;
+}
+
+function checkedValidationId(value: unknown): string {
+  if (typeof value !== "string" || !VALIDATION_ID.test(value)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "validationReportId is not a valid opaque ValidationReport id");
   }
   return value;
 }
@@ -760,6 +968,7 @@ export async function importArtifact(
   if (input.title !== undefined && typeof input.title !== "string") {
     throw storeError("ARTIFACT_INVALID_INPUT", "title must be a string");
   }
+  cleanupArtifactStaging(home);
   const { sourcePath, extension, format } = sourceFormat(input.sourcePath, input.kind);
 
   const bytes = await readImportSource(sourcePath);
@@ -800,24 +1009,30 @@ export async function importArtifact(
   const root = artifactRoot(home);
   const stagingName = `.staging-${artifactId}-${randomUUID().replaceAll("-", "")}`;
   const staging = ensurePrivateStateSubdirectory(home, [".hara", "artifacts", stagingName]);
-  ensurePrivateStateSubdirectory(home, [".hara", "artifacts", stagingName, "revisions", revisionId]);
-  writePrivateStateBytesOnceSync(
-    bindPrivateHaraStateFile(home, ["artifacts", stagingName, "revisions", revisionId], contentRef),
-    bytes,
-  );
-  writePrivateStateFileSync(
-    bindPrivateHaraStateFile(home, ["artifacts", stagingName, "revisions", revisionId], "content.json"),
-    `${JSON.stringify(content, null, 2)}\n`,
-  );
-  writePrivateStateFileSync(
-    bindPrivateHaraStateFile(home, ["artifacts", stagingName, "revisions", revisionId], "revision.json"),
-    `${JSON.stringify(revision, null, 2)}\n`,
-  );
-  writePrivateStateFileSync(
-    bindPrivateHaraStateFile(home, ["artifacts", stagingName], "metadata.json"),
-    `${JSON.stringify(artifact, null, 2)}\n`,
-  );
-  activateStaging(root, staging, artifactId);
+  let activated = false;
+  try {
+    ensurePrivateStateSubdirectory(home, [".hara", "artifacts", stagingName, "revisions", revisionId]);
+    writePrivateStateBytesOnceSync(
+      bindPrivateHaraStateFile(home, ["artifacts", stagingName, "revisions", revisionId], contentRef),
+      bytes,
+    );
+    writePrivateStateFileSync(
+      bindPrivateHaraStateFile(home, ["artifacts", stagingName, "revisions", revisionId], "content.json"),
+      `${JSON.stringify(content, null, 2)}\n`,
+    );
+    writePrivateStateFileSync(
+      bindPrivateHaraStateFile(home, ["artifacts", stagingName, "revisions", revisionId], "revision.json"),
+      `${JSON.stringify(revision, null, 2)}\n`,
+    );
+    writePrivateStateFileSync(
+      bindPrivateHaraStateFile(home, ["artifacts", stagingName], "metadata.json"),
+      `${JSON.stringify(artifact, null, 2)}\n`,
+    );
+    activateStaging(root, staging, artifactId);
+    activated = true;
+  } finally {
+    if (!activated) discardOwnedStagingBestEffort(root, staging);
+  }
   return getArtifact(home, artifactId, false);
 }
 
@@ -913,19 +1128,25 @@ function commitPreparedRevision(
     home,
     [".hara", "artifacts", metadata.artifact.artifactId, stagingName],
   );
-  writePrivateStateBytesOnceSync(
-    bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], contentRef),
-    input.bytes,
-  );
-  writePrivateStateFileSync(
-    bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], "content.json"),
-    `${JSON.stringify(content, null, 2)}\n`,
-  );
-  writePrivateStateFileSync(
-    bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], "revision.json"),
-    `${JSON.stringify(revision, null, 2)}\n`,
-  );
-  activateRevisionStaging(artifact, staging, revisionId);
+  let activated = false;
+  try {
+    writePrivateStateBytesOnceSync(
+      bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], contentRef),
+      input.bytes,
+    );
+    writePrivateStateFileSync(
+      bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], "content.json"),
+      `${JSON.stringify(content, null, 2)}\n`,
+    );
+    writePrivateStateFileSync(
+      bindPrivateHaraStateFile(home, ["artifacts", metadata.artifact.artifactId, stagingName], "revision.json"),
+      `${JSON.stringify(revision, null, 2)}\n`,
+    );
+    activateRevisionStaging(artifact, staging, revisionId);
+    activated = true;
+  } finally {
+    if (!activated) discardOwnedStagingBestEffort(artifact, staging);
+  }
 
   const updated: ArtifactRecord = {
     ...metadata.artifact,
@@ -954,6 +1175,7 @@ export async function commitArtifact(
   home: string,
   input: ArtifactCommitInput,
 ): Promise<ArtifactDetails> {
+  cleanupArtifactStaging(home);
   const artifactId = checkedArtifactId(input.artifactId);
   const baseRevisionId = checkedInputRevisionId(input.baseRevisionId, "baseRevisionId");
   const actor = checkedActor(input.actor);
@@ -1033,6 +1255,425 @@ export function revertArtifact(
   });
 }
 
+function readValidationReport(
+  artifact: PrivateStateDirectoryIdentity,
+  reportId: string,
+): ArtifactValidationReport {
+  const validations = childDirectory(artifact, "validations", "Artifact validation reports are missing");
+  const value = parseJsonFile(join(validations.path, `${reportId}.json`));
+  if (!isValidationReport(value) || value.reportId !== reportId) {
+    throw storeError("ARTIFACT_CORRUPT", "ValidationReport metadata is invalid");
+  }
+  verifyDirectory(validations);
+  return value;
+}
+
+export function validateArtifact(
+  home: string,
+  input: { artifactId: string; revisionId: string },
+): ArtifactValidationReport {
+  const artifactId = checkedArtifactId(input.artifactId);
+  const revisionId = checkedInputRevisionId(input.revisionId, "revisionId");
+  const artifact = artifactDirectory(home, artifactId);
+  const before = readArtifactMetadata(artifact);
+  if (before.artifact.currentRevisionId !== revisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed before validation started; reopen the latest version and validate again",
+    );
+  }
+  const { content } = readRevisionDetails(artifact, revisionId, false);
+  const bytes = readContentBytes(revisionDirectory(artifact, revisionId), content);
+  verifyClaimedFormat(content.extension, bytes);
+  const after = readArtifactMetadata(artifact);
+  if (after.text !== before.text || after.artifact.currentRevisionId !== revisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed while validation was running; reopen the latest version and validate again",
+    );
+  }
+
+  const report: ArtifactValidationReport = {
+    reportId: `val_${randomUUID().replaceAll("-", "")}`,
+    revisionId,
+    validatorId: INTEGRITY_VALIDATOR_ID,
+    validatorVersion: INTEGRITY_VALIDATOR_VERSION,
+    createdAt: new Date().toISOString(),
+    snapshotDigest: content.sha256,
+    status: "pass",
+    findings: [{
+      code: "ARTIFACT_INTEGRITY_VERIFIED",
+      severity: "info",
+      message: "Immutable bytes, recorded SHA-256, size, and declared file signature match this revision.",
+    }],
+  };
+  ensurePrivateStateSubdirectory(home, [".hara", "artifacts", artifactId, "validations"]);
+  writePrivateStateBytesOnceSync(
+    bindPrivateHaraStateFile(home, ["artifacts", artifactId, "validations"], `${report.reportId}.json`),
+    Buffer.from(`${JSON.stringify(report, null, 2)}\n`),
+  );
+  return readValidationReport(artifact, report.reportId);
+}
+
+interface ExternalFileIdentity {
+  dev: number;
+  ino: number;
+  size: number;
+  mode: number;
+  nlink: number;
+}
+
+interface ExportDestination {
+  path: string;
+  parent: PrivateStateDirectoryIdentity;
+}
+
+interface ExportWriteResult {
+  identity: ExternalFileIdentity;
+  warnings: ArtifactExportWarning[];
+}
+
+function verifyExportDirectory(identity: PrivateStateDirectoryIdentity): void {
+  const info = lstatSync(identity.path);
+  if (
+    !info.isDirectory()
+    || info.isSymbolicLink()
+    || info.dev !== identity.dev
+    || info.ino !== identity.ino
+    || realpathSync.native(identity.path) !== identity.path
+  ) throw storeError("ARTIFACT_EXPORT_FAILED", "the selected export directory changed; choose it again");
+}
+
+function exportDestination(
+  destinationPathInput: unknown,
+  expectedExtension: string,
+): ExportDestination {
+  if (
+    typeof destinationPathInput !== "string"
+    || !destinationPathInput
+    || destinationPathInput.length > 4_096
+    || !isAbsolute(destinationPathInput)
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "destinationPath must be an absolute path selected by the user");
+  const selected = resolve(destinationPathInput);
+  const name = basename(selected);
+  if (
+    !name
+    || name === "."
+    || name === ".."
+    || name.length > 255
+    || /[\u0000-\u001f\u007f]/.test(name)
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "the export filename is not safe");
+  if (extname(name).toLowerCase() !== expectedExtension) {
+    throw storeError(
+      "ARTIFACT_INVALID_INPUT",
+      `this safe export preserves ${expectedExtension}; format conversion requires a reviewed Office capability`,
+    );
+  }
+  let parentPath: string;
+  try {
+    parentPath = realpathSync.native(dirname(selected));
+  } catch (error) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "the selected export directory does not exist", error);
+  }
+  const info = lstatSync(parentPath);
+  if (!info.isDirectory() || info.isSymbolicLink()) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "the selected export parent must be a real directory");
+  }
+  const parent = { path: parentPath, dev: info.dev, ino: info.ino } satisfies PrivateStateDirectoryIdentity;
+  verifyExportDirectory(parent);
+  return { path: join(parent.path, name), parent };
+}
+
+function externalFileMatches(path: string, identity: ExternalFileIdentity): boolean {
+  try {
+    const info = lstatSync(path);
+    return info.isFile()
+      && !info.isSymbolicLink()
+      && sameOpenedFileIdentity(info, identity)
+      && info.size === identity.size;
+  } catch {
+    return false;
+  }
+}
+
+function externalFileHasIdentity(path: string, identity: ExternalFileIdentity): boolean {
+  try {
+    const info = lstatSync(path);
+    return info.isFile() && !info.isSymbolicLink() && sameOpenedFileIdentity(info, identity);
+  } catch {
+    return false;
+  }
+}
+
+function removeExternalFileIfSame(
+  destination: ExportDestination,
+  identity: ExternalFileIdentity,
+): boolean {
+  try {
+    verifyExportDirectory(destination.parent);
+    if (!externalFileMatches(destination.path, identity)) return false;
+    unlinkSync(destination.path);
+    verifyExportDirectory(destination.parent);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeExternalFileByIdentity(
+  destination: ExportDestination,
+  identity: ExternalFileIdentity,
+): boolean {
+  try {
+    verifyExportDirectory(destination.parent);
+    if (!externalFileHasIdentity(destination.path, identity)) return false;
+    unlinkSync(destination.path);
+    verifyExportDirectory(destination.parent);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function verifyExternalDigest(path: string, expected: ExternalFileIdentity, sha256: string): void {
+  const before = lstatSync(path);
+  if (!before.isFile() || before.isSymbolicLink() || !sameOpenedFileIdentity(before, expected)) {
+    throw storeError("ARTIFACT_EXPORT_FAILED", "the exported file identity changed before verification");
+  }
+  const fd = openSync(
+    path,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || !sameOpenedFileIdentity(opened, expected) || opened.size !== expected.size) {
+      throw storeError("ARTIFACT_EXPORT_FAILED", "the exported file does not match the committed output");
+    }
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    for (;;) {
+      const count = readSync(fd, chunk, 0, chunk.length, position);
+      if (!count) break;
+      hash.update(chunk.subarray(0, count));
+      position += count;
+    }
+    if (hash.digest("hex") !== sha256) {
+      throw storeError("ARTIFACT_EXPORT_FAILED", "the exported file digest does not match the validated revision");
+    }
+    const after = fstatSync(fd);
+    const linked = lstatSync(path);
+    if (
+      !sameOpenedFileIdentity(opened, after)
+      || opened.size !== after.size
+      || opened.mtimeMs !== after.mtimeMs
+      || opened.ctimeMs !== after.ctimeMs
+      || !sameOpenedFileIdentity(after, linked)
+    ) throw storeError("ARTIFACT_EXPORT_FAILED", "the exported file changed during verification");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function writeExportBytesOnce(
+  destination: ExportDestination,
+  bytes: Buffer,
+  sha256: string,
+): ExportWriteResult {
+  verifyExportDirectory(destination.parent);
+  try {
+    lstatSync(destination.path);
+    throw storeError("ARTIFACT_CONFLICT", "the selected export file already exists; choose a new filename");
+  } catch (error: any) {
+    if (error instanceof ArtifactStoreError || error?.code !== "ENOENT") throw error;
+  }
+
+  const temp = join(
+    destination.parent.path,
+    `.hara-export-${process.pid}-${randomUUID().replaceAll("-", "")}.tmp`,
+  );
+  let fd: number | undefined;
+  let staged: ExternalFileIdentity | undefined;
+  let committed: ExternalFileIdentity | undefined;
+  let createdOutput: ExternalFileIdentity | undefined;
+  const warnings: ArtifactExportWarning[] = [];
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    writeFileSync(fd, bytes);
+    fsyncSync(fd);
+    const stagedInfo = fstatSync(fd);
+    if (!stagedInfo.isFile() || stagedInfo.nlink !== 1 || stagedInfo.size !== bytes.byteLength) {
+      throw storeError("ARTIFACT_EXPORT_FAILED", "the export staging file is unsafe");
+    }
+    staged = {
+      dev: stagedInfo.dev,
+      ino: stagedInfo.ino,
+      size: stagedInfo.size,
+      mode: stagedInfo.mode & 0o777,
+      nlink: stagedInfo.nlink,
+    };
+    closeSync(fd);
+    fd = undefined;
+
+    verifyExportDirectory(destination.parent);
+    try {
+      linkSync(temp, destination.path);
+      const linked = lstatSync(destination.path);
+      if (
+        !linked.isFile()
+        || linked.isSymbolicLink()
+        || !sameOpenedFileIdentity(linked, staged)
+        || linked.size !== staged.size
+      ) throw storeError("ARTIFACT_EXPORT_FAILED", "the exported file changed during atomic activation");
+      unlinkSync(temp);
+      const finalInfo = lstatSync(destination.path);
+      committed = {
+        dev: finalInfo.dev,
+        ino: finalInfo.ino,
+        size: finalInfo.size,
+        mode: finalInfo.mode & 0o777,
+        nlink: finalInfo.nlink,
+      };
+    } catch (error: any) {
+      if (error?.code === "EEXIST") {
+        throw storeError("ARTIFACT_CONFLICT", "the selected export file already exists; choose a new filename");
+      }
+      if (!new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV"]).has(String(error?.code ?? ""))) {
+        throw error;
+      }
+      fd = openSync(destination.path, "wx", 0o600);
+      const created = fstatSync(fd);
+      createdOutput = {
+        dev: created.dev,
+        ino: created.ino,
+        size: created.size,
+        mode: created.mode & 0o777,
+        nlink: created.nlink,
+      };
+      writeFileSync(fd, bytes);
+      fsyncSync(fd);
+      const output = fstatSync(fd);
+      if (!output.isFile() || output.nlink !== 1 || output.size !== bytes.byteLength) {
+        throw storeError("ARTIFACT_EXPORT_FAILED", "the exclusive export output is unsafe");
+      }
+      committed = {
+        dev: output.dev,
+        ino: output.ino,
+        size: output.size,
+        mode: output.mode & 0o777,
+        nlink: output.nlink,
+      };
+      createdOutput = committed;
+      closeSync(fd);
+      fd = undefined;
+      warnings.push({
+        code: "NON_ATOMIC_EXPORT_FILESYSTEM",
+        severity: "warning",
+        message: "The destination filesystem does not support atomic link activation; Hara used an exclusive verified write and did not replace an existing file.",
+      });
+    }
+    if (!committed || committed.nlink !== 1 || committed.size !== bytes.byteLength) {
+      throw storeError("ARTIFACT_EXPORT_FAILED", "the exported file did not reach a committed state");
+    }
+    verifyExternalDigest(destination.path, committed, sha256);
+    verifyExportDirectory(destination.parent);
+    return { identity: committed, warnings };
+  } catch (error) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* preserve original failure */ }
+      fd = undefined;
+    }
+    if (committed) {
+      removeExternalFileIfSame(destination, committed);
+    } else if (createdOutput) {
+      removeExternalFileByIdentity(destination, createdOutput);
+    } else if (staged && externalFileHasIdentity(destination.path, staged)) {
+      removeExternalFileIfSame(destination, staged);
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* preserve original failure */ }
+    if (staged && externalFileMatches(temp, staged)) {
+      try { unlinkSync(temp); } catch { /* retain a changed entry instead of deleting it */ }
+    }
+  }
+}
+
+export function exportArtifact(
+  home: string,
+  input: ArtifactExportInput,
+): ArtifactExportReceipt {
+  const artifactId = checkedArtifactId(input.artifactId);
+  const revisionId = checkedInputRevisionId(input.revisionId, "revisionId");
+  const validationReportId = checkedValidationId(input.validationReportId);
+  const artifact = artifactDirectory(home, artifactId);
+  const before = readArtifactMetadata(artifact);
+  if (before.artifact.currentRevisionId !== revisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed before export started; reopen the latest version, validate, and export again",
+    );
+  }
+  const report = readValidationReport(artifact, validationReportId);
+  const { content } = readRevisionDetails(artifact, revisionId, false);
+  if (
+    report.revisionId !== revisionId
+    || report.snapshotDigest !== content.sha256
+    || report.status !== "pass"
+    || report.validatorId !== INTEGRITY_VALIDATOR_ID
+    || report.validatorVersion !== INTEGRITY_VALIDATOR_VERSION
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "the ValidationReport does not authorize this exact revision");
+  const bytes = readContentBytes(revisionDirectory(artifact, revisionId), content);
+  verifyClaimedFormat(content.extension, bytes);
+  const after = readArtifactMetadata(artifact);
+  if (after.text !== before.text || after.artifact.currentRevisionId !== revisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed while export was prepared; reopen the latest version, validate, and export again",
+    );
+  }
+  const destination = exportDestination(input.destinationPath, content.extension);
+  const receiptId = `exp_${randomUUID().replaceAll("-", "")}`;
+  ensurePrivateStateSubdirectory(home, [".hara", "artifacts", artifactId, "exports"]);
+  const receiptBinding = bindPrivateHaraStateFile(
+    home,
+    ["artifacts", artifactId, "exports"],
+    `${receiptId}.json`,
+  );
+  const written = writeExportBytesOnce(destination, bytes, content.sha256);
+  const receipt: ArtifactExportReceipt = {
+    receiptId,
+    artifactId,
+    revisionId,
+    createdAt: new Date().toISOString(),
+    format: content.extension.slice(1),
+    fidelity: "roundtrip",
+    validationReportId,
+    output: {
+      mediaType: content.mediaType,
+      byteSize: content.byteSize,
+      sha256: content.sha256,
+    },
+    warnings: written.warnings,
+  };
+  try {
+    writePrivateStateBytesOnceSync(
+      receiptBinding,
+      Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`),
+    );
+  } catch (error) {
+    const removed = removeExternalFileIfSame(destination, written.identity);
+    throw storeError(
+      "ARTIFACT_EXPORT_FAILED",
+      removed
+        ? "the ExportReceipt could not be recorded, so the exported copy was removed"
+        : "the ExportReceipt could not be recorded; inspect the selected destination before retrying",
+      error,
+    );
+  }
+  return receipt;
+}
+
 export function getArtifact(
   home: string,
   artifactId: string,
@@ -1042,6 +1683,7 @@ export function getArtifact(
 }
 
 export function listArtifacts(home: string): ArtifactListResult {
+  cleanupArtifactStaging(home);
   const root = artifactRoot(home);
   verifyDirectory(root);
   const entries = readdirSync(root.path, { withFileTypes: true });

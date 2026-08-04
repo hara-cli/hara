@@ -72,6 +72,9 @@
 //                                                   → {artifact,currentRevision,content}
 //   artifact.revert   {artifactId,baseRevisionId,targetRevisionId,taskRunId?}
 //                                                   → {artifact,currentRevision,content}
+//   artifact.validate {artifactId,revisionId}      → {report:ValidationReport}
+//   artifact.export   {artifactId,revisionId,validationReportId,destinationPath}
+//                                                   → {receipt:ExportReceipt} (exact-format, create-only)
 //   artifact.list     {}                          → {artifacts,invalid,truncated}
 //   artifact.get      {artifactId}                → {artifact,currentRevision,content}
 //   artifact.revisions {artifactId}               → {artifactId,revisions}

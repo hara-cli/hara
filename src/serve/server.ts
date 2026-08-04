@@ -112,11 +112,13 @@ import {
 import {
   ArtifactStoreError,
   commitArtifact,
+  exportArtifact,
   getArtifact,
   importArtifact,
   listArtifactRevisions,
   listArtifacts,
   revertArtifact,
+  validateArtifact,
   type ArtifactKind,
 } from "../artifacts/store.js";
 import {
@@ -335,10 +337,10 @@ const SERVE_DESK_STATES = new Set<DeskTaskState>(["open", "claimed", "done", "ca
 const artifactRpcError = (
   id: number | string | null,
   error: unknown,
-  action: "import" | "commit" | "revert" | "list" | "open" | "list revisions",
+  action: "import" | "commit" | "revert" | "validate" | "export" | "list" | "open" | "list revisions",
 ): string => {
   if (error instanceof ArtifactStoreError) {
-    const code = error.code === "ARTIFACT_CORRUPT"
+    const code = error.code === "ARTIFACT_CORRUPT" || error.code === "ARTIFACT_EXPORT_FAILED"
       ? ERR.INTERNAL
       : error.code === "ARTIFACT_CONFLICT"
         ? ERR.CONFLICT
@@ -350,6 +352,8 @@ const artifactRpcError = (
     ERR.INTERNAL,
     action === "import" || action === "commit"
       ? `Artifact ${action} failed safely; the source file was not modified`
+      : action === "export"
+        ? "Artifact export failed safely; no existing destination file was replaced"
       : action === "revert"
         ? "Artifact revert failed safely; no current revision was replaced"
         : `Artifact ${action} failed safely; local Artifact data was not changed`,
@@ -1462,7 +1466,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "settings.organizations.remove", "settings.organizations.check",
             "automation.list", "automation.validate", "automation.add", "automation.update",
             "automation.run", "automation.toggle", "automation.delete", "automation.scheduler.install",
-            "artifact.import", "artifact.commit", "artifact.revert",
+            "artifact.import", "artifact.commit", "artifact.revert", "artifact.validate", "artifact.export",
             "artifact.list", "artifact.get", "artifact.revisions",
             "tasks.list", "approvals.list", "approvals.resolve",
           ];
@@ -2495,6 +2499,45 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcResult(id!, details));
             } catch (error) {
               return reply(artifactRpcError(id, error, "revert"));
+            }
+          }
+          case "artifact.validate": {
+            if (typeof p.artifactId !== "string" || typeof p.revisionId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId and revisionId required"));
+            }
+            try {
+              const report = validateArtifact(artifactHome, {
+                artifactId: p.artifactId,
+                revisionId: p.revisionId,
+              });
+              return reply(rpcResult(id!, { report }));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "validate"));
+            }
+          }
+          case "artifact.export": {
+            if (
+              typeof p.artifactId !== "string"
+              || typeof p.revisionId !== "string"
+              || typeof p.validationReportId !== "string"
+              || typeof p.destinationPath !== "string"
+            ) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                "artifactId, revisionId, validationReportId, and destinationPath required",
+              ));
+            }
+            try {
+              const receipt = exportArtifact(artifactHome, {
+                artifactId: p.artifactId,
+                revisionId: p.revisionId,
+                validationReportId: p.validationReportId,
+                destinationPath: p.destinationPath,
+              });
+              return reply(rpcResult(id!, { receipt }));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "export"));
             }
           }
           case "artifact.list": {
