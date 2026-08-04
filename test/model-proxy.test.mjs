@@ -229,7 +229,7 @@ test("provider SDK wrappers preserve only Hara's redacted model-network diagnosi
   );
 });
 
-test("Windows without a supported HTTP(S) proxy receives an actionable PAC/SOCKS diagnostic", async () => {
+test("closed loopback endpoints receive a local-service diagnosis instead of proxy guidance", async () => {
   const modelFetch = createModelFetch(undefined, {
     env: {},
     platform: "win32",
@@ -243,11 +243,53 @@ test("Windows without a supported HTTP(S) proxy receives an actionable PAC/SOCKS
       signal: AbortSignal.timeout(2_000),
     }),
     (error) => {
-      assert.match(error.message, /without a supported HTTP\(S\) proxy/i);
-      assert.match(error.message, /PAC-only or SOCKS-only/i);
-      assert.match(error.message, /hara config set proxy/i);
+      assert.match(error.message, /selected local endpoint is unavailable/i);
+      assert.match(error.message, /loopback endpoints intentionally bypass proxies/i);
+      assert.match(error.message, /start the selected local model\/gateway service/i);
+      assert.match(error.message, /switch to a working personal direct connection/i);
+      assert.match(error.message, /reconnect or re-enroll the selected organization connection/i);
+      assert.doesNotMatch(error.message, /PAC-only or SOCKS-only/i);
+      assert.doesNotMatch(error.message, /hara config set proxy/i);
       assert.doesNotMatch(error.message, /wpad\\.example/i);
+      assert.doesNotMatch(error.message, /127\.0\.0\.1|:1(?:\D|$)/i);
       return true;
     },
   );
+});
+
+test("remote Windows failures without an HTTP(S) proxy retain safe PAC/SOCKS guidance", { concurrency: false }, async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    const socketError = Object.assign(new Error("private transport detail"), {
+      code: "ENETUNREACH",
+    });
+    throw new TypeError("fetch failed", {
+      cause: new Error("provider wrapper", {
+        cause: new Error("request wrapper", { cause: socketError }),
+      }),
+    });
+  };
+  try {
+    const modelFetch = createModelFetch(undefined, {
+      env: {},
+      platform: "win32",
+      windowsProxy: {
+        enabled: false,
+        autoConfigUrl: "http://wpad.example/proxy.pac",
+      },
+    });
+    await assert.rejects(
+      () => modelFetch("https://private-gateway.example/v1/chat/completions"),
+      (error) => {
+        assert.match(error.message, /without a supported HTTP\(S\) proxy/i);
+        assert.match(error.message, /PAC-only or SOCKS-only/i);
+        assert.match(error.message, /hara config set proxy/i);
+        assert.match(error.message, /ENETUNREACH/i);
+        assert.doesNotMatch(error.message, /private-gateway|private transport detail|wpad\\.example/i);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

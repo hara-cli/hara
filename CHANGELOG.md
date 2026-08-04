@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.138.0 — 2026-08-04 — runtime-safe skills and honest local gateway recovery
+
+- Enforce each installed skill's runtime tool allowlist at the agent loop and tool registry instead of
+  treating skill metadata as prompt-only guidance. Built-in execution, Serve, and delegated runs now
+  share the same bounded policy while older skills without an allowlist remain compatible.
+- Diagnose an unreachable loopback model or gateway as a local endpoint lifecycle failure. Hara keeps
+  its security-preserving proxy bypass, but now tells the user to start the local service, switch to a
+  working personal direct connection, or reconnect the selected organization instead of recommending
+  PAC/SOCKS or HTTP proxy changes that cannot affect loopback traffic.
+- Preserve the existing actionable Windows proxy guidance for real remote endpoints, traverse only a
+  bounded error-cause chain for safe transport codes, and continue redacting gateway addresses, proxy
+  credentials, and provider wrapper details.
+- Upgrade with `npm i -g @nanhara/hara@0.138.0`.
+
 ## 0.137.0 — 2026-07-31 — one-step organization model and Desk enrollment
 
 - Accept an optional separately scoped Hara Desk binding from Hara Control during normal organization

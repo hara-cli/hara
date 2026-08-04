@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.137.0",
+  "version": "0.138.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -60,7 +60,7 @@
     "ink": "^6.8.0",
     "openai": "^6.44.0",
     "react": "^19.2.7",
-    "undici": "^7.28.0",
+    "undici": "^7.29.0",
     "ws": "^8.19.0"
   },
   "devDependencies": {
@@ -81,7 +81,8 @@
       "protobufjs": "7.6.5"
     },
     "@hono/node-server": "2.0.11",
-    "hono": "4.12.31",
-    "fast-uri": "3.1.4"
+    "hono": "4.12.34",
+    "fast-uri": "3.1.5",
+    "ip-address": "10.3.1"
   }
 }

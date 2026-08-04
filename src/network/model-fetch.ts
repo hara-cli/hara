@@ -230,14 +230,21 @@ async function proxyAgent(
 }
 
 function networkErrorCode(error: unknown): string | undefined {
-  const candidate = error as {
-    code?: unknown;
-    cause?: { code?: unknown; cause?: { code?: unknown } };
-  };
-  const values = [candidate?.code, candidate?.cause?.code, candidate?.cause?.cause?.code];
-  return values.find((value): value is string =>
-    typeof value === "string" && /^[A-Z][A-Z0-9_]{1,39}$/u.test(value)
-  );
+  const visited = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 6 && current && !visited.has(current); depth += 1) {
+    visited.add(current);
+    if (typeof current !== "object") return undefined;
+    const candidate = current as { code?: unknown; cause?: unknown };
+    if (
+      typeof candidate.code === "string"
+      && /^[A-Z][A-Z0-9_]{1,39}$/u.test(candidate.code)
+    ) {
+      return candidate.code;
+    }
+    current = candidate.cause;
+  }
+  return undefined;
 }
 
 const SAFE_MODEL_NETWORK_ERROR_PREFIX = "model network request failed";
@@ -271,9 +278,17 @@ function safeModelNetworkError(
   error: unknown,
   proxy: ModelProxySelection | undefined,
   platform: NodeJS.Platform,
+  target: URL,
 ): Error {
   if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) return error;
   const code = networkErrorCode(error);
+  if (loopbackHostname(target.hostname)) {
+    return new Error(
+      `${SAFE_MODEL_NETWORK_ERROR_PREFIX} because the selected local endpoint is unavailable${code ? ` (${code})` : ""}; `
+      + "loopback endpoints intentionally bypass proxies — start the selected local model/gateway service, "
+      + "switch to a working personal direct connection, or reconnect or re-enroll the selected organization connection",
+    );
+  }
   const networkPath = proxy
     ? proxy.source === "windows-system"
       ? " through the Windows system proxy"
@@ -326,6 +341,7 @@ export function createModelFetch(
         error,
         proxy,
         resolutionDefaults.platform ?? process.platform,
+        url,
       );
     }
   };
