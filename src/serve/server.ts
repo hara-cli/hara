@@ -165,6 +165,9 @@ export interface ServeDeps {
   providerSettings?: (cwd?: string) => ProviderSettingsState;
   saveProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
   testProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
+  createProviderConnection?: (input: ProviderConnectionCreateInput, cwd?: string) => Promise<ProviderSettingsState>;
+  useProviderConnection?: (id: string, cwd?: string) => ProviderSettingsState;
+  removeProviderConnection?: (id: string, cwd?: string) => ProviderSettingsState;
   /** Explicitly remove the project profile pin governing cwd. Existing sessions retain their stored
    * profile; the returned snapshots describe only the route used by future sessions. */
   unpinProjectProfile?: (cwd?: string) => ProjectProfileUnpinResult;
@@ -254,6 +257,25 @@ export interface ProviderSettingsState {
     environmentOverride?: boolean;
   };
   providers: ProviderSettingsCatalogEntry[];
+  connections?: ProviderConnectionSummary[];
+  switchLocked?: boolean;
+}
+
+export interface ProviderConnectionSummary {
+  id: string;
+  label: string;
+  provider: string;
+  model: string;
+  baseURL?: string;
+  location: "cloud" | "local";
+  auth: "api-key" | "oauth" | "none";
+  keyConfigured: boolean;
+  authenticated: boolean;
+  active: boolean;
+  legacyPersonal: boolean;
+  removable: boolean;
+  keyHint?: string;
+  createdAt?: string;
 }
 
 export interface ProviderSettingsInput {
@@ -263,6 +285,12 @@ export interface ProviderSettingsInput {
   apiKey?: string;
   clearApiKey?: boolean;
   activatePersonal?: boolean;
+}
+
+export interface ProviderConnectionCreateInput extends ProviderSettingsInput {
+  id: string;
+  label: string;
+  activate?: boolean;
 }
 
 export interface ProviderSettingsTestResult {
@@ -1462,7 +1490,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.list", "session.create", "session.resume", "session.send", "session.steer", "session.interrupt", "session.set-model",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
-            "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.gateways.list",
+            "settings.providers.list", "settings.providers.test", "settings.providers.save",
+            "settings.providers.connections.create", "settings.providers.connections.use",
+            "settings.providers.connections.remove", "settings.gateways.list",
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
             "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
             "settings.organizations.remove", "settings.organizations.check",
@@ -1795,6 +1825,45 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!deps.providerSettings) return reply(rpcError(id, ERR.METHOD, "provider settings not supported by this server"));
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             return reply(rpcResult(id!, redactSensitiveValue(deps.providerSettings(targetCwd)).value));
+          }
+          case "settings.providers.connections.create": {
+            if (!deps.createProviderConnection) return reply(rpcError(id, ERR.METHOD, "named provider connections are not supported by this server"));
+            if (
+              typeof p.id !== "string" ||
+              typeof p.label !== "string" ||
+              typeof p.provider !== "string" ||
+              typeof p.model !== "string" ||
+              (p.baseURL !== undefined && typeof p.baseURL !== "string") ||
+              (p.apiKey !== undefined && typeof p.apiKey !== "string") ||
+              (p.clearApiKey !== undefined && typeof p.clearApiKey !== "boolean") ||
+              (p.activate !== undefined && typeof p.activate !== "boolean")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "id + label + provider + model required; optional baseURL/apiKey/clearApiKey/activate have invalid types"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const input: ProviderConnectionCreateInput = {
+              id: p.id,
+              label: p.label,
+              provider: p.provider,
+              model: p.model,
+              ...(p.baseURL !== undefined ? { baseURL: p.baseURL } : {}),
+              ...(p.apiKey !== undefined ? { apiKey: p.apiKey } : {}),
+              ...(p.clearApiKey !== undefined ? { clearApiKey: p.clearApiKey } : {}),
+              ...(p.activate !== undefined ? { activate: p.activate } : {}),
+            };
+            const result = await deps.createProviderConnection(input, targetCwd);
+            return reply(rpcResult(id!, redactSensitiveValue(result, [p.apiKey]).value));
+          }
+          case "settings.providers.connections.use":
+          case "settings.providers.connections.remove": {
+            if (typeof p.id !== "string") return reply(rpcError(id, ERR.PARAMS, "named provider connection id required"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            if (req.method === "settings.providers.connections.use") {
+              if (!deps.useProviderConnection) return reply(rpcError(id, ERR.METHOD, "named provider connection switching is not supported by this server"));
+              return reply(rpcResult(id!, redactSensitiveValue(deps.useProviderConnection(p.id, targetCwd)).value));
+            }
+            if (!deps.removeProviderConnection) return reply(rpcError(id, ERR.METHOD, "named provider connection removal is not supported by this server"));
+            return reply(rpcResult(id!, redactSensitiveValue(deps.removeProviderConnection(p.id, targetCwd)).value));
           }
           case "settings.profiles.unpin": {
             if (!deps.unpinProjectProfile) return reply(rpcError(id, ERR.METHOD, "project profile recovery not supported by this server"));

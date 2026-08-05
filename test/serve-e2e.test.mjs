@@ -1510,8 +1510,24 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       defaultBaseURL: "http://127.0.0.1:11434/v1",
       customBaseURL: true,
     }],
+    connections: [{
+      id: "personal",
+      label: "Personal",
+      provider: "ollama",
+      model: "qwen3",
+      baseURL: "http://127.0.0.1:11434/v1",
+      location: "local",
+      auth: "none",
+      keyConfigured: true,
+      authenticated: true,
+      active: true,
+      legacyPersonal: true,
+      removable: false,
+    }],
+    switchLocked: false,
   };
   let savedInput;
+  let createdConnectionInput;
   let enrolledOrganizationInput;
   let unpinnedCwd;
   let closeGatewayLoginsCalled = false;
@@ -1553,6 +1569,28 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       savedInput = input;
       return { ...state, accidentalApiKey: input.apiKey };
     },
+    createProviderConnection: async (input) => {
+      createdConnectionInput = input;
+      return {
+        ...state,
+        connections: [...state.connections, {
+          ...state.connections[0],
+          id: input.id,
+          label: input.label,
+          provider: input.provider,
+          model: input.model,
+          active: input.activate === true,
+          legacyPersonal: false,
+          removable: true,
+        }],
+        accidentalApiKey: input.apiKey,
+      };
+    },
+    useProviderConnection: (id) => ({
+      ...state,
+      current: { ...state.current, profileId: id },
+    }),
+    removeProviderConnection: () => ({ ...state, connections: state.connections }),
     gatewayStatuses: async () => [{
       platform: "weixin",
       label: "WeChat",
@@ -1605,6 +1643,11 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.ok(init.result.capabilities.methods.includes("settings.providers.list"));
     assert.ok(init.result.capabilities.methods.includes("settings.providers.test"));
     assert.ok(init.result.capabilities.methods.includes("settings.providers.save"));
+    for (const method of [
+      "settings.providers.connections.create",
+      "settings.providers.connections.use",
+      "settings.providers.connections.remove",
+    ]) assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
     assert.ok(init.result.capabilities.methods.includes("settings.gateways.list"));
     for (const method of [
       "settings.gateways.login.start",
@@ -1630,6 +1673,26 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     const saved = await c.call("settings.providers.save", { provider: "openai", model: "gpt-test", apiKey: secret, activatePersonal: true });
     assert.equal(savedInput.apiKey, secret, "the authenticated callback receives the ephemeral credential");
     assert.equal(JSON.stringify(saved.result).includes(secret), false, "save results must never echo a submitted key");
+
+    const created = await c.call("settings.providers.connections.create", {
+      id: "qwen-personal",
+      label: "Qwen Personal",
+      provider: "openai",
+      model: "qwen3.7-plus",
+      apiKey: secret,
+      activate: false,
+    });
+    assert.equal(createdConnectionInput.apiKey, secret, "named connection creation receives the transient key only inside Serve");
+    assert.equal(created.result.connections.at(-1).id, "qwen-personal");
+    assert.equal(JSON.stringify(created.result).includes(secret), false, "named connection results never echo a submitted key");
+    assert.equal(
+      (await c.call("settings.providers.connections.use", { id: "qwen-personal" })).result.current.profileId,
+      "qwen-personal",
+    );
+    assert.equal(
+      (await c.call("settings.providers.connections.remove", { id: "qwen-personal" })).result.connections.length,
+      1,
+    );
 
     const gateways = await c.call("settings.gateways.list", {});
     assert.equal(gateways.result.gateways[0].platform, "weixin");

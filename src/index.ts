@@ -488,10 +488,48 @@ function providerEnvironmentOverride(): boolean {
   );
 }
 
+function personalProviderConnectionsSnapshot(
+  live: HaraConfig,
+  resolution: ActiveResolution,
+  catalog: ReturnType<typeof providerCatalog>,
+) {
+  const personal = profileByIdForConfig(live, PERSONAL_ID)!;
+  return listProfiles()
+    .filter((candidate) => candidate.kind === "byok")
+    .map((candidate) => candidate.id === PERSONAL_ID ? personal : candidate)
+    .filter((candidate) => !!candidate.provider && candidate.provider !== "hara-gateway")
+    .map((candidate) => {
+      // A connection card describes the persisted route. One-shot HARA_* overrides remain visible on
+      // `current`, but must not make every saved card appear to share the same provider or credential.
+      const target = resolveByokProviderTarget(live, candidate, false, {});
+      const entry = catalog.find((item) => item.id === target.provider)!;
+      const keyConfigured = providerIsLocal(target.provider)
+        || (target.provider === "qwen-oauth" ? loadQwenToken() !== null : !!target.apiKey);
+      return {
+        id: candidate.id,
+        label: candidate.label || (candidate.id === PERSONAL_ID ? "Personal" : candidate.id),
+        provider: target.provider,
+        model: target.model,
+        ...(target.baseURL ? { baseURL: target.baseURL } : {}),
+        location: entry.location as "cloud" | "local",
+        auth: entry.auth as "api-key" | "oauth" | "none",
+        keyConfigured,
+        authenticated: keyConfigured,
+        active: resolution.id === candidate.id,
+        legacyPersonal: candidate.id === PERSONAL_ID,
+        removable: candidate.id !== PERSONAL_ID,
+        ...(candidate.apiKey ? { keyHint: maskKey(candidate.apiKey) } : {}),
+        ...(candidate.createdAt ? { createdAt: candidate.createdAt } : {}),
+      };
+    });
+}
+
 function providerSettingsSnapshot(targetCwd: string) {
   const live = loadConfig({ cwd: targetCwd });
   const { profile, resolution } = profileForConfig(live);
   const catalog = providerCatalog();
+  const connections = personalProviderConnectionsSnapshot(live, resolution, catalog);
+  const switchLocked = resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin";
 
   if (profile.kind === "gateway") {
     const entry = catalog.find((candidate) => candidate.id === "hara-gateway")!;
@@ -512,6 +550,8 @@ function providerSettingsSnapshot(targetCwd: string) {
         ...(profile.tokenExpiresAt ? { tokenExpiresAt: profile.tokenExpiresAt, tokenExpired } : {}),
       },
       providers: catalog,
+      connections,
+      switchLocked,
     };
   }
 
@@ -542,7 +582,110 @@ function providerSettingsSnapshot(targetCwd: string) {
       ...(environmentOverride ? { environmentOverride: true } : {}),
     },
     providers: catalog,
+    connections,
+    switchLocked,
   };
+}
+
+function cleanNamedProviderConnectionId(value: string): string {
+  const id = value.trim();
+  if (!isValidProfileId(id) || id === PERSONAL_ID) {
+    throw new Error("named connection id must use 1-64 letters, numbers, dots, underscores, or dashes and cannot be 'personal'");
+  }
+  return id;
+}
+
+function cleanNamedProviderConnectionLabel(value: string): string {
+  const label = value.trim();
+  if (!label || label.length > 80 || /[\u0000-\u001f\u007f]/.test(label)) {
+    throw new Error("connection name must be 1-80 printable characters");
+  }
+  return label;
+}
+
+async function createNamedProviderConnection(
+  input: {
+    id: string;
+    label: string;
+    provider: string;
+    model: string;
+    baseURL?: string;
+    apiKey?: string;
+    clearApiKey?: boolean;
+    activate?: boolean;
+  },
+  targetCwd: string,
+) {
+  const id = cleanNamedProviderConnectionId(input.id);
+  const label = cleanNamedProviderConnectionLabel(input.label);
+  if (getProfile(id)) throw new Error(`connection '${id}' already exists; choose a new name instead of overwriting it`);
+  if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
+    throw new Error("provider is not a configurable personal provider");
+  }
+  const resolution = resolveActive(targetCwd);
+  const switchLocked = resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin";
+  if (input.activate && (switchLocked || providerEnvironmentOverride())) {
+    throw new Error("the active connection is locked by a flag, environment variable, or project pin; save without switching or remove that override first");
+  }
+  const normalized = normalizePersonalProviderConfig({
+    provider: input.provider,
+    model: input.model,
+    baseURL: input.baseURL,
+    apiKey: input.apiKey,
+    clearApiKey: input.clearApiKey,
+  });
+  if (providerRequiresApiKey(normalized.provider) && !normalized.apiKey) {
+    throw new Error("a new API key is required for a named cloud connection");
+  }
+  const now = new Date().toISOString();
+  const added = addProfile({
+    id,
+    kind: "byok",
+    label,
+    provider: normalized.provider,
+    apiKey: normalized.apiKey,
+    baseURL: normalized.baseURL,
+    defaultModel: normalized.model,
+    createdAt: now,
+    updatedAt: now,
+  }, { activate: input.activate === true });
+  if (!added.ok) throw new Error(added.reason);
+  return providerSettingsSnapshot(targetCwd);
+}
+
+function useNamedProviderConnection(inputId: string, targetCwd: string) {
+  const id = inputId.trim();
+  if (!isValidProfileId(id)) throw new Error("invalid personal connection id");
+  const target = getProfile(id);
+  if (!target || target.kind !== "byok") throw new Error("personal connection was not found");
+  const resolution = resolveActive(targetCwd);
+  if (
+    resolution.source === "flag"
+    || resolution.source === "env"
+    || resolution.source === "pin"
+    || providerEnvironmentOverride()
+  ) {
+    throw new Error("the active connection is locked by a flag, environment variable, or project pin; remove that override before switching");
+  }
+  const switched = useProfile(id);
+  if (!switched.ok) throw new Error(switched.reason);
+  return providerSettingsSnapshot(targetCwd);
+}
+
+function removeNamedProviderConnection(inputId: string, targetCwd: string) {
+  const id = cleanNamedProviderConnectionId(inputId);
+  const target = getProfile(id);
+  if (!target || target.kind !== "byok") throw new Error("personal connection was not found");
+  const resolution = resolveActive(targetCwd);
+  if (
+    resolution.id === id
+    && (resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin")
+  ) {
+    throw new Error("this connection is selected by a flag, environment variable, or project pin; remove that override before deleting it");
+  }
+  const removed = removeProfile(id);
+  if (!removed.ok) throw new Error(removed.reason);
+  return providerSettingsSnapshot(targetCwd);
 }
 
 function organizationAccessState(profile: Profile, now = Date.now()): "valid" | "permanent" | "expiring" | "expired" | "legacy" | "invalid" {
@@ -2876,6 +3019,18 @@ program
         deskSnapshot: fetchDeskSnapshotForProfile,
         deskTask: fetchDeskTaskForProfile,
         testProviderSettings: (input) => testProviderSettingsCandidate(input),
+        createProviderConnection: (input, targetCwd) => createNamedProviderConnection(
+          input,
+          targetCwd ?? cwd,
+        ),
+        useProviderConnection: (inputId, targetCwd) => useNamedProviderConnection(
+          inputId,
+          targetCwd ?? cwd,
+        ),
+        removeProviderConnection: (inputId, targetCwd) => removeNamedProviderConnection(
+          inputId,
+          targetCwd ?? cwd,
+        ),
         saveProviderSettings: async (input, targetCwd) => {
           const settingsCwd = targetCwd ?? cwd;
           if (!isProviderId(input.provider) || input.provider === "hara-gateway") {

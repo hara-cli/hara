@@ -80,6 +80,10 @@ export interface Profile {
   tokenExpiresAt?: string;
   /** Explicit Control policy: this scoped token has no fixed date expiry. It remains revocable. */
   tokenNeverExpires?: boolean;
+  /** Optional lifecycle metadata for user-created named connections. Legacy profiles remain valid
+   * without these fields. */
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface ProfilesFile {
@@ -483,13 +487,17 @@ export function useProfile(id: string): { ok: true; profile: Profile } | { ok: f
   return { ok: true, profile: p };
 }
 
-export function addProfile(p: Profile): { ok: true } | { ok: false; reason: string } {
+export function addProfile(
+  p: Profile,
+  options: { activate?: boolean } = {},
+): { ok: true } | { ok: false; reason: string } {
   if (!isValidProfileId(p.id)) return { ok: false, reason: PROFILE_ID_ERROR };
   const f = maybeMigrate();
   if (f.profiles.some((x) => x.id === p.id)) return { ok: false, reason: `profile '${p.id}' already exists` };
   if (p.kind === "gateway" && (!p.gatewayUrl || !p.deviceToken)) return { ok: false, reason: "gateway profile needs gatewayUrl + deviceToken" };
   if (p.kind === "byok" && !p.provider) return { ok: false, reason: "byok profile needs a provider" };
   f.profiles.push(p);
+  if (options.activate) f.active = p.id;
   persistProfilesFile(f);
   return { ok: true };
 }
