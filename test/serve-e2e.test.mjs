@@ -96,11 +96,12 @@ const memStore = () => {
   };
 };
 
-/** Fake provider: streams "hel"+"lo" and ends. */
+/** Fake provider: emits private reasoning, streams "hel"+"lo", and ends. */
 const textProvider = {
   id: "fake",
   model: "fake-1",
-  async turn({ onText }) {
+  async turn({ onText, onReasoning }) {
+    onReasoning?.("private chain of thought must not cross Serve");
     onText("hel");
     onText("lo");
     return { text: "hello", toolUses: [], stop: "end", usage: { input: 3, output: 2 } };
@@ -485,6 +486,8 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(sent.result.usage.input, 3);
     const deltas = c.events.filter((e) => e.method === "event.text").map((e) => e.params.delta).join("");
     assert.equal(deltas, "hello", "text streamed as events");
+    assert.equal(c.events.some((e) => e.method === "event.reasoning"), false);
+    assert.equal(JSON.stringify(c.events).includes("private chain of thought"), false);
     await c.waitEvent("event.turn_end");
     const taskStates = c.events.filter((e) => e.method === "event.task_state").map((e) => e.params);
     assert.equal(taskStates[0].state, "running");
@@ -503,6 +506,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       "task-state sequences strictly increase",
     );
     assert.ok(taskStates.some((state) => state.phase === "responding"), "stream phase is explicit");
+    assert.ok(taskStates.some((state) => state.phase === "thinking"), "private reasoning still updates the safe typed phase");
     assert.equal(taskStates.at(-1).state, "completed");
     assert.equal(taskStates.at(-1).taskStatus, "completed");
     assert.equal(taskStates.at(-1).phase, "finished");

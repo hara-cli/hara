@@ -1,7 +1,5 @@
-// Non-TUI reasoning rendering (A.P0 #7).
-// Verifies that in plain-terminal mode (no UiSink), reasoning deltas land on their OWN dim lines
-// — each line is prefixed `│ ` and committed once, so a subsequent spinner tick can't clobber it
-// (the old bug where `out(c.dim(d))` shared a line with the spinner's `\r`-overwrite).
+// Provider reasoning is internal execution state. Plain-terminal output must keep the stream alive
+// without exposing reasoning text or retaining a hidden user-accessible transcript copy.
 //
 // We don't need a real provider; we just need a fake Provider that streams a reasoning delta and
 // then ends the turn. We capture every stdout chunk and inspect the sequence.
@@ -51,14 +49,15 @@ async function withTemporaryHome(fn) {
   }
 }
 
-test("non-TUI reasoning: each delta lands on its own dim '│ '-prefixed line, not the spinner row", async () => {
+test("non-TUI reasoning keeps the stream alive without exposing its content", async () => {
   // Fake provider: emit two reasoning deltas (the second contains a newline mid-string), then end.
   const provider = {
     id: "fake",
     model: "fake-model",
-    async turn({ onReasoning }) {
+    async turn({ onReasoning, onText }) {
       onReasoning?.("thinking about it");
       onReasoning?.("\nstill thinking");
+      onText?.("done");
       return { text: "done", toolUses: [], stop: "end" };
     },
   };
@@ -73,14 +72,9 @@ test("non-TUI reasoning: each delta lands on its own dim '│ '-prefixed line, n
   ));
 
   const stripped = chunks.map(stripAnsi).join("");
-  // The reasoning content should appear on its own line(s), prefixed by '│ '.
-  assert.match(stripped, /│ thinking about it/, "first reasoning chunk prefixed by box-drawing char");
-  // The newline-split chunk should also be visible.
-  assert.match(stripped, /│ still thinking/, "post-newline reasoning resumes on a new prefixed line");
-  // Spinner has cleared (no '\r\x1b[K' bytes mid-reasoning that would have eaten the previous line):
-  // i.e. the reasoning output comes AFTER any spinner clears, never the other way round.
-  const reasoningIdx = stripped.indexOf("│ thinking");
-  assert.ok(reasoningIdx >= 0, "reasoning ordering recoverable");
+  assert.equal(stripped.includes("thinking about it"), false);
+  assert.equal(stripped.includes("still thinking"), false);
+  assert.match(stripped, /done/, "the verified assistant result remains visible");
 });
 
 test("non-TUI reasoning: a synchronous provider failure clears the TTY spinner and settles", async () => {

@@ -1128,9 +1128,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         emitTaskState({ state: "running", phase: "responding" });
         broadcast("event.text", { sessionId, delta: d });
       },
-      reasoning: (d) => {
+      reasoning: () => {
+        // Provider reasoning is private execution state. Persistent clients receive only the typed phase;
+        // never forward the model's reasoning delta into the renderer notification stream.
         emitTaskState({ state: "running", phase: "thinking" });
-        broadcast("event.reasoning", { sessionId, delta: d });
       },
       tool: (name, preview) => {
         // The task/status plane is safe for ambient surfaces such as an always-on-top companion.

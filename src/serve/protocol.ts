@@ -83,10 +83,11 @@
 //   session.archive   {sessionId,archived}        → {sessionId,archived}   (list hides archived unless {archived:true})
 //   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)
 // Server → client notifications (all carry sessionId):
-//   event.text / event.reasoning {delta} · event.tool {name,preview} · event.diff {text}
+//   event.text {delta} · event.tool {name,preview} · event.diff {text}
 //   event.notice {text} · event.turn_end {reply,usage,error?,status?,stopReason?} · approval.request {approvalId,question}
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
-//                     authoritative execution plane; clients feature-detect it via capabilities.events
+//                     authoritative execution plane; clients feature-detect it via capabilities.events.
+// Provider reasoning content is intentionally never sent to persistent clients.
 
 export const PROTOCOL_VERSION = 1;
 

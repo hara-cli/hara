@@ -924,18 +924,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }
     const tty = stdout.isTTY && !opts.quiet && !sink;
     const md = tty && process.env.HARA_MD !== "0" ? makeRenderer(out) : null;
-    // Reasoning rendering in plain-terminal mode: we put reasoning on its OWN dim lines (prefixed
-    // "│ ") instead of sharing a line with the spinner — that's what was eating DeepSeek's
-    // reasoning_content in non-TUI mode (each spinner tick `\r`-overwrote it). The TUI keeps its
-    // existing 5-line scroll window via the ink Block; this is the terminal equivalent.
-    let reasoningOpen = false;
-    const flushReasoningTail = (): void => {
-      if (reasoningOpen) {
-        out("\n");
-        reasoningOpen = false;
-      }
-    };
-    // "working Ns" spinner until the first output arrives (cleared on text/reasoning or turn end)
+    // "working Ns" spinner until the first answer token arrives (or the turn ends). Provider reasoning
+    // is deliberately an internal execution signal: it keeps the stall watchdog alive and may update a
+    // typed phase through an empty sink notification, but its content never enters a terminal/UI stream.
+    let reasoningActivityNotified = false;
     let spin: ReturnType<typeof setInterval> | null = null;
     const stopSpin = (): void => {
       if (spin) {
@@ -1015,41 +1007,18 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           return;
         }
         stopSpin();
-        flushReasoningTail();
         if (md) md.push(d);
         else out(d);
       },
-      onReasoning:
-        sink || tty
-          ? (d) => {
-              if (attempt.signal.aborted) return;
-              alive();
-              if (opts.quiet) return;
-              if (sink) {
-                sink.reasoning(d);
-                return;
-              }
-              // Terminal mode: render reasoning on its own dim lines (prefix `│ ` per line). Each
-              // line is committed once and never overwritten — so a subsequent spinner tick can't
-              // clobber it (the old `out(c.dim(d))` bug). Multi-line deltas split cleanly; the
-              // current line resumes mid-output when the next delta arrives.
-              stopSpin();
-              const lines = d.split("\n");
-              for (let i = 0; i < lines.length; i++) {
-                if (!reasoningOpen) {
-                  out(c.dim("│ "));
-                  reasoningOpen = true;
-                }
-                out(c.dim(lines[i]));
-                if (i < lines.length - 1) {
-                  out("\n");
-                  reasoningOpen = false;
-                }
-              }
-            }
-          : () => {
-              if (!attempt.signal.aborted) alive();
-            }, // quiet runs still feed the watchdog (reasoning-only stretches are progress)
+      onReasoning: () => {
+        if (attempt.signal.aborted) return;
+        alive();
+        if (opts.quiet || !sink || reasoningActivityNotified) return;
+        reasoningActivityNotified = true;
+        // Empty means phase-only. UiSink implementations must never receive or retain provider reasoning
+        // text; Serve uses this signal to publish the safe typed `thinking` task phase.
+        sink.reasoning("");
+      },
           signal: attempt.signal,
         });
       });
@@ -1073,7 +1042,6 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       // Every exit path (sync throw, rejected promise, watchdog, Esc, deadline) owns the same terminal
       // teardown. Leaving any of these after the try makes a failed provider strand the spinner/markdown.
       stopSpin();
-      flushReasoningTail();
       md?.end();
       if (!opts.quiet && !sink) out("\n");
     }

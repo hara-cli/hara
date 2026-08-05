@@ -1,6 +1,6 @@
 // The hara TUI (ink). Layout, top to bottom:
 //   <Static>    committed transcript — rendered once each, scrolls into native scrollback
-//   current     the in-progress turn's blocks (assistant text / reasoning / tool / diff), live
+//   current     the in-progress turn's user-visible blocks (assistant text / tool / diff), live
 //   <TodoPanel> live checklist (when the agent keeps one)
 //   status slot ALWAYS one row: StatusRow (spinner while working / key hints idle) ⇄ ModeLine
 //               (shift+tab picker) — constant height so the input box never bobs at turn boundaries
@@ -148,13 +148,11 @@ export interface AppProps {
   visionNotice?: string;
 }
 
-type Kind = "user" | "assistant" | "reasoning" | "tool" | "diff" | "notice";
+type Kind = "user" | "assistant" | "tool" | "diff" | "notice";
 interface Item {
   id: number;
   kind: Kind;
   text: string;
-  /** Unfolded content for the Ctrl+T transcript overlay (full reasoning / full tool output). Falls back to `text`. */
-  full?: string;
 }
 let _id = 0;
 const nid = (): number => ++_id;
@@ -165,17 +163,6 @@ function promptAbortReason(signal: AbortSignal): Error {
   const error = new Error("interactive prompt cancelled");
   error.name = "AbortError";
   return error;
-}
-
-/** Prepare a finalized turn item for the append-only `<Static>` scrollback. A completed reasoning
- *  block collapses to a single-line "✻ thought · N lines" notice (its full text preserved in `full`
- *  for the Ctrl+T overlay) — mirroring codex writing finalized rows to scrollback ONCE. Every other
- *  kind passes through unchanged. Used both mid-turn (as blocks finalize) and at turn end so a given
- *  turn's reasoning is emitted to Static exactly once and never re-rendered/re-emitted. */
-function foldForHistory(it: Item): Item {
-  if (it.kind !== "reasoning") return it;
-  const lines = it.text.split("\n").filter((l) => l.trim()).length;
-  return { ...it, kind: "notice", text: `✻ thought · ${lines} lines`, full: it.text };
 }
 
 /** Redraw throttle for the LIVE region (~30fps). A fast token stream or a slow/remote terminal can
@@ -204,7 +191,7 @@ function tailWindow(rendered: string, maxRows: number): { header: string | null;
   };
 }
 
-const Block = memo(function Block({ item, open, liveRows, width = 80 }: { item: Item; open?: boolean; liveRows?: number; width?: number }) {
+const Block = memo(function Block({ item, liveRows, width = 80 }: { item: Item; liveRows?: number; width?: number }) {
   // Live streaming blocks get a bounded tail view (liveRows set); committed <Static> blocks render full.
   const windowed = (rendered: string): ReactNode => {
     if (!liveRows) return <Text>{rendered}</Text>;
@@ -233,27 +220,6 @@ const Block = memo(function Block({ item, open, liveRows, width = 80 }: { item: 
     }
     case "assistant":
       return windowed(renderMarkdown(item.text)); // headers/bold/inline-code/bullets + verbatim fences
-    case "reasoning": {
-      // A streaming reasoning block lives in the dynamic region ABOVE the input box, and the instant the
-      // model stops thinking it FOLDS to a single "✻ thought · N lines" notice in scrollback. If we streamed
-      // the body live (up to ~11 rows) and then folded to 1, the input box would jump UP by that many rows
-      // every time — the "bobbing" you saw. So by default we show only the compact 1-line header (same height
-      // as the folded form → the box holds still). ctrl+r opts into the full streaming body (its own taller
-      // view), and the FULL text is always in the ctrl+t transcript regardless — nothing is lost.
-      const lines = item.text.replace(/\n+$/, "").split("\n");
-      const n = lines.length;
-      const hint = open ? " · ctrl-r collapse" : " · ctrl-r expand";
-      return (
-        <Box flexDirection="column">
-          <Text color={accent()} dimColor>{`✻ thinking … ${n} line${n === 1 ? "" : "s"}${hint}`}</Text>
-          {open
-            ? lines.map((l, i) => (
-                <Text key={i} dimColor italic>{`${i === 0 ? "• " : "  "}${l}`}</Text>
-              ))
-            : null}
-        </Box>
-      );
-    }
     case "tool":
       return <Text dimColor>{"  " + item.text}</Text>;
     case "diff":
@@ -263,25 +229,19 @@ const Block = memo(function Block({ item, open, liveRows, width = 80 }: { item: 
   }
 });
 
-// ── Ctrl+T transcript overlay (Codex-style): the whole conversation with NOTHING folded — full reasoning,
-// full tool output, full text — scrollable. The folded live view stays the default; this is the "see everything"
-// escape hatch so information is hidden but never lost.
+// ── Ctrl+T transcript overlay: user-visible messages and execution evidence are scrollable, while
+// provider reasoning remains private and never enters this state tree.
 type TLine = { t: string; dim?: boolean; italic?: boolean; color?: string };
 function flattenTranscript(items: Item[]): TLine[] {
   const out: TLine[] = [];
   for (const it of items) {
-    const body = (it.full ?? it.text).replace(/\n+$/, "");
+    const body = it.text.replace(/\n+$/, "");
     if (!body && it.kind !== "user") continue;
     out.push({ t: "" }); // blank line between blocks
     if (it.kind === "user") {
       body.split("\n").forEach((l, i) => out.push({ t: (i === 0 ? "› " : "  ") + l, color: "cyan" }));
-    } else if (it.kind === "reasoning" || (it.kind === "notice" && it.full !== undefined)) {
-      const lines = body.split("\n");
-      out.push({ t: `✻ thinking (${lines.length} line${lines.length === 1 ? "" : "s"})`, dim: true, color: accent() });
-      lines.forEach((l, i) => out.push({ t: (i === 0 ? "• " : "  ") + l, dim: true, italic: true }));
     } else if (it.kind === "tool") {
       out.push({ t: it.text, dim: true });
-      if (it.full && it.full !== it.text) it.full.replace(/\n+$/, "").split("\n").forEach((l) => out.push({ t: "    " + l, dim: true }));
     } else if (it.kind === "diff") {
       body.split("\n").forEach((l) => out.push({ t: l }));
     } else {
@@ -450,7 +410,7 @@ function HeaderCard(props: HeaderInfo) {
         {sessionShort ? row("session", <Text>{sessionShort}</Text>) : null}
       </Box>
       {/* Tip block — moved OUT of the card (顾雅 spec). Dim discoverability line below the card. */}
-      <Text dimColor>{"  Tip: @ attach file · ctrl+t transcript · ctrl+r reasoning · shift+tab approval · esc interrupt"}</Text>
+      <Text dimColor>{"  Tip: @ attach file · ctrl+t transcript · shift+tab approval · esc interrupt"}</Text>
       {props.workspaceNotice ? <Text color="yellow">{`  ⚠ ${props.workspaceNotice}`}</Text> : null}
       {props.updateNotice ? <Text color="yellow">{`  ⬆ ${props.updateNotice}`}</Text> : null}
     </Box>
@@ -637,7 +597,6 @@ export function App({
   // Free-text question prompt (ask_user with no/declined options): re-enables the InputBox to capture one
   // line, then resolves the awaiting tool with that text. Separate from `prompt` (the select-only path).
   const [askText, setAskText] = useState<{ token: symbol; title: string; resolve: (v: string) => void } | null>(null);
-  const [reasoningOpen, setReasoningOpen] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false); // Ctrl+T full-transcript overlay
   const [picker, setPicker] = useState<{ models: string[]; style: ReasoningStyle; current?: string; effort: Effort; resolve: (v: { model: string; effort: Effort } | null) => void } | null>(null); // /model picker overlay
   const [modeSelector, setModeSelector] = useState(false); // transient approval selector: shift+tab pops it, auto-hides
@@ -718,9 +677,9 @@ export function App({
         live[live.length - 1] = { ...last, text: last.text + text };
       } else {
         // A new block begins. Everything before it in the live buffer is now finalized: graduate it
-        // to <Static> (folding reasoning) so it's written to scrollback ONCE and never re-rendered.
+        // to <Static> so it is written to scrollback once and never re-rendered.
         if (live.length) {
-          for (const it of live) toStaticRef.current.push(foldForHistory(it));
+          for (const it of live) toStaticRef.current.push(it);
           liveRef.current = [{ id: nid(), kind, text }];
         } else {
           live.push({ id: nid(), kind, text });
@@ -836,7 +795,9 @@ export function App({
       setWorking(true);
       const sink: Sink = {
         assistantDelta: (d) => pushCurrent("assistant", d, true),
-        reasoningDelta: (d) => pushCurrent("reasoning", d, true),
+        // Provider reasoning is deliberately private. The engine still uses it for stream liveness and
+        // structured phase state, but the terminal retains neither the text nor a hidden transcript copy.
+        reasoningDelta: () => {},
         tool: (name, preview) => pushCurrent("tool", `↳ ${name}${preview ? " " + preview : ""}`),
         diff: (text) => pushCurrent("diff", text),
         notice: (text) => pushCurrent("notice", text),
@@ -951,7 +912,7 @@ export function App({
         clearTimeout(flushTimerRef.current);
         flushTimerRef.current = null;
       }
-      const committed = [...toStaticRef.current, ...liveRef.current.map(foldForHistory)];
+      const committed = [...toStaticRef.current, ...liveRef.current];
       toStaticRef.current = [];
       liveRef.current = [];
       if (committed.length) setHistory((h) => [...h, ...committed]);
@@ -1034,7 +995,6 @@ export function App({
       }
       return;
     }
-    if (key.ctrl && input === "r") return setReasoningOpen((x) => !x);
     if (key.escape && working) {
       abortCurrentTurn();
     }
@@ -1059,7 +1019,7 @@ export function App({
         {(item) => (item.id === -1 ? <HeaderCard key="hdr" {...header!} /> : <Block key={item.id} item={item} width={transcriptWidth} />)}
       </Static>
       {current.map((item) => (
-        <Block key={item.id} item={item} open={reasoningOpen} liveRows={liveRows} width={transcriptWidth} />
+        <Block key={item.id} item={item} liveRows={liveRows} width={transcriptWidth} />
       ))}
       <TodoPanel todos={todos} />
       {picker && (

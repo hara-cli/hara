@@ -98,9 +98,9 @@ test("App header (personal): bordered card, ◆ glyph + title, profile grid, /mo
   assert.ok(!/vision\s+\S/.test(frame), "no 'vision <model>' clause when visionModel is unset");
   // The actionable /model ↹ affordance is present (green in a real TTY).
   assert.ok(frame.includes("/model ↹"), "/model ↹ affordance on the model row");
-  // Tip block (below the card) advertises the transcript + reasoning shortcuts.
+  // Tip block keeps the user-visible execution transcript shortcut, but never advertises private reasoning.
   assert.ok(frame.includes("ctrl+t transcript"), "tip advertises Ctrl+T transcript overlay");
-  assert.ok(frame.includes("ctrl+r reasoning"), "tip advertises Ctrl+R reasoning expand");
+  assert.ok(!frame.includes("ctrl+r"), "private provider reasoning has no reveal shortcut");
   assert.ok(frame.includes("Tip:"), "tip line present below the card");
   assert.ok(frame.includes("@ attach file"), "tip mentions @ file attach");
   unmount();
@@ -730,7 +730,7 @@ test("App commits a notice from a fast (slash-like) turn — no awaited agent ru
   unmount();
 });
 
-test("Ctrl+T transcript overlay: reasoning folds inline but shows FULL in the overlay; esc closes", async () => {
+test("Ctrl+T transcript overlay never retains provider reasoning; esc closes", async () => {
   const onSubmit = async (line, h) => {
     h.sink.reasoningDelta("first line of the secret reasoning\nsecond line\nthird line");
     h.sink.assistantDelta("Done.");
@@ -743,24 +743,23 @@ test("Ctrl+T transcript overlay: reasoning folds inline but shows FULL in the ov
   stdin.write("do it");
   await tick();
   stdin.write("\r");
-  await tick(160); // turn finishes → reasoning commits, folded to "✻ thought · N lines"
+  await tick(160);
   const folded = strip(lastFrame());
-  assert.ok(folded.includes("thought · 3 lines"), "committed reasoning is folded inline to one line");
-  assert.ok(!folded.includes("secret reasoning"), "full reasoning text is NOT inline once committed");
+  assert.ok(folded.includes("Done."), "the assistant result remains visible");
+  assert.ok(!folded.includes("secret reasoning"), "provider reasoning is absent from the normal timeline");
   stdin.write("\x14"); // Ctrl+T → open overlay
   await tick(80);
   const overlay = strip(lastFrame());
   assert.ok(overlay.includes("TRANSCRIPT"), "transcript overlay opened");
-  assert.ok(overlay.includes("secret reasoning"), "overlay shows the FULL reasoning (nothing folded)");
+  assert.ok(!overlay.includes("secret reasoning"), "the execution transcript has no hidden reasoning copy");
+  assert.ok(overlay.includes("Done."), "the execution transcript retains the assistant result");
   stdin.write("\x1b"); // Esc → close
   await tick(80);
   assert.ok(strip(lastFrame()).includes("Type a task"), "overlay closed — input box back");
   unmount();
 });
 
-test("App: streaming reasoning shows only the compact header by default (steady input box); ctrl+r reveals the body", async () => {
-  // Anti-bob: while reasoning is the live tail it must NOT stream its multi-line body above the input box
-  // (that body would fold to 1 line on finalize and yank the box up). Default = 1-line header; ctrl+r expands.
+test("App: streaming reasoning remains private and creates no visible transcript block", async () => {
   const onSubmit = async (line, h) => {
     h.sink.reasoningDelta("alpha thought\nbeta thought\ngamma thought");
     await tick(300); // hold as the live tail (no assistant delta yet) so both samples land pre-fold
@@ -772,23 +771,14 @@ test("App: streaming reasoning shows only the compact header by default (steady 
   stdin.write("think");
   await tick();
   stdin.write("\r");
-  await tick(70); // mid-turn: reasoning is the live tail, collapsed by default
-  const collapsed = strip(lastFrame());
-  assert.ok(collapsed.includes("thinking … 3 lines"), "compact header with the line count is shown");
-  assert.ok(!collapsed.includes("alpha thought"), "reasoning body hidden by default — the input box holds steady");
-  stdin.write("\x12"); // Ctrl+R → expand
   await tick(70);
-  const expanded = strip(lastFrame());
-  assert.ok(expanded.includes("alpha thought") && expanded.includes("gamma thought"), "ctrl+r reveals the full reasoning body");
+  const frame = strip(lastFrame());
+  assert.ok(!frame.includes("alpha thought") && !frame.includes("gamma thought"), "reasoning body is never rendered");
+  assert.ok(!frame.includes("thinking …"), "reasoning does not create a user-visible log row");
   unmount();
 });
 
-test("App live region: finalized reasoning graduates to <Static> ONCE — no stacked/duplicate thinking lines", async () => {
-  // Regression for the remote/slow-terminal duplication bug: a completed reasoning block must be
-  // emitted to scrollback exactly once (folded), and must NOT keep re-appearing as the assistant
-  // streams. We stream reasoning, then a multi-delta assistant reply, and assert the folded
-  // "thought" summary shows up exactly once and the live assistant text renders without the
-  // expanded reasoning still glued above it.
+test("App live region discards reasoning while preserving the streamed assistant result", async () => {
   const onSubmit = async (line, h) => {
     h.sink.reasoningDelta("weighing options\nline two\nline three");
     // Fast token stream after reasoning finalizes — over a slow link this used to thrash + stack.
@@ -808,14 +798,12 @@ test("App live region: finalized reasoning graduates to <Static> ONCE — no sta
   await tick(90); // sample mid-turn: reasoning has finalized, assistant is streaming
   const mid = strip(lastFrame());
   assert.ok(mid.includes("The answer is 42."), "assistant text streams in the live region");
-  // Reasoning finalized the moment assistant text began → folded, shown at most once, never expanded live.
-  const thoughtCount = (mid.match(/thought · \d+ lines/g) || []).length;
-  assert.ok(thoughtCount <= 1, `folded reasoning appears at most once mid-turn (saw ${thoughtCount})`);
-  assert.ok(!mid.includes("weighing options"), "expanded reasoning is NOT re-rendered above the live reply");
+  assert.ok(!mid.includes("thought ·"), "reasoning does not leave a folded marker");
+  assert.ok(!mid.includes("weighing options"), "reasoning text is not retained above the live reply");
   await tick(200); // finish + commit
   const done = strip(lastFrame());
-  const finalCount = (done.match(/thought · \d+ lines/g) || []).length;
-  assert.equal(finalCount, 1, "after the turn, the folded reasoning summary appears exactly once (not stacked)");
+  assert.ok(done.includes("The answer is 42."));
+  assert.ok(!done.includes("weighing options"));
   unmount();
 });
 
