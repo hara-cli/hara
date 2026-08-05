@@ -21,7 +21,7 @@
 //                      attachments: [{kind:"image"|"file"|"directory",path,mediaType?}]
 //                      File-picker paths avoid lossy @mention encoding; Serve enforces type/security limits.
 //   session.interrupt {sessionId}                → {}
-//   approval.reply    {approvalId,allow,always?}  → {}
+//   approval.reply    {approvalId,allow,always?}  → {} (`always` persists only the engine-declared project scope)
 //   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
 //   plugins.set       {name,enabled}              → {name,enabled}   (applies to future sessions/turns)
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}
@@ -84,7 +84,7 @@
 //   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)
 // Server → client notifications (all carry sessionId):
 //   event.text {delta} · event.tool {name,preview} · event.diff {text}
-//   event.notice {text} · event.turn_end {reply,usage,error?,status?,stopReason?} · approval.request {approvalId,question}
+//   event.notice {text} · event.turn_end {reply,usage,error?,status?,stopReason?} · approval.request {approvalId,question,allowAlways}
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events.
 // Provider reasoning content is intentionally never sent to persistent clients.

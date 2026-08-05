@@ -2654,7 +2654,10 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
     await c.call("initialize", { token: "tok" });
     const { result } = await c.call("session.create", {});
     // answer the approval as soon as it arrives (concurrently with the running send)
-    const approver = c.waitEvent("approval.request").then((ev) => c.call("approval.reply", { approvalId: ev.params.approvalId, allow: true }));
+    const approver = c.waitEvent("approval.request").then((ev) => {
+      assert.equal(ev.params.allowAlways, true, "ordinary project edits advertise the narrow remembered scope");
+      return c.call("approval.reply", { approvalId: ev.params.approvalId, allow: true });
+    });
     const sent = await c.call("session.send", { sessionId: result.sessionId, text: "write it" });
     await approver;
     assert.equal(sent.result.reply, "done");

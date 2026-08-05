@@ -98,6 +98,7 @@ import {
 } from "./profile/profile.js";
 import { serviceBindingHost } from "./profile/organization-service.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
+import { projectApprovalPolicy } from "./security/project-approvals.js";
 import { routingProvider } from "./agent/route.js";
 import {
   shouldAutoCompact,
@@ -4326,7 +4327,8 @@ program.action(async (opts) => {
   }
   let approval: ApprovalMode = opts.yes ? "full-auto" : ((opts.approval as ApprovalMode) || cfg.approval);
   let currentTurn: AbortController | null = null; // set during a running turn so Esc can abort it
-  const autoApprove = new Set<string>(); // tools the user chose "don't ask again" for, this session
+  const autoApprove = new Set<string>(); // opaque project scopes accepted during this attached session
+  const projectApprovals = projectApprovalPolicy(cwd);
   let recalledContext = ""; // snippets queued by /recall, prepended to the next message
   let recalledSkillPolicies: NonNullable<RunOpts["skillPolicies"]> = [];
   const sandbox: SandboxMode = (opts.sandbox as SandboxMode) || cfg.sandbox;
@@ -6016,7 +6018,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -6164,6 +6166,7 @@ program.action(async (opts) => {
               memory: buildMemory(),
               confirm: h.confirm,
               autoApprove,
+              projectApprovals,
               projectContext,
               continuationSession,
               executionContext,
@@ -6211,6 +6214,7 @@ program.action(async (opts) => {
           memory: buildMemory(),
           confirm: h.confirm,
           autoApprove,
+          projectApprovals,
           projectContext,
           continuationSession,
           executionContext,
@@ -6305,7 +6309,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -6371,7 +6375,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

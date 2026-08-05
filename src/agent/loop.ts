@@ -24,6 +24,11 @@ import {
   loadPermissionRules,
   splitCompound,
 } from "../security/permissions.js";
+import {
+  projectApprovalScope,
+  type ProjectApprovalPolicy,
+  type ProjectApprovalScope,
+} from "../security/project-approvals.js";
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
 import { failureIdentity, looksFailed, recordCall } from "./repeat-guard.js";
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration } from "./limits.js";
@@ -282,9 +287,15 @@ export interface RunOpts {
   approval: ApprovalMode;
   /** Interactive approval channel. Implementations should actively dismiss their prompt when `signal`
    *  aborts; the loop still races the Promise as a hard boundary for non-cooperative embedders. */
-  confirm: (q: string, signal?: AbortSignal) => Promise<boolean | "always">;
-  /** tool names auto-approved for the rest of the session (chosen via "don't ask again") */
+  confirm: (
+    q: string,
+    signal?: AbortSignal,
+    options?: { allowAlways?: boolean },
+  ) => Promise<boolean | "always">;
+  /** Opaque project-scope keys auto-approved for the rest of the attached session. */
   autoApprove?: Set<string>;
+  /** Durable user-owned project approvals. Repository files can never populate this policy. */
+  projectApprovals?: ProjectApprovalPolicy;
   projectContext?: string;
   /** durable memory digest injected into the system prompt (frozen snapshot) */
   memory?: string;
@@ -1415,6 +1426,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
                   ? await bounded(waitForHuman(opts, life, () => Promise.resolve().then(() => opts.confirm(
                       `${c.red("⛔ guardian circuit-breaker")} — ${breaker.blocks} high-risk actions blocked this turn. Continue anyway?`,
                       runSignal,
+                      { allowAlways: false },
                     ))))
                   : false;
               } catch (error) {
@@ -1434,13 +1446,31 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           }
         }
       }
-      const shouldConfirm = alwaysGate || (cmdDecision !== "allow" && needsConfirm(approvalKind, opts.approval) && !opts.autoApprove?.has(tu.name));
+      let approvalScope: ProjectApprovalScope | undefined;
+      if (!alwaysGate) {
+        try {
+          approvalScope = projectApprovalScope(tu.name, input, ctx.cwd);
+        } catch {
+          // A missing/changed project root must not broaden approval. The action remains one-shot.
+        }
+      }
+      const scopeAlreadyApproved = Boolean(
+        approvalScope
+        && (opts.autoApprove?.has(approvalScope.key) || opts.projectApprovals?.has(approvalScope.key)),
+      );
+      const shouldConfirm = alwaysGate || (
+        cmdDecision !== "allow"
+        && needsConfirm(approvalKind, opts.approval)
+        && !scopeAlreadyApproved
+      );
       if (shouldConfirm) {
         let replyResult: boolean | "always" | typeof RUN_STOPPED;
         try {
+          const scopeHint = approvalScope ? `\n${approvalScope.summary}` : "";
           replyResult = await bounded(waitForHuman(opts, life, () => Promise.resolve().then(() => opts.confirm(
-            `${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?`,
+            `${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?${scopeHint}`,
             runSignal,
+            { allowAlways: Boolean(approvalScope) && !alwaysGate },
           ))));
         } catch (error) {
           if (runSignal.aborted) return finalizeStoppedToolRound();
@@ -1452,7 +1482,17 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           plans.push({ tu, tool, denied: "User denied this action." });
           continue;
         }
-        if (reply === "always" && !alwaysGate) opts.autoApprove?.add(tu.name); // computer: treat "always" as one-time yes
+        if (reply === "always" && approvalScope && !alwaysGate) {
+          opts.autoApprove?.add(approvalScope.key);
+          try {
+            if (!opts.projectApprovals) throw new Error("no durable project approval policy is attached");
+            opts.projectApprovals.remember(approvalScope.key);
+          } catch {
+            const message = "Project approval could not be saved; this action is allowed only for the current session.";
+            if (sink) sink.notice(message);
+            else out(c.yellow(`  ${message}\n`));
+          }
+        }
       }
       plans.push({ tu, tool, operation, approvalKind });
       if (!opts.quiet) {

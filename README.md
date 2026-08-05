@@ -13,9 +13,9 @@
 **Highlights**
 - **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**), and `hara plan --parallel` runs independent atoms concurrently.
 - **Drive it from chat** — `hara gateway` runs your local hara from **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk · WeCom · Signal** (10 platforms), with **two-way images where the platform has a byte-upload API**, resumable per-chat sessions, project/agent roaming, bounded per-thread queues, and approval-gated group automations. Connects out — no public webhook. See **[docs/gateway.md](docs/gateway.md)**.
-- **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only investigation → the model submits its plan via `exit_plan` → approve → execute), selectable approvals with "don't ask again", windowed reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
+- **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only investigation → the model submits its plan via `exit_plan` → approve → execute), narrowly scoped project approvals, private model reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
 - **Persistent memory + auditable self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting and can curate evidence-backed facts/preferences plus verified reusable skills. Durable writes are deduplicated and re-sanitized on load; raw prior chats stay separate behind bounded `session_search`. `/evolve status|now` shows or runs the curation policy; it never grants permission to rewrite product code, permissions, config, or system prompts. Inspect/consolidate with **`hara memory show`** and **`hara memory distill`**. Chinese-aware lexical search works without setup; semantic search remains opt-in.
-- **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI) with live Markdown + visible reasoning.
+- **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI), with live Markdown answers while provider reasoning stays private.
 - **Delegate to other agents** — the **`external_agent`** tool hands a self-contained task to **Claude Code** or **Codex** running headless, and returns the result — so you pick the best engine per task. It is a trusted extension outside Hara's protected-file boundary: every interactive call requires confirmation, and non-interactive use is disabled by default.
 - **Honest under a slow network** — a live "waiting for the model… Ns" status, a stall watchdog that
   auto-fails-over instead of hanging, terminal-native bracketed paste, big pastes folding to a token, and a
@@ -243,8 +243,9 @@ to attach a file (fuzzy, walks subdirectories).
 
 The interactive REPL is an **ink TUI**: a bordered **input box pinned at the bottom** — session name in
 the top-right corner, approval modes + token usage + concurrency in the bottom border — with the
-conversation scrolling above it. Streaming text, reasoning, tool calls, and colored diffs render as live
-blocks; a spinner runs during a turn. **shift+tab** cycles the approval mode, **Esc** interrupts a running
+conversation scrolling above it. Streaming answers, tool calls, and colored diffs render as live blocks;
+provider reasoning never enters terminal or transcript state, while a typed phase and spinner show that the
+turn is active. **shift+tab** cycles the approval mode, **Esc** interrupts a running
 turn, and tool approvals appear inline (y/N). **Ctrl+V** pastes an image from your clipboard (a screenshot,
 or a copied image) — or drag an image file into the terminal — and it appears as a highlighted `[Image #N]`
 token inline where your cursor is (backspace over it to remove it). hara auto-detects the model's capability —
@@ -311,11 +312,17 @@ vector DB needed, and lexical still works when there's no index. Re-running `har
 only changed files re-embed (a full repo rebuild that takes ~a minute re-runs in well under a second).
 
 **Approval modes**: `suggest` confirms edits & shell · `auto-edit` auto-applies file edits but confirms shell · `full-auto` runs everything.
+Choosing **always for this project** stores only an opaque grant digest in the owner-only
+`~/.hara/project-approvals.json`: Bash binds to the exact command, ordinary file changes bind to
+one exact file, `.tmp/`/`logs/`/`output/` bind to that one directory, and Python explicitly binds to Python
+execution in that project. The grant also binds to the real project directory identity, so deleting and
+recreating a path does not inherit it. Deny rules, protected-file checks, the guardian, Computer Use and
+external MCP/agent confirmations remain stricter and cannot be bypassed by a remembered grant.
 **Protected files and shell sandboxing**: built-in file, search, and context paths hard-reject `.env`/credential/private-key/private-Hara-state files before the ordinary approval/dispatch path can authorize them. Safe templates (`.env.example`, `.env.sample`, `.env.template`) remain readable. `HARA_ALLOW_SENSITIVE_FILES=1` is an explicit one-process exposure switch: it removes these built-in denies and that process's shell protected-read mask. Shell subprocesses receive a scrubbed environment; explicitly retain a named inherited variable with `HARA_SUBPROCESS_ENV_ALLOW=NAME[,NAME]` (output is still redacted). With the protected-file policy enabled, shell preflight rejects literal protected paths and environment-dump commands on every OS. On macOS, Seatbelt also masks existing protected files/directories from the shell and `--sandbox workspace-write|read-only` provides **file-write confinement**. Linux/Windows have no equivalent kernel read mask: static shell preflight is a useful guardrail, not a security sandbox, and arbitrary code can bypass it.
 **Screen control** (opt-in): the `computer` tool drives desktop software (screenshot → click/type), native per OS
 (mac `screencapture`+`cliclick` · Windows PowerShell · Linux `scrot`+`xdotool`). Off by default — enable a tier with
 `hara config set computerUse read|click|full` and allowlist apps with `hara config set computerApps "App, …"`. Guarded
-by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and a once-per-session grant. Screenshots are read via your
+by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and per-action approval. Screenshots are read via your
 vision model into **actionable** output — interactive elements + positions (pass `focus` to target what you're after) — so even a text-only main model can click.
 **Sessions and task execution**: conversations are saved automatically — `-c` / `--resume <id>` or
 `hara resume <id>` to continue, `hara sessions` to list, `hara export [id] [--out file]` to render one as a

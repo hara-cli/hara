@@ -102,6 +102,7 @@ import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
+import { projectApprovalPolicy } from "../security/project-approvals.js";
 import {
   DeskClientError,
   type DeskConnectionsSnapshot,
@@ -904,7 +905,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const port = (wss.address() as { port: number }).port;
 
   const authed = new Set<WebSocket>();
-  const pendingApprovals = new Map<string, (v: boolean | "always") => void>();
+  const pendingApprovals = new Map<string, {
+    finish: (v: boolean | "always") => void;
+    allowAlways: boolean;
+  }>();
   const inFlightRequests = new Set<Promise<void>>();
   const automationRuns = new Map<AbortController, ReturnType<typeof runJobTracked>>();
   // Physical provider/tool work can outlive its logical timeout. Keep a process-level ledger independent
@@ -1142,9 +1146,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       diff: (t) => broadcast("event.diff", { sessionId, text: t }),
       notice: (t) => broadcast("event.notice", { sessionId, text: t }),
     };
-    const confirm = (q: string, signal: AbortSignal = turnAbort.signal): Promise<boolean | "always"> =>
+    const confirm = (
+      q: string,
+      signal: AbortSignal = turnAbort.signal,
+      options: { allowAlways?: boolean } = {},
+    ): Promise<boolean | "always"> =>
       new Promise((resolve) => {
         const approvalId = randomUUID();
+        const allowAlways = options.allowAlways === true;
         let settled = false;
         let timer: ReturnType<typeof setTimeout>;
         const finish = (v: boolean | "always"): void => {
@@ -1164,7 +1173,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         };
         const onAbort = (): void => finish(false);
         timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS); // unanswered → deny, turn continues
-        pendingApprovals.set(approvalId, finish);
+        pendingApprovals.set(approvalId, { finish, allowAlways });
         if (signal.aborted) finish(false);
         else {
           // `signal` composes the owning turn cancellation with runAgent's lifecycle cancellation. Listening
@@ -1176,7 +1185,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             detail: q,
             approval: { id: approvalId, question: q },
           });
-          broadcast("approval.request", { sessionId, approvalId, question: q });
+          broadcast("approval.request", { sessionId, approvalId, question: q, allowAlways });
         }
       });
     let stopTodoEvents = (): void => {};
@@ -1293,6 +1302,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         approval: s.approval,
         confirm,
         autoApprove: s.autoApprove,
+        projectApprovals: projectApprovalPolicy(s.meta.cwd),
         projectContext: s.projectContext,
         memory: memoryDigest(s.meta.cwd),
         continuationSession: s.continuationSession,
@@ -1724,8 +1734,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }
           case "approval.reply": {
             if (typeof p.approvalId !== "string") return reply(rpcError(id, ERR.PARAMS, "approvalId required"));
-            const resolve = pendingApprovals.get(p.approvalId);
-            if (resolve) resolve(p.always === true ? "always" : p.allow === true);
+            const approval = pendingApprovals.get(p.approvalId);
+            if (approval) {
+              approval.finish(p.always === true && approval.allowAlways ? "always" : p.allow === true);
+            }
             return reply(rpcResult(id!, {})); // idempotent — a late/duplicate reply is a no-op
           }
           case "plugins.list": {
@@ -2757,7 +2769,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       authed.delete(ws);
       if (authed.size === 0) {
         // nobody left to answer — deny pending approvals now instead of stalling turns for the timeout
-        for (const resolve of pendingApprovals.values()) resolve(false);
+        for (const approval of pendingApprovals.values()) approval.finish(false);
         pendingApprovals.clear();
       }
     });
@@ -2776,7 +2788,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         }
       });
 
-      for (const resolve of pendingApprovals.values()) resolve(false);
+      for (const approval of pendingApprovals.values()) approval.finish(false);
       pendingApprovals.clear();
       const ownedAutomationRuns = [...automationRuns.entries()];
       for (const [controller] of ownedAutomationRuns) {

@@ -249,6 +249,7 @@ test("external_agent is marked outside the file boundary and defaults closed wit
 test("external trust boundary still confirms every action in full-auto and ignores session auto-approval", async () => {
   let runs = 0;
   let confirms = 0;
+  const promptOptions = [];
   const external = {
     name: "fake_external",
     description: "opaque host extension",
@@ -268,8 +269,9 @@ test("external trust boundary still confirms every action in full-auto and ignor
     ]),
     ctx: { cwd: process.cwd(), ask: async () => "yes" },
     approval: "full-auto",
-    confirm: async () => {
+    confirm: async (_question, _signal, options) => {
       confirms++;
+      promptOptions.push(options);
       return "always";
     },
     autoApprove: new Set(["fake_external"]),
@@ -278,6 +280,7 @@ test("external trust boundary still confirms every action in full-auto and ignor
     hooks: false,
   });
   assert.equal(confirms, 2, "each opaque call needs fresh human confirmation even in full-auto");
+  assert.deepEqual(promptOptions, [{ allowAlways: false }, { allowAlways: false }]);
   assert.equal(runs, 2);
 });
 

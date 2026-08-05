@@ -258,10 +258,10 @@ test("App shows a tool-approval confirm and resolves on 'y'", async () => {
   }
 });
 
-test("App confirm is a selectable list: ↓ then Enter picks 'don't ask again' → always", async () => {
+test("App confirm is a selectable list: ↓ then Enter picks the project-scope grant", async () => {
   let reply = null;
   const onSubmit = async (line, h) => {
-    reply = await h.confirm("⚠ bash rm -rf build — run?");
+    reply = await h.confirm("⚠ bash rm -rf build — run?", undefined, { allowAlways: true });
   };
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
@@ -277,13 +277,37 @@ test("App confirm is a selectable list: ↓ then Enter picks 'don't ask again' �
     stdin.write("\x1b[B"); // ↓
     await waitUntil(
       () => strip(lastFrame()).includes("❯ 2."),
-      "Down did not select the don't-ask-again option",
+      "Down did not select the project-scope option",
     );
     stdin.write("\r"); // Enter
     await waitUntil(
       () => reply === "always",
-      "selected don't-ask-again option did not resolve",
+      "selected project-scope option did not resolve",
     );
+  } finally {
+    unmount();
+  }
+});
+
+test("App confirmation omits the project grant for one-shot-only actions", async () => {
+  let reply = null;
+  const onSubmit = async (line, h) => {
+    reply = await h.confirm("external action — run?", undefined, { allowAlways: false });
+  };
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
+  );
+  try {
+    stdin.write("run external");
+    await waitUntil(() => strip(lastFrame()).includes("run external"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(
+      () => strip(lastFrame()).includes("external action — run?"),
+      "one-shot confirmation did not mount",
+    );
+    assert.doesNotMatch(strip(lastFrame()), /always for this project/i);
+    stdin.write("n");
+    await waitUntil(() => reply === false, "one-shot confirmation did not resolve");
   } finally {
     unmount();
   }

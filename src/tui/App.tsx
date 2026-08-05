@@ -71,7 +71,11 @@ export interface Sink {
 }
 export interface Helpers {
   sink: Sink;
-  confirm: (q: string, signal?: AbortSignal) => Promise<boolean | "always">;
+  confirm: (
+    q: string,
+    signal?: AbortSignal,
+    options?: { allowAlways?: boolean },
+  ) => Promise<boolean | "always">;
   select: (title: string, options: { label: string; value: string }[]) => Promise<string>;
   /** ask_user: pose a question (optionally with likely answers) and resolve to the user's answer (chosen
    *  option or free text). Routes through the same prompt/input channel as confirm/select. */
@@ -844,10 +848,16 @@ export function App({
             abortTurnOnEscape,
           });
         });
-      const confirmFn = (q: string, signal: AbortSignal = ctrl.signal): Promise<boolean | "always"> =>
+      const confirmFn = (
+        q: string,
+        signal: AbortSignal = ctrl.signal,
+        options: { allowAlways?: boolean } = {},
+      ): Promise<boolean | "always"> =>
         openPrompt<boolean | "always">(q, [
           { label: "Yes", value: true, key: "y" },
-          { label: "Yes, and don't ask again this session", value: "always", key: "a" },
+          ...(options.allowAlways === true
+            ? [{ label: "Yes, always for this project scope", value: "always" as const, key: "a" }]
+            : []),
           { label: "No  (esc)", value: false, key: "n" },
         ], signal, true);
       const selectFn = (title: string, options: { label: string; value: string }[]): Promise<string> => openPrompt(title, options);

@@ -50,7 +50,7 @@ export interface ServeSession {
   task?: TaskExecution;
   provider: Provider;
   approval: ApprovalMode;
-  autoApprove: Set<string>; // "don't ask again" tool names, session-scoped (runAgent mutates it)
+  autoApprove: Set<string>; // opaque project-scope grants accepted while this session is attached
   stats: { input: number; output: number; lastInput?: number };
   projectContext?: string;
   /** This live attachment came from persisted history (resume/fork), not a fresh empty session. */

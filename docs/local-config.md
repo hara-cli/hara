@@ -20,6 +20,12 @@ provider is required; everything else has a sane default.
 - **Semantic search / vectors** — see below: `embedProvider` (`off` \| `ollama` \| `qwen` \| `openai`) + `embedModel` / `embedBaseURL` / `embedApiKey`.
 - **B-end fleet**: `hara enroll <gateway> --code <code>` → device token in `~/.hara/org.json` (0600); sets `provider=hara-gateway`.
 - **Behavior**: `approval` · `sandbox` · `theme` · `evolve` · `assetCapture` · `computerUse`/`computerApps` · `hooks` · `notify` · `vimMode` · `mcpServers` · `HARA_MAX_CONCURRENCY` (parallel sub-agent/read cap, default 8).
+- **Remembered project approvals**: choosing **always for this project** writes an opaque, owner-only grant
+  to `~/.hara/project-approvals.json`. Grants bind to the canonical project directory identity and a narrow
+  operation scope; the file never stores command text, Python source, file contents, or credentials. Bash is
+  exact-command scoped, ordinary edits are exact-file scoped, `.tmp`/`logs`/`output` edits are directory
+  scoped, and Python is an explicitly labelled project-wide execution scope. Computer Use and external
+  extensions remain one-shot approvals; protected-file, deny and guardian checks always run first.
 - **Local Agent capability roadmap**: calendar, semantic desktop automation, platform permissions,
   and the Desktop capability broker are defined in
   [`local-agent-capabilities.md`](local-agent-capabilities.md).
