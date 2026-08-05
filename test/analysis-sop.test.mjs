@@ -60,6 +60,30 @@ test("system prompt edits existing documents in place without durable helper scr
   assert.match(system, /remove it in finally\/on failure/);
 });
 
+test("system prompt keeps internal orchestration out of user-visible progress", async () => {
+  let system = "";
+  const provider = {
+    id: "f",
+    model: "f",
+    async turn(args) {
+      system = args.system;
+      return { text: "ok", toolUses: [], stop: "end" };
+    },
+  };
+  await runAgent([{ role: "user", content: "run a long task" }], {
+    provider,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+  });
+  assert.match(system, /Never narrate private chain-of-thought/);
+  assert.match(system, /task_intake, todo_write,[\s\S]*tool_search, and system-reminder/);
+  assert.match(system, /major stage starts or[\s\S]*finishes/);
+  assert.match(system, /Ordinary tool calls,[\s\S]*belong in the execution log, not in chat/);
+  assert.match(system, /verified results, remaining blockers/);
+});
+
 test("a resumed session treats persisted history as context instead of rediscovering the workspace", async () => {
   const systems = [];
   const provider = {

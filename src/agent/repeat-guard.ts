@@ -125,7 +125,7 @@ export function failureIdentity(
     key: keyOf(name, input),
     label: `${name} call`,
     semantic: false,
-    hardStopAfter: 3,
+    hardStopAfter: 2,
     kind: "exact",
   };
 }

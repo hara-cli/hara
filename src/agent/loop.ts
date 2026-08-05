@@ -109,6 +109,12 @@ grep/glob; don't read whole large files when a targeted search answers the quest
 grep to locate then read_file just that region with offset/limit — not the whole file. After a successful
 edit_file/write_file do NOT re-read the file to verify — the tool already applied and diffed the change;
 re-reading a big file after every edit is the slowest habit an agent can have.
+Keep user-visible progress outcome-focused. Never narrate private chain-of-thought, internal task analysis,
+tool-selection reasoning, full retry decision trees, or orchestration names such as task_intake, todo_write,
+tool_search, and system-reminder. For long work, give one short update only when a major stage starts or
+finishes, when progress is blocked or needs user action, and when the task completes. Ordinary tool calls,
+one bounded retry, and internal plan changes belong in the execution log, not in chat. The final answer should
+state verified results, remaining blockers, and the next required action without replaying the execution history.
 When editing an existing user artifact, including a DOCX, keep its original path as the canonical output
 and replace it in place by default. Do not invent suffix copies such as "完整版", "简版", or "new" unless
 the user explicitly asks to save a separate version. For one-shot Python library work such as python-docx,
@@ -349,7 +355,7 @@ export interface RunLimitEvent {
 }
 
 const RUN_STOPPED = Symbol("agent-run-stopped");
-const REPEATED_FAILURE_LIMIT = 3;
+const REPEATED_FAILURE_LIMIT = 2;
 
 interface RunLifecycle {
   signal: AbortSignal;

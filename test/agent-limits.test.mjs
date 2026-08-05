@@ -92,7 +92,7 @@ test("an active tool loop hard-stops at maxRounds and alerts exactly once", asyn
   assert.equal(notices.filter((message) => /agent run stopped/.test(message)).length, 1);
 });
 
-test("three identical failed tool calls trip the repeat-loop circuit breaker", async () => {
+test("one retry of an identical failed tool call trips the repeat-loop circuit breaker", async () => {
   let turns = 0;
   const provider = {
     id: "repeat",
@@ -115,10 +115,10 @@ test("three identical failed tool calls trip the repeat-loop circuit breaker", a
       async run() { return "Error: deterministic failure"; },
     }],
   }));
-  assert.equal(turns, 3);
+  assert.equal(turns, 2);
   assert.equal(outcome.status, "halted");
   assert.equal(outcome.stopReason, "repeat_loop");
-  assert.match(outcome.error, /same failing always_fails call repeated 3 times/);
+  assert.match(outcome.error, /same failing always_fails call repeated 2 times/);
   assert.equal(history.at(-1).role, "tool", "the last assistant tool_use remains protocol-complete");
 });
 
@@ -247,7 +247,7 @@ test("a batched empty-recall burst executes only three serial searches", async (
 
 test("a changed failure or successful call clears an older repeated-failure streak", async () => {
   let turn = 0;
-  const sequence = ["fail", "fail", "other-fail", "fail", "fail", "progress", "fail", "fail", "done"];
+  const sequence = ["fail", "other-fail", "fail", "progress", "fail", "other-fail", "fail", "done"];
   const provider = {
     id: "recovering-repeat",
     model: "recovering-repeat",
@@ -290,7 +290,7 @@ test("a changed failure or successful call clears an older repeated-failure stre
   assert.equal(turn, sequence.length, "the old failures do not combine with failures after progress");
 });
 
-test("three repeated unknown or denied calls are failures and trip the breaker", async (t) => {
+test("one retry of unknown or denied calls is enough to trip the breaker", async (t) => {
   for (const scenario of [
     { name: "unknown", toolName: "missing_tool" },
     { name: "denied", toolName: "denied_tool" },
@@ -324,9 +324,9 @@ test("three repeated unknown or denied calls are failures and trip the breaker",
           : {}),
       };
       const outcome = await runAgent([{ role: "user", content: scenario.name }], base(provider, opts));
-      assert.equal(turns, 3);
+      assert.equal(turns, 2);
       assert.equal(outcome.stopReason, "repeat_loop");
-      assert.match(outcome.error, new RegExp(`same failing ${scenario.toolName} call repeated 3 times`));
+      assert.match(outcome.error, new RegExp(`same failing ${scenario.toolName} call repeated 2 times`));
     });
   }
 });
