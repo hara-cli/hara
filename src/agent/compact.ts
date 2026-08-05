@@ -11,6 +11,16 @@ export const AUTO_COMPACT_PCT = 85;
  *  regardless of how large the window is. Overridable via `HARA_AUTO_COMPACT_TOKENS`. */
 export const AUTO_COMPACT_TOKEN_CAP = 200_000;
 
+/** Parse the optional absolute trigger without letting NaN, infinity, zero, or a negative value turn
+ * every ordinary conversation into a compaction request. */
+export function autoCompactTokenCap(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  const integer = Math.floor(parsed);
+  return Number.isFinite(parsed) && integer >= 1
+    ? integer
+    : AUTO_COMPACT_TOKEN_CAP;
+}
+
 import type { NeutralMsg } from "../providers/types.js";
 import { historyChars, prepareHistoryForModel } from "./context-budget.js";
 

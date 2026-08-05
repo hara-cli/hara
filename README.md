@@ -363,7 +363,7 @@ a brief revision cannot share its round with a side effect. `/task` shows the cu
 64-round model/tool cap. Time spent waiting for an engine-owned question or approval does not consume that
 budget; the status row says the task timer is paused, while Esc, shutdown, and explicit cancellation still
 take effect immediately. Answering resumes the remaining budget rather than resetting it. Hara warns after
-five active minutes or at 75% of the round budget, stops the third identical failing tool call, and surfaces
+five active minutes or at 75% of the round budget, stops after one unchanged retry of an identical failing tool call, and surfaces
 the final reason in CLI, Desktop, or gateway output. Tune intentional long work with
 `hara config set runTimeoutMs 45m` (1s..2h) and `hara config set maxAgentRounds 96` (1..256), or
 `HARA_RUN_TIMEOUT_MS` / `HARA_MAX_AGENT_ROUNDS`; neither boundary can be disabled. Sub-agents are capped at
@@ -452,7 +452,7 @@ dangerous ones unless `-y`. Read-only tools run in parallel within a turn, and e
 **colored diff** of what changed. Shell output streams live; press **Esc** to interrupt a running
 turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review`**, and **`/commit`** close the change → review → commit loop without leaving the prompt.
 - **Explicit live steering vs next-task queue**: keep typing while hara works and press Enter to fold a clarification into the next model call; use `/next <message>` to queue a separate task behind the live one. Accepted Desktop steering is persisted before ACK; **Esc** drops the local queue and stops.
-- **Bounded context + checkpoint compaction**: each provider call receives a non-destructive budgeted snapshot (old tool payloads/images cannot monopolize context). Overflow retries once with a tighter snapshot; `/compact` creates a structured execution checkpoint and retains the latest three user-turn groups plus current touched-file content.
+- **Bounded context + checkpoint compaction**: each provider call receives a non-destructive budgeted snapshot (old tool payloads/images cannot monopolize context). Overflow retries once with a tighter snapshot; `/compact` creates a structured execution checkpoint and retains the latest three user-turn groups plus current touched-file content. Auto-compaction is on by default for terminal, headless resumed sessions, and Desktop/Serve after a completed turn reaches either 85% of its model window or the bounded absolute token cap; `hara config set autoCompact false` opts out without removing manual compaction.
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
 - **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. `@<dir>` loads a directory listing, `@src/`+Tab drills into a folder, and mistyped tool/file paths get a "did you mean" suggestion.
 - **Explicit workspace boundary**: launching at Home does not inventory its directories or permit coding mutations. Start Hara from a concrete project, or pass `hara --cwd /path/to/project`, to enable search, `@` completion, shell/external agents, and file edits; explicitly named single-file reads remain available at Home.

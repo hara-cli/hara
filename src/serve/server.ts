@@ -26,12 +26,15 @@ import "../tools/all.js"; // register the full built-in toolset — serve must w
 import { runAgent, type RunOpts } from "../agent/loop.js";
 import {
   COMPACT_SYSTEM,
+  autoCompactTokenCap,
   buildFileRestore,
   compactedConversationHistory,
   compactedHistoryTokenEstimate,
   compactionSourceHistory,
   normalizeCompactionSummary,
   recentHistoryForCompaction,
+  shouldAutoCompact,
+  shouldAutoCompactTokens,
   workingSetFromSummary,
 } from "../agent/compact.js";
 import { rewindTo } from "../agent/rewind.js";
@@ -150,6 +153,9 @@ export interface ServeDeps {
   buildProviderFor?: (model: string, effort?: string, cwd?: string, profileId?: string) => Promise<Provider | null>;
   /** live model list from the endpoint (may be empty — not every endpoint enumerates) */
   listModels?: (cwd?: string, profileId?: string) => Promise<string[]>;
+  /** Live per-project context policy. Production re-reads config for every completed turn; embedders that
+   * omit it retain manual-only `session.compact` behavior. */
+  autoCompact?: (cwd?: string) => { enabled: boolean; tokenCap?: number };
   /** Normalize image input for the session's pinned model: keep native images or translate them
    * through a configured vision sidecar. The callback is identity-aware and must never reroute profiles. */
   prepareImages?: (
@@ -231,6 +237,33 @@ export interface ServeDeps {
   discoveryHome?: string; // tests: isolate the discovery file from the real home directory
   artifactHome?: string; // tests/embedders: isolate ~/.hara/artifacts from the real home directory
   compactTimeoutMs?: number; // tests/embedders: bound a provider that ignores cancellation
+}
+
+export interface ServeAutoCompactDecision {
+  compact: boolean;
+  pct: number;
+  tokenCap: number;
+}
+
+/** Shared, deterministic trigger for Desktop/Serve auto-compaction. Keep it separate from the provider
+ * call so configuration corruption cannot turn every short conversation into a summarization request. */
+export function serveAutoCompactDecision(
+  model: string,
+  lastInput: number,
+  historyLength: number,
+  policy: { enabled: boolean; tokenCap?: number } | undefined,
+): ServeAutoCompactDecision {
+  const safeLastInput = Number.isFinite(lastInput) ? Math.max(0, Math.floor(lastInput)) : 0;
+  const tokenCap = autoCompactTokenCap(policy?.tokenCap);
+  const enabled = policy?.enabled === true;
+  const pct = ctxPctFor(model, safeLastInput);
+  return {
+    compact:
+      shouldAutoCompact(pct, historyLength, enabled)
+      || shouldAutoCompactTokens(safeLastInput, historyLength, enabled, tokenCap),
+    pct,
+    tokenCap,
+  };
 }
 
 export interface ProviderSettingsCatalogEntry {
@@ -1341,11 +1374,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       s.task = finishTaskExecution(s.task, outcome, s.meta.todos, turnAbort.signal.aborted);
       hub.save(s);
       emitTaskState({ phase: "finished" }, s.meta.todos);
-      const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
-      // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
-      // clients render a meter without an extra round-trip.
-      const ctx = ctxOf(s);
       if (outcome.status !== "completed") {
+        const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
+        // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
+        // clients render a meter without an extra round-trip.
+        const ctx = ctxOf(s);
         const failure = outcome.error ?? (outcome.status === "empty"
           ? "the model returned an empty response after retrying"
           : outcome.status === "halted"
@@ -1382,6 +1415,38 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       // A persistent session may already contain many assistant messages. Only messages appended by THIS
       // request are eligible for its reply; a failed/empty turn must never replay a previous success.
       const reply = lastAssistantText(s.history.slice(historyStart));
+      // CLI turns already auto-compact after a successful response. Serve used to expose only the manual
+      // RPC, so Desktop conversations kept resending a large transcript until a person noticed the meter.
+      // Capture the reply first, then compact under the same session lease. Failure is best-effort and never
+      // turns a verified task result into an RPC error; compactSession mutates history only after success.
+      try {
+        const decision = serveAutoCompactDecision(
+          s.meta.model,
+          s.stats.lastInput ?? 0,
+          s.history.length,
+          deps.autoCompact?.(s.meta.cwd),
+        );
+        if (decision.compact && !turnAbort.signal.aborted) {
+          broadcast("event.notice", {
+            sessionId,
+            text: `✻ Auto-compacting conversation (context ${decision.pct}% full, ~${Math.round((s.stats.lastInput ?? 0) / 1000)}k tok)…`,
+          });
+          const summary = await compactSession(s, turnAbort);
+          broadcast("event.notice", {
+            sessionId,
+            text: summary
+              ? `(auto-compacted — context replaced with a summary; ${s.meta.workingSet?.length ?? 0} notes kept)`
+              : "(auto-compact failed — conversation was kept; use Compact or start a new conversation)",
+          });
+        }
+      } catch {
+        broadcast("event.notice", {
+          sessionId,
+          text: "(auto-compact failed — conversation was kept; use Compact or start a new conversation)",
+        });
+      }
+      const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
+      const ctx = ctxOf(s);
       broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply, usage, ctx });
       return { reply, usage, ctx, taskId: s.task!.id, turnId: s.task!.turnId };
     } catch (error) {
@@ -1453,6 +1518,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         (error) => finish(() => reject(error)),
       );
     });
+    // Count a physically completed summarizer request even when it returned an error and the original
+    // history remains in place. Keep lastInput unchanged until replacement succeeds.
+    s.stats.input += r.usage?.input ?? 0;
+    s.stats.output += r.usage?.output ?? 0;
     if (controller.signal.aborted || r.stop === "error") return null;
     const rawSummary = r.text.trim();
     if (!rawSummary) return null;
@@ -1475,8 +1544,6 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const compacted = compactedConversationHistory(summary, recent, restore);
     s.history.length = 0;
     s.history.push(...compacted);
-    s.stats.input += r.usage?.input ?? 0;
-    s.stats.output += r.usage?.output ?? 0;
     s.stats.lastInput = compactedHistoryTokenEstimate(compacted);
     hub.save(s);
     return summary;

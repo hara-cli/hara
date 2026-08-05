@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
-import { historyForClient, startServe } from "../dist/serve/server.js";
+import { historyForClient, serveAutoCompactDecision, startServe } from "../dist/serve/server.js";
 import { addJob, cronDir, findJob, loadJobs, removeJob, saveJobs } from "../dist/cron/store.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
@@ -26,6 +26,18 @@ test("serve client history hides internal steering triage wrappers", () => {
     { role: "user", text: "only the user's refinement" },
     { role: "assistant", text: "done" },
   ]);
+});
+
+test("serve auto-compaction policy is opt-in for embedders and rejects unsafe caps", () => {
+  assert.equal(serveAutoCompactDecision("fake-1", 75, 4, undefined).compact, false);
+  assert.equal(serveAutoCompactDecision("fake-1", 75, 3, { enabled: true, tokenCap: 50 }).compact, false);
+  assert.equal(serveAutoCompactDecision("fake-1", 75, 4, { enabled: true, tokenCap: 50 }).compact, true);
+  assert.equal(serveAutoCompactDecision("fake-1", 75, 4, { enabled: false, tokenCap: 50 }).compact, false);
+  assert.equal(
+    serveAutoCompactDecision("fake-1", 75, 4, { enabled: true, tokenCap: Number.NaN }).compact,
+    false,
+    "a corrupt cap falls back to the production default instead of compacting every turn",
+  );
 });
 
 /** Tiny JSON-RPC-over-ws test client: request/response correlation + notification capture. */
@@ -2556,6 +2568,69 @@ test("serve e2e: compaction has a hard timeout and close retains its lock until 
       await srv.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+});
+
+test("serve automatically compacts a completed Desktop turn without replacing its reply", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-auto-compact-"));
+  const store = memStore();
+  let calls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText, tools }) {
+      calls += 1;
+      if (calls === 1 || calls === 2 || calls === 4) {
+        const text = `answer-${calls}`;
+        onText?.(text);
+        return { text, toolUses: [], stop: "end", usage: { input: 75, output: 2 } };
+      }
+      assert.deepEqual(tools, [], "compaction is a no-tool provider turn");
+      if (calls === 5) {
+        return { text: "", toolUses: [], stop: "error", errorMsg: "summarizer unavailable", usage: { input: 10, output: 0 } };
+      }
+      return { text: "verified work is complete; continue with the latest request", toolUses: [], stop: "end", usage: { input: 15, output: 5 } };
+    },
+  };
+  const deps = {
+    ...baseDeps(provider, store),
+    autoCompact: () => ({ enabled: true, tokenCap: 50 }),
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const sid = (await c.call("session.create", {})).result.sessionId;
+    const first = await c.call("session.send", { sessionId: sid, text: "one" });
+    assert.equal(first.result.reply, "answer-1");
+    assert.equal(calls, 1, "a two-message history is too small to compact");
+
+    const second = await c.call("session.send", { sessionId: sid, text: "two" });
+    assert.equal(second.result.reply, "answer-2", "the user receives the completed turn, never the summary text");
+    assert.equal(calls, 3, "the second completed turn triggered exactly one bounded compaction call");
+    assert.equal(second.result.usage.input, 90, "internal compaction usage remains visible in turn accounting");
+    assert.ok(store.saved.get(sid).history[0].content.startsWith("Execution checkpoint"));
+    const notices = c.events.filter((event) => event.method === "event.notice").map((event) => event.params.text);
+    assert.ok(notices.some((text) => text.includes("Auto-compacting conversation")));
+    assert.ok(notices.some((text) => text.includes("auto-compacted")));
+    const turnEnds = c.events.filter((event) => event.method === "event.turn_end");
+    assert.equal(turnEnds.at(-1).params.reply, "answer-2");
+
+    const third = await c.call("session.send", { sessionId: sid, text: "three" });
+    assert.equal(third.result.reply, "answer-4", "a failed automatic summary never fails the completed task reply");
+    assert.equal(calls, 5, "the failed summarizer is attempted once without recursively retrying");
+    assert.equal(third.result.usage.input, 85, "a provider-reported failed summarizer request is still accounted");
+    assert.ok(store.saved.get(sid).history.some((message) => message.content === "three"));
+    assert.ok(
+      c.events
+        .filter((event) => event.method === "event.notice")
+        .some((event) => event.params.text.includes("auto-compact failed")),
+      "the original history is kept and the recovery action is visible",
+    );
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

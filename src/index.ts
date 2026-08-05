@@ -103,7 +103,7 @@ import { routingProvider } from "./agent/route.js";
 import {
   shouldAutoCompact,
   shouldAutoCompactTokens,
-  AUTO_COMPACT_TOKEN_CAP,
+  autoCompactTokenCap,
   COMPACT_SYSTEM,
   buildFileRestore,
   compactedConversationHistory,
@@ -1656,6 +1656,10 @@ async function compactConversation(
     tools: [],
     onText: () => {},
   }, { timeoutMs: 60_000, label: "conversation compaction", signal, onProviderTurn });
+  // A provider may report billable usage with an error/aborted result. Account for the physical request
+  // exactly once even when the original history must remain authoritative.
+  stats.input += r.usage?.input ?? 0;
+  stats.output += r.usage?.output ?? 0;
   if (signal?.aborted || r.stop === "error") return null;
   const rawSummary = r.text.trim();
   if (!rawSummary) return null;
@@ -1677,8 +1681,6 @@ async function compactConversation(
   const compacted = compactedConversationHistory(summary, recent, restore);
   history.length = 0;
   history.push(...compacted);
-  stats.input += r.usage?.input ?? 0;
-  stats.output += r.usage?.output ?? 0;
   stats.lastInput = compactedHistoryTokenEstimate(compacted); // reflect replacement, not the large summarizer request
   saveSession(meta, history, task);
   return summary;
@@ -1703,7 +1705,7 @@ async function maybeAutoCompact(
   const pct = bar.ctxPctFor(cfg.model, lastInput);
   // Two triggers, whichever hits first: % of window (small-window models) OR an absolute token cap
   // (huge-window models, where 85% is an unreachable 850k). Cap is overridable via env.
-  const cap = Number(process.env.HARA_AUTO_COMPACT_TOKENS) || AUTO_COMPACT_TOKEN_CAP;
+  const cap = autoCompactTokenCap(process.env.HARA_AUTO_COMPACT_TOKENS);
   const overPct = shouldAutoCompact(pct, history.length, cfg.autoCompact);
   const overCap = shouldAutoCompactTokens(lastInput, history.length, cfg.autoCompact, cap);
   if (!overPct && !overCap) return false;
@@ -3149,6 +3151,13 @@ program
             ...(profile.kind === "gateway" && profile.availableModels?.length
               ? { availableModels: [...profile.availableModels] }
               : {}),
+          };
+        },
+        autoCompact: (targetCwd) => {
+          const live = loadConfig({ cwd: targetCwd ?? cwd });
+          return {
+            enabled: live.autoCompact,
+            tokenCap: autoCompactTokenCap(process.env.HARA_AUTO_COMPACT_TOKENS),
           };
         },
         runLimits: (targetCwd) => agentRunLimits(loadConfig({ cwd: targetCwd ?? cwd })),
