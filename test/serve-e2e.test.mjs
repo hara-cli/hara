@@ -1536,7 +1536,9 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       gatewayUrl: "https://control.example.com",
       gatewayHost: "control.example.com",
       model: "deepseek-chat",
-      accessState: "valid",
+      availableModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
+      tokenNeverExpires: true,
+      accessState: "permanent",
     }],
   };
   const deps = {
@@ -1649,6 +1651,9 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
 
     const organizations = await c.call("settings.organizations.list", {});
     assert.equal(organizations.result.connections[0].gatewayHost, "control.example.com");
+    assert.deepEqual(organizations.result.connections[0].availableModels, ["deepseek-v4-flash", "deepseek-v4-pro"]);
+    assert.equal(organizations.result.connections[0].tokenNeverExpires, true);
+    assert.equal(organizations.result.connections[0].accessState, "permanent");
     assert.equal(JSON.stringify(organizations.result).includes("org-device-secret-must-not-leak"), false);
 
     const enrollmentCode = "single-use-code-must-not-leak";

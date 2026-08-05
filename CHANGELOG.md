@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.139.1 — 2026-08-05 — honest permanent access and managed model discovery
+
+- Expose each enrolled organization's authorized model catalog through the authenticated, redacted
+  Serve settings protocol. Desktop can now offer the models granted by Hara Control even while the
+  open conversation remains pinned to a different personal or organization connection.
+- Distinguish an explicit no-date-expiry policy from a legacy Control server that omitted expiry
+  metadata. Enrollment and heartbeat updates preserve that distinction without weakening revocation,
+  model authorization, or quota enforcement.
+- Keep existing conversations pinned to their original provider identity. Switching an organization
+  changes only the route for a newly created conversation; history is never migrated implicitly.
+- Upgrade with `npm i -g @nanhara/hara@0.139.1`.
+
 ## 0.139.0 — 2026-08-05 — verified Office artifact delivery
 
 - Add authenticated `artifact.validate` support that binds an integrity report to the exact current

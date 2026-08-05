@@ -545,8 +545,9 @@ function providerSettingsSnapshot(targetCwd: string) {
   };
 }
 
-function organizationAccessState(profile: Profile, now = Date.now()): "valid" | "expiring" | "expired" | "legacy" | "invalid" {
+function organizationAccessState(profile: Profile, now = Date.now()): "valid" | "permanent" | "expiring" | "expired" | "legacy" | "invalid" {
   if (!profile.deviceToken || !profile.gatewayUrl) return "invalid";
+  if (profile.tokenNeverExpires) return "permanent";
   if (!profile.tokenExpiresAt) return "legacy";
   const expiry = Date.parse(profile.tokenExpiresAt);
   if (!Number.isFinite(expiry)) return "invalid";
@@ -575,8 +576,10 @@ function organizationConnectionsSnapshot(targetCwd: string) {
         active: profile.id === resolution.id,
         ...endpoint,
         model: effectiveModel(profile) || "",
+        ...(profile.availableModels?.length ? { availableModels: [...profile.availableModels] } : {}),
         ...(profile.enrolledAt ? { enrolledAt: profile.enrolledAt } : {}),
         ...(profile.tokenExpiresAt ? { expiresAt: profile.tokenExpiresAt } : {}),
+        ...(profile.tokenNeverExpires ? { tokenNeverExpires: true } : {}),
         accessState: organizationAccessState(profile),
       };
     });

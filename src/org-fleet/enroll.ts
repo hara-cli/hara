@@ -6,10 +6,10 @@
 //
 // Protocol (what `hara-control` implements on the other end):
 //   POST {gateway}/v1/enroll      {code, device:{name,os,hara_version}} -> {device_token,
-//     device_id, model, available_models?, thinking_efforts?, base_url?, expires_at?,
+//     device_id, model, available_models?, thinking_efforts?, base_url?, expires_at? (null = no fixed expiry),
 //     desk?:{url,agent_id,owner,token}}
 //   POST {gateway}/v1/heartbeat   Bearer <device_token> {device_id, name, os, hara_version}
-//     -> 200 {model, available_models?, thinking_efforts?, expires_at?} or legacy 204
+//     -> 200 {model, available_models?, thinking_efforts?, expires_at? (null = no fixed expiry)} or legacy 204
 //   GET  {gateway}/v1/roles       Bearer <device_token> -> {version, org_policy, roles:[…]}  (B3 digital-employee push-down)
 //   POST {gateway}/v1/chat/completions  (OpenAI-compatible; the normal agent traffic, Bearer <device_token>)
 import { homedir, hostname, platform } from "node:os";
@@ -53,6 +53,8 @@ export interface Enrollment {
   enrolledAt: string;
   /** Device-token expiry shared by Hara Control and the model gateway. Missing on legacy servers. */
   expiresAt?: string;
+  /** Explicit null expiry advertised by modern Control: no fixed date expiry, still revocable. */
+  tokenNeverExpires?: boolean;
   /** Optional separately scoped Desk credential provisioned by Control during the same enrollment.
    * It is consumed into desk-connections.json and is never persisted in the gateway profile. */
   desk?: DeskCreds;
@@ -158,6 +160,7 @@ export function loadEnrollment(): Enrollment | null {
         baseURL: ap.baseURL,
         enrolledAt: ap.enrolledAt || new Date().toISOString(),
         expiresAt: ap.tokenExpiresAt,
+        tokenNeverExpires: ap.tokenNeverExpires,
       };
     }
   } catch {
@@ -278,13 +281,18 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     "thinking_efforts",
     { maxItems: THINKING_EFFORTS.size, maxLength: 16, allowed: THINKING_EFFORTS },
   ) ?? inferredGatewayThinkingEfforts(rawModel);
-  const rawExpiresAt = j.expires_at ?? j.expiresAt;
+  const hasExpiry = Object.hasOwn(j, "expires_at") || Object.hasOwn(j, "expiresAt");
+  const rawExpiresAt = Object.hasOwn(j, "expires_at") ? j.expires_at : j.expiresAt;
   let expiresAt: string | undefined;
+  let tokenNeverExpires: boolean | undefined;
   if (rawExpiresAt !== undefined && rawExpiresAt !== null) {
     if (typeof rawExpiresAt !== "string" || !Number.isFinite(Date.parse(rawExpiresAt))) {
       throw new Error("enroll response contains an invalid expires_at");
     }
     expiresAt = new Date(rawExpiresAt).toISOString();
+    tokenNeverExpires = false;
+  } else if (hasExpiry && rawExpiresAt === null) {
+    tokenNeverExpires = true;
   }
   return {
     gatewayUrl: normalizeGatewayUrl(gatewayUrl),
@@ -296,6 +304,7 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     baseURL: normalizeGatewayBaseUrl(j.base_url ?? j.baseURL),
     enrolledAt: now,
     expiresAt,
+    tokenNeverExpires,
     desk: parseDeskBinding(j.desk ?? j.desk_binding ?? j.deskBinding),
   };
 }
@@ -385,6 +394,7 @@ export function gatewayProfileFromEnrollment(id: string, label: string | undefin
     thinkingEfforts: e.thinkingEfforts,
     enrolledAt: e.enrolledAt,
     tokenExpiresAt: e.expiresAt,
+    tokenNeverExpires: e.tokenNeverExpires,
   };
 }
 
@@ -452,6 +462,7 @@ export function enrollmentFromProfile(profile: Profile): Enrollment | null {
     baseURL: profile.baseURL,
     enrolledAt: profile.enrolledAt || new Date(0).toISOString(),
     expiresAt: profile.tokenExpiresAt,
+    tokenNeverExpires: profile.tokenNeverExpires,
   };
 }
 
@@ -477,13 +488,19 @@ function updatedEnrollmentFromHeartbeat(e: Enrollment, body: Record<string, unkn
     "thinking_efforts",
     { maxItems: THINKING_EFFORTS.size, maxLength: 16, allowed: THINKING_EFFORTS },
   );
-  const rawExpiresAt = body.expires_at ?? body.expiresAt;
+  const hasExpiry = Object.hasOwn(body, "expires_at") || Object.hasOwn(body, "expiresAt");
+  const rawExpiresAt = Object.hasOwn(body, "expires_at") ? body.expires_at : body.expiresAt;
   let expiresAt = e.expiresAt;
+  let tokenNeverExpires = e.tokenNeverExpires;
   if (rawExpiresAt !== undefined && rawExpiresAt !== null) {
     if (typeof rawExpiresAt !== "string" || !Number.isFinite(Date.parse(rawExpiresAt))) {
       throw new Error("heartbeat response contains an invalid expires_at");
     }
     expiresAt = new Date(rawExpiresAt).toISOString();
+    tokenNeverExpires = false;
+  } else if (hasExpiry && rawExpiresAt === null) {
+    expiresAt = undefined;
+    tokenNeverExpires = true;
   }
   return {
     ...e,
@@ -491,6 +508,7 @@ function updatedEnrollmentFromHeartbeat(e: Enrollment, body: Record<string, unkn
     availableModels,
     thinkingEfforts: advertisedEfforts ?? e.thinkingEfforts ?? inferredGatewayThinkingEfforts(model),
     expiresAt,
+    tokenNeverExpires,
   };
 }
 
@@ -516,6 +534,7 @@ function persistHeartbeatCatalog(e: Enrollment, persistence: HeartbeatPersistenc
     availableModels: e.availableModels,
     thinkingEfforts: e.thinkingEfforts,
     tokenExpiresAt: e.expiresAt,
+    tokenNeverExpires: e.tokenNeverExpires,
   });
 }
 

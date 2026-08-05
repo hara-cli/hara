@@ -78,6 +78,8 @@ export interface Profile {
   enrolledAt?: string;
   /** Control/data-plane shared expiry for the gateway device token. */
   tokenExpiresAt?: string;
+  /** Explicit Control policy: this scoped token has no fixed date expiry. It remains revocable. */
+  tokenNeverExpires?: boolean;
 }
 
 export interface ProfilesFile {
@@ -164,6 +166,7 @@ function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | nul
     thinkingEfforts: Array.isArray(e.thinkingEfforts) ? e.thinkingEfforts : undefined,
     enrolledAt: e.enrolledAt || new Date().toISOString(),
     tokenExpiresAt: typeof e.expiresAt === "string" ? e.expiresAt : undefined,
+    tokenNeverExpires: e.tokenNeverExpires === true ? true : undefined,
   };
 }
 

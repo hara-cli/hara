@@ -47,6 +47,7 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
   assert.deepEqual(e.availableModels, ["deepseek-v4-pro"]);
   assert.deepEqual(e.thinkingEfforts, ["off", "high", "max"]);
   assert.equal(e.expiresAt, "2026-01-08T00:00:00.000Z");
+  assert.equal(e.tokenNeverExpires, false);
   assert.equal(gatewayBaseURL(e), "https://gw/v1");
   assert.equal(gatewayBaseURL({ ...e, baseURL: "https://gw/openai" }), "https://gw/openai");
   assert.throws(() => parseEnrollResponse("https://gw", {}, "t"), /device_token/);
@@ -81,6 +82,19 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
     }, "t"),
     /invalid desk binding/,
   );
+  const permanent = parseEnrollResponse(
+    "https://gw",
+    { device_token: "t2", device_id: "d2", model: "deepseek-v4-flash", expires_at: null },
+    "2026-01-01",
+  );
+  assert.equal(permanent.expiresAt, undefined);
+  assert.equal(permanent.tokenNeverExpires, true, "an explicit null expiry is distinct from a legacy omission");
+  const legacy = parseEnrollResponse(
+    "https://gw",
+    { device_token: "t3", device_id: "d3", model: "deepseek-v4-flash" },
+    "2026-01-01",
+  );
+  assert.equal(legacy.tokenNeverExpires, undefined, "legacy servers that omit expiry remain distinguishable");
 });
 
 test("organization URL validation requires HTTPS outside loopback and rejects embedded credentials or paths", () => {
@@ -194,6 +208,7 @@ test("profile-native enrollment stores only the scoped token in private profiles
         model: "deepseek-v4-pro",
         available_models: ["deepseek-v4-flash", "deepseek-v4-pro"],
         thinking_efforts: ["off", "high", "max"],
+        expires_at: null,
       }));
     } else {
       res.writeHead(404);
@@ -216,6 +231,8 @@ test("profile-native enrollment stores only the scoped token in private profiles
     assert.equal(storedProfile?.deviceToken, "scoped-device-token");
     assert.deepEqual(storedProfile?.availableModels, ["deepseek-v4-flash", "deepseek-v4-pro"]);
     assert.deepEqual(storedProfile?.thinkingEfforts, ["off", "high", "max"]);
+    assert.equal(storedProfile?.tokenExpiresAt, undefined, "a heartbeat can replace a finite expiry with explicit permanent access");
+    assert.equal(storedProfile?.tokenNeverExpires, true);
     assert.equal(
       loadProfileCreds({
         profileId: "team-a",

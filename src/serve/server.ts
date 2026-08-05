@@ -271,7 +271,7 @@ export interface ProviderSettingsTestResult {
   error?: string;
 }
 
-export type OrganizationAccessState = "valid" | "expiring" | "expired" | "legacy" | "invalid";
+export type OrganizationAccessState = "valid" | "permanent" | "expiring" | "expired" | "legacy" | "invalid";
 
 export interface OrganizationConnectionSummary {
   id: string;
@@ -280,8 +280,10 @@ export interface OrganizationConnectionSummary {
   gatewayUrl: string;
   gatewayHost: string;
   model: string;
+  availableModels?: string[];
   enrolledAt?: string;
   expiresAt?: string;
+  tokenNeverExpires?: boolean;
   accessState: OrganizationAccessState;
 }
 
