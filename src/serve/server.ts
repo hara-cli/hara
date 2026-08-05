@@ -166,6 +166,7 @@ export interface ServeDeps {
   saveProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
   testProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
   createProviderConnection?: (input: ProviderConnectionCreateInput, cwd?: string) => Promise<ProviderSettingsState>;
+  testProviderConnection?: (id: string, cwd?: string) => Promise<ProviderSettingsTestResult>;
   useProviderConnection?: (id: string, cwd?: string) => ProviderSettingsState;
   removeProviderConnection?: (id: string, cwd?: string) => ProviderSettingsState;
   /** Explicitly remove the project profile pin governing cwd. Existing sessions retain their stored
@@ -1491,7 +1492,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
-            "settings.providers.connections.create", "settings.providers.connections.use",
+            "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
             "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
@@ -1853,6 +1854,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             };
             const result = await deps.createProviderConnection(input, targetCwd);
             return reply(rpcResult(id!, redactSensitiveValue(result, [p.apiKey]).value));
+          }
+          case "settings.providers.connections.test": {
+            if (!deps.testProviderConnection) return reply(rpcError(id, ERR.METHOD, "named provider connection testing is not supported by this server"));
+            if (typeof p.id !== "string") return reply(rpcError(id, ERR.PARAMS, "named provider connection id required"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, redactSensitiveValue(await deps.testProviderConnection(p.id, targetCwd)).value));
           }
           case "settings.providers.connections.use":
           case "settings.providers.connections.remove": {

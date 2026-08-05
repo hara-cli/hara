@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,7 +11,7 @@ import WebSocket from "ws";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function reservePort() {
-  const server = createServer();
+  const server = createNetServer();
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", resolve);
@@ -20,6 +21,61 @@ async function reservePort() {
   const port = address.port;
   await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   return port;
+}
+
+async function providerFixture() {
+  const requests = [];
+  const server = createHttpServer((request, response) => {
+    let raw = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => (raw += chunk));
+    request.on("end", () => {
+      requests.push({
+        method: request.method,
+        url: request.url,
+        authorization: request.headers.authorization,
+        body: raw,
+      });
+      if (request.url === "/v1/models") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ object: "list", data: [{ id: "gpt-a", object: "model" }, { id: "gpt-b", object: "model" }] }));
+        return;
+      }
+      if (request.url === "/v1/chat/completions") {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write(`data: ${JSON.stringify({
+          id: "chatcmpl-provider-test",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-a",
+          choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+        })}\n\n`);
+        response.write(`data: ${JSON.stringify({
+          id: "chatcmpl-provider-test",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "gpt-a",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        })}\n\n`);
+        response.end("data: [DONE]\n\n");
+        return;
+      }
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "not found" }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return {
+    requests,
+    baseURL: `http://127.0.0.1:${address.port}/v1`,
+    close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
 }
 
 function connect(port) {
@@ -97,6 +153,7 @@ test("real serve keeps same-provider named personal connections independent and 
   const keyA = "sk-named-connection-a-1111";
   const keyB = "sk-named-connection-b-2222";
   const port = await reservePort();
+  const provider = await providerFixture();
   mkdirSync(haraHome, { recursive: true });
   mkdirSync(project, { recursive: true });
   writeFileSync(join(project, "package.json"), "{}\n");
@@ -169,6 +226,7 @@ test("real serve keeps same-provider named personal connections independent and 
       label: "Team OpenAI A",
       provider: "openai",
       model: "gpt-a",
+      baseURL: provider.baseURL,
       apiKey: keyA,
       activate: false,
     });
@@ -180,6 +238,7 @@ test("real serve keeps same-provider named personal connections independent and 
       label: "Team OpenAI B",
       provider: "openai",
       model: "gpt-b",
+      baseURL: provider.baseURL,
       apiKey: keyB,
       activate: true,
     });
@@ -194,6 +253,16 @@ test("real serve keeps same-provider named personal connections independent and 
     if (process.platform !== "win32") {
       assert.equal(statSync(profilesPath).mode & 0o777, 0o600, "named credentials stay in the private profile store");
     }
+
+    const testedA = await client.call("settings.providers.connections.test", { id: "team-openai-a" });
+    assert.equal(testedA.result.ok, true);
+    assert.deepEqual(testedA.result.models, ["gpt-a", "gpt-b"]);
+    assert.ok(provider.requests.length >= 2, "saved-connection testing probes models and a completion");
+    assert.ok(
+      provider.requests.every((request) => request.authorization === `Bearer ${keyA}`),
+      "testing A uses A's saved credential even while B is active",
+    );
+    assert.equal(JSON.stringify(testedA).includes(keyA), false, "saved-connection testing never echoes its key");
 
     const duplicate = await client.call("settings.providers.connections.create", {
       id: "team-openai-a",
@@ -229,6 +298,7 @@ test("real serve keeps same-provider named personal connections independent and 
       child.kill("SIGTERM");
       await waitForExit(child).catch(() => child.kill("SIGKILL"));
     }
+    await provider.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

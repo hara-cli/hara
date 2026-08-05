@@ -1586,6 +1586,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
         accidentalApiKey: input.apiKey,
       };
     },
+    testProviderConnection: async (id) => ({ ok: true, models: [`${id}-model`] }),
     useProviderConnection: (id) => ({
       ...state,
       current: { ...state.current, profileId: id },
@@ -1645,6 +1646,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.ok(init.result.capabilities.methods.includes("settings.providers.save"));
     for (const method of [
       "settings.providers.connections.create",
+      "settings.providers.connections.test",
       "settings.providers.connections.use",
       "settings.providers.connections.remove",
     ]) assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
@@ -1685,6 +1687,10 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.equal(createdConnectionInput.apiKey, secret, "named connection creation receives the transient key only inside Serve");
     assert.equal(created.result.connections.at(-1).id, "qwen-personal");
     assert.equal(JSON.stringify(created.result).includes(secret), false, "named connection results never echo a submitted key");
+    assert.deepEqual(
+      (await c.call("settings.providers.connections.test", { id: "qwen-personal" })).result,
+      { ok: true, models: ["qwen-personal-model"] },
+    );
     assert.equal(
       (await c.call("settings.providers.connections.use", { id: "qwen-personal" })).result.current.profileId,
       "qwen-personal",

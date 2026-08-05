@@ -798,7 +798,7 @@ async function testProviderSettingsCandidate(input: {
   baseURL?: string;
   apiKey?: string;
   clearApiKey?: boolean;
-}): Promise<{ ok: boolean; models: string[]; error?: string }> {
+}, options: { reusePersonalApiKey?: boolean } = {}): Promise<{ ok: boolean; models: string[]; error?: string }> {
   if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
     throw new Error("provider is not a configurable personal provider");
   }
@@ -810,7 +810,9 @@ async function testProviderSettingsCandidate(input: {
     clearApiKey: input.clearApiKey,
   });
   const raw = readRawConfig();
-  const apiKey = reusablePersonalProviderApiKey(candidate, raw);
+  const apiKey = options.reusePersonalApiKey === false
+    ? candidate.apiKey
+    : reusablePersonalProviderApiKey(candidate, raw);
   if (providerRequiresApiKey(candidate.provider) && !apiKey) {
     return {
       ok: false,
@@ -866,6 +868,23 @@ async function testProviderSettingsCandidate(input: {
     };
   }
   return { ok: true, models };
+}
+
+async function testNamedProviderConnection(inputId: string, targetCwd: string) {
+  const id = inputId.trim();
+  if (!isValidProfileId(id)) throw new Error("invalid personal connection id");
+  const profile = getProfile(id);
+  if (!profile || profile.kind !== "byok") throw new Error("personal connection was not found");
+  const live = loadConfig({ cwd: targetCwd });
+  // Test the persisted identity itself. Ambient one-shot HARA_* routing must not silently test another
+  // endpoint or key, especially when two saved connections use the same provider.
+  const target = resolveByokProviderTarget(live, profileByIdForConfig(live, id) ?? profile, false, {});
+  return testProviderSettingsCandidate({
+    provider: target.provider,
+    model: target.model,
+    ...(target.baseURL ? { baseURL: target.baseURL } : {}),
+    ...(target.apiKey ? { apiKey: target.apiKey } : {}),
+  }, { reusePersonalApiKey: false });
 }
 
 const SETUP_DEFAULT_MODEL: Record<string, string> = {
@@ -3021,6 +3040,10 @@ program
         testProviderSettings: (input) => testProviderSettingsCandidate(input),
         createProviderConnection: (input, targetCwd) => createNamedProviderConnection(
           input,
+          targetCwd ?? cwd,
+        ),
+        testProviderConnection: (inputId, targetCwd) => testNamedProviderConnection(
+          inputId,
           targetCwd ?? cwd,
         ),
         useProviderConnection: (inputId, targetCwd) => useNamedProviderConnection(
