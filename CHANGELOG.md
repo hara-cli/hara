@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.140.0 — 2026-08-05 — named personal model connections
+
+- Add multiple named personal/BYOK model connections behind the authenticated Serve settings
+  protocol. Each connection keeps its own provider, default model, endpoint, and credential instead
+  of overwriting the legacy Personal route.
+- Return only redacted connection metadata to Desktop. API keys remain in the private profile store,
+  candidate and saved connections can be tested independently, and duplicate identities cannot
+  silently overwrite an existing connection.
+- Make save, test, activate, and remove explicit operations while respecting environment and project
+  route locks. Existing sessions remain pinned to the identity they started with; switching affects
+  only newly created conversations.
+- Upgrade with `npm i -g @nanhara/hara@0.140.0`.
+
 ## 0.139.1 — 2026-08-05 — honest permanent access and managed model discovery
 
 - Expose each enrolled organization's authorized model catalog through the authenticated, redacted
