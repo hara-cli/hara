@@ -9,6 +9,14 @@ export const MAX_TASK_STEERING_ENTRIES = 24;
 export const MAX_TASK_BRIEF_GOAL_CHARS = 2_000;
 export const MAX_TASK_BRIEF_LIST_ENTRIES = 12;
 export const MAX_TASK_BRIEF_ITEM_CHARS = 800;
+export const MAX_TASK_CHECKPOINT_STEP_CHARS = 800;
+export const MAX_TASK_CHECKPOINT_ARTIFACTS = 32;
+export const MAX_TASK_CHECKPOINT_ARTIFACT_CHARS = 1_000;
+export const MAX_TASK_CHECKPOINT_FACTS = 64;
+export const MAX_TASK_CHECKPOINT_CAPABILITIES = 32;
+export const MAX_TASK_STATE_KEY_CHARS = 120;
+export const MAX_TASK_FACT_STRING_CHARS = 2_000;
+export const MAX_TASK_EVIDENCE_CHARS = 1_000;
 
 export type TaskExecutionStatus = "running" | "paused" | "completed" | "blocked";
 export type TaskIntent = "answer" | "investigate" | "change";
@@ -24,6 +32,9 @@ export interface TaskBrief {
   constraints: string[];
   acceptance: string[];
   steps: string[];
+  /** Capabilities whose availability materially changes the approach (for example vision or computer
+   * control). Core file/shell tools do not need to be listed. */
+  requiredCapabilities?: string[];
   createdAt: string;
 }
 
@@ -36,6 +47,37 @@ export interface TaskSteering {
    *  audit-only entry from before delivery tracking existed, so old sessions are never replayed. */
   deliveryState?: "pending" | "consumed";
   consumedAt?: string;
+}
+
+export type TaskFactValue = string | number | boolean;
+export type TaskCapabilityState = "available" | "unavailable" | "blocked" | "unknown";
+
+export interface TaskFact {
+  value: TaskFactValue;
+  /** Concise observation that justified the latest value. Required when a prior value changes. */
+  evidence?: string;
+  updatedAt: string;
+}
+
+export interface TaskCapability {
+  state: TaskCapabilityState;
+  /** Concrete preflight result or blocker; never a private chain-of-thought explanation. */
+  detail?: string;
+  checkedAt: string;
+}
+
+/** Supplementary durable checkpoint. Canonical completed/pending steps remain SessionMeta.todos so there
+ * is only one checklist to resume; this object stores the non-derivable cursor, blockers, outputs, facts,
+ * and capability preflight used by progress UI and final synthesis. */
+export interface TaskCheckpoint {
+  currentStep?: string;
+  blockedStep?: string;
+  blockReason?: string;
+  nextStep?: string;
+  artifacts: string[];
+  facts: Record<string, TaskFact>;
+  capabilities: Record<string, TaskCapability>;
+  updatedAt: string;
 }
 
 /** Durable execution state. It intentionally lives beside, not inside, conversation history. */
@@ -54,6 +96,9 @@ export interface TaskExecution {
   lastOutcome?: RunOutcome["status"] | "interrupted";
   /** Present once the model has explicitly understood this execution. Required before side effects. */
   brief?: TaskBrief;
+  /** Structured state shared by resume, progress UI, and final synthesis. Optional only for v1 sessions
+   * written before checkpoints were introduced. */
+  checkpoint?: TaskCheckpoint;
   /** Bounded audit trail; full user messages remain in the transcript. */
   steering?: TaskSteering[];
 }
@@ -90,6 +135,17 @@ function validBriefList(value: unknown): value is string[] {
     value.length > 0 &&
     value.length <= MAX_TASK_BRIEF_LIST_ENTRIES &&
     value.every((item) => typeof item === "string" && item.length > 0 && item.length <= MAX_TASK_BRIEF_ITEM_CHARS);
+}
+
+function validRequiredCapabilities(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > MAX_TASK_CHECKPOINT_CAPABILITIES) return false;
+  const seen = new Set<string>();
+  return value.every((item) => {
+    const parsed = taskStateKey(item, "required capability");
+    if (!parsed.ok || parsed.value !== item || seen.has(item)) return false;
+    seen.add(item);
+    return true;
+  });
 }
 
 export function newTurnInteraction(): Extract<TaskInteraction, { kind: "turn" }> {
@@ -137,6 +193,12 @@ export function createTaskExecution(objective: string, turnId: string, at: Date 
     createdAt: now,
     updatedAt: now,
     startedAt: now,
+    checkpoint: {
+      artifacts: [],
+      facts: {},
+      capabilities: {},
+      updatedAt: now,
+    },
   };
 }
 
@@ -146,6 +208,238 @@ export interface TaskBriefInput {
   constraints?: unknown;
   acceptance?: unknown;
   steps?: unknown;
+  required_capabilities?: unknown;
+}
+
+export interface TaskFactUpdateInput {
+  key?: unknown;
+  value?: unknown;
+  evidence?: unknown;
+  remove?: unknown;
+}
+
+export interface TaskCapabilityUpdateInput {
+  name?: unknown;
+  state?: unknown;
+  detail?: unknown;
+}
+
+export interface TaskCheckpointInput {
+  current_step?: unknown;
+  blocked_step?: unknown;
+  block_reason?: unknown;
+  next_step?: unknown;
+  artifacts?: unknown;
+  facts?: unknown;
+  capabilities?: unknown;
+}
+
+function taskStateKey(value: unknown, label: string): { ok: true; value: string } | { ok: false; reason: string } {
+  if (typeof value !== "string") return { ok: false, reason: `${label} must be a string` };
+  const key = value.trim();
+  if (!/^[a-z][a-z0-9_.-]*$/.test(key) || key.length > MAX_TASK_STATE_KEY_CHARS) {
+    return {
+      ok: false,
+      reason: `${label} must use 1-${MAX_TASK_STATE_KEY_CHARS} lowercase letters, digits, dot, dash, or underscore and start with a letter`,
+    };
+  }
+  return { ok: true, value: key };
+}
+
+function checkpointText(value: unknown, label: string): { ok: true; value?: string } | { ok: false; reason: string } {
+  if (value === undefined) return { ok: true };
+  if (typeof value !== "string") return { ok: false, reason: `${label} must be a string` };
+  const normalized = value.replace(/\r\n?/g, "\n").trim();
+  return { ok: true, ...(normalized ? { value: normalized.slice(0, MAX_TASK_CHECKPOINT_STEP_CHARS) } : {}) };
+}
+
+function factValue(value: unknown): { ok: true; value: TaskFactValue } | { ok: false; reason: string } {
+  if (typeof value === "boolean") return { ok: true, value };
+  if (typeof value === "number" && Number.isFinite(value)) return { ok: true, value };
+  if (typeof value === "string") return { ok: true, value: value.slice(0, MAX_TASK_FACT_STRING_CHARS) };
+  return { ok: false, reason: "fact value must be a finite number, boolean, or string" };
+}
+
+function sameFactValue(left: TaskFactValue, right: TaskFactValue): boolean {
+  return typeof left === typeof right && left === right;
+}
+
+function requiredCapabilityList(value: unknown): { ok: true; value: string[] } | { ok: false; reason: string } {
+  if (value === undefined) return { ok: true, value: [] };
+  if (!Array.isArray(value)) return { ok: false, reason: "required_capabilities must be an array" };
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    const parsed = taskStateKey(raw, "required capability");
+    if (!parsed.ok) return parsed;
+    if (seen.has(parsed.value)) continue;
+    seen.add(parsed.value);
+    out.push(parsed.value);
+    if (out.length > MAX_TASK_CHECKPOINT_CAPABILITIES) {
+      return { ok: false, reason: `required_capabilities cannot exceed ${MAX_TASK_CHECKPOINT_CAPABILITIES} entries` };
+    }
+  }
+  return { ok: true, value: out };
+}
+
+/** Atomically update the task's shared factual/capability checkpoint. A changed fact or capability needs
+ * fresh evidence so the engine cannot silently overwrite an earlier conclusion and later contradict it. */
+export function applyTaskCheckpoint(
+  task: TaskExecution | undefined,
+  input: TaskCheckpointInput,
+  at: Date | string = new Date(),
+): { ok: true; task: TaskExecution; checkpoint: TaskCheckpoint; changes: string[] } | { ok: false; reason: string } {
+  if (!task) return { ok: false, reason: "there is no task to checkpoint" };
+  if (task.status !== "running") return { ok: false, reason: `task ${task.id} is ${task.status}, not running` };
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, reason: "checkpoint input must be an object" };
+  }
+  const now = iso(at);
+  const prior = task.checkpoint ?? {
+    artifacts: [],
+    facts: {},
+    capabilities: {},
+    updatedAt: task.updatedAt,
+  };
+  const next: TaskCheckpoint = {
+    ...prior,
+    artifacts: [...prior.artifacts],
+    facts: { ...prior.facts },
+    capabilities: { ...prior.capabilities },
+    updatedAt: now,
+  };
+  const changes: string[] = [];
+
+  for (const [field, label] of [
+    ["current_step", "current_step"],
+    ["blocked_step", "blocked_step"],
+    ["block_reason", "block_reason"],
+    ["next_step", "next_step"],
+  ] as const) {
+    if (!(field in input)) continue;
+    const parsed = checkpointText(input[field], label);
+    if (!parsed.ok) return parsed;
+    const target = field === "current_step"
+      ? "currentStep"
+      : field === "blocked_step"
+        ? "blockedStep"
+        : field === "block_reason"
+          ? "blockReason"
+          : "nextStep";
+    if (parsed.value) next[target] = parsed.value;
+    else delete next[target];
+    changes.push(label);
+  }
+  if ("blocked_step" in input && !next.blockedStep) delete next.blockReason;
+  if (next.blockReason && !next.blockedStep) {
+    return { ok: false, reason: "block_reason requires blocked_step; clear both when the blocker is resolved" };
+  }
+  if (next.blockedStep && !next.blockReason) {
+    return { ok: false, reason: "blocked_step requires a non-empty block_reason" };
+  }
+
+  if (input.artifacts !== undefined) {
+    if (!Array.isArray(input.artifacts)) return { ok: false, reason: "artifacts must be an array of strings" };
+    const artifacts: string[] = [];
+    const seen = new Set<string>();
+    for (const raw of input.artifacts) {
+      if (typeof raw !== "string") return { ok: false, reason: "every artifact must be a string" };
+      const artifact = raw.replace(/\r\n?/g, "\n").trim().slice(0, MAX_TASK_CHECKPOINT_ARTIFACT_CHARS);
+      if (!artifact || seen.has(artifact)) continue;
+      seen.add(artifact);
+      artifacts.push(artifact);
+      if (artifacts.length > MAX_TASK_CHECKPOINT_ARTIFACTS) {
+        return { ok: false, reason: `artifacts cannot exceed ${MAX_TASK_CHECKPOINT_ARTIFACTS} entries` };
+      }
+    }
+    next.artifacts = artifacts;
+    changes.push("artifacts");
+  }
+
+  if (input.facts !== undefined) {
+    if (!Array.isArray(input.facts)) return { ok: false, reason: "facts must be an array of keyed updates" };
+    const seen = new Set<string>();
+    for (const raw of input.facts as TaskFactUpdateInput[]) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "every fact update must be an object" };
+      const parsedKey = taskStateKey(raw.key, "fact key");
+      if (!parsedKey.ok) return parsedKey;
+      const key = parsedKey.value;
+      if (seen.has(key)) return { ok: false, reason: `fact '${key}' appears more than once in one checkpoint` };
+      seen.add(key);
+      if (raw.evidence !== undefined && typeof raw.evidence !== "string") {
+        return { ok: false, reason: `fact '${key}' evidence must be a string` };
+      }
+      const evidence = typeof raw.evidence === "string"
+        ? raw.evidence.replace(/\r\n?/g, "\n").trim().slice(0, MAX_TASK_EVIDENCE_CHARS)
+        : undefined;
+      const existing = Object.prototype.hasOwnProperty.call(next.facts, key) ? next.facts[key] : undefined;
+      if (raw.remove === true) {
+        if (existing && !evidence) {
+          return { ok: false, reason: `fact '${key}' removal requires fresh evidence` };
+        }
+        delete next.facts[key];
+        continue;
+      }
+      const parsedValue = factValue(raw.value);
+      if (!parsedValue.ok) return { ok: false, reason: `fact '${key}': ${parsedValue.reason}` };
+      if (existing && !sameFactValue(existing.value, parsedValue.value) && !evidence) {
+        return { ok: false, reason: `fact '${key}' changed value; provide fresh evidence for the revision` };
+      }
+      next.facts[key] = {
+        value: parsedValue.value,
+        ...(evidence ? { evidence } : existing?.evidence ? { evidence: existing.evidence } : {}),
+        updatedAt: now,
+      };
+    }
+    if (Object.keys(next.facts).length > MAX_TASK_CHECKPOINT_FACTS) {
+      return { ok: false, reason: `fact table cannot exceed ${MAX_TASK_CHECKPOINT_FACTS} entries` };
+    }
+    changes.push("facts");
+  }
+
+  if (input.capabilities !== undefined) {
+    if (!Array.isArray(input.capabilities)) return { ok: false, reason: "capabilities must be an array of preflight results" };
+    const seen = new Set<string>();
+    for (const raw of input.capabilities as TaskCapabilityUpdateInput[]) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, reason: "every capability update must be an object" };
+      const parsedName = taskStateKey(raw.name, "capability name");
+      if (!parsedName.ok) return parsedName;
+      const name = parsedName.value;
+      if (seen.has(name)) return { ok: false, reason: `capability '${name}' appears more than once in one checkpoint` };
+      seen.add(name);
+      const state = raw.state;
+      if (state !== "available" && state !== "unavailable" && state !== "blocked" && state !== "unknown") {
+        return { ok: false, reason: `capability '${name}' state must be available, unavailable, blocked, or unknown` };
+      }
+      if (raw.detail !== undefined && typeof raw.detail !== "string") {
+        return { ok: false, reason: `capability '${name}' detail must be a string` };
+      }
+      const detail = typeof raw.detail === "string"
+        ? raw.detail.replace(/\r\n?/g, "\n").trim().slice(0, MAX_TASK_EVIDENCE_CHARS)
+        : undefined;
+      const existing = Object.prototype.hasOwnProperty.call(next.capabilities, name) ? next.capabilities[name] : undefined;
+      if (existing && existing.state !== state && !detail) {
+        return { ok: false, reason: `capability '${name}' changed state; provide fresh detail for the revision` };
+      }
+      next.capabilities[name] = {
+        state,
+        ...(detail ? { detail } : existing?.detail ? { detail: existing.detail } : {}),
+        checkedAt: now,
+      };
+    }
+    if (Object.keys(next.capabilities).length > MAX_TASK_CHECKPOINT_CAPABILITIES) {
+      return { ok: false, reason: `capability table cannot exceed ${MAX_TASK_CHECKPOINT_CAPABILITIES} entries` };
+    }
+    changes.push("capabilities");
+  }
+
+  if (!changes.length) return { ok: false, reason: "checkpoint must update at least one field" };
+  return {
+    ok: true,
+    checkpoint: next,
+    changes,
+    task: { ...task, checkpoint: next, updatedAt: now },
+  };
 }
 
 /** Attach or revise the explicit understanding checkpoint. Revision is intentional: steering may add a
@@ -164,6 +458,8 @@ export function applyTaskBrief(
   if (typeof input.goal !== "string" || !input.goal.trim()) {
     return { ok: false, reason: "goal must be a non-empty string" };
   }
+  const requiredCapabilities = requiredCapabilityList(input.required_capabilities);
+  if (!requiredCapabilities.ok) return requiredCapabilities;
   const now = iso(at);
   const brief: TaskBrief = {
     intent,
@@ -171,6 +467,7 @@ export function applyTaskBrief(
     constraints: boundedList(input.constraints, "preserve unrelated user work and stated boundaries"),
     acceptance: boundedList(input.acceptance, intent === "change" ? "the requested change is verified" : "the answer is supported by relevant evidence"),
     steps: boundedList(input.steps, intent === "change" ? "inspect, change, and verify" : "inspect and report"),
+    ...(requiredCapabilities.value.length ? { requiredCapabilities: requiredCapabilities.value } : {}),
     createdAt: now,
   };
   return {
@@ -271,7 +568,7 @@ export function hasPendingTaskSteering(task: TaskExecution | undefined): boolean
 export function requestsTaskContinuation(text: string): boolean {
   const value = text.trim().toLocaleLowerCase();
   if (!value) return false;
-  return /^(?:\/continue(?:\s|$)|(?:continue|resume|go\s+on)(?:[\s,.:;!?，。：；！？]|$)|(?:继续|接着|接着做|继续处理)(?:[\s,.:;!?，。：；！？]|$))/.test(value);
+  return /^(?:\/continue(?:\s|$)|(?:continue|resume|go\s+on)(?:[\s,.:;!?，。：；！？]|$)|(?:继续|接着|接着做|继续处理|重新执行|现在去执行任务)(?:[\s,.:;!?，。：；！？]|$))/.test(value);
 }
 
 export function finishTaskExecution(
@@ -294,7 +591,45 @@ export function finishTaskExecution(
       : outcome?.status === "error" || outcome?.status === "empty" || outcome?.status === "halted"
         ? "blocked"
         : "paused";
-  return { ...task, status, lastOutcome, updatedAt: now, endedAt: now };
+  const current = todos.find((todo) => todo.status === "in_progress")
+    ?? todos.find((todo) => todo.status === "pending");
+  const prior = task.checkpoint ?? {
+    artifacts: [],
+    facts: {},
+    capabilities: {},
+    updatedAt: task.updatedAt,
+  };
+  const checkpoint: TaskCheckpoint = {
+    ...prior,
+    artifacts: [...prior.artifacts],
+    facts: { ...prior.facts },
+    capabilities: { ...prior.capabilities },
+    updatedAt: now,
+  };
+  if (status === "completed") {
+    delete checkpoint.currentStep;
+    delete checkpoint.blockedStep;
+    delete checkpoint.blockReason;
+    delete checkpoint.nextStep;
+  } else if (current) {
+    checkpoint.currentStep = boundedText(current.activeForm || current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
+    checkpoint.nextStep ??= boundedText(current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
+  }
+  if (status === "blocked") {
+    const checkpointUpdatedThisRun = Date.parse(prior.updatedAt) >= Date.parse(task.startedAt);
+    if (!checkpointUpdatedThisRun || !checkpoint.blockedStep) {
+      checkpoint.blockedStep = checkpoint.currentStep ?? "complete the current task step";
+    }
+    if (!checkpointUpdatedThisRun || !checkpoint.blockReason) {
+      checkpoint.blockReason = boundedText(
+        outcome?.status === "empty"
+          ? "the model returned an empty response after retrying"
+          : outcome?.error ?? "the task stopped before completion",
+        MAX_TASK_CHECKPOINT_STEP_CHARS,
+      );
+    }
+  }
+  return { ...task, status, lastOutcome, checkpoint, updatedAt: now, endedAt: now };
 }
 
 /** A process died while this task was running. Recovery is explicit and never claims success. */
@@ -323,6 +658,43 @@ export function forkTaskExecution(task: TaskExecution | undefined, at: Date | st
       ? { ...entry, deliveryState: "consumed", consumedAt: now }
       : { ...entry }),
   };
+}
+
+/** Dynamic prompt projection. Tool results may update this during a run, so compose it from the current
+ * task every model round instead of freezing it into the interaction-start execution context. */
+export function taskCheckpointContext(checkpoint: TaskCheckpoint | undefined): string {
+  if (!checkpoint) return "";
+  const facts = Object.entries(checkpoint.facts);
+  const capabilities = Object.entries(checkpoint.capabilities);
+  const hasState = checkpoint.currentStep || checkpoint.blockedStep || checkpoint.blockReason || checkpoint.nextStep
+    || checkpoint.artifacts.length || facts.length || capabilities.length;
+  if (!hasState) return "";
+  const lines = [
+    "# Structured task state (authoritative)",
+    "Read progress, final claims, and resume decisions from this state plus the canonical Todo checklist. Update it with `task_checkpoint`; do not invent a parallel conclusion.",
+  ];
+  if (checkpoint.currentStep) lines.push(`Current step: ${checkpoint.currentStep}`);
+  if (checkpoint.blockedStep) lines.push(`Blocked step: ${checkpoint.blockedStep}`);
+  if (checkpoint.blockReason) lines.push(`Block reason: ${checkpoint.blockReason}`);
+  if (checkpoint.nextStep) lines.push(`Next step: ${checkpoint.nextStep}`);
+  if (capabilities.length) {
+    lines.push(
+      "## Capability preflight",
+      ...capabilities.map(([name, capability]) =>
+        `- ${name}: ${capability.state}${capability.detail ? ` — ${capability.detail}` : ""}`),
+    );
+  }
+  if (facts.length) {
+    lines.push(
+      "## Verified facts",
+      ...facts.map(([key, fact]) =>
+        `- ${key} = ${JSON.stringify(fact.value)}${fact.evidence ? ` — evidence: ${fact.evidence}` : ""}`),
+    );
+  }
+  if (checkpoint.artifacts.length) {
+    lines.push("## Artifacts", ...checkpoint.artifacts.map((artifact) => `- ${artifact}`));
+  }
+  return lines.join("\n");
 }
 
 export function taskExecutionContext(task: TaskExecution, interaction: TaskInteraction, todos: Todo[] = []): string {
@@ -362,8 +734,55 @@ export function formatTaskExecution(task: TaskExecution | undefined): string {
     `turn ${task.turnId.slice(0, 8)} · outcome ${task.lastOutcome ?? "running"}`,
     `objective: ${task.objective}`,
     `brief: ${task.brief ? `${task.brief.intent} · ${task.brief.goal}` : "(not accepted yet)"}`,
+    `checkpoint: ${task.checkpoint ? `${Object.keys(task.checkpoint.facts).length} fact(s) · ${Object.keys(task.checkpoint.capabilities).length} capability check(s) · ${task.checkpoint.artifacts.length} artifact(s)` : "(legacy none)"}`,
     `steering: ${task.steering?.length ?? 0}`,
   ].join("\n");
+}
+
+function validCheckpointText(value: unknown, max = MAX_TASK_CHECKPOINT_STEP_CHARS): boolean {
+  return value === undefined || (typeof value === "string" && value.length > 0 && value.length <= max);
+}
+
+function validTaskCheckpoint(value: unknown): value is TaskCheckpoint {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const checkpoint = value as Record<string, unknown>;
+  if (
+    !validCheckpointText(checkpoint.currentStep) ||
+    !validCheckpointText(checkpoint.blockedStep) ||
+    !validCheckpointText(checkpoint.blockReason) ||
+    !validCheckpointText(checkpoint.nextStep) ||
+    (checkpoint.blockReason !== undefined && checkpoint.blockedStep === undefined) ||
+    !validTimestamp(checkpoint.updatedAt) ||
+    !Array.isArray(checkpoint.artifacts) ||
+    checkpoint.artifacts.length > MAX_TASK_CHECKPOINT_ARTIFACTS ||
+    !checkpoint.artifacts.every((artifact) => typeof artifact === "string" && artifact.length > 0 && artifact.length <= MAX_TASK_CHECKPOINT_ARTIFACT_CHARS) ||
+    !checkpoint.facts || typeof checkpoint.facts !== "object" || Array.isArray(checkpoint.facts) ||
+    !checkpoint.capabilities || typeof checkpoint.capabilities !== "object" || Array.isArray(checkpoint.capabilities)
+  ) return false;
+  const facts = Object.entries(checkpoint.facts as Record<string, unknown>);
+  if (facts.length > MAX_TASK_CHECKPOINT_FACTS) return false;
+  for (const [key, raw] of facts) {
+    const parsedKey = taskStateKey(key, "fact key");
+    if (!parsedKey.ok || parsedKey.value !== key || !raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+    const fact = raw as Record<string, unknown>;
+    const storedValueValid = typeof fact.value === "boolean"
+      || (typeof fact.value === "number" && Number.isFinite(fact.value))
+      || (typeof fact.value === "string" && fact.value.length <= MAX_TASK_FACT_STRING_CHARS);
+    if (!storedValueValid || !validCheckpointText(fact.evidence, MAX_TASK_EVIDENCE_CHARS) || !validTimestamp(fact.updatedAt)) return false;
+  }
+  const capabilities = Object.entries(checkpoint.capabilities as Record<string, unknown>);
+  if (capabilities.length > MAX_TASK_CHECKPOINT_CAPABILITIES) return false;
+  for (const [name, raw] of capabilities) {
+    const parsedName = taskStateKey(name, "capability name");
+    if (!parsedName.ok || parsedName.value !== name || !raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+    const capability = raw as Record<string, unknown>;
+    if (
+      (capability.state !== "available" && capability.state !== "unavailable" && capability.state !== "blocked" && capability.state !== "unknown") ||
+      !validCheckpointText(capability.detail, MAX_TASK_EVIDENCE_CHARS) ||
+      !validTimestamp(capability.checkedAt)
+    ) return false;
+  }
+  return true;
 }
 
 export function isTaskExecution(value: unknown): value is TaskExecution {
@@ -388,9 +807,11 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
       !validBriefList(brief.constraints) ||
       !validBriefList(brief.acceptance) ||
       !validBriefList(brief.steps) ||
+      (brief.requiredCapabilities !== undefined && !validRequiredCapabilities(brief.requiredCapabilities)) ||
       !validTimestamp(brief.createdAt)
     ) return false;
   }
+  if (task.checkpoint !== undefined && !validTaskCheckpoint(task.checkpoint)) return false;
   if (task.steering === undefined) return true;
   if (!Array.isArray(task.steering) || task.steering.length > MAX_TASK_STEERING_ENTRIES) return false;
   return task.steering.every((entry) => {

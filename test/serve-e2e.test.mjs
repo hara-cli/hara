@@ -2009,6 +2009,73 @@ test("serve e2e: only an explicit continuation resumes an unfinished task", { ti
   }
 });
 
+test("serve e2e: structured task facts, capability preflight, and artifacts survive the durable checkpoint", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-task-state-"));
+  const store = memStore();
+  let call = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      call++;
+      if (call === 1) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "brief-state",
+            name: "task_intake",
+            input: {
+              intent: "investigate",
+              goal: "verify the generated report",
+              constraints: ["do not modify the report"],
+              acceptance: ["verification result and artifact are persisted"],
+              steps: ["inspect report", "record verification state"],
+            },
+          }],
+          stop: "tool_use",
+        };
+      }
+      if (call === 2) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "checkpoint-state",
+            name: "task_checkpoint",
+            input: {
+              artifacts: ["reports/verified.json"],
+              facts: [{ key: "rows_verified", value: 12, evidence: "twelve rows matched" }],
+              capabilities: [{ name: "report_read", state: "available", detail: "read completed" }],
+            },
+          }],
+          stop: "tool_use",
+        };
+      }
+      onText("verified");
+      return { text: "verified", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    const sent = await c.call("session.send", { sessionId: result.sessionId, text: "verify the report" });
+    assert.equal(sent.result.reply, "verified");
+    const saved = store.saved.get(result.sessionId);
+    assert.equal(saved.task.checkpoint.facts.rows_verified.value, 12);
+    assert.equal(saved.task.checkpoint.capabilities.report_read.state, "available");
+    assert.deepEqual(saved.task.checkpoint.artifacts, ["reports/verified.json"]);
+    const state = c.events.filter((event) => event.method === "event.task_state").at(-1);
+    assert.deepEqual(state.params.checkpoint.facts, { rows_verified: 12 });
+    assert.deepEqual(state.params.checkpoint.capabilities, { report_read: { state: "available", detail: "read completed" } });
+    assert.deepEqual(state.params.checkpoint.artifacts, ["reports/verified.json"]);
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: failed and empty turns never replay an earlier assistant reply", { timeout: 20000 }, async () => {
   for (const mode of ["error", "empty"]) {
     const dir = mkdtempSync(join(tmpdir(), `hara-serve-${mode}-`));

@@ -38,7 +38,13 @@ import { redactSensitiveText } from "../security/secrets.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { prepareHistoryForModel } from "./context-budget.js";
 import { rolesDigest } from "../org/roles.js";
-import { applyTaskBrief, type TaskBrief, type TaskExecution } from "../session/task.js";
+import {
+  applyTaskBrief,
+  applyTaskCheckpoint,
+  taskCheckpointContext,
+  type TaskBrief,
+  type TaskExecution,
+} from "../session/task.js";
 import { askUserTool } from "../tools/ask_user.js";
 import { PromptAssembler, type AssembledSystemPrompt } from "./prompt.js";
 import {
@@ -217,13 +223,14 @@ export function composeSystem(
   memory?: string,
   continuationSession = false,
   executionContext?: string,
-  intake?: { enabled: boolean; brief?: TaskBrief },
+  intake?: { enabled: boolean; brief?: TaskBrief; checkpoint?: TaskExecution["checkpoint"] },
   profileId?: string,
 ): AssembledSystemPrompt {
   const assembler = new PromptAssembler();
   assembler.add("core", "static", "core", override || HARA_SYSTEM());
   const skills = skillsDigest(cwd);
   const roles = override ? "" : rolesDigest(cwd, profileId);
+  const checkpointContext = taskCheckpointContext(intake?.checkpoint);
   const intakeContext = !intake?.enabled
     ? ""
     : intake.brief
@@ -236,7 +243,15 @@ export function composeSystem(
           `Goal: ${intake.brief.goal}\n` +
           `Constraints:\n${intake.brief.constraints.map((item) => `- ${item}`).join("\n")}\n` +
           `Acceptance:\n${intake.brief.acceptance.map((item) => `- ${item}`).join("\n")}\n` +
-          `Steps:\n${intake.brief.steps.map((item, index) => `${index + 1}. ${item}`).join("\n")}`
+          `Steps:\n${intake.brief.steps.map((item, index) => `${index + 1}. ${item}`).join("\n")}\n` +
+          (intake.brief.requiredCapabilities?.length
+            ? `Required capability preflight:\n${intake.brief.requiredCapabilities.map((item) => `- ${item}`).join("\n")}\n`
+            : "") +
+          "\n" +
+          "For a multi-step task, preflight only the capabilities materially required by this brief and record " +
+          "their observed states with `task_checkpoint` before depending on them. After each major stage, before " +
+          "reporting a blocker, and before final synthesis, update the shared checkpoint. Canonical step completion " +
+          "belongs in `todo_write`; facts, capability results, blockers, next step, and artifacts belong in `task_checkpoint`."
         )
       : (
           "\n\n# Understanding → execution boundary\n" +
@@ -256,7 +271,8 @@ export function composeSystem(
     .add("memory", "session", "memory", memory ? `# Memory (durable — facts/decisions/prefs you've saved; use memory_search/get for more)\n${memory}` : "")
     .add("roles", "session", "role", roles ? `# Specialist roles (metadata only — use \`agent\` with a role id for bounded read-only expertise)\n${roles}` : "")
     .add("skills", "session", "skill", skills ? `# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
-    .add("task-intake", "turn", "task", intakeContext);
+    .add("task-intake", "turn", "task", intakeContext)
+    .add("task-checkpoint", "turn", "task", checkpointContext);
   return assembler.build();
 }
 
@@ -654,7 +670,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     restrictToolsForSkill,
   };
   let intakeTask = opts.taskIntake?.task;
-  let intakeDirty = false;
+  let taskStateDirty = false;
   const syncIntakeTask = (): void => {
     const current = opts.taskIntake?.current?.();
     if (current && (!intakeTask || current.id === intakeTask.id)) intakeTask = current;
@@ -678,17 +694,24 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             constraints: { type: "array", items: { type: "string" }, description: "User/project boundaries that must remain true." },
             acceptance: { type: "array", items: { type: "string" }, description: "Observable checks that prove the task is done." },
             steps: { type: "array", items: { type: "string" }, description: "Short ordered approach, normally 2–6 steps." },
+            required_capabilities: {
+              type: "array",
+              items: { type: "string" },
+              description: "Only non-core capabilities whose availability materially changes the approach, such as vision_model or computer_control.",
+            },
           },
           required: ["intent", "goal", "constraints", "acceptance", "steps"],
         },
         kind: "read",
         classify: () => ({ effect: "state", concurrencySafe: false }),
         run: async (input) => {
-          syncIntakeTask();
+          // Multiple engine-owned state updates may share one serial tool round. Refresh only before the
+          // first update; a later refresh would replace the not-yet-checkpointed local transition.
+          if (!taskStateDirty) syncIntakeTask();
           const applied = applyTaskBrief(intakeTask, input);
           if (!applied.ok) return `Error: task brief rejected — ${applied.reason}`;
           intakeTask = applied.task;
-          intakeDirty = true;
+          taskStateDirty = true;
           return (
             `Task brief accepted (${applied.brief.intent}).\n` +
             `Goal: ${applied.brief.goal}\n` +
@@ -698,10 +721,74 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         },
       }
     : undefined;
-  // `task_intake` is engine-owned and cannot be shadowed by an ad-hoc tool with the same name.
+  const taskCheckpointTool: Tool | undefined = opts.taskIntake
+    ? {
+        name: "task_checkpoint",
+        description:
+          "Persist the active task's shared execution state. Use after a major stage, whenever a verified fact " +
+          "or required capability state changes, before reporting a blocker, and before final synthesis. Keep the " +
+          "canonical completed/pending step list in todo_write; this tool stores the current/blocked/next cursor, " +
+          "artifacts, verified facts, and capability preflight. A changed prior fact requires fresh evidence. " +
+          "A changed capability state requires fresh detail. Pass an empty string to clear a resolved cursor/blocker " +
+          "field and pass the full artifact list when updating artifacts.",
+        input_schema: {
+          type: "object",
+          properties: {
+            current_step: { type: "string", description: "Current major step; empty clears it." },
+            blocked_step: { type: "string", description: "Blocked step; empty clears it and its reason." },
+            block_reason: { type: "string", description: "Observed blocker, required with blocked_step; empty clears it." },
+            next_step: { type: "string", description: "Concrete next resumable action; empty clears it." },
+            artifacts: {
+              type: "array",
+              items: { type: "string" },
+              description: "Full bounded list of output paths or stable artifact identifiers.",
+            },
+            facts: {
+              type: "array",
+              description: "Keyed fact upserts/removals. Keys use lowercase snake/dot/dash form.",
+              items: {
+                type: "object",
+                properties: {
+                  key: { type: "string" },
+                  value: { description: "Finite number, boolean, or bounded string; omit only when remove=true." },
+                  evidence: { type: "string", description: "Concise observed evidence; required when changing a prior value." },
+                  remove: { type: "boolean", description: "Delete this fact instead of setting value; an existing fact requires fresh evidence." },
+                },
+                required: ["key"],
+              },
+            },
+            capabilities: {
+              type: "array",
+              description: "Observed preflight states for capabilities materially required by this task.",
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  state: { type: "string", enum: ["available", "unavailable", "blocked", "unknown"] },
+                  detail: { type: "string", description: "Concrete check result or blocker; required when changing a prior state." },
+                },
+                required: ["name", "state"],
+              },
+            },
+          },
+        },
+        kind: "read",
+        classify: () => ({ effect: "state", concurrencySafe: false }),
+        run: async (input) => {
+          if (!taskStateDirty) syncIntakeTask();
+          const applied = applyTaskCheckpoint(intakeTask, input);
+          if (!applied.ok) return `Error: task checkpoint rejected — ${applied.reason}`;
+          intakeTask = applied.task;
+          taskStateDirty = true;
+          return `Task checkpoint saved (${applied.changes.join(", ")}).`;
+        },
+      }
+    : undefined;
+  // Engine-owned task tools cannot be shadowed by ad-hoc tools with the same names.
   const runExtraTools: Tool[] = [
-    ...(opts.extraTools ?? []).filter((tool) => tool.name !== "task_intake"),
+    ...(opts.extraTools ?? []).filter((tool) => tool.name !== "task_intake" && tool.name !== "task_checkpoint"),
     ...(taskIntakeTool ? [taskIntakeTool] : []),
+    ...(taskCheckpointTool ? [taskCheckpointTool] : []),
   ];
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
@@ -819,7 +906,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       opts.memory,
       opts.continuationSession,
       opts.executionContext,
-      { enabled: !!opts.taskIntake, brief: intakeTask?.brief },
+      { enabled: !!opts.taskIntake, brief: intakeTask?.brief, checkpoint: intakeTask?.checkpoint },
       ctx.profileId,
     );
     const system = assembledSystem.text;
@@ -1258,6 +1345,25 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           });
           continue;
         }
+        if (requiresChange && intakeTask?.brief?.requiredCapabilities?.length) {
+          const unchecked = intakeTask.brief.requiredCapabilities.filter((name) => {
+            const capability = Object.prototype.hasOwnProperty.call(intakeTask?.checkpoint?.capabilities ?? {}, name)
+              ? intakeTask?.checkpoint?.capabilities[name]
+              : undefined;
+            return !capability || capability.state === "unknown";
+          });
+          if (unchecked.length) {
+            plans.push({
+              tu,
+              tool,
+              denied:
+                `Capability preflight gate: this side effect was NOT executed. Check and record ${unchecked.join(", ")} ` +
+                "with task_checkpoint first. Record unavailable or blocked honestly; a known negative state still " +
+                "closes preflight and lets the task choose a safe partial path.",
+            });
+            continue;
+          }
+        }
         if (requiresChange && intakeTask?.brief?.intent !== "change") {
           plans.push({
             tu,
@@ -1507,7 +1613,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     const boundedContents = limitToolResultBatch(results.map((result) => result.content));
     for (let i = 0; i < results.length; i++) results[i].content = boundedContents[i];
     history.push({ role: "tool", results });
-    if (intakeDirty && intakeTask) {
+    if (taskStateDirty && intakeTask) {
       try {
         // The tool-use/result pair is now protocol-complete. Persist here—never inside the tool—so a crash
         // cannot leave a session ending in an orphaned tool_use, and no later side effect starts before the
@@ -1515,18 +1621,27 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         // from this same tool round is still settling, so merge from the authoritative owner once more at
         // this exact boundary instead of overwriting that acknowledged input with the earlier snapshot.
         const acceptedBrief = intakeTask.brief;
+        const acceptedCheckpoint = intakeTask.checkpoint;
+        const acceptedUpdatedAt = intakeTask.updatedAt;
         syncIntakeTask();
         // The current owner may still carry the previous brief when this call is a revision. The accepted
         // brief is the state transition from this round; authoritative refresh contributes newer steering,
         // while this assignment contributes the new interpretation.
-        if (acceptedBrief && intakeTask) {
-          intakeTask = { ...intakeTask, brief: acceptedBrief };
+        if (intakeTask) {
+          intakeTask = {
+            ...intakeTask,
+            ...(acceptedBrief ? { brief: acceptedBrief } : {}),
+            ...(acceptedCheckpoint ? { checkpoint: acceptedCheckpoint } : {}),
+            updatedAt: Date.parse(acceptedUpdatedAt) >= Date.parse(intakeTask.updatedAt)
+              ? acceptedUpdatedAt
+              : intakeTask.updatedAt,
+          };
         }
         opts.taskIntake?.onUpdate?.(intakeTask);
         opts.taskIntake?.onCheckpoint?.(intakeTask);
-        intakeDirty = false;
+        taskStateDirty = false;
       } catch (error) {
-        return interactionFailure("task-intake checkpoint", error);
+        return interactionFailure("task-state checkpoint", error);
       }
     }
     if (repeatHalt) return hardStop(opts, life, "repeat_loop", repeatHalt);

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   MAX_TASK_STEERING_ENTRIES,
   applyTaskBrief,
+  applyTaskCheckpoint,
   continueTaskExecution,
   consumePendingTaskSteering,
   createTaskExecution,
@@ -19,6 +20,7 @@ import {
   requestsTaskContinuation,
   recoverTaskExecution,
   taskExecutionContext,
+  taskCheckpointContext,
 } from "../dist/session/task.js";
 import { loadSession, newSessionId, saveSession } from "../dist/session/store.js";
 
@@ -71,6 +73,50 @@ test("task brief records the interpreted goal and acceptance separately from the
     "the mutable brief is composed dynamically by the agent loop instead of frozen into execution context",
   );
   assert.equal(isTaskExecution(accepted.task), true);
+});
+
+test("task checkpoint is one durable source for facts, capability preflight, blockers, and artifacts", () => {
+  const interaction = newTurnInteraction();
+  const task = createTaskExecution("verify and publish", interaction.turnId, "2026-08-05T00:00:00.000Z");
+  const first = applyTaskCheckpoint(task, {
+    current_step: "verify release assets",
+    next_step: "publish the verified manifest",
+    artifacts: ["dist/app.tar.gz", "dist/app.tar.gz", "reports/checksums.json"],
+    facts: [
+      { key: "assets_verified", value: 2, evidence: "two SHA-256 comparisons passed" },
+      { key: "manifest_published", value: false },
+      { key: "constructor", value: "ordinary domain fact", evidence: "stored as an own data key" },
+    ],
+    capabilities: [
+      { name: "release_upload", state: "available", detail: "authenticated dry-run passed" },
+      { name: "authenticode", state: "unavailable", detail: "no signing certificate configured" },
+    ],
+  }, "2026-08-05T00:01:00.000Z");
+  assert.equal(first.ok, true);
+  assert.deepEqual(first.checkpoint.artifacts, ["dist/app.tar.gz", "reports/checksums.json"]);
+  assert.equal(first.checkpoint.facts.assets_verified.value, 2);
+  assert.equal(first.checkpoint.facts.constructor.value, "ordinary domain fact");
+  assert.equal(first.checkpoint.capabilities.authenticode.state, "unavailable");
+  assert.match(taskCheckpointContext(first.checkpoint), /assets_verified = 2/);
+  assert.match(taskCheckpointContext(first.checkpoint), /authenticode: unavailable/);
+  assert.equal(isTaskExecution(first.task), true);
+
+  const contradiction = applyTaskCheckpoint(first.task, {
+    facts: [{ key: "manifest_published", value: true }],
+  });
+  assert.equal(contradiction.ok, false);
+  assert.match(contradiction.reason, /fresh evidence/);
+
+  const revised = applyTaskCheckpoint(first.task, {
+    current_step: "",
+    blocked_step: "publish manifest",
+    block_reason: "release approval is pending",
+    facts: [{ key: "manifest_published", value: true, evidence: "public readback matched the uploaded bytes" }],
+  }, "2026-08-05T00:02:00.000Z");
+  assert.equal(revised.ok, true);
+  assert.equal(revised.checkpoint.currentStep, undefined);
+  assert.equal(revised.checkpoint.blockedStep, "publish manifest");
+  assert.equal(revised.checkpoint.facts.manifest_published.value, true);
 });
 
 test("task steering rejects stale turn identity", () => {
@@ -153,7 +199,7 @@ test("fork copies steering audit but never duplicates executable pending ownersh
 });
 
 test("idle continuation detection is explicit instead of hijacking every new message", () => {
-  for (const text of ["继续", "继续，补测试", "go on", "resume: verify it", "/continue deploy"]) {
+  for (const text of ["继续", "继续，补测试", "重新执行", "现在去执行任务", "go on", "resume: verify it", "/continue deploy"]) {
     assert.equal(requestsTaskContinuation(text), true, text);
   }
   for (const text of ["review another project", "修复桌面端", "继续教育模块要改名", "the resume parser is broken", "/resume deadbeef"]) {
@@ -208,12 +254,20 @@ test("session task state round-trips separately, redacts secrets, and legacy ses
     });
     assert.equal(briefed.ok, true);
     task = briefed.task;
+    const checkpointed = applyTaskCheckpoint(task, {
+      artifacts: ["report-API_KEY=super-secret-123456.json"],
+      facts: [{ key: "deployment_ready", value: true, evidence: "API_KEY=super-secret-123456 validated" }],
+      capabilities: [{ name: "deploy", state: "available", detail: "DEPLOY_TOKEN=super-secret-123456 accepted" }],
+    });
+    assert.equal(checkpointed.ok, true);
+    task = checkpointed.task;
     saveSession(meta, [{ role: "user", content: "continue" }], task);
     const loaded = loadSession(id);
     assert.ok(loaded.task, "new top-level task is restored");
     assert.equal(loaded.history[0].content, "continue", "transcript remains independent");
     assert.ok(!loaded.task.objective.includes("super-secret-123456"), "task objective is redacted too");
     assert.ok(!JSON.stringify(loaded.task.brief).includes("super-secret-123456"), "interpreted task brief is redacted too");
+    assert.ok(!JSON.stringify(loaded.task.checkpoint).includes("super-secret-123456"), "structured task checkpoint is redacted too");
 
     const legacyId = newSessionId();
     const legacy = { meta: { ...meta, id: legacyId, updatedAt: "2026-07-15T00:00:00.000Z" }, history: [] };

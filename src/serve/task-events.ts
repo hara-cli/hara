@@ -57,6 +57,12 @@ export interface TaskLifecycleEvent {
     total: number;
     current?: string;
     owner?: string;
+    blockedStep?: string;
+    blockReason?: string;
+    nextStep?: string;
+    artifacts?: string[];
+    facts?: Record<string, string | number | boolean>;
+    capabilities?: Record<string, { state: "available" | "unavailable" | "blocked" | "unknown"; detail?: string }>;
   };
   detail?: string;
   approval?: {
@@ -89,6 +95,7 @@ export function taskLifecycleEvent(
   }
   const current = todos.find((todo) => todo.status === "in_progress")
     ?? todos.find((todo) => todo.status === "pending");
+  const persisted = task.checkpoint;
   const detail = bounded(activity.detail, 500);
   const approval = activity.approval
     ? {
@@ -119,8 +126,30 @@ export function taskLifecycleEvent(
     checkpoint: {
       done: todos.filter((todo) => todo.status === "done").length,
       total: todos.length,
-      ...(current ? { current: bounded(current.activeForm || current.text, 300) } : {}),
+      ...(current
+        ? { current: bounded(current.activeForm || current.text, 300) }
+        : persisted?.currentStep
+          ? { current: bounded(persisted.currentStep, 300) }
+          : {}),
       ...(current?.owner ? { owner: bounded(current.owner, 120) } : {}),
+      ...(persisted?.blockedStep ? { blockedStep: bounded(persisted.blockedStep, 300) } : {}),
+      ...(persisted?.blockReason ? { blockReason: bounded(persisted.blockReason, 500) } : {}),
+      ...(persisted?.nextStep ? { nextStep: bounded(persisted.nextStep, 300) } : {}),
+      ...(persisted?.artifacts.length ? { artifacts: persisted.artifacts.map((item) => item.slice(0, 1_000)) } : {}),
+      ...(persisted && Object.keys(persisted.facts).length
+        ? { facts: Object.fromEntries(Object.entries(persisted.facts).map(([key, fact]) => [key, fact.value])) }
+        : {}),
+      ...(persisted && Object.keys(persisted.capabilities).length
+        ? {
+            capabilities: Object.fromEntries(Object.entries(persisted.capabilities).map(([name, capability]) => [
+              name,
+              {
+                state: capability.state,
+                ...(capability.detail ? { detail: bounded(capability.detail, 500) } : {}),
+              },
+            ])),
+          }
+        : {}),
     },
     ...(detail ? { detail } : {}),
     ...(approval ? { approval } : {}),

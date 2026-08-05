@@ -534,3 +534,157 @@ test("task_intake refreshes authoritative steering state instead of overwriting 
   assert.equal(task.steering.length, 1, "the accepted steering audit survives the later immutable brief update");
   assert.equal(task.steering[0].content, "also preserve the queued correction");
 });
+
+test("task_checkpoint persists after a closed tool round and becomes the next round's authoritative state", async () => {
+  const interaction = newTurnInteraction();
+  let task = createTaskExecution("inspect and publish", interaction.turnId, "2026-08-05T00:00:00.000Z");
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: {
+          current_step: "publish verified output",
+          next_step: "read back the public artifact",
+          artifacts: ["dist/result.json"],
+          facts: [{ key: "checks_passed", value: 4, evidence: "four focused checks passed" }],
+          capabilities: [{ name: "publish", state: "available", detail: "authenticated preflight succeeded" }],
+        },
+      }],
+      stop: "tool_use",
+    },
+    { text: "done", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "inspect and publish" }];
+  const checkpoints = [];
+  await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        const tail = history.at(-1);
+        checkpoints.push({
+          task: next,
+          closed: tail?.role === "tool" && tail.results.some((result) => result.name === "task_checkpoint"),
+        });
+        task = next;
+      },
+    },
+  });
+
+  assert.equal(checkpoints.length, 2, "both the brief and structured state have durable boundaries");
+  assert.equal(checkpoints[1].closed, true, "checkpoint persistence waits for its tool result to close the round");
+  assert.equal(task.checkpoint.facts.checks_passed.value, 4);
+  assert.equal(task.checkpoint.capabilities.publish.state, "available");
+  assert.deepEqual(task.checkpoint.artifacts, ["dist/result.json"]);
+  assert.match(p.systems.at(-1), /checks_passed = 4/);
+  assert.match(p.systems.at(-1), /publish: available/);
+  assert.match(p.systems.at(-1), /dist\/result\.json/);
+});
+
+test("serial task_intake and task_checkpoint updates in one tool round cannot overwrite each other", async () => {
+  const interaction = newTurnInteraction();
+  let task = createTaskExecution("verify one result", interaction.turnId);
+  const p = provider([
+    {
+      text: "",
+      toolUses: [
+        { id: "b1", name: "task_intake", input: BRIEF },
+        {
+          id: "c1",
+          name: "task_checkpoint",
+          input: { facts: [{ key: "verified", value: true, evidence: "readback matched" }] },
+        },
+      ],
+      stop: "tool_use",
+    },
+    { text: "done", toolUses: [], stop: "end" },
+  ]);
+  await runAgent([{ role: "user", content: "verify one result" }], {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        task = next;
+      },
+    },
+  });
+  assert.equal(task.brief.goal, BRIEF.goal);
+  assert.equal(task.checkpoint.facts.verified.value, true);
+});
+
+test("declared non-core capabilities must have one fixed preflight state before side effects", async () => {
+  const interaction = newTurnInteraction();
+  let task = createTaskExecution("prepare a visual report", interaction.turnId);
+  let edits = 0;
+  const edit = {
+    name: "fixture_capability_edit",
+    description: "test-only report edit",
+    input_schema: { type: "object", properties: {} },
+    kind: "edit",
+    async run() {
+      edits++;
+      return "edited";
+    },
+  };
+  const brief = { ...BRIEF, required_capabilities: ["vision_model"] };
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: brief }], stop: "tool_use" },
+    { text: "", toolUses: [{ id: "e0", name: edit.name, input: {} }], stop: "tool_use" },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: { capabilities: [{ name: "vision_model", state: "unavailable", detail: "model route has no image input" }] },
+      }],
+      stop: "tool_use",
+    },
+    { text: "", toolUses: [{ id: "e1", name: edit.name, input: {} }], stop: "tool_use" },
+    { text: "done", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "prepare a visual report" }];
+  await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [edit],
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        task = next;
+      },
+    },
+  });
+
+  assert.equal(edits, 1, "the edit before preflight was denied and the post-preflight safe partial path ran");
+  assert.deepEqual(task.brief.requiredCapabilities, ["vision_model"]);
+  assert.equal(task.checkpoint.capabilities.vision_model.state, "unavailable");
+  const denied = history.find((message) =>
+    message.role === "tool" && message.results.some((result) => result.id === "e0"));
+  assert.match(denied.results.find((result) => result.id === "e0").content, /Capability preflight gate/);
+});
