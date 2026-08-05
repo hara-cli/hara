@@ -96,6 +96,7 @@ import {
   type Profile,
   type ActiveResolution,
 } from "./profile/profile.js";
+import { serviceBindingHost } from "./profile/organization-service.js";
 import { loadPermissionRules, scaffoldPermissions, globalPermissionsPath, projectPermissionsPath } from "./security/permissions.js";
 import { routingProvider } from "./agent/route.js";
 import {
@@ -723,6 +724,19 @@ function organizationConnectionsSnapshot(targetCwd: string) {
         ...(profile.enrolledAt ? { enrolledAt: profile.enrolledAt } : {}),
         ...(profile.tokenExpiresAt ? { expiresAt: profile.tokenExpiresAt } : {}),
         ...(profile.tokenNeverExpires ? { tokenNeverExpires: true } : {}),
+        ...(profile.serviceBindings?.length
+          ? {
+              services: profile.serviceBindings.map((binding) => ({
+                service: binding.service,
+                mode: binding.mode,
+                accountRegion: binding.accountRegion,
+                host: serviceBindingHost(binding.apiOrigin),
+                status: binding.status,
+                capabilitiesVersion: binding.capabilitiesVersion,
+                configVersion: binding.configVersion,
+              })),
+            }
+          : {}),
         accessState: organizationAccessState(profile),
       };
     });

@@ -1555,6 +1555,15 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       availableModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
       tokenNeverExpires: true,
       accessState: "permanent",
+      services: [{
+        service: "DESK_TASKS",
+        mode: "CUSTOMER_HOSTED",
+        accountRegion: "CN",
+        host: "desk.example.com",
+        status: "ACTIVE",
+        capabilitiesVersion: 2,
+        configVersion: 4,
+      }],
     }],
   };
   const deps = {
@@ -1723,6 +1732,15 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.deepEqual(organizations.result.connections[0].availableModels, ["deepseek-v4-flash", "deepseek-v4-pro"]);
     assert.equal(organizations.result.connections[0].tokenNeverExpires, true);
     assert.equal(organizations.result.connections[0].accessState, "permanent");
+    assert.deepEqual(organizations.result.connections[0].services, [{
+      service: "DESK_TASKS",
+      mode: "CUSTOMER_HOSTED",
+      accountRegion: "CN",
+      host: "desk.example.com",
+      status: "ACTIVE",
+      capabilitiesVersion: 2,
+      configVersion: 4,
+    }]);
     assert.equal(JSON.stringify(organizations.result).includes("org-device-secret-must-not-leak"), false);
 
     const enrollmentCode = "single-use-code-must-not-leak";

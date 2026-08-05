@@ -38,6 +38,19 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
       available_models: ["deepseek-v4-pro"],
       thinking_efforts: ["off", "high", "max"],
       expires_at: "2026-01-08T00:00:00Z",
+      service_bindings: [{
+        tenant_id: "tenant-1",
+        service: "COLLAB",
+        mode: "HARA_HOSTED",
+        account_region: "GLOBAL",
+        api_origin: "https://collab.example.test",
+        issuer: "https://account.example.test",
+        jwks_uri: "https://account.example.test/.well-known/jwks.json",
+        audience: "hara-collab",
+        status: "ACTIVE",
+        capabilities_version: 1,
+        config_version: 3,
+      }],
     },
     "2026-01-01",
   );
@@ -48,6 +61,19 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
   assert.deepEqual(e.thinkingEfforts, ["off", "high", "max"]);
   assert.equal(e.expiresAt, "2026-01-08T00:00:00.000Z");
   assert.equal(e.tokenNeverExpires, false);
+  assert.deepEqual(e.serviceBindings, [{
+    tenantId: "tenant-1",
+    service: "COLLAB",
+    mode: "HARA_HOSTED",
+    accountRegion: "GLOBAL",
+    apiOrigin: "https://collab.example.test",
+    issuer: "https://account.example.test",
+    jwksUri: "https://account.example.test/.well-known/jwks.json",
+    audience: "hara-collab",
+    status: "ACTIVE",
+    capabilitiesVersion: 1,
+    configVersion: 3,
+  }]);
   assert.equal(gatewayBaseURL(e), "https://gw/v1");
   assert.equal(gatewayBaseURL({ ...e, baseURL: "https://gw/openai" }), "https://gw/openai");
   assert.throws(() => parseEnrollResponse("https://gw", {}, "t"), /device_token/);
@@ -81,6 +107,23 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
       },
     }, "t"),
     /invalid desk binding/,
+  );
+  assert.throws(
+    () => parseEnrollResponse("https://gw", {
+      device_token: "t1",
+      service_bindings: [{
+        tenant_id: "tenant-1",
+        service: "DESK_TASKS",
+        mode: "HARA_HOSTED",
+        account_region: "GLOBAL",
+        api_origin: "https://desk.example.test",
+        status: "ACTIVE",
+        capabilities_version: 1,
+        config_version: 1,
+        credential: "must-never-cross-the-wire",
+      }],
+    }, "t"),
+    /must not contain credentials/,
   );
   const permanent = parseEnrollResponse(
     "https://gw",
@@ -200,6 +243,16 @@ test("profile-native enrollment stores only the scoped token in private profiles
           owner: "member@example.test",
           token: "separate-desk-token",
         },
+        service_bindings: [{
+          tenant_id: "tenant-team-a",
+          service: "DESK_TASKS",
+          mode: "CUSTOMER_HOSTED",
+          account_region: "CN",
+          api_origin: "https://desk.example.test",
+          status: "ACTIVE",
+          capabilities_version: 1,
+          config_version: 2,
+        }],
       }));
     } else if (req.url === "/v1/heartbeat") {
       heartbeatSeen = req.headers.authorization === "Bearer scoped-device-token";
@@ -233,6 +286,16 @@ test("profile-native enrollment stores only the scoped token in private profiles
     assert.deepEqual(storedProfile?.thinkingEfforts, ["off", "high", "max"]);
     assert.equal(storedProfile?.tokenExpiresAt, undefined, "a heartbeat can replace a finite expiry with explicit permanent access");
     assert.equal(storedProfile?.tokenNeverExpires, true);
+    assert.deepEqual(storedProfile?.serviceBindings, [{
+      tenantId: "tenant-team-a",
+      service: "DESK_TASKS",
+      mode: "CUSTOMER_HOSTED",
+      accountRegion: "CN",
+      apiOrigin: "https://desk.example.test",
+      status: "ACTIVE",
+      capabilitiesVersion: 1,
+      configVersion: 2,
+    }]);
     assert.equal(
       loadProfileCreds({
         profileId: "team-a",
@@ -248,6 +311,7 @@ test("profile-native enrollment stores only the scoped token in private profiles
     const stored = readFileSync(profilesPath, "utf8");
     assert.equal(stored.includes("one-time-code"), false, "the registration code is never persisted");
     assert.equal(stored.includes("separate-desk-token"), false, "the Desk bearer never enters the model profile store");
+    assert.equal(stored.includes("tenant-team-a"), true, "redacted service descriptors stay pinned to the organization profile");
     assert.equal(existsSync(join(home, ".hara", "org.json")), false, "Desktop/profile enrollment does not create legacy state");
     await assert.rejects(
       () => enrollGatewayProfile({ id: "personal", gatewayUrl: url, code: "another-code" }),

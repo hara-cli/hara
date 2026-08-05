@@ -314,6 +314,15 @@ export interface OrganizationConnectionSummary {
   expiresAt?: string;
   tokenNeverExpires?: boolean;
   accessState: OrganizationAccessState;
+  services?: Array<{
+    service: "MODEL_CONTROL" | "DESK_TASKS" | "COLLAB" | "EXTENSION_CATALOG";
+    mode: "HARA_HOSTED" | "CUSTOMER_HOSTED";
+    accountRegion: "CN" | "GLOBAL";
+    host: string;
+    status: "ACTIVE";
+    capabilitiesVersion: number;
+    configVersion: number;
+  }>;
 }
 
 export interface OrganizationConnectionsState {

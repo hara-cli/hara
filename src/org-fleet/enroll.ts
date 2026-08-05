@@ -33,6 +33,10 @@ import {
   type Profile,
 } from "../profile/profile.js";
 import {
+  parseOrganizationServiceBindings,
+  type OrganizationServiceBinding,
+} from "../profile/organization-service.js";
+import {
   bindPrivateHaraStateFile,
   readPrivateStateFileSnapshotSync,
   removePrivateStateFile,
@@ -58,6 +62,8 @@ export interface Enrollment {
   /** Optional separately scoped Desk credential provisioned by Control during the same enrollment.
    * It is consumed into desk-connections.json and is never persisted in the gateway profile. */
   desk?: DeskCreds;
+  /** Redacted active services advertised for this tenant. Never contains a bearer or credential. */
+  serviceBindings?: OrganizationServiceBinding[];
 }
 
 export interface GatewayProfileEnrollmentInput {
@@ -161,6 +167,7 @@ export function loadEnrollment(): Enrollment | null {
         enrolledAt: ap.enrolledAt || new Date().toISOString(),
         expiresAt: ap.tokenExpiresAt,
         tokenNeverExpires: ap.tokenNeverExpires,
+        serviceBindings: ap.serviceBindings,
       };
     }
   } catch {
@@ -306,6 +313,9 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     expiresAt,
     tokenNeverExpires,
     desk: parseDeskBinding(j.desk ?? j.desk_binding ?? j.deskBinding),
+    serviceBindings: parseOrganizationServiceBindings(
+      j.service_bindings ?? j.serviceBindings,
+    ),
   };
 }
 
@@ -395,6 +405,7 @@ export function gatewayProfileFromEnrollment(id: string, label: string | undefin
     enrolledAt: e.enrolledAt,
     tokenExpiresAt: e.expiresAt,
     tokenNeverExpires: e.tokenNeverExpires,
+    serviceBindings: e.serviceBindings,
   };
 }
 
@@ -463,6 +474,7 @@ export function enrollmentFromProfile(profile: Profile): Enrollment | null {
     enrolledAt: profile.enrolledAt || new Date(0).toISOString(),
     expiresAt: profile.tokenExpiresAt,
     tokenNeverExpires: profile.tokenNeverExpires,
+    serviceBindings: profile.serviceBindings,
   };
 }
 

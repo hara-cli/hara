@@ -50,6 +50,10 @@ import {
   type PrivateStateFileBinding,
   type PrivateStateFileSnapshot,
 } from "../security/private-state.js";
+import {
+  parseOrganizationServiceBindings,
+  type OrganizationServiceBinding,
+} from "./organization-service.js";
 
 export type ProfileKind = "byok" | "gateway";
 
@@ -80,6 +84,9 @@ export interface Profile {
   tokenExpiresAt?: string;
   /** Explicit Control policy: this scoped token has no fixed date expiry. It remains revocable. */
   tokenNeverExpires?: boolean;
+  /** Redacted ACTIVE services installed with this organization enrollment. Credentials are held
+   * by their dedicated sidecar stores or obtained later through Account login. */
+  serviceBindings?: OrganizationServiceBinding[];
   /** Optional lifecycle metadata for user-created named connections. Legacy profiles remain valid
    * without these fields. */
   createdAt?: string;
@@ -155,6 +162,13 @@ function readPersonalFromConfig(): Profile {
 function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | null {
   if (!e || !e.gatewayUrl || !e.deviceToken) return null;
   const defaultModel: string = e.model || "";
+  let serviceBindings: OrganizationServiceBinding[] | undefined;
+  try {
+    serviceBindings = parseOrganizationServiceBindings(e.serviceBindings);
+  } catch {
+    // Legacy state predates this descriptor and may be malformed. Ignore only the optional public
+    // metadata rather than making an otherwise valid organization credential impossible to migrate.
+  }
   return {
     id: DEFAULT_ORG_ID,
     kind: "gateway",
@@ -171,6 +185,7 @@ function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | nul
     enrolledAt: e.enrolledAt || new Date().toISOString(),
     tokenExpiresAt: typeof e.expiresAt === "string" ? e.expiresAt : undefined,
     tokenNeverExpires: e.tokenNeverExpires === true ? true : undefined,
+    serviceBindings,
   };
 }
 
