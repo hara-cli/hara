@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.141.1 — 2026-08-06 — private reasoning and reliable preview execution
+
+- Filter leaked `<think>` and `<thinking>` blocks, orphan closing tags, and stream-split tag fragments
+  from both user-visible output and persisted assistant history, while preserving inline documentation.
+  User-facing progress, tool preambles, and final replies are also instructed to keep the language of
+  the latest user message consistently.
+- Replace a completed `task_intake` checkpoint with an explicit model-waiting lifecycle state as soon as
+  the next provider request starts, so a slow response no longer looks like a frozen task. Failed or
+  empty turns retain their resumable blocked boundary instead of appearing indefinitely active.
+- Refuse to run local `python -m http.server` previews or public tunnels under short foreground
+  timeouts. Hara now requires managed background jobs, readiness polling, and URL verification so a
+  successful preview is not destroyed moments after it starts.
+- Upgrade with `npm i -g @nanhara/hara@0.141.1`.
+
 ## 0.141.0 — 2026-08-06 — recoverable conversations and durable execution state
 
 - Keep an unavailable or revoked model route from locking away local conversation history. Persistent
