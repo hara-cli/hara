@@ -2253,7 +2253,8 @@ test("serve e2e: failed and empty turns never replay an earlier assistant reply"
         return { text: "", toolUses: [], stop: "end", usage: { input: 1, output: 0 } };
       },
     };
-    const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, memStore()));
+    const store = memStore();
+    const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
     const c = await connect(srv.port);
     try {
       await c.call("initialize", { token: "tok" });
@@ -2267,6 +2268,9 @@ test("serve e2e: failed and empty turns never replay an earlier assistant reply"
       const turnEnd = c.events.filter((event) => event.method === "event.turn_end").at(-1);
       assert.equal(turnEnd.params.status, mode);
       assert.equal(turnEnd.params.reply, "", `${mode} event has no stale reply`);
+      const taskState = c.events.filter((event) => event.method === "event.task_state").at(-1);
+      assert.equal(taskState.params.state, "blocked", `${mode} cannot leave the task indefinitely running`);
+      assert.equal(store.saved.get(result.sessionId).task.status, "blocked", `${mode} persists a resumable failure boundary`);
     } finally {
       c.close();
       await srv.close();
@@ -2872,6 +2876,14 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
     );
     assert.equal(c.events.filter((e) => e.method === "event.task_state").at(-1).params.state, "completed");
     const lifecycle = c.events.filter((e) => e.method === "event.task_state").map((e) => e.params);
+    const checkpointIndex = lifecycle.findIndex((event) => event.phase === "checkpoint");
+    assert.ok(checkpointIndex >= 0, "task_intake closes with a durable checkpoint");
+    assert.ok(
+      lifecycle.slice(checkpointIndex + 1).some(
+        (event) => event.phase === "thinking" && event.detail === "Waiting for model response",
+      ),
+      "the next provider round replaces the checkpoint phase immediately instead of looking stuck",
+    );
     assert.ok(
       lifecycle.every((event, index) => index === 0 || event.sequence > lifecycle[index - 1].sequence),
       "approval transitions retain strict event ordering",

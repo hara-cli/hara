@@ -37,6 +37,7 @@ import { classifyError, failoverAction, errorHint } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
 import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
 import { setTurnPhase } from "./phase.js";
+import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText } from "../security/secrets.js";
@@ -108,8 +109,9 @@ export function replyLanguageInstruction(env: NodeJS.ProcessEnv = process.env): 
 
 const HARA_SYSTEM = () =>
   `You are hara, a coding agent running in the user's terminal.
-Be concise and direct. ${replyLanguageInstruction()} keep code, commands, paths, and technical identifiers
-unchanged. Use the
+Be concise and direct. ${replyLanguageInstruction()} Keep that language consistent in every user-visible
+progress sentence, tool-round preamble, and final response; never switch languages merely because tools,
+logs, or source text use another language. Keep code, commands, paths, and technical identifiers unchanged. Use the
 provided tools to read files, edit/write files, and run shell
 commands. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
 them whole. Batch INDEPENDENT tool calls in a single response — especially reads (read_file / grep /
@@ -195,7 +197,9 @@ that ordering is authoritative — never skip the middle steps, or you serve sta
 two-day-old work. Package-manager installs receive a longer attached timeout by default; use background jobs
 only when explicitly appropriate, and poll a background job before depending on it. Before opening a public tunnel,
 verify that provider's authentication/config once; if it is missing, stop and ask instead of trying a chain
-of unrelated tunnel tools. After completing a task, give a one-line summary.`;
+of unrelated tunnel tools. Start local HTTP servers and the chosen tunnel as managed background jobs, poll
+until each is ready, and verify the local and public URLs; never give a long-lived server or tunnel a short
+foreground timeout. After completing a task, give a one-line summary.`;
 
 /** When running inside `hara gateway`, tell the agent it's in a chat — so it delivers files via send_file
  *  (the only channel that reaches the peer) and never reaches for the desktop client / computer tool. */
@@ -935,6 +939,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }
     const tty = stdout.isTTY && !opts.quiet && !sink;
     const md = tty && process.env.HARA_MD !== "0" ? makeRenderer(out) : null;
+    const assistantText = new AssistantTextSanitizer();
     // "working Ns" spinner until the first answer token arrives (or the turn ends). Provider reasoning
     // is deliberately an internal execution signal: it keeps the stall watchdog alive and may update a
     // typed phase through an empty sink notification, but its content never enters a terminal/UI stream.
@@ -946,6 +951,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         spin = null;
         out("\r\x1b[K");
       }
+    };
+    const emitVisibleText = (delta: string): void => {
+      if (!delta || opts.quiet) return;
+      if (sink) {
+        sink.text(delta);
+        return;
+      }
+      stopSpin();
+      if (md) md.push(delta);
+      else out(delta);
     };
     if (tty) {
       const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
@@ -976,9 +991,15 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }, Math.min(2_000, Math.max(250, STALL_MS / 4)));
     const alive = (): void => {
       lastEvent = Date.now();
-      if (!opts.quiet) setTurnPhase("streaming");
+      if (!opts.quiet) {
+        setTurnPhase("streaming");
+        sink?.status?.("streaming");
+      }
     };
-    if (!opts.quiet) setTurnPhase("waiting"); // request sent, nothing streamed yet — the status row shows it
+    if (!opts.quiet) {
+      setTurnPhase("waiting"); // request sent, nothing streamed yet — the status row shows it
+      sink?.status?.("waiting");
+    }
     let r!: Awaited<ReturnType<Provider["turn"]>>;
     let removeAttemptStop = (): void => {};
     try {
@@ -1012,14 +1033,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       onText: (d) => {
         if (attempt.signal.aborted) return;
         alive();
-        if (opts.quiet) return;
-        if (sink) {
-          sink.text(d);
-          return;
-        }
-        stopSpin();
-        if (md) md.push(d);
-        else out(d);
+        emitVisibleText(assistantText.push(d));
       },
       onReasoning: () => {
         if (attempt.signal.aborted) return;
@@ -1050,6 +1064,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       clearInterval(stallTimer);
       removeAttemptStop();
       runSignal.removeEventListener("abort", onRunAbort);
+      emitVisibleText(assistantText.finish());
       // Every exit path (sync throw, rejected promise, watchdog, Esc, deadline) owns the same terminal
       // teardown. Leaving any of these after the try makes a failed provider strand the spinner/markdown.
       stopSpin();
@@ -1061,6 +1076,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     if (stalled && r.stop === "error" && !runSignal.aborted) {
       r = { ...r, errorMsg: `model stream timeout — no output for ${Math.round(STALL_MS / 1000)}s (stalled connection?)` };
     }
+    // Built-in providers mirror streamed deltas in `text`, while custom providers may return text without
+    // streaming it. Sanitize the authoritative persisted value independently so neither route can retain a
+    // provider's leaked <think>/<thinking> block in session history or a later model request.
+    r = { ...r, text: sanitizeAssistantText(r.text) };
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;
       opts.stats.output += r.usage.output;

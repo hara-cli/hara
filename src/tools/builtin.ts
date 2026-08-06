@@ -53,6 +53,30 @@ export function isNgrokTunnelCommand(command: string): boolean {
   return /(?:^|[;&|]\s*)ngrok\s+(?:http|tcp|tls|start)\b/i.test(command.trim());
 }
 
+/** Public tunnels are long-lived services. Running one as an attached command with a short timeout can
+ * print a valid URL and then immediately destroy it, which is worse than failing before publication. */
+export function isLongRunningTunnelCommand(command: string): boolean {
+  const parts = splitCompound(command) ?? [command];
+  return parts.some((part) => {
+    if (isNgrokTunnelCommand(part)) return true;
+    const normalized = part.replace(/["']/g, " ").replace(/\s+/g, " ").trim();
+    if (/^(?:(?:npx(?:\s+--yes)?|pnpm\s+dlx|bunx)\s+)?localtunnel(?:\s|$)/i.test(normalized)) {
+      return true;
+    }
+    return /^(?:(?:npx(?:\s+--yes)?|pnpm\s+dlx|bunx)\s+)?lt\s+(?:--port|-p)(?:\s|=)/i.test(normalized);
+  });
+}
+
+/** A local static server is also a durable dependency for a public preview. Keeping it attached to a
+ * short tool timeout makes the later tunnel URL point at a process Hara has already destroyed. */
+export function isLongRunningLocalServerCommand(command: string): boolean {
+  const parts = splitCompound(command) ?? [command];
+  return parts.some((part) => {
+    const normalized = part.replace(/["']/g, " ").replace(/\s+/g, " ").trim();
+    return /^(?:\S*[\\/])?python(?:3(?:\.\d+)*)?\s+-m\s+http\.server(?:\s|$)/iu.test(normalized);
+  });
+}
+
 /**
  * Interactive WeChat login needs a real terminal or Desktop's owned QR surface. An agent shell is
  * headless, so launching it there can strand a login process after the task finishes.
@@ -352,6 +376,16 @@ registerTool({
       return (
         "Skipped ngrok tunnel: no authentication was found in NGROK_AUTHTOKEN/NGROK_API_KEY or the standard ngrok config files. " +
         "Configure ngrok authentication first, then retry. Do not rotate through other tunnel providers blindly; ask the user which authenticated provider to use."
+      );
+    }
+    const longRunningTunnel = isLongRunningTunnelCommand(input.command);
+    const longRunningLocalServer = isLongRunningLocalServerCommand(input.command);
+    if ((longRunningTunnel || longRunningLocalServer) && !input.background) {
+      return (
+        `Skipped foreground ${longRunningTunnel ? "tunnel" : "local server"}: this is a long-running service, ` +
+        "so an attached timeout can kill it after it is already ready. Run this exact command with " +
+        "background:true, poll the returned job until readiness is visible, then verify the local or public " +
+        "URL before depending on it."
       );
     }
     if (input.background) {

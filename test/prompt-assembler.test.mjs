@@ -63,6 +63,8 @@ test("Hara prompt keeps core/session identities stable when the accepted task br
     );
     assert.match(after.text, /Working directory: \/workspace\/project/);
     assert.match(after.text, /Reply in the same language as the user's latest message/);
+    assert.match(after.text, /Keep that language consistent in every user-visible/);
+    assert.match(after.text, /never give a long-lived server or tunnel a short/);
     assert.match(after.text, /# Project context \(AGENTS\.md\)/);
     assert.match(after.text, /The task brief below is the accepted interpretation/);
   } finally {

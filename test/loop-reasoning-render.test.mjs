@@ -99,3 +99,53 @@ test("non-TUI reasoning: a synchronous provider failure clears the TTY spinner a
   assert.match(outcome?.error ?? "", /synchronous provider fixture failure/);
   assert.match(chunks.join(""), /synchronous provider fixture failure/);
 });
+
+test("ordinary provider text cannot leak reasoning tags into streamed output or session history", async () => {
+  const history = [{ role: "user", content: "请回答" }];
+  const provider = {
+    id: "content-reasoning-leak",
+    model: "fake-model",
+    async turn({ onText }) {
+      onText("</thi");
+      onText("nk>\n公开答案");
+      return { text: "</think>\n公开答案", toolUses: [], stop: "end" };
+    },
+  };
+
+  const chunks = await withTemporaryHome(() => withCapturedStdout(() =>
+    runAgent(history, {
+      provider,
+      ctx: { cwd: process.cwd() },
+      approval: "full-auto",
+      confirm: async () => true,
+    }),
+  ));
+
+  const rendered = stripAnsi(chunks.join(""));
+  assert.match(rendered, /公开答案/);
+  assert.doesNotMatch(rendered, /<\/?think/i);
+  assert.equal(history.at(-1)?.role, "assistant");
+  assert.equal(history.at(-1)?.text, "\n公开答案");
+});
+
+test("returned assistant text is sanitized even when a custom provider does not stream it", async () => {
+  const history = [{ role: "user", content: "hi" }];
+  const provider = {
+    id: "return-only-reasoning-leak",
+    model: "fake-model",
+    async turn() {
+      return { text: "<thinking>private trace</thinking>safe", toolUses: [], stop: "end" };
+    },
+  };
+
+  await withTemporaryHome(() => runAgent(history, {
+    provider,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+  }));
+
+  assert.equal(history.at(-1)?.role, "assistant");
+  assert.equal(history.at(-1)?.text, "safe");
+});

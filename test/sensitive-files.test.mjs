@@ -175,6 +175,8 @@ test("sensitive path policy covers Hara control-plane state, NTFS aliases, and n
     assert.equal(sensitiveFileReason(join(state, "workspace", "notes.md")), null);
     assert.equal(sensitiveFileReason(join(state, "skills", "review", "SKILL.md")), null);
     assert.equal(sensitiveFileReason(join(state, "weixin", "media", "incoming.png")), null);
+    assert.equal(sensitiveFileReason(join(state, "desktop", "media", "paste.png")), null);
+    assert.match(sensitiveFileReason(join(state, "tmp", "paste.png")) ?? "", /private Hara/i);
 
     for (const path of [
       ".netrc",

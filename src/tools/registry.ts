@@ -9,6 +9,9 @@ import type { SkillToolPolicyActivation } from "../skills/tool-policy.js";
 export interface UiSink {
   text(delta: string): void;
   reasoning(delta: string): void;
+  /** Provider request lifecycle without provider text. Persistent clients use `waiting` to replace a
+   * stale tool/checkpoint phase while the next model round is in flight. */
+  status?(phase: "waiting" | "streaming"): void;
   tool(name: string, preview: string): void;
   diff(text: string): void;
   notice(text: string): void;

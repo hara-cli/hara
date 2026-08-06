@@ -1170,6 +1170,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         // never forward the model's reasoning delta into the renderer notification stream.
         emitTaskState({ state: "running", phase: "thinking" });
       },
+      status: (phase) => {
+        // A task_intake/checkpoint round can be followed by a slow provider request. Publish that boundary
+        // immediately so Desktop does not leave the last tool phase looking frozen while the model is alive.
+        if (phase === "waiting") {
+          emitTaskState({ state: "running", phase: "thinking", detail: "Waiting for model response" });
+        }
+      },
       tool: (name, preview) => {
         // The task/status plane is safe for ambient surfaces such as an always-on-top companion.
         // Command/path previews remain on the explicit event.tool transcript plane only.

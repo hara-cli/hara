@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSyn
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { capHeadTail, isHeadlessWeixinLoginCommand, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
+import { capHeadTail, isHeadlessWeixinLoginCommand, isLongRunningLocalServerCommand, isLongRunningTunnelCommand, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
 import { atomicWriteText } from "../dist/fs-write.js";
 import { readRegularFileSnapshot } from "../dist/fs-read.js";
@@ -39,6 +39,23 @@ test("package installs and ngrok tunnels are classified for safe timeout/preflig
   for (const c of ["npm test", "pnpm check", "node install.js"]) assert.equal(isPackageInstallCommand(c), false, c);
   assert.equal(isNgrokTunnelCommand("ngrok http 3000"), true);
   assert.equal(isNgrokTunnelCommand("ngrok config check"), false);
+  for (const c of [
+    "ngrok http 3000",
+    "npx localtunnel --port 3000",
+    "npx --yes localtunnel --port 3000",
+    "pnpm dlx localtunnel --port 3000",
+    "bunx lt --port 3000",
+    "lt -p 3000",
+  ]) assert.equal(isLongRunningTunnelCommand(c), true, c);
+  for (const c of ["npm view localtunnel", "echo lt --port 3000", "ngrok config check"]) {
+    assert.equal(isLongRunningTunnelCommand(c), false, c);
+  }
+  for (const c of ["python -m http.server 8000", "python3 -m http.server", "/usr/bin/python3.12 -m http.server 8080"]) {
+    assert.equal(isLongRunningLocalServerCommand(c), true, c);
+  }
+  for (const c of ["python server.py", "python -m http.client", "echo python -m http.server"]) {
+    assert.equal(isLongRunningLocalServerCommand(c), false, c);
+  }
   assert.equal(ngrokAuthConfigured({ NGROK_AUTHTOKEN: "present" }, "/no-home"), true);
   assert.equal(ngrokAuthConfigured({}, "/no-home"), false);
   assert.equal(shellTimeoutMs("npm ci"), 900_000, "installs remain attached with a longer safe default");
@@ -46,6 +63,26 @@ test("package installs and ngrok tunnels are classified for safe timeout/preflig
   assert.equal(shellTimeoutMs("npm ci", 42_000), 42_000);
   assert.equal(shellTimeoutMs("npm ci", -1), 900_000, "invalid requested timeout falls back safely");
   assert.equal(shellTimeoutMs("npm ci", 9_999_999), 3_600_000, "requested timeouts are bounded");
+});
+
+test("public tunnels must use a managed background job instead of a foreground timeout", async () => {
+  const result = await getTool("bash").run(
+    { command: "npx localtunnel --port 3000", timeout_ms: 15_000 },
+    { cwd: process.cwd(), sandbox: "off" },
+  );
+  assert.match(result, /Skipped foreground tunnel/);
+  assert.match(result, /background:true/);
+  assert.match(result, /verify the local or public URL/);
+});
+
+test("local preview servers must remain managed background jobs while a tunnel depends on them", async () => {
+  const result = await getTool("bash").run(
+    { command: "python3 -m http.server 8000", timeout_ms: 15_000 },
+    { cwd: process.cwd(), sandbox: "off" },
+  );
+  assert.match(result, /Skipped foreground local server/);
+  assert.match(result, /background:true/);
+  assert.match(result, /verify the local or public URL/);
 });
 
 test("headless agent shells refuse interactive WeChat QR login regardless of flag order or executable path", async () => {
