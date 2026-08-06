@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.141.0 — 2026-08-06 — recoverable conversations and durable execution state
+
+- Keep an unavailable or revoked model route from locking away local conversation history. Persistent
+  clients can open the stored transcript read-only without constructing the old provider, while every
+  inference path still fails closed until the user selects an authorized connection.
+- Add an explicit, provider-pinned conversation fork for continuing on another personal or organization
+  connection. Cross-route copies require a positive history-transfer signal, validate the target model
+  and image-history capability, preserve the original conversation, and clear route-specific effort.
+- Persist structured task facts, capability preflights, blockers, next steps, and artifacts so resumed
+  work uses one durable checkpoint. Provider reasoning stays private and execution progress remains
+  concise while Desktop can choose progressively richer local execution displays.
+- Persist credential-free, narrowly scoped “always for this project” approvals, expose redacted
+  organization service bindings, and auto-compact completed Desktop/Serve turns only at bounded safe
+  thresholds without replacing the task reply.
+- Upgrade with `npm i -g @nanhara/hara@0.141.0`.
+
 ## 0.140.0 — 2026-08-05 — named personal model connections
 
 - Add multiple named personal/BYOK model connections behind the authenticated Serve settings
