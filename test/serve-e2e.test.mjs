@@ -404,8 +404,13 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
     assert.deepEqual(
       init.result.capabilities.features,
-      ["composer.attachments.v1", "models.capabilities.v1"],
-      "persistent clients can negotiate structured attachments and model capability descriptors",
+      [
+        "composer.attachments.v1",
+        "models.capabilities.v1",
+        "sessions.readonly-history.v1",
+        "sessions.cross-profile-fork.v1",
+      ],
+      "persistent clients can negotiate attachments, model descriptors, and safe session recovery",
     );
     for (const method of [
       "artifact.import",
@@ -1440,6 +1445,125 @@ test("serve e2e: persisted sessions keep their organization profile across activ
   } finally {
     client.close();
     await third.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: an unavailable organization session stays readable and transfers only with explicit consent", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-readonly-history-"));
+  const store = memStore();
+  const sessionId = "stale-key-session";
+  const originalHistory = [
+    { role: "user", content: "continue the existing task" },
+    { role: "assistant", text: "the durable result", toolUses: [], stop: "end" },
+  ];
+  store.saved.set(sessionId, {
+    meta: {
+      id: sessionId,
+      cwd: dir,
+      profileId: "key",
+      provider: "hara-gateway",
+      model: "deepseek-chat",
+      title: "Older task",
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T01:00:00.000Z",
+      source: "interactive",
+    },
+    history: structuredClone(originalHistory),
+  });
+  const providerRequests = [];
+  const personalProvider = { ...textProvider, model: "qwen3.7-plus" };
+  const deps = {
+    ...baseDeps(personalProvider, store),
+    buildSessionProvider: async () => personalProvider,
+    buildProviderFor: async (model, _effort, _cwd, profileId) => {
+      providerRequests.push({ model, profileId });
+      if (profileId === "key") {
+        throw new Error(`model '${model}' is not authorized for organization connection 'key'`);
+      }
+      if (profileId !== "personal" || model !== "qwen3.7-plus") {
+        throw new Error("unexpected target route");
+      }
+      return personalProvider;
+    },
+    runtimeInfo: (_cwd, model, profileId) => {
+      const selectedProfile = profileId ?? "personal";
+      if (selectedProfile === "key") {
+        return {
+          providerId: "hara-gateway",
+          profileId: "key",
+          model: model ?? "deepseek-v4-pro",
+          effortLevels: [],
+          availableModels: ["deepseek-v4-pro"],
+        };
+      }
+      return {
+        providerId: "qwen",
+        profileId: "personal",
+        model: model ?? "qwen3.7-plus",
+        effortLevels: [],
+        availableModels: ["qwen3.7-plus"],
+        attachmentCapabilities: { image: { mode: "native" } },
+      };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(srv.port);
+  try {
+    const initialized = await client.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.methods.includes("session.history"));
+    assert.ok(initialized.result.capabilities.features.includes("sessions.readonly-history.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("sessions.cross-profile-fork.v1"));
+
+    const refusedResume = await client.call("session.resume", { sessionId });
+    assert.match(refusedResume.error.message, /not authorized for organization connection 'key'/);
+    const providerCallsBeforeHistory = providerRequests.length;
+
+    const history = await client.call("session.history", { sessionId });
+    assert.equal(history.result.readOnly, true);
+    assert.equal(history.result.model, "deepseek-chat");
+    assert.equal(history.result.profileId, "key");
+    assert.deepEqual(history.result.history.map((message) => message.text), [
+      "continue the existing task",
+      "the durable result",
+    ]);
+    assert.equal(
+      providerRequests.length,
+      providerCallsBeforeHistory,
+      "reading local history never rebuilds or authorizes the unavailable provider",
+    );
+
+    const missingConsent = await client.call("session.fork", {
+      sessionId,
+      targetProfileId: "personal",
+      targetModel: "qwen3.7-plus",
+    });
+    assert.equal(missingConsent.error.code, -32602);
+    assert.match(missingConsent.error.message, /explicit history-transfer consent required/i);
+
+    const forked = await client.call("session.fork", {
+      sessionId,
+      targetProfileId: "personal",
+      targetModel: "qwen3.7-plus",
+      transferHistory: true,
+    });
+    assert.notEqual(forked.result.sessionId, sessionId);
+    assert.equal(forked.result.profileId, "personal");
+    assert.equal(forked.result.model, "qwen3.7-plus");
+    assert.deepEqual(forked.result.history, history.result.history);
+    assert.equal(store.saved.get(forked.result.sessionId).meta.profileId, "personal");
+    assert.equal(store.saved.get(forked.result.sessionId).meta.model, "qwen3.7-plus");
+    assert.deepEqual(store.saved.get(sessionId).history, originalHistory, "the unavailable source remains unchanged");
+    assert.equal(store.saved.get(sessionId).meta.profileId, "key");
+
+    const continued = await client.call("session.send", {
+      sessionId: forked.result.sessionId,
+      text: "continue now",
+    });
+    assert.equal(continued.result.reply, "hello", "the consented target fork is writable");
+  } finally {
+    client.close();
+    await srv.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

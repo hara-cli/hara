@@ -1575,7 +1575,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
             "server.shutdown",
-            "session.list", "session.create", "session.resume", "session.send", "session.steer", "session.interrupt", "session.set-model",
+            "session.list", "session.create", "session.resume", "session.history", "session.send", "session.steer", "session.interrupt", "session.set-model",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
@@ -1598,7 +1598,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
           }
           if (deps.unpinProjectProfile) methods.push("settings.profiles.unpin");
-          const features = ["composer.attachments.v1", "models.capabilities.v1"];
+          const features = [
+            "composer.attachments.v1",
+            "models.capabilities.v1",
+            "sessions.readonly-history.v1",
+            "sessions.cross-profile-fork.v1",
+          ];
           if (collaborationRemote) features.push("collaboration.remote.v1");
           const runtime = runtimeInfo();
           const setupState = deps.providerSettings
@@ -1739,6 +1744,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               } : undefined,
             }));
           }
+          case "session.history": {
+            // Provider-independent local replay. A revoked organization/model must stop future inference,
+            // not prevent the owner from reading history already stored on this machine.
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            const snapshot = hub.read(p.sessionId);
+            if (!snapshot) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            return reply(rpcResult(id!, {
+              sessionId: snapshot.meta.id,
+              title: snapshot.meta.title,
+              cwd: snapshot.meta.cwd,
+              model: snapshot.meta.model,
+              profileId: snapshot.meta.profileId,
+              history: historyForClient(snapshot.history),
+              readOnly: true,
+            }));
+          }
           case "session.send": {
             if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
               return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
@@ -1833,23 +1854,101 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }
           case "session.fork": {
             // duplicate the conversation into a new session (codex thread/fork) — rewind's
-            // non-destructive sibling: explore a different direction without losing the original
+            // non-destructive sibling: explore a different direction without losing the original.
+            // A target route is also the recovery path for an unavailable pinned connection, but only
+            // after the client records explicit consent to copy the complete durable context.
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
-            const sourceMeta = hub.peekMeta(p.sessionId);
-            const boundProfileId = sourceMeta?.profileId ?? runtimeInfo(sourceMeta?.cwd).profileId ?? "personal";
-            const sourceModel = sourceMeta?.model || runtimeInfo(sourceMeta?.cwd, undefined, boundProfileId).model;
-            const provider = sourceMeta && deps.buildProviderFor
-              ? await deps.buildProviderFor(sourceModel, undefined, sourceMeta.cwd, boundProfileId)
-              : await deps.buildSessionProvider(sourceMeta?.cwd, boundProfileId);
+            const targetRequested =
+              p.targetProfileId !== undefined
+              || p.targetModel !== undefined
+              || p.transferHistory !== undefined;
+            if (
+              p.transferHistory !== undefined && typeof p.transferHistory !== "boolean"
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "transferHistory must be a boolean"));
+            }
+            if (targetRequested && (
+              typeof p.targetProfileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.targetProfileId)
+              || typeof p.targetModel !== "string"
+              || !p.targetModel.trim()
+              || p.targetModel.length > 256
+            )) {
+              return reply(rpcError(id, ERR.PARAMS, "targetProfileId and targetModel are required for a route transfer"));
+            }
+            if (targetRequested && p.transferHistory !== true) {
+              return reply(rpcError(id, ERR.PARAMS, "explicit history-transfer consent required"));
+            }
+            const source = hub.read(p.sessionId);
+            if (!source) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            const sourceProfileId = source.meta.profileId
+              ?? runtimeInfo(source.meta.cwd).profileId
+              ?? "personal";
+            const sourceModel = source.meta.model
+              || runtimeInfo(source.meta.cwd, undefined, sourceProfileId).model;
+            const targetProfileId = targetRequested ? p.targetProfileId as string : sourceProfileId;
+            const targetModel = targetRequested ? (p.targetModel as string).trim() : sourceModel;
+            const targetRuntime = targetRequested
+              ? runtimeInfo(source.meta.cwd, targetModel, targetProfileId)
+              : undefined;
+            if (targetRuntime?.profileId && targetRuntime.profileId !== targetProfileId) {
+              return reply(rpcError(id, ERR.PARAMS, "target organization connection could not be resolved"));
+            }
+            if (targetRuntime?.availableModels?.length && !targetRuntime.availableModels.includes(targetModel)) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                `model '${targetModel}' is not authorized for organization connection '${targetProfileId}'`,
+              ));
+            }
+            const hasRawImageHistory = source.history.some(
+              (message) => message.role === "user" && Boolean(message.images?.length),
+            );
+            if (
+              targetRequested
+              && hasRawImageHistory
+              && targetRuntime?.attachmentCapabilities?.image.mode !== undefined
+              && targetRuntime.attachmentCapabilities.image.mode !== "native"
+            ) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                (
+                  `model '${targetModel}' cannot continue this copied conversation because its history `
+                  + "contains native image attachments; choose an image-native target model"
+                ),
+              ));
+            }
+            const provider = targetRequested
+              ? deps.buildProviderFor
+                ? await deps.buildProviderFor(targetModel, undefined, source.meta.cwd, targetProfileId)
+                : null
+              : deps.buildProviderFor
+                ? await deps.buildProviderFor(sourceModel, undefined, source.meta.cwd, sourceProfileId)
+                : await deps.buildSessionProvider(source.meta.cwd, sourceProfileId);
             if (closing) return;
-            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
-            const r = hub.fork(p.sessionId, { profileId: boundProfileId, provider, providerId: provider.id, approval: deps.approval, projectContext: undefined });
+            if (!provider) {
+              return reply(rpcError(
+                id,
+                targetRequested && !deps.buildProviderFor ? ERR.METHOD : ERR.INTERNAL,
+                targetRequested && !deps.buildProviderFor
+                  ? "cross-profile conversation transfer is not supported by this server"
+                  : "provider not authenticated — check the selected connection",
+              ));
+            }
+            if (provider.model !== targetModel) {
+              return reply(rpcError(id, ERR.INTERNAL, `provider did not honor requested model ${targetModel}`));
+            }
+            const r = hub.fork(p.sessionId, {
+              profileId: targetProfileId,
+              model: targetModel,
+              provider,
+              providerId: provider.id,
+              approval: deps.approval,
+              projectContext: undefined,
+            });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "source session is mid-turn — fork after it completes"));
-            if (!r.session.meta.model) {
-              r.session.meta.model = provider.model;
-              r.session.meta.provider = provider.id;
-            }
             r.session.configuring = true;
             let refreshed = false;
             try {
@@ -1862,7 +1961,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
-            return reply(rpcResult(id!, { sessionId: r.session.meta.id, title: r.session.meta.title, model: r.session.meta.model, history: historyForClient(r.session.history) }));
+            return reply(rpcResult(id!, {
+              sessionId: r.session.meta.id,
+              title: r.session.meta.title,
+              model: r.session.meta.model,
+              profileId: r.session.meta.profileId,
+              history: historyForClient(r.session.history),
+            }));
           }
           case "session.delete": {
             // permanent removal (codex thread/delete) — archive is the soft path; this one is forever

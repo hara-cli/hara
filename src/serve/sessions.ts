@@ -167,6 +167,21 @@ export class SessionHub {
     return this.sessions.get(id)?.meta ?? this.store.load(id)?.meta;
   }
 
+  /** Read a local conversation without attaching a provider or acquiring its writer lock. Session files
+   * are atomically replaced by the store, so this is a safe recovery path for history whose persisted
+   * model/profile is no longer authorized. The returned clone can never mutate live or stored state. */
+  read(id: string): SessionData | null {
+    const live = this.sessions.get(id);
+    const source: SessionData | null = live
+      ? {
+          meta: live.meta,
+          history: live.history,
+          ...(live.task ? { task: live.task } : {}),
+        }
+      : this.store.load(id);
+    return source ? structuredClone(source) : null;
+  }
+
   list(cwd?: string): SessionMeta[] {
     return this.store.list(cwd);
   }
@@ -248,31 +263,42 @@ export class SessionHub {
    *  sibling of rewind. Source may be live or on-disk; the fork is always a fresh live session. */
   fork(
     id: string,
-    o: { profileId?: string; provider: Provider; providerId: string; approval: ApprovalMode; projectContext?: string },
+    o: {
+      profileId?: string;
+      model?: string;
+      provider: Provider;
+      providerId: string;
+      approval: ApprovalMode;
+      projectContext?: string;
+    },
   ): { session: ServeSession } | { missing: true } | { busy: true } {
     const live = this.sessions.get(id);
     if (live?.busy || live?.configuring) return { busy: true };
     const src: { meta: SessionMeta; history: NeutralMsg[]; task?: TaskExecution } | null = live ?? this.store.load(id);
     if (!src) return { missing: true };
+    const sourceProfileId = src.meta.profileId ?? "personal";
+    const targetProfileId = o.profileId ?? sourceProfileId;
+    const targetModel = o.model ?? (src.meta.model || o.provider.model);
+    const preservesRoute = targetProfileId === sourceProfileId && targetModel === src.meta.model;
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: src.meta.cwd,
-      profileId: src.meta.profileId ?? o.profileId ?? "personal",
+      profileId: targetProfileId,
       provider: o.providerId,
-      model: src.meta.model || o.provider.model,
+      model: targetModel,
       title: src.meta.title ? `${src.meta.title} ⑂` : "",
       createdAt: new Date().toISOString(),
       updatedAt: "",
       source: "interactive",
       ...(src.meta.workingSet ? { workingSet: [...src.meta.workingSet] } : {}),
       ...(src.meta.todos ? { todos: src.meta.todos.map((todo) => ({ ...todo, ...(todo.blockedBy ? { blockedBy: [...todo.blockedBy] } : {}) })) } : {}),
-      ...(src.meta.effort ? { effort: src.meta.effort } : {}),
+      ...(preservesRoute && src.meta.effort ? { effort: src.meta.effort } : {}),
     };
     const lock = this.store.acquire(meta.id);
     if (!lock.ok) throw new Error(`could not acquire fork lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
     const s: ServeSession = {
       meta,
-      history: [...src.history],
+      history: structuredClone(src.history),
       task: forkTaskExecution(src.task),
       provider: o.provider,
       approval: o.approval,
@@ -285,7 +311,7 @@ export class SessionHub {
       pendingProviderTurns: 0,
       pendingToolRuns: 0,
       abort: null,
-      effort: src.meta.effort,
+      effort: preservesRoute ? src.meta.effort : undefined,
     };
     try {
       this.sessions.set(meta.id, s);

@@ -14,6 +14,11 @@
 //                                                        its own cursor under automation.list.
 //   session.create    {cwd?,approval?}           → {sessionId,model,profileId}
 //   session.resume    {sessionId}                → {sessionId,model,profileId,history:[{role,text}]}
+//   session.history   {sessionId}                → {sessionId,model,profileId,history:[{role,text}],readOnly:true}
+//                                                    Provider-independent local replay for unavailable routes.
+//   session.fork      {sessionId,targetProfileId?,targetModel?,transferHistory?}
+//                                                   → {sessionId,model,profileId,history:[{role,text}]}
+//                                                    Cross-route copies require transferHistory:true.
 //   session.send      {sessionId,text,images?,attachments?,newTask?} → (streams events, then)
 //                                                             {reply,usage,taskId,turnId,status?,stopReason?}
 //   session.steer     {sessionId,text,expectedTurnId} → {accepted,taskId,turnId}
