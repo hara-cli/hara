@@ -296,6 +296,7 @@ import "./tools/external_agent.js"; // register external_agent (delegate to clau
 import "./tools/ask_user.js"; // register ask_user (pause mid-turn to ask the user a structured question)
 import "./tools/cron.js"; // register cronjob (model-facing scheduler — "remind me every morning" just works)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
+import "./tools/open-directory.js"; // register safe Finder/File Explorer directory opening
 
 const here = dirname(fileURLToPath(import.meta.url));
 // Version: from a build-time define in the compiled single-binary (no package.json on its virtual FS),
