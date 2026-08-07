@@ -87,10 +87,13 @@
 //   presentation.create {title?,project?}          → {artifact,currentRevision,content,project}
 //   presentation.import {sourcePath,title?}        → {artifact,currentRevision,content,project,warnings}
 //                                                     Accepts controlled Slidev Markdown or Hara JSON.
+//   presentation.update {artifactId,baseRevisionId,project}
+//                                                   → {artifact,currentRevision,content,project}
 //   presentation.get {artifactId,revisionId?}      → {artifact,currentRevision,content,project}
 //   presentation.validate {artifactId,revisionId}  → {report:ValidationReport}
 //   presentation.export {artifactId,revisionId,validationReportId,destinationPath,format}
 //                                                   → {receipt:ExportReceipt}; format=json|html|pptx
+//   presentation.render {project}                  → {html} (bounded, ephemeral draft preview)
 //   presentation.preview {artifactId,revisionId}    → {html,revisionId} (same renderer as HTML export)
 //   presentation.preview-file {artifactId,revisionId} → {path,revisionId} (private local HTML)
 //   session.rename    {sessionId,title}           → {sessionId,title}
@@ -98,7 +101,8 @@
 //   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)
 // Server → client notifications (all carry sessionId):
 //   event.text {delta} · event.tool {name,preview} · event.diff {text}
-//   event.notice {text} · event.turn_end {reply,usage,error?,status?,stopReason?} · approval.request {approvalId,question,allowAlways}
+//   event.notice {text} · event.surface {kind,title,resource} · event.turn_end {reply,usage,error?,status?,stopReason?}
+//   approval.request {approvalId,question,allowAlways}
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events.
 // Provider reasoning content is intentionally never sent to persistent clients.

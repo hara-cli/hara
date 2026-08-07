@@ -22,3 +22,4 @@ import "./cron.js"; // cronjob
 import "./computer.js"; // computer (desktop control; self-gates on config)
 import "./open-directory.js"; // safe host file-manager directory reveal
 import "./presentation.js"; // native Hara Presentation create/import/preview/export
+import "./visual-preview.js"; // owner-bound localhost web preview surface for Desktop

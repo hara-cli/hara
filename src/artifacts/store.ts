@@ -213,6 +213,18 @@ export interface ArtifactCommitInput {
   changedPaths?: string[];
 }
 
+export interface ArtifactPreparedCommitInput {
+  artifactId: string;
+  baseRevisionId: string;
+  extension: string;
+  mediaType: string;
+  bytes: Uint8Array;
+  title?: string;
+  actor?: "user" | "agent" | "migration";
+  taskRunId?: string;
+  changedPaths?: string[];
+}
+
 export interface ArtifactRevertInput {
   artifactId: string;
   baseRevisionId: string;
@@ -1190,6 +1202,7 @@ function commitPreparedRevision(
     actor: ArtifactRevision["actor"];
     taskRunId?: string;
     changedPaths: string[];
+    title?: string;
   },
 ): ArtifactDetails {
   const artifact = artifactDirectory(home, input.artifactId);
@@ -1266,6 +1279,9 @@ function commitPreparedRevision(
 
   const updated: ArtifactRecord = {
     ...metadata.artifact,
+    ...(input.title !== undefined
+      ? { title: titleFor(`${input.title}${input.extension}`, input.extension, input.title, metadata.artifact.kind) }
+      : {}),
     currentRevisionId: revisionId,
   };
   try {
@@ -1285,6 +1301,64 @@ function commitPreparedRevision(
     throw error;
   }
   return getArtifact(home, metadata.artifact.artifactId);
+}
+
+/** Commit already-validated capability output without routing it through a user-selected source path.
+ * File authority and optimistic concurrency remain in the Artifact store; renderers never write the
+ * private revision tree directly. */
+export function commitArtifactBytes(
+  home: string,
+  input: ArtifactPreparedCommitInput,
+): ArtifactDetails {
+  cleanupArtifactStaging(home);
+  const artifactId = checkedArtifactId(input.artifactId);
+  const baseRevisionId = checkedInputRevisionId(input.baseRevisionId, "baseRevisionId");
+  const actor = checkedActor(input.actor);
+  const taskRunId = checkedTaskRunId(input.taskRunId);
+  const changedPaths = checkedChangedPaths(input.changedPaths);
+  if (typeof input.extension !== "string" || !/^\.[a-z0-9]{1,12}$/.test(input.extension)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared revision extension is invalid");
+  }
+  if (typeof input.mediaType !== "string" || input.mediaType.length > 200) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared revision media type is invalid");
+  }
+  if (!(input.bytes instanceof Uint8Array)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared revision bytes must be a Uint8Array");
+  }
+  const bytes = Buffer.from(input.bytes);
+  if (bytes.byteLength < 1 || bytes.byteLength > MAX_ARTIFACT_IMPORT_BYTES) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared revision content size is outside the supported range");
+  }
+
+  const before = getArtifact(home, artifactId);
+  if (before.artifact.currentRevisionId !== baseRevisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed after this edit started; reopen the latest version and apply the change again",
+    );
+  }
+  const format = FORMATS.get(input.extension);
+  if (
+    !format
+    || format.kind !== before.artifact.kind
+    || format.mediaType !== input.mediaType
+    || input.extension !== before.content.extension
+    || input.mediaType !== before.content.mediaType
+  ) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared revision format does not match the Artifact");
+  }
+  verifyClaimedFormat(input.extension, bytes);
+  return commitPreparedRevision(home, {
+    artifactId,
+    baseRevisionId,
+    extension: input.extension,
+    mediaType: input.mediaType,
+    bytes,
+    actor,
+    ...(taskRunId ? { taskRunId } : {}),
+    changedPaths,
+    ...(input.title !== undefined ? { title: input.title } : {}),
+  });
 }
 
 export async function commitArtifact(

@@ -131,7 +131,9 @@ import {
   exportPresentationArtifact,
   getPresentationArtifact,
   importPresentationArtifact,
+  renderPresentationDraft,
   renderPresentationPreview,
+  updatePresentationArtifact,
   validatePresentationArtifact,
 } from "../presentations/runtime.js";
 import {
@@ -1194,6 +1196,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       },
       diff: (t) => broadcast("event.diff", { sessionId, text: t }),
       notice: (t) => broadcast("event.notice", { sessionId, text: t }),
+      surface: (event) => broadcast("event.surface", { sessionId, ...event }),
     };
     const confirm = (
       q: string,
@@ -1604,8 +1607,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "automation.run", "automation.toggle", "automation.delete", "automation.scheduler.install",
             "artifact.import", "artifact.commit", "artifact.revert", "artifact.validate", "artifact.export",
             "artifact.list", "artifact.get", "artifact.revisions",
-            "presentation.create", "presentation.import", "presentation.get", "presentation.validate",
-            "presentation.export", "presentation.preview", "presentation.preview-file",
+            "presentation.create", "presentation.import", "presentation.update", "presentation.get", "presentation.validate",
+            "presentation.export", "presentation.render", "presentation.preview", "presentation.preview-file",
             "tasks.list", "approvals.list", "approvals.resolve",
           ];
           const collaborationRemote =
@@ -1637,7 +1640,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             setupState,
             capabilities: {
               methods,
-              events: ["event.task_state"],
+              events: ["event.task_state", "event.surface"],
               features,
             },
           }));
@@ -2750,6 +2753,30 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(artifactRpcError(id, error, "import"));
             }
           }
+          case "presentation.update": {
+            if (
+              typeof p.artifactId !== "string"
+              || typeof p.baseRevisionId !== "string"
+              || !p.project
+              || typeof p.project !== "object"
+              || Array.isArray(p.project)
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId, baseRevisionId, and project required"));
+            }
+            if (p.actor !== undefined || p.taskRunId !== undefined) {
+              return reply(rpcError(id, ERR.PARAMS, "actor and taskRunId are assigned by the authenticated host"));
+            }
+            try {
+              return reply(rpcResult(id!, updatePresentationArtifact(artifactHome, {
+                artifactId: p.artifactId,
+                baseRevisionId: p.baseRevisionId,
+                project: p.project,
+                actor: "user",
+              })));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "commit"));
+            }
+          }
           case "presentation.get": {
             if (typeof p.artifactId !== "string") {
               return reply(rpcError(id, ERR.PARAMS, "artifactId required"));
@@ -2818,6 +2845,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 artifactId: p.artifactId,
                 revisionId: p.revisionId,
               })));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "open"));
+            }
+          }
+          case "presentation.render": {
+            if (!p.project || typeof p.project !== "object" || Array.isArray(p.project)) {
+              return reply(rpcError(id, ERR.PARAMS, "project must be a PresentationProject object"));
+            }
+            try {
+              return reply(rpcResult(id!, renderPresentationDraft({ project: p.project })));
             } catch (error) {
               return reply(artifactRpcError(id, error, "open"));
             }

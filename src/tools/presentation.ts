@@ -6,6 +6,7 @@ import {
   exportPresentationArtifact,
   getPresentationArtifact,
   importPresentationArtifact,
+  updatePresentationArtifact,
   validatePresentationArtifact,
 } from "../presentations/runtime.js";
 import { registerTool } from "./registry.js";
@@ -17,7 +18,7 @@ function result(value: unknown): string {
 registerTool({
   name: "presentation",
   description:
-    "Create, import, inspect, validate, preview, or export a native Hara presentation. "
+    "Create, import, update, inspect, validate, preview, or export a native Hara presentation. "
     + "Use create with a PresentationProject to make a deck visible in Hara Desktop's right panel. "
     + "Give every slide one evidence-backed claim and takeaway title, unique slide/block ids, and usually 2–5 blocks. "
     + "Import accepts controlled Slidev Markdown or Hara presentation JSON. Export supports editable PPTX, "
@@ -27,7 +28,7 @@ registerTool({
     properties: {
       action: {
         type: "string",
-        enum: ["create", "import", "list", "get", "validate", "preview", "export"],
+        enum: ["create", "import", "update", "list", "get", "validate", "preview", "export"],
       },
       title: { type: "string", description: "Presentation title for create/import" },
       project: {
@@ -158,13 +159,22 @@ registerTool({
             actor: "agent",
             ...(ctx.sessionId ? { taskRunId: ctx.sessionId } : {}),
           });
+          ctx.ui?.surface?.({
+            kind: "presentation",
+            title: details.artifact.title,
+            resource: {
+              type: "artifact",
+              artifactId: details.artifact.artifactId,
+              revisionId: details.currentRevision.revisionId,
+            },
+          });
           ctx.ui?.notice(`Presentation created: ${details.artifact.title} (${details.artifact.artifactId})`);
           return result({
             artifact: details.artifact,
             currentRevision: details.currentRevision,
             content: details.content,
             slideCount: details.project.slides.length,
-            next: "Open Office in Hara Desktop to view the exact presenter in the right panel.",
+            next: "Hara Desktop opens the exact presenter in this session's Visual Dock when typed surface events are available.",
           });
         }
         case "import": {
@@ -177,6 +187,15 @@ registerTool({
             actor: "agent",
             ...(ctx.sessionId ? { taskRunId: ctx.sessionId } : {}),
           });
+          ctx.ui?.surface?.({
+            kind: "presentation",
+            title: details.artifact.title,
+            resource: {
+              type: "artifact",
+              artifactId: details.artifact.artifactId,
+              revisionId: details.currentRevision.revisionId,
+            },
+          });
           ctx.ui?.notice(`Presentation imported: ${details.artifact.title} (${details.artifact.artifactId})`);
           return result({
             artifact: details.artifact,
@@ -184,6 +203,40 @@ registerTool({
             content: details.content,
             slideCount: details.project.slides.length,
             warnings: details.warnings,
+          });
+        }
+        case "update": {
+          if (
+            typeof input.artifact_id !== "string"
+            || typeof input.revision_id !== "string"
+            || !input.project
+            || typeof input.project !== "object"
+            || Array.isArray(input.project)
+          ) {
+            return "Error: presentation update requires artifact_id, revision_id, and project.";
+          }
+          const details = updatePresentationArtifact(home, {
+            artifactId: input.artifact_id,
+            baseRevisionId: input.revision_id,
+            project: input.project,
+            actor: "agent",
+            ...(ctx.sessionId ? { taskRunId: ctx.sessionId } : {}),
+          });
+          ctx.ui?.surface?.({
+            kind: "presentation",
+            title: details.artifact.title,
+            resource: {
+              type: "artifact",
+              artifactId: details.artifact.artifactId,
+              revisionId: details.currentRevision.revisionId,
+            },
+          });
+          ctx.ui?.notice(`Presentation updated: ${details.artifact.title} (${details.artifact.artifactId})`);
+          return result({
+            artifact: details.artifact,
+            currentRevision: details.currentRevision,
+            content: details.content,
+            slideCount: details.project.slides.length,
           });
         }
         case "list": {

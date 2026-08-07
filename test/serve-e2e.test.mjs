@@ -402,6 +402,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     }
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
+    assert.ok(init.result.capabilities.events.includes("event.surface"), "typed visual surface event advertised");
     assert.deepEqual(
       init.result.capabilities.features,
       [
@@ -423,9 +424,11 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       "artifact.revisions",
       "presentation.create",
       "presentation.import",
+      "presentation.update",
       "presentation.get",
       "presentation.validate",
       "presentation.export",
+      "presentation.render",
       "presentation.preview",
       "presentation.preview-file",
     ]) {
@@ -509,27 +512,50 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     const presentationRevisionId = createdPresentation.result.currentRevision.revisionId;
     const presentationDetails = await c.call("presentation.get", { artifactId: presentationId });
     assert.equal(presentationDetails.result.project.title, "Release evidence");
+    const editedPresentationProject = {
+      ...presentationDetails.result.project,
+      title: "Release evidence — edited",
+      slides: presentationDetails.result.project.slides.map((slide, index) => index === 0
+        ? { ...slide, takeawayTitle: "One presenter, one saved revision" }
+        : slide),
+    };
+    const renderedDraft = await c.call("presentation.render", { project: editedPresentationProject });
+    assert.match(renderedDraft.result.html, /One presenter, one saved revision/);
+    const updatedPresentation = await c.call("presentation.update", {
+      artifactId: presentationId,
+      baseRevisionId: presentationRevisionId,
+      project: editedPresentationProject,
+    });
+    assert.equal(updatedPresentation.result.artifact.title, "Release evidence — edited");
+    assert.equal(updatedPresentation.result.currentRevision.parentRevisionId, presentationRevisionId);
+    const updatedPresentationRevisionId = updatedPresentation.result.currentRevision.revisionId;
+    const stalePresentationUpdate = await c.call("presentation.update", {
+      artifactId: presentationId,
+      baseRevisionId: presentationRevisionId,
+      project: editedPresentationProject,
+    });
+    assert.equal(stalePresentationUpdate.error.code, -32005);
     const presentationValidation = await c.call("presentation.validate", {
       artifactId: presentationId,
-      revisionId: presentationRevisionId,
+      revisionId: updatedPresentationRevisionId,
     });
     assert.equal(presentationValidation.result.report.status, "pass");
     assert.equal(presentationValidation.result.report.validatorId, "hara.office.presentation");
     const presentationPreview = await c.call("presentation.preview-file", {
       artifactId: presentationId,
-      revisionId: presentationRevisionId,
+      revisionId: updatedPresentationRevisionId,
     });
     const presentationPreviewText = readFileSync(presentationPreview.result.path, "utf8");
     assert.match(presentationPreviewText, /Content-Security-Policy/);
     const presentationInlinePreview = await c.call("presentation.preview", {
       artifactId: presentationId,
-      revisionId: presentationRevisionId,
+      revisionId: updatedPresentationRevisionId,
     });
     assert.equal(presentationInlinePreview.result.html, presentationPreviewText);
     const presentationHtmlPath = join(dir, "release-evidence.html");
     const presentationExport = await c.call("presentation.export", {
       artifactId: presentationId,
-      revisionId: presentationRevisionId,
+      revisionId: updatedPresentationRevisionId,
       validationReportId: presentationValidation.result.report.reportId,
       destinationPath: presentationHtmlPath,
       format: "html",

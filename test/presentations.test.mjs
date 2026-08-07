@@ -11,6 +11,8 @@ import {
   exportPresentationArtifact,
   getPresentationArtifact,
   importPresentationArtifact,
+  renderPresentationDraft,
+  updatePresentationArtifact,
   validatePresentationArtifact,
 } from "../dist/presentations/runtime.js";
 
@@ -111,6 +113,51 @@ title: Release review
   });
 });
 
+test("native Presentation drafts render before save and commits use optimistic revisions", async () => {
+  await withTempHome(async (home) => {
+    const created = createPresentationArtifact(home, { title: "Draft review" });
+    const editedProject = {
+      ...created.project,
+      title: "Draft review — edited",
+      slides: created.project.slides.map((slide, index) => index === 0
+        ? {
+            ...slide,
+            claim: "The editor renders this change before it becomes a revision.",
+            takeawayTitle: "Draft first, then save one exact revision",
+          }
+        : slide),
+    };
+
+    const draft = renderPresentationDraft({ project: editedProject });
+    assert.match(draft.html, /Draft first, then save one exact revision/);
+    assert.equal(
+      getPresentationArtifact(home, created.artifact.artifactId).currentRevision.revisionId,
+      created.currentRevision.revisionId,
+      "ephemeral draft rendering must not mutate the Artifact",
+    );
+
+    const updated = updatePresentationArtifact(home, {
+      artifactId: created.artifact.artifactId,
+      baseRevisionId: created.currentRevision.revisionId,
+      project: editedProject,
+      actor: "user",
+    });
+    assert.equal(updated.artifact.title, "Draft review — edited");
+    assert.equal(updated.currentRevision.parentRevisionId, created.currentRevision.revisionId);
+    assert.deepEqual(updated.currentRevision.changedPaths, ["presentation/project"]);
+    assert.equal(updated.project.slides[0].claim, "The editor renders this change before it becomes a revision.");
+
+    assert.throws(
+      () => updatePresentationArtifact(home, {
+        artifactId: created.artifact.artifactId,
+        baseRevisionId: created.currentRevision.revisionId,
+        project: editedProject,
+      }),
+      /changed after this edit started/,
+    );
+  });
+});
+
 test("Presentation export refuses a report from a different validator", async () => {
   await withTempHome(async (home) => {
     const created = createPresentationArtifact(home, { title: "Validator boundary" });
@@ -150,6 +197,7 @@ test("agent presentation tool exposes a complete generation schema and creates a
   }
 
   const notices = [];
+  const surfaces = [];
   const output = await tool.run({
     action: "create",
     project: {
@@ -181,13 +229,26 @@ test("agent presentation tool exposes a complete generation schema and creates a
   }, {
     cwd: process.cwd(),
     sessionId: "presentation-tool-test",
-    ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice(value) { notices.push(value); } },
+    ui: {
+      text() {}, reasoning() {}, tool() {}, diff() {},
+      notice(value) { notices.push(value); },
+      surface(value) { surfaces.push(value); },
+    },
   });
   assert.doesNotMatch(output, /^Error:/);
   const created = JSON.parse(output);
   assert.equal(created.slideCount, 2);
   assert.equal(created.content.extension, ".hpres");
   assert.match(notices[0], /Presentation created/);
+  assert.deepEqual(surfaces, [{
+    kind: "presentation",
+    title: "Agent launch review",
+    resource: {
+      type: "artifact",
+      artifactId: created.artifact.artifactId,
+      revisionId: created.currentRevision.revisionId,
+    },
+  }]);
 
   const previewOutput = await tool.run({
     action: "preview",

@@ -15,6 +15,16 @@ export interface UiSink {
   tool(name: string, preview: string): void;
   diff(text: string): void;
   notice(text: string): void;
+  /** Typed visual surface offer for persistent clients. Optional so terminal sinks and older embedders
+   * keep working without learning Desktop navigation semantics. Artifact ids are opaque and URL
+   * resources are independently validated by both the offering tool and the Desktop host. */
+  surface?(event: {
+    kind: "presentation" | "spreadsheet" | "document" | "design" | "browser" | "capability";
+    title: string;
+    resource:
+      | { type: "artifact"; artifactId: string; revisionId: string }
+      | { type: "url"; url: string };
+  }): void;
 }
 
 export interface ToolContext {

@@ -195,7 +195,9 @@ try {
   }
   for (const method of [
     "presentation.create",
+    "presentation.update",
     "presentation.validate",
+    "presentation.render",
     "presentation.preview",
     "presentation.export",
   ]) {
@@ -234,18 +236,38 @@ try {
   }
   const artifactId = presentation.result.artifact.artifactId;
   const revisionId = presentation.result.currentRevision.revisionId;
-  const validated = await call(ws, 5, "presentation.validate", { artifactId, revisionId });
+  const editedProject = {
+    ...presentation.result.project,
+    title: "Standalone proof edited",
+    slides: presentation.result.project.slides.map((slide, index) => index === 0
+      ? { ...slide, takeawayTitle: "Standalone native editor proof" }
+      : slide),
+  };
+  const draft = await call(ws, 5, "presentation.render", { project: editedProject });
+  if (draft.error || !draft.result?.html?.includes("Standalone native editor proof")) {
+    throw new Error(`serve Presentation draft render failed: ${JSON.stringify(draft.error ?? draft.result)}`);
+  }
+  const updated = await call(ws, 6, "presentation.update", {
+    artifactId,
+    baseRevisionId: revisionId,
+    project: editedProject,
+  });
+  if (updated.error || updated.result?.currentRevision?.parentRevisionId !== revisionId) {
+    throw new Error(`serve Presentation update failed: ${JSON.stringify(updated.error ?? updated.result)}`);
+  }
+  const updatedRevisionId = updated.result.currentRevision.revisionId;
+  const validated = await call(ws, 7, "presentation.validate", { artifactId, revisionId: updatedRevisionId });
   if (validated.error || validated.result?.report?.status !== "pass") {
     throw new Error(`serve Presentation validation failed: ${JSON.stringify(validated.error ?? validated.result)}`);
   }
-  const preview = await call(ws, 6, "presentation.preview", { artifactId, revisionId });
-  if (preview.error || !preview.result?.html?.includes("Standalone proof")) {
+  const preview = await call(ws, 8, "presentation.preview", { artifactId, revisionId: updatedRevisionId });
+  if (preview.error || !preview.result?.html?.includes("Standalone native editor proof")) {
     throw new Error(`serve Presentation preview failed: ${JSON.stringify(preview.error ?? preview.result)}`);
   }
   const pptxPath = join(root, "standalone-proof.pptx");
-  const exported = await call(ws, 7, "presentation.export", {
+  const exported = await call(ws, 9, "presentation.export", {
     artifactId,
-    revisionId,
+    revisionId: updatedRevisionId,
     validationReportId: validated.result.report.reportId,
     destinationPath: pptxPath,
     format: "pptx",
@@ -259,7 +281,7 @@ try {
     throw new Error(`serve Presentation PPTX export failed: ${JSON.stringify(exported.error ?? exported.result)}`);
   }
 
-  const stopped = await call(ws, 8, "server.shutdown", {});
+  const stopped = await call(ws, 10, "server.shutdown", {});
   if (stopped.error || stopped.result?.accepted !== true) {
     throw new Error(`serve shutdown failed: ${JSON.stringify(stopped.error ?? stopped.result)}`);
   }

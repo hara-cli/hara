@@ -11,6 +11,7 @@ import {
 } from "@nanhara/hara-presentation";
 import {
   ArtifactStoreError,
+  commitArtifactBytes,
   exportArtifactConverted,
   importArtifactBytes,
   readArtifactRevisionContent,
@@ -207,6 +208,42 @@ export function getPresentationArtifact(
   };
 }
 
+export function updatePresentationArtifact(
+  home: string,
+  input: {
+    artifactId: string;
+    baseRevisionId: string;
+    project: unknown;
+    actor?: "user" | "agent" | "migration";
+    taskRunId?: string;
+  },
+): PresentationArtifactDetails {
+  getPresentationArtifact(home, input.artifactId, input.baseRevisionId);
+  let project: Readonly<PresentationProject>;
+  try {
+    project = parsePresentationProject(input.project);
+  } catch (error) {
+    throw runtimeError(
+      "ARTIFACT_INVALID_INPUT",
+      `PresentationProject could not be updated: ${safeMessage(error)}`,
+      error,
+    );
+  }
+  const bytes = Buffer.from(serializePresentationProject(project), "utf8");
+  const details = commitArtifactBytes(home, {
+    artifactId: input.artifactId,
+    baseRevisionId: input.baseRevisionId,
+    extension: PRESENTATION_ARTIFACT_EXTENSION,
+    mediaType: "application/vnd.nanhara.presentation+json",
+    bytes,
+    title: project.title,
+    actor: input.actor ?? "user",
+    ...(input.taskRunId ? { taskRunId: input.taskRunId } : {}),
+    changedPaths: ["presentation/project"],
+  });
+  return { ...details, project };
+}
+
 function validationFindings(error: unknown): Array<{
   code: string;
   severity: "error" | "warning" | "info";
@@ -356,6 +393,37 @@ export function createPresentationPreviewFile(
   return { path: binding.path, revisionId: details.currentRevision.revisionId };
 }
 
+function boundedPresentationHtml(
+  project: unknown,
+  overflowMessage: string,
+): string {
+  let html: string;
+  try {
+    html = renderPresentationHtml(parsePresentationProject(project));
+  } catch (error) {
+    throw runtimeError(
+      "ARTIFACT_INVALID_INPUT",
+      `PresentationProject could not be rendered: ${safeMessage(error)}`,
+      error,
+    );
+  }
+  if (Buffer.byteLength(html, "utf8") > 8 * 1024 * 1024) {
+    throw runtimeError("ARTIFACT_TOO_LARGE", overflowMessage);
+  }
+  return html;
+}
+
+export function renderPresentationDraft(
+  input: { project: unknown },
+): { html: string } {
+  return {
+    html: boundedPresentationHtml(
+      input.project,
+      "the rendered presentation draft exceeds the bounded Desktop preview size; relink oversized embedded images",
+    ),
+  };
+}
+
 export function renderPresentationPreview(
   home: string,
   input: { artifactId: string; revisionId: string },
@@ -367,13 +435,10 @@ export function renderPresentationPreview(
       "the Artifact changed before the Desktop preview was prepared; reopen the latest revision",
     );
   }
-  const html = renderPresentationHtml(details.project);
-  if (Buffer.byteLength(html, "utf8") > 8 * 1024 * 1024) {
-    throw runtimeError(
-      "ARTIFACT_TOO_LARGE",
-      "the rendered presentation exceeds the bounded Desktop preview size; relink oversized embedded images",
-    );
-  }
+  const html = boundedPresentationHtml(
+    details.project,
+    "the rendered presentation exceeds the bounded Desktop preview size; relink oversized embedded images",
+  );
   return { html, revisionId: details.currentRevision.revisionId };
 }
 
