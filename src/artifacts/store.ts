@@ -162,6 +162,43 @@ export interface ArtifactExportInput {
   destinationPath: string;
 }
 
+export interface ArtifactPreparedImportInput {
+  kind: ArtifactKind;
+  title: string;
+  extension: string;
+  mediaType: string;
+  bytes: Uint8Array;
+  origin?: string;
+  actor?: "user" | "agent" | "migration";
+  taskRunId?: string;
+}
+
+export interface ArtifactRevisionContent {
+  artifact: ArtifactRecord;
+  revision: ArtifactRevision;
+  content: ArtifactContentInfo;
+  bytes: Buffer;
+}
+
+export interface ArtifactConvertedExportInput extends ArtifactExportInput {
+  format: string;
+  mediaType: string;
+  fidelity: ArtifactExportReceipt["fidelity"];
+  bytes: Uint8Array;
+  warnings?: ArtifactExportWarning[];
+  validatorId: string;
+  validatorVersion: string;
+}
+
+export interface ArtifactPreparedValidationInput {
+  artifactId: string;
+  revisionId: string;
+  snapshotDigest: string;
+  validatorId: string;
+  validatorVersion: string;
+  findings: ArtifactFinding[];
+}
+
 export interface ArtifactStagingCleanupResult {
   removed: number;
   retained: number;
@@ -210,6 +247,7 @@ interface ArtifactFormat {
 }
 
 const FORMATS = new Map<string, ArtifactFormat>([
+  [".hpres", { kind: "presentation", mediaType: "application/vnd.nanhara.presentation+json" }],
   [".pptx", { kind: "presentation", mediaType: "application/vnd.openxmlformats-officedocument.presentationml.presentation" }],
   [".ppt", { kind: "presentation", mediaType: "application/vnd.ms-powerpoint" }],
   [".odp", { kind: "presentation", mediaType: "application/vnd.oasis.opendocument.presentation" }],
@@ -883,6 +921,38 @@ async function readImportSource(sourcePath: string): Promise<Buffer> {
   }
 }
 
+export async function readArtifactSourceBytes(
+  sourcePathInput: unknown,
+  allowedExtensions: readonly string[],
+): Promise<{ sourcePath: string; extension: string; bytes: Buffer }> {
+  if (
+    typeof sourcePathInput !== "string"
+    || !sourcePathInput
+    || sourcePathInput.length > 4_096
+    || !isAbsolute(sourcePathInput)
+  ) {
+    throw storeError(
+      "ARTIFACT_INVALID_INPUT",
+      "sourcePath must be an absolute path selected by the user",
+    );
+  }
+  const allowed = new Set(allowedExtensions.map((value) => value.toLowerCase()));
+  if (
+    allowed.size < 1
+    || [...allowed].some((value) => !/^\.[a-z0-9]{1,12}$/.test(value))
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "allowed source extensions are invalid");
+  const sourcePath = resolve(sourcePathInput);
+  const extension = extname(sourcePath).toLowerCase();
+  if (!allowed.has(extension)) {
+    throw storeError(
+      "ARTIFACT_INVALID_INPUT",
+      `selected source must use one of: ${[...allowed].join(", ")}`,
+    );
+  }
+  const bytes = await readImportSource(sourcePath);
+  return { sourcePath, extension, bytes };
+}
+
 function verifyClaimedFormat(extension: string, bytes: Buffer): void {
   const startsWith = (signature: readonly number[]): boolean =>
     bytes.length >= signature.length
@@ -955,43 +1025,62 @@ function activateStaging(
   syncDirectory(root.path);
 }
 
-export async function importArtifact(
+export function importArtifactBytes(
   home: string,
-  input: { sourcePath: string; title?: string; kind?: ArtifactKind },
-): Promise<ArtifactDetails> {
-  if (
-    input.kind !== undefined
-    && input.kind !== "presentation"
-    && input.kind !== "spreadsheet"
-    && input.kind !== "document"
-  ) throw storeError("ARTIFACT_INVALID_INPUT", "kind must be presentation, spreadsheet, or document");
-  if (input.title !== undefined && typeof input.title !== "string") {
+  input: ArtifactPreparedImportInput,
+): ArtifactDetails {
+  if (input.kind !== "presentation" && input.kind !== "spreadsheet" && input.kind !== "document") {
+    throw storeError("ARTIFACT_INVALID_INPUT", "kind must be presentation, spreadsheet, or document");
+  }
+  if (typeof input.title !== "string") {
     throw storeError("ARTIFACT_INVALID_INPUT", "title must be a string");
   }
+  if (typeof input.extension !== "string" || !/^\.[a-z0-9]{1,12}$/.test(input.extension)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared Artifact extension is invalid");
+  }
+  const format = FORMATS.get(input.extension);
+  if (!format || format.kind !== input.kind || format.mediaType !== input.mediaType) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared Artifact format does not match its kind and media type");
+  }
+  if (!(input.bytes instanceof Uint8Array)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared Artifact bytes must be a Uint8Array");
+  }
+  const bytes = Buffer.from(input.bytes);
+  if (bytes.byteLength < 1 || bytes.byteLength > MAX_ARTIFACT_IMPORT_BYTES) {
+    throw storeError(
+      bytes.byteLength > MAX_ARTIFACT_IMPORT_BYTES ? "ARTIFACT_TOO_LARGE" : "ARTIFACT_INVALID_INPUT",
+      `prepared Artifact content must contain 1 to ${MAX_ARTIFACT_IMPORT_BYTES / (1024 * 1024)} MiB`,
+    );
+  }
+  const origin = input.origin ?? "generated";
+  if (typeof origin !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(origin)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "prepared Artifact origin is invalid");
+  }
+  const actor = checkedActor(input.actor);
+  const taskRunId = checkedTaskRunId(input.taskRunId);
+  const title = titleFor(`Untitled${input.extension}`, input.extension, input.title, input.kind);
   cleanupArtifactStaging(home);
-  const { sourcePath, extension, format } = sourceFormat(input.sourcePath, input.kind);
-
-  const bytes = await readImportSource(sourcePath);
-  verifyClaimedFormat(extension, bytes);
+  verifyClaimedFormat(input.extension, bytes);
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   const artifactId = newOpaqueId("art");
   const revisionId = newOpaqueId("rev");
   const now = new Date().toISOString();
-  const contentRef = `content${extension}`;
+  const contentRef = `content${input.extension}`;
   const artifact: ArtifactRecord = {
     protocol: ARTIFACT_PROTOCOL_VERSION,
     artifactId,
-    kind: format.kind,
-    title: titleFor(sourcePath, extension, input.title, format.kind),
+    kind: input.kind,
+    title,
     currentRevisionId: revisionId,
-    origin: "local-import",
+    origin,
     dataResidency: "local",
   };
   const revision: ArtifactRevision = {
     revisionId,
     artifactId,
     baseRevisionId: revisionId,
-    actor: "user",
+    actor,
+    ...(taskRunId ? { taskRunId } : {}),
     contentRef,
     assetRefs: [],
     contentDigest: sha256,
@@ -1000,8 +1089,8 @@ export async function importArtifact(
   };
   const content: ArtifactContentInfo = {
     contentRef,
-    extension,
-    mediaType: format.mediaType,
+    extension: input.extension,
+    mediaType: input.mediaType,
     byteSize: bytes.byteLength,
     sha256,
   };
@@ -1034,6 +1123,33 @@ export async function importArtifact(
     if (!activated) discardOwnedStagingBestEffort(root, staging);
   }
   return getArtifact(home, artifactId, false);
+}
+
+export async function importArtifact(
+  home: string,
+  input: { sourcePath: string; title?: string; kind?: ArtifactKind },
+): Promise<ArtifactDetails> {
+  if (
+    input.kind !== undefined
+    && input.kind !== "presentation"
+    && input.kind !== "spreadsheet"
+    && input.kind !== "document"
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "kind must be presentation, spreadsheet, or document");
+  if (input.title !== undefined && typeof input.title !== "string") {
+    throw storeError("ARTIFACT_INVALID_INPUT", "title must be a string");
+  }
+  const { sourcePath, extension, format } = sourceFormat(input.sourcePath, input.kind);
+  const bytes = await readImportSource(sourcePath);
+  verifyClaimedFormat(extension, bytes);
+  return importArtifactBytes(home, {
+    kind: format.kind,
+    title: titleFor(sourcePath, extension, input.title, format.kind),
+    extension,
+    mediaType: format.mediaType,
+    bytes,
+    origin: "local-import",
+    actor: "user",
+  });
 }
 
 function activateRevisionStaging(
@@ -1266,6 +1382,92 @@ function readValidationReport(
   }
   verifyDirectory(validations);
   return value;
+}
+
+function checkedFindings(value: unknown): ArtifactFinding[] {
+  if (!Array.isArray(value) || value.length > 1_000) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "validation findings must be a bounded array");
+  }
+  return value.map((finding) => {
+    if (
+      !finding
+      || typeof finding !== "object"
+      || typeof finding.code !== "string"
+      || !/^[A-Z0-9_]{1,100}$/.test(finding.code)
+      || (finding.severity !== "error" && finding.severity !== "warning" && finding.severity !== "info")
+      || typeof finding.message !== "string"
+      || finding.message.length < 1
+      || finding.message.length > 4_000
+      || (finding.suggestion !== undefined && (typeof finding.suggestion !== "string" || finding.suggestion.length < 1 || finding.suggestion.length > 4_000))
+    ) throw storeError("ARTIFACT_INVALID_INPUT", "validation finding is invalid");
+    return {
+      code: finding.code,
+      severity: finding.severity,
+      message: finding.message,
+      ...(finding.path !== undefined ? { path: normalizeArtifactPath(finding.path) } : {}),
+      ...(finding.suggestion !== undefined ? { suggestion: finding.suggestion } : {}),
+    };
+  });
+}
+
+export function recordArtifactValidation(
+  home: string,
+  input: ArtifactPreparedValidationInput,
+): ArtifactValidationReport {
+  const artifactId = checkedArtifactId(input.artifactId);
+  const revisionId = checkedInputRevisionId(input.revisionId, "revisionId");
+  if (typeof input.snapshotDigest !== "string" || !/^[a-f0-9]{64}$/.test(input.snapshotDigest)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "validation snapshot digest is invalid");
+  }
+  if (
+    typeof input.validatorId !== "string"
+    || !/^[a-z0-9][a-z0-9._-]{0,199}$/.test(input.validatorId)
+    || typeof input.validatorVersion !== "string"
+    || !/^[0-9A-Za-z][0-9A-Za-z._-]{0,99}$/.test(input.validatorVersion)
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "validation identity is invalid");
+  const findings = checkedFindings(input.findings);
+  const artifact = artifactDirectory(home, artifactId);
+  const before = readArtifactMetadata(artifact);
+  if (before.artifact.currentRevisionId !== revisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed before validation completed; reopen the latest version and validate again",
+    );
+  }
+  const { content } = readRevisionDetails(artifact, revisionId, false);
+  const bytes = readContentBytes(revisionDirectory(artifact, revisionId), content);
+  verifyClaimedFormat(content.extension, bytes);
+  if (content.sha256 !== input.snapshotDigest) {
+    throw storeError("ARTIFACT_CONFLICT", "validation findings do not belong to this exact revision");
+  }
+  const after = readArtifactMetadata(artifact);
+  if (after.text !== before.text || after.artifact.currentRevisionId !== revisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed while validation was recorded; reopen the latest version and validate again",
+    );
+  }
+  const status: ArtifactValidationReport["status"] = findings.some((finding) => finding.severity === "error")
+    ? "blocked"
+    : findings.some((finding) => finding.severity === "warning")
+      ? "revise"
+      : "pass";
+  const report: ArtifactValidationReport = {
+    reportId: `val_${randomUUID().replaceAll("-", "")}`,
+    revisionId,
+    validatorId: input.validatorId,
+    validatorVersion: input.validatorVersion,
+    createdAt: new Date().toISOString(),
+    snapshotDigest: content.sha256,
+    status,
+    findings,
+  };
+  ensurePrivateStateSubdirectory(home, [".hara", "artifacts", artifactId, "validations"]);
+  writePrivateStateBytesOnceSync(
+    bindPrivateHaraStateFile(home, ["artifacts", artifactId, "validations"], `${report.reportId}.json`),
+    Buffer.from(`${JSON.stringify(report, null, 2)}\n`),
+  );
+  return readValidationReport(artifact, report.reportId);
 }
 
 export function validateArtifact(
@@ -1599,13 +1801,59 @@ function writeExportBytesOnce(
   }
 }
 
-export function exportArtifact(
+export function exportArtifactConverted(
   home: string,
-  input: ArtifactExportInput,
+  input: ArtifactConvertedExportInput,
 ): ArtifactExportReceipt {
   const artifactId = checkedArtifactId(input.artifactId);
   const revisionId = checkedInputRevisionId(input.revisionId, "revisionId");
   const validationReportId = checkedValidationId(input.validationReportId);
+  if (typeof input.format !== "string" || !/^[a-z0-9]{1,12}$/.test(input.format)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "export format is invalid");
+  }
+  if (
+    typeof input.mediaType !== "string"
+    || input.mediaType.length > 200
+    || !/^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$/.test(input.mediaType)
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "export media type is invalid");
+  if (!new Set(["visual-fidelity", "template-editable", "semantic-editable", "roundtrip"]).has(input.fidelity)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "export fidelity is invalid");
+  }
+  if (!(input.bytes instanceof Uint8Array) || input.bytes.byteLength < 1 || input.bytes.byteLength > 256 * 1024 * 1024) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "export bytes must contain 1 to 256 MiB");
+  }
+  if (
+    typeof input.validatorId !== "string"
+    || input.validatorId.length < 1
+    || input.validatorId.length > 200
+    || typeof input.validatorVersion !== "string"
+    || input.validatorVersion.length < 1
+    || input.validatorVersion.length > 100
+  ) throw storeError("ARTIFACT_INVALID_INPUT", "export validator identity is invalid");
+  if (input.warnings !== undefined && (!Array.isArray(input.warnings) || input.warnings.length > 1_000)) {
+    throw storeError("ARTIFACT_INVALID_INPUT", "export warnings must be a bounded array");
+  }
+  const warnings = (input.warnings ?? []).map((warning) => {
+    if (
+      !warning
+      || warning.severity !== "warning"
+      || typeof warning.code !== "string"
+      || !/^[A-Z0-9_]{1,100}$/.test(warning.code)
+      || typeof warning.message !== "string"
+      || warning.message.length < 1
+      || warning.message.length > 4_000
+      || (warning.suggestion !== undefined && (typeof warning.suggestion !== "string" || warning.suggestion.length < 1 || warning.suggestion.length > 4_000))
+    ) throw storeError("ARTIFACT_INVALID_INPUT", "export warning is invalid");
+    return {
+      code: warning.code,
+      severity: "warning" as const,
+      message: warning.message,
+      ...(warning.path !== undefined ? { path: normalizeArtifactPath(warning.path) } : {}),
+      ...(warning.suggestion !== undefined ? { suggestion: warning.suggestion } : {}),
+    };
+  });
+  const bytes = Buffer.from(input.bytes);
+  const outputSha256 = createHash("sha256").update(bytes).digest("hex");
   const artifact = artifactDirectory(home, artifactId);
   const before = readArtifactMetadata(artifact);
   if (before.artifact.currentRevisionId !== revisionId) {
@@ -1620,11 +1868,11 @@ export function exportArtifact(
     report.revisionId !== revisionId
     || report.snapshotDigest !== content.sha256
     || report.status !== "pass"
-    || report.validatorId !== INTEGRITY_VALIDATOR_ID
-    || report.validatorVersion !== INTEGRITY_VALIDATOR_VERSION
+    || report.validatorId !== input.validatorId
+    || report.validatorVersion !== input.validatorVersion
   ) throw storeError("ARTIFACT_INVALID_INPUT", "the ValidationReport does not authorize this exact revision");
-  const bytes = readContentBytes(revisionDirectory(artifact, revisionId), content);
-  verifyClaimedFormat(content.extension, bytes);
+  const sourceBytes = readContentBytes(revisionDirectory(artifact, revisionId), content);
+  verifyClaimedFormat(content.extension, sourceBytes);
   const after = readArtifactMetadata(artifact);
   if (after.text !== before.text || after.artifact.currentRevisionId !== revisionId) {
     throw storeError(
@@ -1632,7 +1880,7 @@ export function exportArtifact(
       "the Artifact changed while export was prepared; reopen the latest version, validate, and export again",
     );
   }
-  const destination = exportDestination(input.destinationPath, content.extension);
+  const destination = exportDestination(input.destinationPath, `.${input.format}`);
   const receiptId = `exp_${randomUUID().replaceAll("-", "")}`;
   ensurePrivateStateSubdirectory(home, [".hara", "artifacts", artifactId, "exports"]);
   const receiptBinding = bindPrivateHaraStateFile(
@@ -1640,21 +1888,21 @@ export function exportArtifact(
     ["artifacts", artifactId, "exports"],
     `${receiptId}.json`,
   );
-  const written = writeExportBytesOnce(destination, bytes, content.sha256);
+  const written = writeExportBytesOnce(destination, bytes, outputSha256);
   const receipt: ArtifactExportReceipt = {
     receiptId,
     artifactId,
     revisionId,
     createdAt: new Date().toISOString(),
-    format: content.extension.slice(1),
-    fidelity: "roundtrip",
+    format: input.format,
+    fidelity: input.fidelity,
     validationReportId,
     output: {
-      mediaType: content.mediaType,
-      byteSize: content.byteSize,
-      sha256: content.sha256,
+      mediaType: input.mediaType,
+      byteSize: bytes.byteLength,
+      sha256: outputSha256,
     },
-    warnings: written.warnings,
+    warnings: [...warnings, ...written.warnings],
   };
   try {
     writePrivateStateBytesOnceSync(
@@ -1674,12 +1922,54 @@ export function exportArtifact(
   return receipt;
 }
 
+export function exportArtifact(
+  home: string,
+  input: ArtifactExportInput,
+): ArtifactExportReceipt {
+  const source = readArtifactRevisionContent(home, {
+    artifactId: input.artifactId,
+    revisionId: input.revisionId,
+    requireCurrent: true,
+  });
+  return exportArtifactConverted(home, {
+    ...input,
+    format: source.content.extension.slice(1),
+    mediaType: source.content.mediaType,
+    fidelity: "roundtrip",
+    bytes: source.bytes,
+    validatorId: INTEGRITY_VALIDATOR_ID,
+    validatorVersion: INTEGRITY_VALIDATOR_VERSION,
+  });
+}
+
 export function getArtifact(
   home: string,
   artifactId: string,
   verifyDigest = true,
 ): ArtifactDetails {
   return readArtifactDetailsFromDirectory(artifactDirectory(home, artifactId), verifyDigest);
+}
+
+export function readArtifactRevisionContent(
+  home: string,
+  input: { artifactId: string; revisionId?: string; requireCurrent?: boolean },
+): ArtifactRevisionContent {
+  const artifactId = checkedArtifactId(input.artifactId);
+  const artifactDirectoryIdentity = artifactDirectory(home, artifactId);
+  const metadata = readArtifactMetadata(artifactDirectoryIdentity).artifact;
+  const revisionId = input.revisionId === undefined
+    ? checkedRevisionId(metadata.currentRevisionId)
+    : checkedInputRevisionId(input.revisionId, "revisionId");
+  if (input.requireCurrent === true && metadata.currentRevisionId !== revisionId) {
+    throw storeError(
+      "ARTIFACT_CONFLICT",
+      "the Artifact changed; reopen the latest revision before continuing",
+    );
+  }
+  const { revision, content } = readRevisionDetails(artifactDirectoryIdentity, revisionId, false);
+  const bytes = readContentBytes(revisionDirectory(artifactDirectoryIdentity, revisionId), content);
+  verifyDirectory(artifactDirectoryIdentity);
+  return { artifact: metadata, revision, content, bytes };
 }
 
 export function listArtifacts(home: string): ArtifactListResult {

@@ -84,6 +84,15 @@
 //   artifact.list     {}                          → {artifacts,invalid,truncated}
 //   artifact.get      {artifactId}                → {artifact,currentRevision,content}
 //   artifact.revisions {artifactId}               → {artifactId,revisions}
+//   presentation.create {title?,project?}          → {artifact,currentRevision,content,project}
+//   presentation.import {sourcePath,title?}        → {artifact,currentRevision,content,project,warnings}
+//                                                     Accepts controlled Slidev Markdown or Hara JSON.
+//   presentation.get {artifactId,revisionId?}      → {artifact,currentRevision,content,project}
+//   presentation.validate {artifactId,revisionId}  → {report:ValidationReport}
+//   presentation.export {artifactId,revisionId,validationReportId,destinationPath,format}
+//                                                   → {receipt:ExportReceipt}; format=json|html|pptx
+//   presentation.preview {artifactId,revisionId}    → {html,revisionId} (same renderer as HTML export)
+//   presentation.preview-file {artifactId,revisionId} → {path,revisionId} (private local HTML)
 //   session.rename    {sessionId,title}           → {sessionId,title}
 //   session.archive   {sessionId,archived}        → {sessionId,archived}   (list hides archived unless {archived:true})
 //   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)

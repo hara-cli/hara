@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.142.0 — 2026-08-07 — native Hara presentations
+
+- Add the built-in `presentation` agent tool and authenticated Serve methods for creating, importing,
+  inspecting, validating, previewing, and exporting native `hara.presentation/1` decks. Agent-created
+  presentations become local Office Artifacts that Desktop can discover after the turn completes.
+- Drive Desktop, private browser presentation, and self-contained HTML export from the same deterministic
+  renderer bytes. The presenter includes keyboard navigation, full-screen mode, and browser Print / Save
+  as PDF without starting a network server or loading remote content.
+- Export canonical JSON or a real editable PPTX after exact-revision validation. Delivery is create-only,
+  rehashed after writing, bound to a path-redacted receipt, and never overwrites an existing file.
+- Import Hara JSON and a controlled, non-executable subset of Slidev Markdown. Vue, HTML, imports,
+  directives, source inclusions, remote frontmatter, macros, and external image fetching remain blocked;
+  ordinary PPT/PPTX/ODP files continue through the safe byte-preserving Artifact path.
+- Upgrade with `npm i -g @nanhara/hara@0.142.0`.
+
 ## 0.141.1 — 2026-08-06 — private reasoning and reliable preview execution
 
 - Filter leaked `<think>` and `<thinking>` blocks, orphan closing tags, and stream-split tag fragments

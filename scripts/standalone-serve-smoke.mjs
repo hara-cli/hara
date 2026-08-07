@@ -193,6 +193,14 @@ try {
   for (const method of ["desk.connections.list", "desk.snapshot", "desk.task.get"]) {
     if (!methods.has(method)) throw new Error(`serve capability is missing ${method}`);
   }
+  for (const method of [
+    "presentation.create",
+    "presentation.validate",
+    "presentation.preview",
+    "presentation.export",
+  ]) {
+    if (!methods.has(method)) throw new Error(`serve capability is missing ${method}`);
+  }
   if (!features.has("collaboration.remote.v1")) {
     throw new Error("serve capability is missing collaboration.remote.v1");
   }
@@ -214,7 +222,44 @@ try {
   if (listed.error || !Array.isArray(listed.result?.sessions)) {
     throw new Error(`serve session list failed: ${JSON.stringify(listed.error ?? listed.result)}`);
   }
-  const stopped = await call(ws, 4, "server.shutdown", {});
+  // Exercise the complete native Presentation path. This catches dependencies that compile into the Bun
+  // standalone but fail only when the Desktop asks the sidecar to render HTML or an editable PPTX.
+  const presentation = await call(ws, 4, "presentation.create", { title: "Standalone proof" });
+  if (
+    presentation.error
+    || presentation.result?.content?.extension !== ".hpres"
+    || presentation.result?.project?.slides?.length !== 1
+  ) {
+    throw new Error(`serve Presentation create failed: ${JSON.stringify(presentation.error ?? presentation.result)}`);
+  }
+  const artifactId = presentation.result.artifact.artifactId;
+  const revisionId = presentation.result.currentRevision.revisionId;
+  const validated = await call(ws, 5, "presentation.validate", { artifactId, revisionId });
+  if (validated.error || validated.result?.report?.status !== "pass") {
+    throw new Error(`serve Presentation validation failed: ${JSON.stringify(validated.error ?? validated.result)}`);
+  }
+  const preview = await call(ws, 6, "presentation.preview", { artifactId, revisionId });
+  if (preview.error || !preview.result?.html?.includes("Standalone proof")) {
+    throw new Error(`serve Presentation preview failed: ${JSON.stringify(preview.error ?? preview.result)}`);
+  }
+  const pptxPath = join(root, "standalone-proof.pptx");
+  const exported = await call(ws, 7, "presentation.export", {
+    artifactId,
+    revisionId,
+    validationReportId: validated.result.report.reportId,
+    destinationPath: pptxPath,
+    format: "pptx",
+  });
+  const pptxBytes = existsSync(pptxPath) ? readFileSync(pptxPath) : Buffer.alloc(0);
+  if (
+    exported.error
+    || exported.result?.receipt?.fidelity !== "template-editable"
+    || !pptxBytes.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
+  ) {
+    throw new Error(`serve Presentation PPTX export failed: ${JSON.stringify(exported.error ?? exported.result)}`);
+  }
+
+  const stopped = await call(ws, 8, "server.shutdown", {});
   if (stopped.error || stopped.result?.accepted !== true) {
     throw new Error(`serve shutdown failed: ${JSON.stringify(stopped.error ?? stopped.result)}`);
   }
@@ -226,7 +271,7 @@ try {
   );
   if (child.exitCode !== 0) throw new Error(`serve exited ${child.exitCode}: ${(stderr || stdout).trim().slice(-4_000)}`);
   if (existsSync(discoveryPath)) throw new Error("serve.json remained after authenticated shutdown");
-  console.log(`✓ native Serve Desk capabilities + session listing + authenticated shutdown (${expectedVersion})`);
+  console.log(`✓ native Serve Desk + Presentation HTML/PPTX + authenticated shutdown (${expectedVersion})`);
 } catch (error) {
   console.error(`standalone serve smoke: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;

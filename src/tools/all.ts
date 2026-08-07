@@ -20,3 +20,4 @@ import "./external_agent.js"; // external_agent (claude-code / codex delegation)
 import "./ask_user.js"; // ask_user
 import "./cron.js"; // cronjob
 import "./computer.js"; // computer (desktop control; self-gates on config)
+import "./presentation.js"; // native Hara Presentation create/import/preview/export

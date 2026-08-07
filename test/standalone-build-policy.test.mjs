@@ -28,6 +28,10 @@ test("standalone releases use baseline x64 targets and runtime boundary smoke", 
     "desk.connections.list",
     "desk.snapshot",
     "desk.task.get",
+    "presentation.create",
+    "presentation.validate",
+    "presentation.preview",
+    "presentation.export",
     "collaboration.remote.v1",
   ]) {
     assert.match(
@@ -36,6 +40,8 @@ test("standalone releases use baseline x64 targets and runtime boundary smoke", 
       `native serve smoke must require ${capability}`,
     );
   }
+  assert.match(serveSmoke, /"pptx"/, "native serve smoke must execute editable Presentation export");
+  assert.match(serveSmoke, /template-editable/, "native serve smoke verifies the PPTX fidelity contract");
   assert.doesNotMatch(
     serveSmoke,
     /from\s+["']ws["']/,

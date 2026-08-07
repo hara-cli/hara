@@ -421,6 +421,13 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       "artifact.list",
       "artifact.get",
       "artifact.revisions",
+      "presentation.create",
+      "presentation.import",
+      "presentation.get",
+      "presentation.validate",
+      "presentation.export",
+      "presentation.preview",
+      "presentation.preview-file",
     ]) {
       assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
     }
@@ -493,6 +500,48 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(finalArtifactRevisions.result.revisions.length, 3);
     const badArtifactImport = await c.call("artifact.import", { sourcePath: "relative.docx" });
     assert.equal(badArtifactImport.error.code, -32602);
+
+    const createdPresentation = await c.call("presentation.create", { title: "Release evidence" });
+    assert.equal(createdPresentation.result.artifact.kind, "presentation");
+    assert.equal(createdPresentation.result.content.extension, ".hpres");
+    assert.equal(createdPresentation.result.project.slides.length, 1);
+    const presentationId = createdPresentation.result.artifact.artifactId;
+    const presentationRevisionId = createdPresentation.result.currentRevision.revisionId;
+    const presentationDetails = await c.call("presentation.get", { artifactId: presentationId });
+    assert.equal(presentationDetails.result.project.title, "Release evidence");
+    const presentationValidation = await c.call("presentation.validate", {
+      artifactId: presentationId,
+      revisionId: presentationRevisionId,
+    });
+    assert.equal(presentationValidation.result.report.status, "pass");
+    assert.equal(presentationValidation.result.report.validatorId, "hara.office.presentation");
+    const presentationPreview = await c.call("presentation.preview-file", {
+      artifactId: presentationId,
+      revisionId: presentationRevisionId,
+    });
+    const presentationPreviewText = readFileSync(presentationPreview.result.path, "utf8");
+    assert.match(presentationPreviewText, /Content-Security-Policy/);
+    const presentationInlinePreview = await c.call("presentation.preview", {
+      artifactId: presentationId,
+      revisionId: presentationRevisionId,
+    });
+    assert.equal(presentationInlinePreview.result.html, presentationPreviewText);
+    const presentationHtmlPath = join(dir, "release-evidence.html");
+    const presentationExport = await c.call("presentation.export", {
+      artifactId: presentationId,
+      revisionId: presentationRevisionId,
+      validationReportId: presentationValidation.result.report.reportId,
+      destinationPath: presentationHtmlPath,
+      format: "html",
+    });
+    assert.equal(presentationExport.result.receipt.fidelity, "visual-fidelity");
+    assert.match(readFileSync(presentationHtmlPath, "utf8"), /@media print/);
+
+    const slidevSource = join(dir, "release-review.md");
+    writeFileSync(slidevSource, "---\ntitle: Release review\n---\n\n# Evidence is complete\n\n- Tests passed\n- Rollback rehearsed\n");
+    const importedPresentation = await c.call("presentation.import", { sourcePath: slidevSource });
+    assert.equal(importedPresentation.result.project.title, "Release review");
+    assert.equal(importedPresentation.result.artifact.origin, "slidev-import");
 
     const created = await c.call("session.create", {});
     const sid = created.result.sessionId;

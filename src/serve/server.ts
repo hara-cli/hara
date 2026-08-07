@@ -126,6 +126,15 @@ import {
   type ArtifactKind,
 } from "../artifacts/store.js";
 import {
+  createPresentationArtifact,
+  createPresentationPreviewFile,
+  exportPresentationArtifact,
+  getPresentationArtifact,
+  importPresentationArtifact,
+  renderPresentationPreview,
+  validatePresentationArtifact,
+} from "../presentations/runtime.js";
+import {
   consumePendingTaskSteering,
   createTaskExecution,
   continueTaskExecution,
@@ -1595,6 +1604,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "automation.run", "automation.toggle", "automation.delete", "automation.scheduler.install",
             "artifact.import", "artifact.commit", "artifact.revert", "artifact.validate", "artifact.export",
             "artifact.list", "artifact.get", "artifact.revisions",
+            "presentation.create", "presentation.import", "presentation.get", "presentation.validate",
+            "presentation.export", "presentation.preview", "presentation.preview-file",
             "tasks.list", "approvals.list", "approvals.resolve",
           ];
           const collaborationRemote =
@@ -2696,6 +2707,133 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               ));
             }
             return reply(rpcResult(id!, { scheduler: automationSchedulerInfo() }));
+          }
+          case "presentation.create": {
+            if (p.title !== undefined && typeof p.title !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "title must be a string"));
+            }
+            if (p.project !== undefined && (!p.project || typeof p.project !== "object" || Array.isArray(p.project))) {
+              return reply(rpcError(id, ERR.PARAMS, "project must be a PresentationProject object"));
+            }
+            if (p.actor !== undefined || p.taskRunId !== undefined) {
+              return reply(rpcError(id, ERR.PARAMS, "actor and taskRunId are assigned by the authenticated host"));
+            }
+            try {
+              const details = createPresentationArtifact(artifactHome, {
+                ...(p.title !== undefined ? { title: p.title } : {}),
+                ...(p.project !== undefined ? { project: p.project } : {}),
+                actor: "user",
+              });
+              return reply(rpcResult(id!, details));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "import"));
+            }
+          }
+          case "presentation.import": {
+            if (typeof p.sourcePath !== "string" || !p.sourcePath) {
+              return reply(rpcError(id, ERR.PARAMS, "sourcePath required"));
+            }
+            if (p.title !== undefined && typeof p.title !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "title must be a string"));
+            }
+            if (p.actor !== undefined || p.taskRunId !== undefined) {
+              return reply(rpcError(id, ERR.PARAMS, "actor and taskRunId are assigned by the authenticated host"));
+            }
+            try {
+              const details = await importPresentationArtifact(artifactHome, {
+                sourcePath: p.sourcePath,
+                ...(p.title !== undefined ? { title: p.title } : {}),
+                actor: "user",
+              });
+              return reply(rpcResult(id!, details));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "import"));
+            }
+          }
+          case "presentation.get": {
+            if (typeof p.artifactId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId required"));
+            }
+            if (p.revisionId !== undefined && typeof p.revisionId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "revisionId must be a string"));
+            }
+            try {
+              const details = getPresentationArtifact(
+                artifactHome,
+                p.artifactId,
+                p.revisionId,
+              );
+              return reply(rpcResult(id!, details));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "open"));
+            }
+          }
+          case "presentation.validate": {
+            if (typeof p.artifactId !== "string" || typeof p.revisionId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId and revisionId required"));
+            }
+            try {
+              const report = validatePresentationArtifact(artifactHome, {
+                artifactId: p.artifactId,
+                revisionId: p.revisionId,
+              });
+              return reply(rpcResult(id!, { report }));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "validate"));
+            }
+          }
+          case "presentation.export": {
+            if (
+              typeof p.artifactId !== "string"
+              || typeof p.revisionId !== "string"
+              || typeof p.validationReportId !== "string"
+              || typeof p.destinationPath !== "string"
+              || (p.format !== "json" && p.format !== "html" && p.format !== "pptx")
+            ) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                "artifactId, revisionId, validationReportId, destinationPath, and format (json, html, or pptx) required",
+              ));
+            }
+            try {
+              const receipt = await exportPresentationArtifact(artifactHome, {
+                artifactId: p.artifactId,
+                revisionId: p.revisionId,
+                validationReportId: p.validationReportId,
+                destinationPath: p.destinationPath,
+                format: p.format,
+              });
+              return reply(rpcResult(id!, { receipt }));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "export"));
+            }
+          }
+          case "presentation.preview-file": {
+            if (typeof p.artifactId !== "string" || typeof p.revisionId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId and revisionId required"));
+            }
+            try {
+              return reply(rpcResult(id!, createPresentationPreviewFile(artifactHome, {
+                artifactId: p.artifactId,
+                revisionId: p.revisionId,
+              })));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "open"));
+            }
+          }
+          case "presentation.preview": {
+            if (typeof p.artifactId !== "string" || typeof p.revisionId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "artifactId and revisionId required"));
+            }
+            try {
+              return reply(rpcResult(id!, renderPresentationPreview(artifactHome, {
+                artifactId: p.artifactId,
+                revisionId: p.revisionId,
+              })));
+            } catch (error) {
+              return reply(artifactRpcError(id, error, "open"));
+            }
           }
           case "artifact.import": {
             if (typeof p.sourcePath !== "string" || !p.sourcePath) {
