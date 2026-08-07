@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.142.1 — 2026-08-07 — reliable directory opening
+
+- Add the dedicated `open_directory` action for explicit requests to show an existing local folder in
+  Finder, File Explorer, or the Linux file manager. It validates and canonicalizes the directory, passes
+  it as one argument to a fixed platform launcher, and never interpolates the path into a shell command.
+- Treat this narrow, user-visible action as interaction rather than arbitrary command execution, so a
+  clear “open this directory” request no longer requires a `task_intake` brief or hits the repeated-failure
+  breaker. Generic shell execution and the breaker retain their existing safety gates.
+- Upgrade with `npm i -g @nanhara/hara@0.142.1`.
+
 ## 0.142.0 — 2026-08-07 — native Hara presentations
 
 - Add the built-in `presentation` agent tool and authenticated Serve methods for creating, importing,
