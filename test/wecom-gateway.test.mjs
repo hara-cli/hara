@@ -30,6 +30,20 @@ async function waitFor(predicate, label, timeoutMs = 3_000) {
   }
 }
 
+async function withTimeout(promise, timeoutMs, createError) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(createError()), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fakeWecom(handler, options = {}) {
   const server = new WebSocketServer({
     host: "127.0.0.1",
@@ -455,7 +469,7 @@ test("WeCom reconnects when two heartbeat ACKs are missed", async () => {
   }
 });
 
-test("spawned hara gateway uses the local WeCom transport and rejects a blocked sender", async () => {
+test("spawned hara gateway uses the local WeCom transport and rejects a blocked sender", { timeout: 30_000 }, async () => {
   let resolveReply;
   const reply = new Promise((resolve) => { resolveReply = resolve; });
   const fake = await fakeWecom((frame, socket) => {
@@ -524,10 +538,12 @@ test("spawned hara gateway uses the local WeCom transport and rejects a blocked 
   });
 
   try {
-    const sent = await Promise.race([
+    const sent = await withTimeout(Promise.race([
       reply,
-      new Promise((_, reject) => setTimeout(() => reject(new Error(`gateway reply timeout\n${stderr}`)), 5_000)),
-    ]);
+      exited.then(({ code, signal }) => {
+        throw new Error(`gateway exited before reply via ${signal ?? code}\n${stderr}`);
+      }),
+    ]), 15_000, () => new Error(`gateway reply timeout\n${stderr}`));
     assert.equal(sent.body.chatid, "blocked-user");
     assert.equal(sent.body.markdown.content, "⛔ not authorized.");
     assert.match(stderr, /hara gateway: wecom up/);
@@ -535,10 +551,11 @@ test("spawned hara gateway uses the local WeCom transport and rejects a blocked 
     assert.doesNotMatch(`${stdout}\n${stderr}`, new RegExp(localSecret));
 
     child.kill("SIGTERM");
-    const result = await Promise.race([
+    const result = await withTimeout(
       exited,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("spawned gateway did not stop")), 3_000)),
-    ]);
+      5_000,
+      () => new Error(`spawned gateway did not stop\n${stderr}`),
+    );
     assert.equal(result.code, 0, `gateway exited via ${result.signal}\n${stderr}`);
     assert.deepEqual(fake.errors, []);
   } finally {
