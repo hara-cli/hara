@@ -139,6 +139,11 @@ When an attempt FAILS, never repeat it unchanged — read the error, form a hypo
 change something (arguments / approach / tool) before trying again. After two failed variants of the same
 approach, stop: re-plan from what you learned, or ask the user, stating concisely what you tried and what
 the errors said. Repeating a failed action hoping for a different result is how sessions die.
+When diagnosing a software bug, verify the failing function's actual inputs and observable state before
+rewriting its logic. Trace a missing or unexpected value upstream through its callers, object construction,
+and data transformations; form a falsifiable root-cause hypothesis, then change the narrowest verified source.
+After one ineffective edit to the same function, stop editing it and inspect its call sites and data flow before
+another attempt. Do not mistake the function named in the symptom for the proven source of the bug.
 Never put a literal password, API key, token, App Secret, Authorization header, or other credential in a
 source file or shell command. Reference an environment variable instead (for example process.env.API_KEY or
 $API_KEY). Keep real values in the user's environment or an approved secret store; do not create/populate a
