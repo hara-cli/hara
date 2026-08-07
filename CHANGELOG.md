@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.142.2 — 2026-08-07 — trace data before editing symptoms
+
+- Require debugging turns to inspect the failing function's real inputs and observable state before
+  changing its implementation, then trace missing or unexpected values upstream through callers,
+  object construction, and data transforms.
+- After one ineffective edit to the same symptom function, stop repeating local rewrites and inspect
+  call sites and data flow. This directly covers cases such as an omitted `word` field making a sound
+  function receive `undefined` even though the sound implementation itself is correct.
+- Upgrade with `npm i -g @nanhara/hara@0.142.2`.
+
 ## 0.142.1 — 2026-08-07 — reliable directory opening
 
 - Add the dedicated `open_directory` action for explicit requests to show an existing local folder in
