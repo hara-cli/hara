@@ -35,15 +35,40 @@ test("native Presentation Artifact previews and exports one validated revision",
         widthEmu: 12192000,
         heightEmu: 6858000,
         brief: { audience: "Management" },
-        slides: [{
-          id: "slide-1",
-          claim: "产品聚焦改善了交付。",
-          takeawayTitle: "聚焦让可靠性提升",
-          blocks: [
-            { id: "metric-1", type: "metric", literal: { label: "准时交付", value: 92, format: "percent" } },
-            { id: "list-1", type: "list", literal: ["缩小批次", "明确责任"] },
-          ],
-        }],
+        theme: { preset: "signal" },
+        slides: [
+          {
+            id: "slide-1",
+            claim: "产品聚焦改善了交付。",
+            takeawayTitle: "聚焦让可靠性提升",
+            blocks: [
+              { id: "metric-1", type: "metric", literal: { label: "准时交付", value: 92, format: "percent" } },
+              { id: "list-1", type: "list", literal: ["缩小批次", "明确责任"] },
+              {
+                id: "chart-1",
+                type: "chart",
+                literal: {
+                  chartType: "line",
+                  categories: ["一月", "二月", "三月"],
+                  series: [{ name: "准时交付", values: [68, 81, 92] }],
+                },
+              },
+            ],
+          },
+          {
+            id: "slide-2",
+            claim: "左右两侧承担不同职责。",
+            takeawayTitle: "聊天与工作台协同",
+            blocks: [{
+              id: "columns-1",
+              type: "columns",
+              literal: {
+                left: { title: "聊天", items: ["补充资料", "提出修改"] },
+                right: { title: "工作台", items: ["直接编辑", "检查导出"] },
+              },
+            }],
+          },
+        ],
       },
     });
     assert.equal(created.content.extension, ".hpres");
@@ -64,6 +89,8 @@ test("native Presentation Artifact previews and exports one validated revision",
     });
     const previewText = await readFile(preview.path, "utf8");
     assert.match(previewText, /Content-Security-Policy/);
+    assert.match(previewText, /补充资料/);
+    assert.match(previewText, /检查导出/);
     if (process.platform !== "win32") {
       assert.equal((await stat(preview.path)).mode & 0o777, 0o600);
     }
@@ -81,7 +108,10 @@ test("native Presentation Artifact previews and exports one validated revision",
       assert.ok(receipt.output.byteSize > 0);
       const bytes = await readFile(destinationPath);
       assert.equal(bytes.byteLength, receipt.output.byteSize);
-      if (format === "pptx") assert.deepEqual([...bytes.subarray(0, 4)], [0x50, 0x4b, 0x03, 0x04]);
+      if (format === "pptx") {
+        assert.deepEqual([...bytes.subarray(0, 4)], [0x50, 0x4b, 0x03, 0x04]);
+        assert.ok(bytes.includes(Buffer.from("ppt/charts/chart1.xml")), "PPTX keeps an editable native chart part");
+      }
       if (format === "html") assert.match(bytes.toString("utf8"), /@media print/);
     }
   });
@@ -192,9 +222,20 @@ test("agent presentation tool exposes a complete generation schema and creates a
     "slides",
   ]);
   const blockTypes = projectSchema.properties.slides.items.properties.blocks.items.properties.type.enum;
-  for (const type of ["text", "list", "metric", "table", "chart", "compare", "timeline", "flow"]) {
+  for (const type of [
+    "text", "list", "image", "metric", "table", "chart", "compare", "timeline", "flow",
+    "diagram", "columns", "group",
+  ]) {
     assert.ok(blockTypes.includes(type), `tool schema teaches the model how to generate ${type}`);
   }
+  assert.deepEqual(projectSchema.properties.theme.properties.preset.enum, [
+    "editorial", "midnight", "signal", "calm",
+  ]);
+  assert.match(tool.description, /must not repeat one default card grid/);
+  assert.match(
+    projectSchema.properties.slides.items.properties.blocks.items.properties.literal.description,
+    /chartType:bar\|line\|area\|pie\|doughnut/,
+  );
 
   const notices = [];
   const surfaces = [];

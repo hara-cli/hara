@@ -24,7 +24,11 @@ registerTool({
     + "to Hara Desktop's right work surface. The offer is not proof that a Desktop loaded or displayed it; only the "
     + "Desktop host may report that UI state. "
     + "Give every slide one evidence-backed claim and takeaway title, unique slide/block ids, and usually 2–5 blocks; "
-    + "record external sources in notes and never invent evidence. Revise the same Artifact instead of creating parallel copies. "
+    + "record external sources in notes and never invent evidence. Choose a deliberate built-in theme and vary the content "
+    + "composition: statement, data, process, visual, split, or editorial pages must not repeat one default card grid. Use "
+    + "native chart data for real comparisons; use flow/diagram/columns for processes and architecture; use images only when "
+    + "the user supplied a real bounded raster image, otherwise keep an honest image placeholder. Revise the same Artifact "
+    + "instead of creating parallel copies. "
     + "Always validate the exact revision before export. Ordinary PPT work must not configure or invoke a separate vision "
     + "helper; image-based review is optional and only for an explicit request with a natively image-capable main model. "
     + "Import accepts controlled Slidev Markdown or Hara presentation JSON. Export supports editable PPTX, self-contained "
@@ -64,7 +68,15 @@ registerTool({
           },
           theme: {
             type: "object",
-            description: "Optional plain-JSON theme metadata; Presenter remains deterministic",
+            description: "Optional shared visual theme used by Desktop HTML and editable PPTX",
+            additionalProperties: false,
+            properties: {
+              preset: {
+                type: "string",
+                enum: ["editorial", "midnight", "signal", "calm"],
+                description: "Select deliberately from editorial, midnight, signal, or calm",
+              },
+            },
           },
           slides: {
             type: "array",
@@ -116,8 +128,10 @@ registerTool({
                         description:
                           "Block data: heading/text/quote/callout use a string; list uses string[]; "
                           + "metric uses {label,value,format?,delta?}; table uses {headers,rows}; "
-                          + "chart uses {values} or {series:[{values}]}; compare uses {left,right}; "
-                          + "timeline/flow use {items:[{text or title,description?}]}; image uses a safe data:image base64 URL or {alt}.",
+                          + "chart uses {chartType:bar|line|area|pie|doughnut,title?,categories,series:[{name,values}]}; "
+                          + "compare/columns use {left:{title,description?,items?},right:{title,description?,items?}}; "
+                          + "timeline/flow/diagram/group use {items:[{title or text,description?,items?}]}; image uses "
+                          + "{src:data:image/(png|jpeg|webp|gif);base64,...,alt,caption?} or an honest {alt,caption?} placeholder.",
                       },
                     },
                     required: ["id", "type", "literal"],

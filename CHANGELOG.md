@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.144.0 — 2026-08-08 — native visual storytelling
+
+- Upgrade the native Presentation runtime to `0.1.0-alpha.6`, preserving nested columns, groups,
+  comparisons, diagrams, and flows in both Desktop HTML and editable PPTX instead of accepting
+  structured content that later renders as blank cards.
+- Add native editable bar, line, area, pie, and doughnut charts; bounded PNG, JPEG, WebP, and GIF
+  images; and shared editorial, midnight, signal, and calm themes.
+- Teach the Presentation specialist to choose content-aware statement, data, process, visual, split,
+  and editorial compositions instead of repeating one default layout. HTML remains the canonical
+  browser and Print / Save as PDF surface, while PPTX keeps editable shapes and chart data.
+- Upgrade with `npm i -g @nanhara/hara@0.144.0`.
+
 ## 0.143.1 — 2026-08-08 — truthful Desktop presentation handoff
 
 - Treat a Presentation surface event as an offer to the owning Desktop session, not proof that the
