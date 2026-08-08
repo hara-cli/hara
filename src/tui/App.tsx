@@ -119,10 +119,6 @@ export interface HeaderInfo {
   /** When `kind === 'org'`: source of the current model — "org default" / "user override"
    *  / "/model override". Drives the suffix of the model line. */
   modelSource?: string;
-  /** The vision sidecar (describer) model, i.e. `cfg.visionModel` — the model that reads pasted
-   *  images when the main model is text-only. When set, the model line gets a dim `· vision <model>`
-   *  clause. When undefined we render nothing (native-vision main models stay silent — 顾雅 spec). */
-  visionModel?: string;
   /** Update-available notice ("0.112.5 → 0.119.1 · npm i -g @nanhara/hara"). Rendered INSIDE the TUI —
    *  the pre-mount stdout print never survives ink taking over the screen, which is why TUI users
    *  reported the update check as "completely dead" while stuck versions piled up. */
@@ -145,7 +141,7 @@ export interface AppProps {
   onClipboardImage?: () => ImageAttachment | null;
   /** modal (vim) keybindings in the input box */
   vim?: boolean;
-  /** Vision routing notice text (e.g. "glm-5 is text-only — images read by qwen-vl-max").
+  /** Image compatibility notice text (e.g. "glm-5 is text-only — attached images use Hara's compatibility helper").
    *  When set, the FIRST image attachment in this session triggers a one-shot inline notice.
    *  Header doesn't display it (顾雅: kill the always-on vision line). Undefined = native vision
    *  (no notice) or no describer configured (a different path warns when an image actually arrives). */
@@ -337,18 +333,11 @@ export function fieldFormatter(labels: string[]): (label: string) => string {
   return (label: string): string => label.padEnd(width, " ");
 }
 
-/** Dim trailing clause for the model line: the vision sidecar (only when configured). Pure so the
- *  composition (spacing, silence-when-unset) can be pinned in a unit test without rendering React.
- *  Returns "" when no describer is configured (native-vision main models stay silent — 顾雅 spec).
- *  The actionable `/model ↹` hint is rendered separately (in green) by the view. */
-export function modelLineSuffix(visionModel?: string): string {
-  return visionModel ? ` · vision ${visionModel}` : "";
-}
-
 // The header is emitted ONCE into <Static> (App's id:-1 sentinel). A rounded, dim-bordered card
 // (codex polish) that HUGS its content via alignSelf="flex-start" — so it neither spans the full
 // width nor blows out on resize. Keeps hara's identity: seal-red ◆ glyph + title, the org/profile
-// grid, and the vision sidecar clause. One accent (◆ + title); one green affordance (/model ↹).
+// grid. One accent (◆ + title); one green affordance (/model ↹). Optional image compatibility is
+// intentionally absent until an image is actually attached.
 function HeaderCard(props: HeaderInfo) {
   const { version, modelLabel, cwd, agentsMdLoaded, session, kind } = props;
   const home = process.env.HOME ?? "";
@@ -398,9 +387,9 @@ function HeaderCard(props: HeaderInfo) {
         {row("model", (
           <Text>
             <Text>{modelLabel}</Text>
-            {isOrg
-              ? props.modelSource ? <Text dimColor>{` · from ${props.modelSource}`}</Text> : null
-              : props.visionModel ? <Text dimColor>{modelLineSuffix(props.visionModel)}</Text> : null}
+            {isOrg && props.modelSource
+              ? <Text dimColor>{` · from ${props.modelSource}`}</Text>
+              : null}
             <Text>{"   "}</Text>
             <Text color="green">{"/model ↹"}</Text>
           </Text>

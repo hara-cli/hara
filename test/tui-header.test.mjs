@@ -2,7 +2,7 @@
 // rendering without React, so they can be pinned exactly — no escape codes, no layout drift.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractHost, shortenHome, shortenSession, modelLineSuffix, fieldFormatter } from "../dist/tui/App.js";
+import { extractHost, shortenHome, shortenSession, fieldFormatter } from "../dist/tui/App.js";
 import { routeHost } from "../dist/profile/profile.js";
 
 test("extractHost: returns host-only for canonical URLs (no scheme, no path, no query)", () => {
@@ -48,17 +48,6 @@ test("shortenSession: 8-char prefix, never the whole id; safe on missing input",
   assert.equal(shortenSession(""), "");
   assert.equal(shortenSession(undefined), "");
   assert.equal(shortenSession(null), "");
-});
-
-test("modelLineSuffix: the dim vision clause '· vision <model>' ONLY when a visionModel is set (no /model hint here)", () => {
-  // With a describer configured → just the vision clause. The actionable `/model ↹` hint now lives in
-  // the view (rendered green), NOT in this dim suffix.
-  const withVision = modelLineSuffix("qwen3.7-plus");
-  assert.ok(withVision.includes("vision qwen3.7-plus"), "vision sidecar shown when set");
-  assert.ok(!withVision.includes("/model"), "the /model affordance is rendered by the view, not baked into the suffix");
-  // No describer → empty (silence beats a fabricated describer; native-vision models say nothing).
-  assert.equal(modelLineSuffix(undefined), "", "empty suffix when no describer configured");
-  assert.equal(modelLineSuffix(""), "", "empty string is treated as unset (falsy)");
 });
 
 test("fieldFormatter: pads every label to the WIDEST label actually shown (data-driven grid, codex FieldFormatter::from_labels)", () => {

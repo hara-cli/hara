@@ -106,13 +106,12 @@ test("App header (personal): bordered card, ◆ glyph + title, profile grid, /mo
   unmount();
 });
 
-test("App header (personal w/ visionModel): identity row appends a dim '· vision <model>' clause", async () => {
+test("App header keeps the optional image compatibility model out of primary identity", async () => {
   const header = {
     version: "9.9.9",
     modelLabel: "qwen:glm-5",
     cwd: "/Users/jeff/work/x",
     kind: "personal",
-    visionModel: "qwen3.7-plus",
   };
   const { lastFrame, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), header, onSubmit: async () => {} }),
@@ -121,12 +120,12 @@ test("App header (personal w/ visionModel): identity row appends a dim '· visio
   const frame = strip(lastFrame());
   assert.ok(/profile\s+personal/.test(frame), "profile grid row shows 'personal'");
   assert.ok(/model\s+qwen:glm-5/.test(frame), "model row carries provider:model");
-  assert.ok(frame.includes("vision qwen3.7-plus"), "vision sidecar model surfaced on the model row (dim)");
-  assert.ok(frame.includes("/model ↹"), "/model ↹ affordance present alongside the vision clause");
+  assert.ok(!frame.includes("vision qwen3.7-plus"), "the compatibility helper is not presented as a second primary model");
+  assert.ok(frame.includes("/model ↹"), "/model ↹ remains the primary model affordance");
   unmount();
 });
 
-test("App header (org, routed): model row shows provenance '· from <source>' INSTEAD of the vision clause", async () => {
+test("App header (org, routed): model row shows connection provenance without image-helper chrome", async () => {
   // When routed via an org, the model row surfaces WHERE the model came from (provenance) rather than
   // the vision sidecar — the vision describer is a personal-config detail, not org-relevant chrome.
   const header = {
@@ -137,7 +136,6 @@ test("App header (org, routed): model row shows provenance '· from <source>' IN
     orgLabel: "Acme Inc",
     orgId: "acme-jeff",
     modelSource: "org default",
-    visionModel: "qwen3.7-plus",
   };
   const { lastFrame, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), header, onSubmit: async () => {} }),
@@ -146,7 +144,7 @@ test("App header (org, routed): model row shows provenance '· from <source>' IN
   const frame = strip(lastFrame());
   assert.ok(/model\s+qwen:glm-5/.test(frame), "org model row present");
   assert.ok(frame.includes("from org default"), "provenance ('from <source>') shown on the org model row");
-  assert.ok(!frame.includes("vision qwen3.7-plus"), "vision clause suppressed on org (provenance takes its place)");
+  assert.ok(!frame.includes("vision qwen3.7-plus"), "image-helper internals stay out of organization identity");
   assert.ok(frame.includes("/model ↹"), "/model ↹ affordance still present on the org model row");
   unmount();
 });
@@ -202,7 +200,7 @@ test("App header (org/gateway): split identity + model + source rows; route host
   unmount();
 });
 
-test("App lazy vision notice: not in header at init; emitted inline once on the first image attachment", async () => {
+test("App image compatibility notice stays lazy until an image attachment is used", async () => {
   const header = { version: "9.9.9", modelLabel: "qwen:glm-5", cwd: "/x", kind: "personal" };
   const onSubmit = async (line, h) => {
     h.sink.assistantDelta("ok");
@@ -215,12 +213,12 @@ test("App lazy vision notice: not in header at init; emitted inline once on the 
       cwd: process.cwd(),
       header,
       onSubmit,
-      visionNotice: "glm-5 is text-only — images read by qwen-vl-max",
+      visionNotice: "glm-5 is text-only — attached images use Hara's compatibility helper",
     }),
   );
   await tick();
   // At init the notice is NOT in the frame — header doesn't carry it anymore.
-  assert.ok(!strip(lastFrame()).includes("images read by qwen-vl-max"), "vision notice silent at init");
+  assert.ok(!strip(lastFrame()).includes("compatibility helper"), "image compatibility notice is silent at init");
   // Simulate a turn where the runner reports an image attachment by having the App see one in handleSubmit.
   // We can't paste a real image via stdin in ink-testing-library, so we feed a synthetic onClipboardImage and
   // press Ctrl+V — but the simplest path is to drive the notice via a direct image turn through onSubmit + the
@@ -230,7 +228,7 @@ test("App lazy vision notice: not in header at init; emitted inline once on the 
   stdin.write("\r");
   await tick(150);
   // Still no notice — no image yet.
-  assert.ok(!strip(lastFrame()).includes("images read by qwen-vl-max"), "still no notice after a plain text turn");
+  assert.ok(!strip(lastFrame()).includes("compatibility helper"), "still no image notice after a plain text turn");
   unmount();
 });
 

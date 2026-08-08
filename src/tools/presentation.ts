@@ -19,10 +19,14 @@ registerTool({
   name: "presentation",
   description:
     "Create, import, update, inspect, validate, preview, or export a native Hara presentation. "
-    + "Use create with a PresentationProject to make a deck visible in Hara Desktop's right panel. "
-    + "Give every slide one evidence-backed claim and takeaway title, unique slide/block ids, and usually 2–5 blocks. "
-    + "Import accepts controlled Slidev Markdown or Hara presentation JSON. Export supports editable PPTX, "
-    + "self-contained HTML (also browser Print/Save PDF), and canonical JSON.",
+    + "Work as a Presentation specialist: infer a minimal audience/purpose/source brief, ask only for missing facts "
+    + "that materially change the result, then create an editable draft early so it opens in Hara Desktop's right panel. "
+    + "Give every slide one evidence-backed claim and takeaway title, unique slide/block ids, and usually 2–5 blocks; "
+    + "record external sources in notes and never invent evidence. Revise the same Artifact instead of creating parallel copies. "
+    + "Always validate the exact revision before export. Ordinary PPT work must not configure or invoke a separate vision "
+    + "helper; image-based review is optional and only for an explicit request with a natively image-capable main model. "
+    + "Import accepts controlled Slidev Markdown or Hara presentation JSON. Export supports editable PPTX, self-contained "
+    + "HTML (also browser Print/Save PDF), and canonical JSON.",
   input_schema: {
     type: "object",
     properties: {

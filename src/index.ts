@@ -1888,7 +1888,13 @@ function runDoctor(cfg: HaraConfig): string {
   const ad = assetsDir();
   const roles = loadRoles(cfg.cwd);
   const vcap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-  const vdesc = vcap === "vision" ? c.dim("sees images (inline)") : vcap === "text" ? c.dim("text-only") : c.yellow("capability unknown — asks on first image");
+  const imageStatus = vcap === "vision"
+    ? c.dim("native on the main model")
+    : cfg.visionModel
+      ? c.dim("advanced compatibility fallback · ") + c.bold(cfg.visionModel)
+      : vcap === "text"
+        ? c.dim("off for this text-only model")
+        : c.dim("checked on first image");
   const installation = activeInstallation();
   const lines = [
     c.bold("hara doctor"),
@@ -1903,7 +1909,7 @@ function runDoctor(cfg: HaraConfig): string {
     `${dot} skills ${(() => { const n = loadSkillIndex(cfg.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(cfg.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
     `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)} ${c.dim("· capture")} ${c.bold(cfg.assetCapture)}`,
     `${dot} search ${c.dim("lexical (always on)")}${cfg.embedProvider === "off" ? c.dim(" · semantic off (hara config set embedProvider ollama|qwen)") : c.dim(" · semantic ") + c.bold(cfg.embedProvider) + (() => { const idx = ["repo", "assets", "memory"].filter((n) => indexExists(n, cfg.cwd)); return c.dim(" · indexed: ") + (idx.length ? c.green(idx.join(", ")) : c.yellow("none — run: hara index --all")); })()}`,
-    `${dot} vision · ${c.bold(cfg.model)} ${vdesc}${cfg.visionModel ? c.dim(" · describer ") + c.bold(cfg.visionModel) : vcap === "text" ? c.yellow(" · set /vision <model>") : ""}`,
+    `${dot} images ${imageStatus}`,
     `${dot} screen ${cfg.computerUse === "off" ? c.dim("off (hara config set computerUse read|click|full)") : c.bold(cfg.computerUse) + c.dim(` · ${computerBackends()}${cfg.computerApps.length ? " · apps: " + cfg.computerApps.join(", ") : " · no app allowlist"}`)}`,
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
     `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
@@ -2962,10 +2968,10 @@ program
           if (!live.visionModel) {
             throw new Error(
               native === "text"
-                ? `model '${opts.model}' cannot read images and no vision sidecar is configured`
+                ? `model '${opts.model}' cannot read images; switch to an image-capable main model or configure the advanced image fallback`
                 : (
                     `image capability for model '${opts.model}' is unknown; ` +
-                    "configure a vision model or a modelVision override before sending images"
+                    "choose a model with advertised image support or set an advanced modelVision override"
                   ),
             );
           }
@@ -2976,7 +2982,7 @@ program
           }, opts.profileId);
           if (!visionProvider) {
             throw new Error(
-              `vision sidecar '${live.visionModel}' is not authenticated for profile '${profile.id}'`,
+              `the advanced image fallback is not authenticated for profile '${profile.id}'`,
             );
           }
           const description = await describeImages(visionProvider, images, {
@@ -5048,7 +5054,7 @@ program.action(async (opts) => {
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
   if (resumed) out(c.dim(`(resumed ${shortId(meta.id)} · ${history.length} msgs · model = ${cfg.model})\n`));
 
-  // Vision describer state — shared by the `/vision` command (both REPLs) and the TUI image pipeline.
+  // Advanced image fallback state — shared by the `/vision` command (both REPLs) and the TUI image pipeline.
   let visionProvider: Provider | null | undefined;
   let remindedVision = false;
   /** `/vision <model>` sets the describer; `/vision main yes|no|auto` sets the current model's capability. */
@@ -5056,7 +5062,7 @@ program.action(async (opts) => {
     const parts = arg.trim().split(/\s+/).filter(Boolean);
     if (parts.length === 0) {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      return `vision — main ${cfg.model}: ${cap}${cap === "unknown" ? " (asks on first image)" : ""} · describer: ${cfg.visionModel || "(none — /vision <model>)"}`;
+      return `images — main ${cfg.model}: ${cap}${cap === "unknown" ? " (checked on first image)" : ""} · advanced fallback: ${cfg.visionModel || "off"}`;
     }
     if (parts[0] === "main") {
       const v = parts[1];
@@ -5077,7 +5083,7 @@ program.action(async (opts) => {
     visionProvider = undefined; // rebuild the describer with the new model
     writeConfigValue("visionModel", model);
     const warn = classifyVision(cfg.provider, model, cfg.modelVision) !== "vision" ? `  ⚠ ${model} isn't a known vision model — if it can't read images, pick a *-vl / vision model.` : "";
-    return `(visionModel → ${model}; text-only main models describe pasted images with it)${warn}`;
+    return `(advanced image fallback → ${model}; used only when the selected main model cannot read images)${warn}`;
   };
 
   const commands: Slash[] = [
@@ -5193,7 +5199,7 @@ program.action(async (opts) => {
     },
     {
       name: "vision",
-      desc: "vision describer: /vision <model> · /vision main yes|no|auto",
+      desc: "advanced image fallback: /vision <model> · /vision main yes|no|auto",
       run: (a) => void out(applyVision(a || "") + "\n"),
     },
     {
@@ -5545,13 +5551,12 @@ program.action(async (opts) => {
       }
     };
     const remindVision = (sink: { notice: (s: string) => void }): void => {
-      if (remindedVision) return void sink.notice(`⚠ image skipped — ${cfg.model} is text-only. Add a vision model: /vision <model>`);
+      if (remindedVision) return void sink.notice(`⚠ image skipped — ${cfg.model} is text-only. Switch to an image-capable main model.`);
       remindedVision = true;
       sink.notice(
         `⚠ ${cfg.model} is text-only and can't see images, so your image was skipped.\n` +
-          `  Add a vision model to read images for it:\n` +
-          `      /vision qwen-vl-max     ← sets it now (uses your current plan/key) and remembers it\n` +
-          `  It OCRs/describes each pasted image into text the model can act on.`,
+          `  Switch this conversation to a main model with native image support.\n` +
+          `  Advanced compatibility remains available with /vision <model> when a text-only route must be kept.`,
       );
     };
     const resolveImages = async (
@@ -5563,7 +5568,7 @@ program.action(async (opts) => {
       if (cap === "unknown") {
         const ans = await h.select(`Can your model "${cfg.model}" understand images (vision)?`, [
           { label: "Yes — send images to it directly", value: "yes" },
-          { label: "No — describe them with a vision model first", value: "no" },
+          { label: "No — this is a text-only model", value: "no" },
           { label: "Skip the image this time", value: "skip" },
         ]);
         if (ans === "skip") return { skip: true };
@@ -5579,13 +5584,13 @@ program.action(async (opts) => {
       }
       const vp = await getVisionProvider();
       if (!vp) {
-        h.sink.notice(`(visionModel ${cfg.visionModel} unavailable — check visionApiKey/visionBaseURL)`);
+        h.sink.notice("(image compatibility helper unavailable — check the advanced image fallback settings)");
         return { skip: true };
       }
-      h.sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with ${cfg.visionModel}…`);
+      h.sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with the image compatibility helper…`);
       try {
         const desc = await describeImages(vp, imgs, { signal: h.signal });
-        return { extraText: `\n\n[Image description — via ${cfg.visionModel}]\n${desc}` };
+        return { extraText: `\n\n[Image description — compatibility helper]\n${desc}` };
       } catch (e) {
         const msg = h.signal?.aborted ? "image describe cancelled" : `image describe failed: ${e instanceof Error ? e.message : String(e)}`;
         h.sink.notice(`(${msg})`);
@@ -5598,8 +5603,8 @@ program.action(async (opts) => {
     //     (route host only when baseURL is custom); org spreads to `org <label> · <id> → <host>`
     //     plus its own `model` line annotated with the source (org default / user override).
     //   • cwd line silently appends "· AGENTS.md" when loaded — we never show a negative noise line.
-    //   • Vision routing is NOT in the header anymore — App emits a one-shot inline notice via
-    //     `visionNotice` the first time an image lands in the session.
+    //   • Image compatibility is not model identity. It stays out of the header and appears only as a
+    //     one-shot inline notice when a text-only model actually receives an image.
     const __mainCap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
     const __routeForHeader = routeHost(__activeP);
     // Model-source label (org only). `loadConfig` already merges env > project > overlay > globals,
@@ -5616,7 +5621,7 @@ program.action(async (opts) => {
     // too — the existing per-image picker (resolveImages) handles that on first paste.
     const __visionNotice =
       __mainCap === "text" && cfg.visionModel
-        ? `${cfg.model} is text-only — images read by ${cfg.visionModel}`
+        ? `${cfg.model} is text-only — attached images use Hara's compatibility helper`
         : undefined;
     await runTui({
       initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
@@ -5635,7 +5640,6 @@ program.action(async (opts) => {
         orgId: __activeP.kind === "gateway" ? __activeP.deviceId || __activeP.id : undefined,
         routeHost: __routeForHeader?.host,
         modelSource: __modelSource,
-        visionModel: cfg.visionModel,
         // the pre-mount stdout notice (line ~2497) doesn't survive ink taking the screen — TUI users
         // never saw update notices and versions silently went stale (field report: stuck on 0.112.5)
         updateNotice: cfg.updateCheck ? (checkForUpdate(pkg.version) ?? undefined) : undefined,

@@ -16,7 +16,9 @@ provider is required; everything else has a sane default.
 | `baseURL` | OpenAI-compatible base (for qwen/openai) | `https://…/v1` |
 
 ## Optional
-- **Vision sidecar** (OCR/describe pasted images for a text-only main model): `visionModel` / `visionBaseURL` / `visionApiKey` (default to the main provider).
+- **Advanced image fallback** (optional compatibility for attached images when the selected main model is text-only):
+  `visionModel` / `visionBaseURL` / `visionApiKey` (default to the main provider). Prefer a main model with
+  native image input. This fallback is not part of Presentation generation or its default validation path.
 - **Semantic search / vectors** — see below: `embedProvider` (`off` \| `ollama` \| `qwen` \| `openai`) + `embedModel` / `embedBaseURL` / `embedApiKey`.
 - **B-end fleet**: `hara enroll <gateway> --code <code>` → device token in `~/.hara/org.json` (0600); sets `provider=hara-gateway`.
 - **Behavior**: `approval` · `sandbox` · `theme` · `evolve` · `assetCapture` · `computerUse`/`computerApps` · `hooks` · `notify` · `vimMode` · `mcpServers` · `HARA_MAX_CONCURRENCY` (parallel sub-agent/read cap, default 8).

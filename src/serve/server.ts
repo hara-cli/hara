@@ -1292,8 +1292,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         } else if (imageMode === "unsupported" || imageMode === "unknown") {
           throw new Error(
             imageMode === "unsupported"
-              ? `model '${s.meta.model}' cannot read images and no vision sidecar is configured`
-              : `image capability for model '${s.meta.model}' is unknown; configure a vision model or a modelVision override before sending images`,
+              ? `model '${s.meta.model}' cannot read images; switch to an image-capable main model or configure the advanced image fallback`
+              : `image capability for model '${s.meta.model}' is unknown; choose a model with advertised image support or set an advanced modelVision override`,
           );
         }
       }
