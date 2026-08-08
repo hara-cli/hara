@@ -30,6 +30,7 @@ import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { isValidProfileId } from "../profile/profile.js";
 import { sleepSync } from "../sync-sleep.js";
 import { isTaskExecution, type TaskExecution } from "./task.js";
+import type { ApprovalMode } from "../config.js";
 
 /** Durable transcripts are local input on resume. Bound both allocation and post-parse traversal so a
  * corrupt/hostile session cannot turn startup or `hara sessions` into an unbounded resource operation. */
@@ -96,6 +97,9 @@ export interface SessionMeta {
   jobId?: string;
   /** Per-session reasoning effort pin used by persistent Serve clients. */
   effort?: string;
+  /** Per-session approval policy. New persistent clients write this explicitly so reconnecting never
+   * silently falls back from full-auto (or another user choice) to the Serve process default. */
+  approval?: ApprovalMode;
   /** archived sessions are hidden from pickers/lists but kept on disk (codex thread/archive) */
   archived?: boolean;
   /** Gateway thread ownership marker; absent for interactive/cron and legacy sessions. */
@@ -1008,6 +1012,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   if (data.meta.source !== undefined) safe.meta.source = data.meta.source;
   if (data.meta.jobId !== undefined) safe.meta.jobId = data.meta.jobId;
   if (data.meta.effort !== undefined) safe.meta.effort = data.meta.effort;
+  if (data.meta.approval !== undefined) safe.meta.approval = data.meta.approval;
   if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
   if (data.task && safe.task) {
@@ -1255,6 +1260,10 @@ function isSessionMeta(value: unknown): value is SessionMeta {
     (meta.sourceName === undefined || typeof meta.sourceName === "string") &&
     (meta.jobId === undefined || (typeof meta.jobId === "string" && AUTOMATION_JOB_ID.test(meta.jobId))) &&
     (meta.effort === undefined || typeof meta.effort === "string") &&
+    (meta.approval === undefined
+      || meta.approval === "suggest"
+      || meta.approval === "auto-edit"
+      || meta.approval === "full-auto") &&
     (meta.archived === undefined || typeof meta.archived === "boolean") &&
     (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string")
   );

@@ -1625,6 +1625,7 @@ test("serve e2e: an unavailable organization session stays readable and transfer
     assert.notEqual(forked.result.sessionId, sessionId);
     assert.equal(forked.result.profileId, "personal");
     assert.equal(forked.result.model, "qwen3.7-plus");
+    assert.equal(forked.result.approval, "full-auto", "legacy source inherits the server policy when forked");
     assert.deepEqual(forked.result.history, history.result.history);
     assert.equal(store.saved.get(forked.result.sessionId).meta.profileId, "personal");
     assert.equal(store.saved.get(forked.result.sessionId).meta.model, "qwen3.7-plus");
@@ -2900,6 +2901,7 @@ test("serve e2e: files.search + session.context + compact + rewind (codex deskto
     // session.fork: duplicate history into a NEW live session; original untouched
     const fk = await c.call("session.fork", { sessionId: sid });
     assert.ok(fk.result.sessionId && fk.result.sessionId !== sid, "fork got a fresh id");
+    assert.equal(fk.result.approval, "full-auto", "fork reports the inherited approval mode");
     assert.equal(fk.result.history.length, comp.result.history.length, "fork copied the compacted checkpoint plus recent anchor");
     assert.ok(store.saved.has(fk.result.sessionId), "fork persisted immediately");
     const fsend = await c.call("session.send", { sessionId: fk.result.sessionId, text: "diverge" });
@@ -2967,6 +2969,57 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
   } finally {
     c.close();
     await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: a per-session full-auto choice persists across reconnects without approval prompts", { timeout: 30000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-full-auto-persist-"));
+  const store = memStore();
+  let sessionId = "";
+
+  const firstServer = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(toolProvider(), store, "suggest"),
+  );
+  const firstClient = await connect(firstServer.port);
+  try {
+    await firstClient.call("initialize", { token: "tok" });
+    const created = await firstClient.call("session.create", {});
+    sessionId = created.result.sessionId;
+    assert.equal(created.result.approval, "suggest");
+
+    const changed = await firstClient.call("session.set-approval", {
+      sessionId,
+      approval: "full-auto",
+    });
+    assert.equal(changed.result.approval, "full-auto");
+    assert.equal(store.saved.get(sessionId).meta.approval, "full-auto");
+
+    const sent = await firstClient.call("session.send", { sessionId, text: "write without prompting" });
+    assert.equal(sent.result.reply, "done");
+    assert.equal(firstClient.events.filter((event) => event.method === "approval.request").length, 0);
+  } finally {
+    firstClient.close();
+    await firstServer.close();
+  }
+
+  const secondServer = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok-2", cwd: dir },
+    baseDeps(toolProvider(), store, "suggest"),
+  );
+  const secondClient = await connect(secondServer.port);
+  try {
+    await secondClient.call("initialize", { token: "tok-2" });
+    const resumed = await secondClient.call("session.resume", { sessionId });
+    assert.equal(resumed.result.approval, "full-auto", "resume restores the conversation choice, not the server default");
+
+    const sent = await secondClient.call("session.send", { sessionId, text: "write after reconnect" });
+    assert.equal(sent.result.reply, "done");
+    assert.equal(secondClient.events.filter((event) => event.method === "approval.request").length, 0);
+  } finally {
+    secondClient.close();
+    await secondServer.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -1,9 +1,9 @@
 import { homedir } from "node:os";
 
 export const MIN_NODE_MAJOR = 22;
-// Commander 15 (a direct runtime dependency) requires this exact floor. Keep package engines, startup,
-// doctor, and docs aligned so an early Node 22 release gets an upgrade hint before dependencies load.
-export const MIN_NODE_VERSION = "22.12.0";
+// The native Presentation runtime requires this exact floor. Keep package engines, startup, doctor, and
+// docs aligned so an earlier Node 22 release gets an upgrade hint before dependencies load.
+export const MIN_NODE_VERSION = "22.23.1";
 
 type RuntimeVersions = {
   node?: string;

@@ -94,6 +94,7 @@ export class SessionHub {
       profileId: o.profileId ?? "personal",
       provider: o.providerId,
       model: o.model,
+      approval: o.approval,
       title: "",
       createdAt: new Date().toISOString(),
       updatedAt: "",
@@ -116,7 +117,12 @@ export class SessionHub {
   /** Resume a persisted session. Returns the live session, or a lock/missing failure. */
   resume(
     id: string,
-    o: { provider: Provider; approval: ApprovalMode; projectContext?: string },
+    o: {
+      provider: Provider;
+      approval: ApprovalMode;
+      legacyApproval?: ApprovalMode;
+      projectContext?: string;
+    },
   ): { session: ServeSession } | { missing: true } | { lockedBy: number } | { busy: true } {
     const live = this.sessions.get(id);
     if (live?.busy || live?.configuring) return { busy: true };
@@ -131,7 +137,9 @@ export class SessionHub {
       // the session's explicit pin.
       prior.meta.provider = o.provider.id;
       const task = recoverTaskExecution(prior.task);
-      const s: ServeSession = { meta: prior.meta, history: [...prior.history], task, provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
+      const approval = prior.meta.approval ?? o.legacyApproval ?? o.approval;
+      prior.meta.approval = approval;
+      const s: ServeSession = { meta: prior.meta, history: [...prior.history], task, provider: o.provider, approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
       this.sessions.set(id, s);
       keepLock = true; // live session owns it until delete/releaseAll
       return { session: s };
@@ -259,6 +267,23 @@ export class SessionHub {
     });
   }
 
+  /** Change one conversation's approval policy. The active turn remains immutable; callers retry after
+   * it finishes. Persisting the choice keeps reconnect/restart semantics identical to the visible UI. */
+  setApproval(id: string, approval: ApprovalMode): "updated" | "busy" | "missing" {
+    const live = this.sessions.get(id);
+    if (live) {
+      if (live.busy || live.configuring) return "busy";
+      live.approval = approval;
+      live.meta.approval = approval;
+      this.store.save(live.meta, live.history, live.task);
+      return "updated";
+    }
+    const updated = this.mutateStored(id, (current) => {
+      current.meta.approval = approval;
+    });
+    return updated ? "updated" : "missing";
+  }
+
   /** Fork: duplicate a session's history into a NEW session (codex thread/fork) — the non-destructive
    *  sibling of rewind. Source may be live or on-disk; the fork is always a fresh live session. */
   fork(
@@ -280,12 +305,14 @@ export class SessionHub {
     const targetProfileId = o.profileId ?? sourceProfileId;
     const targetModel = o.model ?? (src.meta.model || o.provider.model);
     const preservesRoute = targetProfileId === sourceProfileId && targetModel === src.meta.model;
+    const approval = src.meta.approval ?? o.approval;
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: src.meta.cwd,
       profileId: targetProfileId,
       provider: o.providerId,
       model: targetModel,
+      approval,
       title: src.meta.title ? `${src.meta.title} ⑂` : "",
       createdAt: new Date().toISOString(),
       updatedAt: "",
@@ -301,7 +328,7 @@ export class SessionHub {
       history: structuredClone(src.history),
       task: forkTaskExecution(src.task),
       provider: o.provider,
-      approval: o.approval,
+      approval,
       autoApprove: new Set(),
       stats: { input: 0, output: 0 },
       projectContext: o.projectContext,

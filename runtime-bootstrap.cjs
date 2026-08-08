@@ -4,7 +4,7 @@
 // This file is the npm/Docker entry point. Keep it dependency-free and parseable by old Node releases so
 // users get an upgrade instruction instead of a SyntaxError from Hara's ESM output or its dependencies.
 var MIN_NODE_MAJOR = 22;
-var MIN_NODE_VERSION = "22.12.0";
+var MIN_NODE_VERSION = "22.23.1";
 
 function supportedNodeVersion(version) {
   var match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);

@@ -29,6 +29,9 @@ export interface UiSink {
 
 export interface ToolContext {
   cwd: string;
+  /** Host-selected local state root. Normal agent runs omit this and use the operating-system home;
+   * hermetic embedders/tests may isolate durable Artifact state without mutating the user's profile. */
+  stateHome?: string;
   sandbox?: SandboxMode;
   /** Identity route that owns the current persisted conversation. Auxiliary prompts/providers must use
    * this instead of consulting whichever profile is globally active at the moment. */

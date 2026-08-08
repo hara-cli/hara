@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.144.1 — 2026-08-09 — layout-safe presentations and durable permissions
+
+- Upgrade the native Presentation runtime to `0.1.0-alpha.7`. It adds separate pitch, report,
+  technical, and visual layout templates; multilingual content-density limits; and final browser
+  geometry evidence so overlapping or overflowing slides cannot be treated as ready for delivery.
+- Teach the Presentation specialist to choose templates independently from color themes, keep at
+  most six visible top-level blocks per slide, use editable native charts and structured flows or
+  diagrams, and repair validation findings by shortening, splitting, or changing the layout.
+- Persist each conversation's approval mode and expose an authenticated per-session switch for
+  Desktop. A selected `full-auto` conversation now stays full-auto after reconnect or engine restart,
+  while protected paths, screen-control grants, external extensions, and explicit deny rules retain
+  their mandatory safety boundaries.
+- Align the npm runtime floor with the Presentation kernel at Node.js 22.23.1, so unsupported Node 22
+  patch releases receive an actionable upgrade message before dependencies load.
+- Upgrade with `npm i -g @nanhara/hara@0.144.1`.
+
 ## 0.144.0 — 2026-08-08 — native visual storytelling
 
 - Upgrade the native Presentation runtime to `0.1.0-alpha.6`, preserving nested columns, groups,

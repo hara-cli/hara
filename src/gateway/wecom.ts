@@ -418,7 +418,7 @@ export function wecomAdapter(
       });
     },
     async start(onMessage, signal, shouldDownload) {
-      if (!WSImpl) throw new Error("WeCom gateway requires Node 22.12 or newer; upgrade Node and restart Hara");
+      if (!WSImpl) throw new Error("WeCom gateway requires Node 22.23.1 or newer; upgrade Node and restart Hara");
       let authFailures = 0;
       let reconnectAttempts = 0;
       while (!signal.aborted) {

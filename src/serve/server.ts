@@ -53,7 +53,7 @@ import type {
 import type { GatewayStatus } from "../gateway/serve.js";
 import type { GatewayLoginSnapshot } from "../gateway/login.js";
 import type { UiSink } from "../tools/registry.js";
-import type { ApprovalMode } from "../config.js";
+import { APPROVAL_MODES, type ApprovalMode } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
 import { loadAgentContext } from "../context/agents-md.js";
 import {
@@ -677,6 +677,10 @@ export function historyForClient(history: NeutralMsg[]): ClientHistoryMessage[] 
 }
 
 const AUTOMATION_DELIVERY_MODES = ["always", "on-output", "on-error"] as const;
+
+function isApprovalMode(value: unknown): value is ApprovalMode {
+  return typeof value === "string" && APPROVAL_MODES.includes(value as ApprovalMode);
+}
 
 function isAutomationDeliveryMode(value: unknown): value is CronDeliverMode {
   return typeof value === "string"
@@ -1594,7 +1598,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
             "server.shutdown",
-            "session.list", "session.create", "session.resume", "session.history", "session.send", "session.steer", "session.interrupt", "session.set-model",
+            "session.list", "session.create", "session.resume", "session.history", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
@@ -1685,6 +1689,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 title: m.title,
                 cwd: m.cwd,
                 model: m.model,
+                approval: m.approval,
                 profileId: m.profileId,
                 updatedAt: m.updatedAt,
                 source: m.source ?? "interactive",
@@ -1706,12 +1711,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const provider = await deps.buildSessionProvider(cwd, profileId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
-            const approval = (["suggest", "auto-edit", "full-auto"] as ApprovalMode[]).includes(p.approval) ? (p.approval as ApprovalMode) : deps.approval;
+            if (p.approval !== undefined && !isApprovalMode(p.approval)) {
+              return reply(rpcError(id, ERR.PARAMS, "approval must be suggest, auto-edit, or full-auto"));
+            }
+            const approval = isApprovalMode(p.approval) ? p.approval : deps.approval;
             const s = hub.create({ cwd, profileId, provider, providerId: provider.id, model: provider.model, approval, projectContext: loadAgentContext(cwd) || undefined });
-            return reply(rpcResult(id!, { sessionId: s.meta.id, model: s.meta.model, profileId: s.meta.profileId }));
+            return reply(rpcResult(id!, { sessionId: s.meta.id, model: s.meta.model, profileId: s.meta.profileId, approval: s.approval }));
           }
           case "session.resume": {
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            if (p.approval !== undefined && !isApprovalMode(p.approval)) {
+              return reply(rpcError(id, ERR.PARAMS, "approval must be suggest, auto-edit, or full-auto"));
+            }
             const live = hub.get(p.sessionId);
             if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
             const priorMeta = hub.peekMeta(p.sessionId);
@@ -1722,7 +1733,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               : await deps.buildSessionProvider(priorMeta?.cwd, boundProfileId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
-            const r = hub.resume(p.sessionId, { provider, approval: deps.approval, projectContext: undefined });
+            const migratedApproval = priorMeta?.approval === undefined;
+            const r = hub.resume(p.sessionId, {
+              provider,
+              approval: deps.approval,
+              ...(isApprovalMode(p.approval) ? { legacyApproval: p.approval } : {}),
+              projectContext: undefined,
+            });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if ("lockedBy" in r) return reply(rpcError(id, ERR.LOCKED, `session held by live pid ${r.lockedBy}`));
             if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
@@ -1748,13 +1765,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               hub.detach(r.session.meta.id);
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
-            if (migratedProfileBinding || migratedRuntimeDefaults) hub.save(r.session);
+            if (migratedProfileBinding || migratedRuntimeDefaults || migratedApproval) hub.save(r.session);
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
             broadcastTaskState(r.session, { phase: "restored" });
             return reply(rpcResult(id!, {
               sessionId: r.session.meta.id,
               model: r.session.meta.model,
               profileId: r.session.meta.profileId,
+              approval: r.session.approval,
               history: historyForClient(r.session.history),
               task: r.session.task ? {
                 id: r.session.task.id,
@@ -1777,6 +1795,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               cwd: snapshot.meta.cwd,
               model: snapshot.meta.model,
               profileId: snapshot.meta.profileId,
+              approval: snapshot.meta.approval,
               history: historyForClient(snapshot.history),
               readOnly: true,
             }));
@@ -1987,6 +2006,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               title: r.session.meta.title,
               model: r.session.meta.model,
               profileId: r.session.meta.profileId,
+              approval: r.session.approval,
               history: historyForClient(r.session.history),
             }));
           }
@@ -2304,6 +2324,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             } finally {
               s.configuring = false;
             }
+          }
+          case "session.set-approval": {
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            if (!isApprovalMode(p.approval)) {
+              return reply(rpcError(id, ERR.PARAMS, "approval must be suggest, auto-edit, or full-auto"));
+            }
+            const changed = hub.setApproval(p.sessionId, p.approval);
+            if (changed === "missing") return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            if (changed === "busy") {
+              return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — switch approval mode after it finishes"));
+            }
+            return reply(rpcResult(id!, { sessionId: p.sessionId, approval: p.approval }));
           }
           case "automation.list": {
             // The automation timeline's data: cron jobs with their last outcome, plus this machine's

@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { isAbsolute } from "node:path";
 import { listArtifacts } from "../artifacts/store.js";
 import {
   createPresentationArtifact,
@@ -23,13 +24,18 @@ registerTool({
     + "that materially change the result, then create an editable draft early and offer its exact Artifact revision "
     + "to Hara Desktop's right work surface. The offer is not proof that a Desktop loaded or displayed it; only the "
     + "Desktop host may report that UI state. "
-    + "Give every slide one evidence-backed claim and takeaway title, unique slide/block ids, and usually 2–5 blocks; "
-    + "record external sources in notes and never invent evidence. Choose a deliberate built-in theme and vary the content "
+    + "Give every slide one evidence-backed claim and takeaway title, unique slide/block ids, and usually 2–5 visible "
+    + "top-level blocks (never more than six); record external sources in notes and never invent evidence. Choose a "
+    + "deliberate layout template independently from the color theme: pitch for a persuasive proposal, report for evidence "
+    + "and charts, technical for architecture/process detail, or visual for image-led storytelling. Vary the content "
     + "composition: statement, data, process, visual, split, or editorial pages must not repeat one default card grid. Use "
     + "native chart data for real comparisons; use flow/diagram/columns for processes and architecture; use images only when "
     + "the user supplied a real bounded raster image, otherwise keep an honest image placeholder. Revise the same Artifact "
-    + "instead of creating parallel copies. "
-    + "Always validate the exact revision before export. Ordinary PPT work must not configure or invoke a separate vision "
+    + "instead of creating parallel copies. If validation reports layout density, title, list, composite, or chart findings, "
+    + "shorten content, split the slide, or choose a roomier template; never repeat the same rejected dense project. "
+    + "Always validate the exact revision before export. A surface offer only proves that Desktop was notified; do not say "
+    + "the right surface is open or visible until the Desktop host reports the exact revision as active. Ordinary PPT work "
+    + "must not configure or invoke a separate vision "
     + "helper; image-based review is optional and only for an explicit request with a natively image-capable main model. "
     + "Import accepts controlled Slidev Markdown or Hara presentation JSON. Export supports editable PPTX, self-contained "
     + "HTML (also browser Print/Save PDF), and canonical JSON.",
@@ -78,6 +84,20 @@ registerTool({
               },
             },
           },
+          template: {
+            type: "object",
+            description:
+              "Optional layout geometry, independent from theme colors. Choose for the story and content density.",
+            additionalProperties: false,
+            properties: {
+              preset: {
+                type: "string",
+                enum: ["pitch", "report", "technical", "visual"],
+                description:
+                  "pitch=persuasive proposal; report=evidence/charts; technical=process/architecture; visual=image-led",
+              },
+            },
+          },
           slides: {
             type: "array",
             minItems: 1,
@@ -106,7 +126,7 @@ registerTool({
                 blocks: {
                   type: "array",
                   minItems: 1,
-                  maxItems: 200,
+                  maxItems: 7,
                   items: {
                     type: "object",
                     additionalProperties: true,
@@ -169,7 +189,9 @@ registerTool({
     return { effect: "edit", concurrencySafe: false };
   },
   async run(input, ctx) {
-    const home = homedir();
+    const home = typeof ctx.stateHome === "string" && isAbsolute(ctx.stateHome)
+      ? ctx.stateHome
+      : homedir();
     try {
       switch (input.action) {
         case "create": {

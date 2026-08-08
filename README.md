@@ -26,7 +26,7 @@ Track it: https://github.com/hara-cli/hara · https://hara.run
 
 ## Install
 
-The npm package requires **Node.js 22.12 or newer**. If needed, upgrade first with
+The npm package requires **Node.js 22.23.1 or newer**. If needed, upgrade first with
 `nvm install 22 && nvm use 22`. Node.js 20 is end-of-life and is not a supported Hara runtime.
 
 ```bash

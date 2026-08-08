@@ -36,6 +36,7 @@ test("native Presentation Artifact previews and exports one validated revision",
         heightEmu: 6858000,
         brief: { audience: "Management" },
         theme: { preset: "signal" },
+        template: { preset: "report" },
         slides: [
           {
             id: "slide-1",
@@ -210,6 +211,7 @@ test("Presentation export refuses a report from a different validator", async ()
 });
 
 test("agent presentation tool exposes a complete generation schema and creates a Desktop-ready deck", async () => {
+  await withTempHome(async (stateHome) => {
   const tool = getTool("presentation");
   assert.ok(tool);
   const projectSchema = tool.input_schema.properties.project;
@@ -231,7 +233,13 @@ test("agent presentation tool exposes a complete generation schema and creates a
   assert.deepEqual(projectSchema.properties.theme.properties.preset.enum, [
     "editorial", "midnight", "signal", "calm",
   ]);
+  assert.deepEqual(projectSchema.properties.template.properties.preset.enum, [
+    "pitch", "report", "technical", "visual",
+  ]);
+  assert.equal(projectSchema.properties.slides.items.properties.blocks.maxItems, 7);
   assert.match(tool.description, /must not repeat one default card grid/);
+  assert.match(tool.description, /never more than six/);
+  assert.match(tool.description, /shorten content, split the slide, or choose a roomier template/);
   assert.match(
     projectSchema.properties.slides.items.properties.blocks.items.properties.literal.description,
     /chartType:bar\|line\|area\|pie\|doughnut/,
@@ -247,6 +255,7 @@ test("agent presentation tool exposes a complete generation schema and creates a
       widthEmu: 12192000,
       heightEmu: 6858000,
       brief: { audience: "Release owners", purpose: "Make the release decision" },
+      template: { preset: "technical" },
       slides: [
         {
           id: "slide-01",
@@ -269,6 +278,7 @@ test("agent presentation tool exposes a complete generation schema and creates a
     },
   }, {
     cwd: process.cwd(),
+    stateHome,
     sessionId: "presentation-tool-test",
     ui: {
       text() {}, reasoning() {}, tool() {}, diff() {},
@@ -297,10 +307,11 @@ test("agent presentation tool exposes a complete generation schema and creates a
     action: "preview",
     artifact_id: created.artifact.artifactId,
     revision_id: created.currentRevision.revisionId,
-  }, { cwd: process.cwd() });
+  }, { cwd: process.cwd(), stateHome });
   const preview = JSON.parse(previewOutput);
   assert.equal(preview.previewFileCreated, true);
   assert.equal(preview.openedInDesktop, false);
   assert.match(preview.meaning, /does not open/);
   assert.match(await readFile(preview.path, "utf8"), /Ship from evidence, not optimism/);
+  });
 });

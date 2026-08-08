@@ -12,12 +12,13 @@
 //                                                        page:{hasMore,limit,nextCursor?}}
 //                                                        Interactive sessions only; automation history has
 //                                                        its own cursor under automation.list.
-//   session.create    {cwd?,approval?}           → {sessionId,model,profileId}
-//   session.resume    {sessionId}                → {sessionId,model,profileId,history:[{role,text}]}
-//   session.history   {sessionId}                → {sessionId,model,profileId,history:[{role,text}],readOnly:true}
+//   session.create    {cwd?,approval?}           → {sessionId,model,profileId,approval}
+//   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}]}
+//                                                    approval only migrates legacy sessions with no saved choice.
+//   session.history   {sessionId}                → {sessionId,model,profileId,approval?,history:[{role,text}],readOnly:true}
 //                                                    Provider-independent local replay for unavailable routes.
 //   session.fork      {sessionId,targetProfileId?,targetModel?,transferHistory?}
-//                                                   → {sessionId,model,profileId,history:[{role,text}]}
+//                                                   → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    Cross-route copies require transferHistory:true.
 //   session.send      {sessionId,text,images?,attachments?,newTask?} → (streams events, then)
 //                                                             {reply,usage,taskId,turnId,status?,stopReason?}
@@ -99,6 +100,7 @@
 //   session.rename    {sessionId,title}           → {sessionId,title}
 //   session.archive   {sessionId,archived}        → {sessionId,archived}   (list hides archived unless {archived:true})
 //   session.set-model {sessionId,model?,effort?}  → {sessionId,model,effort} (next turn; refused mid-turn)
+//   session.set-approval {sessionId,approval}      → {sessionId,approval} (next turn; refused mid-turn)
 // Server → client notifications (all carry sessionId):
 //   event.text {delta} · event.tool {name,preview} · event.diff {text}
 //   event.notice {text} · event.surface {kind,title,resource} · event.turn_end {reply,usage,error?,status?,stopReason?}

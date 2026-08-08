@@ -30,7 +30,7 @@ import {
 
 export const PRESENTATION_ARTIFACT_EXTENSION = ".hpres";
 export const PRESENTATION_VALIDATOR_ID = "hara.office.presentation";
-export const PRESENTATION_VALIDATOR_VERSION = "1.0.0";
+export const PRESENTATION_VALIDATOR_VERSION = "1.1.0";
 const PRESENTATION_SOURCE_EXTENSIONS = [".hpres", ".json", ".md", ".markdown"] as const;
 
 export interface PresentationArtifactDetails extends ArtifactDetails {
@@ -89,6 +89,7 @@ function starterProject(title: string): Readonly<PresentationProject> {
       sourceFormat: "hara-native",
       purpose: "Draft a focused presentation and refine it with Hara.",
     },
+    template: { preset: "pitch" },
     slides: [
       {
         id: "slide-1",
@@ -286,7 +287,7 @@ export function validatePresentationArtifact(
     findings = [{
       code: "PRESENTATION_VALIDATED",
       severity: "info",
-      message: "PresentationProject structure, immutable content digest, and safe block contract match this revision.",
+      message: "PresentationProject structure, layout-density gate, immutable content digest, and safe block contract match this revision.",
     }];
   } catch (error) {
     findings = validationFindings(error);

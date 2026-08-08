@@ -6,7 +6,7 @@ Core TypeScript lives in `src/`, organized by domain: orchestration in `src/agen
 
 ## Build, Test, and Development Commands
 
-- `npm ci` installs the locked dependency set. Use Node.js 22.12 or newer.
+- `npm ci` installs the locked dependency set. Use Node.js 22.23.1 or newer.
 - `npm run dev -- --help` runs the CLI directly from `src/` through `tsx`.
 - `npm run build` type-checks and compiles TypeScript, then normalizes distribution file modes.
 - `npm test` builds and runs all `test/*.test.mjs` files.
