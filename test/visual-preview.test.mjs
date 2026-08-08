@@ -43,10 +43,12 @@ test("visual preview offers an owner-bound browser surface without echoing URL s
   });
   const result = JSON.parse(output);
   assert.deepEqual(result, {
-    openedInDesktop: true,
+    surfaceOfferEmitted: true,
+    openedInDesktop: false,
     origin: "http://127.0.0.1:5173",
     title: "Product preview",
-    next: "Keep the Hara background job running for live reload; stop it with the job tool when the preview is no longer needed. The Visual Dock tab is bound to this project session.",
+    meaning: "The host was notified about this loopback preview; this does not prove that it loaded, became visible, or is the active tab.",
+    next: "Keep the Hara background job running for live reload; stop it with the job tool when the preview is no longer needed.",
   });
   assert.equal(output.includes("do-not-echo"), false);
   assert.deepEqual(surfaces, [{

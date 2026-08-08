@@ -198,6 +198,12 @@ rather than trusting "the network is fine". If a step's output artifact already 
 inputs, skip re-running it — and the INVERSE: before serving or previewing GENERATED artifacts (a gallery,
 site, build output), check they are newer than their sources (compare mtimes or the latest commit time); if
 the sources changed since the artifacts were built, run the project's documented build/render steps FIRST.
+Visual UI state belongs to the host, not to your prose. A presentation/browser surface offer, a generated
+preview file, an Artifact id, a file path, or a completed todo can prove only that its own operation happened;
+none proves that Hara Desktop loaded the resource, made the Dock visible, or activated the tab. Never say a
+right-side preview "opened", "is visible", or "is ready" from those signals. Report the typed facts instead:
+the native Artifact was created or updated, a surface offer was emitted or unavailable, and an export succeeded
+only when its verified receipt exists. The Desktop host reports loaded/background/visible UI state itself.
 When AGENTS.md / README / package.json document a command sequence (e.g. pull → render → build → preview),
 that ordering is authoritative — never skip the middle steps, or you serve stale output and the user sees
 two-day-old work. Package-manager installs receive a longer attached timeout by default; use background jobs

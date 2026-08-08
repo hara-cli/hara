@@ -239,6 +239,8 @@ test("agent presentation tool exposes a complete generation schema and creates a
   const created = JSON.parse(output);
   assert.equal(created.slideCount, 2);
   assert.equal(created.content.extension, ".hpres");
+  assert.equal(created.surfaceOffer.status, "offered");
+  assert.match(created.surfaceOffer.meaning, /does not prove/);
   assert.match(notices[0], /Presentation created/);
   assert.deepEqual(surfaces, [{
     kind: "presentation",
@@ -256,5 +258,8 @@ test("agent presentation tool exposes a complete generation schema and creates a
     revision_id: created.currentRevision.revisionId,
   }, { cwd: process.cwd() });
   const preview = JSON.parse(previewOutput);
+  assert.equal(preview.previewFileCreated, true);
+  assert.equal(preview.openedInDesktop, false);
+  assert.match(preview.meaning, /does not open/);
   assert.match(await readFile(preview.path, "utf8"), /Ship from evidence, not optimism/);
 });

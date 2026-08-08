@@ -25,9 +25,10 @@ export function localPreviewUrl(input: unknown): URL | null {
 registerTool({
   name: "visual_preview",
   description:
-    "Open an already-running local web development server in Hara Desktop's right Visual Dock. "
+    "Offer an already-running local web development server to Hara Desktop's right Visual Dock. "
     + "Use this after starting a Node/Vite/Next/static server on an explicit localhost port. "
-    + "Only loopback HTTP URLs without credentials are accepted; remote websites and shell commands are rejected.",
+    + "Only loopback HTTP URLs without credentials are accepted; remote websites and shell commands are rejected. "
+    + "The tool can prove only that an offer was emitted, not that a Desktop loaded or displayed it.",
   input_schema: {
     type: "object",
     properties: {
@@ -56,16 +57,21 @@ registerTool({
       ? input.title.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 200)
       : "Web preview";
     const safeTitle = title || "Web preview";
+    const surfaceOfferEmitted = typeof ctx.ui?.surface === "function";
     ctx.ui?.surface?.({
       kind: "browser",
       title: safeTitle,
       resource: { type: "url", url: parsed.toString() },
     });
     return JSON.stringify({
-      openedInDesktop: typeof ctx.ui?.surface === "function",
+      surfaceOfferEmitted,
+      openedInDesktop: false,
       origin: parsed.origin,
       title: safeTitle,
-      next: "Keep the Hara background job running for live reload; stop it with the job tool when the preview is no longer needed. The Visual Dock tab is bound to this project session.",
+      meaning: surfaceOfferEmitted
+        ? "The host was notified about this loopback preview; this does not prove that it loaded, became visible, or is the active tab."
+        : "No persistent visual host was attached, so no Desktop surface was offered.",
+      next: "Keep the Hara background job running for live reload; stop it with the job tool when the preview is no longer needed.",
     }, null, 2);
   },
 });

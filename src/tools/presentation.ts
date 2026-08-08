@@ -20,7 +20,9 @@ registerTool({
   description:
     "Create, import, update, inspect, validate, preview, or export a native Hara presentation. "
     + "Work as a Presentation specialist: infer a minimal audience/purpose/source brief, ask only for missing facts "
-    + "that materially change the result, then create an editable draft early so it opens in Hara Desktop's right panel. "
+    + "that materially change the result, then create an editable draft early and offer its exact Artifact revision "
+    + "to Hara Desktop's right work surface. The offer is not proof that a Desktop loaded or displayed it; only the "
+    + "Desktop host may report that UI state. "
     + "Give every slide one evidence-backed claim and takeaway title, unique slide/block ids, and usually 2–5 blocks; "
     + "record external sources in notes and never invent evidence. Revise the same Artifact instead of creating parallel copies. "
     + "Always validate the exact revision before export. Ordinary PPT work must not configure or invoke a separate vision "
@@ -163,6 +165,7 @@ registerTool({
             actor: "agent",
             ...(ctx.sessionId ? { taskRunId: ctx.sessionId } : {}),
           });
+          const surfaceOffer = typeof ctx.ui?.surface === "function" ? "offered" : "unavailable";
           ctx.ui?.surface?.({
             kind: "presentation",
             title: details.artifact.title,
@@ -178,7 +181,12 @@ registerTool({
             currentRevision: details.currentRevision,
             content: details.content,
             slideCount: details.project.slides.length,
-            next: "Hara Desktop opens the exact presenter in this session's Visual Dock when typed surface events are available.",
+            surfaceOffer: {
+              status: surfaceOffer,
+              meaning: surfaceOffer === "offered"
+                ? "The host was notified about this exact Artifact revision; this does not prove that it loaded, became visible, or is the active tab."
+                : "No persistent visual host was attached. The Artifact still exists and can be opened from Hara Office.",
+            },
           });
         }
         case "import": {
@@ -191,6 +199,7 @@ registerTool({
             actor: "agent",
             ...(ctx.sessionId ? { taskRunId: ctx.sessionId } : {}),
           });
+          const surfaceOffer = typeof ctx.ui?.surface === "function" ? "offered" : "unavailable";
           ctx.ui?.surface?.({
             kind: "presentation",
             title: details.artifact.title,
@@ -207,6 +216,12 @@ registerTool({
             content: details.content,
             slideCount: details.project.slides.length,
             warnings: details.warnings,
+            surfaceOffer: {
+              status: surfaceOffer,
+              meaning: surfaceOffer === "offered"
+                ? "The host was notified about this exact Artifact revision; this does not prove that it loaded, became visible, or is the active tab."
+                : "No persistent visual host was attached. The Artifact still exists and can be opened from Hara Office.",
+            },
           });
         }
         case "update": {
@@ -226,6 +241,7 @@ registerTool({
             actor: "agent",
             ...(ctx.sessionId ? { taskRunId: ctx.sessionId } : {}),
           });
+          const surfaceOffer = typeof ctx.ui?.surface === "function" ? "offered" : "unavailable";
           ctx.ui?.surface?.({
             kind: "presentation",
             title: details.artifact.title,
@@ -241,6 +257,12 @@ registerTool({
             currentRevision: details.currentRevision,
             content: details.content,
             slideCount: details.project.slides.length,
+            surfaceOffer: {
+              status: surfaceOffer,
+              meaning: surfaceOffer === "offered"
+                ? "The host was notified about this exact Artifact revision; this does not prove that it loaded, became visible, or is the active tab."
+                : "No persistent visual host was attached. The Artifact still exists and can be opened from Hara Office.",
+            },
           });
         }
         case "list": {
@@ -277,10 +299,16 @@ registerTool({
           if (typeof input.artifact_id !== "string" || typeof input.revision_id !== "string") {
             return "Error: presentation preview requires artifact_id and revision_id.";
           }
-          return result(createPresentationPreviewFile(home, {
+          const preview = createPresentationPreviewFile(home, {
             artifactId: input.artifact_id,
             revisionId: input.revision_id,
-          }));
+          });
+          return result({
+            ...preview,
+            previewFileCreated: true,
+            openedInDesktop: false,
+            meaning: "A private HTML preview file was created. This action does not open, load, or activate a Desktop work surface.",
+          });
         }
         case "export": {
           if (

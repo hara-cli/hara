@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.143.1 — 2026-08-08 — truthful Desktop presentation handoff
+
+- Treat a Presentation surface event as an offer to the owning Desktop session, not proof that the
+  right-side tab loaded, became visible, or became active. The Desktop host remains the sole authority
+  for reporting those UI states after it verifies the exact Artifact revision and preview bytes.
+- Distinguish creation of a private presentation preview HTML file from opening it in Desktop. Tool
+  results now expose the boundary explicitly so agents cannot turn a successful render or export into
+  the false claim that the presentation is already visible in the right-side Extension Dock.
+- Forbid model-owned “open the Desktop panel” completion claims based on a surface offer, Artifact ID,
+  file path, preview receipt, or completed todo. Upgrade with `npm i -g @nanhara/hara@0.143.1`.
+
 ## 0.143.0 — 2026-08-08 — editable visual work surfaces
 
 - Let Presentation specialists create an editable draft early, revise the same owner-bound Artifact
