@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.143.0 — 2026-08-08 — editable visual work surfaces
+
+- Let Presentation specialists create an editable draft early, revise the same owner-bound Artifact
+  with optimistic revision checks, render unsaved drafts through the exact bounded presenter, and open
+  each created or updated deck directly in the originating Desktop session's right-side surface.
+- Add typed visual-surface events and a generic `visual_preview` action for credential-free
+  `http://localhost`, `127.0.0.1`, or `[::1]` URLs with an explicit port. Desktop can therefore place a
+  Node-powered local web result beside its conversation without treating arbitrary remote pages as
+  trusted project capabilities.
+- Keep ordinary PPT generation on one main model and one structured source. The optional image
+  compatibility fallback remains available for text-only attachment and screenshot workflows, but is
+  removed from primary model identity and is never part of default Presentation generation or
+  deterministic validation.
+- Upgrade the Presentation runtime to `0.1.0-alpha.5`, which removes PptxGenJS's unused vulnerable
+  `image-size` declaration from the production dependency graph while preserving editable PPTX output.
+- Upgrade with `npm i -g @nanhara/hara@0.143.0`.
+
 ## 0.142.2 — 2026-08-07 — trace data before editing symptoms
 
 - Require debugging turns to inspect the failing function's real inputs and observable state before
