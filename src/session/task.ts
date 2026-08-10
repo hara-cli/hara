@@ -17,6 +17,9 @@ export const MAX_TASK_CHECKPOINT_CAPABILITIES = 32;
 export const MAX_TASK_STATE_KEY_CHARS = 120;
 export const MAX_TASK_FACT_STRING_CHARS = 2_000;
 export const MAX_TASK_EVIDENCE_CHARS = 1_000;
+export const DEFAULT_TASK_ROUND_BUDGET = 100;
+export const TASK_ROUND_CHECKPOINT_INTERVAL = 50;
+export const MAX_TASK_ROUND_BUDGET = 1_000_000;
 
 export type TaskExecutionStatus = "running" | "paused" | "completed" | "blocked";
 export type TaskIntent = "answer" | "investigate" | "change";
@@ -94,6 +97,10 @@ export interface TaskExecution {
   startedAt: string;
   endedAt?: string;
   lastOutcome?: RunOutcome["status"] | "interrupted";
+  /** Cumulative provider rounds across every run/continue within this execution. */
+  roundsUsed?: number;
+  /** Explicitly extended in 100-round tranches only when the user resumes at the current cap. */
+  roundBudgetLimit?: number;
   /** Present once the model has explicitly understood this execution. Required before side effects. */
   brief?: TaskBrief;
   /** Structured state shared by resume, progress UI, and final synthesis. Optional only for v1 sessions
@@ -193,6 +200,8 @@ export function createTaskExecution(objective: string, turnId: string, at: Date 
     createdAt: now,
     updatedAt: now,
     startedAt: now,
+    roundsUsed: 0,
+    roundBudgetLimit: DEFAULT_TASK_ROUND_BUDGET,
     checkpoint: {
       artifacts: [],
       facts: {},
@@ -487,6 +496,10 @@ export function continueTaskExecution(
     return { ok: false, reason: `stale steer for turn ${interaction.expectedTurnId}; active turn is ${task.turnId}` };
   }
   const now = iso(at);
+  const budget = taskRoundBudget(task);
+  const roundBudgetLimit = budget.used >= budget.limit
+    ? Math.min(MAX_TASK_ROUND_BUDGET, budget.limit + DEFAULT_TASK_ROUND_BUDGET)
+    : budget.limit;
   return {
     ok: true,
     task: {
@@ -497,7 +510,41 @@ export function continueTaskExecution(
       startedAt: now,
       endedAt: undefined,
       lastOutcome: undefined,
+      roundsUsed: budget.used,
+      roundBudgetLimit,
     },
+  };
+}
+
+export function taskRoundBudget(task: TaskExecution): { used: number; limit: number; checkpointAt: number } {
+  const used = Number.isSafeInteger(task.roundsUsed) && (task.roundsUsed ?? -1) >= 0
+    ? task.roundsUsed!
+    : 0;
+  const storedLimit = Number.isSafeInteger(task.roundBudgetLimit)
+    && (task.roundBudgetLimit ?? 0) >= DEFAULT_TASK_ROUND_BUDGET
+    ? task.roundBudgetLimit!
+    : DEFAULT_TASK_ROUND_BUDGET;
+  const limit = storedLimit;
+  return {
+    used,
+    limit,
+    checkpointAt: Math.max(0, limit - TASK_ROUND_CHECKPOINT_INTERVAL),
+  };
+}
+
+/** Persist one closed run's provider-round usage without changing task completion semantics. */
+export function recordTaskRoundUsage(
+  task: TaskExecution,
+  rounds: number,
+  at: Date | string = new Date(),
+): TaskExecution {
+  if (!Number.isSafeInteger(rounds) || rounds <= 0) return task;
+  const budget = taskRoundBudget(task);
+  return {
+    ...task,
+    roundsUsed: Math.min(budget.limit, budget.used + rounds),
+    roundBudgetLimit: budget.limit,
+    updatedAt: iso(at),
   };
 }
 
@@ -586,7 +633,7 @@ export function finishTaskExecution(
     ? "paused"
     : outcome?.status === "completed"
       ? (incomplete ? "paused" : "completed")
-      : outcome?.status === "halted" && outcome.stopReason === "deadline"
+      : outcome?.status === "halted" && (outcome.stopReason === "deadline" || outcome.stopReason === "task_round_budget")
         ? "paused"
       : outcome?.status === "error" || outcome?.status === "empty" || outcome?.status === "halted"
         ? "blocked"
@@ -707,6 +754,7 @@ export function taskExecutionContext(task: TaskExecution, interaction: TaskInter
     `Turn ID: ${task.turnId}`,
     `Objective: ${task.objective}`,
     `Interaction: ${interaction.kind}`,
+    `Cumulative round budget: ${taskRoundBudget(task).used}/${taskRoundBudget(task).limit}`,
     steeringNote,
     "Conversation messages provide evidence and refinements, but the task objective above remains authoritative until an explicit new task starts.",
   ];
@@ -732,6 +780,7 @@ export function formatTaskExecution(task: TaskExecution | undefined): string {
   return [
     `task ${task.id.slice(0, 8)} · ${task.status}`,
     `turn ${task.turnId.slice(0, 8)} · outcome ${task.lastOutcome ?? "running"}`,
+    `rounds: ${taskRoundBudget(task).used}/${taskRoundBudget(task).limit}`,
     `objective: ${task.objective}`,
     `brief: ${task.brief ? `${task.brief.intent} · ${task.brief.goal}` : "(not accepted yet)"}`,
     `checkpoint: ${task.checkpoint ? `${Object.keys(task.checkpoint.facts).length} fact(s) · ${Object.keys(task.checkpoint.capabilities).length} capability check(s) · ${task.checkpoint.artifacts.length} artifact(s)` : "(legacy none)"}`,
@@ -797,6 +846,10 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
     !validTimestamp(task.createdAt) || !validTimestamp(task.updatedAt) || !validTimestamp(task.startedAt) ||
     (task.endedAt !== undefined && !validTimestamp(task.endedAt)) ||
     (task.lastOutcome !== undefined && task.lastOutcome !== "completed" && task.lastOutcome !== "error" && task.lastOutcome !== "empty" && task.lastOutcome !== "halted" && task.lastOutcome !== "interrupted")
+    || ((task.roundsUsed === undefined) !== (task.roundBudgetLimit === undefined))
+    || (task.roundsUsed !== undefined && (!Number.isSafeInteger(task.roundsUsed) || (task.roundsUsed as number) < 0 || (task.roundsUsed as number) > MAX_TASK_ROUND_BUDGET))
+    || (task.roundBudgetLimit !== undefined && (!Number.isSafeInteger(task.roundBudgetLimit) || (task.roundBudgetLimit as number) < DEFAULT_TASK_ROUND_BUDGET || (task.roundBudgetLimit as number) > MAX_TASK_ROUND_BUDGET || (task.roundBudgetLimit as number) % DEFAULT_TASK_ROUND_BUDGET !== 0))
+    || (typeof task.roundsUsed === "number" && typeof task.roundBudgetLimit === "number" && task.roundsUsed > task.roundBudgetLimit)
   ) return false;
   if (task.brief !== undefined) {
     if (!task.brief || typeof task.brief !== "object" || Array.isArray(task.brief)) return false;

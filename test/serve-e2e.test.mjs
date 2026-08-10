@@ -2398,6 +2398,92 @@ test("serve e2e: an active deadline returns a recoverable paused result instead 
   }
 });
 
+test("serve e2e: cumulative task rounds pause at 100 and explicit continuation opens the next tranche", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-task-round-budget-"));
+  const store = memStore();
+  const sessionId = randomUUID();
+  const created = createTaskExecution("finish the bounded long task", randomUUID(), "2026-08-10T00:00:00.000Z");
+  const pausedAtNinetyNine = {
+    ...created,
+    status: "paused",
+    endedAt: "2026-08-10T00:01:00.000Z",
+    roundsUsed: 99,
+    roundBudgetLimit: 100,
+  };
+  store.saved.set(sessionId, {
+    meta: {
+      id: sessionId,
+      cwd: dir,
+      provider: "fake",
+      model: "fake-1",
+      title: "bounded task",
+      createdAt: "2026-08-10T00:00:00.000Z",
+      updatedAt: "2026-08-10T00:01:00.000Z",
+      source: "interactive",
+    },
+    history: [{ role: "user", content: "finish the bounded long task" }],
+    task: pausedAtNinetyNine,
+  });
+
+  let calls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "round-100-checkpoint",
+            name: "task_checkpoint",
+            input: { current_step: "verify the next strategy" },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      onText("continued in the next bounded tranche");
+      return {
+        text: "continued in the next bounded tranche",
+        toolUses: [],
+        stop: "end",
+        usage: { input: 1, output: 1 },
+      };
+    },
+  };
+  const deps = {
+    ...baseDeps(provider, store),
+    runLimits: () => ({ timeoutMs: 10_000, maxRounds: 256 }),
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const opened = await c.call("session.resume", { sessionId });
+    assert.equal(opened.error, undefined);
+
+    const capped = await c.call("session.send", { sessionId, text: "continue to the safety checkpoint" });
+    assert.equal(capped.error, undefined);
+    assert.equal(capped.result.status, "paused");
+    assert.equal(capped.result.stopReason, "task_round_budget");
+    assert.match(capped.result.reply, /100 cumulative provider round\(s\).*\/continue/is);
+    assert.equal(store.saved.get(sessionId).task.roundsUsed, 100);
+    assert.equal(store.saved.get(sessionId).task.roundBudgetLimit, 100);
+    assert.equal(store.saved.get(sessionId).task.status, "paused");
+
+    const resumed = await c.call("session.send", { sessionId, text: "/continue" });
+    assert.equal(resumed.error, undefined);
+    assert.equal(resumed.result.reply, "continued in the next bounded tranche");
+    assert.equal(store.saved.get(sessionId).task.roundsUsed, 101);
+    assert.equal(store.saved.get(sessionId).task.roundBudgetLimit, 200);
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: graceful close aborts turns, closes clients, releases settled locks, and is idempotent", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-close-"));
   const store = memStore();
@@ -2967,6 +3053,47 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
     );
     assert.equal(readFileSync(join(dir, "approved.txt"), "utf8"), "hi", "the approved tool actually ran");
   } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: a mid-turn conversation can fork from its last protocol-complete snapshot", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-mid-turn-fork-"));
+  const store = memStore();
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(toolProvider(), store, "suggest"),
+  );
+  const c = await connect(srv.port);
+  let sending;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    sending = c.call("session.send", { sessionId: result.sessionId, text: "write it, then keep working" });
+    const approval = await c.waitEvent("approval.request");
+
+    const forked = await c.call("session.fork", { sessionId: result.sessionId });
+    assert.equal(forked.error, undefined, "an approval wait cannot permanently lock conversation transfer");
+    assert.notEqual(forked.result.sessionId, result.sessionId);
+    const snapshot = store.saved.get(forked.result.sessionId);
+    assert.ok(snapshot.history.some((message) => message.role === "user" && message.content.includes("write it")));
+    assert.equal(
+      snapshot.history.some((message, index) =>
+        message.role === "assistant"
+        && message.toolUses.length > 0
+        && snapshot.history[index + 1]?.role !== "tool"),
+      false,
+      "the copied history never ends with an orphaned tool_use",
+    );
+    assert.equal(snapshot.task.status, "paused", "the copied execution is a recoverable snapshot, not running");
+
+    await c.call("approval.reply", { approvalId: approval.params.approvalId, allow: false });
+    const original = await sending;
+    assert.equal(original.result.reply, "done", "copying does not interrupt or mutate the source turn");
+  } finally {
+    if (sending) await sending.catch(() => {});
     c.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });

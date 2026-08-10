@@ -11,6 +11,63 @@ const seenByScope = new Map<string, Map<string, { fails: number }>>();
 const HOME_WORKSPACE_BOUNDARY_KEY = "root-cause:home-workspace-boundary";
 const EMPTY_RECALL_KEY = "root-cause:empty-memory-or-session-recall";
 
+function stableFailureSignal(content: string): string | undefined {
+  if (/web_fetch (?:received only a JavaScript SPA shell|could not verify the rendered page)/iu.test(content)) {
+    return "browser rendering unavailable";
+  }
+  const apiCode = /(?:"?(?:error[_-]?code|err[_-]?code|code)"?\s*[:=]\s*"?)(-?\d{4,})/iu.exec(content)?.[1];
+  if (apiCode) return `API error ${apiCode}`;
+  const httpCode = /\bHTTP(?:\/\d(?:\.\d)?)?\s+([45]\d{2})\b/iu.exec(content)?.[1];
+  if (httpCode) return `HTTP ${httpCode}`;
+  if (/\b(?:params?|parameters?) error\b|\binvalid (?:request )?(?:params?|parameters?)\b/iu.test(content)) {
+    return "parameter validation error";
+  }
+  return undefined;
+}
+
+function webFetchStrategyAnchor(name: string, input: unknown): string | undefined {
+  if (name !== "web_fetch" || !input || typeof input !== "object") return undefined;
+  const raw = (input as Record<string, unknown>).url;
+  if (typeof raw !== "string") return undefined;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    return `web_fetch+${parsed.hostname.toLowerCase()}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function commandStrategyAnchor(input: unknown): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const command = (input as Record<string, unknown>).command;
+  if (typeof command !== "string" || !command.trim()) return undefined;
+  const lower = command.toLowerCase();
+  const executable = /\b(curl|wget|powershell(?:\.exe)?|pwsh(?:\.exe)?|python\d*(?:\.exe)?|node(?:\.exe)?|bash|sh)\b/iu.exec(lower)?.[1];
+  const script = /(?:^|[\s"'=])([^\s"'=]+\.(?:ps1|py|m?js|cjs|ts|sh))(?=$|[\s"'])/iu.exec(command)?.[1]
+    ?.replace(/\\/gu, "/")
+    .toLowerCase();
+  const rawUrl = /https?:\/\/[^\s"'<>]+/iu.exec(command)?.[0];
+  let endpoint: string | undefined;
+  if (rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      parsed.username = "";
+      parsed.password = "";
+      endpoint = `${parsed.hostname.toLowerCase()}${parsed.pathname
+        .replace(/\b\d+\b/gu, ":id")
+        .replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/giu, ":id")}`;
+    } catch {
+      // A malformed URL is already part of the exact-call breaker, not a semantic strategy family.
+    }
+  }
+  // An interpreter/executable alone is far too broad: unrelated Python or PowerShell commands can return
+  // the same API status. Only form a semantic strategy family around a concrete script or endpoint.
+  if (!script && !endpoint) return undefined;
+  const parts = [executable, script, endpoint].filter((value): value is string => Boolean(value));
+  return parts.length ? [...new Set(parts)].join("+") : undefined;
+}
+
 function scopedSeen(scope?: string): Map<string, { fails: number }> {
   const key = scope?.trim() || DEFAULT_SCOPE;
   const seen = seenByScope.get(key) ?? new Map<string, { fails: number }>();
@@ -86,32 +143,33 @@ export interface FailureIdentity {
   semantic: boolean;
   /** Consecutive calls allowed before the run-level breaker stops another model round. */
   hardStopAfter: number;
-  kind: "exact" | "home_boundary" | "empty_recall";
+  kind: "exact" | "home_boundary" | "empty_recall" | "strategy";
 }
 
-/** Stable identity used by both the warning note and the run-level hard breaker. */
-export function failureIdentity(
+/** All consecutive failure identities. Exact calls stop on the second attempt; materially different
+ * command variants sharing one stable endpoint/script + high-signal error stop on the third. */
+export function failureIdentities(
   name: string,
   input: unknown,
   content: string,
   isError = false,
-): FailureIdentity {
+): FailureIdentity[] {
   const failed = isError || looksFailed(content, name);
   if (failed && isHomeWorkspaceBoundaryFailure(content)) {
-    return {
+    return [{
       key: HOME_WORKSPACE_BOUNDARY_KEY,
       label: "Home workspace boundary",
       semantic: true,
       hardStopAfter: 1,
       kind: "home_boundary",
-    };
+    }];
   }
   if (
     failed &&
     (name === "memory_search" || name === "session_search") &&
     /^\(no (?:memory|session) matches\)\s*$/.test(content.trimStart())
   ) {
-    return {
+    return [{
       // Different queries and both recall tools share one no-progress cause. Otherwise a model can evade
       // the breaker by paraphrasing the same empty lookup dozens of times or alternating tools.
       key: EMPTY_RECALL_KEY,
@@ -119,32 +177,68 @@ export function failureIdentity(
       semantic: true,
       hardStopAfter: 3,
       kind: "empty_recall",
-    };
+    }];
   }
-  return {
+  const identities: FailureIdentity[] = [{
     key: keyOf(name, input),
     label: `${name} call`,
     semantic: false,
     hardStopAfter: 2,
     kind: "exact",
-  };
+  }];
+  if (failed) {
+    const signal = stableFailureSignal(content);
+    const anchor = commandStrategyAnchor(input) ?? webFetchStrategyAnchor(name, input);
+    if (signal && anchor) {
+      identities.push({
+        key: `root-cause:command-strategy:${anchor}:${signal}`,
+        label: `${anchor} approach (${signal})`,
+        semantic: true,
+        hardStopAfter: name === "web_fetch" ? 2 : 3,
+        kind: "strategy",
+      });
+    }
+  }
+  return identities;
+}
+
+/** Primary identity retained for callers that need the historical one-cause view. */
+export function failureIdentity(
+  name: string,
+  input: unknown,
+  content: string,
+  isError = false,
+): FailureIdentity {
+  return failureIdentities(name, input, content, isError)[0];
 }
 
 /** Record a completed call; returns a warning to APPEND to the tool result when the same call has now
  *  failed >=2x in a row (empty string otherwise). Pure aside from the session-scoped map. */
 export function recordCall(name: string, input: unknown, content: string, isError = false, scope?: string): string {
   const failed = isError || looksFailed(content, name);
-  const identity = failureIdentity(name, input, content, isError);
+  const identities = failureIdentities(name, input, content, isError);
   const seen = scopedSeen(scope);
   if (!failed) {
     seen.clear(); // any success is progress; a later failure starts a fresh no-progress streak
     return "";
   }
-  const s = seen.get(identity.key) ?? { fails: 0 };
-  s.fails++;
-  // "In a row" is literal: a different failed call is a changed attempt and breaks the old streak.
+  const next = identities.map((identity) => ({
+    identity,
+    streak: { fails: (seen.get(identity.key)?.fails ?? 0) + 1 },
+  }));
+  // "In a row" is literal: retain only identities shared by this failure and the immediately previous one.
   seen.clear();
-  seen.set(identity.key, s);
+  for (const { identity, streak } of next) seen.set(identity.key, streak);
+  const exact = next.find(({ identity }) => identity.kind === "exact");
+  const semantic = next.find(({ identity }) => identity.kind !== "exact");
+  const selected = semantic?.identity.kind === "home_boundary" || semantic?.identity.kind === "empty_recall"
+    ? semantic
+    : exact && exact.streak.fails >= exact.identity.hardStopAfter
+      ? exact
+      : next.find(({ identity, streak }) => identity.kind === "strategy" && streak.fails >= 2)
+        ?? exact;
+  const identity = selected!.identity;
+  const s = selected!.streak;
   if (identity.kind === "home_boundary") {
     if (s.fails === 1) {
       return (
@@ -171,6 +265,19 @@ export function recordCall(name: string, input: unknown, content: string, isErro
       `\n\n⟳ hara: ${s.fails} consecutive memory/session searches returned no matches — stop recall calls now. ` +
       "Recall tools are disabled for the rest of this turn. Tell the user the prior history was not found, " +
       "then ask for the missing detail or whether to recreate it."
+    );
+  }
+  if (identity.kind === "strategy") {
+    if (s.fails < identity.hardStopAfter) {
+      return (
+        `\n\n⟳ hara: ${s.fails} consecutive variants of the same ${identity.label} have failed. ` +
+        "Stop tuning parameters blindly: inspect existing workspace tools/scripts and question the API, library, or shell-boundary assumption. " +
+        "Try one materially different strategy; another variant of this approach will stop the run."
+      );
+    }
+    return (
+      `\n\n⟳ hara: ${s.fails} consecutive variants of the same ${identity.label} have failed — stop this strategy now. ` +
+      "Inspect existing workspace tools/scripts, challenge the underlying API/library assumption, and switch language, library, or endpoint before continuing."
     );
   }
   if (s.fails < 2) return "";

@@ -343,6 +343,58 @@ test("an investigate brief may inspect with a read-only command but cannot mutat
   assert.match(resultRound.results.find((result) => result.id === "bg2").content, /intent is 'investigate'/);
 });
 
+test("an investigate brief may render a web page while computer approval remains mandatory", async () => {
+  const interaction = newTurnInteraction();
+  const created = createTaskExecution("inspect a JavaScript-rendered page", interaction.turnId);
+  const accepted = applyTaskBrief(created, {
+    ...BRIEF,
+    intent: "investigate",
+    goal: "read the rendered page without changing external or project state",
+  });
+  assert.equal(accepted.ok, true);
+  let runs = 0;
+  let confirmations = 0;
+  const renderedFetch = {
+    name: "fixture_rendered_fetch",
+    description: "test-only isolated page renderer",
+    input_schema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+    kind: "read",
+    classify() {
+      return { effect: "read", concurrencySafe: false, approvalKind: "computer" };
+    },
+    async run() {
+      runs += 1;
+      return "rendered page text";
+    },
+  };
+  const p = provider([
+    {
+      text: "",
+      toolUses: [{ id: "render1", name: renderedFetch.name, input: { url: "https://example.com/app" } }],
+      stop: "tool_use",
+    },
+    { text: "diagnosed", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "inspect the page" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => {
+      confirmations += 1;
+      return true;
+    },
+    quiet: true,
+    extraTools: [renderedFetch],
+    taskIntake: { task: accepted.task },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(runs, 1, "the read-only render is permitted by an investigate brief");
+  assert.equal(confirmations, 1, "computer-use approval is never bypassed by read-only semantics");
+  assert.doesNotMatch(JSON.stringify(history), /intent is 'investigate'/);
+});
+
 test("read-only actions inside mixed task and cron tools remain available for investigation", async () => {
   const interaction = newTurnInteraction();
   const task = createTaskExecution("inspect task and scheduler state", interaction.turnId);

@@ -295,11 +295,15 @@ export class SessionHub {
       providerId: string;
       approval: ApprovalMode;
       projectContext?: string;
+      /** Immutable source captured before asynchronous target-provider setup. A live turn may continue
+       * changing after this snapshot, but the fork remains one coherent point-in-time copy. */
+      sourceSnapshot?: SessionData;
     },
   ): { session: ServeSession } | { missing: true } | { busy: true } {
     const live = this.sessions.get(id);
-    if (live?.busy || live?.configuring) return { busy: true };
-    const src: { meta: SessionMeta; history: NeutralMsg[]; task?: TaskExecution } | null = live ?? this.store.load(id);
+    if (live?.configuring) return { busy: true };
+    const src: { meta: SessionMeta; history: NeutralMsg[]; task?: TaskExecution } | null =
+      o.sourceSnapshot ?? live ?? this.store.load(id);
     if (!src) return { missing: true };
     const sourceProfileId = src.meta.profileId ?? "personal";
     const targetProfileId = o.profileId ?? sourceProfileId;
@@ -323,16 +327,22 @@ export class SessionHub {
     };
     const lock = this.store.acquire(meta.id);
     if (!lock.ok) throw new Error(`could not acquire fork lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
+    const history = structuredClone(src.history);
+    // A live agent appends assistant tool_use before the matching tool result. Copying at that exact
+    // boundary would create an invalid conversation that the target provider cannot resume. Preserve the
+    // user's current request and every closed round, but omit only the unfinished assistant action.
+    const trailing = history.at(-1);
+    if (trailing?.role === "assistant" && trailing.toolUses.length > 0) history.pop();
     const s: ServeSession = {
       meta,
-      history: structuredClone(src.history),
+      history,
       task: forkTaskExecution(src.task),
       provider: o.provider,
       approval,
       autoApprove: new Set(),
       stats: { input: 0, output: 0 },
       projectContext: o.projectContext,
-      continuationSession: src.history.length > 0,
+      continuationSession: history.length > 0,
       busy: false,
       configuring: false,
       pendingProviderTurns: 0,

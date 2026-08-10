@@ -28,17 +28,17 @@ function fixture() {
   return { root, home, project, nested };
 }
 
-test("project approval scopes are narrow, stable and credential-free", () => {
+test("project approval scopes match project-level operation families and stay credential-free", () => {
   const { root, project, nested } = fixture();
   try {
     const bashA = projectApprovalScope("bash", { command: "npm test" }, nested);
     const bashB = projectApprovalScope("bash", { command: "npm test" }, project);
     const bashOther = projectApprovalScope("bash", { command: "npm run build" }, project);
     const bashEnvironment = projectApprovalScope("bash", { command: "NODE_ENV=test npm test" }, project);
-    assert.equal(bashA.key, bashB.key, "subdirectory cwd preserves the exact project command scope");
-    assert.notEqual(bashA.key, bashOther.key, "another command needs another explicit grant");
-    assert.notEqual(bashA.key, bashEnvironment.key, "environment assignments never inherit a plain command grant");
-    assert.match(bashA.summary, /exact Bash command/);
+    assert.equal(bashA.key, bashB.key, "subdirectory cwd preserves the project Bash scope");
+    assert.equal(bashA.key, bashOther.key, "another Bash command reuses the project category grant");
+    assert.equal(bashA.key, bashEnvironment.key, "operation parameters do not fracture a project category grant");
+    assert.match(bashA.summary, /Bash commands for this project/);
 
     const pythonA = projectApprovalScope("python", { code: "print('one')" }, project);
     const pythonB = projectApprovalScope("python", { code: "print('two')" }, nested);
@@ -48,20 +48,27 @@ test("project approval scopes are narrow, stable and credential-free", () => {
     const tempA = projectApprovalScope("write_file", { path: ".tmp/a.txt", content: "a" }, project);
     const tempB = projectApprovalScope("edit_file", { path: ".tmp/b.txt", old_string: "b", new_string: "c" }, project);
     const log = projectApprovalScope("write_file", { path: "logs/a.txt", content: "a" }, project);
-    assert.equal(tempA.key, tempB.key, "write and edit share the reviewed .tmp directory scope");
-    assert.notEqual(tempA.key, log.key, "each reviewed scratch directory remains separate");
+    assert.equal(tempA.key, tempB.key, "write and edit share the project file-change scope");
+    assert.equal(tempA.key, log.key, "paths and content do not fracture the project file-change grant");
 
     const sourceA = projectApprovalScope("write_file", { path: "src/a.ts", content: "SECRET_A" }, project);
     const sourceB = projectApprovalScope("edit_file", { path: "src/b.ts", old_string: "x", new_string: "SECRET_B" }, project);
-    assert.notEqual(sourceA.key, sourceB.key, "ordinary source changes bind to one exact file");
+    const patch = projectApprovalScope("apply_patch", { patch: "SECRET_PATCH" }, project);
+    assert.equal(sourceA.key, sourceB.key, "ordinary file changes share one explicit project category");
+    assert.equal(sourceA.key, patch.key, "patch and file editors share the same category grant");
     const manyFieldsA = Object.fromEntries(Array.from({ length: 1_001 }, (_, index) => [`field${index}`, index]));
     const manyFieldsB = { ...manyFieldsA, field1000: "changed" };
-    assert.notEqual(
+    assert.equal(
       projectApprovalScope("scoped_exec", manyFieldsA, project).key,
       projectApprovalScope("scoped_exec", manyFieldsB, project).key,
-      "large exact inputs never collide through truncation",
+      "request IDs and other operation arguments do not create one-off grants",
     );
-    for (const scope of [bashA, bashOther, bashEnvironment, pythonA, tempA, log, sourceA, sourceB]) {
+    assert.notEqual(
+      projectApprovalScope("scoped_exec", manyFieldsA, project).key,
+      projectApprovalScope("other_exec", manyFieldsA, project).key,
+      "different tool categories remain independent",
+    );
+    for (const scope of [bashA, bashOther, bashEnvironment, pythonA, tempA, log, sourceA, sourceB, patch]) {
       assert.match(scope.key, /^v1:[a-f0-9]{64}$/);
       assert.doesNotMatch(scope.key, /npm|SECRET|src|project/);
     }
@@ -137,7 +144,7 @@ test("a corrupt approval store fails closed and is never silently overwritten", 
   }
 });
 
-test("the agent reuses only the accepted project scope and asks again for different input", async () => {
+test("the agent reuses one accepted project operation family across different inputs", async () => {
   const { root, project } = fixture();
   const accepted = new Set();
   const policy = {
@@ -193,8 +200,8 @@ test("the agent reuses only the accepted project scope and asks again for differ
     });
     assert.equal(outcome.status, "completed");
     assert.equal(executions, 3);
-    assert.equal(confirmations, 2, "same input reuses the scope; different input prompts again");
-    assert.equal(accepted.size, 2);
+    assert.equal(confirmations, 1, "different request parameters reuse the explicit project category grant");
+    assert.equal(accepted.size, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

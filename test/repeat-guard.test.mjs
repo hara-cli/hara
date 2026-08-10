@@ -2,7 +2,7 @@
 // this" note appended to its result; successes never warn and reset the streak.
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { failureIdentity, recordCall, looksFailed, keyOf, resetRepeatGuard } from "../dist/agent/repeat-guard.js";
+import { failureIdentities, failureIdentity, recordCall, looksFailed, keyOf, resetRepeatGuard } from "../dist/agent/repeat-guard.js";
 
 beforeEach(() => resetRepeatGuard());
 
@@ -76,6 +76,45 @@ test("2nd identical failure warns; 1st doesn't; different args are a different c
   const warn = recordCall("bash", args, "Command failed: exit code 128");
   assert.match(warn, /FAILED 2×/, "second identical failure warns");
   assert.equal(recordCall("bash", { command: "git pull origin dev" }, "Command failed: x"), "", "different args -> separate streak");
+});
+
+test("three parameter variants sharing one command strategy and API error force a re-plan", () => {
+  const failure = 'Command failed: request rejected\n{"code":1061002,"msg":"params error"}';
+  const commands = [
+    'curl -F file=@a.pdf https://open.feishu.cn/open-apis/drive/v1/medias/upload_all',
+    'curl -F file_name=a.pdf -F file=@a.pdf https://open.feishu.cn/open-apis/drive/v1/medias/upload_all',
+    'curl -H "Content-Type: multipart/form-data" -F file=@a.pdf https://open.feishu.cn/open-apis/drive/v1/medias/upload_all',
+  ];
+  assert.equal(recordCall("bash", { command: commands[0] }, failure), "");
+  assert.match(recordCall("bash", { command: commands[1] }, failure), /2 consecutive variants.*tools\/scripts.*materially different strategy/is);
+  assert.match(recordCall("bash", { command: commands[2] }, failure), /3 consecutive variants.*stop this strategy now/is);
+  const identities = failureIdentities("bash", { command: commands[0] }, failure);
+  assert.equal(identities.find((identity) => identity.kind === "strategy")?.hardStopAfter, 3);
+});
+
+test("two unusable SPA fetch variants stop the text-fetch strategy and direct the agent to a real browser", () => {
+  resetRepeatGuard();
+  const failure = "Error: web_fetch received only a JavaScript SPA shell at https://example.com. Use open_browser.";
+  assert.equal(recordCall("web_fetch", { url: "https://example.com/app" }, failure), "");
+  const warning = recordCall("web_fetch", { url: "https://example.com/app", render: true }, failure);
+  assert.match(warning, /2 consecutive variants.*web_fetch\+example\.com.*browser rendering unavailable.*stop this strategy now/is);
+  const identity = failureIdentities("web_fetch", { url: "https://example.com/app" }, failure)
+    .find((entry) => entry.kind === "strategy");
+  assert.equal(identity?.hardStopAfter, 2);
+});
+
+test("a changed high-signal root cause does not accumulate as one command strategy", () => {
+  assert.equal(recordCall("bash", { command: "curl -F attempt=1 https://api.example/upload" }, 'Command failed: {"code":1061002}'), "");
+  assert.equal(recordCall("bash", { command: "curl -F attempt=2 https://api.example/upload" }, 'Command failed: {"code":1061003}'), "");
+});
+
+test("an interpreter name alone cannot merge unrelated failing scripts", () => {
+  const failure = 'Command failed: {"code":1061002,"msg":"params error"}';
+  assert.equal(recordCall("bash", { command: "python scripts/upload_a.py --attempt 1" }, failure), "");
+  assert.equal(recordCall("bash", { command: "python scripts/upload_b.py --attempt 2" }, failure), "");
+  const firstStrategy = failureIdentities("bash", { command: "python scripts/upload_a.py --attempt 3" }, failure)
+    .find((identity) => identity.kind === "strategy");
+  assert.match(firstStrategy?.key ?? "", /scripts\/upload_a\.py/);
 });
 
 test("different directory tools share the same protected-Home root cause", () => {

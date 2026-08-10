@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.145.0 — 2026-08-10 — real-browser verification and bounded autonomous work
+
+- Add the shell-free `open_browser` tool for testing websites in the user's real system browser with
+  explicit screen-control approval. Text extraction remains on `web_fetch`, while interactive and SPA
+  verification now moves to a browser instead of repeating unusable fetch variants or inventing a 404
+  from hidden framework markup.
+- Reuse project-level “always allow” decisions by operation family rather than by each concrete command,
+  path, or request. Protected files, deny rules, guardian checks, screen control, and external-extension
+  boundaries still require their independent safety decisions.
+- Allow a running or approval-waiting conversation to fork from a protocol-complete immutable snapshot.
+  The original turn continues independently, while an unfinished forked task resumes from a safe paused
+  boundary instead of copying a dangling tool call.
+- Stop exact repeated failures after two attempts and changed variants of the same failing script or
+  endpoint after three high-signal failures. Agents now scan existing tools and scripts before creating
+  integrations, warn about Bash/PowerShell Unicode boundaries, checkpoint at 50 rounds, and pause
+  recoverably at 100 rounds until the user explicitly continues.
+- Upgrade with `npm i -g @nanhara/hara@0.145.0`.
+
 ## 0.144.1 — 2026-08-09 — layout-safe presentations and durable permissions
 
 - Upgrade the native Presentation runtime to `0.1.0-alpha.7`. It adds separate pitch, report,

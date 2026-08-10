@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { htmlToText, parseSearchResults, parseBaiduSearchResults, parseBingSearchResults, parseGoogleSearchResults, looksLikeJsRenderedShell, isPrivateIp, resolvePublicHost, bypassesWebProxy, selectWebProxy, requestPinned } from "../dist/tools/web.js";
 import { findHeadlessBrowser, renderHeadlessHtml } from "../dist/tools/headless-web.js";
-import { getTool } from "../dist/tools/registry.js";
+import { approvalKindForOperation, getTool, toolOperationTraits } from "../dist/tools/registry.js";
 import "../dist/tools/web.js";
 
 // Unit tests must not inherit a developer workstation's persisted/environment proxy. Dedicated cases below
@@ -150,7 +150,14 @@ test("looksLikeJsRenderedShell: catches an empty SPA shell, not real article tex
 test("web_fetch classifies explicit headless rendering behind computer approval", () => {
   const tool = getTool("web_fetch");
   assert.deepEqual(tool.classify({ url: "https://example.com" }, { cwd: "." }), { effect: "read", concurrencySafe: true });
-  assert.deepEqual(tool.classify({ url: "https://example.com", render: true }, { cwd: "." }), { effect: "computer", concurrencySafe: false });
+  assert.deepEqual(tool.classify({ url: "https://example.com", render: true }, { cwd: "." }), {
+    effect: "read",
+    concurrencySafe: false,
+    approvalKind: "computer",
+  });
+  const rendered = toolOperationTraits(tool, { url: "https://example.com", render: true }, { cwd: "." });
+  assert.equal(rendered.effect, "read", "rendering does not mutate task state");
+  assert.equal(approvalKindForOperation(rendered), "computer", "rendering still requires explicit computer-use consent");
 });
 
 test("isolated headless renderer launches the configured browser with a loopback validating proxy", { skip: process.platform === "win32" }, async () => {
@@ -189,6 +196,20 @@ test("htmlToText: strips tags/scripts, decodes entities, keeps list structure", 
   assert.ok(!t.includes("bad()")); // <script> removed
   assert.match(t, /- a/);
   assert.match(t, /- b/);
+});
+
+test("htmlToText: bounded HTML cannot leak an unterminated Next.js payload as fake page content", () => {
+  const truncatedInScript = `
+    <html><body><main>Visible route content</main>
+    <script>self.__next_f.push(["hidden not-found: Sorry, the page does not exist"])
+  `;
+  const text = htmlToText(truncatedInScript);
+  assert.match(text, /Visible route content/);
+  assert.doesNotMatch(text, /not-found|page does not exist|__next_f/);
+
+  assert.equal(htmlToText("<html><head><title>Hidden title"), "");
+  assert.equal(htmlToText("<main>Readable</main><!-- unfinished hidden 404"), "Readable");
+  assert.doesNotMatch(htmlToText("<main>Readable</main><svg><rect y=\"4\" wid"), /rect|wid/);
 });
 
 test("isPrivateIp: blocks loopback/private/link-local/CGNAT, allows public (SSRF guard)", () => {

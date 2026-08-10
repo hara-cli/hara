@@ -30,7 +30,7 @@ import {
   type ProjectApprovalScope,
 } from "../security/project-approvals.js";
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
-import { failureIdentity, looksFailed, recordCall } from "./repeat-guard.js";
+import { failureIdentities, looksFailed, recordCall } from "./repeat-guard.js";
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
@@ -47,6 +47,8 @@ import { rolesDigest } from "../org/roles.js";
 import {
   applyTaskBrief,
   applyTaskCheckpoint,
+  recordTaskRoundUsage,
+  taskRoundBudget,
   taskCheckpointContext,
   type TaskBrief,
   type TaskExecution,
@@ -114,7 +116,12 @@ progress sentence, tool-round preamble, and final response; never switch languag
 logs, or source text use another language. Keep code, commands, paths, and technical identifiers unchanged. Use the
 provided tools to read files, edit/write files, and run shell
 commands. When the user asks to show or open an existing folder in their system file manager, call
-open_directory directly; never shell out to open, explorer, or xdg-open. Prefer small, verifiable steps; edit existing files with edit_file rather than rewriting
+open_directory directly; never shell out to open, explorer, or xdg-open. For website UI, SPA, visual, or
+interaction testing, call open_browser directly so the real system browser executes the page; do not start
+with task_intake and do not treat web_fetch text as visual proof. Use web_fetch for document/API text retrieval
+only. If one web_fetch attempt returns an SPA shell or unusable headless render, do not retry it with parameter
+variations: switch to open_browser, then use computer screenshot/find/click when configured. Prefer small,
+verifiable steps; edit existing files with edit_file rather than rewriting
 them whole. Batch INDEPENDENT tool calls in a single response — especially reads (read_file / grep /
 glob / ls run in PARALLEL when requested together); one-call-per-turn exploration is the slowest thing
 you can do. When analyzing a project, start wide in ONE batch — manifest (package.json / Cargo.toml /
@@ -123,6 +130,11 @@ grep/glob; don't read whole large files when a targeted search answers the quest
 grep to locate then read_file just that region with offset/limit — not the whole file. After a successful
 edit_file/write_file do NOT re-read the file to verify — the tool already applied and diffed the change;
 re-reading a big file after every edit is the slowest habit an agent can have.
+Before creating a new integration, upload, conversion, or automation script, make one targeted search of
+the manifest and conventional tools/, scripts/, bin/, and lib/ locations for an existing SDK/client/helper;
+reuse or extend it when it already owns the workflow. Do not recursively dump the workspace. When Bash or
+Git Bash invokes PowerShell with non-ASCII paths or arguments, avoid an inline -Command boundary: call an
+ASCII-named .ps1 with -File, resolve the non-ASCII paths inside PowerShell, and set UTF-8 explicitly there.
 Keep user-visible progress outcome-focused. Never narrate private chain-of-thought, internal task analysis,
 tool-selection reasoning, full retry decision trees, or orchestration names such as task_intake, todo_write,
 tool_search, and system-reminder. For long work, give one short update only when a major stage starts or
@@ -332,6 +344,8 @@ export interface RunOpts {
     /** Called at the closed tool-round boundary, after task_intake's result is in history and before any
      * later model/tool round. Persistent runners use this for a crash-safe session snapshot. */
     onCheckpoint?: (task: TaskExecution) => void;
+    /** Persist cumulative provider-round usage at every closed run boundary. */
+    onRoundUsage?: (task: TaskExecution) => void;
   };
   stats?: { input: number; output: number; lastInput?: number };
   /** role persona used instead of the default hara system prompt */
@@ -386,7 +400,7 @@ export interface RunOutcome {
   stopReason?: RunStopReason;
 }
 
-export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop";
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "task_round_budget";
 
 export interface RunLimitEvent {
   kind: RunStopReason;
@@ -421,6 +435,10 @@ interface RunLifecycle {
   limitAnnounced: boolean;
   disposed: boolean;
   failedCalls: Map<string, number>;
+  taskRoundsUsed: number;
+  taskRoundLimit?: number;
+  taskRoundCheckpointAt?: number;
+  taskRoundCheckpointInjected: boolean;
 }
 
 export function deadlineCheckpointReminder(timeoutMs: number): string {
@@ -430,6 +448,15 @@ export function deadlineCheckpointReminder(timeoutMs: number): string {
     "and reply with the completed checkpoint plus the next exact step. Do not start another generation batch, " +
     "install, full validation suite, preview, render, deployment, or other multi-minute stage in this turn. " +
     "The user can run /continue to start that next stage with a fresh bounded budget."
+  );
+}
+
+export function taskRoundCheckpointReminder(used: number, limit: number): string {
+  return (
+    `Task-level round checkpoint: ${used}/${limit} cumulative provider rounds have been used across this task. ` +
+    "Before expanding work, verify the original objective and acceptance checks, summarize concrete evidence and errors, " +
+    "inspect existing workspace tools/scripts, and state a materially different strategy if progress has stalled. " +
+    `The task will pause at ${limit} rounds and only an explicit /continue opens the next bounded tranche.`
   );
 }
 
@@ -587,6 +614,8 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
   const timeoutController = new AbortController();
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeoutController.signal]) : timeoutController.signal;
   const activeStartedAt = Date.now();
+  const task = opts.taskIntake?.current?.() ?? opts.taskIntake?.task;
+  const taskBudget = task ? taskRoundBudget(task) : undefined;
   let removeStopListener = (): void => {};
   const stopPromise = new Promise<typeof RUN_STOPPED>((resolveStopped) => {
     const stopped = (): void => resolveStopped(RUN_STOPPED);
@@ -615,6 +644,12 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
     limitAnnounced: false,
     disposed: false,
     failedCalls: new Map<string, number>(),
+    taskRoundsUsed: taskBudget?.used ?? 0,
+    ...(taskBudget ? {
+      taskRoundLimit: taskBudget.limit,
+      taskRoundCheckpointAt: taskBudget.checkpointAt,
+    } : {}),
+    taskRoundCheckpointInjected: false,
   };
   armRunTimers(opts, life);
   return life;
@@ -630,6 +665,8 @@ function hardStop(opts: RunOpts, life: RunLifecycle, kind: RunStopReason, detail
   const elapsedMs = runActiveElapsedMs(life);
   const message = kind === "deadline"
     ? `⏸ agent run paused: active-execution deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). Waiting for your answers did not consume this budget. No further model or tool calls will start in this turn. Session-backed work keeps its task and checklist checkpoint; type \`/continue\` to resume in a fresh bounded turn. Only for intentionally long single turns, use \`hara config set runTimeoutMs 45m\` (maximum 2h).`
+    : kind === "task_round_budget"
+      ? `⏸ task paused after ${life.taskRoundsUsed + life.rounds} cumulative provider round(s), reaching its ${life.taskRoundLimit}-round task budget. This is a recoverable evidence checkpoint, not completion. Review the task state and type \`/continue\` to explicitly open the next bounded tranche.`
     : kind === "max_rounds"
       ? `⛔ agent run stopped: ${life.maxRounds}-round safety limit reached after ${formatAgentDuration(elapsedMs)}. This usually means the model is looping. Increase it with \`hara config set maxAgentRounds <n>\` (maximum 256) only if the extra rounds are intentional.`
       : detail?.count === 1 && detail.label === "Home workspace boundary"
@@ -648,7 +685,12 @@ function hardStop(opts: RunOpts, life: RunLifecycle, kind: RunStopReason, detail
 export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<RunOutcome> {
   const life = createRunLifecycle(opts);
   try {
-    return await runAgentInner(history, opts, life);
+    const outcome = await runAgentInner(history, opts, life);
+    if (life.rounds > 0 && opts.taskIntake?.onRoundUsage) {
+      const current = opts.taskIntake.current?.() ?? opts.taskIntake.task;
+      opts.taskIntake.onRoundUsage(recordTaskRoundUsage(current, life.rounds));
+    }
+    return outcome;
   } finally {
     disposeRunLifecycle(life);
   }
@@ -879,8 +921,28 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // A cancellation that already happened is authoritative: do not start pending-input work, a provider
     // request, or any later tool round merely to give it an already-aborted signal.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
+    if (life.taskRoundLimit !== undefined && life.taskRoundsUsed + life.rounds >= life.taskRoundLimit) {
+      return hardStop(opts, life, "task_round_budget");
+    }
     if (life.rounds >= life.maxRounds) return hardStop(opts, life, "max_rounds");
     life.rounds += 1;
+    const cumulativeTaskRounds = life.taskRoundsUsed + life.rounds;
+    if (
+      life.taskRoundCheckpointAt !== undefined
+      && life.taskRoundsUsed < life.taskRoundCheckpointAt
+      && cumulativeTaskRounds >= life.taskRoundCheckpointAt
+      && !life.taskRoundCheckpointInjected
+    ) {
+      life.taskRoundCheckpointInjected = true;
+      showRunNotice(
+        opts,
+        `⚠ task checkpoint: ${cumulativeTaskRounds}/${life.taskRoundLimit} cumulative rounds used. Hara is reviewing evidence and strategy before continuing.`,
+      );
+      history.push({
+        role: "user",
+        content: wrapReminders([taskRoundCheckpointReminder(cumulativeTaskRounds, life.taskRoundLimit!)]),
+      });
+    }
     if (life.rounds >= Math.ceil(life.maxRounds * 0.75)) warnRun(opts, life);
     if (runActiveElapsedMs(life) >= Math.floor(life.timeoutMs * 0.8)) requestRunCheckpoint(opts, life);
     if (!opts.quiet && life.checkpointDue && !life.checkpointInjected) {
@@ -1212,16 +1274,20 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     let repeatHalt: { label: string; count: number } | null = null;
     const noteCall = (name: string, input: unknown, content: string, isError = false): string => {
       const note = recordCall(name, input, content, isError, ctx.todoScope);
-      const identity = failureIdentity(name, input, content, isError);
+      const identities = failureIdentities(name, input, content, isError);
       if (isError || looksFailed(content, name)) {
-        const count = (life.failedCalls.get(identity.key) ?? 0) + 1;
+        const counts = identities.map((identity) => ({
+          identity,
+          count: (life.failedCalls.get(identity.key) ?? 0) + 1,
+        }));
         // This is a *consecutive no-progress* streak, not a lifetime counter for the call. A different
         // failure is a changed attempt; keep only that new streak instead of letting an old failure
         // silently accumulate across intervening work.
         life.failedCalls.clear();
-        life.failedCalls.set(identity.key, count);
-        const failureLimit = identity.hardStopAfter;
-        if (count >= failureLimit && !repeatHalt) {
+        for (const { identity, count } of counts) life.failedCalls.set(identity.key, count);
+        const stopped = counts.find(({ identity, count }) => count >= identity.hardStopAfter);
+        if (stopped && !repeatHalt) {
+          const { identity, count } = stopped;
           if (identity.kind === "empty_recall") {
             // Empty recall is not a fatal agent failure. Remove both recall schemas for later model rounds,
             // close any remaining batched calls below, and let the model plainly tell the user no history

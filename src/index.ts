@@ -297,6 +297,7 @@ import "./tools/ask_user.js"; // register ask_user (pause mid-turn to ask the us
 import "./tools/cron.js"; // register cronjob (model-facing scheduler — "remind me every morning" just works)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 import "./tools/open-directory.js"; // register safe Finder/File Explorer directory opening
+import "./tools/open-browser.js"; // register safe real-browser navigation for website/UI testing
 
 const here = dirname(fileURLToPath(import.meta.url));
 // Version: from a build-time define in the compiled single-binary (no package.json on its virtual FS),
@@ -4726,6 +4727,10 @@ program.action(async (opts) => {
           task = next;
           if (meta) saveSession(meta, history, task);
         },
+        onRoundUsage: (next: TaskExecution): void => {
+          task = next;
+          if (meta) saveSession(meta, history, task);
+        },
       },
       ...(roleOverride ? { systemOverride: roleOverride } : {}),
       ...(headlessToolFilter ? { toolFilter: headlessToolFilter } : {}),
@@ -4989,6 +4994,10 @@ program.action(async (opts) => {
           task = next;
         },
         onCheckpoint: (next: TaskExecution): void => {
+          task = next;
+          persistSession();
+        },
+        onRoundUsage: (next: TaskExecution): void => {
           task = next;
           persistSession();
         },

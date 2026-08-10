@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deadlineCheckpointReminder, runAgent } from "../dist/agent/loop.js";
+import { deadlineCheckpointReminder, runAgent, taskRoundCheckpointReminder } from "../dist/agent/loop.js";
 import {
   agentMaxRounds,
   agentRunTimeoutMs,
@@ -15,6 +15,7 @@ import {
 import { runShell } from "../dist/sandbox.js";
 import { getTool } from "../dist/tools/registry.js";
 import { onTurnPhase, setTurnPhase } from "../dist/agent/phase.js";
+import { createTaskExecution } from "../dist/session/task.js";
 import "../dist/tools/builtin.js";
 import "../dist/tools/memory.js";
 
@@ -120,6 +121,43 @@ test("one retry of an identical failed tool call trips the repeat-loop circuit b
   assert.equal(outcome.stopReason, "repeat_loop");
   assert.match(outcome.error, /same failing always_fails call repeated 2 times/);
   assert.equal(history.at(-1).role, "tool", "the last assistant tool_use remains protocol-complete");
+});
+
+test("three changed command variants with one stable API failure trip the strategy breaker", async () => {
+  let turns = 0;
+  const provider = {
+    id: "strategy-repeat",
+    model: "strategy-repeat",
+    async turn() {
+      turns += 1;
+      return {
+        text: "",
+        toolUses: [{
+          id: `variant-${turns}`,
+          name: "fixture_command_strategy",
+          input: {
+            command: `curl -F attempt=${turns} https://open.feishu.cn/open-apis/drive/v1/medias/upload_all`,
+          },
+        }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "upload the file" }], base(provider, {
+    maxRounds: 20,
+    timeoutMs: "10s",
+    quiet: true,
+    extraTools: [{
+      name: "fixture_command_strategy",
+      description: "test strategy variants",
+      input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+      kind: "read",
+      async run() { return 'Command failed: {"code":1061002,"msg":"params error"}'; },
+    }],
+  }));
+  assert.equal(turns, 3);
+  assert.equal(outcome.stopReason, "repeat_loop");
+  assert.match(outcome.error, /curl\+open\.feishu\.cn.*API error 1061002.*repeated 3 times/is);
 });
 
 test("the first tool blocked by the Home boundary stops before another model round", async () => {
@@ -430,6 +468,93 @@ test("the 80% time boundary reaches the model as an in-band checkpoint instructi
   assert.equal(outcome.status, "completed");
   assert.equal(sawCheckpoint, true);
   assert.match(deadlineCheckpointReminder(30 * 60_000), /Do not start another generation batch/);
+});
+
+test("the cumulative 50-round task checkpoint reaches the next provider request", async () => {
+  const interaction = { kind: "turn", turnId: "round-checkpoint-turn" };
+  let task = {
+    ...createTaskExecution("verify the long-running task strategy", interaction.turnId),
+    roundsUsed: 49,
+    roundBudgetLimit: 100,
+  };
+  const notices = [];
+  let sawCheckpoint = false;
+  const history = [{ role: "user", content: "continue the bounded task" }];
+  const provider = {
+    id: "task-checkpoint-aware",
+    model: "task-checkpoint-aware",
+    async turn({ history: preparedHistory }) {
+      sawCheckpoint = preparedHistory.some((message) =>
+        message.role === "user" && message.content.includes("Task-level round checkpoint: 50/100"),
+      );
+      return { text: "checkpoint reviewed", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent(history, base(provider, {
+    ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
+    timeoutMs: "10s",
+    maxRounds: 10,
+    taskIntake: {
+      task,
+      current: () => task,
+      onRoundUsage: (next) => { task = next; },
+    },
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(task.roundsUsed, 50);
+  assert.equal(sawCheckpoint, true);
+  assert.ok(notices.some((message) => /task checkpoint: 50\/100/.test(message)));
+  assert.match(taskRoundCheckpointReminder(50, 100), /only an explicit \/continue opens the next bounded tranche/);
+});
+
+test("the cumulative 100-round task cap pauses before another provider call", async () => {
+  let task = {
+    ...createTaskExecution("stop at the durable task boundary", "round-cap-turn"),
+    roundsUsed: 99,
+    roundBudgetLimit: 100,
+  };
+  let providerTurns = 0;
+  let toolRuns = 0;
+  const alerts = [];
+  const provider = {
+    id: "task-round-cap",
+    model: "task-round-cap",
+    async turn() {
+      providerTurns += 1;
+      return {
+        text: "",
+        toolUses: [{ id: `bounded-${providerTurns}`, name: "bounded_progress", input: { turn: providerTurns } }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "continue until the task checkpoint" }], base(provider, {
+    timeoutMs: "10s",
+    maxRounds: 256,
+    quiet: true,
+    onLimit: (event) => alerts.push(event),
+    taskIntake: {
+      task,
+      current: () => task,
+      onRoundUsage: (next) => { task = next; },
+    },
+    extraTools: [{
+      name: "bounded_progress",
+      description: "one successful read-only task step",
+      input_schema: { type: "object", properties: { turn: { type: "number" } }, required: ["turn"] },
+      kind: "read",
+      async run() { toolRuns += 1; return "checkpoint artifact saved"; },
+    }],
+  }));
+  assert.equal(providerTurns, 1, "the next provider request never starts after the cumulative cap");
+  assert.equal(toolRuns, 1);
+  assert.equal(outcome.status, "halted");
+  assert.equal(outcome.stopReason, "task_round_budget");
+  assert.equal(task.roundsUsed, 100);
+  assert.match(outcome.error, /100 cumulative provider round\(s\)/);
+  assert.match(outcome.error, /type `\/continue`/);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0].kind, "task_round_budget");
 });
 
 test("active deadline closes a tool round even when the tool ignores cancellation", async () => {

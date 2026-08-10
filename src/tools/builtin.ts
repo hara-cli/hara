@@ -94,6 +94,22 @@ export function isHeadlessWeixinLoginCommand(command: string): boolean {
   });
 }
 
+/** Legacy and mixed Windows shells can silently re-encode non-ASCII argv at a Bash↔PowerShell boundary. */
+export function crossShellEncodingWarning(command: string): string | undefined {
+  if (!/[^\x00-\x7f]/u.test(command)) return undefined;
+  const parts = splitCompound(command) ?? [command];
+  const invokesPowerShell = parts.some((part) =>
+    /(?:^|[;&|]\s*)(?:"[^"]*[\\/]powershell(?:\.exe)?"|'[^']*[\\/]powershell(?:\.exe)'|(?:\S*[\\/])?(?:powershell|pwsh)(?:\.exe)?)(?=\s|$)/iu
+      .test(part.trim()),
+  );
+  if (!invokesPowerShell) return undefined;
+  return (
+    "⚠ hara: this command crosses a Bash↔PowerShell boundary with non-ASCII text. Prefer an ASCII-only " +
+    "`powershell -File script.ps1` invocation; resolve non-ASCII paths and set UTF-8 inside the script. " +
+    "Inline `-Command` or non-ASCII cross-shell arguments may be re-encoded."
+  );
+}
+
 /** Read only the presence of ngrok auth — never return or print its value. */
 export function ngrokAuthConfigured(env: NodeJS.ProcessEnv = process.env, home = homedir()): boolean {
   if (env.NGROK_AUTHTOKEN || env.NGROK_API_KEY) return true;
@@ -349,6 +365,8 @@ registerTool({
         "or run `hara gateway --platform weixin --login` yourself in a real terminal."
       );
     }
+    const encodingWarning = crossShellEncodingWarning(String(input.command ?? ""));
+    if (encodingWarning) ctx.ui?.notice(encodingWarning);
     const packageInstall = isPackageInstallCommand(String(input.command ?? ""));
     if (input.registry !== undefined && typeof input.registry !== "string") {
       return "Error: `registry` must be a string such as npmmirror or https://registry.npmjs.org/.";
@@ -393,7 +411,7 @@ registerTool({
     if (input.background) {
       const id = startJob(input.command, ctx.cwd, ctx.sandbox ?? "off", registry ? packageRegistryEnv(registry) : {});
       const safeCommand = redactToolSubprocessOutput(String(input.command));
-      return `Started background job ${id}: \`${safeCommand}\`.` +
+      return (encodingWarning ? `${encodingWarning}\n` : "") + `Started background job ${id}: \`${safeCommand}\`.` +
         (registry ? " Explicit package registry override applied." : "") +
         ` Manage with the \`job\` tool — {action:"tail",id:"${id}"} for output, {action:"kill",id:"${id}"} to stop, {action:"list"} for all. Poll until it exits before running steps that depend on it.`;
     }
@@ -438,11 +456,13 @@ registerTool({
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
       // The endpoint can be a private hostname/path. Confirmation is useful, but echoing it back into the
       // model transcript is unnecessary and may expose organization-specific routing metadata.
-      const notice = registry ? "hara: explicit package registry override applied\n" : "";
+      const notice = (encodingWarning ? `${encodingWarning}\n` : "")
+        + (registry ? "hara: explicit package registry override applied\n" : "");
       return capHeadTail(redactToolSubprocessOutput(notice + (combined.trim() || "(no output)")));
     } catch (e: any) {
       flushLive();
       let base = `Command failed: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`;
+      if (encodingWarning) base += `\n${encodingWarning}`;
       // Timeout gets an ACTIONABLE next step, not just a corpse — the model (and user) should pick a
       // lane instead of blind-retrying into the same wall.
       if (/timed out after \d+ms/.test(String(e.message))) {

@@ -34,6 +34,8 @@ test("system prompt teaches the analysis SOP: batch reads, manifest-first, fan o
   assert.ok(/package\.json \/ Cargo\.toml \/\s+pyproject\.toml \/ go\.mod/.test(system), "manifest-first sweep for project analysis");
   assert.ok(/more than ~3 searches/.test(system), "CC's fan-out heuristic present");
   assert.ok(/role "explore"/.test(system), "points at the built-in explore persona");
+  assert.match(system, /tools\/, scripts\/, bin\/, and lib\/[\s\S]*existing SDK\/client\/helper/);
+  assert.match(system, /Bash or[\s\S]*PowerShell with non-ASCII[\s\S]*ASCII-named \.ps1 with -File/);
 });
 
 test("system prompt edits existing documents in place without durable helper scripts", async () => {

@@ -4,7 +4,7 @@ import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSyn
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { capHeadTail, isHeadlessWeixinLoginCommand, isLongRunningLocalServerCommand, isLongRunningTunnelCommand, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
+import { capHeadTail, crossShellEncodingWarning, isHeadlessWeixinLoginCommand, isLongRunningLocalServerCommand, isLongRunningTunnelCommand, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
 import { atomicWriteText } from "../dist/fs-write.js";
 import { readRegularFileSnapshot } from "../dist/fs-read.js";
@@ -108,6 +108,18 @@ test("headless agent shells refuse interactive WeChat QR login regardless of fla
   );
   assert.match(result, /Blocked interactive WeChat login/);
   assert.match(result, /Hara Desktop/);
+});
+
+test("Bash-to-PowerShell non-ASCII arguments produce a safe encoding-boundary warning", () => {
+  for (const command of [
+    'powershell -Command "上传 文件.pdf"',
+    'pwsh.exe -File upload.ps1 -Path "资料/报告.pdf"',
+    '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "处理中文"',
+  ]) {
+    assert.match(crossShellEncodingWarning(command) ?? "", /ASCII-only.*-File.*UTF-8.*inside the script/is, command);
+  }
+  assert.equal(crossShellEncodingWarning("powershell -File upload.ps1"), undefined);
+  assert.equal(crossShellEncodingWarning("printf '中文'"), undefined);
 });
 
 test("package registry switching is explicit, normalized, and injected without shell interpolation", () => {

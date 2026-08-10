@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
 import { lstatSync, realpathSync } from "node:fs";
 import { findProjectRoot } from "../context/agents-md.js";
 import { isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
@@ -17,8 +16,6 @@ const MAX_PROJECTS = 128;
 const MAX_GRANTS_PER_PROJECT = 256;
 const GRANT_KEY = /^v1:[a-f0-9]{64}$/;
 const PROJECT_KEY = /^p1:[a-f0-9]{64}$/;
-const MAX_SCOPE_BYTES = 1024 * 1024;
-const SCRATCH_DIRECTORIES = [".tmp", "logs", "output"] as const;
 
 interface ProjectIdentity {
   root: string;
@@ -233,106 +230,46 @@ export function projectApprovalPolicy(cwd: string, home = homedir()): ProjectApp
   }
 }
 
-function stableValue(value: unknown, depth = 0, ancestors = new WeakSet<object>()): unknown {
-  if (depth > 64) throw new Error("project approval scope is too deeply nested");
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
-  if (typeof value === "number") return Number.isFinite(value) ? value : { $number: String(value) };
-  if (typeof value === "undefined") return { $undefined: true };
-  if (typeof value === "bigint") return { $bigint: value.toString() };
-  if (!value || typeof value !== "object") throw new Error("project approval scope contains an unsupported value");
-  if (ancestors.has(value)) throw new Error("project approval scope contains a cycle");
-  ancestors.add(value);
-  try {
-    if (Array.isArray(value)) return value.map((entry) => stableValue(entry, depth + 1, ancestors));
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new Error("project approval scope contains a non-JSON object");
-    }
-    const record = value as Record<string, unknown>;
-    return Object.fromEntries(
-      Object.keys(record).sort().map((key) => [key, stableValue(record[key], depth + 1, ancestors)]),
-    );
-  } finally {
-    ancestors.delete(value);
-  }
-}
-
 function scopeKey(scope: unknown): string {
-  const encoded = JSON.stringify(stableValue(scope));
-  if (Buffer.byteLength(encoded, "utf8") > MAX_SCOPE_BYTES) {
-    throw new Error("project approval scope is too large");
-  }
+  const encoded = JSON.stringify(scope);
   const digest = createHash("sha256").update(encoded).digest("hex");
   return `v1:${digest}`;
 }
 
-function inside(parent: string, child: string): boolean {
-  const rel = relative(parent, child);
-  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
-}
-
-function resolvedInputPath(cwd: string, root: string, input: Record<string, unknown>): string | null {
-  if (typeof input.path !== "string" || !input.path.trim() || input.path.includes("\0")) return null;
-  if (!isAbsolute(input.path)) return resolve(realpathSync.native(cwd), input.path);
-  const target = resolve(input.path);
-  if (inside(root, target)) return target;
-  // macOS commonly exposes /var through the /private/var real path. Preserve an explicitly absolute path,
-  // but map the same lexical project tree onto its canonical root before deciding scratch-directory scope.
-  const lexicalRoot = resolve(findProjectRoot(cwd));
-  return inside(lexicalRoot, target) ? resolve(root, relative(lexicalRoot, target)) : target;
-}
-
 /**
- * Compute the narrow permission scope offered by “always”. Only the opaque key is persisted.
- * High-risk computer/external tools never call this function because they remain one-shot approvals.
+ * Compute the project + operation-family scope offered by “always”. Concrete commands, request IDs,
+ * paths, and tool arguments are deliberately excluded: the UI says "for this project", so repeating the
+ * same category must hit the remembered grant. Protected-file, permission, guardian, computer, and
+ * external-action boundaries are evaluated separately and cannot be bypassed by this scope.
  */
 export function projectApprovalScope(
   toolName: string,
-  input: Record<string, unknown>,
+  _input: Record<string, unknown>,
   cwd: string,
 ): ProjectApprovalScope {
   const identity = projectIdentity(cwd);
-  const root = identity.root;
   const project = { rootKey: identity.rootKey, dev: identity.dev, ino: identity.ino };
   if (toolName === "python") {
     return {
-      key: scopeKey({ version: 1, project, kind: "python" }),
+      key: scopeKey({ version: 2, project, kind: "python" }),
       summary: "Always grants Python execution for this project; protected-file and high-risk guards still apply.",
     };
   }
-  if (toolName === "bash" && typeof input.command === "string") {
+  if (toolName === "bash") {
     return {
-      key: scopeKey({
-        version: 1,
-        project,
-        kind: "bash-command",
-        command: input.command.trim(),
-        background: input.background === true,
-        registry: typeof input.registry === "string" ? input.registry : null,
-      }),
-      summary: "Always grants only this exact Bash command in this project.",
+      key: scopeKey({ version: 2, project, kind: "bash" }),
+      summary: "Always grants Bash commands for this project; protected-file, permission, and high-risk guards still apply.",
     };
   }
-  if (toolName === "write_file" || toolName === "edit_file") {
-    const target = resolvedInputPath(cwd, root, input);
-    if (target) {
-      for (const directory of SCRATCH_DIRECTORIES) {
-        const boundary = resolve(root, directory);
-        if (inside(boundary, target)) {
-          return {
-            key: scopeKey({ version: 1, project, kind: "scratch-write", boundary }),
-            summary: `Always grants file changes under ${directory}/ in this project.`,
-          };
-        }
-      }
-      return {
-        key: scopeKey({ version: 1, project, kind: "file-edit", target }),
-        summary: "Always grants changes only to this exact file in this project.",
-      };
-    }
+  if (toolName === "write_file" || toolName === "edit_file" || toolName === "apply_patch") {
+    return {
+      key: scopeKey({ version: 2, project, kind: "file-change" }),
+      summary: "Always grants file changes inside this project; project and protected-file boundaries still apply.",
+    };
   }
+  const safeToolName = toolName.replace(/[^a-z0-9_.:-]/giu, "").slice(0, 80) || "this tool";
   return {
-    key: scopeKey({ version: 1, project, kind: "exact-tool-input", toolName, input }),
-    summary: `Always grants only this exact ${toolName} action in this project.`,
+    key: scopeKey({ version: 2, project, kind: "tool-family", toolName }),
+    summary: `Always grants ${safeToolName} actions for this project; independent safety boundaries still apply.`,
   };
 }

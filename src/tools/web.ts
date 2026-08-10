@@ -13,6 +13,10 @@ import { loadConfig } from "../config.js";
 import { renderHeadlessHtml } from "./headless-web.js";
 
 const MAX = 60_000;
+// HTML often expands far beyond its readable text (Next.js RSC payloads are a common example). Keep
+// the input safety ceiling independent from the requested text output cap so we do not cut inside a
+// script before reaching the visible body and then misreport hidden router/not-found data as content.
+const MAX_HTML_INPUT_BYTES = 4 * 1024 * 1024;
 const SEARCH_ATTEMPT_MS = 8_000;
 const SEARCH_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36";
 type SearchResult = { title: string; url: string; snippet: string };
@@ -388,14 +392,16 @@ async function readPinnedCapped(res: PinnedResponse["body"], maxBytes: number): 
 /** Strip HTML to a readable-ish plain-text approximation (no dependency). */
 export function htmlToText(html: string): string {
   return html
-    .replace(/<head[\s\S]*?<\/head>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ")
+    // `$` alternatives make the reducer safe when the bounded network reader stops in the middle of
+    // a head/script/style/comment. Hidden framework payloads must never become apparent page text.
+    .replace(/<head\b[\s\S]*?(?:<\/head>|$)/gi, " ")
+    .replace(/<script\b[\s\S]*?(?:<\/script>|$)/gi, " ")
+    .replace(/<style\b[\s\S]*?(?:<\/style>|$)/gi, " ")
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, " ")
     .replace(/<li[^>]*>/gi, "\n- ")
     .replace(/<\/(p|div|h[1-6]|li|tr|section|article|header|footer|ul|ol|blockquote)>/gi, "\n")
     .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
+    .replace(/<[^>]*(?:>|$)/g, " ")
     .replace(/&nbsp;/g, " ")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
@@ -736,7 +742,7 @@ registerTool({
   kind: "read",
   classify(input) {
     return input?.render
-      ? { effect: "computer", concurrencySafe: false }
+      ? { effect: "read", concurrencySafe: false, approvalKind: "computer" }
       : { effect: "read", concurrencySafe: true };
   },
   visibility: "deferred",
@@ -787,7 +793,7 @@ registerTool({
       let raw: string;
       let bodyRead = false;
       try {
-        raw = await readPinnedCapped(res.body, cap * 4); // byte ceiling (HTML→text shrinks; cap*4 leaves headroom)
+        raw = await readPinnedCapped(res.body, /html/i.test(ct) ? MAX_HTML_INPUT_BYTES : cap * 4);
         bodyRead = true;
       } finally {
         await res.release(!bodyRead);
@@ -819,13 +825,20 @@ registerTool({
               : rendered.error === "output-too-large"
                 ? "The rendered DOM exceeded the 4 MiB safety ceiling."
                 : "The isolated browser finished without usable rendered text.";
-          return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(`${text || "(empty shell)"}\n\nHeadless render unavailable: ${reason}`, current.href)}`;
+          return (
+            `Error: web_fetch could not verify the rendered page at ${current.origin}: ${reason} ` +
+            "Do not retry web_fetch with parameter variations; use open_browser for the real system browser, " +
+            "then computer screenshot/find/click for visual or interaction verification.\n\n" +
+            wrapUntrusted(text || "(empty SPA shell)", current.href)
+          );
         }
         const hint =
-          "This page appears to be JavaScript-rendered; web_fetch received only the SPA shell and does not execute page scripts. " +
-          "Retry web_fetch with render=true (it uses a fresh isolated browser and requires approval), use an available browser/web skill, " +
-          "or use the site's authenticated API/connector (for example the Feishu Docs API).";
-        return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(`${text || "(empty shell)"}\n\n${hint}`, current.href)}`;
+          "Do not retry web_fetch for visual/UI verification. Use open_browser for the real system browser, then " +
+          "computer screenshot/find/click when configured; use an authenticated API/connector only when the task is data retrieval.";
+        return (
+          `Error: web_fetch received only a JavaScript SPA shell at ${current.origin}. ${hint}\n\n` +
+          wrapUntrusted(text || "(empty SPA shell)", current.href)
+        );
       }
       return `# ${current.href} (HTTP ${res.status})\n\n${wrapUntrusted(text || "(empty body)", current.href)}`;
     } catch (e: any) {

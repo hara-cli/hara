@@ -15,10 +15,12 @@ import {
   isTaskExecution,
   newSteerInteraction,
   newTurnInteraction,
+  recordTaskRoundUsage,
   recordTaskSteering,
   routeTaskInteraction,
   requestsTaskContinuation,
   recoverTaskExecution,
+  taskRoundBudget,
   taskExecutionContext,
   taskCheckpointContext,
 } from "../dist/session/task.js";
@@ -144,15 +146,55 @@ test("task completion remains paused while durable todos are unfinished", () => 
   assert.equal(completed.status, "completed");
 });
 
-test("a total deadline is a resumable pause while loop breakers remain blocked", () => {
+test("deadline and cumulative task-round limits are resumable pauses while loop breakers remain blocked", () => {
   const interaction = newTurnInteraction();
   const task = createTaskExecution("finish the long task", interaction.turnId);
   const deadline = finishTaskExecution(task, { status: "halted", stopReason: "deadline", error: "deadline" });
   assert.equal(deadline.status, "paused");
   assert.equal(deadline.lastOutcome, "halted");
 
+  const roundBudget = finishTaskExecution(task, { status: "halted", stopReason: "task_round_budget", error: "checkpoint" });
+  assert.equal(roundBudget.status, "paused");
+  assert.equal(roundBudget.lastOutcome, "halted");
+
   const loop = finishTaskExecution(task, { status: "halted", stopReason: "repeat_loop", error: "loop" });
   assert.equal(loop.status, "blocked");
+});
+
+test("task rounds persist cumulatively and only explicit continuation opens another 100-round tranche", () => {
+  const first = newTurnInteraction();
+  const created = createTaskExecution("finish a bounded long task", first.turnId, "2026-08-10T00:00:00.000Z");
+  assert.deepEqual(taskRoundBudget(created), { used: 0, limit: 100, checkpointAt: 50 });
+
+  const atLimit = recordTaskRoundUsage(created, 100, "2026-08-10T00:10:00.000Z");
+  assert.deepEqual(taskRoundBudget(atLimit), { used: 100, limit: 100, checkpointAt: 50 });
+  assert.equal(recordTaskRoundUsage(created, 101).roundsUsed, 100, "accounting cannot overshoot its current tranche");
+  assert.match(taskExecutionContext(atLimit, first), /Cumulative round budget: 100\/100/);
+  assert.equal(isTaskExecution(atLimit), true);
+
+  const paused = finishTaskExecution(atLimit, {
+    status: "halted",
+    stopReason: "task_round_budget",
+    error: "bounded checkpoint",
+  });
+  assert.equal(paused.status, "paused");
+
+  const resumedInteraction = newSteerInteraction(first.turnId);
+  const resumed = continueTaskExecution(paused, resumedInteraction, "2026-08-10T00:11:00.000Z");
+  assert.equal(resumed.ok, true);
+  assert.deepEqual(taskRoundBudget(resumed.task), { used: 100, limit: 200, checkpointAt: 150 });
+  assert.equal(isTaskExecution(resumed.task), true);
+
+  const belowLimit = recordTaskRoundUsage(created, 25, "2026-08-10T00:05:00.000Z");
+  const normalContinuation = continueTaskExecution(
+    belowLimit,
+    newSteerInteraction(first.turnId),
+    "2026-08-10T00:06:00.000Z",
+  );
+  assert.equal(normalContinuation.ok, true);
+  assert.deepEqual(taskRoundBudget(normalContinuation.task), { used: 25, limit: 100, checkpointAt: 50 });
+  assert.equal(isTaskExecution({ ...created, roundBudgetLimit: undefined }), false, "partial budget metadata fails closed");
+  assert.equal(isTaskExecution({ ...created, roundsUsed: undefined }), false, "a forged limit without usage fails closed");
 });
 
 test("task steering audit is bounded", () => {
@@ -264,6 +306,8 @@ test("session task state round-trips separately, redacts secrets, and legacy ses
     saveSession(meta, [{ role: "user", content: "continue" }], task);
     const loaded = loadSession(id);
     assert.ok(loaded.task, "new top-level task is restored");
+    assert.equal(loaded.task.roundsUsed, 0, "cumulative round usage survives the redacted session copy");
+    assert.equal(loaded.task.roundBudgetLimit, 100, "the bounded tranche survives the redacted session copy");
     assert.equal(loaded.history[0].content, "continue", "transcript remains independent");
     assert.ok(!loaded.task.objective.includes("super-secret-123456"), "task objective is redacted too");
     assert.ok(!JSON.stringify(loaded.task.brief).includes("super-secret-123456"), "interpreted task brief is redacted too");

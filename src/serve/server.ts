@@ -1114,7 +1114,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     taskId: string;
     turnId: string;
     status?: "paused";
-    stopReason?: "deadline";
+    stopReason?: "deadline" | "task_round_budget";
   }> => {
     const sessionId = s.meta.id;
     s.busy = true;
@@ -1376,6 +1376,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             hub.save(s);
             emitTaskState({ state: "running", phase: "checkpoint" }, serializeTodos(sessionId));
           },
+          onRoundUsage: (next): void => {
+            s.task = next;
+            hub.save(s);
+            emitTaskState({ state: "running", phase: "checkpoint" }, serializeTodos(sessionId));
+          },
         },
         pendingInput: async () => {
           materializePendingSteering(s); // helper updates the shared live history after its write-ahead save
@@ -1407,8 +1412,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           : outcome.status === "halted"
             ? "agent turn halted by a safety control"
             : "agent turn failed");
-        if (outcome.status === "halted" && outcome.stopReason === "deadline") {
-          // An active-execution deadline is a successful, recoverable checkpoint transition. The typed
+        if (outcome.status === "halted" && (outcome.stopReason === "deadline" || outcome.stopReason === "task_round_budget")) {
+          // A bounded lifecycle pause is a successful, recoverable checkpoint transition. The typed
           // task event already says `paused`; returning a normal RPC result keeps Desktop and other Serve
           // clients from rendering the same state as `error:` while still exposing the focused /continue
           // guidance to request/response-only clients. Other safety halts remain explicit failures.
@@ -1418,7 +1423,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             turnId: s.task!.turnId,
             reply: "",
             status: "paused",
-            stopReason: "deadline",
+            stopReason: outcome.stopReason,
             usage,
             ctx,
           });
@@ -1429,7 +1434,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             taskId: s.task!.id,
             turnId: s.task!.turnId,
             status: "paused",
-            stopReason: "deadline",
+            stopReason: outcome.stopReason,
           };
         }
         broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply: "", error: failure, status: outcome.status, usage, ctx });
@@ -1986,9 +1991,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               providerId: provider.id,
               approval: deps.approval,
               projectContext: undefined,
+              sourceSnapshot: source,
             });
             if ("missing" in r) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
-            if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "source session is mid-turn — fork after it completes"));
+            if ("busy" in r) return reply(rpcError(id, ERR.BUSY, "source session is changing configuration — retry fork shortly"));
             r.session.configuring = true;
             let refreshed = false;
             try {

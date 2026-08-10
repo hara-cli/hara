@@ -74,6 +74,9 @@ export interface ToolOperationTraits {
   effect: ToolEffect;
   /** True only when this exact operation can overlap other operations without shared-state races. */
   concurrencySafe: boolean;
+  /** Optional approval boundary when it is stricter than the operation's data effect. For example,
+   * isolated browser rendering remains a read but still requires explicit computer-use consent. */
+  approvalKind?: "read" | "edit" | "exec" | "computer";
   /** Metadata for future audit/permission UIs; never weakens the ordinary approval/guardian boundary. */
   destructive?: boolean;
 }
@@ -168,6 +171,7 @@ function defaultEffect(tool: Tool): ToolEffect {
 }
 
 const TOOL_EFFECTS = new Set<ToolEffect>(["read", "state", "edit", "exec", "computer", "interactive"]);
+const TOOL_APPROVAL_KINDS = new Set(["read", "edit", "exec", "computer"]);
 
 /** Conservative, non-throwing classifier shared by approval, understanding, guardian, and scheduling. */
 export function toolOperationTraits(tool: Tool, input: unknown, ctx: ToolContext): ToolOperationTraits {
@@ -182,6 +186,9 @@ export function toolOperationTraits(tool: Tool, input: unknown, ctx: ToolContext
     return {
       effect: classified.effect,
       concurrencySafe: classified.concurrencySafe === true,
+      ...(classified.approvalKind && TOOL_APPROVAL_KINDS.has(classified.approvalKind)
+        ? { approvalKind: classified.approvalKind }
+        : {}),
       ...(classified.destructive === true ? { destructive: true } : {}),
     };
   } catch {
@@ -191,6 +198,7 @@ export function toolOperationTraits(tool: Tool, input: unknown, ctx: ToolContext
 }
 
 export function approvalKindForOperation(traits: ToolOperationTraits): Tool["kind"] {
+  if (traits.approvalKind) return traits.approvalKind;
   if (traits.effect === "edit") return "edit";
   if (traits.effect === "exec") return "exec";
   if (traits.effect === "computer") return "computer";
