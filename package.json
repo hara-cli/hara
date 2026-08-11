@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.145.0",
+  "version": "0.145.1",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -55,7 +55,7 @@
     "@anthropic-ai/sdk": "^0.104.2",
     "@larksuiteoapi/node-sdk": "^1.68.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@nanhara/hara-presentation": "0.1.0-alpha.7",
+    "@nanhara/hara-presentation": "0.1.0-alpha.8",
     "commander": "^15.0.0",
     "cross-spawn": "^7.0.6",
     "ink": "^6.8.0",

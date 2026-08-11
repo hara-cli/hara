@@ -236,9 +236,14 @@ test("agent presentation tool exposes a complete generation schema and creates a
   assert.deepEqual(projectSchema.properties.template.properties.preset.enum, [
     "pitch", "report", "technical", "visual",
   ]);
-  assert.equal(projectSchema.properties.slides.items.properties.blocks.maxItems, 7);
+  assert.equal(projectSchema.properties.slides.items.properties.blocks.maxItems, 6);
   assert.match(tool.description, /must not repeat one default card grid/);
   assert.match(tool.description, /never more than six/);
+  assert.match(tool.description, /usually 2–3 visible top-level blocks/);
+  assert.match(tool.description, /Title, claim, evidence, and action must play distinct semantic roles/);
+  assert.match(tool.description, /generic heading blocks/);
+  assert.match(tool.description, /audience-facing copy only/);
+  assert.match(tool.description, /at most two body blocks on a statement page/);
   assert.match(tool.description, /shorten content, split the slide, or choose a roomier template/);
   assert.match(
     projectSchema.properties.slides.items.properties.blocks.items.properties.literal.description,

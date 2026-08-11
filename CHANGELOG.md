@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.145.1 — 2026-08-12 — clearer presentation previews
+
+- Upgrade the native Presentation runtime to `0.1.0-alpha.8`. Opening-slide composition now follows
+  authored content instead of page position, Chinese headings wrap more predictably, and tighter
+  multilingual density budgets prevent crowded slides from being accepted as final output.
+- Expose structured slide, block, and overflow diagnostics for Desktop without painting raw validation
+  warnings over the presentation itself. HTML preview and editable PPTX export now use the same visible
+  block selection, so duplicate title blocks cannot make one renderer diverge from the other.
+- Strengthen the Presentation specialist contract: each slide has one narrative job, title/claim/evidence/
+  action roles stay distinct, reader-facing content is preferred over internal Artifact or revision
+  terminology, and background detail moves to speaker notes. Upgrade with
+  `npm i -g @nanhara/hara@0.145.1`.
+
 ## 0.145.0 — 2026-08-10 — real-browser verification and bounded autonomous work
 
 - Add the shell-free `open_browser` tool for testing websites in the user's real system browser with

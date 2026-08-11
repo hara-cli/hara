@@ -24,8 +24,15 @@ registerTool({
     + "that materially change the result, then create an editable draft early and offer its exact Artifact revision "
     + "to Hara Desktop's right work surface. The offer is not proof that a Desktop loaded or displayed it; only the "
     + "Desktop host may report that UI state. "
-    + "Give every slide one evidence-backed claim and takeaway title, unique slide/block ids, and usually 2–5 visible "
-    + "top-level blocks (never more than six); record external sources in notes and never invent evidence. Choose a "
+    + "Give every slide one narrative job, one evidence-backed claim, one short takeaway title, unique slide/block ids, "
+    + "and usually 2–3 visible top-level blocks (normally no more than four and never more than six). Title, claim, "
+    + "evidence, and action must play distinct semantic roles: do not paraphrase the same fact across them, do not add "
+    + "generic heading blocks such as Problem Statement or Key Points, and keep background detail in speaker notes. "
+    + "Target 8–16 Chinese characters or 5–10 English words for a title, 15–32 Chinese characters for a claim, at most "
+    + "four list items, and at most two body blocks on a statement page. Write audience-facing copy only; never expose "
+    + "agent plans, tool results, Artifact/revision/surface state, validation codes, or production scaffolding unless the "
+    + "user explicitly requests a technical deck about those internals. Record external sources in notes and never invent "
+    + "evidence. Choose a "
     + "deliberate layout template independently from the color theme: pitch for a persuasive proposal, report for evidence "
     + "and charts, technical for architecture/process detail, or visual for image-led storytelling. Vary the content "
     + "composition: statement, data, process, visual, split, or editorial pages must not repeat one default card grid. Use "
@@ -115,18 +122,23 @@ registerTool({
                 claim: {
                   type: "string",
                   minLength: 1,
-                  description: "The evidence-backed assertion this slide proves",
+                  description:
+                    "The concise evidence-backed assertion this slide proves; add scope or evidence and never restate the title",
                 },
                 takeawayTitle: {
                   type: "string",
                   minLength: 1,
-                  description: "Short conclusion shown as the slide title",
+                  description:
+                    "Audience-facing conclusion shown as the slide title; target 8–16 Chinese characters or 5–10 English words",
                 },
-                notes: { type: "string", description: "Optional speaker notes" },
+                notes: {
+                  type: "string",
+                  description: "Optional speaker notes for sources, background, caveats, and details that should not crowd the slide",
+                },
                 blocks: {
                   type: "array",
                   minItems: 1,
-                  maxItems: 7,
+                  maxItems: 6,
                   items: {
                     type: "object",
                     additionalProperties: true,
