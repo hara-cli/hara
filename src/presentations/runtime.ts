@@ -399,6 +399,7 @@ export async function exportPresentationArtifact(
     warnings,
     validatorId: PRESENTATION_VALIDATOR_ID,
     validatorVersion: PRESENTATION_VALIDATOR_VERSION,
+    allowRevisionSourceCopy: input.format === "json",
   });
 }
 

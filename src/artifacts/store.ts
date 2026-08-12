@@ -188,6 +188,8 @@ export interface ArtifactConvertedExportInput extends ArtifactExportInput {
   warnings?: ArtifactExportWarning[];
   validatorId: string;
   validatorVersion: string;
+  /** Allow a JSON source copy when this exact revision has only advisory findings. */
+  allowRevisionSourceCopy?: boolean;
 }
 
 export interface ArtifactPreparedValidationInput {
@@ -1938,10 +1940,13 @@ export function exportArtifactConverted(
   }
   const report = readValidationReport(artifact, validationReportId);
   const { content } = readRevisionDetails(artifact, revisionId, false);
+  const revisionSourceCopyAuthorized = input.allowRevisionSourceCopy === true
+    && input.format === "json"
+    && report.status === "revise";
   if (
     report.revisionId !== revisionId
     || report.snapshotDigest !== content.sha256
-    || report.status !== "pass"
+    || (report.status !== "pass" && !revisionSourceCopyAuthorized)
     || report.validatorId !== input.validatorId
     || report.validatorVersion !== input.validatorVersion
   ) throw storeError("ARTIFACT_INVALID_INPUT", "the ValidationReport does not authorize this exact revision");
@@ -1976,7 +1981,15 @@ export function exportArtifactConverted(
       byteSize: bytes.byteLength,
       sha256: outputSha256,
     },
-    warnings: [...warnings, ...written.warnings],
+    warnings: [
+      ...(revisionSourceCopyAuthorized ? [{
+        code: "SOURCE_COPY_NEEDS_REVISION",
+        severity: "warning" as const,
+        message: "This recoverable JSON source copy preserves a revision that still has advisory validation findings.",
+      }] : []),
+      ...warnings,
+      ...written.warnings,
+    ],
   };
   try {
     writePrivateStateBytesOnceSync(

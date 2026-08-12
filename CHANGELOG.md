@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.146.1 — 2026-08-12 — recoverable presentation source exports
+
+- Keep JSON as the recoverable source-copy path when an Agent-created presentation has advisory
+  narrative findings. The receipt remains bound to the exact revision, digest, and Presentation
+  validator and records that the copy still needs revision; blocked/invalid content and all delivery
+  formats (PDF, HTML, and PPTX) retain the strict passing-validation requirement. Upgrade with
+  `npm i -g @nanhara/hara@0.146.1`.
+
 ## 0.146.0 — 2026-08-12 — native Responses, verified PDF, and Windows recovery
 
 - Use DeepSeek's native, stateless Responses API for the officially supported `deepseek-v4-flash`

@@ -214,6 +214,30 @@ test("agent-authored narrative warnings require revision before export", async (
     assert.equal(report.status, "revise");
     assert.ok(report.findings.some((finding) => finding.code === "PRESENTATION_NARRATIVE_DUPLICATE_MESSAGE"));
     assert.ok(report.findings.some((finding) => finding.code === "PRESENTATION_NARRATIVE_GENERIC_HEADING"));
+
+    const sourcePath = join(home, "repeated-deck.json");
+    const sourceReceipt = await exportPresentationArtifact(home, {
+      artifactId: created.artifact.artifactId,
+      revisionId: created.currentRevision.revisionId,
+      validationReportId: report.reportId,
+      destinationPath: sourcePath,
+      format: "json",
+    });
+    assert.equal(sourceReceipt.format, "json");
+    assert.ok(sourceReceipt.warnings.some((warning) => warning.code === "SOURCE_COPY_NEEDS_REVISION"));
+    assert.equal(JSON.parse(await readFile(sourcePath, "utf8")).title, "Repeated deck");
+
+    await assert.rejects(
+      exportPresentationArtifact(home, {
+        artifactId: created.artifact.artifactId,
+        revisionId: created.currentRevision.revisionId,
+        validationReportId: report.reportId,
+        destinationPath: join(home, "repeated-deck.pptx"),
+        format: "pptx",
+      }),
+      /does not authorize this exact revision/,
+      "advisory findings may preserve JSON source but must still block delivery formats",
+    );
   });
 });
 
