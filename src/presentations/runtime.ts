@@ -9,6 +9,8 @@ import {
   type PresentationImportWarning,
   type PresentationProject,
 } from "@nanhara/hara-presentation";
+import { renderPresentationPdf } from "./pdf.js";
+import { analyzePresentationNarrative } from "./quality.js";
 import {
   ArtifactStoreError,
   commitArtifactBytes,
@@ -30,7 +32,7 @@ import {
 
 export const PRESENTATION_ARTIFACT_EXTENSION = ".hpres";
 export const PRESENTATION_VALIDATOR_ID = "hara.office.presentation";
-export const PRESENTATION_VALIDATOR_VERSION = "1.1.0";
+export const PRESENTATION_VALIDATOR_VERSION = "1.2.0";
 const PRESENTATION_SOURCE_EXTENSIONS = [".hpres", ".json", ".md", ".markdown"] as const;
 
 export interface PresentationArtifactDetails extends ArtifactDetails {
@@ -96,7 +98,6 @@ function starterProject(title: string): Readonly<PresentationProject> {
         claim: "A clear point of view makes the presentation useful.",
         takeawayTitle: title,
         blocks: [
-          { id: "slide-1-heading", type: "heading", literal: title },
           {
             id: "slide-1-callout",
             type: "callout",
@@ -283,11 +284,17 @@ export function validatePresentationArtifact(
   assertPresentationContent(source);
   let findings: ArtifactValidationReport["findings"];
   try {
-    parsePresentationProject(source.bytes);
-    findings = [{
+    const project = parsePresentationProject(source.bytes);
+    // The deterministic narrative gate enforces the specialist Agent's authoring contract. User-authored
+    // and imported decks still receive structural/layout validation, but are not blocked by Hara's house
+    // style merely because their intentional copy or composition differs.
+    const narrativeFindings = source.artifact.origin === "agent-created"
+      ? analyzePresentationNarrative(project)
+      : [];
+    findings = [...narrativeFindings, {
       code: "PRESENTATION_VALIDATED",
       severity: "info",
-      message: "PresentationProject structure, layout-density gate, immutable content digest, and safe block contract match this revision.",
+      message: "PresentationProject structure, layout-density gate, narrative-quality gate, immutable content digest, and safe block contract match this revision.",
     }];
   } catch (error) {
     findings = validationFindings(error);
@@ -324,7 +331,7 @@ export async function exportPresentationArtifact(
     revisionId: string;
     validationReportId: string;
     destinationPath: string;
-    format: "json" | "html" | "pptx";
+    format: "json" | "html" | "pdf" | "pptx";
   },
 ): Promise<ArtifactExportReceipt> {
   const source = readArtifactRevisionContent(home, {
@@ -350,6 +357,28 @@ export async function exportPresentationArtifact(
       code: "PDF_VIA_BROWSER_PRINT",
       severity: "warning",
       message: "Open this HTML presenter in a browser and use Print / Save as PDF for a font-aware PDF.",
+    }];
+  } else if (input.format === "pdf") {
+    let rendered;
+    try {
+      rendered = await renderPresentationPdf(
+        renderPresentationHtml(project),
+        project.slides.length,
+      );
+    } catch (error) {
+      throw runtimeError(
+        "ARTIFACT_EXPORT_FAILED",
+        `Presentation PDF export failed: ${safeMessage(error)}`,
+        error,
+      );
+    }
+    bytes = rendered.bytes;
+    mediaType = rendered.mediaType;
+    fidelity = rendered.fidelity;
+    warnings = [{
+      code: "PDF_LOCAL_BROWSER_RENDERER",
+      severity: "warning",
+      message: `PDF was rendered from the exact self-contained presenter in a local Chromium browser and verified at ${rendered.pageCount} page(s).`,
     }];
   } else {
     const rendered = await renderPresentationPptx(project);

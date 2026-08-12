@@ -44,8 +44,8 @@ registerTool({
     + "the right surface is open or visible until the Desktop host reports the exact revision as active. Ordinary PPT work "
     + "must not configure or invoke a separate vision "
     + "helper; image-based review is optional and only for an explicit request with a natively image-capable main model. "
-    + "Import accepts controlled Slidev Markdown or Hara presentation JSON. Export supports editable PPTX, self-contained "
-    + "HTML (also browser Print/Save PDF), and canonical JSON.",
+    + "Import accepts controlled Slidev Markdown or Hara presentation JSON. Export supports editable PPTX, direct verified "
+    + "PDF, self-contained HTML, and canonical JSON.",
   input_schema: {
     type: "object",
     properties: {
@@ -186,7 +186,7 @@ registerTool({
         type: "string",
         description: "Absolute create-only destination path with the selected format extension",
       },
-      format: { type: "string", enum: ["json", "html", "pptx"] },
+      format: { type: "string", enum: ["json", "html", "pdf", "pptx"] },
     },
     required: ["action"],
   },
@@ -363,7 +363,7 @@ registerTool({
             typeof input.artifact_id !== "string"
             || typeof input.revision_id !== "string"
             || typeof input.destination_path !== "string"
-            || (input.format !== "json" && input.format !== "html" && input.format !== "pptx")
+            || (input.format !== "json" && input.format !== "html" && input.format !== "pdf" && input.format !== "pptx")
           ) {
             return "Error: presentation export requires artifact_id, revision_id, destination_path, and format.";
           }

@@ -22,7 +22,7 @@ function makeDemoPlugin(name) {
   mkdirSync(join(root, ".hara-plugin"), { recursive: true });
   writeFileSync(
     join(root, ".hara-plugin", "plugin.json"),
-    JSON.stringify({ name, version: "1.2.3", description: "demo", skills: ["skills"], agents: ["agents"], mcpServers: { demoSrv: { command: "echo", args: ["hi"] } } }),
+    JSON.stringify({ name, version: "1.2.3", description: "demo", skills: ["skills"], agents: ["agents"], mcpServers: { demoSrv: { command: "echo", args: ["hi"], description: "demo capability" } } }),
   );
   mkdirSync(join(root, "skills", "demo-skill"), { recursive: true });
   writeFileSync(join(root, "skills", "demo-skill", "SKILL.md"), "---\nname: demo-skill\ndescription: a plugin skill\n---\n\nbody");
@@ -109,6 +109,7 @@ test("plugin install → skills/roles/mcp auto-contribute; disable hides them; u
     assert.ok(pluginRoleDirs().some((d) => d.includes(pname)), "plugin role dir contributed");
     assert.ok(loadRoles(process.cwd()).some((r) => r.id === "demo-role"), "plugin role loaded");
     assert.ok(pluginMcpServers().demoSrv, "plugin mcp server contributed");
+    assert.equal(pluginMcpServers().demoSrv.description, "demo capability");
 
     setPluginEnabled(pname, false); // disable
     assert.ok(!pluginSkillDirs().some((d) => d.includes(pname)), "disabled plugin contributes nothing");

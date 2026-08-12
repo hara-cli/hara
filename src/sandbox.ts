@@ -23,7 +23,9 @@ export type SandboxMode = "off" | "workspace-write" | "read-only";
 
 // Windows shell resolution. hara (and the model) speak POSIX shell — the agent writes `ls`, `grep`,
 // `cat`, pipes, `&&`. So on Windows we PREFER a real bash (Git Bash or WSL, which most Windows devs
-// have) and only fall back to cmd.exe when none is found. Memoized: the PATH probe runs at most once.
+// have) and only fall back to cmd.exe when none is found. Discovery is memoized only after a candidate has
+// proved it can execute a minimal POSIX command; a broken WSL app alias must not become a process-lifetime
+// single point of failure.
 let _winBash: string | null | undefined;
 /** Conventional Git-for-Windows installations are not always added to PATH (the installer makes that
  *  an explicit choice). Keep candidate construction pure so non-Windows CI can cover it. */
@@ -47,17 +49,53 @@ export function firstInstalledWindowsBash(
   }) ?? null;
 }
 
-function findWindowsBash(): string | null {
+export function firstHealthyWindowsBash(
+  candidates: readonly string[],
+  probe: (path: string) => boolean,
+): string | null {
+  for (const path of candidates) {
+    try {
+      if (probe(path)) return path;
+    } catch {
+      /* a failed candidate must not prevent checking Git Bash or another healthy entry */
+    }
+  }
+  return null;
+}
+
+function windowsBashWorks(path: string): boolean {
+  const check = spawnSync(path, ["-c", "exit 0"], {
+    encoding: "utf8",
+    timeout: 3000,
+    windowsHide: true,
+    env: toolSubprocessEnv(),
+  });
+  return check.status === 0 && !check.error;
+}
+
+function findWindowsBash(refresh = false): string | null {
+  if (refresh) _winBash = undefined;
   if (_winBash !== undefined) return _winBash;
   // `where bash` finds Git Bash / WSL bash on PATH; also probe the default Git-for-Windows location.
   // `timeout` is CRITICAL: this is a SYNCHRONOUS probe on the main thread — without it a slow `where`
   // (a huge PATH, a dead network drive on PATH) hangs hara at startup with nothing able to interrupt it.
   const onPath = spawnSync("where", ["bash"], { encoding: "utf8", timeout: 3000 });
-  const hit = onPath.status === 0 ? String(onPath.stdout).split(/\r?\n/).find((l) => l.trim()) : "";
-  _winBash = (hit && hit.trim()) || firstInstalledWindowsBash(windowsBashCandidates(), (path) => (
-    existsSync(path) && statSync(path).isFile()
-  ));
+  const onPathCandidates = onPath.status === 0
+    ? String(onPath.stdout).split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    : [];
+  const conventional = windowsBashCandidates().filter((path) => {
+    try { return existsSync(path) && statSync(path).isFile(); } catch { return false; }
+  });
+  const candidates = [...new Set([...onPathCandidates, ...conventional])];
+  _winBash = firstHealthyWindowsBash(candidates, windowsBashWorks);
   return _winBash;
+}
+
+/** A cached Windows bash can disappear or become unhealthy after startup (for example WSL is shut down).
+ * Re-probe once for a different healthy candidate; callers decide whether replaying their command is safe. */
+function refreshWindowsBashAfterFailure(failed: string): string | null {
+  if (_winBash !== failed) return _winBash ?? null;
+  return findWindowsBash(true);
 }
 
 /** Pure shell-argv resolution — split out so the platform branching is unit-testable without spawning.
@@ -144,6 +182,26 @@ export interface ShellOpts {
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
 }
 
+interface ShellLaunch {
+  cmd: string;
+  args: string[];
+  windowsBash?: string;
+}
+
+function shellLaunch(command: string, cwd: string, mode: SandboxMode): ShellLaunch {
+  const argv = shellCommand(command, cwd, mode);
+  return {
+    ...argv,
+    ...(platform() === "win32" && /(?:^|[\\/])bash\.exe$/i.test(argv.cmd)
+      ? { windowsBash: argv.cmd }
+      : {}),
+  };
+}
+
+function windowsBashLaunchFailure(error: NodeJS.ErrnoException): boolean {
+  return ["ENOENT", "EACCES", "ENOEXEC", "UNKNOWN"].includes(String(error.code ?? ""));
+}
+
 /**
  * Run a shell command, sandboxed when mode != off and the platform supports it.
  * Streams output via `opts.onData` while capturing it for the resolved value.
@@ -182,8 +240,8 @@ function maybeWarnWindowsShell(): void {
   if (warnedWinShell || findWindowsBash()) return;
   warnedWinShell = true;
   process.stderr.write(
-    "hara: no bash found on PATH — shell commands run under cmd.exe, where most Unix commands (ls, grep, cat) fail.\n" +
-      "      Install Git for Windows (bundles bash) or run hara inside WSL for full command support.\n",
+    "hara: no healthy bash found — shell commands run under native cmd.exe; Unix commands (ls, grep, cat) may fail.\n" +
+      "      Windows-native commands (PowerShell, cmd, py, node) remain available; repair Git Bash/WSL for POSIX commands.\n",
   );
 }
 
@@ -197,9 +255,8 @@ export function maybeWarnUnsandboxed(mode: SandboxMode): void {
 
 export function runShell(command: string, cwd: string, mode: SandboxMode, opts: ShellOpts): Promise<{ stdout: string; stderr: string }> {
   if (opts.signal?.aborted) return Promise.reject(new Error("interrupted before command start"));
-  const { cmd, args } = shellCommand(command, cwd, mode);
-
-  return new Promise((resolve, reject) => {
+  const execute = (launch: ShellLaunch, canRetryWindowsBash: boolean): Promise<{ stdout: string; stderr: string }> => new Promise((resolve, reject) => {
+    const { cmd, args } = launch;
     // Non-interactive by contract: there is no terminal to answer a credential prompt, so a git
     // https op against a private repo would otherwise sit silently until the timeout (observed as
     // "git hangs 5 minutes"). With prompts disabled it fails in seconds with a real auth error.
@@ -313,7 +370,26 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
       if (receivedBytes <= opts.maxBuffer) opts.onData?.(s, "stderr");
       checkOverflow();
     });
-    child.on("error", (e) => {
+    child.on("error", (e: NodeJS.ErrnoException) => {
+      if (canRetryWindowsBash && launch.windowsBash && windowsBashLaunchFailure(e)) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        opts.signal?.removeEventListener("abort", abortRun);
+        cancelTermination?.();
+        const replacement = refreshWindowsBashAfterFailure(launch.windowsBash);
+        if (replacement && replacement !== launch.windowsBash) {
+          execute(
+            { cmd: replacement, args: ["-c", command], windowsBash: replacement },
+            false,
+          ).then(resolve, reject);
+          return;
+        }
+        // `error` means the shell process never started, so the command has not run and a single native
+        // retry is safe. Do not do this for a non-zero shell exit: that command may already have effects.
+        execute(resolveShellArgv(command, "win32", null), false).then(resolve, reject);
+        return;
+      }
       settle(null, e);
     });
     child.on("close", (code) => {
@@ -325,4 +401,5 @@ export function runShell(command: string, cwd: string, mode: SandboxMode, opts: 
       settle(code);
     });
   });
+  return execute(shellLaunch(command, cwd, mode), true);
 }

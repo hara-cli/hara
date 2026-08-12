@@ -30,6 +30,21 @@ const BY_WIRE: Record<WireApi, PlatformCaps> = {
   anthropic: { wireApi: "anthropic", reasoning: "thinking_budget", cache: "cache_control" },
 };
 
+function isOfficialDeepSeekEndpoint(providerId?: string, baseURL?: string): boolean {
+  if (baseURL) return /api\.deepseek\.com/i.test(baseURL);
+  return providerId === "deepseek";
+}
+
+function isDeepSeekFlashResponses(
+  providerId?: string,
+  baseURL?: string,
+  modelId?: string,
+): boolean {
+  return isOfficialDeepSeekEndpoint(providerId, baseURL)
+    && !/\/anthropic\/?($|\?)/i.test(baseURL ?? "")
+    && /^deepseek-v4-flash$/i.test(modelId ?? "");
+}
+
 /** Endpoint-shape rules, matched against the baseURL. FIRST match wins — most specific first. This is what
  *  makes a *custom* profile (e.g. `custom:qwen3.7-plus` pointing at coding.dashscope) resolve correctly
  *  without the user declaring a provider id: the DashScope host implies chat + enable_thinking. */
@@ -46,8 +61,8 @@ const BY_BASEURL: { test: RegExp; caps: PlatformCaps }[] = [
   // GLM, MiniMax, Aliyun apps/anthropic … all expose `.../anthropic` with thinking + explicit cache. One
   // row covers the whole ecosystem — talk to it with the anthropic transport.
   { test: /\/anthropic\/?($|\?)/i, caps: { wireApi: "anthropic", reasoning: "thinking_budget", cache: "cache_control" } },
-  // DeepSeek OpenAI-compatible (chat): DeepSeek V4 (v4-pro/v4-flash) exposes a per-request thinking switch
-  // (`thinking: {type}`) + `reasoning_effort` (high|max) on this path — the `deepseek` style sends both.
+  // DeepSeek OpenAI-compatible Chat fallback. `resolvePlatform` upgrades only the officially supported
+  // deepseek-v4-flash model to Responses; V4 Pro and legacy ids continue through Chat.
   { test: /api\.deepseek\.com/i, caps: { wireApi: "chat", reasoning: "deepseek", cache: "auto" } },
 ];
 
@@ -74,6 +89,7 @@ export function resolvePlatform(
   wireApiOverride?: WireApi,
   modelId?: string,
 ): PlatformCaps {
+  const deepSeekResponses = isDeepSeekFlashResponses(providerId, baseURL, modelId);
   // baseURL shape is the strongest signal for a custom profile; else the provider-id override; else chat.
   const byUrl = baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
   const managedDeepSeekGateway =
@@ -82,12 +98,19 @@ export function resolvePlatform(
   const byProv = managedDeepSeekGateway
     ? { ...BY_PROVIDER["hara-gateway"], reasoning: "deepseek" as const }
     : providerId ? BY_PROVIDER[providerId] : undefined;
-  const resolved: PlatformCaps = byUrl ?? { ...BY_WIRE.chat, ...(byProv ?? {}) };
+  const resolved: PlatformCaps = deepSeekResponses
+    ? { wireApi: "responses", reasoning: "deepseek_responses", cache: "auto" }
+    : byUrl ?? { ...BY_WIRE.chat, ...(byProv ?? {}) };
   // An explicit wireApi from config wins the transport. When it changes the wire, the reasoning style
   // follows that wire's default (reasoning is wire-dependent — reasoning_effort on chat vs reasoning_object
   // on responses); cache is kept from the resolved row (it tracks the endpoint, not the wire).
   if (wireApiOverride && wireApiOverride !== resolved.wireApi) {
-    return { ...resolved, wireApi: wireApiOverride, reasoning: BY_WIRE[wireApiOverride].reasoning };
+    const reasoning = wireApiOverride === "responses" && deepSeekResponses
+      ? "deepseek_responses"
+      : wireApiOverride === "chat" && isOfficialDeepSeekEndpoint(providerId, baseURL)
+        ? "deepseek"
+        : BY_WIRE[wireApiOverride].reasoning;
+    return { ...resolved, wireApi: wireApiOverride, reasoning };
   }
   return resolved;
 }

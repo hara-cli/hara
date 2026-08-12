@@ -11,6 +11,7 @@ test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSe
   assert.deepEqual(levelsFor("reasoning_effort"), ["off", "low", "medium", "high"]);
   assert.deepEqual(levelsFor("thinking_budget"), ["off", "low", "medium", "high"]);
   assert.deepEqual(levelsFor("deepseek"), ["off", "high", "max"]);
+  assert.deepEqual(levelsFor("deepseek_responses"), ["off", "low", "high", "max"]);
   assert.deepEqual(levelsFor("none"), []);
   assert.deepEqual(levelsFor("enable_thinking", "qwen3-coder-next"), [], "model-level capability overrides the shared endpoint");
   assert.deepEqual(levelsFor("enable_thinking", "qwen3-coder-plus"), []);

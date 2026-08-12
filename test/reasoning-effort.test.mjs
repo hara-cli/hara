@@ -64,7 +64,7 @@ test("openai: models that don't accept the reasoning_effort param return false (
 // ── reasoningParams: the OpenAI-compat merge body per style (incl. the new DeepSeek style + max clamp) ──
 
 test("reasoning: unset dial → {} for every style (model default, zero impact)", () => {
-  for (const style of ["reasoning_effort", "reasoning_object", "deepseek", "enable_thinking", "ollama_think", "none"]) {
+  for (const style of ["reasoning_effort", "reasoning_object", "deepseek_responses", "deepseek", "enable_thinking", "ollama_think", "none"]) {
     assert.deepEqual(reasoningParams(style, undefined, "deepseek-v4-pro"), {}, `${style} unset → {}`);
   }
 });
@@ -99,8 +99,10 @@ test("reasoning_object style: max clamps to 'high' too", () => {
 
 // ── resolvePlatform: DeepSeek (by provider id AND by baseURL) resolves to the deepseek style ──
 
-test("registry: deepseek resolves to the 'deepseek' reasoning style (provider id + baseURL)", () => {
+test("registry: DeepSeek without a Flash model stays on Chat; V4 Flash selects Responses", () => {
   assert.equal(resolvePlatform("deepseek").reasoning, "deepseek", "by provider id");
   assert.equal(resolvePlatform(undefined, "https://api.deepseek.com/v1").reasoning, "deepseek", "by baseURL");
   assert.equal(resolvePlatform(undefined, "https://api.deepseek.com/v1").wireApi, "chat");
+  assert.equal(resolvePlatform("deepseek", undefined, undefined, "deepseek-v4-flash").wireApi, "responses");
+  assert.equal(resolvePlatform("deepseek", undefined, undefined, "deepseek-v4-flash").reasoning, "deepseek_responses");
 });

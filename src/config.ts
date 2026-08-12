@@ -32,6 +32,9 @@ export interface McpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  /** Optional bounded, non-secret capability hint shown before the trusted server is launched. This lets
+   * the model select one relevant lazy MCP server without speculatively executing every configured host. */
+  description?: string;
   /** Optional trusted process directory. Plugin-contributed servers bind this to their immutable package root. */
   cwd?: string;
 }
@@ -99,8 +102,8 @@ export interface HaraConfig {
    *   - "low"    → small budget (anthropic budget_tokens, openai reasoning_effort:"low")
    *   - "medium" → balanced (anthropic adaptive, openai reasoning_effort:"medium")
    *   - "high"   → large budget (anthropic budget_tokens up, openai reasoning_effort:"high")
-   *  GLM/DeepSeek-style models put reasoning in the stream and can't be silenced here — "off" just
-   *  means we don't render it (handled at the UI layer). */
+   *  Provider adapters map this to the closest supported control. DeepSeek V4 Flash uses Responses
+   *  for low/high/max; "off" deliberately falls back to Chat with `thinking.disabled`. */
   reasoningEffort: "off" | "low" | "medium" | "high" | "max" | undefined;
   /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
   hooks: HooksConfig;
@@ -130,8 +133,8 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   },
   "qwen-oauth": { model: "coder-model", envKey: "QWEN_OAUTH_TOKEN" },
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
-  // GLM / DeepSeek / OpenRouter are OpenAI-compatible: buildProvider routes them through the
-  // openai path (createOpenAIProvider) using the preset baseURL below. The preset baseURL is
+  // GLM / DeepSeek / OpenRouter expose OpenAI-compatible endpoints. The exact DeepSeek V4 Flash
+  // model is routed through Responses; its other model ids keep using Chat. The preset baseURL is
   // applied by loadConfig (merged.baseURL ?? d.baseURL), so the setup wizard never asks for a URL.
   glm: {
     model: "glm-4.6",
@@ -139,7 +142,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
     envKey: "GLM_API_KEY",
   },
   deepseek: {
-    model: "deepseek-chat",
+    model: "deepseek-v4-flash",
     baseURL: "https://api.deepseek.com",
     envKey: "DEEPSEEK_API_KEY",
   },

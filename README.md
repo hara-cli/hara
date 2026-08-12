@@ -119,6 +119,20 @@ hara config set model    qwen-plus   # or qwen-max, qwen3-coder-plus, …
 > Plan keys (Coding Plan / Token Plan) are licensed **only** for use inside AI coding agents /
 > OpenClaw-type tools like hara — not Dify/n8n, API-testing tools, or direct script/backend calls.
 
+**DeepSeek — native Responses for V4 Flash**
+```bash
+hara config set provider deepseek
+hara config set apiKey   ...
+hara config set model    deepseek-v4-flash   # the built-in default
+```
+On the official `https://api.deepseek.com` endpoint, `deepseek-v4-flash` uses the semantic streaming
+Responses API. Hara resends the complete durable message/tool history on every request because this
+endpoint is stateless: it never depends on `previous_response_id`, `conversation`, or server-side storage.
+`deepseek-v4-pro` stays on the OpenAI-compatible Chat endpoint until DeepSeek documents Responses support
+for it. Explicit custom or legacy ids are not silently remapped; their availability remains provider-side.
+DeepSeek Responses does not accept image/file input, so Hara keeps the existing
+text-only model boundary and uses an explicitly configured image describer when needed.
+
 **Any OpenAI-compatible endpoint** (GLM, Kimi, OpenAI, local servers)
 ```bash
 hara config set provider openai
@@ -179,8 +193,10 @@ describer and `/vision main yes|no|auto` corrects a model's detected capability.
 hara config set reasoningEffort high     # or off / low / medium / max
 ```
 hara expresses it the way each endpoint wants (OpenAI `reasoning_effort`, Anthropic thinking budget,
-DashScope `enable_thinking`, **DeepSeek** V4 `thinking` + `reasoning_effort` where `max` genuinely raises the
-effort). In the TUI, bare `/model` opens a picker — ↑↓ pick a model, **←→ set the thinking level**.
+DashScope `enable_thinking`, **DeepSeek** Chat `thinking` + `reasoning_effort`, or DeepSeek Flash Responses
+`reasoning.effort`). Because DeepSeek Responses does not document an `off` value, choosing `off` for Flash
+uses the Chat endpoint with `thinking.disabled`; Hara never sends an invented enum. In the TUI, bare `/model`
+opens a picker — ↑↓ pick a model, **←→ set the thinking level**.
 
 Config lives in `~/.hara/config.json`; the nearest project `.hara/config.json` may set the explicitly safe
 project preferences `model`, `theme`, `vimMode`, `autoCompact`, and `reasoningEffort`. Repository config is
@@ -342,7 +358,7 @@ commit make owner-only copies under `~/.hara/artifacts`, never change the select
 its absolute path. Relative, linked, protected, macro-enabled, type-confused, empty, and oversized inputs fail
 closed. The runtime does **not** yet render, format-edit, export, or execute imported content; those operations
 require matching reviewed Office capabilities and validation/export receipts.
-**MCP**: add an `mcpServers` map to global config (a reviewed project config additionally needs `HARA_TRUST_PROJECT_CONFIG=1` at launch). Hara starts with every configured server stopped and exposes only `mcp_connect`; when the current task first needs one server, the agent requests permission to connect that server and its tools appear on the next round as `mcp__<server>__<tool>`. Unrelated servers remain stopped. Configured MCP servers, like `external_agent`, are trusted host extensions outside Hara's protected-file boundary. Every interactive external-tool call requires confirmation (even in `full-auto`), and non-interactive runs disable them by default; reviewed automation can explicitly opt in before launch with `HARA_ALLOW_TRUSTED_EXTENSIONS=1`. hara can also **be** an MCP server — `hara mcp` exposes its read/search tools (esp. **`codebase_search`**) over stdio so other clients (Claude Desktop, Cursor, another hara) can use them; read-only by default (`HARA_MCP_TOOLS` to override).
+**MCP**: add an `mcpServers` map to global config (a reviewed project config additionally needs `HARA_TRUST_PROJECT_CONFIG=1` at launch). Each entry may include a short non-secret `description` (for example, `"Bilibili fan queue status updates"`) so the model can select the right server while it is still stopped. Hara starts with every configured server stopped and exposes only `mcp_connect`; when the current task first needs one server, the agent requests permission to connect that server and its tools appear on the next round as `mcp__<server>__<tool>`. Unrelated servers remain stopped. Configured MCP servers, like `external_agent`, are trusted host extensions outside Hara's protected-file boundary. Every interactive external-tool call requires confirmation (even in `full-auto`), and non-interactive runs disable them by default; reviewed automation can explicitly opt in before launch with `HARA_ALLOW_TRUSTED_EXTENSIONS=1`. hara can also **be** an MCP server — `hara mcp` exposes its read/search tools (esp. **`codebase_search`**) over stdio so other clients (Claude Desktop, Cursor, another hara) can use them; read-only by default (`HARA_MCP_TOOLS` to override).
 **Vim mode**: `hara config set vimMode true` makes the prompt modal — Esc → normal, `i/a/A/I` insert, `h l 0 $ w b e` motions, `x D C dd cw p` edits. Off by default.
 **Scheduled tasks**: `hara cron add "0 9 * * 1-5" "<task>"` (or `"every 30m"`, `"in 2h"`) runs a task on a schedule — each run is a fresh hara session. `hara cron install` wires a per-minute tick into calendar-minute launchd events on macOS or crontab on Linux (no daemon); `--org` routes through the role org. macOS users upgrading from Hara 0.134.1 or older should run `hara cron install` once to replace the old coalescible `StartInterval` LaunchAgent; jobs and run history are preserved. Manage with `hara cron list/run/enable/disable/remove/logs`. Every job has a 30-minute deadline and the whole sequential tick has a non-renewable 60-minute watchdog: a job timeout kills its process tree, records `timed out` + duration/error, then continues with the next due job; a tick timeout stops the remainder and releases the global lock. Add `--deliver feishu:<chatId>` (or Telegram/WeChat/webhook) for outcomes. `--deliver-mode always` preserves the existing every-run heartbeat, `on-output` sends only when redacted stdout is non-empty, and `on-error` sends only failed runs; `--alert-after N` remains independent and still raises the consecutive-failure 🚨 threshold alarm (default 3). Delivery intent is durable before transport, uses a stable idempotency key, and retries with bounded backoff on later ticks until confirmed. A failed channel cannot grow `jobs.json` forever: each job keeps at most 64 pending effects, reserves outcome/alert room before launch, and disables itself with a visible backlog error when full; restore delivery, let the queue drain, then re-enable it. Tune milliseconds with `HARA_CRON_JOB_TIMEOUT_MS` (hard max 24h) and `HARA_CRON_TICK_TIMEOUT_MS` (hard max 5h); scheduled jobs are also capped by the tick. After upgrading from a version whose tick is already stuck, terminate that specific legacy `hara cron tick` process tree once (or reboot); the next scheduler minute marks over-age state interrupted/disabled and recovers the lock without replaying a possibly orphaned task.
 **Work coordination**: `todo_write` is the agent's short, session-scoped checklist; it persists with that

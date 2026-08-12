@@ -1,0 +1,319 @@
+import OpenAI from "openai";
+import { imageToBase64 } from "../images.js";
+import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
+import { assembleToolCalls } from "./openai.js";
+import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
+import type { NeutralMsg, Provider, ToolUse, TurnArgs, TurnResult } from "./types.js";
+
+const TEXT_ONLY_IMAGE_NOTE = "[Image attachment omitted: this Responses endpoint accepts text only.]";
+
+/** Build a complete, provider-neutral history for a stateless Responses endpoint. DeepSeek does not
+ * support previous_response_id/conversation/store, so every turn deliberately replays all message,
+ * function_call, and function_call_output items. */
+export function toResponsesInput(
+  history: NeutralMsg[],
+  supportsImages = true,
+): any[] {
+  const input: any[] = [];
+  for (const message of history) {
+    if (message.role === "user") {
+      if (!message.images?.length) {
+        input.push({ role: "user", content: message.content });
+        continue;
+      }
+
+      if (!supportsImages) {
+        const description = message.imageDescription?.trim();
+        input.push({
+          role: "user",
+          // Persistent clients normally append this description to `content` before the neutral message is
+          // recorded. Include it here only when an older/custom caller supplied the structured field without
+          // doing so, so a stateless Responses replay never silently drops the already-paid-for image context.
+          content: [message.content, ...(
+            description && !message.content.includes(description)
+              ? [`[Attached image description]\n${description}`]
+              : description
+                ? []
+                : [TEXT_ONLY_IMAGE_NOTE]
+          )]
+            .filter(Boolean)
+            .join("\n\n"),
+        });
+        continue;
+      }
+
+      const parts: any[] = [];
+      if (message.content) parts.push({ type: "input_text", text: message.content });
+      for (const image of message.images) {
+        const data = imageToBase64(image.path);
+        if (data) {
+          parts.push({
+            type: "input_image",
+            image_url: `data:${image.mediaType};base64,${data}`,
+            detail: "auto",
+          });
+        }
+      }
+      input.push({ role: "user", content: parts.length ? parts : message.content });
+      continue;
+    }
+
+    if (message.role === "assistant") {
+      if (message.text.trim()) input.push({ role: "assistant", content: message.text });
+      for (const toolUse of message.toolUses) {
+        input.push({
+          type: "function_call",
+          call_id: toolUse.id,
+          name: toolUse.name,
+          arguments: JSON.stringify(toolUse.input ?? {}),
+        });
+      }
+      continue;
+    }
+
+    for (const result of message.results) {
+      input.push({
+        type: "function_call_output",
+        call_id: result.id,
+        output: result.isError ? `ERROR: ${result.content}` : result.content,
+      });
+    }
+  }
+  return input;
+}
+
+type PendingFunctionCall = {
+  key: string;
+  index: number;
+  id: string;
+  name: string;
+  args: string;
+};
+
+function itemKey(event: any, item?: any): string {
+  return String(event?.item_id ?? item?.id ?? `output:${event?.output_index ?? 0}`);
+}
+
+function incompleteReason(response: any): string {
+  const reason = response?.incomplete_details?.reason;
+  return reason
+    ? `Responses generation was incomplete (${reason}). Increase the output allowance or ask the model to split large edits into smaller tool calls.`
+    : "Responses generation was incomplete. Ask the model to split large edits into smaller tool calls and retry.";
+}
+
+/** OpenAI Responses transport. It intentionally uses neither response ids nor server-side storage: this
+ * keeps the same durable-history semantics across OpenAI-compatible providers and is required by
+ * DeepSeek's stateless Responses implementation. */
+export function createResponsesProvider(opts: {
+  apiKey: string;
+  model: string;
+  baseURL?: string;
+  label?: string;
+  reasoningEffort?: "off" | "low" | "medium" | "high" | "max";
+  reasoningStyle?: ReasoningStyle;
+  supportsImages?: boolean;
+  omitAuthorization?: boolean;
+  fetch?: typeof fetch;
+}): Provider {
+  const client = new OpenAI({
+    apiKey: opts.apiKey,
+    maxRetries: 4,
+    ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
+    ...(opts.omitAuthorization ? { defaultHeaders: { Authorization: null } } : {}),
+    ...(opts.fetch ? { fetch: opts.fetch } : {}),
+  });
+
+  return {
+    id: opts.label ?? "openai",
+    model: opts.model,
+    async turn({ system, history, tools, onText, onReasoning, onActivity, signal }: TurnArgs): Promise<TurnResult> {
+      const responseTools = tools.map((tool) => ({
+        type: "function" as const,
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.input_schema,
+      }));
+      const params: any = {
+        model: opts.model,
+        instructions: system,
+        input: toResponsesInput(history, opts.supportsImages !== false),
+        max_output_tokens: 32000,
+        stream: true,
+      };
+      if (responseTools.length) params.tools = responseTools;
+      Object.assign(
+        params,
+        reasoningParams(opts.reasoningStyle ?? "reasoning_object", opts.reasoningEffort, opts.model),
+      );
+
+      let text = "";
+      let usage = { input: 0, output: 0 };
+      let terminal: "completed" | "incomplete" | "failed" | undefined;
+      let terminalResponse: any;
+      let streamFailure: string | undefined;
+      const calls = new Map<string, PendingFunctionCall>();
+      const textDeltaItems = new Set<string>();
+      const completedTextItems = new Set<string>();
+
+      const acceptText = (value: unknown, key: string) => {
+        if (typeof value !== "string" || !value || completedTextItems.has(key)) return;
+        text += value;
+        onText(value);
+      };
+      const acceptFunctionItem = (event: any, item: any, replaceArgs = false) => {
+        if (!item || item.type !== "function_call") return;
+        const key = itemKey(event, item);
+        const current = calls.get(key) ?? {
+          key,
+          index: Number(event?.output_index ?? calls.size),
+          id: "",
+          name: "",
+          args: "",
+        };
+        if (item.call_id) current.id = String(item.call_id);
+        if (item.name) current.name = String(item.name);
+        if (typeof item.arguments === "string" && (replaceArgs || !current.args)) {
+          current.args = item.arguments;
+        }
+        calls.set(key, current);
+      };
+      const recoverTerminalOutput = (response: any) => {
+        for (const [outputIndex, item] of (response?.output ?? []).entries()) {
+          const event = { item_id: item?.id, output_index: outputIndex };
+          if (item?.type === "function_call") {
+            acceptFunctionItem(event, item, true);
+            continue;
+          }
+          if (item?.type !== "message") continue;
+          const key = itemKey(event, item);
+          if (textDeltaItems.has(key) || completedTextItems.has(key)) continue;
+          for (const part of item.content ?? []) {
+            if (part?.type === "output_text") acceptText(part.text, key);
+          }
+          completedTextItems.add(key);
+        }
+      };
+
+      try {
+        const stream = await client.responses.create(params, { signal });
+        for await (const event of stream as any) {
+          onActivity?.();
+          switch (event?.type) {
+            case "response.output_text.delta": {
+              const key = itemKey(event);
+              textDeltaItems.add(key);
+              acceptText(event.delta, key);
+              break;
+            }
+            case "response.output_text.done": {
+              const key = itemKey(event);
+              if (!textDeltaItems.has(key)) acceptText(event.text, key);
+              completedTextItems.add(key);
+              break;
+            }
+            case "response.reasoning_text.delta":
+            case "response.reasoning_summary_text.delta":
+              if (opts.reasoningEffort !== "off" && typeof event.delta === "string") {
+                onReasoning?.(event.delta);
+              }
+              break;
+            case "response.output_item.added":
+              acceptFunctionItem(event, event.item);
+              break;
+            case "response.function_call_arguments.delta": {
+              const key = itemKey(event);
+              const current = calls.get(key) ?? {
+                key,
+                index: Number(event.output_index ?? calls.size),
+                id: "",
+                name: "",
+                args: "",
+              };
+              if (typeof event.delta === "string") current.args += event.delta;
+              calls.set(key, current);
+              break;
+            }
+            case "response.function_call_arguments.done": {
+              const key = itemKey(event);
+              const current = calls.get(key) ?? {
+                key,
+                index: Number(event.output_index ?? calls.size),
+                id: "",
+                name: "",
+                args: "",
+              };
+              if (typeof event.name === "string") current.name = event.name;
+              if (typeof event.arguments === "string") current.args = event.arguments;
+              calls.set(key, current);
+              break;
+            }
+            case "response.output_item.done":
+              acceptFunctionItem(event, event.item, true);
+              break;
+            case "response.completed":
+              terminal = "completed";
+              terminalResponse = event.response;
+              recoverTerminalOutput(event.response);
+              break;
+            case "response.incomplete":
+              terminal = "incomplete";
+              terminalResponse = event.response;
+              recoverTerminalOutput(event.response);
+              break;
+            case "response.failed":
+              terminal = "failed";
+              terminalResponse = event.response;
+              recoverTerminalOutput(event.response);
+              break;
+            case "error":
+              streamFailure = String(event?.error?.message ?? event?.message ?? "Responses stream failed");
+              break;
+          }
+        }
+      } catch (error: any) {
+        if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
+        const networkFailure = safeModelNetworkFailureMessage(error);
+        return {
+          text: "",
+          toolUses: [],
+          stop: "error",
+          errorMsg: networkFailure ?? `${error?.status ?? ""} ${error?.message ?? error}`.trim(),
+        };
+      }
+
+      if (terminalResponse?.usage) {
+        usage = {
+          input: terminalResponse.usage.input_tokens ?? 0,
+          output: terminalResponse.usage.output_tokens ?? 0,
+        };
+      }
+      if (streamFailure) return { text, toolUses: [], stop: "error", errorMsg: streamFailure, usage };
+      if (!terminal) {
+        return {
+          text,
+          toolUses: [],
+          stop: "error",
+          errorMsg: "Responses stream ended before response.completed/response.incomplete/response.failed.",
+          usage,
+        };
+      }
+      if (terminal === "failed") {
+        const message = terminalResponse?.error?.message ?? "Responses generation failed.";
+        return { text, toolUses: [], stop: "error", errorMsg: String(message), usage };
+      }
+
+      const orderedCalls = [...calls.values()]
+        .sort((a, b) => a.index - b.index)
+        .map(({ id, name, args }) => ({ id, name, args }));
+      const assembled = assembleToolCalls(orderedCalls, terminal === "incomplete" ? "length" : undefined);
+      if (assembled.error) {
+        return { text, toolUses: [], stop: "error", errorMsg: assembled.error, usage };
+      }
+      if (terminal === "incomplete") {
+        return { text, toolUses: [], stop: "error", errorMsg: incompleteReason(terminalResponse), usage };
+      }
+      const stop = assembled.toolUses.length ? "tool_use" : "end";
+      return { text, toolUses: assembled.toolUses as ToolUse[], stop, usage };
+    },
+  };
+}

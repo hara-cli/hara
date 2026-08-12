@@ -5,6 +5,7 @@ import { createModelFetch, userModelFetch } from "../network/model-fetch.js";
 import { getValidQwenAuth } from "./qwen-oauth.js";
 import { createAnthropicProvider } from "./anthropic.js";
 import { createOpenAIProvider } from "./openai.js";
+import { createResponsesProvider } from "./responses.js";
 import { resolvePlatform } from "./registry.js";
 import type { Provider } from "./types.js";
 import type { ProviderTarget } from "./target.js";
@@ -33,24 +34,37 @@ export async function createProviderForTarget(
   // discarded all user credentials at target resolution.
   const transportKey = apiKey ?? (providerIsLocal(provider) ? "hara-local-no-secret" : undefined);
   if (!transportKey) return null;
-  const wire = resolvePlatform(provider, baseURL, undefined, model).wireApi;
+  const caps = resolvePlatform(provider, baseURL, undefined, model);
+  const wire = caps.wireApi;
   if (wire === "anthropic") {
     return createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort, fetch });
   }
   if (wire === "responses") {
-    return {
-      id: provider,
+    // DeepSeek documents no `off` value for Responses reasoning. Preserve the user's explicit choice by
+    // using its Chat endpoint for that one mode, where thinking.disabled is supported. All other Flash
+    // requests use native stateless Responses streaming.
+    if (caps.reasoning === "deepseek_responses" && reasoningEffort === "off") {
+      return createOpenAIProvider({
+        apiKey: transportKey,
+        model,
+        baseURL,
+        label: provider,
+        reasoningEffort,
+        reasoningStyle: "deepseek",
+        fetch,
+      });
+    }
+    return createResponsesProvider({
+      apiKey: transportKey,
       model,
-      async turn() {
-        return {
-          text: "",
-          toolUses: [],
-          stop: "error" as const,
-          errorMsg:
-            "This endpoint uses the OpenAI Responses API, which hara doesn't speak yet. Point hara at an OpenAI-compatible chat endpoint (…/compatible-mode/v1 or …/v1) or an Anthropic-compatible endpoint (…/apps/anthropic).",
-        };
-      },
-    };
+      baseURL,
+      label: provider,
+      reasoningEffort,
+      reasoningStyle: caps.reasoning,
+      supportsImages: caps.reasoning !== "deepseek_responses",
+      omitAuthorization: providerIsLocal(provider),
+      fetch,
+    });
   }
   return createOpenAIProvider({
     apiKey: transportKey,

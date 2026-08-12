@@ -578,17 +578,19 @@ export async function streamFileSlice(
     : null;
   const handle = verified?.handle
     ?? await open(path, constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK"));
-  let stream: ReturnType<typeof handle.createReadStream> | undefined;
   try {
     const info = verified?.info ?? await handle.stat();
     if (!info.isFile()) throw new NonRegularFileError(path);
-    // `end` is an inclusive byte offset. It makes the scan ceiling a true fd-level byte bound (not just
-    // a post-read character counter, which could overshoot badly on multi-byte text or a giant chunk).
-    stream = handle.createReadStream({ encoding: "utf8", highWaterMark: 64 * 1024, autoClose: false, end: maxScan - 1 });
-    for await (const raw of stream) {
-      const chunk = String(raw);
+    // Read positionally from the exact descriptor we validated instead of wrapping that FileHandle in a
+    // ReadStream. Besides making the byte ceiling explicit, this removes the FileHandle/ReadStream ownership
+    // boundary implicated by Windows/Bun EBADF field failures. Those failures were especially visible on
+    // Chinese filenames, but the path itself already reaches Node as Unicode and is not shell-encoded.
+    const decoder = new StringDecoder("utf8");
+    let readBytes = 0;
+    let binarySampledBytes = 0;
+    let reachedEof = false;
+    const consume = (chunk: string): void => {
       if (chunk.length) sawData = true;
-      if (scanned < 4096 && chunk.slice(0, 4096 - scanned).includes("\0")) throw new BinaryFileError(path);
       scanned += chunk.length;
       let at = 0;
       while (at < chunk.length) {
@@ -603,21 +605,40 @@ export async function streamFileSlice(
         at = newline + 1;
         if (hasMore) break;
       }
+    };
+    while (readBytes < maxScan) {
+      const buffer = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, maxScan - readBytes));
+      const result = await handle.read(buffer, 0, buffer.length, readBytes);
+      if (!result.bytesRead) {
+        reachedEof = true;
+        break;
+      }
+      const bytes = buffer.subarray(0, result.bytesRead);
+      if (binarySampledBytes < 4096) {
+        const sample = bytes.subarray(0, Math.min(bytes.length, 4096 - binarySampledBytes));
+        binarySampledBytes += sample.length;
+        if (sample.includes(0)) throw new BinaryFileError(path);
+      }
+      readBytes += result.bytesRead;
+      consume(decoder.write(bytes));
       if (hasMore) {
         stoppedEarly = true;
         break;
       }
     }
-    if (!stoppedEarly && stream.bytesRead >= maxScan) {
+    if (!stoppedEarly && !reachedEof && readBytes >= maxScan) {
       // Re-fstat the same open file description so concurrent growth is also detected. An exact-size file
       // is genuine EOF and should still receive the normal total-line rendering.
       const latest = await handle.stat();
-      if (latest.size > stream.bytesRead) {
+      if (latest.size > readBytes) {
         scanLimited = true;
         stoppedEarly = true;
         if (lineNo >= start && lineNo <= requestedEnd) finishLine(true);
+      } else {
+        reachedEof = true;
       }
     }
+    if (reachedEof) consume(decoder.end());
     if (verified) {
       const latest = await handle.stat();
       verifyOpenedRegularFileSync(path, latest, { action: "read", rejectHardLinks: true, protectSensitive: true });
@@ -630,7 +651,6 @@ export async function streamFileSlice(
       ) throw new Error(`refusing to read ${path}: file changed while reading it`);
     }
   } finally {
-    stream?.destroy();
     await handle.close().catch(() => {});
   }
 

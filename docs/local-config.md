@@ -10,10 +10,15 @@ provider is required; everything else has a sane default.
 ## Required — the LLM provider
 | key | what | example |
 |---|---|---|
-| `provider` | `anthropic` \| `qwen` \| `qwen-oauth` \| `openai` \| `hara-gateway` | `qwen` |
+| `provider` | `anthropic` \| `qwen` \| `qwen-oauth` \| `openai` \| `glm` \| `deepseek` \| `openrouter` \| `ollama` \| `lmstudio` \| `hara-gateway` | `qwen` |
 | `apiKey` | provider key (env fallback per provider, e.g. `ANTHROPIC_API_KEY`) | `sk-…` |
 | `model` | default model | `glm-5` |
 | `baseURL` | OpenAI-compatible base (for qwen/openai) | `https://…/v1` |
+
+The built-in DeepSeek profile defaults to `deepseek-v4-flash` at `https://api.deepseek.com`. That exact
+official model uses native, stateless Responses streaming; V4 Pro keeps the Chat transport, while explicit
+custom or legacy ids are not silently remapped and remain subject to provider-side availability.
+The complete local history is replayed on each Responses call, including function calls and outputs.
 
 ## Optional
 - **Advanced image fallback** (optional compatibility for attached images when the selected main model is text-only):
@@ -22,6 +27,8 @@ provider is required; everything else has a sane default.
 - **Semantic search / vectors** — see below: `embedProvider` (`off` \| `ollama` \| `qwen` \| `openai`) + `embedModel` / `embedBaseURL` / `embedApiKey`.
 - **B-end fleet**: `hara enroll <gateway> --code <code>` → device token in `~/.hara/org.json` (0600); sets `provider=hara-gateway`.
 - **Behavior**: `approval` · `sandbox` · `theme` · `evolve` · `assetCapture` · `computerUse`/`computerApps` · `hooks` · `notify` · `vimMode` · `mcpServers` · `HARA_MAX_CONCURRENCY` (parallel sub-agent/read cap, default 8).
+  An `mcpServers.<name>.description` may provide a short non-secret capability hint so the lazy launcher can
+  choose the relevant reviewed server without starting every configured external process.
 - **Remembered project approvals**: choosing **always for this project** writes an opaque, owner-only grant
   to `~/.hara/project-approvals.json`. Grants bind to the canonical project directory identity and a narrow
   operation scope; the file never stores command text, Python source, file contents, or credentials. Bash is

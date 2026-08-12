@@ -2853,12 +2853,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               || typeof p.revisionId !== "string"
               || typeof p.validationReportId !== "string"
               || typeof p.destinationPath !== "string"
-              || (p.format !== "json" && p.format !== "html" && p.format !== "pptx")
+              || (p.format !== "json" && p.format !== "html" && p.format !== "pdf" && p.format !== "pptx")
             ) {
               return reply(rpcError(
                 id,
                 ERR.PARAMS,
-                "artifactId, revisionId, validationReportId, destinationPath, and format (json, html, or pptx) required",
+                "artifactId, revisionId, validationReportId, destinationPath, and format (json, html, pdf, or pptx) required",
               ));
             }
             try {

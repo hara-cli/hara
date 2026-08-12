@@ -21,13 +21,20 @@ test("streamFileSlice returns a bounded window and a continuation offset without
   }
 });
 
-test("streamFileSlice reaches EOF for an exact total and ignores a trailing phantom line", async () => {
+test("streamFileSlice reaches EOF for exact totals, preserves UTF-8, and ignores a trailing phantom line", async () => {
   const dir = fixture();
   try {
     const path = join(dir, "tail.txt");
     writeFileSync(path, "a\nb\n");
     assert.equal(await streamFileSlice(path, 1, 10), "     1\ta\n     2\tb");
     assert.equal(await streamFileSlice(path, 9, 10), "(file has 2 lines — offset 9 is past the end)");
+
+    const unicode = join(dir, "B站上传工作流.md");
+    writeFileSync(unicode, "第一步🙂\n第二步：同步粉丝队列\n");
+    assert.equal(
+      await streamFileSlice(unicode, 1, 10, { protectSensitive: true }),
+      "     1\t第一步🙂\n     2\t第二步：同步粉丝队列",
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -46,6 +53,22 @@ test("streamFileSlice bounds a giant single line and rejects sampled binary cont
     const binary = join(dir, "binary.dat");
     writeFileSync(binary, Buffer.from([1, 2, 0, 3]));
     await assert.rejects(streamFileSlice(binary), (error) => error instanceof BinaryFileError);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("streamFileSlice keeps a multibyte character intact across its internal 64 KiB read boundary", async () => {
+  const dir = fixture();
+  try {
+    const path = join(dir, "跨块中文.md");
+    // 32,767 × "a\n" = 65,534 bytes. The following "x" occupies byte 65,535, so the first byte of
+    // "界" is the final byte of the first 64 KiB read and its remaining bytes arrive in the next read.
+    writeFileSync(path, `${"a\n".repeat(32_767)}x界\n完成`);
+    const out = await streamFileSlice(path, 32_768, 2);
+    assert.ok(out.includes(" 32768\tx界"), "the split UTF-8 character is decoded as one scalar");
+    assert.ok(!out.includes("�"), "no replacement character is introduced at the chunk boundary");
+    assert.ok(out.includes(" 32769\t完成"));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.146.0 — 2026-08-12 — native Responses, verified PDF, and Windows recovery
+
+- Use DeepSeek's native, stateless Responses API for the officially supported `deepseek-v4-flash`
+  model, including semantic SSE events, streamed reasoning/text, durable function-call replay, bounded
+  incomplete-response failures, and accurate usage. `off` keeps a real non-thinking Chat fallback,
+  while V4 Pro remains on Chat; new DeepSeek setups no longer default to the retired legacy model id.
+- Export native presentations directly to PDF through the same self-contained browser renderer used by
+  Desktop, validate the PDF header/end marker and exact slide count before issuing a receipt, and keep
+  editable PPTX, HTML, and JSON exports intact. Agent-created decks now stop for revision when they
+  repeat titles, claims, generic headings, or one composition instead of presenting template repetition
+  as a finished deck; imported and user-authored decks retain their own editorial choices.
+- Replace the Windows/Bun-sensitive `FileHandle`/`ReadStream` boundary with bounded positional reads on
+  the verified descriptor, preserving UTF-8 across chunk boundaries and fixing reported Chinese-path
+  `read_file` failures. Probe every discovered Windows Bash before caching it, skip broken WSL aliases,
+  retry a launch failure once with a healthy Git Bash, and exercise the contracts under Node and Bun CI.
+- Let reviewed MCP configuration and plugins declare short non-secret capability descriptions so Hara
+  can choose the relevant lazy server without launching unrelated external processes. Approval and
+  trusted-extension boundaries are unchanged. Upgrade with `npm i -g @nanhara/hara@0.146.0`.
+
 ## 0.145.1 — 2026-08-12 — clearer presentation previews
 
 - Upgrade the native Presentation runtime to `0.1.0-alpha.8`. Opening-slide composition now follows

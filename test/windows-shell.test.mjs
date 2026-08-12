@@ -2,7 +2,12 @@
 // (Git Bash / WSL) and fall back to cmd.exe. Pure argv logic, unit-tested without spawning.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { firstInstalledWindowsBash, resolveShellArgv, windowsBashCandidates } from "../dist/sandbox.js";
+import {
+  firstHealthyWindowsBash,
+  firstInstalledWindowsBash,
+  resolveShellArgv,
+  windowsBashCandidates,
+} from "../dist/sandbox.js";
 
 test("resolveShellArgv: POSIX platforms use /bin/sh -c", () => {
   assert.deepEqual(resolveShellArgv("ls -la", "darwin", null), { cmd: "/bin/sh", args: ["-c", "ls -la"] });
@@ -29,4 +34,27 @@ test("Windows shell discovery probes conventional Git Bash installs outside PATH
     firstInstalledWindowsBash(candidates, (path) => path === "C:\\Program Files\\Git\\bin\\bash.exe"),
     "C:\\Program Files\\Git\\bin\\bash.exe",
   );
+});
+
+test("Windows shell discovery skips a broken WSL alias and keeps probing for Git Bash", () => {
+  const attempts = [];
+  const selected = firstHealthyWindowsBash(
+    [
+      "C:\\Windows\\System32\\bash.exe",
+      "C:\\Program Files\\Git\\bin\\bash.exe",
+    ],
+    (path) => {
+      attempts.push(path);
+      return path.includes("Program Files");
+    },
+  );
+  assert.equal(selected, "C:\\Program Files\\Git\\bin\\bash.exe");
+  assert.deepEqual(attempts, [
+    "C:\\Windows\\System32\\bash.exe",
+    "C:\\Program Files\\Git\\bin\\bash.exe",
+  ]);
+});
+
+test("Windows shell discovery returns no bash when every discovered executable is unhealthy", () => {
+  assert.equal(firstHealthyWindowsBash(["C:\\Windows\\System32\\bash.exe"], () => false), null);
 });

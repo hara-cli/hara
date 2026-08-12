@@ -34,7 +34,7 @@ export interface VerifiedPluginManifest {
 
 const MANIFEST_PATHS = [".claude-plugin/plugin.json", ".hara-plugin/plugin.json", "plugin.json"];
 const TOP_LEVEL_KEYS = new Set(["name", "version", "description", "skills", "agents", "mcpServers", "hooks", "bin", "panels"]);
-const MCP_KEYS = new Set(["command", "args", "env"]);
+const MCP_KEYS = new Set(["command", "args", "env", "description"]);
 const PANEL_KEYS = new Set(["id", "title", "command", "args", "port", "detect"]);
 const HOOK_KEYS = new Set(["matcher", "command"]);
 const ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -148,6 +148,7 @@ function validateMcpServers(value: unknown): Record<string, McpServerConfig> {
     if (/\s/u.test(command)) throw new Error(`MCP server '${name}' command must be one executable, not a shell command`);
     const config: McpServerConfig = { command };
     if (item.args !== undefined) config.args = stringArray(item.args, `MCP server '${name}' args`);
+    if (item.description !== undefined) config.description = text(item.description, `MCP server '${name}' description`, 1024);
     if (item.env !== undefined) {
       const env = record(item.env, `MCP server '${name}' env`);
       if (Object.keys(env).length > 128) throw new Error(`MCP server '${name}' env has too many entries`);
@@ -330,6 +331,7 @@ export function bindPluginMcpServers(root: string, manifest: PluginManifest): Re
       command,
       ...(args.length ? { args } : {}),
       ...(input.env ? { env: { ...input.env } } : {}),
+      ...(input.description ? { description: input.description } : {}),
       cwd: realpathSync.native(resolve(root)),
     };
   }

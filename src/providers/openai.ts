@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import type { Provider, NeutralMsg, ToolUse, TurnArgs, TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
-import { reasoningParams } from "./reasoning.js";
+import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
 import { resolvePlatform } from "./registry.js";
 
 /** Assemble streamed tool-call fragments into tool uses. CRITICAL: non-empty arguments that don't parse
@@ -93,6 +93,9 @@ export function createOpenAIProvider(opts: {
   baseURL?: string;
   label?: string;
   reasoningEffort?: "off" | "low" | "medium" | "high" | "max";
+  /** Internal transport override for a capability-preserving fallback (currently DeepSeek Responses
+   * `off` → Chat with thinking.disabled). Normal callers should let the registry choose. */
+  reasoningStyle?: ReasoningStyle;
   /** Local OpenAI-compatible endpoints may intentionally use auth:none. The SDK still requires a
    * constructor value, so explicitly remove its generated Authorization header at the final header layer. */
   omitAuthorization?: boolean;
@@ -126,7 +129,7 @@ export function createOpenAIProvider(opts: {
       // into the params to merge. UNSET → {} (model default, zero impact). One data-driven line replaces
       // the old per-platform if/else — a new platform is a registry row, not code here.
       const caps = resolvePlatform(opts.label, opts.baseURL, undefined, opts.model);
-      Object.assign(params, reasoningParams(caps.reasoning, opts.reasoningEffort, opts.model));
+      Object.assign(params, reasoningParams(opts.reasoningStyle ?? caps.reasoning, opts.reasoningEffort, opts.model));
 
       // Stream: emit text deltas live; accumulate tool-call args by index; grab usage from the tail chunk.
       let text = "";

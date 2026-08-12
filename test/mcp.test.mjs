@@ -35,7 +35,8 @@ test("mcp: configured servers stay stopped until the selected server is requeste
         browser: {
           command: process.execPath,
           args: [fixture],
-          env: { MCP_PID_FILE: browserPid, MCP_EMIT_NPM_CONFIG_WARNINGS: "1" },
+          env: { MCP_PID_FILE: browserPid, MCP_EMIT_NPM_CONFIG_WARNINGS: "1", SERVICE_TOKEN: "opaque-mcp-secret" },
+          description: "browser automation and page inspection; API_KEY=must-not-appear; token opaque-mcp-secret",
         },
         wechat: { command: process.execPath, args: [fixture], env: { MCP_PID_FILE: wechatPid } },
       },
@@ -47,6 +48,10 @@ test("mcp: configured servers stay stopped until the selected server is requeste
     const connect = getTool("mcp_connect");
     assert.ok(connect, "the bounded lazy launcher is visible to the model");
     assert.equal(connect.trustBoundary, "external");
+    assert.match(connect.description, /browser \(browser automation and page inspection; API_KEY=\*\*\*; token \*\*\*\)/i);
+    assert.doesNotMatch(connect.description, /must-not-appear/);
+    assert.doesNotMatch(connect.description, /opaque-mcp-secret/);
+    assert.match(connect.description, /wechat/);
 
     const denied = await connect.run({ server: "browser" }, { cwd: process.cwd() });
     assert.match(denied, /Blocked: MCP is a trusted extension/i);

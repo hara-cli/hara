@@ -3,6 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { registerTool } from "../tools/registry.js";
 import type { McpServerConfig } from "../config.js";
+import { redactSensitiveValue } from "../security/secrets.js";
 import { redactToolSubprocessOutput, toolSubprocessEnv } from "../security/subprocess-env.js";
 import { sensitiveStructuredInputReason } from "../security/sensitive-files.js";
 
@@ -238,7 +239,18 @@ export function registerLazyMcpServers(
   if (!names.length) return;
   const display = names
     .slice(0, 24)
-    .map((name) => safeDiagnosticName(name))
+    .map((name) => {
+      const safeName = safeDiagnosticName(name);
+      const hint = redactSensitiveValue(
+        String(servers[name]?.description ?? ""),
+        Object.values(servers[name]?.env ?? {}),
+      ).value
+        .replace(/[\u0000-\u001f\u007f]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 240);
+      return hint ? `${safeName} (${hint})` : safeName;
+    })
     .join(", ");
   const more = names.length > 24 ? `, … (${names.length - 24} more)` : "";
   registerTool({

@@ -15,6 +15,10 @@ import {
   updatePresentationArtifact,
   validatePresentationArtifact,
 } from "../dist/presentations/runtime.js";
+import { findHeadlessBrowser } from "../dist/tools/headless-web.js";
+import { inspectPresentationPdf, renderPresentationPdf } from "../dist/presentations/pdf.js";
+import { analyzePresentationNarrative } from "../dist/presentations/quality.js";
+import { renderPresentationHtml } from "@nanhara/hara-presentation";
 
 async function withTempHome(fn) {
   const home = await mkdtemp(join(tmpdir(), "hara-presentation-test-"));
@@ -96,7 +100,8 @@ test("native Presentation Artifact previews and exports one validated revision",
       assert.equal((await stat(preview.path)).mode & 0o777, 0o600);
     }
 
-    for (const format of ["json", "html", "pptx"]) {
+    const formats = findHeadlessBrowser() ? ["json", "html", "pdf", "pptx"] : ["json", "html", "pptx"];
+    for (const format of formats) {
       const destinationPath = join(home, `经营复盘.${format}`);
       const receipt = await exportPresentationArtifact(home, {
         artifactId: created.artifact.artifactId,
@@ -114,7 +119,128 @@ test("native Presentation Artifact previews and exports one validated revision",
         assert.ok(bytes.includes(Buffer.from("ppt/charts/chart1.xml")), "PPTX keeps an editable native chart part");
       }
       if (format === "html") assert.match(bytes.toString("utf8"), /@media print/);
+      if (format === "pdf") {
+        assert.equal(bytes.subarray(0, 5).toString("latin1"), "%PDF-");
+        assert.deepEqual(inspectPresentationPdf(bytes, 2), { pageCount: 2 });
+        assert.ok(receipt.warnings.some((warning) => warning.code === "PDF_LOCAL_BROWSER_RENDERER"));
+      }
     }
+  });
+});
+
+test("direct PDF rendering verifies the exact slide count", { skip: !findHeadlessBrowser() }, async () => {
+  const project = {
+    schemaVersion: "hara.presentation/1",
+    title: "PDF proof",
+    widthEmu: 12192000,
+    heightEmu: 6858000,
+    brief: {},
+    slides: [
+      {
+        id: "slide-1",
+        claim: "The exact presenter becomes page one.",
+        takeawayTitle: "One source, one PDF",
+        blocks: [{ id: "chart-1", type: "chart", literal: { categories: ["A", "B"], values: [3, 8] } }],
+      },
+      {
+        id: "slide-2",
+        claim: "A second narrative job becomes page two.",
+        takeawayTitle: "Page count is verified",
+        blocks: [{ id: "flow-1", type: "flow", literal: { items: ["Create", "Render", "Verify"] } }],
+      },
+    ],
+  };
+  const result = await renderPresentationPdf(renderPresentationHtml(project), 2);
+  assert.equal(result.mediaType, "application/pdf");
+  assert.equal(result.fidelity, "visual-fidelity");
+  assert.equal(result.pageCount, 2);
+  assert.ok(result.bytes.byteLength > 10_000);
+  assert.throws(
+    () => inspectPresentationPdf(result.bytes, 3),
+    /expected 3, rendered 2/,
+    "a partial/wrong-page deck must never receive an export receipt",
+  );
+});
+
+test("narrative quality gate catches repeated copy, generic headings, and template-like repetition", () => {
+  const slides = Array.from({ length: 6 }, (_, index) => ({
+    id: `slide-${index + 1}`,
+    claim: index === 0 ? "Ship from evidence" : `Evidence point ${index + 1}`,
+    takeawayTitle: index === 0 ? "Ship from evidence" : `Decision ${index + 1}`,
+    blocks: [{
+      id: `heading-${index + 1}`,
+      type: "heading",
+      literal: index === 0 ? "Key Points" : `Evidence ${index + 1}`,
+    }],
+  }));
+  const findings = analyzePresentationNarrative({
+    schemaVersion: "hara.presentation/1",
+    title: "Quality proof",
+    widthEmu: 12192000,
+    heightEmu: 6858000,
+    brief: {},
+    slides,
+  });
+  const codes = new Set(findings.map((finding) => finding.code));
+  assert.ok(codes.has("PRESENTATION_NARRATIVE_DUPLICATE_MESSAGE"));
+  assert.ok(codes.has("PRESENTATION_NARRATIVE_GENERIC_HEADING"));
+  assert.ok(codes.has("PRESENTATION_NARRATIVE_REPETITIVE_COMPOSITION"));
+  assert.ok(codes.has("PRESENTATION_NARRATIVE_VISUAL_MONOTONY"));
+  assert.ok(findings.every((finding) => finding.severity === "warning"));
+});
+
+test("agent-authored narrative warnings require revision before export", async () => {
+  await withTempHome(async (home) => {
+    const created = createPresentationArtifact(home, {
+      actor: "agent",
+      project: {
+        schemaVersion: "hara.presentation/1",
+        title: "Repeated deck",
+        widthEmu: 12192000,
+        heightEmu: 6858000,
+        brief: {},
+        slides: [{
+          id: "slide-1",
+          claim: "One repeated sentence",
+          takeawayTitle: "One repeated sentence",
+          blocks: [{ id: "heading-1", type: "heading", literal: "Key Points" }],
+        }],
+      },
+    });
+    const report = validatePresentationArtifact(home, {
+      artifactId: created.artifact.artifactId,
+      revisionId: created.currentRevision.revisionId,
+    });
+    assert.equal(report.status, "revise");
+    assert.ok(report.findings.some((finding) => finding.code === "PRESENTATION_NARRATIVE_DUPLICATE_MESSAGE"));
+    assert.ok(report.findings.some((finding) => finding.code === "PRESENTATION_NARRATIVE_GENERIC_HEADING"));
+  });
+});
+
+test("user-authored decks keep structural validation without enforcing the Agent house style", async () => {
+  await withTempHome(async (home) => {
+    const created = createPresentationArtifact(home, {
+      actor: "user",
+      project: {
+        schemaVersion: "hara.presentation/1",
+        title: "Intentional repetition",
+        widthEmu: 12192000,
+        heightEmu: 6858000,
+        brief: {},
+        slides: [{
+          id: "slide-1",
+          claim: "One repeated sentence",
+          takeawayTitle: "One repeated sentence",
+          blocks: [{ id: "heading-1", type: "heading", literal: "Key Points" }],
+        }],
+      },
+    });
+    const report = validatePresentationArtifact(home, {
+      artifactId: created.artifact.artifactId,
+      revisionId: created.currentRevision.revisionId,
+    });
+    assert.equal(report.status, "pass");
+    assert.ok(report.findings.every((finding) => !finding.code.startsWith("PRESENTATION_NARRATIVE_")));
   });
 });
 

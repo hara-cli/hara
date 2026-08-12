@@ -35,6 +35,13 @@ test("reasoningParams reasoning_object (Responses API): reasoning:{effort} on re
   assert.deepEqual(reasoningParams("reasoning_object", "medium", "qwen3.7-plus"), {});
 });
 
+test("reasoningParams DeepSeek Responses uses only documented effort values", () => {
+  assert.deepEqual(reasoningParams("deepseek_responses", "low", "deepseek-v4-flash"), { reasoning: { effort: "low" } });
+  assert.deepEqual(reasoningParams("deepseek_responses", "medium", "deepseek-v4-flash"), { reasoning: { effort: "high" } });
+  assert.deepEqual(reasoningParams("deepseek_responses", "max", "deepseek-v4-flash"), { reasoning: { effort: "max" } });
+  assert.deepEqual(reasoningParams("deepseek_responses", "off", "deepseek-v4-flash"), {}, "factory routes off through Chat");
+});
+
 test("reasoningParams none / thinking_budget: nothing merged on the chat/responses body", () => {
   assert.deepEqual(reasoningParams("none", "off"), {});
   assert.deepEqual(reasoningParams("thinking_budget", "high"), {}, "Anthropic thinking is applied in anthropic.ts");
@@ -63,13 +70,14 @@ test("resolvePlatform: ANY vendor's /anthropic endpoint → anthropic wire + thi
   }
 });
 
-test("resolvePlatform: DeepSeek OpenAI-compat (chat) → the deepseek style (thinking:{type} + reasoning_effort)", () => {
-  // DeepSeek V4 (v4-pro/v4-flash) added a per-request thinking switch + reasoning_effort(high|max) on the
-  // OpenAI-compat chat path — see the `deepseek` reasoning style in reasoning.ts.
-  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com").reasoning, "deepseek");
-  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/v1").wireApi, "chat");
+test("resolvePlatform: only DeepSeek V4 Flash uses Responses; Pro/legacy keep the Chat fallback", () => {
+  const flash = resolvePlatform("deepseek", "https://api.deepseek.com", undefined, "deepseek-v4-flash");
+  assert.equal(flash.wireApi, "responses");
+  assert.equal(flash.reasoning, "deepseek_responses");
+  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/v1", undefined, "deepseek-v4-pro").wireApi, "chat");
+  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com", undefined, "deepseek-chat").reasoning, "deepseek");
   // The vendor's /anthropic endpoint still wins (checked first) → anthropic wire, not the chat deepseek style.
-  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/anthropic").reasoning, "thinking_budget");
+  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/anthropic", undefined, "deepseek-v4-flash").reasoning, "thinking_budget");
   assert.equal(
     resolvePlatform("hara-gateway", "https://gw.nanhara.tech/v1", undefined, "deepseek-v4-pro").reasoning,
     "deepseek",

@@ -92,8 +92,8 @@
 //                                                   → {artifact,currentRevision,content,project}
 //   presentation.get {artifactId,revisionId?}      → {artifact,currentRevision,content,project}
 //   presentation.validate {artifactId,revisionId}  → {report:ValidationReport}
-//   presentation.export {artifactId,revisionId,validationReportId,destinationPath,format}
-//                                                   → {receipt:ExportReceipt}; format=json|html|pptx
+//   presentation.export {artifactId,revisionId,validationReportId,destinationPath,format} // json|html|pdf|pptx
+//                                                   → {receipt:ExportReceipt}; format=json|html|pdf|pptx
 //   presentation.render {project}                  → {html} (bounded, ephemeral draft preview)
 //   presentation.preview {artifactId,revisionId}    → {html,revisionId} (same renderer as HTML export)
 //   presentation.preview-file {artifactId,revisionId} → {path,revisionId} (private local HTML)

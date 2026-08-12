@@ -11,6 +11,10 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *                         thinking phase server-side (off → the big latency vanishes, measured 14s→1.6s).
  *  - `reasoning_effort` — OpenAI chat reasoning models (o-series / gpt-5): the `reasoning_effort` enum.
  *  - `reasoning_object` — OpenAI Responses API: `reasoning: { effort }` (for the responses transport).
+ *  - `deepseek_responses` — DeepSeek V4 Flash Responses API: `reasoning: { effort }`, with DeepSeek's
+ *                         documented low|high|max levels. `off` is intentionally omitted here because
+ *                         the Responses endpoint has no documented disabled value; the provider factory
+ *                         falls back to DeepSeek Chat for that one explicit setting.
  *  - `deepseek`         — DeepSeek V4 OpenAI-compat chat: a `thinking: { type }` on/off object PLUS a
  *                         `reasoning_effort` enum whose NATIVE values are only `high`|`max` (the server
  *                         accepts low/medium but maps them → high, and xhigh → max). OFF must go through
@@ -21,7 +25,7 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `ollama_think`     — Ollama's OpenAI-compat endpoint: a `think` boolean that stops a local reasoning
  *                         model's thinking phase (measured: deepseek-r1:14b 17s → 0.6s). Off models ignore it.
  *  - `none`             — the platform has no thinking control; leave the request untouched. */
-export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
+export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "deepseek_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
 
 /** OpenAI reasoning families that accept `reasoning_effort` / `reasoning.effort`. Others reject it, so the
  *  `reasoning_effort` / `reasoning_object` styles no-op on non-reasoning models. */
@@ -61,6 +65,12 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
     case "reasoning_object":
       if (!isReasoningModel(model)) return {};
       return { reasoning: { effort: effort === "off" ? "minimal" : effort === "max" ? "high" : effort } };
+    case "deepseek_responses":
+      // DeepSeek's Responses compatibility surface currently exposes low|high|max, but no documented
+      // disabled/minimal value. The factory routes an explicit `off` through Chat Completions where
+      // `thinking:{type:"disabled"}` is supported. Never invent an unsupported Responses enum here.
+      if (effort === "off") return {};
+      return { reasoning: { effort: effort === "medium" ? "high" : effort } };
     case "deepseek":
       // off → turn thinking OFF via the object (reasoning_effort can't say "off"). Any level → thinking ON
       // + the effort enum. DeepSeek natively exposes high|max; normalize legacy low/medium config values

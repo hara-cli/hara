@@ -330,6 +330,7 @@ registerTool({
   name: "bash",
   description:
     "Run a shell command in the working directory; returns combined stdout/stderr. " +
+    "On Windows Hara verifies Bash first and otherwise uses native cmd.exe; follow the startup notice's syntax guidance. " +
     "Do not use this to show a folder in Finder/File Explorer; call open_directory instead.",
   input_schema: {
     type: "object",
