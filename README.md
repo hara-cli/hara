@@ -119,19 +119,21 @@ hara config set model    qwen-plus   # or qwen-max, qwen3-coder-plus, …
 > Plan keys (Coding Plan / Token Plan) are licensed **only** for use inside AI coding agents /
 > OpenClaw-type tools like hara — not Dify/n8n, API-testing tools, or direct script/backend calls.
 
-**DeepSeek — native Responses for V4 Flash**
+**DeepSeek — native Responses for V4 Flash and V4 Pro**
 ```bash
 hara config set provider deepseek
 hara config set apiKey   ...
 hara config set model    deepseek-v4-flash   # the built-in default
+# or: hara config set model deepseek-v4-pro
 ```
-On the official `https://api.deepseek.com` endpoint, `deepseek-v4-flash` uses the semantic streaming
+On the official `https://api.deepseek.com` endpoint, `deepseek-v4-flash` and `deepseek-v4-pro` use the semantic streaming
 Responses API. Hara resends the complete durable message/tool history on every request because this
 endpoint is stateless: it never depends on `previous_response_id`, `conversation`, or server-side storage.
-`deepseek-v4-pro` stays on the OpenAI-compatible Chat endpoint until DeepSeek documents Responses support
-for it. Explicit custom or legacy ids are not silently remapped; their availability remains provider-side.
+Explicit custom or legacy ids are not silently remapped; their availability remains provider-side.
 DeepSeek Responses does not accept image/file input, so Hara keeps the existing
 text-only model boundary and uses an explicitly configured image describer when needed.
+If live model discovery is unavailable, `/model` still offers the two documented V4 models as a
+host-scoped fallback; a successful live `/models` response remains authoritative.
 
 **Any OpenAI-compatible endpoint** (GLM, Kimi, OpenAI, local servers)
 ```bash
@@ -193,8 +195,8 @@ describer and `/vision main yes|no|auto` corrects a model's detected capability.
 hara config set reasoningEffort high     # or off / low / medium / max
 ```
 hara expresses it the way each endpoint wants (OpenAI `reasoning_effort`, Anthropic thinking budget,
-DashScope `enable_thinking`, **DeepSeek** Chat `thinking` + `reasoning_effort`, or DeepSeek Flash Responses
-`reasoning.effort`). Because DeepSeek Responses does not document an `off` value, choosing `off` for Flash
+DashScope `enable_thinking`, **DeepSeek** Chat `thinking` + `reasoning_effort`, or DeepSeek V4 Responses
+`reasoning.effort`). Because DeepSeek Responses does not document an `off` value, choosing `off` for either V4 model
 uses the Chat endpoint with `thinking.disabled`; Hara never sends an invented enum. In the TUI, bare `/model`
 opens a picker — ↑↓ pick a model, **←→ set the thinking level**.
 

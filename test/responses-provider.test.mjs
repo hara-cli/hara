@@ -31,10 +31,10 @@ function listen(events) {
   });
 }
 
-function completed(output = [], usage = { input_tokens: 17, output_tokens: 9 }) {
+function completed(output = [], usage = { input_tokens: 17, output_tokens: 9 }, sequenceNumber = 99) {
   return {
     type: "response.completed",
-    sequence_number: 99,
+    sequence_number: sequenceNumber,
     response: { id: "resp_test", status: "completed", output, usage },
   };
 }
@@ -80,7 +80,8 @@ test("toResponsesInput preserves a structured image description for text-only re
   }]);
 });
 
-test("Responses transport consumes semantic SSE, streams reasoning/text, and assembles function calls", async () => {
+for (const deepSeekModel of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
+test(`Responses transport consumes semantic SSE and function calls for ${deepSeekModel}`, async () => {
   const events = [
     { type: "response.created", sequence_number: 0, response: { id: "resp_test", status: "in_progress" } },
     { type: "response.reasoning_text.delta", sequence_number: 1, item_id: "reason_1", delta: "thinking" },
@@ -114,7 +115,7 @@ test("Responses transport consumes semantic SSE, streams reasoning/text, and ass
     const provider = createResponsesProvider({
       apiKey: "test-key",
       baseURL: mock.baseURL,
-      model: "deepseek-v4-flash",
+      model: deepSeekModel,
       label: "deepseek",
       reasoningEffort: "high",
       reasoningStyle: "deepseek_responses",
@@ -141,6 +142,7 @@ test("Responses transport consumes semantic SSE, streams reasoning/text, and ass
     const request = mock.requests[0];
     assert.equal(request.url, "/v1/responses");
     assert.equal(request.authorization, "Bearer test-key");
+    assert.equal(request.body.model, deepSeekModel);
     assert.equal(request.body.instructions, "Be precise.");
     assert.deepEqual(request.body.reasoning, { effort: "high" });
     assert.equal(request.body.stream, true);
@@ -158,6 +160,7 @@ test("Responses transport consumes semantic SSE, streams reasoning/text, and ass
     await new Promise((resolve) => mock.server.close(resolve));
   }
 });
+}
 
 test("Responses transport treats incomplete and missing terminal events as errors", async (t) => {
   await t.test("incomplete", async () => {
@@ -205,4 +208,71 @@ test("Responses transport treats incomplete and missing terminal events as error
       await new Promise((resolve) => mock.server.close(resolve));
     }
   });
+});
+
+test("Responses transport preserves usage and redacts server diagnostics on failed terminal events", async () => {
+  const apiKey = "opaque-provider-key-ce81";
+  const mock = await listen([{
+    type: "response.failed",
+    sequence_number: 0,
+    response: {
+      id: "resp_failed",
+      status: "failed",
+      error: { message: `tool choice is unsupported; Authorization: Bearer ${apiKey}` },
+      output: [],
+      usage: { input_tokens: 11, output_tokens: 2 },
+    },
+  }]);
+  try {
+    const result = await createResponsesProvider({
+      apiKey,
+      baseURL: mock.baseURL,
+      model: "deepseek-v4-pro",
+    }).turn({ system: "test", history: [], tools: [], onText() {} });
+    assert.equal(result.stop, "error");
+    assert.equal(result.errorMsg, "tool choice is unsupported; Authorization: Bearer ***");
+    assert.doesNotMatch(result.errorMsg, /ce81|opaque-provider-key/);
+    assert.deepEqual(result.usage, { input: 11, output: 2 });
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+  }
+});
+
+test("Responses transport fails closed on a regressing sequence number", async () => {
+  const mock = await listen([
+    { type: "response.output_text.delta", sequence_number: 2, item_id: "msg_1", output_index: 0, delta: "unsafe" },
+    { type: "response.output_text.delta", sequence_number: 1, item_id: "msg_1", output_index: 0, delta: " duplicate" },
+    completed([], { input_tokens: 2, output_tokens: 2 }, 3),
+  ]);
+  try {
+    const result = await createResponsesProvider({
+      apiKey: "test-key",
+      baseURL: mock.baseURL,
+      model: "deepseek-v4-pro",
+    }).turn({ system: "test", history: [], tools: [], onText() {} });
+    assert.equal(result.stop, "error");
+    assert.match(result.errorMsg, /sequence_number/i);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+  }
+});
+
+test("Responses transport fails closed when output arrives after a terminal event", async () => {
+  const mock = await listen([
+    completed([], { input_tokens: 1, output_tokens: 0 }, 0),
+    { type: "response.output_text.delta", sequence_number: 1, item_id: "msg_1", output_index: 0, delta: "late" },
+  ]);
+  try {
+    const emitted = [];
+    const result = await createResponsesProvider({
+      apiKey: "test-key",
+      baseURL: mock.baseURL,
+      model: "deepseek-v4-pro",
+    }).turn({ system: "test", history: [], tools: [], onText: (delta) => emitted.push(delta) });
+    assert.equal(result.stop, "error");
+    assert.match(result.errorMsg, /after response\.completed/i);
+    assert.deepEqual(emitted, [], "late output is rejected before it reaches the UI");
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+  }
 });

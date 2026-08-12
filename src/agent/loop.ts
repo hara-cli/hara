@@ -41,6 +41,7 @@ import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText } from "../security/secrets.js";
+import { safeProviderErrorMessage } from "../providers/errors.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { prepareHistoryForModel } from "./context-budget.js";
 import { rolesDigest } from "../org/roles.js";
@@ -1132,7 +1133,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             text: "",
             toolUses: [],
             stop: "error",
-            errorMsg: error instanceof Error ? error.message : String(error),
+            errorMsg: safeProviderErrorMessage(error),
           };
     } finally {
       clearInterval(stallTimer);

@@ -1,4 +1,5 @@
 import type { Provider, TurnArgs, TurnResult } from "./types.js";
+import { safeProviderErrorMessage } from "./errors.js";
 
 export interface BoundedTurnOptions {
   /** A hard wall-clock bound. The Promise settles at this deadline even when a provider ignores abort. */
@@ -51,7 +52,7 @@ export async function boundedProviderTurn(
     // Cancellation may happen synchronously after this async function returns but before its provider
     // microtask starts. Re-check here so an already-cancelled auxiliary call never incurs a request/cost.
     .then(() => controller.signal.aborted ? errorResult(`${label} cancelled`) : provider.turn({ ...args, signal: controller.signal }))
-    .catch((error: unknown) => errorResult(error instanceof Error ? error.message : String(error)));
+    .catch((error: unknown) => errorResult(safeProviderErrorMessage(error)));
   try {
     options.onProviderTurn?.(turn);
   } catch {

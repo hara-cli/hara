@@ -75,6 +75,20 @@ test("boundedProviderTurn converts synchronous and asynchronous provider failure
   }
 });
 
+test("boundedProviderTurn redacts credentials from non-conforming provider exceptions", async () => {
+  const provider = {
+    id: "unsafe",
+    model: "unsafe",
+    turn() {
+      throw new Error("Authorization: Bearer sk-providerexception123456789");
+    },
+  };
+  const result = await boundedProviderTurn(provider, args, { timeoutMs: 100 });
+  assert.equal(result.stop, "error");
+  assert.equal(result.errorMsg, "Authorization: Bearer sk-***");
+  assert.doesNotMatch(result.errorMsg, /providerexception/);
+});
+
 test("boundedProviderTurn keeps a headless process alive until its hard timeout", async () => {
   const moduleUrl = new URL("../dist/providers/bounded-turn.js", import.meta.url).href;
   const script = `

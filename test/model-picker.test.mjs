@@ -3,7 +3,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { levelsFor, levelLabel, movePicker } from "../dist/tui/model-picker.js";
-import { CODING_PLAN_FALLBACK_MODELS, codingPlanFallbackModels, listModels } from "../dist/providers/models.js";
+import {
+  CODING_PLAN_FALLBACK_MODELS,
+  DEEPSEEK_FALLBACK_MODELS,
+  codingPlanFallbackModels,
+  deepSeekFallbackModels,
+  listModels,
+} from "../dist/providers/models.js";
 
 test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSeek uses its native off/high/max; none → nothing", () => {
   assert.deepEqual(levelsFor("enable_thinking"), ["off", "high"]);
@@ -74,5 +80,27 @@ test("Coding Plan model discovery uses live ids first and the documented exact l
     await listModels("https://coding.dashscope.aliyuncs.com/v1", "k", live),
     ["future-model"],
     "live discovery is authoritative and is never polluted by a stale fallback",
+  );
+});
+
+test("DeepSeek model discovery falls back to the official V4 Responses catalog on the exact host", async () => {
+  assert.deepEqual([...DEEPSEEK_FALLBACK_MODELS], ["deepseek-v4-flash", "deepseek-v4-pro"]);
+  assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com/v1"), [...DEEPSEEK_FALLBACK_MODELS]);
+  assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com./v1"), [...DEEPSEEK_FALLBACK_MODELS]);
+  assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com.example/v1"), []);
+  assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com/anthropic"), []);
+  assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com/proxy/v1"), []);
+
+  const unavailable = async () => ({ ok: false, json: async () => ({}) });
+  assert.deepEqual(
+    await listModels("https://api.deepseek.com", "k", unavailable),
+    [...DEEPSEEK_FALLBACK_MODELS],
+    "the picker remains usable when the official model-list endpoint is unavailable",
+  );
+  const live = async () => ({ ok: true, json: async () => ({ data: [{ id: "deepseek-v5" }] }) });
+  assert.deepEqual(
+    await listModels("https://api.deepseek.com", "k", live),
+    ["deepseek-v5"],
+    "live discovery remains authoritative over the dated fallback",
   );
 });

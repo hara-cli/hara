@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.146.2 — 2026-08-13 — DeepSeek V4 Pro Responses parity
+
+- Route official `deepseek-v4-pro` requests through the same native, stateless Responses API already used
+  by V4 Flash, including semantic SSE, durable function-call replay, text-only attachment handling, and
+  the explicit non-thinking Chat fallback. Legacy/custom DeepSeek model ids remain on Chat.
+- Match the official DeepSeek API by parsed hostname instead of a substring, so a lookalike host cannot
+  inherit vendor-specific transport or reasoning behavior. Keep the supported Responses model catalog in
+  one exported, regression-tested capability table to make future provider updates auditable.
+- Keep `/model` usable when the official model-list endpoint is unavailable by offering the exact documented
+  V4 Flash/Pro catalog only on `api.deepseek.com`; a successful live model list remains authoritative.
+- Reject regressing Responses sequence numbers and any event after a terminal response instead of accepting
+  ambiguous output. Redact known credentials, credential-shaped values, and credential-bearing URLs from
+  bounded provider diagnostics before they can enter the terminal, Desktop UI, or durable session history.
+
 ## 0.146.1 — 2026-08-12 — recoverable presentation source exports
 
 - Keep JSON as the recoverable source-copy path when an Agent-created presentation has advisory

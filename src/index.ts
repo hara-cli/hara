@@ -1020,7 +1020,7 @@ async function pingProvider(args: { provider: ProviderId; apiKey: string; model:
 
 /** Interactive first-run setup: pick a provider (numbered menu), API key (masked), and model →
  *  ~/.hara/config.json. Compatible providers are dispatched by their model capability (including
- *  DeepSeek V4 Flash Responses); "Qwen free" routes to device login. Storage stays config.json 0600. */
+ *  DeepSeek V4 Flash/Pro Responses); "Qwen free" routes to device login. Storage stays config.json 0600. */
 async function runSetup(): Promise<void> {
   if (!stdin.isTTY) {
     out(c.yellow("`hara setup` is interactive — run it in a terminal, or use `hara config set <key> <value>` in scripts.\n"));

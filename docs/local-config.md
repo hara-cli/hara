@@ -15,10 +15,12 @@ provider is required; everything else has a sane default.
 | `model` | default model | `glm-5` |
 | `baseURL` | OpenAI-compatible base (for qwen/openai) | `https://…/v1` |
 
-The built-in DeepSeek profile defaults to `deepseek-v4-flash` at `https://api.deepseek.com`. That exact
-official model uses native, stateless Responses streaming; V4 Pro keeps the Chat transport, while explicit
+The built-in DeepSeek profile defaults to `deepseek-v4-flash` at `https://api.deepseek.com`. Official
+`deepseek-v4-flash` and `deepseek-v4-pro` models use native, stateless Responses streaming, while explicit
 custom or legacy ids are not silently remapped and remain subject to provider-side availability.
 The complete local history is replayed on each Responses call, including function calls and outputs.
+The model picker uses live discovery first and falls back to the two documented V4 ids only for the exact
+official DeepSeek host.
 
 ## Optional
 - **Advanced image fallback** (optional compatibility for attached images when the selected main model is text-only):

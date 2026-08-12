@@ -1,4 +1,8 @@
 import { userModelFetch } from "../network/model-fetch.js";
+import {
+  DEEPSEEK_RESPONSES_MODELS,
+  isOfficialDeepSeekResponsesEndpoint,
+} from "./deepseek.js";
 
 // Alibaba Coding Plan's documented exact ids (verified 2026-07-18). Live `/models` remains authoritative;
 // this list is only a usability fallback because the coding endpoint/key combinations do not all enumerate.
@@ -16,6 +20,10 @@ export const CODING_PLAN_FALLBACK_MODELS = Object.freeze([
   "glm-4.7",
 ]);
 
+/** DeepSeek's official Responses catalog. Live `/models` still wins, but its availability should not be
+ * required for the model picker to expose the two documented V4 choices. */
+export const DEEPSEEK_FALLBACK_MODELS = DEEPSEEK_RESPONSES_MODELS;
+
 export function codingPlanFallbackModels(baseURL: string | undefined): string[] {
   if (!baseURL) return [];
   try {
@@ -26,6 +34,12 @@ export function codingPlanFallbackModels(baseURL: string | undefined): string[] 
   } catch {
     return [];
   }
+}
+
+export function deepSeekFallbackModels(baseURL: string | undefined): string[] {
+  return isOfficialDeepSeekResponsesEndpoint(undefined, baseURL)
+    ? [...DEEPSEEK_FALLBACK_MODELS]
+    : [];
 }
 
 // Model discovery — "what can this key run?" A coding-plan / OpenAI-compatible key usually exposes many
@@ -39,7 +53,10 @@ export async function listModels(
   fetchImpl: typeof fetch = userModelFetch,
 ): Promise<string[]> {
   if (!baseURL) return []; // SDK-default hosts (anthropic/openai) — no custom endpoint to enumerate
-  const fallback = codingPlanFallbackModels(baseURL);
+  const fallback = [
+    ...codingPlanFallbackModels(baseURL),
+    ...deepSeekFallbackModels(baseURL),
+  ];
   try {
     const url = baseURL.replace(/\/+$/, "") + "/models";
     const headers: Record<string, string> = {};

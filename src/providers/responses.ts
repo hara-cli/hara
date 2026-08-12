@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
+import { safeProviderErrorMessage } from "./errors.js";
 import { assembleToolCalls } from "./openai.js";
 import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
 import type { NeutralMsg, Provider, ToolUse, TurnArgs, TurnResult } from "./types.js";
@@ -151,6 +152,7 @@ export function createResponsesProvider(opts: {
       let terminal: "completed" | "incomplete" | "failed" | undefined;
       let terminalResponse: any;
       let streamFailure: string | undefined;
+      let lastSequenceNumber = -1;
       const calls = new Map<string, PendingFunctionCall>();
       const textDeltaItems = new Set<string>();
       const completedTextItems = new Set<string>();
@@ -198,6 +200,17 @@ export function createResponsesProvider(opts: {
         const stream = await client.responses.create(params, { signal });
         for await (const event of stream as any) {
           onActivity?.();
+          if (Number.isInteger(event?.sequence_number)) {
+            if (event.sequence_number <= lastSequenceNumber) {
+              streamFailure = "Responses stream sequence_number was not strictly increasing.";
+              break;
+            }
+            lastSequenceNumber = event.sequence_number;
+          }
+          if (terminal) {
+            streamFailure = `Responses stream emitted ${String(event?.type ?? "an unknown event")} after response.${terminal}.`;
+            break;
+          }
           switch (event?.type) {
             case "response.output_text.delta": {
               const key = itemKey(event);
@@ -266,9 +279,14 @@ export function createResponsesProvider(opts: {
               recoverTerminalOutput(event.response);
               break;
             case "error":
-              streamFailure = String(event?.error?.message ?? event?.message ?? "Responses stream failed");
+              streamFailure = safeProviderErrorMessage(
+                event?.error?.message ?? event?.message,
+                [opts.apiKey],
+                "Responses stream failed.",
+              );
               break;
           }
+          if (streamFailure) break;
         }
       } catch (error: any) {
         if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
@@ -277,7 +295,7 @@ export function createResponsesProvider(opts: {
           text: "",
           toolUses: [],
           stop: "error",
-          errorMsg: networkFailure ?? `${error?.status ?? ""} ${error?.message ?? error}`.trim(),
+          errorMsg: networkFailure ?? safeProviderErrorMessage(error, [opts.apiKey]),
         };
       }
 
@@ -298,8 +316,12 @@ export function createResponsesProvider(opts: {
         };
       }
       if (terminal === "failed") {
-        const message = terminalResponse?.error?.message ?? "Responses generation failed.";
-        return { text, toolUses: [], stop: "error", errorMsg: String(message), usage };
+        const message = safeProviderErrorMessage(
+          terminalResponse?.error?.message,
+          [opts.apiKey],
+          "Responses generation failed.",
+        );
+        return { text, toolUses: [], stop: "error", errorMsg: message, usage };
       }
 
       const orderedCalls = [...calls.values()]

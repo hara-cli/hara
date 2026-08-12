@@ -4,6 +4,11 @@
 // (chat / responses / anthropic) and the reasoning styles (reasoning.ts) are the finite reusable pieces
 // the rows point at.
 import type { ReasoningStyle } from "./reasoning.js";
+import {
+  DEEPSEEK_RESPONSES_MODELS,
+  isDeepSeekResponsesModel,
+  isOfficialDeepSeekEndpoint,
+} from "./deepseek.js";
 
 /** The wire protocol used to talk to a platform (which transport builds the request + reads the stream). */
 export type WireApi = "chat" | "responses" | "anthropic";
@@ -30,20 +35,7 @@ const BY_WIRE: Record<WireApi, PlatformCaps> = {
   anthropic: { wireApi: "anthropic", reasoning: "thinking_budget", cache: "cache_control" },
 };
 
-function isOfficialDeepSeekEndpoint(providerId?: string, baseURL?: string): boolean {
-  if (baseURL) return /api\.deepseek\.com/i.test(baseURL);
-  return providerId === "deepseek";
-}
-
-function isDeepSeekFlashResponses(
-  providerId?: string,
-  baseURL?: string,
-  modelId?: string,
-): boolean {
-  return isOfficialDeepSeekEndpoint(providerId, baseURL)
-    && !/\/anthropic\/?($|\?)/i.test(baseURL ?? "")
-    && /^deepseek-v4-flash$/i.test(modelId ?? "");
-}
+export { DEEPSEEK_RESPONSES_MODELS, isDeepSeekResponsesModel } from "./deepseek.js";
 
 /** Endpoint-shape rules, matched against the baseURL. FIRST match wins — most specific first. This is what
  *  makes a *custom* profile (e.g. `custom:qwen3.7-plus` pointing at coding.dashscope) resolve correctly
@@ -61,9 +53,9 @@ const BY_BASEURL: { test: RegExp; caps: PlatformCaps }[] = [
   // GLM, MiniMax, Aliyun apps/anthropic … all expose `.../anthropic` with thinking + explicit cache. One
   // row covers the whole ecosystem — talk to it with the anthropic transport.
   { test: /\/anthropic\/?($|\?)/i, caps: { wireApi: "anthropic", reasoning: "thinking_budget", cache: "cache_control" } },
-  // DeepSeek OpenAI-compatible Chat fallback. `resolvePlatform` upgrades only the officially supported
-  // deepseek-v4-flash model to Responses; V4 Pro and legacy ids continue through Chat.
-  { test: /api\.deepseek\.com/i, caps: { wireApi: "chat", reasoning: "deepseek", cache: "auto" } },
+  // DeepSeek OpenAI-compatible Chat fallback. `resolvePlatform` upgrades the official V4 Responses
+  // catalog before reaching this row; legacy ids and explicit custom models continue through Chat.
+  { test: /^https?:\/\/api\.deepseek\.com(?::\d+)?(?:\/|$)/i, caps: { wireApi: "chat", reasoning: "deepseek", cache: "auto" } },
 ];
 
 /** Per-provider-id overrides (built-in providers whose id alone fixes the shape). */
@@ -89,7 +81,7 @@ export function resolvePlatform(
   wireApiOverride?: WireApi,
   modelId?: string,
 ): PlatformCaps {
-  const deepSeekResponses = isDeepSeekFlashResponses(providerId, baseURL, modelId);
+  const deepSeekResponses = isDeepSeekResponsesModel(providerId, baseURL, modelId);
   // baseURL shape is the strongest signal for a custom profile; else the provider-id override; else chat.
   const byUrl = baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
   const managedDeepSeekGateway =

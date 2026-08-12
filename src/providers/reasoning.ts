@@ -11,7 +11,7 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *                         thinking phase server-side (off → the big latency vanishes, measured 14s→1.6s).
  *  - `reasoning_effort` — OpenAI chat reasoning models (o-series / gpt-5): the `reasoning_effort` enum.
  *  - `reasoning_object` — OpenAI Responses API: `reasoning: { effort }` (for the responses transport).
- *  - `deepseek_responses` — DeepSeek V4 Flash Responses API: `reasoning: { effort }`, with DeepSeek's
+ *  - `deepseek_responses` — DeepSeek V4 Flash/Pro Responses API: `reasoning: { effort }`, with DeepSeek's
  *                         documented low|high|max levels. `off` is intentionally omitted here because
  *                         the Responses endpoint has no documented disabled value; the provider factory
  *                         falls back to DeepSeek Chat for that one explicit setting.

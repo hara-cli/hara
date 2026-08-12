@@ -133,8 +133,8 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   },
   "qwen-oauth": { model: "coder-model", envKey: "QWEN_OAUTH_TOKEN" },
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
-  // GLM / DeepSeek / OpenRouter expose OpenAI-compatible endpoints. The exact DeepSeek V4 Flash
-  // model is routed through Responses; its other model ids keep using Chat. The preset baseURL is
+  // GLM / DeepSeek / OpenRouter expose OpenAI-compatible endpoints. Official DeepSeek V4 Flash/Pro
+  // models are routed through Responses; its other model ids keep using Chat. The preset baseURL is
   // applied by loadConfig (merged.baseURL ?? d.baseURL), so the setup wizard never asks for a URL.
   glm: {
     model: "glm-4.6",

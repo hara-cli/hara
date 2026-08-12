@@ -99,10 +99,12 @@ test("reasoning_object style: max clamps to 'high' too", () => {
 
 // ── resolvePlatform: DeepSeek (by provider id AND by baseURL) resolves to the deepseek style ──
 
-test("registry: DeepSeek without a Flash model stays on Chat; V4 Flash selects Responses", () => {
+test("registry: DeepSeek without a V4 Responses model stays on Chat; Flash and Pro select Responses", () => {
   assert.equal(resolvePlatform("deepseek").reasoning, "deepseek", "by provider id");
   assert.equal(resolvePlatform(undefined, "https://api.deepseek.com/v1").reasoning, "deepseek", "by baseURL");
   assert.equal(resolvePlatform(undefined, "https://api.deepseek.com/v1").wireApi, "chat");
   assert.equal(resolvePlatform("deepseek", undefined, undefined, "deepseek-v4-flash").wireApi, "responses");
   assert.equal(resolvePlatform("deepseek", undefined, undefined, "deepseek-v4-flash").reasoning, "deepseek_responses");
+  assert.equal(resolvePlatform("deepseek", undefined, undefined, "deepseek-v4-pro").wireApi, "responses");
+  assert.equal(resolvePlatform("deepseek", undefined, undefined, "deepseek-v4-pro").reasoning, "deepseek_responses");
 });

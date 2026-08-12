@@ -4,7 +4,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { reasoningParams, supportsReasoningStyle } from "../dist/providers/reasoning.js";
-import { resolvePlatform } from "../dist/providers/registry.js";
+import {
+  DEEPSEEK_RESPONSES_MODELS,
+  isDeepSeekResponsesModel,
+  resolvePlatform,
+} from "../dist/providers/registry.js";
 
 const DS = "https://coding.dashscope.aliyuncs.com/v1"; // the reporter's custom endpoint
 
@@ -70,11 +74,14 @@ test("resolvePlatform: ANY vendor's /anthropic endpoint → anthropic wire + thi
   }
 });
 
-test("resolvePlatform: only DeepSeek V4 Flash uses Responses; Pro/legacy keep the Chat fallback", () => {
-  const flash = resolvePlatform("deepseek", "https://api.deepseek.com", undefined, "deepseek-v4-flash");
-  assert.equal(flash.wireApi, "responses");
-  assert.equal(flash.reasoning, "deepseek_responses");
-  assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/v1", undefined, "deepseek-v4-pro").wireApi, "chat");
+test("resolvePlatform: DeepSeek V4 Flash/Pro use Responses; legacy ids keep Chat", () => {
+  assert.deepEqual([...DEEPSEEK_RESPONSES_MODELS], ["deepseek-v4-flash", "deepseek-v4-pro"]);
+  for (const model of DEEPSEEK_RESPONSES_MODELS) {
+    const caps = resolvePlatform("deepseek", "https://api.deepseek.com/v1", undefined, model);
+    assert.equal(caps.wireApi, "responses", model);
+    assert.equal(caps.reasoning, "deepseek_responses", model);
+    assert.equal(isDeepSeekResponsesModel("deepseek", undefined, model), true, `${model} uses the built-in endpoint`);
+  }
   assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com", undefined, "deepseek-chat").reasoning, "deepseek");
   // The vendor's /anthropic endpoint still wins (checked first) → anthropic wire, not the chat deepseek style.
   assert.equal(resolvePlatform("deepseek", "https://api.deepseek.com/anthropic", undefined, "deepseek-v4-flash").reasoning, "thinking_budget");
@@ -88,6 +95,20 @@ test("resolvePlatform: only DeepSeek V4 Flash uses Responses; Pro/legacy keep th
     "none",
     "unrelated gateway models never inherit DeepSeek-only request fields",
   );
+});
+
+test("resolvePlatform: DeepSeek Responses routing requires the exact official host", () => {
+  for (const baseURL of [
+    "https://api.deepseek.com.example/v1",
+    "https://evil.test/api.deepseek.com/v1",
+    "not a URL containing api.deepseek.com",
+  ]) {
+    assert.equal(isDeepSeekResponsesModel("deepseek", baseURL, "deepseek-v4-pro"), false, baseURL);
+    assert.equal(resolvePlatform("deepseek", baseURL, undefined, "deepseek-v4-pro").wireApi, "chat", baseURL);
+  }
+  assert.equal(isDeepSeekResponsesModel("custom", "https://api.deepseek.com./v1", "DEEPSEEK-V4-PRO"), true);
+  assert.equal(isDeepSeekResponsesModel("deepseek", "https://api.deepseek.com/anthropic", "deepseek-v4-pro"), false);
+  assert.equal(isDeepSeekResponsesModel("deepseek", "https://api.deepseek.com/proxy/v1", "deepseek-v4-pro"), false);
 });
 
 test("resolvePlatform: a custom DashScope baseURL → chat + enable_thinking (custom:qwen3.7-plus)", () => {

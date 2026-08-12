@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import type { Provider, NeutralMsg, ToolUse, TurnArgs, TurnResult } from "./types.js";
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
+import { safeProviderErrorMessage } from "./errors.js";
 import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
 import { resolvePlatform } from "./registry.js";
 
@@ -170,7 +171,7 @@ export function createOpenAIProvider(opts: {
           text: "",
           toolUses: [],
           stop: "error",
-          errorMsg: networkFailure ?? `${e?.status ?? ""} ${e?.message ?? e}`,
+          errorMsg: networkFailure ?? safeProviderErrorMessage(e, [opts.apiKey]),
         };
       }
 
