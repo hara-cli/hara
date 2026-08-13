@@ -94,7 +94,16 @@ import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from ".
 import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
 import { ensureSessionMetadataIndex } from "../session/store.js";
-import { parseFrame, rpcResult, rpcError, rpcNotify, ERR, PROTOCOL_VERSION } from "./protocol.js";
+import {
+  parseFrame,
+  rpcResult,
+  rpcError,
+  rpcNotify,
+  ERR,
+  PROTOCOL_VERSION,
+  type SessionSubmitMode,
+  type SessionSubmitResult,
+} from "./protocol.js";
 import {
   taskLifecycleEvent,
   type TaskLifecycleActivity,
@@ -958,6 +967,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     allowAlways: boolean;
   }>();
   const inFlightRequests = new Set<Promise<void>>();
+  const sessionSubmissionTails = new Map<string, Promise<void>>();
   const automationRuns = new Map<AbortController, ReturnType<typeof runJobTracked>>();
   // Physical provider/tool work can outlive its logical timeout. Keep a process-level ledger independent
   // of SessionHub membership so detach/delete cannot make an updater believe the old engine is quiescent.
@@ -974,6 +984,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     };
     void operation.then(settled, settled);
     return operation;
+  };
+
+  /** Serialize only each input's routing decision, not the lifetime of a started turn. Starting marks the
+   * session busy synchronously and returns a completion Promise, so the next ordered submission can still
+   * steer that live turn while the original request continues streaming. */
+  const enqueueSessionSubmission = <T>(
+    sessionId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const prior = sessionSubmissionTails.get(sessionId) ?? Promise.resolve();
+    const current = prior.catch(() => {}).then(operation);
+    const tail = current.then(() => {}, () => {});
+    sessionSubmissionTails.set(sessionId, tail);
+    void tail.then(() => {
+      if (sessionSubmissionTails.get(sessionId) === tail) sessionSubmissionTails.delete(sessionId);
+    });
+    return current;
   };
 
   const releaseSessionBusyIfIdle = (session: ServeSession): void => {
@@ -1496,6 +1523,173 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     }
   };
 
+  type RunTurnResult = Awaited<ReturnType<typeof runTurn>>;
+  type SubmitResult = SessionSubmitResult<RunTurnResult>;
+  type SubmitDecision = SubmitResult | {
+    submission: "starting";
+    completion: Promise<RunTurnResult>;
+  };
+
+  class SessionSubmitParamsError extends Error {}
+
+  /** One server-owned admission point for user input. The busy/turn check and the chosen mutation are
+   * contiguous before the first awaited start, so renderer event lag cannot turn a send→steer retry into
+   * input for the wrong logical turn. Mention expansion deliberately happens only after routing accepts a
+   * steer; a rejected submission has no filesystem/context side effects. */
+  const submitSessionInput = async (
+    s: ServeSession,
+    input: {
+      text: string;
+      images?: unknown[];
+      attachments?: unknown[];
+      newTask?: boolean;
+      mode: SessionSubmitMode;
+      expectedTurnId?: string;
+      expectedModel?: string;
+      expectedEffort?: string;
+    },
+    deferStartedResult = false,
+  ): Promise<SubmitDecision> => {
+    const intents: SessionAttachmentIntent[] = [
+      ...((input.attachments ?? []) as SessionAttachmentIntent[]),
+      ...((input.images ?? []).map((image: any) => ({
+        kind: "image" as const,
+        path: image?.path,
+        ...(typeof image?.mediaType === "string" ? { mediaType: image.mediaType } : {}),
+      }))),
+    ];
+    const text = input.text;
+    const routingState = (): {
+      occupied: boolean;
+      steerable: boolean;
+      activeTurnId?: string;
+    } => {
+      const steerable = Boolean(
+        s.busy
+        && s.abort
+        && !s.configuring
+        && s.task?.status === "running",
+      );
+      return {
+        occupied: s.busy || s.configuring,
+        steerable,
+        ...(steerable ? { activeTurnId: s.task!.turnId } : {}),
+      };
+    };
+    let state = routingState();
+
+    // A Desktop composer can stage a model/effort change while a turn is still ending. Keep this
+    // precondition in Core so an idle transition can never start the input on the old provider.
+    if (
+      input.expectedModel !== undefined
+      && (
+        s.meta.model !== input.expectedModel
+        || (s.effort ?? "") !== (input.expectedEffort ?? "")
+      )
+    ) {
+      return {
+        submission: "not_submitted",
+        reason: "configuration_mismatch",
+        ...(state.activeTurnId ? { activeTurnId: state.activeTurnId } : {}),
+      };
+    }
+
+    if (input.newTask && state.occupied) {
+      return {
+        submission: "not_submitted",
+        reason: "not_idle",
+        ...(state.activeTurnId ? { activeTurnId: state.activeTurnId } : {}),
+      };
+    }
+    if (input.mode === "start_if_idle" && state.occupied) {
+      return { submission: "not_submitted", reason: "not_idle", ...(state.activeTurnId ? { activeTurnId: state.activeTurnId } : {}) };
+    }
+    if (input.mode === "steer" && !state.steerable) {
+      return {
+        submission: "not_submitted",
+        reason: state.occupied ? "active_turn_not_steerable" : "no_active_turn",
+      };
+    }
+
+    const shouldSteer = input.mode === "steer" || (input.mode === "start_or_steer" && state.occupied);
+    if (shouldSteer) {
+      if (!state.steerable) {
+        return {
+          submission: "not_submitted",
+          reason: "active_turn_not_steerable",
+        };
+      }
+      if (intents.length > 0) {
+        return { submission: "not_submitted", reason: "attachments_not_steerable", activeTurnId: state.activeTurnId };
+      }
+      if (!text.trim()) {
+        return { submission: "not_submitted", reason: "empty_input", activeTurnId: state.activeTurnId };
+      }
+      if (input.mode === "steer" && input.expectedTurnId !== state.activeTurnId) {
+        return {
+          submission: "not_submitted",
+          reason: "expected_turn_mismatch",
+          expectedTurnId: input.expectedTurnId,
+          activeTurnId: state.activeTurnId,
+        };
+      }
+      const expanded = await expandMentionsAsync(text, s.meta.cwd);
+      // Expansion can yield while the previous turn finishes. Re-read the execution plane immediately
+      // before mutation: start_or_steer follows the then-current state; strict steer keeps its turn guard.
+      state = routingState();
+      if (input.mode === "start_or_steer" && !state.occupied) {
+        const completion = runTurn(s, text);
+        if (deferStartedResult) return { submission: "starting", completion };
+        const result = await completion;
+        return { submission: "started", ...result };
+      }
+      if (!state.steerable) {
+        return {
+          submission: "not_submitted",
+          reason: state.occupied ? "active_turn_not_steerable" : "no_active_turn",
+        };
+      }
+      if (input.mode === "steer" && input.expectedTurnId !== state.activeTurnId) {
+        return {
+          submission: "not_submitted",
+          reason: "expected_turn_mismatch",
+          expectedTurnId: input.expectedTurnId,
+          activeTurnId: state.activeTurnId,
+        };
+      }
+      const recorded = recordTaskSteering(s.task, state.activeTurnId!, expanded);
+      if (!recorded.ok) {
+        return {
+          submission: "not_submitted",
+          reason: "active_turn_not_steerable",
+          activeTurnId: state.activeTurnId,
+          detail: recorded.reason,
+        };
+      }
+      s.task = recorded.task;
+      hub.save(s); // executable inbox entry is durable before ACK
+      broadcastTaskState(s, { state: "running", phase: "steering", detail: "Steering accepted" });
+      return { submission: "steered", taskId: s.task.id, turnId: s.task.turnId };
+    }
+
+    if (!text.trim() && intents.length === 0) {
+      return { submission: "not_submitted", reason: "empty_input" };
+    }
+    let validated: ValidatedSessionAttachments;
+    try {
+      validated = validateSessionAttachments(s.meta.cwd, intents);
+    } catch (error) {
+      throw new SessionSubmitParamsError(error instanceof Error ? error.message : String(error));
+    }
+    const effectiveText = text.trim()
+      ? text
+      : "Please inspect the attached context and tell me what you find.";
+    const completion = runTurn(s, effectiveText, validated, input.newTask === true, text);
+    if (deferStartedResult) return { submission: "starting", completion };
+    const result = await completion;
+    return { submission: "started", ...result };
+  };
+
   /** Context watermark for a session: how full the model's window was on the last turn. */
   const ctxOf = (s: ServeSession): { lastInput: number; window: number; pct: number } => {
     const lastInput = s.stats.lastInput ?? 0;
@@ -1603,7 +1797,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
             "server.shutdown",
-            "session.list", "session.create", "session.resume", "session.history", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
+            "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
@@ -1805,41 +1999,96 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               readOnly: true,
             }));
           }
-          case "session.send": {
+          case "session.submit": {
             if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
               return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
             }
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId} — session.create/resume first`));
-            if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "this session is busy or changing configuration"));
             if (p.images !== undefined && !Array.isArray(p.images)) {
               return reply(rpcError(id, ERR.PARAMS, "images must be an array"));
             }
             if (p.attachments !== undefined && !Array.isArray(p.attachments)) {
               return reply(rpcError(id, ERR.PARAMS, "attachments must be an array"));
             }
-            const intents: SessionAttachmentIntent[] = [
-              ...((p.attachments ?? []) as SessionAttachmentIntent[]),
-              ...((p.images ?? []).map((image: any) => ({
-                kind: "image" as const,
-                path: image?.path,
-                ...(typeof image?.mediaType === "string" ? { mediaType: image.mediaType } : {}),
-              }))),
-            ];
-            if (!p.text.trim() && intents.length === 0) {
-              return reply(rpcError(id, ERR.PARAMS, "text or at least one attachment is required"));
+            const mode = p.mode ?? "start_or_steer";
+            if (mode !== "start_or_steer" && mode !== "start_if_idle" && mode !== "steer") {
+              return reply(rpcError(id, ERR.PARAMS, "mode must be start_or_steer, start_if_idle, or steer"));
             }
-            let validated: ValidatedSessionAttachments;
+            if (mode === "steer" && typeof p.expectedTurnId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "expectedTurnId required for steer mode"));
+            }
+            if (p.expectedModel !== undefined && (typeof p.expectedModel !== "string" || !p.expectedModel)) {
+              return reply(rpcError(id, ERR.PARAMS, "expectedModel must be a non-empty string"));
+            }
+            if (p.expectedEffort !== undefined && typeof p.expectedEffort !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "expectedEffort must be a string"));
+            }
+            if (p.expectedEffort !== undefined && p.expectedModel === undefined) {
+              return reply(rpcError(id, ERR.PARAMS, "expectedModel required with expectedEffort"));
+            }
             try {
-              validated = validateSessionAttachments(s.meta.cwd, intents);
-            } catch (error: any) {
-              return reply(rpcError(id, ERR.PARAMS, String(error?.message ?? error)));
+              const decision = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
+                  text: p.text,
+                  images: p.images,
+                  attachments: p.attachments,
+                  newTask: p.newTask === true,
+                  mode,
+                  expectedTurnId: p.expectedTurnId,
+                  expectedModel: p.expectedModel,
+                  expectedEffort: p.expectedEffort,
+                }, true));
+              const result = decision.submission === "starting"
+                ? { submission: "started" as const, ...await decision.completion }
+                : decision;
+              return reply(rpcResult(id!, result));
+            } catch (error) {
+              if (error instanceof SessionSubmitParamsError) {
+                return reply(rpcError(id, ERR.PARAMS, error.message));
+              }
+              throw error;
             }
-            const text = p.text.trim()
-              ? p.text
-              : "Please inspect the attached context and tell me what you find.";
-            const r = await runTurn(s, text, validated, p.newTask === true, p.text);
-            return reply(rpcResult(id!, r));
+          }
+          case "session.send": {
+            if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
+            }
+            const s = hub.get(p.sessionId);
+            if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId} — session.create/resume first`));
+            if (p.images !== undefined && !Array.isArray(p.images)) {
+              return reply(rpcError(id, ERR.PARAMS, "images must be an array"));
+            }
+            if (p.attachments !== undefined && !Array.isArray(p.attachments)) {
+              return reply(rpcError(id, ERR.PARAMS, "attachments must be an array"));
+            }
+            try {
+              const decision = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
+                  text: p.text,
+                  images: p.images,
+                  attachments: p.attachments,
+                  newTask: p.newTask === true,
+                  mode: "start_if_idle",
+                }, true));
+              const result = decision.submission === "starting"
+                ? { submission: "started" as const, ...await decision.completion }
+                : decision;
+              if (result.submission === "not_submitted") {
+                if (result.reason === "empty_input") {
+                  return reply(rpcError(id, ERR.PARAMS, "text or at least one attachment is required"));
+                }
+                return reply(rpcError(id, ERR.BUSY, "this session is busy or changing configuration"));
+              }
+              if (result.submission !== "started") {
+                return reply(rpcError(id, ERR.INTERNAL, "legacy session.send unexpectedly steered"));
+              }
+              const { submission: _submission, ...legacy } = result;
+              return reply(rpcResult(id!, legacy));
+            } catch (error) {
+              if (error instanceof SessionSubmitParamsError) {
+                return reply(rpcError(id, ERR.PARAMS, error.message));
+              }
+              throw error;
+            }
           }
           case "session.steer": {
             if (typeof p.sessionId !== "string" || typeof p.text !== "string" || !p.text || typeof p.expectedTurnId !== "string") {
@@ -1847,14 +2096,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
-            if (!s.busy || !s.abort || s.configuring) return reply(rpcError(id, ERR.BUSY, "there is no steerable running turn"));
-            const expanded = await expandMentionsAsync(p.text, s.meta.cwd, { signal: s.abort.signal });
-            const recorded = recordTaskSteering(s.task, p.expectedTurnId, expanded);
-            if (!recorded.ok) return reply(rpcError(id, ERR.BUSY, recorded.reason));
-            s.task = recorded.task;
-            hub.save(s); // executable inbox entry is durable before ACK
-            broadcastTaskState(s, { state: "running", phase: "steering", detail: "Steering accepted" });
-            return reply(rpcResult(id!, { accepted: true, taskId: s.task.id, turnId: s.task.turnId }));
+            const result = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
+                text: p.text,
+                mode: "steer",
+                expectedTurnId: p.expectedTurnId,
+              }));
+            if (result.submission !== "steered") {
+              const detail = result.submission === "not_submitted"
+                ? result.reason === "expected_turn_mismatch"
+                  ? `stale steer for turn ${p.expectedTurnId}; active turn is ${result.activeTurnId ?? "none"}`
+                  : result.detail ?? result.reason
+                : "steer unexpectedly started a turn";
+              return reply(rpcError(id, ERR.BUSY, detail));
+            }
+            return reply(rpcResult(id!, { accepted: true, taskId: result.taskId, turnId: result.turnId }));
           }
           case "session.interrupt": {
             const s = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;

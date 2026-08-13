@@ -20,9 +20,19 @@
 //   session.fork      {sessionId,targetProfileId?,targetModel?,transferHistory?}
 //                                                   → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    Cross-route copies require transferHistory:true.
-//   session.send      {sessionId,text,images?,attachments?,newTask?} → (streams events, then)
+//   session.submit    {sessionId,text,images?,attachments?,newTask?,mode?,expectedTurnId?,expectedModel?,expectedEffort?}
+//                                                   → {submission:"started",reply,usage,taskId,turnId,…}
+//                                                   | {submission:"steered",taskId,turnId}
+//                                                   | {submission:"not_submitted",reason,activeTurnId?}
+//                      mode: "start_or_steer" (default) atomically starts an idle session or steers its
+//                            authoritative live turn; "start_if_idle" and "steer" expose strict variants.
+//                      newTask:true is never steerable: when occupied it returns not_idle and starts only
+//                                   after the session is idle.
+//                      expectedModel + expectedEffort guard a staged next-turn route from starting on an
+//                                   older provider configuration during an idle transition.
+//   session.send      {sessionId,text,images?,attachments?,newTask?} → (legacy start_if_idle; streams events, then)
 //                                                             {reply,usage,taskId,turnId,status?,stopReason?}
-//   session.steer     {sessionId,text,expectedTurnId} → {accepted,taskId,turnId}
+//   session.steer     {sessionId,text,expectedTurnId} → {accepted,taskId,turnId} (legacy strict steer)
 //                      images: [{path,mediaType?}] — pasted screenshots etc., inlined for vision models
 //                      attachments: [{kind:"image"|"file"|"directory",path,mediaType?}]
 //                      File-picker paths avoid lossy @mention encoding; Serve enforces type/security limits.
@@ -110,6 +120,30 @@
 // Provider reasoning content is intentionally never sent to persistent clients.
 
 export const PROTOCOL_VERSION = 1;
+
+/** One ordered Core routing decision. Adding this method is protocol-v1 compatible because clients
+ * feature-detect methods during initialize; session.send/session.steer remain legacy adapters. */
+export type SessionSubmitMode = "start_or_steer" | "start_if_idle" | "steer";
+
+export type SessionNotSubmittedReason =
+  | "not_idle"
+  | "no_active_turn"
+  | "expected_turn_mismatch"
+  | "configuration_mismatch"
+  | "active_turn_not_steerable"
+  | "attachments_not_steerable"
+  | "empty_input";
+
+export type SessionSubmitResult<TStarted> =
+  | ({ submission: "started" } & TStarted)
+  | { submission: "steered"; taskId: string; turnId: string }
+  | {
+      submission: "not_submitted";
+      reason: SessionNotSubmittedReason;
+      activeTurnId?: string;
+      expectedTurnId?: string;
+      detail?: string;
+    };
 
 export interface RpcRequest {
   jsonrpc: "2.0";

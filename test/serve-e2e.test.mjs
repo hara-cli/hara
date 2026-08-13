@@ -401,6 +401,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
     }
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
+    assert.ok(init.result.capabilities.methods.includes("session.submit"), "atomic turn-input routing advertised");
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
     assert.ok(init.result.capabilities.events.includes("event.surface"), "typed visual surface event advertised");
     assert.deepEqual(
@@ -2130,6 +2131,185 @@ test("serve e2e: session.steer targets the live turn and stays in the same task"
   } finally {
     releaseFirst?.();
     if (sending) await sending.catch(() => {});
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: session.submit atomically starts or steers and reports non-submission", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-submit-"));
+  const store = memStore();
+  let releaseFirst;
+  let calls = 0;
+  const providerHistories = [];
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ history, onText }) {
+      calls++;
+      providerHistories.push(structuredClone(history));
+      if (calls === 1) {
+        await new Promise((resolve) => { releaseFirst = resolve; });
+        onText("first");
+        return { text: "first", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+      }
+      onText("steered");
+      return { text: "steered", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  let starting;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    starting = c.call("session.submit", {
+      sessionId: result.sessionId,
+      text: "primary objective",
+      mode: "start_or_steer",
+    });
+    const started = await c.waitEvent("event.turn_start");
+
+    const idleOnly = await c.call("session.submit", {
+      sessionId: result.sessionId,
+      text: "wait for the next turn",
+      mode: "start_if_idle",
+    });
+    assert.deepEqual(idleOnly.result, {
+      submission: "not_submitted",
+      reason: "not_idle",
+      activeTurnId: started.params.turnId,
+    });
+
+    const pendingModelRoute = await c.call("session.submit", {
+      sessionId: result.sessionId,
+      text: "use the newly selected model",
+      mode: "start_if_idle",
+      expectedModel: "fake-2",
+      expectedEffort: "high",
+    });
+    assert.deepEqual(pendingModelRoute.result, {
+      submission: "not_submitted",
+      reason: "configuration_mismatch",
+      activeTurnId: started.params.turnId,
+    }, "a staged composer route cannot start or steer on the previous provider");
+
+    const forcedNewTask = await c.call("session.submit", {
+      sessionId: result.sessionId,
+      text: "a separate objective",
+      newTask: true,
+    });
+    assert.deepEqual(forcedNewTask.result, {
+      submission: "not_submitted",
+      reason: "not_idle",
+      activeTurnId: started.params.turnId,
+    }, "newTask never steers into the currently running task");
+
+    const wrongTurn = await c.call("session.submit", {
+      sessionId: result.sessionId,
+      text: "strict stale steer",
+      mode: "steer",
+      expectedTurnId: "stale-turn",
+    });
+    assert.deepEqual(wrongTurn.result, {
+      submission: "not_submitted",
+      reason: "expected_turn_mismatch",
+      expectedTurnId: "stale-turn",
+      activeTurnId: started.params.turnId,
+    });
+
+    const attachment = await c.call("session.submit", {
+      sessionId: result.sessionId,
+      text: "inspect this later",
+      attachments: [{ kind: "file", path: join(dir, "not-opened-during-steer.txt") }],
+    });
+    assert.deepEqual(attachment.result, {
+      submission: "not_submitted",
+      reason: "attachments_not_steerable",
+      activeTurnId: started.params.turnId,
+    }, "an active turn rejects attachment steering without touching the selected path");
+
+    const steered = await c.call("session.submit", {
+      sessionId: result.sessionId,
+      text: "also cover the edge case",
+    });
+    assert.equal(steered.result.submission, "steered");
+    assert.equal(steered.result.taskId, started.params.taskId);
+    assert.equal(steered.result.turnId, started.params.turnId);
+
+    releaseFirst();
+    const completed = await starting;
+    assert.equal(completed.result.submission, "started");
+    assert.equal(completed.result.reply, "steered");
+    assert.equal(completed.result.taskId, started.params.taskId);
+    assert.equal(calls, 2);
+    assert.ok(providerHistories[1].some((message) => message.role === "user" && message.content.includes("also cover the edge case")));
+
+    const noActiveTurn = await c.call("session.submit", {
+      sessionId: result.sessionId,
+      text: "too late",
+      mode: "steer",
+      expectedTurnId: started.params.turnId,
+    });
+    assert.equal(noActiveTurn.result.submission, "not_submitted");
+    assert.equal(noActiveTurn.result.reason, "no_active_turn");
+    assert.equal(noActiveTurn.result.activeTurnId, undefined, "an idle session must not leak the prior turn as active");
+  } finally {
+    releaseFirst?.();
+    if (starting) await starting.catch(() => {});
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: concurrent session.submit calls preserve wire order without waiting for turn completion", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-submit-order-"));
+  const store = memStore();
+  let releaseFirst;
+  let calls = 0;
+  const providerHistories = [];
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ history }) {
+      calls++;
+      providerHistories.push(structuredClone(history));
+      if (calls === 1) {
+        await new Promise((resolve) => { releaseFirst = resolve; });
+        return { text: "first", toolUses: [], stop: "end" };
+      }
+      return { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  let first;
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    first = c.call("session.submit", { sessionId: result.sessionId, text: "primary" });
+    await c.waitEvent("event.turn_start");
+
+    const [second, third] = await Promise.all([
+      c.call("session.submit", { sessionId: result.sessionId, text: "follow-up two" }),
+      c.call("session.submit", { sessionId: result.sessionId, text: "follow-up three" }),
+    ]);
+    assert.equal(second.result.submission, "steered");
+    assert.equal(third.result.submission, "steered");
+
+    releaseFirst();
+    assert.equal((await first).result.submission, "started");
+    assert.equal(calls, 2, "both concurrent steering inputs are consumed by one ordered follow-up round");
+    const followUps = providerHistories[1]
+      .filter((message) => message.role === "user" && message.content.includes(INTERJECT_PREFIX))
+      .map((message) => message.content);
+    assert.match(followUps[0], /follow-up two/);
+    assert.match(followUps[1], /follow-up three/);
+  } finally {
+    releaseFirst?.();
+    if (first) await first.catch(() => {});
     c.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });

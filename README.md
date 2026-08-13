@@ -347,10 +347,15 @@ vision model into **actionable** output — interactive elements + positions (pa
 Markdown transcript. The current task is persisted separately with stable task/turn identity and recovers as
 paused rather than being inferred from chat text. At idle, ordinary input starts a new task; an explicit
 `继续` / `continue` / `resume` / `go on` resumes the paused objective, while `/new` forces a clean task boundary.
-Type-ahead Enter steers the exact live turn; `/next <message>` queues a separate task after it. Desktop/serve
-clients use `session.steer` with `expectedTurnId` (durable before ACK) and may pass `newTask: true` to force a
-new execution. The `hara resume` launcher preserves terminal input in both npm/Node and standalone-binary
-installs.
+Type-ahead Enter steers the exact live turn; `/next <message>` queues a separate task after it. Current
+Desktop/serve clients use the feature-detected `session.submit` admission point: Core atomically starts an
+idle session or steers its authoritative live turn, serializes concurrent submissions in arrival order, and
+returns an explicit non-submission reason when attachments or a forced `newTask` must wait for the next turn.
+When Desktop has staged a model or thinking change, `expectedModel` + `expectedEffort` also keep an idle
+transition from starting that input on the previous provider configuration.
+Older protocol-v1 clients remain compatible through strict `session.send` and expected-turn
+`session.steer`; accepted steering is durable before ACK. The `hara resume` launcher preserves terminal input
+in both npm/Node and standalone-binary installs.
 **Local deliverables**: Hara Serve 0.128 adds the first local `artifact/1` foundation for presentations,
 spreadsheets, and documents. An authenticated Desktop client can import, list, integrity-check, and inspect
 version history through `artifact.import|list|get|revisions`. The next revision transaction slice also

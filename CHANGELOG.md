@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.146.3 — 2026-08-13 — authoritative turn input routing
+
+- Add the feature-detected `session.submit` Serve method so Core, rather than delayed renderer state,
+  atomically decides whether input starts an idle turn, steers the authoritative live turn, or is not
+  submitted. Concurrent submissions for one session retain arrival order without blocking steering on the
+  lifetime of the original request; accepted steering remains durable before acknowledgement.
+- Preserve protocol-v1 compatibility through the existing strict `session.send` and expected-turn
+  `session.steer` adapters. Idle or configuring sessions no longer expose a stale prior turn as active, and
+  `newTask: true` can never be inserted into the currently running task.
+- Keep attachments coupled to their text and reject attachment steering before opening any selected path.
+  Desktop can therefore queue the complete input for the next turn without losing it, misattributing a late
+  `turn_end`, or reporting an old turn as live. Upgrade with `npm i -g @nanhara/hara@0.146.3`.
+- Let persistent clients bind a submission to the staged model and thinking effort. Core rejects a stale
+  configuration instead of starting the next turn on the previous provider during an idle transition.
+
 ## 0.146.2 — 2026-08-13 — DeepSeek V4 Pro Responses parity
 
 - Route official `deepseek-v4-pro` requests through the same native, stateless Responses API already used
