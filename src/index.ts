@@ -9,6 +9,7 @@ import {
   effectiveAttachmentCapabilities,
   locateImage,
   classifyVision,
+  visionSidecarAuthorized,
   SCREENSHOT_SYSTEM,
 } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
@@ -18,7 +19,6 @@ import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync, realpathSync, statSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
 import {
   loadConfig,
@@ -159,7 +159,12 @@ import { getTools, type Tool, type ToolContext } from "./tools/registry.js";
 import { resetReachability } from "./tools/net-reachability.js";
 import { resetRepeatGuard } from "./agent/repeat-guard.js";
 import { allowsEvolutionTool, EVOLUTION_SYSTEM, evolutionStatus, shouldAutoEvolve } from "./agent/evolution.js";
-import { EXPLORE_SYSTEM } from "./tools/agent.js";
+import {
+  createNativeSubagentProvider,
+  NATIVE_SUBAGENT_PROVIDER_ID,
+  type NativeSubagentRequest,
+} from "./subagent/native.js";
+import { SubagentRuntime, subagentResultText } from "./subagent/runtime.js";
 import {
   overrideProviderTarget,
   profileByIdForConfig,
@@ -263,7 +268,7 @@ import {
 } from "./session/transfer.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
 import { createPhysicalOperationDrain } from "./session/operation-drain.js";
-import { loadGlobalRoles, loadRoles, orgRolesDir, roleToolFilter, scaffoldRoles, subagentToolFilter, type Role } from "./org/roles.js";
+import { loadGlobalRoles, loadRoles, orgRolesDir, roleToolFilter, scaffoldRoles, type Role } from "./org/roles.js";
 import { buildAgentsIndex, canonicalProjectPath, resolveAgent, loadProjects, addProject, removeProject, type AgentIndexEntry } from "./org/projects.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks, haraBinDir } from "./plugins/plugins.js";
@@ -1720,6 +1725,20 @@ async function maybeAutoCompact(
 }
 
 /** Run a (read-only by default) sub-agent to completion, quietly, and return its final text. */
+const subagentRuntimes = new WeakMap<object, SubagentRuntime<NativeSubagentRequest>>();
+
+function subagentRuntimeFor(stats: object): SubagentRuntime<NativeSubagentRequest> {
+  const current = subagentRuntimes.get(stats);
+  if (current) return current;
+  const runtime = new SubagentRuntime<NativeSubagentRequest>({
+    maxConcurrent: maxParallel(),
+    maxQueued: maxParallel() * 4,
+  });
+  runtime.register(createNativeSubagentProvider());
+  subagentRuntimes.set(stats, runtime);
+  return runtime;
+}
+
 async function runSubagent(
   cfg: HaraConfig,
   baseProvider: Provider,
@@ -1734,81 +1753,23 @@ async function runSubagent(
   boundProfileId?: string,
 ): Promise<string> {
   const executionProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
-  const roles = loadRoles(cwd, executionProfileId);
-  const roleRef = roleId?.trim();
-  if (roleId !== undefined && !roleRef) return "Error: sub-agent role cannot be blank.";
-  let role: Role | undefined;
-  if (roleRef?.includes(":")) {
-    const hit = resolveAgent(roleRef, cwd, executionProfileId);
-    if (hit && "ambiguous" in hit) {
-      return `Error: sub-agent role '${roleRef}' is ambiguous; use one of: ${hit.ambiguous.map((entry) => `${entry.project}:${entry.name}`).join(", ")}.`;
-    }
-    if (hit?.project && resolve(hit.home) !== resolve(cwd)) {
-      return `Error: sub-agent role '${roleRef}' belongs to ${hit.home}; nested read-only agents stay in their parent home (${cwd}).`;
-    }
-    if (hit && !("ambiguous" in hit)) {
-      role = hit.project
-        ? roles.find((candidate) => candidate.id === hit.name)
-        : loadGlobalRoles(executionProfileId).find((candidate) => candidate.id === hit.name);
-    }
-  } else if (roleRef) {
-    role = roles.find((candidate) => candidate.id === roleRef);
-  }
-  // Built-in explore persona: `agent(role:"explore")` works with ZERO user setup (a user-defined
-  // explore role still wins — it was found above and carries its own system).
-  const builtinSystem = !role && roleRef === "explore" ? EXPLORE_SYSTEM : undefined;
-  if (roleRef && !role && !builtinSystem) {
-    return `Error: no sub-agent role '${roleRef}' is available in ${cwd}. Use a local role id, global:<name>, or role "explore".`;
-  }
-  const __subModel = effectiveRoleModel(role?.model, baseProvider.model);
-  const provider = __subModel && __subModel !== baseProvider.model
-    ? ((await buildProvider(cfg, { model: __subModel }, executionProfileId)) ?? baseProvider)
-    : baseProvider;
-  // A sub-agent runs full-auto + UNCONFIRMED + parallel, so it is ALWAYS read-only — a role may narrow
-  // further but can never GRANT write/exec to a fan-out sub-agent (that would bypass the approval gate).
-  // Write-capable roles run in the main loop via `hara org`, behind the user's gate.
-  const toolFilter = subagentToolFilter(role, (n: string) => READONLY_TOOLS.has(n));
-  const subHistory: NeutralMsg[] = [{ role: "user", content: task }];
-  const todoScope = `subagent:${randomUUID()}`;
-  let outcome: RunOutcome;
-  try {
-    outcome = await runAgent(subHistory, {
-      provider,
-      ctx: { cwd, sandbox, todoScope, profileId: executionProfileId }, // isolated checklist; no spawn → no recursion
-      approval: "full-auto", // read-only tools, so no prompts (can't prompt in parallel)
-      confirm: async () => true,
-      projectContext,
-      memory: memoryDigest(cwd),
-      stats,
-      systemOverride: role?.system ?? builtinSystem,
-      toolFilter,
-      hooks: false,
-      quiet: true,
-      signal,
-      timeoutMs: Math.min(cfg.runTimeoutMs, 8 * 60_000),
-      maxRounds: Math.min(cfg.maxAgentRounds, 24),
-      ...(observers ?? {}),
-    });
-  } finally {
-    disposeTodoScope(todoScope);
-    disposeReminderScope(todoScope);
-    resetRepeatGuard(todoScope);
-    clearTouched(todoScope);
-  }
-  if (outcome.status !== "completed") {
-    const reason = outcome.error?.trim()
-      || (outcome.status === "empty"
-        ? "the model returned an empty response"
-        : outcome.stopReason
-          ? `the run stopped (${outcome.stopReason})`
-          : `the run ended with status ${outcome.status}`);
-    return `Error: sub-agent ${reason}`;
-  }
-  for (let i = subHistory.length - 1; i >= 0; i--) {
-    const m = subHistory[i] as { role: string; text?: string };
-    if (m.role === "assistant" && typeof m.text === "string" && m.text.trim()) return m.text.trim();
-  }
-  return "(sub-agent produced no output)";
+  const result = await subagentRuntimeFor(stats).run(NATIVE_SUBAGENT_PROVIDER_ID, {
+    task,
+    ...(roleId !== undefined ? { role: roleId } : {}),
+    signal,
+    baseProvider,
+    cwd,
+    sandbox,
+    projectContext,
+    profileId: executionProfileId,
+    parentStats: stats,
+    timeoutMs: cfg.runTimeoutMs,
+    maxRounds: cfg.maxAgentRounds,
+    observers,
+    isReadonlyTool: (name) => READONLY_TOOLS.has(name),
+    resolveProvider: (model, profileId) => buildProvider(cfg, { model }, profileId),
+  });
+  return subagentResultText(result);
 }
 
 /** Check the hara setup and print a health summary (provider/auth/model/node/assets/roles). */
@@ -2966,9 +2927,19 @@ program
             : { ...resolveByokProviderTarget(live, profile, false), model: opts.model };
           const native = classifyVision(target.provider, opts.model, live.modelVision);
           if (native === "vision") return { images };
-          if (!live.visionModel) {
+          const visionAuthorized = visionSidecarAuthorized(
+            live.visionModel,
+            profile.kind === "gateway" ? profile.availableModels ?? [] : undefined,
+          );
+          if (!visionAuthorized) {
             throw new Error(
-              native === "text"
+              profile.kind === "gateway" && live.visionModel
+                ? (
+                    `the advanced image fallback '${live.visionModel}' is not authorized for organization ` +
+                    `connection '${profile.id}'; use an image-capable model or organization-managed image ` +
+                    "fallback from this connection"
+                  )
+                : native === "text"
                 ? `model '${opts.model}' cannot read images; switch to an image-capable main model or configure the advanced image fallback`
                 : (
                     `image capability for model '${opts.model}' is unknown; ` +
@@ -3155,6 +3126,7 @@ program
               model,
               live.modelVision,
               live.visionModel,
+              profile.kind === "gateway" ? profile.availableModels ?? [] : undefined,
             ),
             ...(profile.kind === "gateway" && profile.availableModels?.length
               ? { availableModels: [...profile.availableModels] }

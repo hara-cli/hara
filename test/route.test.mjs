@@ -10,6 +10,12 @@ test("isTrivialTurn: trivial Q&A → true; coding/action/code/long → false (co
   assert.equal(isTrivialTurn("fix the bug in app.js"), false);
   assert.equal(isTrivialTurn("refactor this function"), false);
   assert.equal(isTrivialTurn("add a test for the parser"), false);
+  assert.equal(isTrivialTurn("修复这个问题"), false);
+  assert.equal(isTrivialTurn("继续优化并发布"), false);
+  assert.equal(isTrivialTurn("开始"), false, "a continuation command must retain the context-capable primary model");
+  assert.equal(isTrivialTurn("谢谢"), true);
+  assert.equal(isTrivialTurn("什么是闭包？"), true);
+  assert.equal(isTrivialTurn("这是一段较长的中文说明，用于确认没有空格的实质内容不会仅仅因为它没有英文动作词就被当作普通闲聊并路由到较弱的备用模型，从而降低理解和执行质量。"), false);
   assert.equal(isTrivialTurn("`npm test`"), false); // backtick / code
   assert.equal(isTrivialTurn("see https://example.com"), false); // URL
   assert.equal(isTrivialTurn("x".repeat(200)), false); // too long

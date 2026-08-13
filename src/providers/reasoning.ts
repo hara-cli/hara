@@ -12,12 +12,10 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `reasoning_effort` — OpenAI chat reasoning models (o-series / gpt-5): the `reasoning_effort` enum.
  *  - `reasoning_object` — OpenAI Responses API: `reasoning: { effort }` (for the responses transport).
  *  - `deepseek_responses` — DeepSeek V4 Flash/Pro Responses API: `reasoning: { effort }`, with DeepSeek's
- *                         documented low|high|max levels. `off` is intentionally omitted here because
- *                         the Responses endpoint has no documented disabled value; the provider factory
- *                         falls back to DeepSeek Chat for that one explicit setting.
+ *                         documented none|low|high|max values (`none` disables thinking).
  *  - `deepseek`         — DeepSeek V4 OpenAI-compat chat: a `thinking: { type }` on/off object PLUS a
- *                         `reasoning_effort` enum whose NATIVE values are only `high`|`max` (the server
- *                         accepts low/medium but maps them → high, and xhigh → max). OFF must go through
+ *                         `reasoning_effort` enum whose native values are `low`|`high`|`max` (the server
+ *                         maps medium/xhigh → high). OFF must go through
  *                         `thinking: { type: "disabled" }` because `reasoning_effort` has no off/minimal —
  *                         those would be read as high. Unlike the OpenAI `reasoning_effort` style this is
  *                         NOT gated on isReasoningModel — DeepSeek's own thinking models own that switch.
@@ -66,19 +64,16 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
       if (!isReasoningModel(model)) return {};
       return { reasoning: { effort: effort === "off" ? "minimal" : effort === "max" ? "high" : effort } };
     case "deepseek_responses":
-      // DeepSeek's Responses compatibility surface currently exposes low|high|max, but no documented
-      // disabled/minimal value. The factory routes an explicit `off` through Chat Completions where
-      // `thinking:{type:"disabled"}` is supported. Never invent an unsupported Responses enum here.
-      if (effort === "off") return {};
-      return { reasoning: { effort: effort === "medium" ? "high" : effort } };
+      // DeepSeek Responses owns a provider-specific `none` value for disabling thinking. Keep the
+      // transport stable instead of silently switching an `off` request to Chat Completions.
+      return { reasoning: { effort: effort === "off" ? "none" : effort === "medium" ? "high" : effort } };
     case "deepseek":
       // off → turn thinking OFF via the object (reasoning_effort can't say "off"). Any level → thinking ON
-      // + the effort enum. DeepSeek natively exposes high|max; normalize legacy low/medium config values
-      // to high so the wire request always uses a documented option.
+      // + the effort enum. Normalize the cross-provider `medium` value to DeepSeek's documented `high`.
       if (effort === "off") return { thinking: { type: "disabled" } };
       return {
         thinking: { type: "enabled" },
-        reasoning_effort: effort === "max" ? "max" : "high",
+        reasoning_effort: effort === "low" ? "low" : effort === "max" ? "max" : "high",
       };
     case "thinking_budget": // Anthropic — applied by anthropic.ts, not on a chat/responses merge body
     case "none":

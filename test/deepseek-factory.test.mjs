@@ -35,7 +35,7 @@ function rewriteDeepSeekTo(localBaseURL, nativeFetch) {
   };
 }
 
-test("official DeepSeek V4 Pro factory uses Responses and preserves explicit off via Chat", async (t) => {
+test("official DeepSeek V4 Pro factory keeps every thinking level on Responses", async (t) => {
   const restoreEnvironment = clearProxyEnvironment();
   let requestPath;
   let requestBody;
@@ -46,23 +46,12 @@ test("official DeepSeek V4 Pro factory uses Responses and preserves explicit off
     request.on("end", () => {
       requestBody = JSON.parse(body);
       response.writeHead(200, { "content-type": "text/event-stream" });
-      if (request.url === "/responses") {
-        response.end(
-          "event: response.output_text.delta\n"
-          + 'data: {"type":"response.output_text.delta","sequence_number":0,"item_id":"msg_1","output_index":0,"delta":"ok"}\n\n'
-          + "event: response.completed\n"
-          + 'data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_pro","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
-        );
-        return;
-      }
-      response.end([
-        'data: {"id":"chat_pro","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}',
-        "",
-        'data: {"id":"chat_pro","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
-        "",
-        "data: [DONE]",
-        "",
-      ].join("\n"));
+      response.end(
+        "event: response.output_text.delta\n"
+        + 'data: {"type":"response.output_text.delta","sequence_number":0,"item_id":"msg_1","output_index":0,"delta":"ok"}\n\n'
+        + "event: response.completed\n"
+        + 'data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp_pro","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+      );
     });
   });
   server.listen(0, "127.0.0.1");
@@ -94,7 +83,7 @@ test("official DeepSeek V4 Pro factory uses Responses and preserves explicit off
       assert.equal(requestBody.store, undefined);
     });
 
-    await t.test("off uses Chat thinking.disabled", async () => {
+    await t.test("off uses Responses reasoning.none", async () => {
       const provider = await createProviderForTarget({
         provider: "deepseek",
         apiKey: "synthetic-deepseek-key",
@@ -109,9 +98,8 @@ test("official DeepSeek V4 Pro factory uses Responses and preserves explicit off
         onText: () => {},
       });
       assert.equal(result.stop, "end", result.errorMsg);
-      assert.equal(requestPath, "/chat/completions");
-      assert.deepEqual(requestBody.thinking, { type: "disabled" });
-      assert.equal(requestBody.reasoning_effort, undefined);
+      assert.equal(requestPath, "/responses");
+      assert.deepEqual(requestBody.reasoning, { effort: "none" });
     });
   } finally {
     globalThis.fetch = originalFetch;

@@ -40,20 +40,6 @@ export async function createProviderForTarget(
     return createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort, fetch });
   }
   if (wire === "responses") {
-    // DeepSeek documents no `off` value for Responses reasoning. Preserve the user's explicit choice by
-    // using its Chat endpoint for that one mode, where thinking.disabled is supported. All other V4
-    // requests use native stateless Responses streaming.
-    if (caps.reasoning === "deepseek_responses" && reasoningEffort === "off") {
-      return createOpenAIProvider({
-        apiKey: transportKey,
-        model,
-        baseURL,
-        label: provider,
-        reasoningEffort,
-        reasoningStyle: "deepseek",
-        fetch,
-      });
-    }
     return createResponsesProvider({
       apiKey: transportKey,
       model,

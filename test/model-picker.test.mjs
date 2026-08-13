@@ -11,12 +11,12 @@ import {
   listModels,
 } from "../dist/providers/models.js";
 
-test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSeek uses its native off/high/max; none → nothing", () => {
+test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSeek uses off plus native low/high/max; none → nothing", () => {
   assert.deepEqual(levelsFor("enable_thinking"), ["off", "high"]);
   assert.deepEqual(levelsFor("ollama_think"), ["off", "high"]);
   assert.deepEqual(levelsFor("reasoning_effort"), ["off", "low", "medium", "high"]);
   assert.deepEqual(levelsFor("thinking_budget"), ["off", "low", "medium", "high"]);
-  assert.deepEqual(levelsFor("deepseek"), ["off", "high", "max"]);
+  assert.deepEqual(levelsFor("deepseek"), ["off", "low", "high", "max"]);
   assert.deepEqual(levelsFor("deepseek_responses"), ["off", "low", "high", "max"]);
   assert.deepEqual(levelsFor("none"), []);
   assert.deepEqual(levelsFor("enable_thinking", "qwen3-coder-next"), [], "model-level capability overrides the shared endpoint");

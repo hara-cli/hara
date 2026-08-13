@@ -102,8 +102,8 @@ export interface HaraConfig {
    *   - "low"    → small budget (anthropic budget_tokens, openai reasoning_effort:"low")
    *   - "medium" → balanced (anthropic adaptive, openai reasoning_effort:"medium")
    *   - "high"   → large budget (anthropic budget_tokens up, openai reasoning_effort:"high")
-   *  Provider adapters map this to the closest supported control. DeepSeek V4 Flash uses Responses
-   *  for low/high/max; "off" deliberately falls back to Chat with `thinking.disabled`. */
+   *  Provider adapters map this to the closest supported control. Official DeepSeek V4 Flash/Pro use
+   *  Responses for the complete native none/low/high/max set (`off` maps to `none`). */
   reasoningEffort: "off" | "low" | "medium" | "high" | "max" | undefined;
   /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
   hooks: HooksConfig;

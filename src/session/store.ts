@@ -22,7 +22,11 @@ import {
 } from "node:fs";
 import { opendir as openDirAsync } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import type { NeutralMsg } from "../providers/types.js";
+import {
+  MAX_ASSISTANT_CONTINUATION_CHARS,
+  MAX_ASSISTANT_CONTINUATION_ITEMS,
+  type NeutralMsg,
+} from "../providers/types.js";
 import { redactSensitiveValue } from "../security/secrets.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
@@ -1180,6 +1184,42 @@ function isPersistedTodo(value: unknown): boolean {
   );
 }
 
+function isAssistantContinuation(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const continuation = value as Record<string, unknown>;
+  if (continuation.type === "chat_reasoning") {
+    return typeof continuation.text === "string"
+      && continuation.text.length <= MAX_ASSISTANT_CONTINUATION_CHARS;
+  }
+  if (
+    continuation.type !== "responses_reasoning"
+    || !Array.isArray(continuation.items)
+    || continuation.items.length > MAX_ASSISTANT_CONTINUATION_ITEMS
+  ) return false;
+  let textChars = 0;
+  return continuation.items.every((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+    const item = raw as Record<string, unknown>;
+    const validParts = (parts: unknown, type: string): boolean => Array.isArray(parts)
+      && parts.length <= MAX_ASSISTANT_CONTINUATION_ITEMS
+      && parts.every((rawPart) => {
+        if (!rawPart || typeof rawPart !== "object" || Array.isArray(rawPart)) return false;
+        const part = rawPart as Record<string, unknown>;
+        if (part.type !== type || typeof part.text !== "string") return false;
+        textChars += part.text.length;
+        return textChars <= MAX_ASSISTANT_CONTINUATION_CHARS;
+      });
+    if (typeof item.encrypted_content === "string") textChars += item.encrypted_content.length;
+    return item.type === "reasoning"
+      && typeof item.id === "string"
+      && validParts(item.summary, "summary_text")
+      && (item.content === undefined || validParts(item.content, "reasoning_text"))
+      && (item.encrypted_content === undefined || item.encrypted_content === null || typeof item.encrypted_content === "string")
+      && textChars <= MAX_ASSISTANT_CONTINUATION_CHARS
+      && (item.status === undefined || item.status === "in_progress" || item.status === "completed" || item.status === "incomplete");
+  });
+}
+
 function isNeutralMessage(value: unknown): value is NeutralMsg {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const message = value as Record<string, unknown>;
@@ -1225,7 +1265,9 @@ function isNeutralMessage(value: unknown): value is NeutralMsg {
     );
   }
   if (message.role === "assistant") {
-    return typeof message.text === "string" && Array.isArray(message.toolUses) && message.toolUses.every((use) => {
+    return typeof message.text === "string"
+      && (message.continuation === undefined || isAssistantContinuation(message.continuation))
+      && Array.isArray(message.toolUses) && message.toolUses.every((use) => {
       if (!use || typeof use !== "object" || Array.isArray(use)) return false;
       const tool = use as Record<string, unknown>;
       return typeof tool.id === "string" && typeof tool.name === "string" && Object.hasOwn(tool, "input");

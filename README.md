@@ -196,9 +196,10 @@ hara config set reasoningEffort high     # or off / low / medium / max
 ```
 hara expresses it the way each endpoint wants (OpenAI `reasoning_effort`, Anthropic thinking budget,
 DashScope `enable_thinking`, **DeepSeek** Chat `thinking` + `reasoning_effort`, or DeepSeek V4 Responses
-`reasoning.effort`). Because DeepSeek Responses does not document an `off` value, choosing `off` for either V4 model
-uses the Chat endpoint with `thinking.disabled`; Hara never sends an invented enum. In the TUI, bare `/model`
-opens a picker — ↑↓ pick a model, **←→ set the thinking level**.
+`reasoning.effort`). DeepSeek Flash/Pro expose three thinking grades—`low`, `high`, `max`—plus `off`;
+on Responses, Hara maps `off` to the documented `none` value without changing transport. The shared
+cross-provider `medium` value normalizes to DeepSeek `high`. In the TUI, bare `/model` opens a picker —
+↑↓ pick a model, **←→ set the thinking level**.
 
 Config lives in `~/.hara/config.json`; the nearest project `.hara/config.json` may set the explicitly safe
 project preferences `model`, `theme`, `vimMode`, `autoCompact`, and `reasoningEffort`. Repository config is
@@ -432,7 +433,10 @@ the diff and either approves or sends it back with fixes — looping implement �
 (or `--rounds N`). Add **`--commit`** and it commits the approved result with an AI-written message (guarded
 to a clean start tree; a review that doesn't pass leaves the work uncommitted). The
 **`agent`** tool spawns **parallel read-only sub-agents** for fan-out — analyze / review / search
-several things at once (each can take a `role`), bounded to 8 concurrent (`HARA_MAX_CONCURRENCY`).
+several things at once (each can take a `role`). A provider-neutral root runtime owns FIFO admission,
+structured completion/cancellation/error state, and a bounded queue; the native provider keeps each child
+on an isolated checklist and read-only tool floor. Concurrency defaults to 8 (`HARA_MAX_CONCURRENCY`), and
+delegated token totals count toward usage without changing the parent conversation's context gauge.
 
 Claude Code role collections work in place: Hara discovers both `~/.claude/agents/*.md` and project
 `.claude/agents/*.md`, translates common Claude tool names (`Read`, `Edit`, `Bash`, `WebSearch`, …), and

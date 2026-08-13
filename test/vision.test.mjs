@@ -8,6 +8,7 @@ import {
   SCREENSHOT_SYSTEM,
   classifyVision,
   parseLocate,
+  visionSidecarAuthorized,
 } from "../dist/vision.js";
 
 test("parseLocate: grounding coords (per-mille / percent / fraction) → 0..1 fractions", () => {
@@ -106,6 +107,36 @@ test("effective attachment capabilities distinguish native, sidecar, unsupported
     effectiveAttachmentCapabilities("openai", "unlisted-private-model").image.mode,
     "unknown",
   );
+  assert.equal(
+    effectiveAttachmentCapabilities(
+      "hara-gateway",
+      "deepseek-v4-pro",
+      {},
+      "qwen3.7-plus",
+      ["deepseek-v4-flash", "deepseek-v4-pro"],
+    ).image.mode,
+    "unsupported",
+    "an unrelated global sidecar cannot widen a scoped organization connection",
+  );
+  assert.equal(
+    effectiveAttachmentCapabilities(
+      "hara-gateway",
+      "deepseek-v4-pro",
+      {},
+      "qwen3.7-plus",
+      ["deepseek-v4-pro", "qwen3.7-plus"],
+    ).image.mode,
+    "vision-sidecar",
+    "an organization-advertised sidecar is usable through that scoped key",
+  );
+});
+
+test("vision sidecar authorization never widens a scoped organization credential", () => {
+  assert.equal(visionSidecarAuthorized("qwen3.7-plus"), true, "BYOK has no server catalog constraint");
+  assert.equal(visionSidecarAuthorized("qwen3.7-plus", []), false, "unknown organization capability fails closed");
+  assert.equal(visionSidecarAuthorized("qwen3.7-plus", ["deepseek-v4-pro"]), false);
+  assert.equal(visionSidecarAuthorized("qwen3.7-plus", ["deepseek-v4-pro", "qwen3.7-plus"]), true);
+  assert.equal(visionSidecarAuthorized(undefined, ["qwen3.7-plus"]), false);
 });
 
 function fakeProvider(result) {

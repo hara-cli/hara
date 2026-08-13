@@ -2,6 +2,24 @@
 
 export type ToolUse = { id: string; name: string; input: any };
 export type ToolResult = { id: string; name: string; content: string; isError?: boolean };
+export interface ResponsesReasoningItem {
+  type: "reasoning";
+  id: string;
+  summary: Array<{ type: "summary_text"; text: string }>;
+  content?: Array<{ type: "reasoning_text"; text: string }>;
+  encrypted_content?: string | null;
+  status?: "in_progress" | "completed" | "incomplete";
+}
+
+export const MAX_ASSISTANT_CONTINUATION_ITEMS = 64;
+export const MAX_ASSISTANT_CONTINUATION_CHARS = 128_000;
+
+/** Provider-owned state that must be returned unchanged beside a tool call on the next stateless request.
+ * It is deliberately separate from visible assistant text: renderers never need private reasoning, while
+ * Responses and DeepSeek Chat require it for correct multi-step tool execution. */
+export type AssistantContinuation =
+  | { type: "responses_reasoning"; items: ResponsesReasoningItem[] }
+  | { type: "chat_reasoning"; text: string };
 /** An image the user attached to a turn. Only the path rides in history (sessions stay small); the
  *  bytes are read + base64-encoded by each provider at request time. */
 export type ImageAttachment = { path: string; mediaType: string };
@@ -28,7 +46,7 @@ export type NeutralMsg =
       attachments?: UserAttachmentView[];
       imageDescription?: string;
     }
-  | { role: "assistant"; text: string; toolUses: ToolUse[] }
+  | { role: "assistant"; text: string; toolUses: ToolUse[]; continuation?: AssistantContinuation }
   | { role: "tool"; results: ToolResult[] };
 
 export type ToolSpec = {
@@ -56,6 +74,8 @@ export interface TurnResult {
   text: string;
   toolUses: ToolUse[];
   stop: "end" | "tool_use" | "error";
+  /** Opaque-to-the-UI provider state needed to continue this exact tool-call turn. */
+  continuation?: AssistantContinuation;
   errorMsg?: string;
   usage?: { input: number; output: number };
 }

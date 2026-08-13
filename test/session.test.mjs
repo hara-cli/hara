@@ -1116,6 +1116,38 @@ test("session: corrupt / malformed files don't crash load or list (audit M4)", (
     writeFileSync(join(dir, "bad8.json"), JSON.stringify({ meta: { ...validMeta, id: "bad8", archived: "yes" }, history: [] }));
     writeFileSync(join(dir, "bad9.json"), JSON.stringify({ meta: { ...validMeta, id: "bad9" }, history: [null] }));
     writeFileSync(join(dir, "bad10.json"), JSON.stringify({ meta: { ...validMeta, id: "bad10" }, history: [{ role: "assistant", text: "x" }] }));
+    writeFileSync(join(dir, "bad11.json"), JSON.stringify({
+      meta: { ...validMeta, id: "bad11" },
+      history: [{ role: "assistant", text: "x", toolUses: [], continuation: { type: "unknown", text: "x" } }],
+    }));
+    writeFileSync(join(dir, "bad12.json"), JSON.stringify({
+      meta: { ...validMeta, id: "bad12" },
+      history: [{ role: "assistant", text: "x", toolUses: [], continuation: { type: "chat_reasoning", text: "x".repeat(128_001) } }],
+    }));
+    writeFileSync(join(dir, "bad13.json"), JSON.stringify({
+      meta: { ...validMeta, id: "bad13" },
+      history: [{
+        role: "assistant",
+        text: "x",
+        toolUses: [],
+        continuation: {
+          type: "responses_reasoning",
+          items: Array.from({ length: 65 }, (_, index) => ({ type: "reasoning", id: `r-${index}`, summary: [] })),
+        },
+      }],
+    }));
+    writeFileSync(join(dir, "bad14.json"), JSON.stringify({
+      meta: { ...validMeta, id: "bad14" },
+      history: [{
+        role: "assistant",
+        text: "x",
+        toolUses: [],
+        continuation: {
+          type: "responses_reasoning",
+          items: [{ type: "reasoning", id: "r-1", summary: [{ type: "summary_text", text: 42 }] }],
+        },
+      }],
+    }));
     writeFileSync(join(dir, "spoofed.json"), JSON.stringify({ meta: { ...validMeta, id: "different" }, history: [] }));
     const oversized = join(dir, "oversized.json");
     writeFileSync(oversized, "{}");
@@ -1131,7 +1163,7 @@ test("session: corrupt / malformed files don't crash load or list (audit M4)", (
     assert.equal(sessionFileExists("missing"), false);
     assert.equal(loadSession("bad2"), null);
     assert.equal(loadSession("bad3"), null, "history must be an array");
-    for (const id of ["bad4", "bad5", "bad6", "bad7", "bad8", "bad9", "bad10", "spoofed", "oversized", "too-deep"]) {
+    for (const id of ["bad4", "bad5", "bad6", "bad7", "bad8", "bad9", "bad10", "bad11", "bad12", "bad13", "bad14", "spoofed", "oversized", "too-deep"]) {
       assert.equal(loadSession(id), null, id);
     }
     assert.doesNotThrow(() => listSessions(), "metaless/corrupt files are skipped, not crashed on");
@@ -1252,7 +1284,21 @@ test("session: save → load round-trip, title, latestForCwd, list", () => {
   try {
     const history = [
       { role: "user", content: "hello world task" },
-      { role: "assistant", text: "done", toolUses: [] },
+      {
+        role: "assistant",
+        text: "I will inspect it",
+        toolUses: [{ id: "call-1", name: "read_file", input: { path: "README.md" } }],
+        continuation: {
+          type: "responses_reasoning",
+          items: [{
+            type: "reasoning",
+            id: "reason-1",
+            summary: [],
+            content: [{ type: "reasoning_text", text: "Inspect the requested file." }],
+            status: "completed",
+          }],
+        },
+      },
     ];
     const meta = {
       id,
@@ -1270,6 +1316,7 @@ test("session: save → load round-trip, title, latestForCwd, list", () => {
     assert.equal(loaded.meta.id, id);
     assert.equal(loaded.meta.title, "hello world task"); // natural auto-summary (CJK-safe), not a slug
     assert.equal(loaded.history.length, 2);
+    assert.deepEqual(loaded.history[1].continuation, history[1].continuation, "provider continuation survives resume exactly");
     assert.equal(latestForCwd(cwd)?.meta.id, id);
     assert.ok(listSessions(cwd).some((m) => m.id === id));
     assert.equal(resolveSessionId(shortId(id)), id); // resume by short-id prefix resolves to the full UUID

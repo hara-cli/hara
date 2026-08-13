@@ -286,6 +286,15 @@ function readDirBounded(dir: string, budget: ScanBudget): Dirent<string>[] {
 
 function protectedDirectoryReason(path: string): string | null {
   const absolute = resolve(path);
+  const haraSegments = securityRelativeComponents(absolute, join(homedir(), ".hara"));
+  if (haraSegments !== null && haraSegments.length > 0) {
+    const top = haraSegments[0];
+    // Agent-authored content remains traversable. Weixin must be entered so its public media directory can
+    // stay readable; every other private runtime subtree is represented by one compact Seatbelt subpath.
+    if (HARA_AGENT_CONTENT_DIRS.has(top)) return null;
+    if (top === "weixin" && (haraSegments.length === 1 || haraSegments[1] === "media")) return null;
+    return "private Hara state";
+  }
   const parts = securityPathComponents(absolute);
   const haraAt = parts.lastIndexOf(".hara");
   if (haraAt >= 0 && HARA_PRIVATE_DIRS.has(parts[haraAt + 1] ?? "")) return "private Hara state";

@@ -417,20 +417,34 @@ test("Seatbelt discovery fails closed on scan overflow and masks private state d
 
     const homeSessions = join(home, ".hara", "sessions");
     const homeCheckpoints = join(home, ".hara", "checkpoints");
+    const homeSessionIndex = join(home, ".hara", "session-index");
+    const homeMedia = join(home, ".hara", "weixin", "media");
     const projectIndex = join(project, ".hara", "index");
     const sshKey = join(home, ".ssh", "deploy-production");
     mkdirSync(homeSessions, { recursive: true });
     mkdirSync(homeCheckpoints, { recursive: true });
+    mkdirSync(homeSessionIndex, { recursive: true });
+    mkdirSync(homeMedia, { recursive: true });
     mkdirSync(projectIndex, { recursive: true });
     mkdirSync(join(home, ".ssh"), { recursive: true });
     writeFileSync(sshKey, "private-key-material\n");
+    for (let index = 0; index < 600; index++) {
+      writeFileSync(join(homeSessionIndex, `${index}.json`), "private runtime metadata\n");
+    }
+    writeFileSync(join(homeMedia, "public-input.txt"), "authorized attachment\n");
     const directories = existingSensitiveReadDirectories(project);
     assert.ok(directories.includes(homeSessions));
     assert.ok(directories.includes(homeCheckpoints));
+    assert.ok(directories.includes(homeSessionIndex), "growing private runtime state is represented by one subpath");
+    assert.ok(!directories.includes(homeMedia), "authorized inbound media stays readable");
     assert.ok(directories.includes(projectIndex));
     const masks = existingSensitiveSeatbeltMasks(project);
     assert.ok(masks.writeContainers.includes(join(project, ".hara")), "renaming the project .hara container is denied");
     assert.ok(masks.files.includes(sshKey), "custom SSH key names are concretely masked");
+    assert.ok(
+      !masks.files.some((path) => path.startsWith(`${homeSessionIndex}/`)),
+      "private runtime children do not grow the inline Seatbelt profile",
+    );
     assert.ok(masks.writeContainers.includes(join(home, ".ssh")), "renaming .ssh cannot relocate a key outside the mask");
   } finally {
     if (previousHome === undefined) delete process.env.HOME;

@@ -19,6 +19,9 @@ The built-in DeepSeek profile defaults to `deepseek-v4-flash` at `https://api.de
 `deepseek-v4-flash` and `deepseek-v4-pro` models use native, stateless Responses streaming, while explicit
 custom or legacy ids are not silently remapped and remain subject to provider-side availability.
 The complete local history is replayed on each Responses call, including function calls and outputs.
+Reasoning output attached to a tool-call turn is persisted privately and replayed with that turn as required
+by the stateless protocol; it is never rendered as assistant text. Flash and Pro both expose `off` plus the
+native `low` / `high` / `max` grades (`off` is sent as Responses `none`).
 The model picker uses live discovery first and falls back to the two documented V4 ids only for the exact
 official DeepSeek host.
 

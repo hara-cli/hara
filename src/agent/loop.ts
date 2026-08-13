@@ -290,7 +290,12 @@ export function composeSystem(
       : (
           "\n\n# Understanding → execution boundary\n" +
           "Do not jump from a raw request straight into side effects. You may answer, inspect files, search, " +
-          "ask a necessary question, or build a todo list first. BEFORE the first edit, non-read-only command, " +
+          "ask a necessary question, or build a todo list first. Resolve references such as 'this', 'start', " +
+          "'continue', '开始', '继续', and '这个' against the latest user request, accepted brief, and durable " +
+          "checkpoint; never record those words alone as the goal. Before intake, identify the concrete outcome, " +
+          "target, hard boundaries, and observable proof. Ask one concise question only when a missing answer would " +
+          "materially change scope, safety, or the deliverable; otherwise state the conservative assumption in " +
+          "constraints. BEFORE the first edit, non-read-only command, " +
           "background-process start/stop, computer action, external agent, or MCP connection, call `task_intake` in its OWN tool round with " +
           "the interpreted goal, intent, constraints, acceptance checks, and short steps. Use intent `answer` " +
           "for a direct answer, `investigate` for evidence gathering/diagnosis, and `change` when the user asked " +
@@ -751,7 +756,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         description:
           "Record or revise your explicit understanding of the active task before side effects. Call this " +
           "in its own tool round only after using the conversation and any needed read-only evidence to identify " +
-          "the real goal. Required before edits, non-read-only commands, background-process start/stop, computer actions, external agents, or MCP.",
+          "the real goal, concrete target, boundaries, and observable completion proof. Resolve deictic requests " +
+          "such as 'start/continue/this' from active context instead of copying them as the goal. Required before " +
+          "edits, non-read-only commands, background-process start/stop, computer actions, external agents, or MCP.",
         input_schema: {
           type: "object",
           properties: {
@@ -760,8 +767,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
               enum: ["answer", "investigate", "change"],
               description: "answer = direct response, investigate = evidence/diagnosis, change = modify or deliver",
             },
-            goal: { type: "string", description: "One concrete interpreted outcome; include the actual target, not generic 'help the user'." },
-            constraints: { type: "array", items: { type: "string" }, description: "User/project boundaries that must remain true." },
+            goal: { type: "string", description: "One concrete interpreted outcome with the actual target; never use only 'start', 'continue', 'this task', or generic 'help the user'." },
+            constraints: { type: "array", items: { type: "string" }, description: "User/project boundaries and any conservative assumptions that must remain true." },
             acceptance: { type: "array", items: { type: "string" }, description: "Observable checks that prove the task is done." },
             steps: { type: "array", items: { type: "string" }, description: "Short ordered approach, normally 2–6 steps." },
             required_capabilities: {
@@ -1163,7 +1170,12 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
-    history.push({ role: "assistant", text: r.text, toolUses: r.toolUses });
+    history.push({
+      role: "assistant",
+      text: r.text,
+      toolUses: r.toolUses,
+      ...(r.continuation ? { continuation: r.continuation } : {}),
+    });
 
     if (r.stop === "error") {
       const kind = classifyError(r.errorMsg ?? "");

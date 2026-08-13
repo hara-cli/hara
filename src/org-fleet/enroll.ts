@@ -203,7 +203,7 @@ function parseAdvertisedStringList(
 
 function inferredGatewayThinkingEfforts(model: string): string[] {
   return /^(?:deepseek-v4-(?:flash|pro)|deepseek-(?:chat|reasoner|pro))$/i.test(model)
-    ? ["off", "high", "max"]
+    ? ["off", "low", "high", "max"]
     : [];
 }
 

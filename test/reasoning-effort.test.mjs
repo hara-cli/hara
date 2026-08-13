@@ -78,8 +78,8 @@ test("deepseek style: high/max → thinking enabled + the effort enum passed thr
   assert.deepEqual(reasoningParams("deepseek", "max", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "max" });
 });
 
-test("deepseek style: legacy low/medium config values normalize to the documented high wire value", () => {
-  assert.deepEqual(reasoningParams("deepseek", "low", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "high" });
+test("deepseek style: low is native while legacy medium normalizes to the documented high wire value", () => {
+  assert.deepEqual(reasoningParams("deepseek", "low", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "low" });
   assert.deepEqual(reasoningParams("deepseek", "medium", "deepseek-v4-pro"), { thinking: { type: "enabled" }, reasoning_effort: "high" });
 });
 

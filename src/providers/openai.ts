@@ -42,7 +42,7 @@ export function assembleToolCalls(
 export { isReasoningModel } from "./reasoning.js";
 
 /** Build OpenAI chat-completions messages from neutral history. */
-export function toOpenAI(system: string, history: NeutralMsg[]): any[] {
+export function toOpenAI(system: string, history: NeutralMsg[], reasoningStyle: ReasoningStyle = "none"): any[] {
   const msgs: any[] = [{ role: "system", content: system }];
   for (const m of history) {
     if (m.role === "user") {
@@ -71,7 +71,12 @@ export function toOpenAI(system: string, history: NeutralMsg[]): any[] {
       if (!m.text.trim() && tool_calls.length === 0) continue;
       msgs.push({
         role: "assistant",
-        content: m.text.trim() ? m.text : null,
+        // DeepSeek's thinking-mode passback contract expects the original assistant content. Pure tool-call
+        // turns use an empty string on that wire; null has been rejected by compatible gateways in practice.
+        content: m.text.trim() ? m.text : reasoningStyle === "deepseek" ? "" : null,
+        ...(tool_calls.length && m.continuation?.type === "chat_reasoning" && m.continuation.text
+          ? { reasoning_content: m.continuation.text }
+          : {}),
         ...(tool_calls.length ? { tool_calls } : {}),
       });
     } else {
@@ -119,7 +124,11 @@ export function createOpenAIProvider(opts: {
       }));
       const params: any = {
         model: opts.model,
-        messages: toOpenAI(system, history),
+        messages: toOpenAI(
+          system,
+          history,
+          opts.reasoningStyle ?? resolvePlatform(opts.label, opts.baseURL, undefined, opts.model).reasoning,
+        ),
         max_tokens: 32000, // was 8192 — too small: a big write_file's args got truncated → unparseable → loop
         stream: true,
         stream_options: { include_usage: true },
@@ -135,6 +144,7 @@ export function createOpenAIProvider(opts: {
       // Stream: emit text deltas live; accumulate tool-call args by index; grab usage from the tail chunk.
       let text = "";
       const acc = new Map<number, { id: string; name: string; args: string }>();
+      let reasoning = "";
       let finish: string | undefined;
       let usage = { input: 0, output: 0 };
       try {
@@ -148,6 +158,7 @@ export function createOpenAIProvider(opts: {
             onText(delta.content);
           }
           const rc = (delta as any)?.reasoning_content ?? (delta as any)?.reasoning; // GLM-5 / DeepSeek
+          if (typeof rc === "string") reasoning += rc;
           // reasoningEffort="off" + a stream-reasoning model: server can't be silenced, so we just
           // don't surface it. Anything else (incl. undefined) shows the reasoning live.
           if (rc && opts.reasoningEffort !== "off") onReasoning?.(rc);
@@ -178,7 +189,16 @@ export function createOpenAIProvider(opts: {
       const { toolUses, error: argsError } = assembleToolCalls([...acc.values()], finish);
       if (argsError) return { text, toolUses: [], stop: "error", errorMsg: argsError, usage };
       const stop = finish === "tool_calls" || toolUses.length ? "tool_use" : "end";
-      return { text, toolUses, stop, usage };
+      const style = opts.reasoningStyle ?? resolvePlatform(opts.label, opts.baseURL, undefined, opts.model).reasoning;
+      return {
+        text,
+        toolUses,
+        stop,
+        usage,
+        ...(toolUses.length && reasoning && style === "deepseek"
+          ? { continuation: { type: "chat_reasoning" as const, text: reasoning } }
+          : {}),
+      };
     },
   };
 }

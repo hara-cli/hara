@@ -4,7 +4,14 @@ import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
 import { assembleToolCalls } from "./openai.js";
 import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
-import type { NeutralMsg, Provider, ToolUse, TurnArgs, TurnResult } from "./types.js";
+import type {
+  NeutralMsg,
+  Provider,
+  ResponsesReasoningItem,
+  ToolUse,
+  TurnArgs,
+  TurnResult,
+} from "./types.js";
 
 const TEXT_ONLY_IMAGE_NOTE = "[Image attachment omitted: this Responses endpoint accepts text only.]";
 
@@ -60,6 +67,9 @@ export function toResponsesInput(
     }
 
     if (message.role === "assistant") {
+      if (message.continuation?.type === "responses_reasoning") {
+        input.push(...message.continuation.items);
+      }
       if (message.text.trim()) input.push({ role: "assistant", content: message.text });
       for (const toolUse of message.toolUses) {
         input.push({
@@ -90,6 +100,48 @@ type PendingFunctionCall = {
   name: string;
   args: string;
 };
+
+type PendingReasoningItem = {
+  key: string;
+  index: number;
+  item: ResponsesReasoningItem;
+};
+
+function reasoningParts<Type extends "reasoning_text" | "summary_text">(
+  value: unknown,
+  type: Type,
+): Array<{ type: Type; text: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((part) => {
+    if (!part || typeof part !== "object") return [];
+    const candidate = part as Record<string, unknown>;
+    return candidate.type === type && typeof candidate.text === "string"
+      ? [{ type, text: candidate.text }]
+      : [];
+  });
+}
+
+function normalizedReasoningItem(item: any, fallbackId: string): ResponsesReasoningItem | null {
+  if (!item || item.type !== "reasoning") return null;
+  const id = typeof item.id === "string" && item.id ? item.id : fallbackId;
+  if (!id) return null;
+  const summary = reasoningParts(item.summary, "summary_text");
+  const content = reasoningParts(item.content, "reasoning_text");
+  const encrypted = typeof item.encrypted_content === "string" || item.encrypted_content === null
+    ? item.encrypted_content
+    : undefined;
+  if (!summary.length && !content.length && encrypted === undefined) {
+    return { type: "reasoning", id, summary: [] };
+  }
+  return {
+    type: "reasoning",
+    id,
+    summary,
+    ...(content.length ? { content } : {}),
+    ...(encrypted !== undefined ? { encrypted_content: encrypted } : {}),
+    ...(["in_progress", "completed", "incomplete"].includes(item.status) ? { status: item.status } : {}),
+  };
+}
 
 function itemKey(event: any, item?: any): string {
   return String(event?.item_id ?? item?.id ?? `output:${event?.output_index ?? 0}`);
@@ -154,6 +206,8 @@ export function createResponsesProvider(opts: {
       let streamFailure: string | undefined;
       let lastSequenceNumber = -1;
       const calls = new Map<string, PendingFunctionCall>();
+      const reasoningItems = new Map<string, PendingReasoningItem>();
+      const reasoningText = new Map<string, string>();
       const textDeltaItems = new Set<string>();
       const completedTextItems = new Set<string>();
 
@@ -179,9 +233,28 @@ export function createResponsesProvider(opts: {
         }
         calls.set(key, current);
       };
+      const acceptReasoningItem = (event: any, item: any) => {
+        if (!item || item.type !== "reasoning") return;
+        const key = itemKey(event, item);
+        const normalized = normalizedReasoningItem(item, key);
+        if (!normalized) return;
+        const streamed = reasoningText.get(key);
+        if (streamed && !(normalized.content?.length)) {
+          normalized.content = [{ type: "reasoning_text", text: streamed }];
+        }
+        reasoningItems.set(key, {
+          key,
+          index: Number(event?.output_index ?? reasoningItems.size),
+          item: normalized,
+        });
+      };
       const recoverTerminalOutput = (response: any) => {
         for (const [outputIndex, item] of (response?.output ?? []).entries()) {
           const event = { item_id: item?.id, output_index: outputIndex };
+          if (item?.type === "reasoning") {
+            acceptReasoningItem(event, item);
+            continue;
+          }
           if (item?.type === "function_call") {
             acceptFunctionItem(event, item, true);
             continue;
@@ -224,7 +297,18 @@ export function createResponsesProvider(opts: {
               completedTextItems.add(key);
               break;
             }
-            case "response.reasoning_text.delta":
+            case "response.reasoning_text.delta": {
+              const key = itemKey(event);
+              if (typeof event.delta === "string") {
+                reasoningText.set(key, (reasoningText.get(key) ?? "") + event.delta);
+                const pending = reasoningItems.get(key);
+                if (pending) pending.item.content = [{ type: "reasoning_text", text: reasoningText.get(key)! }];
+              }
+              if (opts.reasoningEffort !== "off" && typeof event.delta === "string") {
+                onReasoning?.(event.delta);
+              }
+              break;
+            }
             case "response.reasoning_summary_text.delta":
               if (opts.reasoningEffort !== "off" && typeof event.delta === "string") {
                 onReasoning?.(event.delta);
@@ -232,6 +316,7 @@ export function createResponsesProvider(opts: {
               break;
             case "response.output_item.added":
               acceptFunctionItem(event, event.item);
+              acceptReasoningItem(event, event.item);
               break;
             case "response.function_call_arguments.delta": {
               const key = itemKey(event);
@@ -262,6 +347,7 @@ export function createResponsesProvider(opts: {
             }
             case "response.output_item.done":
               acceptFunctionItem(event, event.item, true);
+              acceptReasoningItem(event, event.item);
               break;
             case "response.completed":
               terminal = "completed";
@@ -335,7 +421,21 @@ export function createResponsesProvider(opts: {
         return { text, toolUses: [], stop: "error", errorMsg: incompleteReason(terminalResponse), usage };
       }
       const stop = assembled.toolUses.length ? "tool_use" : "end";
-      return { text, toolUses: assembled.toolUses as ToolUse[], stop, usage };
+      // Stateless Responses requires completed reasoning output items to be included in the next request.
+      // Keep them only for actionable tool-call turns; final-answer reasoning never enters durable history.
+      const continuationItems = [...reasoningItems.values()]
+        .sort((left, right) => left.index - right.index)
+        .map(({ item }) => item)
+        .filter((item) => item.content?.length || item.summary.length || item.encrypted_content !== undefined);
+      return {
+        text,
+        toolUses: assembled.toolUses as ToolUse[],
+        stop,
+        usage,
+        ...(assembled.toolUses.length && continuationItems.length
+          ? { continuation: { type: "responses_reasoning" as const, items: continuationItems } }
+          : {}),
+      };
     },
   };
 }

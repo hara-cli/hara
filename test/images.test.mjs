@@ -91,3 +91,26 @@ test("toOpenAI omits empty assistant history unless it carries tool calls", () =
     }],
   });
 });
+
+test("toOpenAI replays DeepSeek reasoning only beside its tool-call turn", () => {
+  const msgs = toOpenAI("sys", [
+    { role: "user", content: "inspect" },
+    {
+      role: "assistant",
+      text: "",
+      toolUses: [{ id: "call-1", name: "read_file", input: { path: "README.md" } }],
+      continuation: { type: "chat_reasoning", text: "I should inspect the file." },
+    },
+    { role: "tool", results: [{ id: "call-1", name: "read_file", content: "hello" }] },
+  ], "deepseek");
+  assert.deepEqual(msgs[2], {
+    role: "assistant",
+    content: "",
+    reasoning_content: "I should inspect the file.",
+    tool_calls: [{
+      id: "call-1",
+      type: "function",
+      function: { name: "read_file", arguments: '{"path":"README.md"}' },
+    }],
+  });
+});

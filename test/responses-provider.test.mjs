@@ -50,6 +50,16 @@ test("toResponsesInput replays durable tool history and never reads images on a 
       role: "assistant",
       text: "I will inspect it.",
       toolUses: [{ id: "call_1", name: "read_file", input: { path: "README.md" } }],
+      continuation: {
+        type: "responses_reasoning",
+        items: [{
+          type: "reasoning",
+          id: "reason_1",
+          summary: [],
+          content: [{ type: "reasoning_text", text: "I should inspect the readme." }],
+          status: "completed",
+        }],
+      },
     },
     {
       role: "tool",
@@ -61,6 +71,13 @@ test("toResponsesInput replays durable tool history and never reads images on a 
     {
       role: "user",
       content: "inspect this\n\n[Image attachment omitted: this Responses endpoint accepts text only.]",
+    },
+    {
+      type: "reasoning",
+      id: "reason_1",
+      summary: [],
+      content: [{ type: "reasoning_text", text: "I should inspect the readme." }],
+      status: "completed",
     },
     { role: "assistant", content: "I will inspect it." },
     { type: "function_call", call_id: "call_1", name: "read_file", arguments: '{"path":"README.md"}' },
@@ -84,25 +101,50 @@ for (const deepSeekModel of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
 test(`Responses transport consumes semantic SSE and function calls for ${deepSeekModel}`, async () => {
   const events = [
     { type: "response.created", sequence_number: 0, response: { id: "resp_test", status: "in_progress" } },
-    { type: "response.reasoning_text.delta", sequence_number: 1, item_id: "reason_1", delta: "thinking" },
-    { type: "response.output_text.delta", sequence_number: 2, item_id: "msg_1", output_index: 0, delta: "Ready" },
-    { type: "response.output_text.done", sequence_number: 3, item_id: "msg_1", output_index: 0, text: "Ready" },
     {
       type: "response.output_item.added",
-      sequence_number: 4,
-      output_index: 1,
-      item: { id: "fc_1", type: "function_call", call_id: "call_1", name: "read_file", arguments: "" },
+      sequence_number: 1,
+      output_index: 0,
+      item: { id: "reason_1", type: "reasoning", summary: [], content: [], status: "in_progress" },
     },
-    { type: "response.function_call_arguments.delta", sequence_number: 5, item_id: "fc_1", output_index: 1, delta: '{"path":' },
-    { type: "response.function_call_arguments.delta", sequence_number: 6, item_id: "fc_1", output_index: 1, delta: '"README.md"}' },
-    { type: "response.function_call_arguments.done", sequence_number: 7, item_id: "fc_1", output_index: 1, name: "read_file", arguments: '{"path":"README.md"}' },
+    { type: "response.reasoning_text.delta", sequence_number: 2, item_id: "reason_1", output_index: 0, delta: "thinking" },
     {
       type: "response.output_item.done",
-      sequence_number: 8,
-      output_index: 1,
+      sequence_number: 3,
+      output_index: 0,
+      item: {
+        id: "reason_1",
+        type: "reasoning",
+        summary: [],
+        content: [{ type: "reasoning_text", text: "thinking" }],
+        status: "completed",
+      },
+    },
+    { type: "response.output_text.delta", sequence_number: 4, item_id: "msg_1", output_index: 1, delta: "Ready" },
+    { type: "response.output_text.done", sequence_number: 5, item_id: "msg_1", output_index: 1, text: "Ready" },
+    {
+      type: "response.output_item.added",
+      sequence_number: 6,
+      output_index: 2,
+      item: { id: "fc_1", type: "function_call", call_id: "call_1", name: "read_file", arguments: "" },
+    },
+    { type: "response.function_call_arguments.delta", sequence_number: 7, item_id: "fc_1", output_index: 2, delta: '{"path":' },
+    { type: "response.function_call_arguments.delta", sequence_number: 8, item_id: "fc_1", output_index: 2, delta: '"README.md"}' },
+    { type: "response.function_call_arguments.done", sequence_number: 9, item_id: "fc_1", output_index: 2, name: "read_file", arguments: '{"path":"README.md"}' },
+    {
+      type: "response.output_item.done",
+      sequence_number: 10,
+      output_index: 2,
       item: { id: "fc_1", type: "function_call", call_id: "call_1", name: "read_file", arguments: '{"path":"README.md"}' },
     },
     completed([
+      {
+        id: "reason_1",
+        type: "reasoning",
+        summary: [],
+        content: [{ type: "reasoning_text", text: "thinking" }],
+        status: "completed",
+      },
       { id: "msg_1", type: "message", role: "assistant", content: [{ type: "output_text", text: "Ready" }] },
       { id: "fc_1", type: "function_call", call_id: "call_1", name: "read_file", arguments: '{"path":"README.md"}' },
     ]),
@@ -134,6 +176,16 @@ test(`Responses transport consumes semantic SSE and function calls for ${deepSee
     assert.deepEqual(text, ["Ready"]);
     assert.deepEqual(reasoning, ["thinking"]);
     assert.deepEqual(result.toolUses, [{ id: "call_1", name: "read_file", input: { path: "README.md" } }]);
+    assert.deepEqual(result.continuation, {
+      type: "responses_reasoning",
+      items: [{
+        id: "reason_1",
+        type: "reasoning",
+        summary: [],
+        content: [{ type: "reasoning_text", text: "thinking" }],
+        status: "completed",
+      }],
+    });
     assert.equal(result.stop, "tool_use");
     assert.deepEqual(result.usage, { input: 17, output: 9 });
     assert.equal(activity, events.length);

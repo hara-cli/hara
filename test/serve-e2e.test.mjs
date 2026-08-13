@@ -1335,7 +1335,7 @@ test("serve e2e: models.list honors a persisted session profile before that sess
         profileId: selectedProfile,
         model: selectedModel,
         availableModels: [selectedProfile === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro"],
-        effortLevels: ["off", "high", "max"],
+        effortLevels: ["off", "low", "high", "max"],
       };
     },
   };
@@ -1370,7 +1370,7 @@ test("serve e2e: managed gateway enforces its model scope and advertised DeepSee
     runtimeInfo: (_cwd, model) => ({
       providerId: "hara-gateway",
       model: model ?? "deepseek-v4-pro",
-      effortLevels: ["off", "high", "max"],
+      effortLevels: ["off", "low", "high", "max"],
       availableModels: ["deepseek-v4-pro"],
     }),
   };
@@ -1389,7 +1389,7 @@ test("serve e2e: managed gateway enforces its model scope and advertised DeepSee
 
     const listed = await c.call("models.list", { sessionId: sid });
     assert.deepEqual(listed.result.models, ["deepseek-v4-pro"], "stored token scope wins over a broader discovery response");
-    assert.deepEqual(listed.result.effortLevels, ["off", "high", "max"]);
+    assert.deepEqual(listed.result.effortLevels, ["off", "low", "high", "max"]);
 
     const forbiddenModel = await c.call("session.set-model", {
       sessionId: sid,
@@ -1460,7 +1460,7 @@ test("serve e2e: persisted sessions keep their organization profile across activ
         providerId: "hara-gateway",
         profileId: selected,
         model: selectedModel,
-        effortLevels: ["off", "high", "max"],
+        effortLevels: ["off", "low", "high", "max"],
         availableModels: [models[selected]],
       };
     },
@@ -1680,7 +1680,7 @@ test("serve e2e: resume refuses an identity changed between provider preflight a
       profileId: profileId ?? "pro-org",
       model: model ?? (profileId === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro"),
       availableModels: [profileId === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro"],
-      effortLevels: ["off", "high", "max"],
+      effortLevels: ["off", "low", "high", "max"],
     }),
   };
   const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);

@@ -43,7 +43,23 @@ test("reasoningParams DeepSeek Responses uses only documented effort values", ()
   assert.deepEqual(reasoningParams("deepseek_responses", "low", "deepseek-v4-flash"), { reasoning: { effort: "low" } });
   assert.deepEqual(reasoningParams("deepseek_responses", "medium", "deepseek-v4-flash"), { reasoning: { effort: "high" } });
   assert.deepEqual(reasoningParams("deepseek_responses", "max", "deepseek-v4-flash"), { reasoning: { effort: "max" } });
-  assert.deepEqual(reasoningParams("deepseek_responses", "off", "deepseek-v4-flash"), {}, "factory routes off through Chat");
+  assert.deepEqual(reasoningParams("deepseek_responses", "off", "deepseek-v4-flash"), { reasoning: { effort: "none" } });
+});
+
+test("reasoningParams DeepSeek Chat preserves its native low/high/max levels", () => {
+  assert.deepEqual(reasoningParams("deepseek", "off", "deepseek-v4-pro"), { thinking: { type: "disabled" } });
+  assert.deepEqual(reasoningParams("deepseek", "low", "deepseek-v4-pro"), {
+    thinking: { type: "enabled" },
+    reasoning_effort: "low",
+  });
+  assert.deepEqual(reasoningParams("deepseek", "medium", "deepseek-v4-pro"), {
+    thinking: { type: "enabled" },
+    reasoning_effort: "high",
+  });
+  assert.deepEqual(reasoningParams("deepseek", "max", "deepseek-v4-pro"), {
+    thinking: { type: "enabled" },
+    reasoning_effort: "max",
+  });
 });
 
 test("reasoningParams none / thinking_budget: nothing merged on the chat/responses body", () => {

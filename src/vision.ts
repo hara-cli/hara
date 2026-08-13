@@ -26,6 +26,19 @@ export interface EffectiveAttachmentCapabilities {
   binaryFile: "agent-tool";
 }
 
+/** A configured sidecar can use the current credential only when that credential is unconstrained (BYOK)
+ * or its server-authoritative catalog contains the exact model. Passing [] means capability is unknown and
+ * therefore unavailable — persistent UIs must not advertise a route they cannot prove. */
+export function visionSidecarAuthorized(
+  visionModel?: string,
+  authorizedModels?: readonly string[],
+): boolean {
+  return Boolean(visionModel) && (
+    authorizedModels === undefined
+    || authorizedModels.includes(visionModel!)
+  );
+}
+
 // Built-in capability map for the major model families. First matching rule wins, so each family's
 // vision pattern is listed BEFORE its text catch-all. Anything that matches nothing → "unknown"
 // (we ask the user once and remember). Easy to extend — add a rule near the right family.
@@ -89,12 +102,17 @@ export function effectiveAttachmentCapabilities(
   model: string,
   overrides: Record<string, "yes" | "no"> = {},
   visionModel?: string,
+  authorizedModels?: readonly string[],
 ): EffectiveAttachmentCapabilities {
   const native = classifyVision(provider, model, overrides);
+  // A gateway credential is scoped to its advertised model catalog. A global sidecar name must never
+  // make a Desktop organization session claim image support unless that exact model is authorized by the
+  // current connection. BYOK callers omit the catalog and retain their configured fallback behavior.
+  const sidecarAuthorized = visionSidecarAuthorized(visionModel, authorizedModels);
   const image = native === "vision"
     ? { mode: "native" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES }
-    : visionModel
-      ? { mode: "vision-sidecar" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES, viaModel: visionModel }
+    : sidecarAuthorized
+      ? { mode: "vision-sidecar" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES, viaModel: visionModel! }
       : native === "text"
         ? { mode: "unsupported" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES }
         : { mode: "unknown" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES };

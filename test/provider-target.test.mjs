@@ -278,3 +278,72 @@ test("managed DeepSeek V4 gateway sends the selected native thinking controls on
     await once(server, "close");
   }
 });
+
+test("managed DeepSeek gateway preserves reasoning across a tool-call continuation", async () => {
+  const requestBodies = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      requestBodies.push(JSON.parse(body));
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      if (requestBodies.length === 1) {
+        response.end([
+          'data: {"id":"managed-tool","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"I should inspect the file.","tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}]},"finish_reason":null}]}',
+          "",
+          'data: {"id":"managed-tool","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}',
+          "",
+          "data: [DONE]",
+          "",
+        ].join("\n"));
+        return;
+      }
+      response.end([
+        'data: {"id":"managed-done","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"done"},"finish_reason":null}]}',
+        "",
+        'data: {"id":"managed-done","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":1}}',
+        "",
+        "data: [DONE]",
+        "",
+      ].join("\n"));
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const provider = await createProviderForTarget({
+      provider: "hara-gateway",
+      apiKey: "scoped-device-token",
+      model: "deepseek-v4-flash",
+      baseURL: `http://127.0.0.1:${address.port}/v1`,
+    }, "high");
+    assert.ok(provider);
+    const first = await provider.turn({
+      system: "inspect",
+      history: [{ role: "user", content: "inspect README" }],
+      tools: [{ name: "read_file", description: "Read a file", input_schema: { type: "object" } }],
+      onText: () => {},
+    });
+    assert.equal(first.stop, "tool_use");
+    assert.deepEqual(first.continuation, { type: "chat_reasoning", text: "I should inspect the file." });
+
+    const second = await provider.turn({
+      system: "inspect",
+      history: [
+        { role: "user", content: "inspect README" },
+        { role: "assistant", text: first.text, toolUses: first.toolUses, continuation: first.continuation },
+        { role: "tool", results: [{ id: "call-1", name: "read_file", content: "hello" }] },
+      ],
+      tools: [{ name: "read_file", description: "Read a file", input_schema: { type: "object" } }],
+      onText: () => {},
+    });
+    assert.equal(second.stop, "end");
+    assert.equal(requestBodies[1].messages[2].reasoning_content, "I should inspect the file.");
+    assert.equal(requestBodies[1].messages[2].tool_calls[0].id, "call-1");
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});

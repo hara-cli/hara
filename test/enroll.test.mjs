@@ -36,7 +36,7 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
       device_id: "d1",
       model: "deepseek-v4-pro",
       available_models: ["deepseek-v4-pro"],
-      thinking_efforts: ["off", "high", "max"],
+      thinking_efforts: ["off", "low", "high", "max"],
       expires_at: "2026-01-08T00:00:00Z",
       service_bindings: [{
         tenant_id: "tenant-1",
@@ -58,7 +58,7 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
   assert.equal(e.deviceToken, "t1");
   assert.equal(e.deviceId, "d1");
   assert.deepEqual(e.availableModels, ["deepseek-v4-pro"]);
-  assert.deepEqual(e.thinkingEfforts, ["off", "high", "max"]);
+  assert.deepEqual(e.thinkingEfforts, ["off", "low", "high", "max"]);
   assert.equal(e.expiresAt, "2026-01-08T00:00:00.000Z");
   assert.equal(e.tokenNeverExpires, false);
   assert.deepEqual(e.serviceBindings, [{
@@ -235,7 +235,7 @@ test("profile-native enrollment stores only the scoped token in private profiles
         device_id: "device-one",
         model: "deepseek-v4-pro",
         available_models: ["deepseek-v4-pro"],
-        thinking_efforts: ["off", "high", "max"],
+        thinking_efforts: ["off", "low", "high", "max"],
         expires_at: "2099-01-01T00:00:00Z",
         desk: {
           url: "https://desk.example.test",
@@ -260,7 +260,7 @@ test("profile-native enrollment stores only the scoped token in private profiles
       res.end(JSON.stringify({
         model: "deepseek-v4-pro",
         available_models: ["deepseek-v4-flash", "deepseek-v4-pro"],
-        thinking_efforts: ["off", "high", "max"],
+        thinking_efforts: ["off", "low", "high", "max"],
         expires_at: null,
       }));
     } else {
@@ -283,7 +283,7 @@ test("profile-native enrollment stores only the scoped token in private profiles
     const storedProfile = listProfiles().find((profile) => profile.id === "team-a");
     assert.equal(storedProfile?.deviceToken, "scoped-device-token");
     assert.deepEqual(storedProfile?.availableModels, ["deepseek-v4-flash", "deepseek-v4-pro"]);
-    assert.deepEqual(storedProfile?.thinkingEfforts, ["off", "high", "max"]);
+    assert.deepEqual(storedProfile?.thinkingEfforts, ["off", "low", "high", "max"]);
     assert.equal(storedProfile?.tokenExpiresAt, undefined, "a heartbeat can replace a finite expiry with explicit permanent access");
     assert.equal(storedProfile?.tokenNeverExpires, true);
     assert.deepEqual(storedProfile?.serviceBindings, [{

@@ -47,7 +47,7 @@ export function historyChars(history: NeutralMsg[]): number {
     if (message.role === "user") {
       total += message.content.length + (message.images?.reduce((sum, image) => sum + image.path.length + image.mediaType.length + 64, 0) ?? 0);
     } else if (message.role === "assistant") {
-      total += message.text.length + jsonChars(message.toolUses);
+      total += message.text.length + jsonChars(message.toolUses) + jsonChars(message.continuation ?? null);
     } else {
       total += message.results.reduce((sum, result) => sum + result.content.length + result.id.length + result.name.length + 32, 0);
     }
@@ -145,7 +145,12 @@ export function prepareHistoryForModel(history: NeutralMsg[], options: PrepareOp
       const text = clip(message.text, MAX_ASSISTANT_ITEM_CHARS, "assistant message");
       const toolUses = boundToolUses(message.toolUses, MAX_TOOL_INPUT_STRING_CHARS);
       if (text !== message.text || jsonChars(toolUses) !== jsonChars(message.toolUses)) changed = true;
-      return { role: "assistant", text, toolUses };
+      return {
+        role: "assistant",
+        text,
+        toolUses,
+        ...(message.continuation ? { continuation: structuredClone(message.continuation) } : {}),
+      };
     }
     const results = message.results.map((result) => {
       const content = clip(result.content, 24_000, `tool result ${result.name}`);
@@ -161,7 +166,12 @@ export function prepareHistoryForModel(history: NeutralMsg[], options: PrepareOp
         return { role: "tool", results: message.results.map((result) => ({ ...result, content: clip(result.content, toolCap, `tool result ${result.name}`) })) };
       }
       if (message.role === "assistant") {
-        return { role: "assistant", text: clip(message.text, assistantCap, "assistant message"), toolUses: boundToolUses(message.toolUses, inputCap) };
+        return {
+          role: "assistant",
+          text: clip(message.text, assistantCap, "assistant message"),
+          toolUses: boundToolUses(message.toolUses, inputCap),
+          ...(message.continuation ? { continuation: structuredClone(message.continuation) } : {}),
+        };
       }
       const cap = index === latestUser ? Math.max(recentUserCap, 24_000) : recentUsers.has(index) ? recentUserCap : oldUserCap;
       return { ...message, content: clip(message.content, cap, "user message") };

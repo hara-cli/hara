@@ -5,6 +5,27 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.147.0 — 2026-08-14 — durable reasoning and bounded sub-agents
+
+- Give both official DeepSeek V4 Flash and Pro the complete `off` / `low` / `high` / `max` thinking
+  control on native stateless Responses. Hara now preserves completed reasoning items across tool rounds,
+  replays them in request order without relying on unsupported server-side conversation state, retains
+  DeepSeek Chat reasoning beside tool calls for managed gateways, and rejects malformed or unterminated
+  semantic streams.
+- Introduce a provider-neutral sub-agent runtime with FIFO admission, a root concurrency budget, bounded
+  queues, abort-aware cancellation, structured settlements, isolated read-only child state, truthful
+  delegated usage accounting, and credential-redacted failures. Existing local/global/explore roles remain
+  compatible, while future execution adapters no longer need to be wired into the main agent loop.
+- Improve Chinese task understanding and routing so concise commands such as “修复”, “开始”, and “继续”
+  resolve against the active request and durable checkpoint instead of becoming vague goals or casual-chat
+  turns. Intake now records a concrete target, boundaries, assumptions, and observable completion proof.
+- Fail closed when an organization connection has not authorized the configured image fallback, preventing
+  Desktop from advertising a global vision route that the company key cannot use. Keep the optional vision
+  helper for text-only providers without treating it as a second reasoning model.
+- Compact private Hara directory rules before compiling the macOS Seatbelt profile, so large session stores
+  no longer exceed the platform profile-size limit while protected credentials remain denied. Upgrade with
+  `npm i -g @nanhara/hara@0.147.0`.
+
 ## 0.146.3 — 2026-08-13 — authoritative turn input routing
 
 - Add the feature-detected `session.submit` Serve method so Core, rather than delayed renderer state,
