@@ -4893,6 +4893,10 @@ program.action(async (opts) => {
     }
   }
   let projectContext = loadAgentContext(cwd) || undefined;
+  const refreshProjectContext = (): string | undefined => {
+    projectContext = loadAgentContext(cwd) || undefined;
+    return projectContext;
+  };
   const spawn = (t: string, role?: string, signal?: AbortSignal) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role, signal);
 
   // session: --resume <id> / --continue (latest in this cwd) / new
@@ -6032,6 +6036,7 @@ program.action(async (opts) => {
             const sk = loadSkillIndex(cwd).find((s) => s.id === nm && s.userInvocable);
             if (sk) {
               h.sink.notice(`↗ entering ${sk.id}…`);
+              refreshProjectContext();
               resumeTaskPending = false; // an explicit skill entry starts its own task
               clearTodos();
               meta.todos = [];
@@ -6076,6 +6081,7 @@ program.action(async (opts) => {
         // A message that begins with an absolute file path (the case skipped above) → inline it as an
         // @-mention so its content is read into the turn (drag-a-file-in → interpret it).
         line = inlineLeadingPath(line, existsSync);
+        refreshProjectContext();
         const ui = { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice };
         const appr = h.approval;
         let submittedInteraction: TaskInteraction = routeTaskInteraction(
@@ -6333,6 +6339,7 @@ program.action(async (opts) => {
           // ENTER the mode: load the skill + run a kickoff turn now (mirrors the TUI path) so e.g. /design
           // opens its workspace + surfaces prior progress immediately, instead of just staging context.
           out(c.dim(`↗ entering ${sk.id}…\n`));
+          refreshProjectContext();
           const skillContent = `Skill \`${sk.id}\`:\n${loadSkillBody(sk)}\n\n---\nEntering ${sk.id} mode${rest.length ? ` — request: ${rest.join(" ")}` : ""}. Follow this skill now. If it has a workspace or live preview, OPEN it FIRST so any existing progress is visible, then proceed — offer to continue existing work or start fresh.`;
           const skillInteraction = newTurnInteraction();
           resumeTaskPending = false;
@@ -6372,6 +6379,7 @@ program.action(async (opts) => {
       continue;
     }
     line = inlineLeadingPath(line, existsSync); // leading dropped file path → @-mention so it's read in
+    refreshProjectContext();
     const automaticRecall = await automaticSessionRecall(line, { cwd, sessionId: meta.id });
     const recallPrefix = [recalledContext, automaticRecall].filter(Boolean).join("\n\n");
     const turnSkillPolicies = recalledSkillPolicies;

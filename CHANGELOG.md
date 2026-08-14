@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.147.2 — 2026-08-14 — live project-instruction refresh
+
+- Refresh the bounded, protected `AGENTS.md` project context immediately before every idle CLI or Desktop
+  turn. Edits now take effect in the existing conversation without restarting `hara serve`, reopening the
+  project, or discarding history.
+- Keep an active turn's system context stable: steering accepted while work is running never reloads project
+  instructions underneath that execution. The next idle turn receives the update, while approval modes,
+  gateway sender restrictions, protected-path rules, and the existing 32 KiB context cap remain unchanged.
+  Upgrade with `npm i -g @nanhara/hara@0.147.2`.
+
 ## 0.147.1 — 2026-08-14 — truthful task completion and local image inspection
 
 - Add the native `inspect_image` tool for images discovered or downloaded during a task. Hara now verifies

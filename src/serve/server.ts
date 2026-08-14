@@ -1145,6 +1145,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     stopReason?: "deadline" | "task_round_budget";
   }> => {
     const sessionId = s.meta.id;
+    // Serve sessions can stay attached to Desktop for days. Refresh project instructions at the
+    // boundary of each idle turn so an AGENTS.md edit takes effect without restarting the server or
+    // discarding conversation history. Active steering never enters runTurn, so a file change cannot
+    // rewrite the system context underneath work that is already running.
+    s.projectContext = loadAgentContext(s.meta.cwd) || undefined;
     s.busy = true;
     const turnAbort = new AbortController();
     s.abort = turnAbort;

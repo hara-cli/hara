@@ -2096,6 +2096,42 @@ test("serve e2e: live metadata and resume are serialized with an active turn", {
   }
 });
 
+test("serve e2e: an attached session reloads AGENTS.md before every idle turn", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-agents-refresh-"));
+  const store = memStore();
+  const systems = [];
+  writeFileSync(join(dir, "AGENTS.md"), "FIRST_PROJECT_RULE");
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ system, onText }) {
+      systems.push(system);
+      onText("ok");
+      return { text: "ok", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    await c.call("session.send", { sessionId: result.sessionId, text: "answer once" });
+
+    writeFileSync(join(dir, "AGENTS.md"), "SECOND_PROJECT_RULE");
+    await c.call("session.send", { sessionId: result.sessionId, text: "answer again" });
+
+    assert.equal(systems.length, 2);
+    assert.match(systems[0], /FIRST_PROJECT_RULE/);
+    assert.doesNotMatch(systems[0], /SECOND_PROJECT_RULE/);
+    assert.match(systems[1], /SECOND_PROJECT_RULE/);
+    assert.doesNotMatch(systems[1], /FIRST_PROJECT_RULE/);
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: session.steer targets the live turn and stays in the same task", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-steer-"));
   const store = memStore();
