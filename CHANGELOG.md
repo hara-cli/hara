@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.147.1 — 2026-08-14 — truthful task completion and local image inspection
+
+- Add the native `inspect_image` tool for images discovered or downloaded during a task. Hara now verifies
+  workspace scope, file identity, format, and size; gives an owner-only snapshot to the conversation's
+  authorized image route; and removes it afterward. Qwen 3.7 Plus and other image-capable main models no
+  longer need an unrelated project script, `.env` access, or a second API key to inspect a local image.
+- Require an engine-readable final receipt after an accepted task brief. A task reaches `completed` only
+  with fresh observable evidence; missing user input becomes an explicit resumable `awaiting_user` pause,
+  and any later tool call or checkpoint change invalidates stale success evidence.
+- Keep repeated failures in a bounded no-progress ledger, so alternating several failing tools cannot evade
+  the circuit breaker. Prefer a matching configured MCP service over inspecting its source directory, while
+  preserving Hara's existing trusted-extension approval boundary.
+- Prefer Git Bash on Windows and reject mixed WSL/drive-letter paths before they become malformed paths.
+  Persist the Hara runtime version in every new or resumed CLI, Desktop, and scheduled session so future
+  reports identify the exact engine that produced them. Upgrade with `npm i -g @nanhara/hara@0.147.1`.
+
 ## 0.147.0 — 2026-08-14 — durable reasoning and bounded sub-agents
 
 - Give both official DeepSeek V4 Flash and Pro the complete `off` / `low` / `high` / `max` thinking

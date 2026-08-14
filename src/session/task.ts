@@ -14,6 +14,7 @@ export const MAX_TASK_CHECKPOINT_ARTIFACTS = 32;
 export const MAX_TASK_CHECKPOINT_ARTIFACT_CHARS = 1_000;
 export const MAX_TASK_CHECKPOINT_FACTS = 64;
 export const MAX_TASK_CHECKPOINT_CAPABILITIES = 32;
+export const MAX_TASK_COMPLETION_EVIDENCE = 12;
 export const MAX_TASK_STATE_KEY_CHARS = 120;
 export const MAX_TASK_FACT_STRING_CHARS = 2_000;
 export const MAX_TASK_EVIDENCE_CHARS = 1_000;
@@ -69,6 +70,18 @@ export interface TaskCapability {
   checkedAt: string;
 }
 
+export type TaskCompletionState = "verified" | "awaiting_user";
+
+/** Engine-readable completion receipt. Free-form assistant prose is never treated as proof that the accepted
+ * brief succeeded. A verified task names observable evidence; a task waiting on the user names the exact
+ * missing input without falsely entering the completed state. */
+export interface TaskCompletion {
+  state: TaskCompletionState;
+  evidence: string[];
+  waitingFor?: string;
+  updatedAt: string;
+}
+
 /** Supplementary durable checkpoint. Canonical completed/pending steps remain SessionMeta.todos so there
  * is only one checklist to resume; this object stores the non-derivable cursor, blockers, outputs, facts,
  * and capability preflight used by progress UI and final synthesis. */
@@ -80,6 +93,7 @@ export interface TaskCheckpoint {
   artifacts: string[];
   facts: Record<string, TaskFact>;
   capabilities: Record<string, TaskCapability>;
+  completion?: TaskCompletion;
   updatedAt: string;
 }
 
@@ -241,6 +255,13 @@ export interface TaskCheckpointInput {
   artifacts?: unknown;
   facts?: unknown;
   capabilities?: unknown;
+  completion?: unknown;
+}
+
+interface TaskCompletionInput {
+  state?: unknown;
+  evidence?: unknown;
+  waiting_for?: unknown;
 }
 
 function taskStateKey(value: unknown, label: string): { ok: true; value: string } | { ok: false; reason: string } {
@@ -289,6 +310,55 @@ function requiredCapabilityList(value: unknown): { ok: true; value: string[] } |
     }
   }
   return { ok: true, value: out };
+}
+
+function completionInput(
+  value: unknown,
+  at: string,
+): { ok: true; value: TaskCompletion } | { ok: false; reason: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, reason: "completion must be an object" };
+  }
+  const input = value as TaskCompletionInput;
+  if (input.state !== "verified" && input.state !== "awaiting_user") {
+    return { ok: false, reason: "completion state must be verified or awaiting_user" };
+  }
+  if (!Array.isArray(input.evidence)) {
+    return { ok: false, reason: "completion evidence must be an array of observed checks" };
+  }
+  const evidence: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input.evidence) {
+    if (typeof raw !== "string") return { ok: false, reason: "every completion evidence item must be a string" };
+    const item = raw.replace(/\r\n?/g, "\n").trim().slice(0, MAX_TASK_EVIDENCE_CHARS);
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    evidence.push(item);
+    if (evidence.length > MAX_TASK_COMPLETION_EVIDENCE) {
+      return { ok: false, reason: `completion evidence cannot exceed ${MAX_TASK_COMPLETION_EVIDENCE} entries` };
+    }
+  }
+  const waitingFor = typeof input.waiting_for === "string"
+    ? input.waiting_for.replace(/\r\n?/g, "\n").trim().slice(0, MAX_TASK_CHECKPOINT_STEP_CHARS)
+    : "";
+  if (input.waiting_for !== undefined && typeof input.waiting_for !== "string") {
+    return { ok: false, reason: "completion waiting_for must be a string" };
+  }
+  if (input.state === "verified" && !evidence.length) {
+    return { ok: false, reason: "verified completion requires at least one observable evidence item" };
+  }
+  if (input.state === "awaiting_user" && !waitingFor) {
+    return { ok: false, reason: "awaiting_user completion requires waiting_for" };
+  }
+  return {
+    ok: true,
+    value: {
+      state: input.state,
+      evidence,
+      ...(waitingFor ? { waitingFor } : {}),
+      updatedAt: at,
+    },
+  };
 }
 
 /** Atomically update the task's shared factual/capability checkpoint. A changed fact or capability needs
@@ -442,6 +512,29 @@ export function applyTaskCheckpoint(
     changes.push("capabilities");
   }
 
+  if (input.completion !== undefined) {
+    const parsed = completionInput(input.completion, now);
+    if (!parsed.ok) return parsed;
+    if (parsed.value.state === "verified" && (next.blockedStep || next.blockReason)) {
+      return {
+        ok: false,
+        reason: "verified completion cannot retain a blocker; clear blocked_step and block_reason in the same checkpoint",
+      };
+    }
+    next.completion = parsed.value;
+    if (parsed.value.state === "awaiting_user") {
+      next.blockedStep ??= next.currentStep ?? "complete the accepted task";
+      next.blockReason ??= parsed.value.waitingFor;
+      next.nextStep ??= `Continue after the user provides: ${parsed.value.waitingFor}`;
+    }
+    changes.push("completion");
+  } else if (changes.length && next.completion) {
+    // Any later state mutation invalidates an earlier receipt unless the caller explicitly re-attests in
+    // the same atomic checkpoint. This prevents stale success from surviving newly discovered evidence.
+    delete next.completion;
+    changes.push("completion invalidated");
+  }
+
   if (!changes.length) return { ok: false, reason: "checkpoint must update at least one field" };
   return {
     ok: true,
@@ -479,10 +572,13 @@ export function applyTaskBrief(
     ...(requiredCapabilities.value.length ? { requiredCapabilities: requiredCapabilities.value } : {}),
     createdAt: now,
   };
+  const checkpoint = task.checkpoint
+    ? { ...task.checkpoint, completion: undefined, updatedAt: now }
+    : task.checkpoint;
   return {
     ok: true,
     brief,
-    task: { ...task, brief, updatedAt: now },
+    task: { ...task, brief, ...(checkpoint ? { checkpoint } : {}), updatedAt: now },
   };
 }
 
@@ -504,6 +600,9 @@ export function continueTaskExecution(
     ok: true,
     task: {
       ...task,
+      ...(task.checkpoint
+        ? { checkpoint: { ...task.checkpoint, completion: undefined, updatedAt: now } }
+        : {}),
       status: "running",
       turnId: interaction.turnId,
       updatedAt: now,
@@ -628,11 +727,19 @@ export function finishTaskExecution(
   if (!task) return undefined;
   const now = iso(at);
   const incomplete = todos.some((todo) => todo.status !== "done");
+  const completion = task.checkpoint?.completion;
+  const completionIsFresh = Boolean(
+    completion
+    && Date.parse(completion.updatedAt) >= Date.parse(task.startedAt)
+    && (!task.brief || Date.parse(completion.updatedAt) >= Date.parse(task.brief.createdAt)),
+  );
+  const acceptedBriefVerified = !task.brief
+    || (completionIsFresh && completion?.state === "verified");
   const lastOutcome = interrupted ? "interrupted" : (outcome?.status ?? "interrupted");
   const status: TaskExecutionStatus = interrupted
     ? "paused"
     : outcome?.status === "completed"
-      ? (incomplete ? "paused" : "completed")
+      ? (incomplete || !acceptedBriefVerified ? "paused" : "completed")
       : outcome?.status === "halted" && (outcome.stopReason === "deadline" || outcome.stopReason === "task_round_budget")
         ? "paused"
       : outcome?.status === "error" || outcome?.status === "empty" || outcome?.status === "halted"
@@ -661,6 +768,17 @@ export function finishTaskExecution(
   } else if (current) {
     checkpoint.currentStep = boundedText(current.activeForm || current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
     checkpoint.nextStep ??= boundedText(current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
+  } else if (outcome?.status === "completed" && task.brief && !acceptedBriefVerified) {
+    if (completionIsFresh && completion?.state === "awaiting_user") {
+      checkpoint.blockedStep ??= "complete the accepted task";
+      checkpoint.blockReason ??= completion.waitingFor ?? "required user input is missing";
+      checkpoint.nextStep ??= completion.waitingFor
+        ? `Continue after the user provides: ${completion.waitingFor}`
+        : "continue after the required user input arrives";
+    } else {
+      checkpoint.currentStep = "verify the accepted completion checks";
+      checkpoint.nextStep = "record a verified completion receipt or the exact input still needed from the user";
+    }
   }
   if (status === "blocked") {
     const checkpointUpdatedThisRun = Date.parse(prior.updatedAt) >= Date.parse(task.startedAt);
@@ -714,7 +832,7 @@ export function taskCheckpointContext(checkpoint: TaskCheckpoint | undefined): s
   const facts = Object.entries(checkpoint.facts);
   const capabilities = Object.entries(checkpoint.capabilities);
   const hasState = checkpoint.currentStep || checkpoint.blockedStep || checkpoint.blockReason || checkpoint.nextStep
-    || checkpoint.artifacts.length || facts.length || capabilities.length;
+    || checkpoint.artifacts.length || facts.length || capabilities.length || checkpoint.completion;
   if (!hasState) return "";
   const lines = [
     "# Structured task state (authoritative)",
@@ -740,6 +858,14 @@ export function taskCheckpointContext(checkpoint: TaskCheckpoint | undefined): s
   }
   if (checkpoint.artifacts.length) {
     lines.push("## Artifacts", ...checkpoint.artifacts.map((artifact) => `- ${artifact}`));
+  }
+  if (checkpoint.completion) {
+    lines.push(
+      "## Completion receipt",
+      `- state: ${checkpoint.completion.state}`,
+      ...(checkpoint.completion.waitingFor ? [`- waiting for: ${checkpoint.completion.waitingFor}`] : []),
+      ...checkpoint.completion.evidence.map((item) => `- evidence: ${item}`),
+    );
   }
   return lines.join("\n");
 }
@@ -777,6 +903,7 @@ export function taskExecutionContext(task: TaskExecution, interaction: TaskInter
 
 export function formatTaskExecution(task: TaskExecution | undefined): string {
   if (!task) return "(no task state)";
+  const receipt = task.checkpoint?.completion;
   return [
     `task ${task.id.slice(0, 8)} · ${task.status}`,
     `turn ${task.turnId.slice(0, 8)} · outcome ${task.lastOutcome ?? "running"}`,
@@ -784,6 +911,7 @@ export function formatTaskExecution(task: TaskExecution | undefined): string {
     `objective: ${task.objective}`,
     `brief: ${task.brief ? `${task.brief.intent} · ${task.brief.goal}` : "(not accepted yet)"}`,
     `checkpoint: ${task.checkpoint ? `${Object.keys(task.checkpoint.facts).length} fact(s) · ${Object.keys(task.checkpoint.capabilities).length} capability check(s) · ${task.checkpoint.artifacts.length} artifact(s)` : "(legacy none)"}`,
+    `completion: ${receipt ? `${receipt.state} · ${receipt.evidence.length} evidence item(s)${receipt.waitingFor ? ` · waiting for ${receipt.waitingFor}` : ""}` : "(no receipt)"}`,
     `steering: ${task.steering?.length ?? 0}`,
   ].join("\n");
 }
@@ -829,6 +957,20 @@ function validTaskCheckpoint(value: unknown): value is TaskCheckpoint {
       (capability.state !== "available" && capability.state !== "unavailable" && capability.state !== "blocked" && capability.state !== "unknown") ||
       !validCheckpointText(capability.detail, MAX_TASK_EVIDENCE_CHARS) ||
       !validTimestamp(capability.checkedAt)
+    ) return false;
+  }
+  if (checkpoint.completion !== undefined) {
+    if (!checkpoint.completion || typeof checkpoint.completion !== "object" || Array.isArray(checkpoint.completion)) return false;
+    const completion = checkpoint.completion as Record<string, unknown>;
+    if (
+      (completion.state !== "verified" && completion.state !== "awaiting_user")
+      || !Array.isArray(completion.evidence)
+      || completion.evidence.length > MAX_TASK_COMPLETION_EVIDENCE
+      || !completion.evidence.every((item) => typeof item === "string" && item.length > 0 && item.length <= MAX_TASK_EVIDENCE_CHARS)
+      || (completion.waitingFor !== undefined && !validCheckpointText(completion.waitingFor))
+      || (completion.state === "verified" && completion.evidence.length === 0)
+      || (completion.state === "awaiting_user" && !completion.waitingFor)
+      || !validTimestamp(completion.updatedAt)
     ) return false;
   }
   return true;

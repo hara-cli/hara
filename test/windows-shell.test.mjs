@@ -6,6 +6,7 @@ import {
   firstHealthyWindowsBash,
   firstInstalledWindowsBash,
   resolveShellArgv,
+  windowsShellPathPreflight,
   windowsBashCandidates,
 } from "../dist/sandbox.js";
 
@@ -57,4 +58,25 @@ test("Windows shell discovery skips a broken WSL alias and keeps probing for Git
 
 test("Windows shell discovery returns no bash when every discovered executable is unhealthy", () => {
   assert.equal(firstHealthyWindowsBash(["C:\\Windows\\System32\\bash.exe"], () => false), null);
+});
+
+test("Windows shell path preflight rejects WSL/drive-letter mixing before Node resolves a bogus path", () => {
+  const wsl = "C:\\Windows\\System32\\bash.exe";
+  assert.match(
+    windowsShellPathPreflight('node "D:/Work/八字案例短视频/nayi-admin-mcp/index.js"', wsl) ?? "",
+    /Windows absolute path to WSL Bash.*\/mnt\/d\/.*wslpath.*Git Bash/is,
+  );
+  assert.match(
+    windowsShellPathPreflight('node "/mnt/d/Work/八字案例短视频/D:/Work/八字案例短视频/index.js"', wsl) ?? "",
+    /mixes WSL.*Windows.*one absolute path dialect/is,
+  );
+});
+
+test("Windows shell path preflight permits one deliberate dialect", () => {
+  const wsl = "C:\\Windows\\System32\\bash.exe";
+  const git = "C:\\Program Files\\Git\\bin\\bash.exe";
+  assert.equal(windowsShellPathPreflight('node "/mnt/d/Work/project/index.js"', wsl), undefined);
+  assert.equal(windowsShellPathPreflight('node "D:/Work/project/index.js"', git), undefined);
+  assert.equal(windowsShellPathPreflight('node "$(wslpath -u \'D:\\Work\\project\\index.js\')"', wsl), undefined);
+  assert.equal(windowsShellPathPreflight('node.exe "D:/Work/project/index.js"', wsl), undefined);
 });

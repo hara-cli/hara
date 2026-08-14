@@ -72,6 +72,7 @@ test("session-model: SessionMeta model and identity profile round-trip through s
     const meta = {
       id,
       cwd,
+      haraVersion: "0.148.0-test",
       profileId: tokenShapedProfileId,
       provider: "qwen",
       model: "claude-4-opus", // ← the per-session pinned model
@@ -84,6 +85,7 @@ test("session-model: SessionMeta model and identity profile round-trip through s
     const loaded = loadSession(id);
     assert.ok(loaded);
     assert.equal(loaded.meta.model, "claude-4-opus", "resume restores the pinned model — the whole point");
+    assert.equal(loaded.meta.haraVersion, "0.148.0-test", "the report can identify the runtime that last wrote the session");
     assert.equal(
       loaded.meta.profileId,
       tokenShapedProfileId,

@@ -76,7 +76,8 @@ function windowsBashWorks(path: string): boolean {
 function findWindowsBash(refresh = false): string | null {
   if (refresh) _winBash = undefined;
   if (_winBash !== undefined) return _winBash;
-  // `where bash` finds Git Bash / WSL bash on PATH; also probe the default Git-for-Windows location.
+  // Prefer a conventional Git Bash before PATH aliases. A healthy WSL bash is still a fallback, but Git
+  // Bash shares Windows path semantics with the cwd and avoids needless D:\\... ↔ /mnt/d/... crossings.
   // `timeout` is CRITICAL: this is a SYNCHRONOUS probe on the main thread — without it a slow `where`
   // (a huge PATH, a dead network drive on PATH) hangs hara at startup with nothing able to interrupt it.
   const onPath = spawnSync("where", ["bash"], { encoding: "utf8", timeout: 3000 });
@@ -86,7 +87,7 @@ function findWindowsBash(refresh = false): string | null {
   const conventional = windowsBashCandidates().filter((path) => {
     try { return existsSync(path) && statSync(path).isFile(); } catch { return false; }
   });
-  const candidates = [...new Set([...onPathCandidates, ...conventional])];
+  const candidates = [...new Set([...conventional, ...onPathCandidates])];
   _winBash = firstHealthyWindowsBash(candidates, windowsBashWorks);
   return _winBash;
 }
@@ -107,6 +108,33 @@ export function resolveShellArgv(command: string, plat: string, bash: string | n
     return bash ? { cmd: bash, args: ["-c", command] } : { cmd: "cmd.exe", args: ["/d", "/s", "/c", command] };
   }
   return { cmd: "/bin/sh", args: ["-c", command] };
+}
+
+function isGitForWindowsBash(bash: string): boolean {
+  return /(?:^|[\\/])Git[\\/](?:bin|usr[\\/]bin)[\\/]bash\.exe$/iu.test(bash);
+}
+
+/** Reject a Windows path before WSL interprets it as a relative POSIX path such as
+ * `/mnt/d/project/D:/Work/project`. Rewriting arbitrary shell text would be unsafe, so the diagnostic
+ * tells the model to choose one dialect explicitly instead. Exported as a pure helper for Windows CI. */
+export function windowsShellPathPreflight(command: string, bash: string | null): string | undefined {
+  const mixedToken = /\/mnt\/([a-z])\/[^\s"'|;&]*[a-z]:[\\/]/iu.exec(command);
+  if (mixedToken) {
+    return (
+      "shell command contains one path that mixes WSL (/mnt/<drive>/...) and Windows (<drive>:/...) syntax. " +
+      "Use one absolute path dialect; do not append a Windows absolute path to the current WSL directory."
+    );
+  }
+  if (!bash || isGitForWindowsBash(bash)) return undefined;
+  if (/\bwslpath\b/iu.test(command)) return undefined;
+  if (/^\s*(?:powershell|pwsh|cmd|node|python|py)\.exe\b/iu.test(command)) return undefined;
+  const windowsAbsolute = /(?:^|[\s"'=(])([a-z]):[\\/]/iu.exec(command);
+  if (!windowsAbsolute) return undefined;
+  const drive = windowsAbsolute[1].toLowerCase();
+  return (
+    `shell command passes a Windows absolute path to WSL Bash. Convert it explicitly to /mnt/${drive}/... ` +
+    "with wslpath, use a Windows-native executable, or install/select Git Bash; Hara will not guess by concatenating path dialects."
+  );
 }
 
 const MAX_INLINE_SEATBELT_PROFILE_BYTES = 96 * 1024;
@@ -230,7 +258,12 @@ export function shellCommand(command: string, cwd: string, mode: SandboxMode): {
   maybeWarnUnsandboxed(mode);
   const plat = platform();
   if (plat === "win32") maybeWarnWindowsShell();
-  return resolveShellArgv(command, plat, plat === "win32" ? findWindowsBash() : null);
+  const bash = plat === "win32" ? findWindowsBash() : null;
+  if (plat === "win32") {
+    const pathReason = windowsShellPathPreflight(command, bash);
+    if (pathReason) throw new Error(pathReason);
+  }
+  return resolveShellArgv(command, plat, bash);
 }
 
 /** One-time notice on Windows when no bash is found — the POSIX commands the model writes won't run

@@ -283,9 +283,46 @@ test("a batched empty-recall burst executes only three serial searches", async (
   assert.equal(outcome.status, "completed");
 });
 
-test("a changed failure or successful call clears an older repeated-failure streak", async () => {
+test("an interleaved failure cannot hide a repeated no-progress call", async () => {
   let turn = 0;
-  const sequence = ["fail", "other-fail", "fail", "progress", "fail", "other-fail", "fail", "done"];
+  const sequence = ["fail", "other-fail", "fail"];
+  const provider = {
+    id: "interleaved-repeat",
+    model: "interleaved-repeat",
+    async turn() {
+      const step = sequence[Math.min(turn, sequence.length - 1)];
+      turn += 1;
+      return {
+        text: "",
+        toolUses: [{
+          id: `call-${turn}`,
+          name: "sometimes_fails",
+          input: { same: step !== "other-fail" },
+        }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "recover" }], base(provider, {
+    maxRounds: 10,
+    timeoutMs: "10s",
+    quiet: true,
+    extraTools: [{
+      name: "sometimes_fails",
+      description: "test failure",
+      input_schema: { type: "object", properties: { same: { type: "boolean" } } },
+      kind: "read",
+      async run() { return "Error: deterministic failure"; },
+    }],
+  }));
+  assert.equal(outcome.stopReason, "repeat_loop");
+  assert.equal(turn, 3);
+  assert.match(outcome.error, /same failing sometimes_fails call repeated 2 times/);
+});
+
+test("a successful call clears the bounded repeated-failure ledger", async () => {
+  let turn = 0;
+  const sequence = ["fail", "other-fail", "progress", "fail", "other-fail", "done"];
   const provider = {
     id: "recovering-repeat",
     model: "recovering-repeat",

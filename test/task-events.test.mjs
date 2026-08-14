@@ -92,6 +92,32 @@ test("task lifecycle event projects the same persisted blocker, facts, capabilit
   });
 });
 
+test("task lifecycle event exposes an awaiting-user completion receipt without claiming completion", () => {
+  const task = createTaskExecution("publish after approval", "turn-await", "2026-08-14T00:00:00.000Z");
+  const applied = applyTaskCheckpoint(task, {
+    completion: {
+      state: "awaiting_user",
+      evidence: ["the signed candidate passed local verification"],
+      waiting_for: "release-owner approval",
+    },
+  }, "2026-08-14T00:01:00.000Z");
+  assert.equal(applied.ok, true);
+  const event = taskLifecycleEvent(
+    "session-await",
+    { ...applied.task, status: "paused" },
+    [],
+    { phase: "finished" },
+    { streamId: "serve-1", sequence: 82 },
+    "2026-08-14T00:02:00.000Z",
+  );
+  assert.equal(event.state, "paused");
+  assert.deepEqual(event.checkpoint.completion, {
+    state: "awaiting_user",
+    evidence: ["the signed candidate passed local verification"],
+    waitingFor: "release-owner approval",
+  });
+});
+
 test("a late runtime phase cannot resurrect a terminal task as running", () => {
   const task = {
     ...createTaskExecution("finished work", "turn-3", "2026-07-19T12:00:00.000Z"),

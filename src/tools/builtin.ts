@@ -9,13 +9,20 @@ import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
 import { atomicWriteText, bindAtomicWritePath, type AtomicWriteBoundary } from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
-import { BinaryFileError, readVerifiedRegularFileSnapshot, resolveVerifiedModelPath, streamFileSlice } from "../fs-read.js";
+import {
+  BinaryFileError,
+  InvalidUtf8FileError,
+  readVerifiedRegularFileSnapshot,
+  resolveVerifiedModelPath,
+  streamFileSlice,
+} from "../fs-read.js";
 import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
 import { sensitiveFileError, sensitiveShellCommandReason } from "../security/sensitive-files.js";
 import { createToolOutputLineRedactor, redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { isReadOnlyCommand, splitCompound } from "../security/permissions.js";
 import { loadConfig } from "../config.js";
 import { commandHasPackageRegistry, normalizePackageRegistry, packageRegistryEnv } from "../package-registry.js";
+import { mediaTypeFor } from "../images.js";
 import {
   hostsInCommand,
   isNetworkGitOp,
@@ -167,6 +174,15 @@ export function capHeadTail(s: string, max = MAX): string {
 
 const READ_LINES = 300; // sized to stay useful under the global 24k-char tool-result context boundary
 const LINE_CAP = 2000; // chars per line before truncation (minified bundles / data lines)
+
+function binaryReadGuidance(path: string): string {
+  return (
+    `Error: cannot read ${path}: file appears binary or is not valid UTF-8. ` +
+    "If it is a PNG/JPEG/GIF/WebP inside this workspace, call inspect_image; otherwise use a format-specific tool. " +
+    "Do not read credentials or add a second API key just to inspect an image."
+  );
+}
+
 /** Render a line slice of a file, cat -n style. The old read_file dumped the WHOLE file (100K-char cap,
  *  tail simply lost) — on long files that both flooded the context (~25k tokens per read, again on every
  *  re-read) and made everything past the cap unreachable. Now: line numbers (anchor for edits and for
@@ -209,6 +225,10 @@ registerTool({
     const p = abs(input.path, ctx.cwd);
     const denied = sensitiveFileError(p, "read");
     if (denied) return denied;
+    // A model commonly discovers a downloaded/generated image by its path and tries read_file first. Route
+    // the declared image shape before the lossy streaming decoder can turn binary bytes into replacement
+    // characters. inspect_image independently verifies magic bytes, size, identity, and workspace scope.
+    if (mediaTypeFor(p)) return binaryReadGuidance(input.path);
     try {
       const target = resolveVerifiedModelPath(p, "read");
       // streamFileSlice opens O_NONBLOCK, validates the same fd as a regular file, and stops after the
@@ -218,7 +238,7 @@ registerTool({
         protectSensitive: true,
       }));
     } catch (e: any) {
-      if (e instanceof BinaryFileError) return `Error: cannot read ${input.path}: file appears binary; use an image/media-specific tool or inspect it with \`file\`.`;
+      if (e instanceof BinaryFileError || e instanceof InvalidUtf8FileError) return binaryReadGuidance(input.path);
       const near = await nearestPathsAsync(ctx.cwd, input.path, 3, { timeoutMs: 1_000, signal: ctx.signal });
       return `Error: cannot read ${input.path}: ${e.message ?? e.code}.` + (near.length ? ` Did you mean: ${near.join(", ")}?` : "");
     }

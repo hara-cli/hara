@@ -5,8 +5,9 @@ import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { saveSession } from "../dist/session/store.js";
+import { loadSession, saveSession } from "../dist/session/store.js";
 import { persistPrintAutomationOccurrence } from "../dist/cron/runner.js";
+import { HARA_RUNTIME_VERSION } from "../dist/version.js";
 import { getTool } from "../dist/tools/registry.js";
 import { automaticSessionRecall, sessionRecallQuery, sessionSearchTerms } from "../dist/tools/session-search.js";
 
@@ -84,6 +85,7 @@ test("a freshly bound cron occurrence can automatically recall the same job's pr
     name: "renamed task",
     cwd: project,
   });
+  assert.equal(loadSession(currentId)?.meta.haraVersion, HARA_RUNTIME_VERSION);
   const recalled = await automaticSessionRecall(
     "继续上次任务的 cobalt handoff",
     { cwd: project, sessionId: currentId },

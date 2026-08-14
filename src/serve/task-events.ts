@@ -63,6 +63,11 @@ export interface TaskLifecycleEvent {
     artifacts?: string[];
     facts?: Record<string, string | number | boolean>;
     capabilities?: Record<string, { state: "available" | "unavailable" | "blocked" | "unknown"; detail?: string }>;
+    completion?: {
+      state: "verified" | "awaiting_user";
+      evidence: string[];
+      waitingFor?: string;
+    };
   };
   detail?: string;
   approval?: {
@@ -148,6 +153,17 @@ export function taskLifecycleEvent(
                 ...(capability.detail ? { detail: bounded(capability.detail, 500) } : {}),
               },
             ])),
+          }
+        : {}),
+      ...(persisted?.completion
+        ? {
+            completion: {
+              state: persisted.completion.state,
+              evidence: persisted.completion.evidence.map((item) => item.slice(0, 1_000)),
+              ...(persisted.completion.waitingFor
+                ? { waitingFor: bounded(persisted.completion.waitingFor, 500) }
+                : {}),
+            },
           }
         : {}),
     },

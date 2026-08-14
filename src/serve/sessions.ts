@@ -68,7 +68,11 @@ export interface ServeSession {
 
 export class SessionHub {
   private sessions = new Map<string, ServeSession>();
-  constructor(private store: SessionStore = realStore) {}
+  constructor(private store: SessionStore = realStore, private haraVersion?: string) {}
+
+  private stampVersion(meta: SessionMeta): void {
+    if (this.haraVersion) meta.haraVersion = this.haraVersion;
+  }
 
   /** Mutate an on-disk session under the same single-writer lock used by live sessions. The load happens
    *  only AFTER acquisition, so a writer that finished immediately before us cannot be overwritten by a
@@ -80,6 +84,7 @@ export class SessionHub {
       const current = this.store.load(id);
       if (!current) return false;
       mutate(current);
+      this.stampVersion(current.meta);
       this.store.save(current.meta, current.history, current.task);
       return true;
     } finally {
@@ -91,6 +96,7 @@ export class SessionHub {
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: o.cwd,
+      ...(this.haraVersion ? { haraVersion: this.haraVersion } : {}),
       profileId: o.profileId ?? "personal",
       provider: o.providerId,
       model: o.model,
@@ -136,6 +142,7 @@ export class SessionHub {
       // Credentials are refreshed live inside the session's persisted identity route; the model remains
       // the session's explicit pin.
       prior.meta.provider = o.provider.id;
+      this.stampVersion(prior.meta);
       const task = recoverTaskExecution(prior.task);
       const approval = prior.meta.approval ?? o.legacyApproval ?? o.approval;
       prior.meta.approval = approval;
@@ -226,6 +233,7 @@ export class SessionHub {
       const first = s.history.find((m) => m.role === "user");
       if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
     }
+    this.stampVersion(s.meta);
     this.store.save(s.meta, s.history, s.task);
   }
 
@@ -236,6 +244,7 @@ export class SessionHub {
       const first = history.find((m) => m.role === "user");
       if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
     }
+    this.stampVersion(s.meta);
     this.store.save(s.meta, history, task);
   }
 
@@ -245,6 +254,7 @@ export class SessionHub {
     if (live) {
       if (live.busy || live.configuring) return false;
       live.meta.title = title;
+      this.stampVersion(live.meta);
       this.store.save(live.meta, live.history, live.task);
       return true;
     }
@@ -259,6 +269,7 @@ export class SessionHub {
     if (live) {
       if (live.busy || live.configuring) return false;
       live.meta.archived = on;
+      this.stampVersion(live.meta);
       this.store.save(live.meta, live.history, live.task);
       return true;
     }
@@ -275,6 +286,7 @@ export class SessionHub {
       if (live.busy || live.configuring) return "busy";
       live.approval = approval;
       live.meta.approval = approval;
+      this.stampVersion(live.meta);
       this.store.save(live.meta, live.history, live.task);
       return "updated";
     }
@@ -313,6 +325,7 @@ export class SessionHub {
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: src.meta.cwd,
+      ...(this.haraVersion ? { haraVersion: this.haraVersion } : {}),
       profileId: targetProfileId,
       provider: o.providerId,
       model: targetModel,

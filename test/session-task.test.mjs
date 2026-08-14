@@ -146,6 +146,76 @@ test("task completion remains paused while durable todos are unfinished", () => 
   assert.equal(completed.status, "completed");
 });
 
+test("an accepted brief requires a fresh engine-readable completion receipt", () => {
+  const interaction = newTurnInteraction();
+  const created = createTaskExecution("publish the verified result", interaction.turnId, "2026-08-14T00:00:00.000Z");
+  const briefed = applyTaskBrief(created, {
+    intent: "change",
+    goal: "publish the verified result",
+    constraints: ["do not claim success before readback"],
+    acceptance: ["public readback matches the local digest"],
+    steps: ["publish", "read back", "record the evidence"],
+  }, "2026-08-14T00:01:00.000Z");
+  assert.equal(briefed.ok, true);
+
+  const missing = finishTaskExecution(
+    briefed.task,
+    { status: "completed" },
+    [{ text: "publish", status: "done" }],
+    false,
+    "2026-08-14T00:02:00.000Z",
+  );
+  assert.equal(missing.status, "paused");
+  assert.match(missing.checkpoint.currentStep, /verify the accepted completion checks/);
+
+  const waiting = applyTaskCheckpoint(briefed.task, {
+    completion: {
+      state: "awaiting_user",
+      evidence: ["the release candidate was built locally"],
+      waiting_for: "approval to publish the public release",
+    },
+  }, "2026-08-14T00:02:30.000Z");
+  assert.equal(waiting.ok, true);
+  const paused = finishTaskExecution(waiting.task, { status: "completed" }, [], false, "2026-08-14T00:03:00.000Z");
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.checkpoint.completion.state, "awaiting_user");
+  assert.match(paused.checkpoint.blockReason, /approval to publish/);
+
+  const verified = applyTaskCheckpoint(briefed.task, {
+    completion: {
+      state: "verified",
+      evidence: ["public readback matched the local SHA-256 digest"],
+    },
+  }, "2026-08-14T00:04:00.000Z");
+  assert.equal(verified.ok, true);
+  const completed = finishTaskExecution(verified.task, { status: "completed" }, [], false, "2026-08-14T00:05:00.000Z");
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.checkpoint.completion.state, "verified");
+
+  const continued = continueTaskExecution(
+    completed,
+    newSteerInteraction(interaction.turnId),
+    "2026-08-14T00:06:00.000Z",
+  );
+  assert.equal(continued.ok, true);
+  assert.equal(continued.task.checkpoint.completion, undefined, "continuation invalidates stale success evidence");
+});
+
+test("verified completion cannot coexist with a persisted blocker", () => {
+  const interaction = newTurnInteraction();
+  const created = createTaskExecution("verify the artifact", interaction.turnId, "2026-08-14T00:00:00.000Z");
+  const blocked = applyTaskCheckpoint(created, {
+    blocked_step: "read back artifact",
+    block_reason: "artifact is not public",
+  }, "2026-08-14T00:01:00.000Z");
+  assert.equal(blocked.ok, true);
+  const rejected = applyTaskCheckpoint(blocked.task, {
+    completion: { state: "verified", evidence: ["local build passed"] },
+  }, "2026-08-14T00:02:00.000Z");
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.reason, /cannot retain a blocker/);
+});
+
 test("deadline and cumulative task-round limits are resumable pauses while loop breakers remain blocked", () => {
   const interaction = newTurnInteraction();
   const task = createTaskExecution("finish the long task", interaction.turnId);

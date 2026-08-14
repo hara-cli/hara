@@ -86,6 +86,28 @@ test("system prompt keeps internal orchestration out of user-visible progress", 
   assert.match(system, /verified results, remaining blockers/);
 });
 
+test("system prompt prefers a matching configured MCP service over inspecting its implementation", async () => {
+  let system = "";
+  const provider = {
+    id: "f",
+    model: "f",
+    async turn(args) {
+      system = args.system;
+      return { text: "ok", toolUses: [], stop: "end" };
+    },
+  };
+  await runAgent([{ role: "user", content: "update the customer record in the configured service" }], {
+    provider,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+  });
+  assert.match(system, /server's name or description matches that service/);
+  assert.match(system, /prefer `mcp_connect` and its exposed tool/);
+  assert.match(system, /Finding an MCP repository path does not connect or use the server/);
+});
+
 test("a resumed session treats persisted history as context instead of rediscovering the workspace", async () => {
   const systems = [];
   const provider = {

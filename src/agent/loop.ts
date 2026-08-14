@@ -174,7 +174,9 @@ only as reviewed trusted extensions. Their tool calls require confirmation every
 are disabled without an interactive approval channel unless the user launched with
 HARA_ALLOW_TRUSTED_EXTENSIONS=1. Configured MCP servers stay stopped by default; when a task materially needs
 one, call \`mcp_connect\` for that server only, then use the newly available tools on the next round. Never
-connect every configured server speculatively.
+connect every configured server speculatively. When the user asks to update an external service and a configured
+server's name or description matches that service, prefer \`mcp_connect\` and its exposed tool over inspecting the
+server's source directory or recreating its API. Finding an MCP repository path does not connect or use the server.
 Optional web, desktop, scheduler, external-agent, and connected-MCP schemas may be deferred to keep context
 focused. If a needed capability is absent from the current tool list, call \`tool_search\` once with the
 capability/service name; use the activated tool on the next round. Do not search speculatively.
@@ -285,7 +287,10 @@ export function composeSystem(
           "For a multi-step task, preflight only the capabilities materially required by this brief and record " +
           "their observed states with `task_checkpoint` before depending on them. After each major stage, before " +
           "reporting a blocker, and before final synthesis, update the shared checkpoint. Canonical step completion " +
-          "belongs in `todo_write`; facts, capability results, blockers, next step, and artifacts belong in `task_checkpoint`."
+          "belongs in `todo_write`; facts, capability results, blockers, next step, and artifacts belong in `task_checkpoint`. " +
+          "Immediately before the final answer, persist a completion receipt: use completion.state=`verified` with " +
+          "observable evidence only after every acceptance check passes, or completion.state=`awaiting_user` with the " +
+          "exact missing input. An accepted brief without a fresh receipt remains paused and is never marked completed."
         )
       : (
           "\n\n# Understanding → execution boundary\n" +
@@ -299,7 +304,9 @@ export function composeSystem(
           "background-process start/stop, computer action, external agent, or MCP connection, call `task_intake` in its OWN tool round with " +
           "the interpreted goal, intent, constraints, acceptance checks, and short steps. Use intent `answer` " +
           "for a direct answer, `investigate` for evidence gathering/diagnosis, and `change` when the user asked " +
-          "you to modify or deliver something. Do not claim completion until the acceptance checks are verified."
+          "you to modify or deliver something. Do not claim completion until the acceptance checks are verified. " +
+          "Once a brief is accepted, finish with a task_checkpoint completion receipt: verified plus observable " +
+          "evidence, or awaiting_user plus the exact missing input."
         );
   assembler
     .add("working-directory", "session", "runtime", `Working directory: ${cwd}`)
@@ -805,7 +812,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           "Persist the active task's shared execution state. Use after a major stage, whenever a verified fact " +
           "or required capability state changes, before reporting a blocker, and before final synthesis. Keep the " +
           "canonical completed/pending step list in todo_write; this tool stores the current/blocked/next cursor, " +
-          "artifacts, verified facts, and capability preflight. A changed prior fact requires fresh evidence. " +
+          "artifacts, verified facts, capability preflight, and the final completion receipt. Before the final answer, " +
+          "set completion to verified with observable acceptance evidence, or awaiting_user with the exact missing input. " +
+          "Without this fresh receipt an accepted task remains paused. A changed prior fact requires fresh evidence. " +
           "A changed capability state requires fresh detail. Pass an empty string to clear a resolved cursor/blocker " +
           "field and pass the full artifact list when updating artifacts.",
         input_schema: {
@@ -846,6 +855,23 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
                 },
                 required: ["name", "state"],
               },
+            },
+            completion: {
+              type: "object",
+              description: "Final engine-readable receipt. Use verified only after all acceptance checks pass; otherwise awaiting_user.",
+              properties: {
+                state: { type: "string", enum: ["verified", "awaiting_user"] },
+                evidence: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: "Observable checks/results. At least one is required for verified.",
+                },
+                waiting_for: {
+                  type: "string",
+                  description: "Exact user input or external decision still required; mandatory for awaiting_user.",
+                },
+              },
+              required: ["state", "evidence"],
             },
           },
         },
@@ -1293,11 +1319,17 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           identity,
           count: (life.failedCalls.get(identity.key) ?? 0) + 1,
         }));
-        // This is a *consecutive no-progress* streak, not a lifetime counter for the call. A different
-        // failure is a changed attempt; keep only that new streak instead of letting an old failure
-        // silently accumulate across intervening work.
-        life.failedCalls.clear();
-        for (const { identity, count } of counts) life.failedCalls.set(identity.key, count);
+        // Retain a bounded run-local no-progress ledger. Alternating read_file → python → read_file is
+        // still the same unchanged read failure, not evidence that the underlying cause improved.
+        for (const { identity, count } of counts) {
+          life.failedCalls.delete(identity.key);
+          life.failedCalls.set(identity.key, count);
+        }
+        while (life.failedCalls.size > 64) {
+          const oldest = life.failedCalls.keys().next().value as string | undefined;
+          if (oldest === undefined) break;
+          life.failedCalls.delete(oldest);
+        }
         const stopped = counts.find(({ identity, count }) => count >= identity.hardStopAfter);
         if (stopped && !repeatHalt) {
           const { identity, count } = stopped;
@@ -1340,6 +1372,19 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // transaction boundary for the whole response: accept/checkpoint the interpretation first, then let
     // the next model round act against the newly authoritative brief.
     const taskBriefTransitionInRound = r.toolUses.some((tu) => tu.name === "task_intake");
+    // A completion receipt attests to the state after all work. Any later non-checkpoint tool invalidates
+    // it before execution; otherwise a model could verify early, mutate afterward, and retain stale success.
+    if (opts.taskIntake && r.toolUses.some((tu) => tu.name !== "task_checkpoint")) {
+      if (!taskStateDirty) syncIntakeTask();
+      if (intakeTask?.checkpoint?.completion) {
+        const checkpoint = { ...intakeTask.checkpoint };
+        delete checkpoint.completion;
+        const updatedAt = new Date().toISOString();
+        checkpoint.updatedAt = updatedAt;
+        intakeTask = { ...intakeTask, checkpoint, updatedAt };
+        taskStateDirty = true;
+      }
+    }
     // Loading instructions and changing their execution authority is one transaction boundary. Do not let a
     // provider batch work beside `skill` using the wider schema it saw before the allowlist became active.
     const skillPolicyTransitionInRound = r.toolUses.some((tu) => tu.name === "skill");
@@ -1375,6 +1420,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         continue;
       }
       const input = tu.input as Record<string, unknown>;
+      if (tu.name === "task_checkpoint" && input.completion !== undefined && r.toolUses.length > 1) {
+        plans.push({
+          tu,
+          tool,
+          denied:
+            "Completion receipt boundary: task_checkpoint with completion must be the only tool in its final tool round. " +
+            "Finish and observe all work first, then record the receipt in the next round.",
+        });
+        continue;
+      }
       const command = tool.kind === "exec" && typeof input.command === "string" ? input.command : null;
       let operation = toolOperationTraits(tool, input, toolCtx);
       // One-release compatibility for embedders/older plugins that only implement static kind. New built-ins

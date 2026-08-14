@@ -35,6 +35,7 @@ import { isValidProfileId } from "../profile/profile.js";
 import { sleepSync } from "../sync-sleep.js";
 import { isTaskExecution, type TaskExecution } from "./task.js";
 import type { ApprovalMode } from "../config.js";
+import { isValidHaraVersion } from "../version.js";
 
 /** Durable transcripts are local input on resume. Bound both allocation and post-parse traversal so a
  * corrupt/hostile session cannot turn startup or `hara sessions` into an unbounded resource operation. */
@@ -77,6 +78,8 @@ export function automatedTitle(source: SessionSource, sourceName: string | undef
 export interface SessionMeta {
   id: string;
   cwd: string;
+  /** Hara runtime that last opened/wrote this session. Optional only for legacy transcripts. */
+  haraVersion?: string;
   /** Identity route that owns this conversation. New sessions always persist it; legacy sessions may
    * omit it and bind to the active profile once on their next successful resume/save. */
   profileId?: string;
@@ -1290,6 +1293,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
   return (
     validSessionId(meta.id) &&
     typeof meta.cwd === "string" &&
+    (meta.haraVersion === undefined || isValidHaraVersion(meta.haraVersion)) &&
     (meta.profileId === undefined || isValidProfileId(meta.profileId)) &&
     typeof meta.provider === "string" &&
     typeof meta.model === "string" &&

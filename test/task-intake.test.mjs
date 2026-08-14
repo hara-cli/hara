@@ -740,3 +740,53 @@ test("declared non-core capabilities must have one fixed preflight state before 
     message.role === "tool" && message.results.some((result) => result.id === "e0"));
   assert.match(denied.results.find((result) => result.id === "e0").content, /Capability preflight gate/);
 });
+
+test("a later tool call invalidates an early completion receipt", async () => {
+  const interaction = newTurnInteraction();
+  let task = createTaskExecution("inspect then finish", interaction.turnId);
+  let reads = 0;
+  const inspect = {
+    name: "fixture_receipt_read",
+    description: "test-only read after receipt",
+    input_schema: { type: "object", properties: {} },
+    kind: "read",
+    async run() {
+      reads += 1;
+      return "new evidence discovered";
+    },
+  };
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: { completion: { state: "verified", evidence: ["an earlier check passed"] } },
+      }],
+      stop: "tool_use",
+    },
+    { text: "", toolUses: [{ id: "r1", name: inspect.name, input: {} }], stop: "tool_use" },
+    { text: "done", toolUses: [], stop: "end" },
+  ]);
+  await runAgent([{ role: "user", content: "inspect then finish" }], {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [inspect],
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        task = next;
+      },
+    },
+  });
+  assert.equal(reads, 1);
+  assert.equal(task.checkpoint.completion, undefined, "work after attestation requires a new final receipt");
+});

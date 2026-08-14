@@ -1526,13 +1526,14 @@ test("SessionHub acquires before load and locks offline rename/archive mutations
     delete() { return false; },
   };
   const provider = { id: "new-provider", model: "new-model", async turn() { throw new Error("unused"); } };
-  const hub = new SessionHub(store);
+  const hub = new SessionHub(store, "0.148.0-test");
 
   const resumed = hub.resume("stored", { provider, approval: "suggest" });
   assert.ok("session" in resumed);
   assert.deepEqual(events.slice(0, 2), ["acquire:stored", "load:stored"], "resume reads only after locking");
   assert.equal(resumed.session.meta.provider, "new-provider");
   assert.equal(resumed.session.meta.model, "old-model", "resume keeps the persisted model pin");
+  assert.equal(resumed.session.meta.haraVersion, "0.148.0-test", "resume stamps the runtime that now owns the session");
   assert.equal(resumed.session.continuationSession, true, "non-empty persisted history enables continuity guidance");
   assert.equal(resumed.session.task.status, "paused", "a persisted running task recovers as paused/interrupted");
   assert.equal(resumed.session.task.objective, "finish stored task", "resume keeps task identity outside history");
@@ -1559,6 +1560,7 @@ test("SessionHub acquires before load and locks offline rename/archive mutations
   assert.equal(hub.rename("stored", "new title"), true);
   assert.deepEqual(events, ["acquire:stored", "load:stored", "save:stored", "release:stored"]);
   assert.equal(data.meta.title, "new title");
+  assert.equal(data.meta.haraVersion, "0.148.0-test", "offline metadata writes retain runtime provenance");
 
   events.length = 0;
   assert.equal(hub.setArchived("stored", true), true);
@@ -1590,10 +1592,13 @@ test("SessionHub releaseIdle keeps in-flight locks and releases only quiescent s
     delete: (id) => saved.delete(id),
   };
   const provider = { id: "fake", model: "fake-1", async turn() { throw new Error("unused"); } };
-  const hub = new SessionHub(store);
+  const hub = new SessionHub(store, "0.148.0-test");
   const busy = hub.create({ cwd: "/tmp/busy", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
   const configuring = hub.create({ cwd: "/tmp/configuring", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
   const idle = hub.create({ cwd: "/tmp/idle", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
+  assert.equal(busy.meta.haraVersion, "0.148.0-test");
+  assert.equal(configuring.meta.haraVersion, "0.148.0-test");
+  assert.equal(idle.meta.haraVersion, "0.148.0-test");
   busy.busy = true;
   configuring.configuring = true;
 

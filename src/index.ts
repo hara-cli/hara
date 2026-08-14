@@ -283,6 +283,7 @@ import { c, out, statusLine } from "./ui.js";
 import * as bar from "./statusbar.js";
 import { nearest } from "./fuzzy.js";
 import "./tools/builtin.js"; // register read_file/write_file/python/bash/job
+import "./tools/inspect-image.js"; // register verified local image inspection
 import "./tools/runtime.js"; // register tool_search/tool_result_read
 import "./tools/edit.js"; // register edit_file
 import "./tools/search.js"; // register grep/glob/ls
@@ -303,20 +304,13 @@ import "./tools/cron.js"; // register cronjob (model-facing scheduler — "remin
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
 import "./tools/open-directory.js"; // register safe Finder/File Explorer directory opening
 import "./tools/open-browser.js"; // register safe real-browser navigation for website/UI testing
+import { HARA_RUNTIME_VERSION } from "./version.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // Version: from a build-time define in the compiled single-binary (no package.json on its virtual FS),
 // else read package.json (npm install / `node dist`). The read is wrapped so the binary never hits it.
 const pkg = {
-  version:
-    process.env.HARA_BUILD_VERSION ??
-    (((): string => {
-      try {
-        return (JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8")) as { version: string }).version;
-      } catch {
-        return "0.0.0";
-      }
-    })()),
+  version: HARA_RUNTIME_VERSION,
 };
 
 const maskKey = (v?: string) => (v ? `••••${v.slice(-4)}` : "(unset)");
@@ -1519,7 +1513,7 @@ async function runResume(o: OrgOpts): Promise<RunOutcome> {
   return executePlan(plan, roles, o);
 }
 
-const READONLY_TOOLS = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write"]);
+const READONLY_TOOLS = new Set(["read_file", "inspect_image", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write"]);
 const REVIEW_SYSTEM =
   "You are a senior code reviewer. Review the safe Git status metadata the user provides for: correctness bugs, security " +
   "issues, missing error handling, unclear naming, and missing/weak tests. You may read files (read-only) " +
@@ -2959,6 +2953,7 @@ program
           }
           const description = await describeImages(visionProvider, images, {
             signal: opts.signal,
+            hint: opts.hint,
           });
           return {
             description,
@@ -4303,6 +4298,42 @@ program.action(async (opts) => {
       void syncOrgRolesForProfile(profile);
     }
   };
+  /** The engine owns local-file validation; this selector owns provider identity. Prefer the current main
+   * model whenever it sees images natively. A compatibility helper is used only for a text-only main model
+   * and only when the same profile is authorized to call it. No credential ever enters model context. */
+  const inspectImageWithCurrentRoute = async (
+    primary: Provider,
+    profile: Profile,
+    image: ImageAttachment,
+    hint?: string,
+    signal?: AbortSignal,
+  ): Promise<{ text: string; model: string }> => {
+    const native = classifyVision(primary.id, primary.model, cfg.modelVision);
+    let imageProvider: Provider | null = native === "vision" ? primary : null;
+    if (!imageProvider && cfg.visionModel) {
+      const authorized = visionSidecarAuthorized(
+        cfg.visionModel,
+        profile.kind === "gateway" ? profile.availableModels ?? [] : undefined,
+      );
+      if (authorized) {
+        imageProvider = await buildProvider(cfg, {
+          model: cfg.visionModel,
+          ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
+          ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
+        }, profile.id);
+      }
+    }
+    if (!imageProvider) {
+      throw new Error(
+        `model '${primary.model}' cannot inspect images through profile '${profile.id}'; ` +
+        "switch this conversation to an image-capable model or configure an authorized compatibility helper",
+      );
+    }
+    return {
+      text: await describeImages(imageProvider, [image], { hint, signal }),
+      model: imageProvider.model,
+    };
+  };
   // Safety UX: first line of stdout = "where am I sending requests right now". Stable, scriptable,
   // and reassuring at the start of every session. Suppressed in pure -p print mode to keep that
   // path clean stdout-only (the user wants the model output, not banner noise). Set HARA_QUIET=1
@@ -4477,6 +4508,7 @@ program.action(async (opts) => {
       meta = prior?.meta ?? {
         id: rid,
         cwd,
+        haraVersion: pkg.version,
         profileId: authoritativeProfileId,
         provider: cfg.provider,
         model: cfg.model,
@@ -4492,6 +4524,10 @@ program.action(async (opts) => {
           : { source: "interactive" as const }),
       };
       requiresAudienceBindingSave = !prior;
+      if (meta.haraVersion !== pkg.version) {
+        meta.haraVersion = pkg.version;
+        requiresAudienceBindingSave = true;
+      }
       if (src.source === "gateway") {
         const gatewayOwner = gatewayOwnerFromSessionId(rid, src.sourceName ?? "");
         if (meta.source !== "gateway") {
@@ -4682,6 +4718,8 @@ program.action(async (opts) => {
           },
         ),
         describeImage,
+        inspectImage: (image: ImageAttachment, hint?: string, signal?: AbortSignal) =>
+          inspectImageWithCurrentRoute(headlessProvider, __activeP, image, hint, signal),
       },
       approval: "full-auto" as const,
       confirm: async () => true,
@@ -4905,6 +4943,7 @@ program.action(async (opts) => {
   const meta: SessionMeta = resumed?.meta ?? {
     id: sessionId,
     cwd,
+    haraVersion: pkg.version,
     profileId: sessionRouteProfileId,
     provider: cfg.provider,
     model: cfg.model,
@@ -4913,6 +4952,7 @@ program.action(async (opts) => {
     updatedAt: "",
     source: "interactive",
   };
+  meta.haraVersion = pkg.version;
   const authoritativeProfileId = meta.profileId ?? profileForConfig(cfg).profile.id;
   meta.profileId = authoritativeProfileId;
   // Conversation transcript and task execution are restored independently. A process that disappeared
@@ -5519,6 +5559,8 @@ program.action(async (opts) => {
         return "";
       }
     };
+    const inspectImage = (image: ImageAttachment, hint?: string, signal?: AbortSignal) =>
+      inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal);
     // grounding for accurate RPA: ask the vision model WHERE an element is (0..1 fractions) so the computer
     // tool can click it precisely instead of guessing pixels from a text description.
     const locateScreenshot = async (path: string, target: string, signal?: AbortSignal): Promise<{ x: number; y: number } | null> => {
@@ -6013,7 +6055,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -6098,7 +6140,7 @@ program.action(async (opts) => {
           };
           let planOutcome = await runAgent(history, {
             provider,
-            ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+            ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
             approval: "suggest",
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n) || n === "memory_search" || n === "memory_get" || n === "session_search",
@@ -6156,7 +6198,7 @@ program.action(async (opts) => {
             const xout = stats.output;
             planOutcome = await runAgent(history, {
               provider,
-              ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+              ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
               approval: choice as ApprovalMode,
               memory: buildMemory(),
               confirm: h.confirm,
@@ -6204,7 +6246,7 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         const turnOutcome = await runAgent(history, {
           provider,
-          ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, locate: locateScreenshot },
+          ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
           approval: appr,
           memory: buildMemory(),
           confirm: h.confirm,
@@ -6304,7 +6346,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal) }, approval, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -6370,7 +6412,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser }, approval, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal) }, approval, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

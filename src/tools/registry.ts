@@ -1,4 +1,4 @@
-import type { ToolSpec } from "../providers/types.js";
+import type { ImageAttachment, ToolSpec } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
 import { prepareToolResult } from "./result-limit.js";
 import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
@@ -63,6 +63,14 @@ export interface ToolContext {
   /** describe an image file via the vision sidecar (lets the computer tool return a screenshot as text);
    *  `hint` focuses the description on a goal (e.g. "the Login button") for actionable RPA output */
   describeImage?: (path: string, hint?: string, signal?: AbortSignal) => Promise<string>;
+  /** Inspect a verified, engine-owned image snapshot with the current session's authorized image route.
+   * The inspect_image tool owns filesystem validation and passes only a private temporary snapshot here;
+   * embedders must preserve the session/profile identity when selecting the provider. */
+  inspectImage?: (
+    image: ImageAttachment,
+    hint?: string,
+    signal?: AbortSignal,
+  ) => Promise<{ text: string; model: string }>;
   /** locate a UI element in a screenshot via a grounding vision model → center as 0..1 fractions (for RPA clicks) */
   locate?: (path: string, target: string, signal?: AbortSignal) => Promise<{ x: number; y: number } | null>;
 }

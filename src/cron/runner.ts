@@ -32,6 +32,7 @@ import {
   saveSession,
   type SessionMeta,
 } from "../session/store.js";
+import { HARA_RUNTIME_VERSION } from "../version.js";
 
 /** Jobs that are enabled AND due at `nowMs` (pure — for the tick and for testing). */
 export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
@@ -80,6 +81,7 @@ export function persistPrintAutomationOccurrence(
   const meta: SessionMeta = {
     id: sessionId,
     cwd: job.cwd,
+    haraVersion: HARA_RUNTIME_VERSION,
     provider: "",
     model: "",
     title: automatedTitle("cron", job.name, at),

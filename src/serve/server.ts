@@ -60,7 +60,7 @@ import {
   expandExplicitAttachmentsAsync,
   expandMentionsAsync,
 } from "../context/mentions.js";
-import type { EffectiveAttachmentCapabilities } from "../vision.js";
+import { describeImages, type EffectiveAttachmentCapabilities } from "../vision.js";
 import { memoryDigest } from "../memory/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled, panelsForProject } from "../plugins/plugins.js";
 import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
@@ -185,6 +185,7 @@ export interface ServeDeps {
       model: string;
       profileId?: string;
       signal: AbortSignal;
+      hint?: string;
     },
   ) => Promise<{ images?: ImageAttachment[]; description?: string; viaModel?: string }>;
   /** Redacted provider/local-model control plane for Desktop settings. Credentials are accepted only by
@@ -906,7 +907,7 @@ function automationScheduleForRequest(
 export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<ServeHandle> {
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
-  const hub = new SessionHub(deps.store ?? realStore);
+  const hub = new SessionHub(deps.store ?? realStore, deps.version);
   // Existing pre-index transcripts are imported in yielding batches. The server can accept health/init
   // traffic immediately; only metadata listing waits for the one-time compatibility view to be complete.
   const sessionIndexReady = (): Promise<void> =>
@@ -1381,6 +1382,42 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             s.meta.profileId,
           ),
           ui: sink,
+          inspectImage: async (image, hint, signal) => {
+            const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId);
+            let images = [image];
+            if (deps.prepareImages) {
+              const prepared = await deps.prepareImages(images, {
+                cwd: s.meta.cwd,
+                model: s.meta.model,
+                profileId: s.meta.profileId,
+                signal: signal ?? turnAbort.signal,
+                hint,
+              });
+              if (prepared.description?.trim()) {
+                return {
+                  text: prepared.description.trim(),
+                  model: prepared.viaModel
+                    ?? runtime.attachmentCapabilities?.image.viaModel
+                    ?? s.provider.model,
+                };
+              }
+              images = prepared.images ?? [];
+            } else if (runtime.attachmentCapabilities?.image.mode !== "native") {
+              throw new Error(
+                `model '${s.meta.model}' has no authorized image route for this session`,
+              );
+            }
+            if (!images.length) {
+              throw new Error(`model '${s.meta.model}' has no authorized image route for this session`);
+            }
+            return {
+              text: await describeImages(s.provider, images, {
+                hint,
+                signal: signal ?? turnAbort.signal,
+              }),
+              model: s.provider.model,
+            };
+          },
         },
         approval: s.approval,
         confirm,

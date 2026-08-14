@@ -150,6 +150,27 @@ const toolProvider = () => {
       if (n === 2) {
         return { text: "", toolUses: [{ id: "t1", name: "write_file", input: { path: "approved.txt", content: "hi" } }], stop: "tool_use", usage: { input: 1, output: 1 } };
       }
+      if (n === 3) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "receipt1",
+            name: "task_checkpoint",
+            input: {
+              current_step: "",
+              blocked_step: "",
+              block_reason: "",
+              next_step: "",
+              completion: {
+                state: "verified",
+                evidence: ["approved.txt was written and read back with the exact content hi"],
+              },
+            },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
       onText("done");
       return { text: "done", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
     },
@@ -3186,6 +3207,86 @@ test("serve e2e: files.search + session.context + compact + rewind (codex deskto
     assert.equal(again.error.code, -32003, "double delete → no-session error");
   } finally {
     c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: inspect_image gives an agent-discovered workspace image to the pinned native model", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-inspect-image-"));
+  const imagePath = join(dir, "downloaded.png");
+  writeFileSync(
+    imagePath,
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]),
+  );
+  const store = memStore();
+  let agentRound = 0;
+  let finalHistory = [];
+  const provider = {
+    id: "fake",
+    model: "fake-native-vision",
+    async turn(args) {
+      const imageTurn = args.history.findLast((message) => message.role === "user")?.images?.length;
+      if (imageTurn) {
+        assert.equal(args.history.findLast((message) => message.role === "user").images[0].mediaType, "image/png");
+        return {
+          text: "The screenshot shows account 313499857952.",
+          toolUses: [],
+          stop: "end",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (agentRound++ === 0) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "inspect-1",
+            name: "inspect_image",
+            input: { path: "downloaded.png", focus: "read the account number" },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      finalHistory = structuredClone(args.history);
+      args.onText("identified");
+      return { text: "identified", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const deps = {
+    ...baseDeps(provider, store),
+    prepareImages: async (images, opts) => {
+      assert.equal(opts.model, "fake-native-vision");
+      assert.equal(opts.hint, "read the account number");
+      return { images };
+    },
+    runtimeInfo: () => ({
+      providerId: "fake",
+      model: "fake-native-vision",
+      effortLevels: [],
+      attachmentCapabilities: {
+        image: { mode: "native" },
+        textFile: "inline-text",
+        directory: "bounded-inventory-and-tools",
+        binaryFile: "agent-tool",
+      },
+    }),
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const sessionId = (await client.call("session.create", {})).result.sessionId;
+    const sent = await client.call("session.send", {
+      sessionId,
+      text: "Inspect the image downloaded during this task.",
+    });
+    assert.equal(sent.result.reply, "identified");
+    const result = finalHistory.findLast((message) => message.role === "tool").results[0].content;
+    assert.match(result, /Image inspected with fake-native-vision/);
+    assert.match(result, /313499857952/);
+  } finally {
+    client.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });
   }

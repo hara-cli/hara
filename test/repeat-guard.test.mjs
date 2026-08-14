@@ -40,9 +40,9 @@ test("three empty recall queries coalesce across changed arguments and both reca
   const first = recordCall("memory_search", { query: "马斯克" }, "(no memory matches)");
   const second = recordCall("memory_search", { query: "Elon Musk" }, "(no memory matches)");
   const third = recordCall("session_search", { query: "Wikipedia Musk" }, "(no session matches)");
-  assert.match(first, /1 consecutive.*at most 2 more/is);
-  assert.match(second, /2 consecutive.*at most 1 more/is);
-  assert.match(third, /3 consecutive.*recall tools are disabled.*tell the user/is);
+  assert.match(first, /1 memory\/session search.*at most 2 more/is);
+  assert.match(second, /2 memory\/session searches.*at most 1 more/is);
+  assert.match(third, /3 memory\/session searches.*recall tools are disabled.*tell the user/is);
   const identity = failureIdentity("session_search", { query: "different" }, "(no session matches)");
   assert.equal(identity.semantic, true);
   assert.equal(identity.hardStopAfter, 3);
@@ -62,12 +62,12 @@ test("recordCall advances the repeated-failure streak for tool-specific diagnost
   }
 });
 
-test("a different failure or any success breaks the consecutive streak", () => {
+test("interleaved failures accumulate until a successful action resets the no-progress ledger", () => {
   assert.equal(recordCall("bash", { command: "npm test" }, "Command failed: first"), "");
+  assert.equal(recordCall("bash", { command: "npm lint" }, "Command failed: lint"), "", "a different failure is not progress");
+  assert.match(recordCall("bash", { command: "npm test" }, "Command failed: second"), /FAILED 2×/, "the old key survives an interleaved failure");
   assert.equal(recordCall("edit_file", { path: "x" }, "updated"), "");
-  assert.equal(recordCall("bash", { command: "npm test" }, "Command failed: second"), "", "progress reset the old test failure");
-  assert.equal(recordCall("bash", { command: "npm lint" }, "Command failed: lint"), "", "a changed failed attempt resets the prior key");
-  assert.equal(recordCall("bash", { command: "npm test" }, "Command failed: third"), "", "the old key did not accumulate across another failure");
+  assert.equal(recordCall("bash", { command: "npm test" }, "Command failed: third"), "", "real progress resets the ledger");
 });
 
 test("2nd identical failure warns; 1st doesn't; different args are a different call", () => {
@@ -86,8 +86,8 @@ test("three parameter variants sharing one command strategy and API error force 
     'curl -H "Content-Type: multipart/form-data" -F file=@a.pdf https://open.feishu.cn/open-apis/drive/v1/medias/upload_all',
   ];
   assert.equal(recordCall("bash", { command: commands[0] }, failure), "");
-  assert.match(recordCall("bash", { command: commands[1] }, failure), /2 consecutive variants.*tools\/scripts.*materially different strategy/is);
-  assert.match(recordCall("bash", { command: commands[2] }, failure), /3 consecutive variants.*stop this strategy now/is);
+  assert.match(recordCall("bash", { command: commands[1] }, failure), /2 variants.*without intervening progress.*tools\/scripts.*materially different strategy/is);
+  assert.match(recordCall("bash", { command: commands[2] }, failure), /3 variants.*without intervening progress.*stop this strategy now/is);
   const identities = failureIdentities("bash", { command: commands[0] }, failure);
   assert.equal(identities.find((identity) => identity.kind === "strategy")?.hardStopAfter, 3);
 });
@@ -97,7 +97,7 @@ test("two unusable SPA fetch variants stop the text-fetch strategy and direct th
   const failure = "Error: web_fetch received only a JavaScript SPA shell at https://example.com. Use open_browser.";
   assert.equal(recordCall("web_fetch", { url: "https://example.com/app" }, failure), "");
   const warning = recordCall("web_fetch", { url: "https://example.com/app", render: true }, failure);
-  assert.match(warning, /2 consecutive variants.*web_fetch\+example\.com.*browser rendering unavailable.*stop this strategy now/is);
+  assert.match(warning, /2 variants.*web_fetch\+example\.com.*browser rendering unavailable.*stop this strategy now/is);
   const identity = failureIdentities("web_fetch", { url: "https://example.com/app" }, failure)
     .find((entry) => entry.kind === "strategy");
   assert.equal(identity?.hardStopAfter, 2);
@@ -122,7 +122,7 @@ test("different directory tools share the same protected-Home root cause", () =>
   const glob = "Error: glob will not enumerate or recursively scan directories while Hara is rooted at the home directory.";
   assert.equal(failureIdentity("grep", { pattern: "x" }, grep).semantic, true);
   assert.match(recordCall("grep", { pattern: "x" }, grep), /first project tool.*\/cd <project>.*current conversation will continue/is);
-  assert.match(recordCall("glob", { pattern: "**/*" }, glob), /same Home workspace boundary.*2 consecutive/is);
+  assert.match(recordCall("glob", { pattern: "**/*" }, glob), /same Home workspace boundary.*2 calls without intervening progress/is);
 });
 
 test("a success resets the streak; loop-level errors (isError) count as failures", () => {

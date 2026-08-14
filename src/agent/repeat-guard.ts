@@ -2,11 +2,13 @@
 // EXACT same failing tool call, unchanged, expecting a different result (observed: 4x `git pull` into the
 // same wall; Nx the same failing build command). The guardian breaker only covers DENIED actions; this
 // covers FAILED ones. Deterministic and session-scoped (module state, same pattern as net-reachability):
-// when an identical (tool, args) call fails twice in a row, the tool result gets an explicit "stop
-// repeating this" note the model can't miss. Successful repeats are NOT flagged — a re-read after an edit
-// or a re-run after a fix is legitimate, and a success resets the failure streak. Serve can run several
+// when an identical (tool, args) call fails twice without any successful action between the failures, the
+// tool result gets an explicit "stop repeating this" note the model can't miss. A model cannot evade the
+// guard by alternating several failing tools. Successful repeats are NOT flagged — a re-read after an edit
+// or a re-run after a fix is legitimate, and any success resets the bounded no-progress ledger. Serve can run several
 // sessions in one process, so streaks are keyed by the same run scope as todo/reminder state.
 const DEFAULT_SCOPE = "default";
+const MAX_FAILURE_IDENTITIES_PER_SCOPE = 64;
 const seenByScope = new Map<string, Map<string, { fails: number }>>();
 const HOME_WORKSPACE_BOUNDARY_KEY = "root-cause:home-workspace-boundary";
 const EMPTY_RECALL_KEY = "root-cause:empty-memory-or-session-recall";
@@ -141,12 +143,12 @@ export interface FailureIdentity {
   key: string;
   label: string;
   semantic: boolean;
-  /** Consecutive calls allowed before the run-level breaker stops another model round. */
+  /** No-progress failures allowed before the run-level breaker stops another model round. */
   hardStopAfter: number;
   kind: "exact" | "home_boundary" | "empty_recall" | "strategy";
 }
 
-/** All consecutive failure identities. Exact calls stop on the second attempt; materially different
+/** All no-progress failure identities. Exact calls stop on the second attempt; materially different
  * command variants sharing one stable endpoint/script + high-signal error stop on the third. */
 export function failureIdentities(
   name: string,
@@ -213,7 +215,7 @@ export function failureIdentity(
 }
 
 /** Record a completed call; returns a warning to APPEND to the tool result when the same call has now
- *  failed >=2x in a row (empty string otherwise). Pure aside from the session-scoped map. */
+ * failed >=2x without intervening success (empty string otherwise). Pure aside from the scoped map. */
 export function recordCall(name: string, input: unknown, content: string, isError = false, scope?: string): string {
   const failed = isError || looksFailed(content, name);
   const identities = failureIdentities(name, input, content, isError);
@@ -222,13 +224,18 @@ export function recordCall(name: string, input: unknown, content: string, isErro
     seen.clear(); // any success is progress; a later failure starts a fresh no-progress streak
     return "";
   }
-  const next = identities.map((identity) => ({
-    identity,
-    streak: { fails: (seen.get(identity.key)?.fails ?? 0) + 1 },
-  }));
-  // "In a row" is literal: retain only identities shared by this failure and the immediately previous one.
-  seen.clear();
-  for (const { identity, streak } of next) seen.set(identity.key, streak);
+  const next = identities.map((identity) => {
+    const streak = { fails: (seen.get(identity.key)?.fails ?? 0) + 1 };
+    // Refresh insertion order so the fixed-size ledger drops the least recently observed identity.
+    seen.delete(identity.key);
+    seen.set(identity.key, streak);
+    return { identity, streak };
+  });
+  while (seen.size > MAX_FAILURE_IDENTITIES_PER_SCOPE) {
+    const oldest = seen.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    seen.delete(oldest);
+  }
   const exact = next.find(({ identity }) => identity.kind === "exact");
   const semantic = next.find(({ identity }) => identity.kind !== "exact");
   const selected = semantic?.identity.kind === "home_boundary" || semantic?.identity.kind === "empty_recall"
@@ -248,7 +255,7 @@ export function recordCall(name: string, input: unknown, content: string, isErro
       );
     }
     return (
-      `\n\n⟳ hara: the same ${identity.label} has now blocked ${s.fails} consecutive tool calls — ` +
+      `\n\n⟳ hara: the same ${identity.label} has now blocked ${s.fails} calls without intervening progress — ` +
       "another filesystem/search tool cannot bypass it. Ask the user to switch with `/cd <project>` and keep the current conversation " +
       "or stop this run; do not probe another directory tool from Home."
     );
@@ -256,13 +263,13 @@ export function recordCall(name: string, input: unknown, content: string, isErro
   if (identity.kind === "empty_recall") {
     if (s.fails < identity.hardStopAfter) {
       return (
-        `\n\n⟳ hara: ${s.fails} consecutive memory/session search${s.fails === 1 ? " has" : "es have"} returned no matches. ` +
+        `\n\n⟳ hara: ${s.fails} memory/session search${s.fails === 1 ? " has" : "es have"} returned no matches without intervening progress. ` +
         `Try at most ${identity.hardStopAfter - s.fails} more materially different recall ${identity.hardStopAfter - s.fails === 1 ? "query" : "queries"}; ` +
         "then stop searching and answer from current evidence or tell the user the history was not found."
       );
     }
     return (
-      `\n\n⟳ hara: ${s.fails} consecutive memory/session searches returned no matches — stop recall calls now. ` +
+      `\n\n⟳ hara: ${s.fails} memory/session searches returned no matches without intervening progress — stop recall calls now. ` +
       "Recall tools are disabled for the rest of this turn. Tell the user the prior history was not found, " +
       "then ask for the missing detail or whether to recreate it."
     );
@@ -270,13 +277,13 @@ export function recordCall(name: string, input: unknown, content: string, isErro
   if (identity.kind === "strategy") {
     if (s.fails < identity.hardStopAfter) {
       return (
-        `\n\n⟳ hara: ${s.fails} consecutive variants of the same ${identity.label} have failed. ` +
+        `\n\n⟳ hara: ${s.fails} variants of the same ${identity.label} have failed without intervening progress. ` +
         "Stop tuning parameters blindly: inspect existing workspace tools/scripts and question the API, library, or shell-boundary assumption. " +
         "Try one materially different strategy; another variant of this approach will stop the run."
       );
     }
     return (
-      `\n\n⟳ hara: ${s.fails} consecutive variants of the same ${identity.label} have failed — stop this strategy now. ` +
+      `\n\n⟳ hara: ${s.fails} variants of the same ${identity.label} have failed without intervening progress — stop this strategy now. ` +
       "Inspect existing workspace tools/scripts, challenge the underlying API/library assumption, and switch language, library, or endpoint before continuing."
     );
   }
