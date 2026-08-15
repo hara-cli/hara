@@ -424,6 +424,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
     assert.ok(init.result.capabilities.methods.includes("session.submit"), "atomic turn-input routing advertised");
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
+    assert.ok(init.result.capabilities.events.includes("event.workforce_state"), "typed workforce snapshot event advertised");
     assert.ok(init.result.capabilities.events.includes("event.surface"), "typed visual surface event advertised");
     assert.deepEqual(
       init.result.capabilities.features,
@@ -624,6 +625,11 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.equal(taskStates.at(-1).state, "completed");
     assert.equal(taskStates.at(-1).taskStatus, "completed");
     assert.equal(taskStates.at(-1).phase, "finished");
+    const workforceStates = c.events.filter((e) => e.method === "event.workforce_state").map((e) => e.params);
+    assert.ok(workforceStates.length > 0, "root execution emits workforce snapshots");
+    assert.ok(workforceStates.every((state) => state.mode === "snapshot" && state.actors[0]?.kind === "root"));
+    assert.ok(workforceStates.every((state, index) => index === 0 || state.sequence > workforceStates[index - 1].sequence));
+    assert.doesNotMatch(JSON.stringify(workforceStates), /hi there|private chain of thought/);
 
     // persisted through the (injected) store + listed
     assert.ok(store.saved.get(sid), "session persisted after the turn");

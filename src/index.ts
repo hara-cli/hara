@@ -164,7 +164,11 @@ import {
   NATIVE_SUBAGENT_PROVIDER_ID,
   type NativeSubagentRequest,
 } from "./subagent/native.js";
-import { SubagentRuntime, subagentResultText } from "./subagent/runtime.js";
+import {
+  SubagentRuntime,
+  subagentResultText,
+  type SubagentLifecycleObserver,
+} from "./subagent/runtime.js";
 import {
   overrideProviderTarget,
   profileByIdForConfig,
@@ -1743,7 +1747,9 @@ async function runSubagent(
   task: string,
   roleId?: string,
   signal?: AbortSignal,
-  observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun">,
+  observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun"> & {
+    onSubagentLifecycle?: SubagentLifecycleObserver;
+  },
   boundProfileId?: string,
 ): Promise<string> {
   const executionProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
@@ -1759,10 +1765,15 @@ async function runSubagent(
     parentStats: stats,
     timeoutMs: cfg.runTimeoutMs,
     maxRounds: cfg.maxAgentRounds,
-    observers,
+    ...(observers ? {
+      observers: {
+        onProviderTurn: observers.onProviderTurn,
+        onToolRun: observers.onToolRun,
+      },
+    } : {}),
     isReadonlyTool: (name) => READONLY_TOOLS.has(name),
     resolveProvider: (model, profileId) => buildProvider(cfg, { model }, profileId),
-  });
+  }, observers?.onSubagentLifecycle);
   return subagentResultText(result);
 }
 

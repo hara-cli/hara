@@ -109,6 +109,8 @@ import {
   type TaskLifecycleActivity,
   type TaskLifecycleCursor,
 } from "./task-events.js";
+import { WorkforceStateLedger } from "./workforce-events.js";
+import type { SubagentLifecycleObserver } from "../subagent/runtime.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
@@ -246,7 +248,9 @@ export interface ServeDeps {
     task: string,
     role?: string,
     signal?: AbortSignal,
-    observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun">,
+    observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun"> & {
+      onSubagentLifecycle?: SubagentLifecycleObserver;
+    },
     profileId?: string,
   ) => Promise<string>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
@@ -974,6 +978,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   // of SessionHub membership so detach/delete cannot make an updater believe the old engine is quiescent.
   const activeOperations = new Set<Promise<unknown>>();
   let taskEventSequence = 0;
+  const workforceLedger = new WorkforceStateLedger(instanceId);
   let closing = false;
   let closePromise: Promise<void> | null = null;
 
@@ -1073,16 +1078,21 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     // while every published event has a unique position in this server-wide stream.
     taskEventSequence = event.sequence;
     broadcast("event.task_state", { ...event });
+    // Project every published task transition into the visual workforce stream. Task updates originate
+    // from both the regular turn sink and a few lifecycle helpers, so keeping this beside the canonical
+    // task broadcast prevents Desktop from missing the normal starting/responding/completed path.
+    broadcast("event.workforce_state", { ...workforceLedger.recordTask(event) });
   };
   const broadcastTaskState = (session: ServeSession, activity: TaskLifecycleActivity): void => {
     if (!session.task) return;
-    publishTaskState(taskLifecycleEvent(
+    const event = taskLifecycleEvent(
       session.meta.id,
       session.task,
       session.meta.todos ?? [],
       activity,
       nextTaskEventCursor(),
-    ));
+    );
+    publishTaskState(event);
   };
 
   // Discovery file — the desktop shell reads this to find the running server (like a pid/port file).
@@ -1372,20 +1382,29 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           profileId: s.meta.profileId,
           todoScope: sessionId,
           sessionId,
-          spawn: (t, role, signal) => deps.spawnSubagent(
-            s.provider,
-            s.meta.cwd,
-            s.projectContext,
-            s.stats,
-            t,
-            role,
-            signal,
-            {
-              onProviderTurn: (turn) => observeProviderTurn(s, turn),
-              onToolRun: (toolRun) => observeToolRun(s, toolRun),
-            },
-            s.meta.profileId,
-          ),
+          spawn: (t, role, signal) => {
+            const taskId = s.task?.id;
+            const turnId = s.task?.turnId;
+            return deps.spawnSubagent(
+              s.provider,
+              s.meta.cwd,
+              s.projectContext,
+              s.stats,
+              t,
+              role,
+              signal,
+              {
+                onProviderTurn: (turn) => observeProviderTurn(s, turn),
+                onToolRun: (toolRun) => observeToolRun(s, toolRun),
+                onSubagentLifecycle: (event) => {
+                  if (!taskId || !turnId) return;
+                  const snapshot = workforceLedger.recordSubagent(s.meta.id, taskId, turnId, event);
+                  if (snapshot) broadcast("event.workforce_state", { ...snapshot });
+                },
+              },
+              s.meta.profileId,
+            );
+          },
           ui: sink,
           inspectImage: async (image, hint, signal) => {
             const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId);
@@ -1885,7 +1904,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             setupState,
             capabilities: {
               methods,
-              events: ["event.task_state", "event.surface"],
+              events: ["event.task_state", "event.workforce_state", "event.surface"],
               features,
             },
           }));
@@ -2323,6 +2342,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             disposeReminderScope(p.sessionId);
             resetRepeatGuard(p.sessionId);
             clearTouched(p.sessionId);
+            workforceLedger.forget(p.sessionId);
             return reply(rpcResult(id!, { sessionId: p.sessionId, deleted: true }));
           }
           case "models.list": {

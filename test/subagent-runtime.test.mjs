@@ -109,3 +109,27 @@ test("SubagentRuntime rejects duplicate or unknown providers and closes pending 
   gate.resolve();
   assert.equal((await active).status, "completed", "dispose does not falsify an already-running provider settlement");
 });
+
+test("SubagentRuntime publishes metadata-only lifecycle without letting observers affect execution", async () => {
+  const runtime = new SubagentRuntime({ maxConcurrent: 1 });
+  runtime.register({
+    id: "fixture",
+    async run() {
+      return { status: "completed", text: "private result that must not enter lifecycle" };
+    },
+  });
+  const events = [];
+  const result = await runtime.run(
+    "fixture",
+    { task: "private task that must not enter lifecycle", role: "research" },
+    (event) => {
+      events.push(event);
+      if (event.state === "working") throw new Error("observer failure");
+    },
+  );
+  assert.equal(result.status, "completed");
+  assert.deepEqual(events.map((event) => event.state), ["queued", "working", "completed"]);
+  assert.ok(events.every((event) => event.id === result.id));
+  assert.ok(events.every((event) => event.role === "research"));
+  assert.doesNotMatch(JSON.stringify(events), /private task|private result/);
+});

@@ -33,6 +33,22 @@ export interface SubagentResult extends SubagentSettlement {
   durationMs: number;
 }
 
+export type SubagentLifecycleState = "queued" | "working" | "completed" | "failed" | "cancelled";
+
+/** Safe execution metadata for host status surfaces. It deliberately excludes task text, provider
+ * messages, tool arguments, paths, output, and credentials. */
+export interface SubagentLifecycleEvent {
+  id: string;
+  providerId: string;
+  role?: string;
+  state: SubagentLifecycleState;
+  queuedAt: string;
+  startedAt?: string;
+  endedAt?: string;
+}
+
+export type SubagentLifecycleObserver = (event: SubagentLifecycleEvent) => void;
+
 export interface SubagentProvider<Request extends SubagentRequest> {
   id: string;
   run(request: Request): Promise<SubagentSettlement>;
@@ -157,16 +173,39 @@ export class SubagentRuntime<Request extends SubagentRequest> {
     }
   }
 
-  async run(providerId: string, request: Request): Promise<SubagentResult> {
+  async run(
+    providerId: string,
+    request: Request,
+    onLifecycle?: SubagentLifecycleObserver,
+  ): Promise<SubagentResult> {
     const id = randomUUID();
     const queuedAt = iso();
+    const publish = (event: SubagentLifecycleEvent): void => {
+      try {
+        onLifecycle?.(event);
+      } catch {
+        // Observability can never change admission or provider execution.
+      }
+    };
+    const lifecycleBase = {
+      id,
+      providerId,
+      ...(request.role ? { role: request.role } : {}),
+      queuedAt,
+    };
     const provider = this.providers.get(providerId);
     if (!provider) {
-      return this.failure(id, providerId, request.role, queuedAt, "error", `provider '${providerId}' is not registered`);
+      const result = this.failure(id, providerId, request.role, queuedAt, "error", `provider '${providerId}' is not registered`);
+      publish({ ...lifecycleBase, state: "failed", endedAt: result.endedAt });
+      return result;
     }
     if (typeof request.task !== "string" || !request.task.trim()) {
-      return this.failure(id, providerId, request.role, queuedAt, "error", "task cannot be blank");
+      const result = this.failure(id, providerId, request.role, queuedAt, "error", "task cannot be blank");
+      publish({ ...lifecycleBase, state: "failed", endedAt: result.endedAt });
+      return result;
     }
+
+    publish({ ...lifecycleBase, state: "queued" });
 
     let release: (() => void) | undefined;
     try {
@@ -178,15 +217,22 @@ export class SubagentRuntime<Request extends SubagentRequest> {
         : kind === "cancelled"
           ? "cancelled before execution"
           : "the root sub-agent runtime is closed";
-      return this.failure(id, providerId, request.role, queuedAt, kind === "cancelled" ? "cancelled" : "error", message);
+      const result = this.failure(id, providerId, request.role, queuedAt, kind === "cancelled" ? "cancelled" : "error", message);
+      publish({
+        ...lifecycleBase,
+        state: kind === "cancelled" ? "cancelled" : "failed",
+        endedAt: result.endedAt,
+      });
+      return result;
     }
 
     const startedAt = iso();
     const startedMs = Date.now();
+    publish({ ...lifecycleBase, state: "working", startedAt });
     try {
       const settlement = await provider.run(request);
       const endedAt = iso();
-      return {
+      const result: SubagentResult = {
         ...settlement,
         id,
         providerId,
@@ -196,8 +242,19 @@ export class SubagentRuntime<Request extends SubagentRequest> {
         endedAt,
         durationMs: Math.max(0, Date.now() - startedMs),
       };
+      publish({
+        ...lifecycleBase,
+        state: settlement.status === "completed"
+          ? "completed"
+          : settlement.status === "cancelled"
+            ? "cancelled"
+            : "failed",
+        startedAt,
+        endedAt,
+      });
+      return result;
     } catch (error) {
-      return this.failure(
+      const result = this.failure(
         id,
         providerId,
         request.role,
@@ -207,6 +264,13 @@ export class SubagentRuntime<Request extends SubagentRequest> {
         startedAt,
         startedMs,
       );
+      publish({
+        ...lifecycleBase,
+        state: request.signal?.aborted ? "cancelled" : "failed",
+        startedAt,
+        endedAt: result.endedAt,
+      });
+      return result;
     } finally {
       release();
     }

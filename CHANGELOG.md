@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.148.0 — 2026-08-16 — privacy-bounded Agent Office state
+
+- Add a versioned `event.workforce_state` stream for Desktop and other persistent clients. It projects the
+  real root task and sub-agent lifecycle into ordered, bounded snapshots without exposing prompts, task
+  text, provider identities, files, commands, tool arguments, reasoning, output, or credentials.
+- Publish queued, working, completed, failed, and cancelled sub-agent transitions from the provider-neutral
+  runtime. Observer failures cannot alter admission or execution, late child events cannot cross task turns,
+  live agents are never evicted to make room for display overflow, and ended actors are pruned within a
+  24-actor memory bound.
+- Project every canonical task-state transition into the workforce stream and advertise the event through
+  Serve capability negotiation, while older Desktop clients continue to ignore the additive event safely.
+  Upgrade with `npm i -g @nanhara/hara@0.148.0`.
+
 ## 0.147.2 — 2026-08-14 — live project-instruction refresh
 
 - Refresh the bounded, protected `AGENTS.md` project context immediately before every idle CLI or Desktop
