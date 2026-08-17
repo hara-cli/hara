@@ -75,7 +75,7 @@ export interface ToolContext {
   locate?: (path: string, target: string, signal?: AbortSignal) => Promise<{ x: number; y: number } | null>;
 }
 
-export type ToolEffect = "read" | "state" | "edit" | "exec" | "computer" | "interactive";
+export type ToolEffect = "read" | "state" | "probe" | "edit" | "exec" | "computer" | "interactive";
 
 export interface ToolOperationTraits {
   /** Concrete effect for this input. Multi-action tools must not share one static permission label. */
@@ -178,7 +178,7 @@ function defaultEffect(tool: Tool): ToolEffect {
   return "exec";
 }
 
-const TOOL_EFFECTS = new Set<ToolEffect>(["read", "state", "edit", "exec", "computer", "interactive"]);
+const TOOL_EFFECTS = new Set<ToolEffect>(["read", "state", "probe", "edit", "exec", "computer", "interactive"]);
 const TOOL_APPROVAL_KINDS = new Set(["read", "edit", "exec", "computer"]);
 
 /** Conservative, non-throwing classifier shared by approval, understanding, guardian, and scheduling. */
@@ -207,6 +207,7 @@ export function toolOperationTraits(tool: Tool, input: unknown, ctx: ToolContext
 
 export function approvalKindForOperation(traits: ToolOperationTraits): Tool["kind"] {
   if (traits.approvalKind) return traits.approvalKind;
+  if (traits.effect === "probe") return "exec";
   if (traits.effect === "edit") return "edit";
   if (traits.effect === "exec") return "exec";
   if (traits.effect === "computer") return "computer";

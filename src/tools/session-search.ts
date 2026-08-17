@@ -20,7 +20,8 @@ const MAX_MESSAGE_SCAN_CHARS = 120_000;
 const MAX_EXCERPT_CHARS = 700;
 
 const HISTORICAL_REFERENCE = [
-  /(?:之前|以前|上次|前一(?:次|个)|此前|我们前面)(?:的|聊过|讨论过|说过|做过|处理过|提过|那个|那次|任务|问题|方案|对话|会话|项目|内容)?/u,
+  /(?:之前|以前)(?:的|聊过|讨论过|说过|做过|处理过|提过|那个|那次|任务|问题|方案|规划|工作|反馈|修改|记录|结果|对话|会话|项目|内容)/u,
+  /(?:上次|前一(?:次|个)|此前|我们前面)(?:的|聊过|讨论过|说过|做过|处理过|提过|那个|那次|任务|问题|方案|规划|工作|反馈|修改|记录|结果|对话|会话|项目|内容)?/u,
   /(?:继续|接着)(?:之前|以前|上次|前一(?:次|个)|此前)(?:的|那个|那次)?/u,
   /(?:还记得|记不记得|你记得)(?:之前|以前|上次|我们)?/u,
   /\b(?:previous|prior|earlier|last)\s+(?:chat|session|conversation|time|task|issue|discussion|project)\b/iu,
@@ -70,6 +71,20 @@ export function sessionRecallQuery(messageValue: unknown): string | null {
 export async function automaticSessionRecall(message: unknown, ctx: ToolContext): Promise<string> {
   const query = sessionRecallQuery(message);
   if (!query) return "";
+  // A user may resend the same chat message when the prior answer missed it. Re-injecting the same large,
+  // untrusted transcript block on every resend both wastes context and can visually bury the authoritative
+  // current request. Suppress only an exact normalized prompt already auto-recalled in the recent active
+  // transcript; a materially different historical reference can still recall independently.
+  const current = ctx.sessionId ? loadSession(ctx.sessionId) : null;
+  const normalizedQuery = normalized(query);
+  const alreadyInjected = current?.history.slice(-24).some((entry) => {
+    if (entry.role !== "user" || !entry.content.startsWith("Automatic prior-session recall")) return false;
+    const separator = "\n\n---\n\n";
+    const at = entry.content.lastIndexOf(separator);
+    if (at < 0) return false;
+    return normalized(entry.content.slice(at + separator.length)) === normalizedQuery;
+  });
+  if (alreadyInjected) return "";
   const result = await searchSessionHistory(query, "auto", 3, ctx);
   if (result === "(no session matches)" || result.startsWith("Error:") || result.startsWith("Blocked:")) return "";
   return `Automatic prior-session recall (triggered by the user's explicit historical reference):\n${result}`;

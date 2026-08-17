@@ -206,6 +206,38 @@ export function renderFileSlice(text: string, offset?: number, limit?: number): 
   return head + body;
 }
 
+function stripNoopRedirections(command: string): string {
+  return command
+    .replace(/\s+(?:\d?>|&>)\s*\/dev\/null\b/gu, "")
+    .replace(/\s+\d?>&\d\b/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+/** A bounded connectivity check has an observable network effect, so it is not ordinary read-only shell.
+ * It can nevertheless execute under an `investigate` brief without falsely granting mutation authority;
+ * approval remains `exec`. Keep this intentionally narrow and finite. */
+export function isBoundedDiagnosticProbePart(command: string): boolean {
+  const canonical = stripNoopRedirections(command);
+  if (!canonical || /[<>]/u.test(canonical)) return false;
+  const tokens = canonical.split(" ").filter(Boolean);
+  const program = (tokens[0]?.split(/[\\/]/u).at(-1) ?? "").toLowerCase();
+  const args = tokens.slice(1);
+  if (program === "nc" || program === "netcat") {
+    const flags = args.filter((arg) => /^-[A-Za-z]+$/u.test(arg)).join("");
+    return flags.includes("z") && !/[leckUu]/u.test(flags);
+  }
+  if (program === "ping" || program === "ping6") {
+    const countAt = args.indexOf("-c");
+    const count = countAt >= 0 ? Number(args[countAt + 1]) : Number.NaN;
+    return Number.isInteger(count) && count >= 1 && count <= 20 && !args.includes("-f");
+  }
+  if (program === "nslookup" || program === "host") {
+    return args.some((arg) => arg && !arg.startsWith("-"));
+  }
+  return false;
+}
+
 registerTool({
   name: "read_file",
   description:
@@ -370,8 +402,15 @@ registerTool({
       !Boolean(input?.background)
       && !!parts?.length
       && parts.every(isReadOnlyCommand);
+    const diagnosticProbe =
+      !Boolean(input?.background)
+      && !!parts?.length
+      && parts.some(isBoundedDiagnosticProbePart)
+      && parts.every((part) => isReadOnlyCommand(stripNoopRedirections(part)) || isBoundedDiagnosticProbePart(part));
     return readOnly
       ? { effect: "read", concurrencySafe: true }
+      : diagnosticProbe
+        ? { effect: "probe", concurrencySafe: true, approvalKind: "exec" }
       : { effect: "exec", concurrencySafe: false };
   },
   requiresProjectWorkspace: true,

@@ -11,6 +11,7 @@ import {
 } from "../tools/registry.js";
 import { limitToolResultBatch } from "../tools/result-limit.js";
 import { stdout } from "node:process";
+import { hostname as executionHostname } from "node:os";
 import { c, out } from "../ui.js";
 import { activity } from "../activity.js";
 import { makeRenderer } from "../md.js";
@@ -152,6 +153,11 @@ When an attempt FAILS, never repeat it unchanged — read the error, form a hypo
 change something (arguments / approach / tool) before trying again. After two failed variants of the same
 approach, stop: re-plan from what you learned, or ask the user, stating concisely what you tried and what
 the errors said. Repeating a failed action hoping for a different result is how sessions die.
+The latest direct user correction outranks your earlier assumption. If the user says you misunderstood the
+machine, path, process, or execution location, do not repeat your old claim or ask the same question again:
+run one bounded read-only check such as hostname, pwd, uname, or process inspection and update the hypothesis
+from that evidence. A request that limits edits to named files is a hard scope boundary: further diagnosis
+may be read-only, but never mutate another config, dependency, mount, or service merely to make the symptom disappear.
 When diagnosing a software bug, verify the failing function's actual inputs and observable state before
 rewriting its logic. Trace a missing or unexpected value upstream through its callers, object construction,
 and data transformations; form a falsifiable root-cause hypothesis, then change the narrowest verified source.
@@ -233,9 +239,12 @@ foreground timeout. After completing a task, give a one-line summary.`;
 function gatewayNote(): string {
   const plat = process.env.HARA_GATEWAY;
   if (!plat) return "";
+  const host = executionHostname();
   return (
     `\n\n# You are in a chat gateway (${plat})\n` +
     `You are talking to the user through the ${plat} chat — not a terminal, and NOT the desktop ${plat} app. ` +
+    `Your file and shell tools execute directly on host ${host}; the user's physical location and SSH client do not change that host. ` +
+    `When the user identifies this machine by an alias or corrects your location assumption, verify it with one bounded read-only host check before replying. ` +
     `To send a file or image to them, call the \`send_file\` tool with an absolute path; that is the ONLY channel ` +
     `that reaches this chat. Do NOT use the \`computer\` tool, AppleScript, or any desktop/${plat}-client automation ` +
     `to deliver files — that drives a different window and silently fails to reach the user. Never tell the user a ` +
@@ -1464,12 +1473,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           operation.effect === "read"
           || operation.effect === "state"
           || operation.effect === "interactive";
+        const operationProbe = operation.effect === "probe";
         const needsBrief = tool.trustBoundary === "external" || !operationReadOnly;
         const requiresChange =
           tool.trustBoundary !== "external" &&
           !operationReadOnly &&
           (operation.effect === "edit" || operation.effect === "exec" || operation.effect === "computer");
-        if (taskBriefTransitionInRound && (requiresChange || tool.trustBoundary === "external")) {
+        if (taskBriefTransitionInRound && (requiresChange || operationProbe || tool.trustBoundary === "external")) {
           plans.push({
             tu,
             tool,
@@ -1516,6 +1526,21 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
               `Understanding gate: task brief intent is '${intakeTask?.brief?.intent ?? "unset"}', so this ` +
               "side effect was NOT executed. Revise task_intake to intent 'change' with the user's authorized " +
               "goal and acceptance checks before trying again.",
+          });
+          continue;
+        }
+        if (
+          operationProbe
+          && intakeTask?.brief?.intent !== "investigate"
+          && intakeTask?.brief?.intent !== "change"
+        ) {
+          plans.push({
+            tu,
+            tool,
+            denied:
+              `Understanding gate: task brief intent is '${intakeTask?.brief?.intent ?? "unset"}', so this ` +
+              "diagnostic probe was NOT executed. Revise task_intake to intent 'investigate' or 'change' " +
+              "with the user's authorized goal before trying again.",
           });
           continue;
         }

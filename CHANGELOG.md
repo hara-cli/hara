@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.148.1 — 2026-08-17 — deterministic correction and diagnostic intake
+
+- Stop treating positional Chinese “之前” in instructions such as “在这行之前插入” as a request to
+  retrieve an older conversation. Automatic transcript recall now requires an explicit historical reference
+  and suppresses an exact repeated injection when a user resends the same request.
+- Tell chat-gateway agents which host actually executes file and shell tools. The latest user correction now
+  outranks an earlier location assumption, bounded host checks provide evidence, and a named-file edit scope
+  remains a hard mutation boundary throughout diagnosis.
+- Classify finite `nc -z`, counted `ping`, `nslookup`, and `host` checks as diagnostic probes. They can run
+  under an accepted investigation brief without pretending to be ordinary read-only commands, while shell
+  approval, task-intake round boundaries, and mutation restrictions remain enforced. Upgrade with
+  `npm i -g @nanhara/hara@0.148.1`.
+
 ## 0.148.0 — 2026-08-16 — privacy-bounded Agent Office state
 
 - Add a versioned `event.workforce_state` stream for Desktop and other persistent clients. It projects the

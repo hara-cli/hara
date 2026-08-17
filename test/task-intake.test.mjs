@@ -443,6 +443,109 @@ test("read-only actions inside mixed task and cron tools remain available for in
   assert.deepEqual(calls.sort(), ["cronjob:list", "task:list"], "list operations are evidence gathering even before a brief exists");
 });
 
+test("a bounded diagnostic probe runs under an investigate brief without granting mutation authority", async () => {
+  const interaction = newTurnInteraction();
+  let task = createTaskExecution("check one endpoint", interaction.turnId);
+  task = applyTaskBrief(task, {
+    intent: "investigate",
+    goal: "check one endpoint",
+    constraints: ["do not change host state"],
+    acceptance: ["probe result captured"],
+    steps: ["run the bounded probe"],
+    createdAt: "2026-08-17T00:00:00.000Z",
+  });
+  let probes = 0;
+  const probe = {
+    name: "fixture_probe",
+    description: "test-only bounded diagnostic",
+    input_schema: { type: "object", properties: {} },
+    kind: "exec",
+    classify() {
+      return { effect: "probe", concurrencySafe: true, approvalKind: "exec" };
+    },
+    async run() {
+      probes += 1;
+      return "reachable";
+    },
+  };
+  const p = provider([
+    { text: "", toolUses: [{ id: "p1", name: probe.name, input: {} }], stop: "tool_use" },
+    { text: "diagnosed", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "check the endpoint without changing anything" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [probe],
+    taskIntake: { task },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(probes, 1);
+  assert.doesNotMatch(JSON.stringify(history), /intent is 'investigate'/);
+});
+
+test("task_intake and a diagnostic probe in the same response cannot bypass the round boundary", async () => {
+  const interaction = newTurnInteraction();
+  let task = createTaskExecution("check one endpoint", interaction.turnId);
+  let probes = 0;
+  const probe = {
+    name: "fixture_same_round_probe",
+    description: "test-only bounded diagnostic",
+    input_schema: { type: "object", properties: {} },
+    kind: "exec",
+    classify() {
+      return { effect: "probe", concurrencySafe: true, approvalKind: "exec" };
+    },
+    async run() {
+      probes += 1;
+      return "reachable";
+    },
+  };
+  const investigateBrief = {
+    ...BRIEF,
+    intent: "investigate",
+    goal: "check one endpoint",
+  };
+  const p = provider([
+    {
+      text: "",
+      toolUses: [
+        { id: "b1", name: "task_intake", input: investigateBrief },
+        { id: "p0", name: probe.name, input: {} },
+      ],
+      stop: "tool_use",
+    },
+    { text: "", toolUses: [{ id: "p1", name: probe.name, input: {} }], stop: "tool_use" },
+    { text: "diagnosed", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "check the endpoint without changing anything" }];
+  await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [probe],
+    taskIntake: {
+      task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        task = next;
+      },
+    },
+  });
+
+  assert.equal(probes, 1, "same-response probe stayed blocked; the next-round probe ran");
+  const firstToolRound = history.find((message) => message.role === "tool");
+  assert.match(firstToolRound.results.find((result) => result.name === probe.name).content, /Wait for the next model round/);
+});
+
 test("stopping a background job is a state change even when the job tool is classified read-only", async () => {
   const interaction = newTurnInteraction();
   let task = createTaskExecution("stop the stuck background process", interaction.turnId);

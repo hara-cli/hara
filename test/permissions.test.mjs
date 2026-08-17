@@ -108,6 +108,10 @@ test("readonly autorun never approves Git commands that can reveal a deleted his
 test("splitCompound: splits top-level operators; fails closed on substitution / unbalanced quotes", () => {
   assert.deepEqual(splitCompound("npm test && git commit"), ["npm test", "git commit"]);
   assert.deepEqual(splitCompound("ls | grep x ; pwd"), ["ls", "grep x", "pwd"]);
+  assert.deepEqual(
+    splitCompound("nc -zv -w 5 192.0.2.10 22 2>&1 | head -3"),
+    ["nc -zv -w 5 192.0.2.10 22 2>&1", "head -3"],
+  );
   assert.equal(splitCompound("echo $(rm -rf /)"), null); // command substitution
   assert.equal(splitCompound("echo `whoami`"), null); // backtick
   assert.equal(splitCompound(`echo "unbalanced`), null); // unbalanced quote

@@ -164,6 +164,20 @@ export function splitCompound(command: string): string[] | null {
     if (ch === '"') { dq = true; buf += ch; continue; }
     if (ch === "`") return null; // backtick command substitution → can't model, fail closed
     if (ch === "$" && next === "(") return null; // $(…) substitution → fail closed
+    // File-descriptor duplication is a redirection, not a background separator. Keep `2>&1`,
+    // `1>&2`, `0<&3`, and the bash `&>` shorthand inside the current simple command so a
+    // bounded diagnostic such as `nc ... 2>&1 | head` remains parseable. The downstream
+    // command classifier still treats ordinary output redirections conservatively.
+    if (
+      ch === "&"
+      && (
+        ((command[i - 1] === ">" || command[i - 1] === "<") && /[0-9-]/u.test(next ?? ""))
+        || next === ">"
+      )
+    ) {
+      buf += ch;
+      continue;
+    }
     if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) { parts.push(buf); buf = ""; i++; continue; }
     if (ch === ";" || ch === "|" || ch === "\n" || ch === "&") { parts.push(buf); buf = ""; continue; }
     buf += ch;

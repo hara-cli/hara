@@ -4,8 +4,8 @@ import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSyn
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { capHeadTail, crossShellEncodingWarning, isHeadlessWeixinLoginCommand, isLongRunningLocalServerCommand, isLongRunningTunnelCommand, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
-import { getTool, getTools } from "../dist/tools/registry.js";
+import { capHeadTail, crossShellEncodingWarning, isBoundedDiagnosticProbePart, isHeadlessWeixinLoginCommand, isLongRunningLocalServerCommand, isLongRunningTunnelCommand, isPackageInstallCommand, isNgrokTunnelCommand, ngrokAuthConfigured, pythonStdinCommand, shellTimeoutMs } from "../dist/tools/builtin.js"; // also registers the built-ins (run `npm run build` first)
+import { approvalKindForOperation, getTool, getTools, toolOperationTraits } from "../dist/tools/registry.js";
 import { atomicWriteText } from "../dist/fs-write.js";
 import { readRegularFileSnapshot } from "../dist/fs-read.js";
 import { commandHasPackageRegistry, normalizePackageRegistry, packageRegistryEnv } from "../dist/package-registry.js";
@@ -63,6 +63,28 @@ test("package installs and ngrok tunnels are classified for safe timeout/preflig
   assert.equal(shellTimeoutMs("npm ci", 42_000), 42_000);
   assert.equal(shellTimeoutMs("npm ci", -1), 900_000, "invalid requested timeout falls back safely");
   assert.equal(shellTimeoutMs("npm ci", 9_999_999), 3_600_000, "requested timeouts are bounded");
+});
+
+test("bounded connectivity checks are investigative probes without becoming read-only approvals", () => {
+  for (const command of [
+    "nc -zv -w 5 192.0.2.10 22 2>&1",
+    "ping -c 3 -W 2 192.0.2.10 2>/dev/null",
+    "nslookup example.com 2>&1",
+  ]) assert.equal(isBoundedDiagnosticProbePart(command), true, command);
+  for (const command of [
+    "nc -l 4444",
+    "nc -zve /bin/sh 192.0.2.10 22",
+    "ping -f 192.0.2.10",
+    "ping 192.0.2.10",
+  ]) assert.equal(isBoundedDiagnosticProbePart(command), false, command);
+
+  const traits = toolOperationTraits(
+    getTool("bash"),
+    { command: "nc -zv -w 5 192.0.2.10 22 2>&1 | head -3" },
+    { cwd: process.cwd() },
+  );
+  assert.equal(traits.effect, "probe");
+  assert.equal(approvalKindForOperation(traits), "exec", "a network probe still keeps the shell approval boundary");
 });
 
 test("public tunnels must use a managed background job instead of a foreground timeout", async () => {

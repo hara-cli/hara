@@ -86,3 +86,19 @@ test("reply language follows the latest message by default and accepts an explic
     "invalid environment values fail back to automatic language matching",
   );
 });
+
+test("gateway prompt identifies the actual execution host and treats location corrections as evidence requests", () => {
+  const originalGateway = process.env.HARA_GATEWAY;
+  process.env.HARA_GATEWAY = "feishu";
+  try {
+    const prompt = composeSystem("/workspace/project").text;
+    assert.match(prompt, /file and shell tools execute directly on host/);
+    assert.match(prompt, /physical location and SSH client do not change that host/);
+    assert.match(prompt, /verify it with one bounded read-only host check/);
+    assert.match(prompt, /latest direct user correction outranks your earlier assumption/);
+    assert.match(prompt, /limits edits to named files is a hard scope boundary/);
+  } finally {
+    if (originalGateway === undefined) delete process.env.HARA_GATEWAY;
+    else process.env.HARA_GATEWAY = originalGateway;
+  }
+});
