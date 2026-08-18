@@ -5,7 +5,7 @@ import { redactSensitiveText } from "./secrets.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, win32 as winPath } from "node:path";
 import { normalizePortableWindowsHome } from "../runtime.js";
 
 const SECRET_NAME = /(?:^|_)(?:API_?KEY|KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?|COOKIE|JWT|AUTH)(?:_|$)/i;
@@ -38,6 +38,55 @@ function explicitAllow(env: NodeJS.ProcessEnv): Set<string> {
 function environmentValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const key = Object.keys(env).find((candidate) => candidate.toUpperCase() === name);
   return key ? env[key] : undefined;
+}
+
+function windowsSystemRoot(env: NodeJS.ProcessEnv): string {
+  const configured = String(environmentValue(env, "SYSTEMROOT") ?? "").trim();
+  if (configured && winPath.isAbsolute(configured) && !/[\u0000-\u001f\u007f]/u.test(configured)) {
+    return winPath.normalize(configured);
+  }
+  return "C:\\Windows";
+}
+
+/** Resolve a Windows inbox executable without depending on a possibly truncated launcher PATH. */
+export function windowsSystemExecutable(name: string, env: NodeJS.ProcessEnv = process.env): string {
+  if (!/^[A-Za-z0-9._-]+$/u.test(name)) throw new Error("Windows system executable name is invalid");
+  return winPath.join(windowsSystemRoot(env), "System32", name);
+}
+
+/** Prefer the OS-declared command processor, then the canonical System32 location. */
+export function windowsCommandProcessor(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = String(environmentValue(env, "COMSPEC") ?? "").trim();
+  if (configured && winPath.isAbsolute(configured) && !/[\u0000-\u001f\u007f]/u.test(configured)) {
+    return winPath.normalize(configured);
+  }
+  return windowsSystemExecutable("cmd.exe", env);
+}
+
+/**
+ * Desktop launchers and portable shells occasionally replace PATH instead of extending it. Restore the
+ * Windows inbox directories in the child-only environment so cmd.exe, where.exe, taskkill.exe and
+ * PowerShell remain reachable. System locations are prepended, preventing a project command from shadowing
+ * an OS executable; the parent Hara process and process.env are never mutated.
+ */
+export function restoreWindowsSystemPath(
+  env: NodeJS.ProcessEnv,
+  runtimePlatform: NodeJS.Platform | string = platform(),
+): void {
+  if (runtimePlatform !== "win32") return;
+  const root = windowsSystemRoot(env);
+  const required = [
+    winPath.join(root, "System32"),
+    root,
+    winPath.join(root, "System32", "Wbem"),
+    winPath.join(root, "System32", "WindowsPowerShell", "v1.0"),
+  ];
+  const pathKey = Object.keys(env).find((candidate) => candidate.toUpperCase() === "PATH") ?? "PATH";
+  const existing = String(env[pathKey] ?? "").split(winPath.delimiter).filter(Boolean);
+  const requiredKeys = new Set(required.map((entry) => winPath.normalize(entry).toLowerCase()));
+  const remaining = existing.filter((entry) => !requiredKeys.has(winPath.normalize(entry).toLowerCase()));
+  env[pathKey] = [...required, ...remaining].join(winPath.delimiter);
+  if (!environmentValue(env, "COMSPEC")) env.ComSpec = windowsSystemExecutable("cmd.exe", env);
 }
 
 /** Installed plugin commands are user-approved Hara extensions. Make them reachable by model-controlled
@@ -80,6 +129,7 @@ export function toolSubprocessEnv(
     if (value === undefined) delete out[name];
     else out[name] = value;
   }
+  restoreWindowsSystemPath(out);
   appendHaraPluginBin(out);
   return out;
 }
@@ -184,7 +234,7 @@ export function terminateSubprocessTree(
       try {
         // Asynchronous taskkill preserves the caller's wall-clock fallback; a synchronous 5s taskkill
         // timeout here could itself make a 200ms tool timeout take ten seconds across TERM + force passes.
-        const killer = spawn("taskkill", ["/pid", String(pid), "/t", ...(hard ? ["/f"] : [])], {
+        const killer = spawn(windowsSystemExecutable("taskkill.exe"), ["/pid", String(pid), "/t", ...(hard ? ["/f"] : [])], {
           stdio: "ignore",
           windowsHide: true,
           env: toolSubprocessEnv(),

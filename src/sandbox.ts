@@ -16,7 +16,12 @@ import {
   sensitiveFilesAllowed,
   sensitiveShellCommandReason,
 } from "./security/sensitive-files.js";
-import { terminateSubprocessTree, toolSubprocessEnv } from "./security/subprocess-env.js";
+import {
+  terminateSubprocessTree,
+  toolSubprocessEnv,
+  windowsCommandProcessor,
+  windowsSystemExecutable,
+} from "./security/subprocess-env.js";
 import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "./context/workspace-scope.js";
 
 export type SandboxMode = "off" | "workspace-write" | "read-only";
@@ -80,7 +85,12 @@ function findWindowsBash(refresh = false): string | null {
   // Bash shares Windows path semantics with the cwd and avoids needless D:\\... ↔ /mnt/d/... crossings.
   // `timeout` is CRITICAL: this is a SYNCHRONOUS probe on the main thread — without it a slow `where`
   // (a huge PATH, a dead network drive on PATH) hangs hara at startup with nothing able to interrupt it.
-  const onPath = spawnSync("where", ["bash"], { encoding: "utf8", timeout: 3000 });
+  const onPath = spawnSync(windowsSystemExecutable("where.exe"), ["bash"], {
+    encoding: "utf8",
+    timeout: 3000,
+    windowsHide: true,
+    env: toolSubprocessEnv(),
+  });
   const onPathCandidates = onPath.status === 0
     ? String(onPath.stdout).split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
     : [];
@@ -101,11 +111,18 @@ function refreshWindowsBashAfterFailure(failed: string): string | null {
 
 /** Pure shell-argv resolution — split out so the platform branching is unit-testable without spawning.
  *  `plat` and `bash` are injected; production passes the real platform() + findWindowsBash(). */
-export function resolveShellArgv(command: string, plat: string, bash: string | null): { cmd: string; args: string[] } {
+export function resolveShellArgv(
+  command: string,
+  plat: string,
+  bash: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): { cmd: string; args: string[] } {
   if (plat === "win32") {
     // A real bash keeps POSIX commands working; cmd.exe is the last resort (most `ls/grep` will fail
     // there — the model should be told, see maybeWarnWindowsShell).
-    return bash ? { cmd: bash, args: ["-c", command] } : { cmd: "cmd.exe", args: ["/d", "/s", "/c", command] };
+    return bash
+      ? { cmd: bash, args: ["-c", command] }
+      : { cmd: windowsCommandProcessor(env), args: ["/d", "/s", "/c", command] };
   }
   return { cmd: "/bin/sh", args: ["-c", command] };
 }

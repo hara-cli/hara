@@ -3,7 +3,7 @@
 // styles and the resolver that makes a custom DashScope profile Just Work.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { reasoningParams, supportsReasoningStyle } from "../dist/providers/reasoning.js";
+import { isQwenResponsesReasoningModel, reasoningParams, supportsReasoningStyle } from "../dist/providers/reasoning.js";
 import {
   DEEPSEEK_RESPONSES_MODELS,
   isDeepSeekResponsesModel,
@@ -37,6 +37,19 @@ test("reasoningParams reasoning_effort: only OpenAI reasoning models; off → mi
 test("reasoningParams reasoning_object (Responses API): reasoning:{effort} on reasoning models", () => {
   assert.deepEqual(reasoningParams("reasoning_object", "medium", "gpt-5"), { reasoning: { effort: "medium" } });
   assert.deepEqual(reasoningParams("reasoning_object", "medium", "qwen3.7-plus"), {});
+});
+
+test("Token Plan Qwen Responses uses documented model-specific reasoning levels", () => {
+  assert.equal(isQwenResponsesReasoningModel("qwen3.8-max"), true);
+  assert.equal(isQwenResponsesReasoningModel("qwen/qwen3.7-max"), true);
+  assert.equal(isQwenResponsesReasoningModel("deepseek-v4-pro"), false, "shared Token Plan host is not a Qwen capability");
+  assert.deepEqual(reasoningParams("qwen_responses", "low", "qwen3.8-max"), { reasoning: { effort: "low" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "medium", "qwen3.8-max"), { reasoning: { effort: "medium" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "high", "qwen3.8-max"), { reasoning: { effort: "xhigh" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.8-max"), { reasoning: { effort: "xhigh" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.8-max"), { reasoning: { effort: "low" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.7-max"), { reasoning: { effort: "none" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "high", "deepseek-v4-pro"), {});
 });
 
 test("reasoningParams DeepSeek Responses uses only documented effort values", () => {
@@ -139,6 +152,7 @@ test("resolvePlatform: DashScope endpoint variants + built-in providers", () => 
   assert.equal(resolvePlatform(undefined, "https://coding.dashscope.aliyuncs.com/apps/anthropic").wireApi, "anthropic");
   assert.equal(resolvePlatform(undefined, "https://coding.dashscope.aliyuncs.com/apps/anthropic").cache, "cache_control");
   assert.equal(resolvePlatform(undefined, "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1").wireApi, "responses");
+  assert.equal(resolvePlatform(undefined, "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1").reasoning, "qwen_responses");
   assert.equal(resolvePlatform("anthropic").wireApi, "anthropic");
   assert.equal(resolvePlatform("openai").reasoning, "reasoning_effort");
 });

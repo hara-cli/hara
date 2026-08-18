@@ -14,13 +14,33 @@ export function levelsFor(style: ReasoningStyle, model = ""): Effort[] {
   if (style === "deepseek" || style === "deepseek_responses") {
     return ["off", "low", "high", "max"];
   }
+  if (style === "qwen_responses") {
+    const bare = model.split("/").at(-1) ?? model;
+    return /^qwen3\.8-max(?:-|$)/i.test(bare)
+      ? ["low", "medium", "max"]
+      : ["off", "low", "medium", "high", "max"];
+  }
   return ["off", "low", "medium", "high"];
 }
 
 /** Label a level for display — binary styles read as on/off, graded ones as the level name. */
-export function levelLabel(style: ReasoningStyle, e: Effort): string {
+export function levelLabel(style: ReasoningStyle, e: Effort, model = ""): string {
   if (style === "enable_thinking" || style === "ollama_think") return e === "off" ? "off" : "on";
+  const bare = model.split("/").at(-1) ?? model;
+  if (style === "qwen_responses" && e === "max" && /^qwen3\.8-max(?:-|$)/i.test(bare)) return "xhigh";
   return String(e);
+}
+
+/** Normalize a persisted cross-provider dial value to one the selected model can actually accept. */
+export function normalizeEffort(style: ReasoningStyle, model: string, effort: Effort): Effort {
+  const levels = levelsFor(style, model);
+  if (!levels.length) return undefined;
+  if (levels.includes(effort)) return effort;
+  const bare = model.split("/").at(-1) ?? model;
+  if (style === "qwen_responses" && /^qwen3\.8-max(?:-|$)/i.test(bare)) {
+    return effort === "high" || effort === "max" ? "max" : "low";
+  }
+  return levels[0];
 }
 
 export interface PickerState {
@@ -44,7 +64,8 @@ export function movePicker(
   }
   const levels = levelsFor(style, model);
   if (!levels.length) return s;
-  const cur = Math.max(0, levels.indexOf(s.effort));
+  const normalized = normalizeEffort(style, model, s.effort);
+  const cur = Math.max(0, levels.indexOf(normalized));
   const d = key === "right" ? 1 : -1;
   return { ...s, effort: levels[(cur + d + levels.length) % levels.length] };
 }
@@ -71,17 +92,18 @@ export function ModelPicker({
   const [s, setS] = useState<PickerState>({ modelIdx: start, effort });
   const selectedModel = models[s.modelIdx] ?? current ?? "";
   const levels = levelsFor(style, selectedModel);
+  const effectiveEffort = normalizeEffort(style, selectedModel, s.effort);
   useInput((_input, key) => {
     if (key.escape) return onCancel();
-    if (key.return) return onSelect(selectedModel, levels.length ? s.effort : undefined);
+    if (key.return) return onSelect(selectedModel, effectiveEffort);
     if (key.upArrow) setS((p) => movePicker(p, "up", models.length, style));
     else if (key.downArrow) setS((p) => movePicker(p, "down", models.length, style));
-    else if (key.leftArrow) setS((p) => movePicker(p, "left", models.length, style, selectedModel));
-    else if (key.rightArrow) setS((p) => movePicker(p, "right", models.length, style, selectedModel));
+    else if (key.leftArrow) setS((p) => movePicker({ ...p, effort: effectiveEffort }, "left", models.length, style, selectedModel));
+    else if (key.rightArrow) setS((p) => movePicker({ ...p, effort: effectiveEffort }, "right", models.length, style, selectedModel));
   });
 
   const hasLevels = levels.length > 0;
-  const dial = hasLevels ? `thinking ◀ ${levelLabel(style, s.effort)} ▶` : "";
+  const dial = hasLevels ? `thinking ◀ ${levelLabel(style, effectiveEffort, selectedModel)} ▶` : "";
   return (
     <Box flexDirection="column" marginTop={1}>
       <Text color="yellow">{`  pick a model  ·  ↑↓ model  ·  ${hasLevels ? "←→ thinking  ·  " : ""}⏎ apply  ·  esc`}</Text>

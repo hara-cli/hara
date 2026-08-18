@@ -214,6 +214,28 @@ test(`Responses transport consumes semantic SSE and function calls for ${deepSee
 });
 }
 
+test("Token Plan Qwen request carries xhigh reasoning without OpenAI-only state fields", async () => {
+  const mock = await listen([completed([], { input_tokens: 2, output_tokens: 1 }, 0)]);
+  try {
+    await createResponsesProvider({
+      apiKey: "test-key",
+      baseURL: mock.baseURL,
+      model: "qwen3.8-max",
+      reasoningEffort: "max",
+      reasoningStyle: "qwen_responses",
+    }).turn({ system: "test", history: [{ role: "user", content: "ping" }], tools: [], onText() {} });
+
+    assert.equal(mock.requests.length, 1);
+    assert.deepEqual(mock.requests[0].body.reasoning, { effort: "xhigh" });
+    assert.equal(mock.requests[0].body.previous_response_id, undefined);
+    assert.equal(mock.requests[0].body.conversation, undefined);
+    assert.equal(mock.requests[0].body.store, undefined);
+    assert.equal(mock.requests[0].body.parallel_tool_calls, undefined);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+  }
+});
+
 test("Responses transport treats incomplete and missing terminal events as errors", async (t) => {
   await t.test("incomplete", async () => {
     const mock = await listen([{

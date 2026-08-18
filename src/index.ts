@@ -38,6 +38,7 @@ import {
   CONFIG_KEYS,
   APPROVAL_MODES,
   SANDBOX_MODES,
+  COMPUTER_USE_MODES,
   REASONING_EFFORTS,
   type HaraConfig,
   type ApprovalMode,
@@ -3958,6 +3959,10 @@ config
       out(c.red(`Invalid sandbox mode. One of: ${SANDBOX_MODES.join(", ")}.\n`));
       process.exit(1);
     }
+    if (key === "computerUse" && !COMPUTER_USE_MODES.includes(value as HaraConfig["computerUse"])) {
+      out(c.red(`Invalid computer-use mode. One of: ${COMPUTER_USE_MODES.join(", ")}.\n`));
+      process.exit(1);
+    }
     if (key === "reasoningEffort" && !REASONING_EFFORTS.includes(value as typeof REASONING_EFFORTS[number])) {
       out(c.red(`Invalid reasoning effort. One of: ${REASONING_EFFORTS.join(", ")}.\n`));
       process.exit(1);
@@ -3998,6 +4003,13 @@ config
     }
     writeConfigValue(key, value);
     out(c.green(`Set ${key} → ${configPath()}\n`));
+    const computerUseOverride = String(process.env.HARA_COMPUTER_USE ?? "").trim();
+    if (key === "computerUse" && computerUseOverride && computerUseOverride !== value) {
+      out(c.yellow(
+        `Saved ${value}, but HARA_COMPUTER_USE currently overrides it for this process. ` +
+        "Unset that environment variable and restart Hara to use the saved value.\n",
+      ));
+    }
   });
 config
   .command("get [key]")

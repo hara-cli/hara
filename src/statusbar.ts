@@ -36,6 +36,8 @@ export function contextWindow(model: string): number {
   // qwen3-coder-next and qwen3-max as 1M, causing the context guard to overfeed their 262k windows.
   const m = model.toLowerCase().split("/").at(-1) ?? model.toLowerCase();
   if (/haiku/.test(m)) return 200_000;
+  if (/^qwen3\.8-max(?:-|$)/.test(m)) return 983_616;
+  if (/^qwen3\.7-max(?:-|$)/.test(m)) return 1_000_000;
   if (/^qwen3\.[567]-plus(?:-|$)/.test(m) || /^qwen3-coder-plus(?:-|$)/.test(m)) return 1_000_000;
   if (/^(?:qwen3-max-2026-01-23|qwen3-coder-next)(?:-|$)/.test(m) || /^kimi-k2\.5(?:-|$)/.test(m)) return 262_144;
   if (/^glm-(?:5|4\.7)(?:-|$)/.test(m)) return 202_752;

@@ -147,6 +147,44 @@ test("loadConfig: blank env/project routing values do not hide global credential
   }
 });
 
+test("config set persists computerUse and explains a conflicting environment override", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-computer-use-"));
+  const home = join(root, "home");
+  mkdirSync(home, { recursive: true });
+  try {
+    const child = spawnSync(
+      process.execPath,
+      [join(process.cwd(), "runtime-bootstrap.cjs"), "config", "set", "computerUse", "full"],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: home,
+          USERPROFILE: home,
+          HARA_COMPUTER_USE: "off",
+        },
+      },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    assert.match(child.stdout, /Set computerUse/);
+    assert.match(child.stdout, /HARA_COMPUTER_USE currently overrides it/);
+    const saved = JSON.parse(readFileSync(join(home, ".hara", "config.json"), "utf8"));
+    assert.equal(saved.computerUse, "full");
+
+    const invalid = spawnSync(
+      process.execPath,
+      [join(process.cwd(), "runtime-bootstrap.cjs"), "config", "set", "computerUse", "always"],
+      { cwd: process.cwd(), encoding: "utf8", env: { ...process.env, HOME: home, USERPROFILE: home } },
+    );
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stdout, /Invalid computer-use mode/);
+    assert.equal(JSON.parse(readFileSync(join(home, ".hara", "config.json"), "utf8")).computerUse, "full");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("loadConfig: Home control-plane config is never re-read as project input or inherited from above Home", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-config-home-boundary-"));
   const home = join(root, "home");

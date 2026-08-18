@@ -35,7 +35,9 @@ import {
   createToolOutputLineRedactor,
   isSecretEnvironmentName,
   redactToolSubprocessOutput,
+  restoreWindowsSystemPath,
   toolSubprocessEnv,
+  windowsSystemExecutable,
 } from "../dist/security/subprocess-env.js";
 import {
   bindPrivateHaraStateFile,
@@ -54,6 +56,35 @@ import "../dist/tools/edit.js";
 import "../dist/tools/patch.js";
 
 const SECRET = "opaque-boundary-value-729184";
+
+test("Windows child environment restores trusted inbox tools ahead of a truncated PATH", () => {
+  const env = {
+    Path: "D:\\Portable\\bin;d:\\windows\\SYSTEM32;D:\\Project\\bin",
+    SystemRoot: "D:\\Windows",
+  };
+  restoreWindowsSystemPath(env, "win32");
+  assert.deepEqual(env.Path.split(";"), [
+    "D:\\Windows\\System32",
+    "D:\\Windows",
+    "D:\\Windows\\System32\\Wbem",
+    "D:\\Windows\\System32\\WindowsPowerShell\\v1.0",
+    "D:\\Portable\\bin",
+    "D:\\Project\\bin",
+  ]);
+  assert.equal(env.ComSpec, "D:\\Windows\\System32\\cmd.exe");
+  assert.equal(windowsSystemExecutable("where.exe", env), "D:\\Windows\\System32\\where.exe");
+});
+
+test("Windows child environment keeps an absolute case-insensitive ComSpec and never mutates non-Windows PATH", () => {
+  const windowsEnv = { COMSPEC: "E:\\OS\\System32\\cmd.exe", PATH: "E:\\bin", SystemRoot: "E:\\OS" };
+  restoreWindowsSystemPath(windowsEnv, "win32");
+  assert.equal(windowsEnv.COMSPEC, "E:\\OS\\System32\\cmd.exe");
+  assert.equal(windowsEnv.ComSpec, undefined);
+
+  const posixEnv = { PATH: "/usr/bin:/bin" };
+  restoreWindowsSystemPath(posixEnv, "linux");
+  assert.deepEqual(posixEnv, { PATH: "/usr/bin:/bin" });
+});
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "hara-sensitive-"));

@@ -218,6 +218,7 @@ export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval"
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = ["off", "low", "medium", "high", "max"];
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
+export const COMPUTER_USE_MODES: HaraConfig["computerUse"][] = ["off", "read", "click", "full"];
 const PROJECT_ROOT_MARKERS = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml", ".hg"];
 const MAX_PROJECT_CONFIG_BYTES = 256 * 1024;
 const MAX_GLOBAL_CONFIG_BYTES = 1024 * 1024;
@@ -619,7 +620,10 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   const theme = (process.env.HARA_THEME ?? merged.theme ?? "dark") as "dark" | "light";
   const evolve = (process.env.HARA_EVOLVE ?? merged.evolve ?? "proactive") as "off" | "light" | "proactive";
   const assetCapture = (process.env.HARA_ASSET_CAPTURE ?? merged.assetCapture ?? "ask") as "off" | "ask" | "auto";
-  const computerUse = (process.env.HARA_COMPUTER_USE ?? merged.computerUse ?? "off") as "off" | "read" | "click" | "full";
+  const requestedComputerUse = nonBlankEnv(process.env.HARA_COMPUTER_USE) ?? merged.computerUse ?? "off";
+  const computerUse = COMPUTER_USE_MODES.includes(requestedComputerUse as HaraConfig["computerUse"])
+    ? requestedComputerUse as HaraConfig["computerUse"]
+    : "off";
   const computerApps = String(process.env.HARA_COMPUTER_APPS ?? merged.computerApps ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const visionModel = nonBlankEnv(process.env.HARA_VISION_MODEL) ?? merged.visionModel;
   const visionBaseURL = nonBlankEnv(process.env.HARA_VISION_BASE_URL) ?? merged.visionBaseURL;

@@ -149,6 +149,11 @@ the user explicitly asks to save a separate version. For one-shot Python library
 call the python tool with source directly; never write a durable helper .py file and then run it. If an
 atomic binary save needs a temporary output, remove it in finally/on failure and leave only the requested
 document when the task completes.
+Before claiming a DOCX, PDF, presentation, or spreadsheet is complete, render or open the final artifact and
+visually inspect representative pages, including the first page and the densest page. Fix clipped/overlapping
+content, cramped tables, stray template language, and inconsistent headings; a successful file write alone is
+not visual acceptance. If no renderer or preview surface is available, state that limitation instead of claiming
+the layout was verified.
 When an attempt FAILS, never repeat it unchanged — read the error, form a hypothesis about the cause, and
 change something (arguments / approach / tool) before trying again. After two failed variants of the same
 approach, stop: re-plan from what you learned, or ask the user, stating concisely what you tried and what

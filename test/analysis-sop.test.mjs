@@ -60,6 +60,9 @@ test("system prompt edits existing documents in place without durable helper scr
   assert.match(system, /call the python tool with source directly/);
   assert.match(system, /never write a durable helper \.py file/);
   assert.match(system, /remove it in finally\/on failure/);
+  assert.match(system, /visually inspect representative pages/);
+  assert.match(system, /clipped\/overlapping[\s\S]*cramped tables[\s\S]*stray template language/);
+  assert.match(system, /successful file write alone is\s+not visual acceptance/);
 });
 
 test("system prompt keeps internal orchestration out of user-visible progress", async () => {

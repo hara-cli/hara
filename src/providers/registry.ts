@@ -42,7 +42,7 @@ export { DEEPSEEK_RESPONSES_MODELS, isDeepSeekResponsesModel } from "./deepseek.
  *  without the user declaring a provider id: the DashScope host implies chat + enable_thinking. */
 const BY_BASEURL: { test: RegExp; caps: PlatformCaps }[] = [
   // Alibaba Token Plan — OpenAI-compatible; new models use the Responses API.
-  { test: /token-plan.*maas\.aliyuncs\.com\/compatible-mode/i, caps: { wireApi: "responses", reasoning: "reasoning_object", cache: "auto" } },
+  { test: /token-plan.*maas\.aliyuncs\.com\/compatible-mode/i, caps: { wireApi: "responses", reasoning: "qwen_responses", cache: "auto" } },
   // Alibaba DashScope — OpenAI-compatible chat (coding plan /v1, pay-as-you-go /compatible-mode): the key
   // difference is `enable_thinking`, which actually turns Qwen/GLM thinking off (the DashScope speedup).
   { test: /dashscope\.aliyuncs\.com\/(v1|compatible-mode)|maas\.aliyuncs\.com\/compatible-mode/i, caps: { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" } },

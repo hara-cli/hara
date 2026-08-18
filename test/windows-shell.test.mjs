@@ -22,9 +22,20 @@ test("resolveShellArgv: Windows uses bash when found (Git Bash / WSL keeps ls/gr
 });
 
 test("resolveShellArgv: Windows falls back to cmd.exe when no bash is on PATH", () => {
-  const r = resolveShellArgv("echo hi", "win32", null);
-  assert.equal(r.cmd, "cmd.exe");
+  const r = resolveShellArgv("echo hi", "win32", null, {
+    SystemRoot: "D:\\Windows",
+    PATH: "D:\\Portable\\bin",
+  });
+  assert.equal(r.cmd, "D:\\Windows\\System32\\cmd.exe");
   assert.deepEqual(r.args, ["/d", "/s", "/c", "echo hi"]);
+});
+
+test("resolveShellArgv: Windows honors an absolute ComSpec even when PATH omits System32", () => {
+  const r = resolveShellArgv("echo hi", "win32", null, {
+    ComSpec: "E:\\OS\\System32\\cmd.exe",
+    PATH: "D:\\Portable\\bin",
+  });
+  assert.equal(r.cmd, "E:\\OS\\System32\\cmd.exe");
 });
 
 test("Windows shell discovery probes conventional Git Bash installs outside PATH", () => {

@@ -11,6 +11,9 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *                         thinking phase server-side (off → the big latency vanishes, measured 14s→1.6s).
  *  - `reasoning_effort` — OpenAI chat reasoning models (o-series / gpt-5): the `reasoning_effort` enum.
  *  - `reasoning_object` — OpenAI Responses API: `reasoning: { effort }` (for the responses transport).
+ *  - `qwen_responses` — Alibaba Model Studio Responses API for Qwen: `reasoning: { effort }`, with
+ *                         model-specific levels. qwen3.8-max accepts low|medium|xhigh; older supported
+ *                         Qwen Responses models also accept `none` and the wider graded dial.
  *  - `deepseek_responses` — DeepSeek V4 Flash/Pro Responses API: `reasoning: { effort }`, with DeepSeek's
  *                         documented none|low|high|max values (`none` disables thinking).
  *  - `deepseek`         — DeepSeek V4 OpenAI-compat chat: a `thinking: { type }` on/off object PLUS a
@@ -23,7 +26,7 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `ollama_think`     — Ollama's OpenAI-compat endpoint: a `think` boolean that stops a local reasoning
  *                         model's thinking phase (measured: deepseek-r1:14b 17s → 0.6s). Off models ignore it.
  *  - `none`             — the platform has no thinking control; leave the request untouched. */
-export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "deepseek_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
+export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "qwen_responses" | "deepseek_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
 
 /** OpenAI reasoning families that accept `reasoning_effort` / `reasoning.effort`. Others reject it, so the
  *  `reasoning_effort` / `reasoning_object` styles no-op on non-reasoning models. */
@@ -31,13 +34,23 @@ export function isReasoningModel(model: string): boolean {
   return /^(o1|o3|o4|gpt-5)/i.test(model);
 }
 
+const bareModel = (model: string): string => model.split("/").at(-1) ?? model;
+
+/** Qwen models whose public Model Studio metadata documents Responses reasoning controls. Keep this
+ * allow-list family-shaped: the Token Plan endpoint also serves GLM/DeepSeek models, which must not
+ * receive Qwen-only values merely because they share a base URL. */
+export function isQwenResponsesReasoningModel(model: string): boolean {
+  return /^qwen3\.(?:7|8)-(?:max|plus)(?:-|$)/i.test(bareModel(model));
+}
+
 /** Endpoint capability is not enough: Alibaba's Coding Plan serves qwen3-coder-next/plus on the same
  * DashScope URL as thinking models, but documents both coder ids as not supporting thinking mode. */
 export function supportsReasoningStyle(style: ReasoningStyle, model = ""): boolean {
   if (style === "none") return false;
-  if (style === "enable_thinking" && /^qwen3-coder-(?:next|plus)(?:-|$)/i.test(model.split("/").at(-1) ?? model)) {
+  if (style === "enable_thinking" && /^qwen3-coder-(?:next|plus)(?:-|$)/i.test(bareModel(model))) {
     return false;
   }
+  if (style === "qwen_responses") return isQwenResponsesReasoningModel(model);
   return true;
 }
 
@@ -63,6 +76,17 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
     case "reasoning_object":
       if (!isReasoningModel(model)) return {};
       return { reasoning: { effort: effort === "off" ? "minimal" : effort === "max" ? "high" : effort } };
+    case "qwen_responses": {
+      if (!supportsReasoningStyle(style, model)) return {};
+      // The qwen3.8-max catalog exposed to Codex documents low|medium|xhigh (default xhigh), not an
+      // off value. A stale cross-provider `off` therefore degrades to low instead of sending an invalid
+      // enum or unexpectedly restoring the expensive default. `max` is Hara's portable name for xhigh.
+      const qwen38Max = /^qwen3\.8-max(?:-|$)/i.test(bareModel(model));
+      const mapped = qwen38Max
+        ? effort === "off" || effort === "low" ? "low" : effort === "medium" ? "medium" : "xhigh"
+        : effort === "off" ? "none" : effort;
+      return { reasoning: { effort: mapped } };
+    }
     case "deepseek_responses":
       // DeepSeek Responses owns a provider-specific `none` value for disabling thinking. Keep the
       // transport stable instead of silently switching an `off` request to Chat Completions.

@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.148.2 — 2026-08-19 — Token Plan and Windows execution fidelity
+
+- Recognize Alibaba Model Studio Token Plan as a native Responses endpoint without treating its shared
+  Qwen, DeepSeek, and GLM catalog as OpenAI models. `qwen3.8-max` now receives its documented
+  `reasoning.effort` values; low and medium remain exact, while Hara's high/max dial maps to `xhigh`.
+- Present only low / medium / xhigh for `qwen3.8-max`. A stale cross-provider off setting safely degrades
+  to low, and non-Qwen models on the same Token Plan host receive no Qwen-only reasoning fields.
+- Use the documented 983,616-token context window for `qwen3.8-max` and the one-million-token window for
+  `qwen3.7-max`, preventing premature history compaction. Verified with unit and transport regressions plus
+  a live, redacted Token Plan Responses stream.
+- Restore trusted Windows inbox directories in model-controlled child environments and resolve `cmd.exe`,
+  `where.exe`, and `taskkill.exe` independently of a launcher-truncated PATH. `computerUse` now rejects invalid
+  modes and warns when `HARA_COMPUTER_USE` overrides the saved setting instead of appearing not to persist.
+- Require visual inspection before claiming Office artifacts are complete, including checks for overlap,
+  cramped tables, inconsistent headings, and stray template language. Upgrade with
+  `npm i -g @nanhara/hara@0.148.2`.
+
 ## 0.148.1 — 2026-08-17 — deterministic correction and diagnostic intake
 
 - Stop treating positional Chinese “之前” in instructions such as “在这行之前插入” as a request to
