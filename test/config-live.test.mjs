@@ -591,6 +591,47 @@ test("provider catalog: Ollama and LM Studio are first-class local no-key preset
   );
 });
 
+test("provider catalog: Token Plan is the single current Alibaba setup entry and legacy Qwen routes stay loadable", () => {
+  const catalog = providerCatalog();
+  const tokenPlan = catalog.find((provider) => provider.id === "token-plan");
+  assert.deepEqual(
+    {
+      auth: tokenPlan?.auth,
+      baseURL: tokenPlan?.defaultBaseURL,
+      model: tokenPlan?.defaultModel,
+      customBaseURL: tokenPlan?.customBaseURL,
+    },
+    {
+      auth: "api-key",
+      baseURL: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      model: "qwen3.8-max",
+      customBaseURL: false,
+    },
+  );
+  assert.ok(tokenPlan?.knownModels?.includes("glm-5.2"));
+  assert.equal(catalog.find((provider) => provider.id === "qwen")?.legacy, true);
+  assert.equal(catalog.find((provider) => provider.id === "qwen-oauth")?.legacy, true);
+});
+
+test("provider settings pin Token Plan credentials to the official Beijing endpoint", () => {
+  assert.equal(
+    normalizePersonalProviderConfig({
+      provider: "token-plan",
+      model: "qwen3.8-max",
+      baseURL: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/",
+    }).baseURL,
+    "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+  );
+  assert.throws(
+    () => normalizePersonalProviderConfig({
+      provider: "token-plan",
+      model: "qwen3.8-max",
+      baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    }),
+    /fixed Beijing endpoint/,
+  );
+});
+
 test("provider settings validation keeps local endpoints loopback-only and cloud HTTP secure", () => {
   assert.throws(
     () => normalizePersonalProviderConfig({ provider: "ollama", model: "qwen3", baseURL: "http://192.168.1.10:11434/v1" }),

@@ -127,6 +127,28 @@ test("personal and explicit sidecar targets still use merged config", () => {
   assert.equal(sidecar.model, "vision");
 });
 
+test("legacy Qwen/OpenAI profiles on the exact Token Plan endpoint canonicalize without losing their saved key", () => {
+  const target = resolveByokProviderTarget(
+    personalConfig,
+    {
+      id: "token-plan-old",
+      kind: "byok",
+      provider: "qwen",
+      apiKey: "subscription-key",
+      baseURL: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      defaultModel: "glm-5",
+    },
+    false,
+    {},
+  );
+  assert.deepEqual(target, {
+    provider: "token-plan",
+    apiKey: "subscription-key",
+    baseURL: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    model: "glm-5",
+  });
+});
+
 test("local targets discard flat and environment cloud credentials", () => {
   const target = resolveByokProviderTarget(
     {

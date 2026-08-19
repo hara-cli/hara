@@ -14,9 +14,14 @@ import {
 import { readVerifiedRegularFileSnapshotSync } from "./fs-read.js";
 import { projectRepositoryTrustedAtStartup } from "./security/project-trust.js";
 import { isHomeWorkspace } from "./context/workspace-scope.js";
+import {
+  TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
+  TOKEN_PLAN_OPENAI_BASE_URL,
+} from "./providers/alibaba.js";
 
 export type ProviderId =
   | "anthropic"
+  | "token-plan"
   | "qwen"
   | "qwen-oauth"
   | "openai"
@@ -126,6 +131,11 @@ export interface HaraConfig {
 
 const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; envKey: string }> = {
   anthropic: { model: "claude-opus-4-8", envKey: "ANTHROPIC_API_KEY" },
+  "token-plan": {
+    model: "qwen3.8-max",
+    baseURL: TOKEN_PLAN_OPENAI_BASE_URL,
+    envKey: "OPENAI_API_KEY",
+  },
   qwen: {
     model: "qwen-plus",
     baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -175,13 +185,24 @@ export interface ProviderCatalogEntry {
   defaultModel: string;
   defaultBaseURL?: string;
   customBaseURL: boolean;
+  /** Setup-time suggestions only. A live key-scoped `/models` response is authoritative. */
+  knownModels?: readonly string[];
+  /** Kept loadable for existing profiles but hidden from new-connection setup. */
+  legacy?: boolean;
 }
 
 const PROVIDER_LABELS: Record<ProviderId, Omit<ProviderCatalogEntry, "id" | "defaultModel" | "defaultBaseURL">> = {
   anthropic: { label: "Anthropic", location: "cloud", auth: "api-key", customBaseURL: true },
+  "token-plan": {
+    label: "Alibaba Cloud Model Studio Token Plan",
+    location: "cloud",
+    auth: "api-key",
+    customBaseURL: false,
+    knownModels: TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
+  },
   openai: { label: "OpenAI / compatible", location: "cloud", auth: "api-key", customBaseURL: true },
-  qwen: { label: "Qwen (DashScope)", location: "cloud", auth: "api-key", customBaseURL: true },
-  "qwen-oauth": { label: "Qwen Coding (browser sign-in)", location: "cloud", auth: "oauth", customBaseURL: false },
+  qwen: { label: "Qwen (legacy DashScope)", location: "cloud", auth: "api-key", customBaseURL: true, legacy: true },
+  "qwen-oauth": { label: "Qwen Code OAuth (legacy, not Token Plan)", location: "cloud", auth: "oauth", customBaseURL: false, legacy: true },
   glm: { label: "GLM (Zhipu)", location: "cloud", auth: "api-key", customBaseURL: true },
   deepseek: { label: "DeepSeek", location: "cloud", auth: "api-key", customBaseURL: true },
   openrouter: { label: "OpenRouter", location: "cloud", auth: "api-key", customBaseURL: true },
@@ -479,7 +500,20 @@ function cleanProviderBaseURL(provider: ProviderId, value: string | undefined): 
   if (providerIsLocal(provider) && !loopbackHost(url.hostname)) {
     throw new Error(`${provider} is labeled local and must use localhost/127.0.0.1/::1; use an OpenAI-compatible cloud profile for a remote host`);
   }
-  return raw.replace(/\/+$/, "");
+  const normalized = raw.replace(/\/+$/, "");
+  if (provider === "token-plan") {
+    const expected = new URL(TOKEN_PLAN_OPENAI_BASE_URL);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (
+      url.protocol !== expected.protocol
+      || url.host.toLowerCase() !== expected.host.toLowerCase()
+      || pathname !== expected.pathname.replace(/\/+$/, "")
+    ) {
+      throw new Error(`token-plan uses the fixed Beijing endpoint ${TOKEN_PLAN_OPENAI_BASE_URL}`);
+    }
+    return TOKEN_PLAN_OPENAI_BASE_URL;
+  }
+  return normalized;
 }
 
 function providerEndpointIdentity(provider: ProviderId, value: string | undefined): string {

@@ -14,6 +14,7 @@ import {
   type ActiveResolution,
   type Profile,
 } from "../profile/profile.js";
+import { isOfficialTokenPlanOpenAIEndpoint } from "./alibaba.js";
 
 export interface ProviderTarget {
   provider: ProviderId;
@@ -89,24 +90,30 @@ export function resolveByokProviderTarget(
     isProviderId(env.HARA_PROVIDER) && env.HARA_PROVIDER !== "hara-gateway"
       ? env.HARA_PROVIDER
       : undefined;
-  const provider: ProviderId =
+  const configuredProvider: ProviderId =
     personalOrOverride
       ? (cfg.provider !== "hara-gateway" ? cfg.provider : profileProvider)
       : environmentProvider ?? profileProvider;
-  const namedProviderChanged = !personalOrOverride && provider !== profileProvider;
+  const namedProviderChanged = !personalOrOverride && configuredProvider !== profileProvider;
+  const baseURL = personalOrOverride
+    ? cfg.baseURL ?? profile.baseURL ?? providerDefaultBaseURL(configuredProvider)
+    : env.HARA_BASE_URL
+      ?? (namedProviderChanged ? undefined : profile.baseURL)
+      ?? providerDefaultBaseURL(configuredProvider);
+  // Older Hara versions stored Token Plan as a generic OpenAI or Qwen route. Canonicalize the exact
+  // official endpoint at runtime so model discovery, environment-key lookup and Desktop presentation all
+  // converge on the new first-class provider without rewriting the user's private profile on read.
+  const provider: ProviderId = isOfficialTokenPlanOpenAIEndpoint(baseURL)
+    ? "token-plan"
+    : configuredProvider;
   const envKey = providerEnvKey(provider);
   const providerEnvApiKey = envKey ? env[envKey] : undefined;
   const candidateApiKey = personalOrOverride
-    ? cfg.apiKey ?? profile.apiKey
+    ? cfg.apiKey ?? profile.apiKey ?? env.HARA_API_KEY ?? providerEnvApiKey
     : env.HARA_API_KEY ?? providerEnvApiKey ?? (namedProviderChanged ? undefined : profile.apiKey);
   // Ollama/LM Studio declare auth:none. Never forward a stale cloud key (including HARA_API_KEY) to a
   // loopback process that happens to occupy the configured port.
   const apiKey = providerIsLocal(provider) ? undefined : candidateApiKey;
-  const baseURL = personalOrOverride
-    ? cfg.baseURL ?? profile.baseURL ?? providerDefaultBaseURL(provider)
-    : env.HARA_BASE_URL
-      ?? (namedProviderChanged ? undefined : profile.baseURL)
-      ?? providerDefaultBaseURL(provider);
   const profileModel = profile.model || profile.defaultModel || "";
   const model = personalOrOverride
     ? cfg.model || env.HARA_MODEL || profileModel

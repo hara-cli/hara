@@ -47,7 +47,8 @@
 //                                                    sessionPage:{hasMore,limit,nextCursor?},
 //                                                    scheduler:{installed,supported,platform,detail}}
 //                                                    Raw delivery targets are write-only and never returned.
-//   models.list       {sessionId?}                → {models:[…],entries:[{id,providerId,effortLevels,
+//   models.list       {sessionId?}                → {models:[…],current,currentAvailable?,recommendedModel?,
+//                                                    entries:[{id,providerId,available?,effortLevels,
 //                                                    attachmentCapabilities}],current,profileId?,
 //                                                    effortLevels:[…],attachmentCapabilities}
 //   settings.providers.list {}                    → redacted provider catalog + current profile state

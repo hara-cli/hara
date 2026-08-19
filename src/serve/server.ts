@@ -117,6 +117,7 @@ import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 import { projectApprovalPolicy } from "../security/project-approvals.js";
+import { tokenPlanModelReplacement } from "../providers/alibaba.js";
 import {
   DeskClientError,
   type DeskConnectionsSnapshot,
@@ -2361,11 +2362,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const models = defaultRuntime.availableModels?.length
               ? [...defaultRuntime.availableModels]
               : discoveredModels;
+            const currentAvailable = models.length ? models.includes(current) : undefined;
+            const recommendedModel = currentAvailable === false
+              ? tokenPlanModelReplacement(current, models)
+              : undefined;
             const entries = [...new Set([current, ...models])].map((model) => {
               const modelRuntime = runtimeInfo(targetCwd, model, profileId);
               return {
                 id: model,
                 providerId: modelRuntime.providerId,
+                ...(models.length ? { available: models.includes(model) } : {}),
                 effortLevels: modelRuntime.effortLevels ?? [],
                 attachmentCapabilities: modelRuntime.attachmentCapabilities,
               };
@@ -2374,6 +2380,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               models,
               entries,
               current,
+              ...(currentAvailable !== undefined ? { currentAvailable } : {}),
+              ...(recommendedModel ? { recommendedModel } : {}),
               profileId: savedMeta?.profileId ?? defaultRuntime.profileId,
               effort: session?.effort ?? savedMeta?.effort ?? null,
               effortLevels: currentRuntime.effortLevels,

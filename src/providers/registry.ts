@@ -63,6 +63,9 @@ const BY_BASEURL: { test: RegExp; caps: PlatformCaps }[] = [
 /** Per-provider-id overrides (built-in providers whose id alone fixes the shape). */
 const BY_PROVIDER: Record<string, Partial<PlatformCaps>> = {
   anthropic: { wireApi: "anthropic", reasoning: "thinking_budget", cache: "cache_control" },
+  // Exact model-level routing is resolved from the official Token Plan base URL above. This row keeps
+  // the provider conservative if a future saved profile is missing its preset endpoint.
+  "token-plan": { wireApi: "chat", reasoning: "none", cache: "auto" },
   qwen: { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" }, // DashScope
   "qwen-oauth": { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" },
   glm: { wireApi: "chat", reasoning: "none", cache: "auto" }, // Zhipu native /paas/v4 — different thinking param; leave alone (its /anthropic endpoint resolves via baseURL)

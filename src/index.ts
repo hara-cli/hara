@@ -910,6 +910,7 @@ async function testNamedProviderConnection(inputId: string, targetCwd: string) {
 
 const SETUP_DEFAULT_MODEL: Record<string, string> = {
   anthropic: "claude-opus-4-8",
+  "token-plan": "qwen3.8-max",
   qwen: "qwen-plus",
   openai: "gpt-4o-mini",
   glm: "glm-4.6",
@@ -920,19 +921,17 @@ const SETUP_DEFAULT_MODEL: Record<string, string> = {
   "qwen-oauth": "coder-model",
 };
 
-/** Numbered provider menu for `hara setup`. Order is the displayed order; `id` maps to a ProviderId
- *  (or the special "custom"/"qwen-oauth" routes). GLM/DeepSeek carry a preset base URL so the user
- *  never types one; "custom" prompts for an OpenAI-compatible base URL. */
+/** Numbered provider menu for `hara setup`. Token Plan is Alibaba's only new-user subscription entry;
+ * legacy DashScope and Qwen Code OAuth profiles remain loadable but are not advertised here. */
 const SETUP_MENU: { label: string; id: ProviderId | "custom" }[] = [
   { label: "Anthropic", id: "anthropic" },
   { label: "OpenAI", id: "openai" },
+  { label: "Alibaba Cloud Model Studio Token Plan (API key, Beijing)", id: "token-plan" },
   { label: "GLM (Zhipu)", id: "glm" },
   { label: "DeepSeek", id: "deepseek" },
-  { label: "Qwen (DashScope key)", id: "qwen" },
   { label: "Ollama (local, no key)", id: "ollama" },
   { label: "LM Studio (local, no key)", id: "lmstudio" },
   { label: "OpenAI-compatible (custom base URL)", id: "custom" },
-  { label: "Qwen — free, no key (browser sign-in)", id: "qwen-oauth" },
 ];
 
 /** Read a secret from the TTY without echoing it (shows `*` per char). Falls back to a plain
@@ -1023,8 +1022,8 @@ async function pingProvider(args: { provider: ProviderId; apiKey: string; model:
 }
 
 /** Interactive first-run setup: pick a provider (numbered menu), API key (masked), and model →
- *  ~/.hara/config.json. Compatible providers are dispatched by their model capability (including
- *  DeepSeek V4 Flash/Pro Responses); "Qwen free" routes to device login. Storage stays config.json 0600. */
+ *  ~/.hara/config.json. Token Plan models are selected from the key-scoped live catalog when possible;
+ *  the documented text-model catalog is only an explicitly unverified setup fallback. */
 async function runSetup(): Promise<void> {
   if (!stdin.isTTY) {
     out(c.yellow("`hara setup` is interactive — run it in a terminal, or use `hara config set <key> <value>` in scripts.\n"));
@@ -1038,22 +1037,6 @@ async function runSetup(): Promise<void> {
     const pick = (await rl.question(`Provider [1]: `)).trim() || "1";
     const idx = Number.parseInt(pick, 10);
     const choice = Number.isInteger(idx) && idx >= 1 && idx <= SETUP_MENU.length ? SETUP_MENU[idx - 1] : SETUP_MENU[0];
-
-    // Route 7: Qwen free device login — no key, no model prompt. Reuse the existing flow + config writes.
-    if (choice.id === "qwen-oauth") {
-      try {
-        await qwenDeviceLogin((m) => out(m + "\n"));
-        updatePersonalProviderConfig({
-          provider: "qwen-oauth",
-          model: "coder-model",
-          clearApiKey: true,
-        });
-        out(c.green("\n✓ Qwen OAuth complete — provider set to qwen-oauth (model coder-model).\n") + c.dim(`Check it with ${c.bold("hara doctor")}, then just run ${c.bold("hara")}.\n`));
-      } catch (e: any) {
-        out(c.red(`\nQwen OAuth failed: ${e?.message ?? e}\n`));
-      }
-      return;
-    }
 
     // Resolve the concrete provider id + base URL. "custom" = OpenAI-compatible: ask for the base
     // URL and store the chosen provider as "openai" (the generic OpenAI-compatible dispatch).
@@ -1074,7 +1057,37 @@ async function runSetup(): Promise<void> {
       ? (await readSecret(`API key ${c.dim(`(masked; blank = use the ${envKey} env var)`)}: `, rl)).trim()
       : "";
     const defaultModel = SETUP_DEFAULT_MODEL[choice.id === "custom" ? "openai" : provider] ?? "";
-    const model = (await rl.question(`Model [${defaultModel || "?"}]: `)).trim() || defaultModel;
+    const effectiveSetupKey = apiKey || process.env[envKey] || process.env.HARA_API_KEY || "";
+    const preset = providerCatalog().find((entry) => entry.id === provider);
+    const liveModels = effectiveSetupKey && baseURL
+      ? await listModels(baseURL, effectiveSetupKey).catch(() => [])
+      : [];
+    const modelChoices = liveModels.length ? liveModels : [...(preset?.knownModels ?? [])];
+    let model: string;
+    if (modelChoices.length) {
+      out(liveModels.length
+        ? c.dim("\nModels authorized for this key:\n")
+        : c.yellow("\nKnown Token Plan text models (not yet verified for this key):\n"));
+      modelChoices.forEach((modelId, i) => out(`  ${c.bold(String(i + 1))}) ${modelId}\n`));
+      const defaultIndex = Math.max(0, modelChoices.indexOf(defaultModel));
+      while (true) {
+        const pickedModel = (await rl.question(`Model [${defaultIndex + 1}: ${modelChoices[defaultIndex]}]: `)).trim();
+        if (!pickedModel) {
+          model = modelChoices[defaultIndex];
+          break;
+        }
+        if (/^\d+$/.test(pickedModel)) {
+          const pickedIndex = Number.parseInt(pickedModel, 10);
+          if (pickedIndex >= 1 && pickedIndex <= modelChoices.length) {
+            model = modelChoices[pickedIndex - 1];
+            break;
+          }
+        }
+        out(c.yellow(`Choose a number from 1 to ${modelChoices.length}.\n`));
+      }
+    } else {
+      model = (await rl.question(`Model [${defaultModel || "?"}]: `)).trim() || defaultModel;
+    }
 
     updatePersonalProviderConfig({
       provider,
@@ -1085,9 +1098,9 @@ async function runSetup(): Promise<void> {
     });
 
     // One-shot validation ping (best-effort; never blocks saving). Only when we have a key + model.
-    if ((apiKey || providerIsLocal(provider)) && model) {
+    if ((effectiveSetupKey || providerIsLocal(provider)) && model) {
       out(c.dim("\nChecking connection… "));
-      const ok = await pingProvider({ provider, apiKey, model, baseURL: baseURL || undefined });
+      const ok = await pingProvider({ provider, apiKey: effectiveSetupKey, model, baseURL: baseURL || undefined });
       out(ok ? c.green("✓ connected\n") : c.yellow(`⚠ couldn't reach ${provider} (saved anyway)\n`));
     }
 
@@ -2518,7 +2531,7 @@ profileCmd
   .option("--code <code>", "(gateway) enrollment code from your admin")
   .option("--label <label>", "human-friendly label for the profile")
   .option("--byok", "(byok) BYOK profile — bring your own provider key")
-  .option("--provider <id>", "(byok/local) anthropic | openai-compatible | openai | glm | deepseek | openrouter | qwen | qwen-oauth | ollama | lmstudio")
+  .option("--provider <id>", "(byok/local) anthropic | token-plan | openai-compatible | openai | glm | deepseek | openrouter | ollama | lmstudio (legacy: qwen | qwen-oauth)")
   .option("--key <key>", "(byok) API key for scripts; omit in a terminal for masked input")
   .option("--no-key-prompt", "(byok) do not prompt for a missing API key; resolve it from the provider environment at use-time")
   .option("--base-url <url>", "(byok) override the provider base URL (OpenAI-compatible endpoints)")
@@ -2619,7 +2632,7 @@ profileCmd
       out(c.dim(`Switch to it with \`hara profile use ${id}\`.\n`));
       return;
     }
-    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|openai-compatible|openai|glm|deepseek|openrouter|qwen|qwen-oauth|ollama|lmstudio [--base-url … --model …]\n"));
+    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|token-plan|openai-compatible|openai|glm|deepseek|openrouter|ollama|lmstudio [--base-url … --model …]\n"));
     process.exit(1);
   });
 
@@ -3969,7 +3982,7 @@ pluginCmd.action(() => {
 const login = program.command("login").description("authenticate a provider");
 login
   .command("qwen")
-  .description("Qwen OAuth device login (free 'Qwen Code' tier — same as OpenClaw)")
+  .description("legacy Qwen Code OAuth login (not Alibaba Token Plan; new setup uses a Token Plan API key)")
   .action(async () => {
     try {
       await qwenDeviceLogin((m) => out(m + "\n"));

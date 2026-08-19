@@ -1100,6 +1100,50 @@ test("serve e2e: models.list derives reasoning controls from the session-pinned 
   }
 });
 
+test("serve e2e: models.list marks a removed Token Plan session model and returns only a live-authorized replacement", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-stale-token-plan-model-"));
+  const store = memStore();
+  const sessionId = "stale-glm-session";
+  store.saved.set(sessionId, {
+    meta: {
+      id: sessionId,
+      cwd: dir,
+      profileId: "personal",
+      provider: "token-plan",
+      model: "glm-5",
+      title: "Stale GLM session",
+      createdAt: "2026-08-19T00:00:00.000Z",
+      updatedAt: "2026-08-19T00:00:00.000Z",
+      source: "interactive",
+    },
+    history: [],
+  });
+  const deps = {
+    ...baseDeps(textProvider, store),
+    listModels: async () => ["glm-5.2", "qwen3.8-max"],
+    runtimeInfo: (_cwd, model) => ({
+      providerId: "token-plan",
+      model: model ?? "qwen3.8-max",
+      effortLevels: [],
+    }),
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const listed = await client.call("models.list", { sessionId });
+    assert.equal(listed.result.current, "glm-5");
+    assert.equal(listed.result.currentAvailable, false);
+    assert.equal(listed.result.recommendedModel, "glm-5.2");
+    assert.equal(listed.result.entries.find((entry) => entry.id === "glm-5").available, false);
+    assert.equal(listed.result.entries.find((entry) => entry.id === "glm-5.2").available, true);
+  } finally {
+    client.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: structured attachments support image-only turns and expose path-free history", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-attachments-"));
   const store = memStore();

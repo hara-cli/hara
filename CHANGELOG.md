@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.148.4 — 2026-08-20 — first-class Token Plan and stale-model recovery
+
+- Add Alibaba Cloud Model Studio Token Plan as the single current Alibaba setup entry, with its fixed
+  Beijing OpenAI-compatible endpoint, masked API-key input, and selectable text-model catalog. The CLI
+  replaces setup suggestions with the current Key's live `/models` authorization result when available;
+  media generators remain on their dedicated capability surfaces.
+- Keep legacy DashScope and Qwen Code OAuth profiles readable without presenting browser sign-in as a
+  Token Plan login. Older `qwen` or generic `openai` profiles using the exact Token Plan endpoint are
+  canonicalized at runtime without rewriting or exposing their stored credential.
+- Mark a session-pinned model unavailable when it disappears from the live authorized catalog. Persistent
+  clients receive a verified replacement only when that replacement is present for the current Key, including
+  `glm-5` → `glm-5.2` and `deepseek-v4-flash` → `deepseek-v4-flash-0731`. Upgrade with
+  `npm i -g @nanhara/hara@0.148.4`.
+
 ## 0.148.3 — 2026-08-19 — model-aware Token Plan routing
 
 - Read the exact Key-scoped Token Plan `/models` catalog while filtering image, audio, and video generators

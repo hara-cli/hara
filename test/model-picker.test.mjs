@@ -10,6 +10,11 @@ import {
   deepSeekFallbackModels,
   listModels,
 } from "../dist/providers/models.js";
+import {
+  TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
+  TOKEN_PLAN_OPENAI_BASE_URL,
+  tokenPlanModelReplacement,
+} from "../dist/providers/alibaba.js";
 
 test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSeek uses off plus native low/high/max; none → nothing", () => {
   assert.deepEqual(levelsFor("enable_thinking"), ["off", "high"]);
@@ -96,7 +101,7 @@ test("Coding Plan model discovery uses live ids first and the documented exact l
 });
 
 test("Token Plan discovery follows the key-scoped live catalog but hides models that need separate media APIs", async () => {
-  const tokenPlan = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+  const tokenPlan = TOKEN_PLAN_OPENAI_BASE_URL;
   const live = async () => ({
     ok: true,
     json: async () => ({
@@ -136,6 +141,16 @@ test("Token Plan discovery follows the key-scoped live catalog but hides models 
     [],
     "when entitlement discovery is unavailable Hara must not guess a personal/team catalog",
   );
+});
+
+test("Token Plan setup suggestions stay separate from live entitlement and stale ids migrate only to authorized targets", () => {
+  assert.ok(TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS.includes("qwen3.8-max"));
+  assert.ok(TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS.includes("glm-5.2"));
+  assert.equal(TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS.some((id) => /audio|image|happyhorse|wan/i.test(id)), false);
+  assert.equal(tokenPlanModelReplacement("glm-5", ["glm-5.2", "qwen3.8-max"]), "glm-5.2");
+  assert.equal(tokenPlanModelReplacement("glm-5", ["qwen3.8-max"]), undefined, "never recommends an unauthorized static target");
+  assert.equal(tokenPlanModelReplacement("glm-5.2", ["glm-5.2"]), undefined, "available current model needs no migration");
+  assert.equal(tokenPlanModelReplacement("deepseek-v4-flash", ["deepseek-v4-flash-0731"]), "deepseek-v4-flash-0731");
 });
 
 test("DeepSeek model discovery falls back to the official V4 Responses catalog on the exact host", async () => {
