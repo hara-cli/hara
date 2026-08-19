@@ -5,6 +5,10 @@
 // the rows point at.
 import type { ReasoningStyle } from "./reasoning.js";
 import {
+  isOfficialTokenPlanOpenAIEndpoint,
+  isTokenPlanQwenResponsesModel,
+} from "./alibaba.js";
+import {
   DEEPSEEK_RESPONSES_MODELS,
   isDeepSeekResponsesModel,
   isOfficialDeepSeekEndpoint,
@@ -41,8 +45,6 @@ export { DEEPSEEK_RESPONSES_MODELS, isDeepSeekResponsesModel } from "./deepseek.
  *  makes a *custom* profile (e.g. `custom:qwen3.7-plus` pointing at coding.dashscope) resolve correctly
  *  without the user declaring a provider id: the DashScope host implies chat + enable_thinking. */
 const BY_BASEURL: { test: RegExp; caps: PlatformCaps }[] = [
-  // Alibaba Token Plan — OpenAI-compatible; new models use the Responses API.
-  { test: /token-plan.*maas\.aliyuncs\.com\/compatible-mode/i, caps: { wireApi: "responses", reasoning: "qwen_responses", cache: "auto" } },
   // Alibaba DashScope — OpenAI-compatible chat (coding plan /v1, pay-as-you-go /compatible-mode): the key
   // difference is `enable_thinking`, which actually turns Qwen/GLM thinking off (the DashScope speedup).
   { test: /dashscope\.aliyuncs\.com\/(v1|compatible-mode)|maas\.aliyuncs\.com\/compatible-mode/i, caps: { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" } },
@@ -82,8 +84,14 @@ export function resolvePlatform(
   modelId?: string,
 ): PlatformCaps {
   const deepSeekResponses = isDeepSeekResponsesModel(providerId, baseURL, modelId);
+  const tokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
+  const tokenPlanResponses = tokenPlan && isTokenPlanQwenResponsesModel(modelId ?? "");
   // baseURL shape is the strongest signal for a custom profile; else the provider-id override; else chat.
-  const byUrl = baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
+  const byUrl = tokenPlan
+    ? tokenPlanResponses
+      ? { wireApi: "responses" as const, reasoning: "qwen_responses" as const, cache: "auto" as const }
+      : { wireApi: "chat" as const, reasoning: "none" as const, cache: "auto" as const }
+    : baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
   const managedDeepSeekGateway =
     providerId === "hara-gateway"
     && /^(?:deepseek-v4-(?:flash|pro)|deepseek-(?:chat|reasoner|pro))$/i.test(modelId ?? "");

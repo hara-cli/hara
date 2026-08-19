@@ -411,11 +411,12 @@ test("statusbar: ctxPctFor + nextMode cycle", () => {
   assert.equal(ctxPctFor("any", 0), 0);
 });
 
-test("statusbar: Coding Plan context windows use exact documented sizes", () => {
+test("statusbar: Alibaba plan context windows use exact documented sizes", () => {
   assert.equal(contextWindow("qwen3.8-max"), 983_616);
   assert.equal(contextWindow("qwen/qwen3.8-max"), 983_616);
   assert.equal(contextWindow("qwen3.7-max"), 1_000_000);
   assert.equal(contextWindow("qwen3.7-plus"), 1_000_000);
+  assert.equal(contextWindow("qwen3.6-flash"), 1_000_000);
   assert.equal(contextWindow("qwen/qwen3.5-plus-2026-04-20"), 1_000_000);
   assert.equal(contextWindow("qwen3-coder-plus"), 1_000_000);
   assert.equal(contextWindow("qwen3-coder-next"), 262_144);

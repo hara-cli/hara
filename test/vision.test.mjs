@@ -33,6 +33,9 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("qwen", "qwen3.7-plus"); // Coding Plan: 视觉理解 (verified live)
   V("qwen", "qwen3.6-plus");
   V("qwen", "qwen3.5-plus");
+  V("qwen", "qwen3.6-flash");
+  V("qwen", "qwen3.8-max");
+  V("qwen", "qwen3.8-max-preview");
   V("openai", "kimi-k2.5"); // Coding Plan: 视觉理解
   V("openai", "glm-4v");
   V("openai", "glm-4.5v");
@@ -63,6 +66,7 @@ test("classifyVision: text-only families → 'text'", () => {
   T("openai", "glm-4.6");
   T("qwen", "qwen3-max-2026-01-23"); // Coding Plan: text only (no 视觉理解)
   T("qwen", "qwen3-coder-next");
+  T("qwen", "qwen3.7-max");
   T("openai", "glm-5"); // Coding Plan: text only
   T("openai", "glm-4.7");
   T("openai", "minimax-m2.5");

@@ -17,7 +17,11 @@ import {
   streamFileSlice,
 } from "../fs-read.js";
 import { startJob, listJobs, tailJob, killJob } from "../exec/jobs.js";
-import { sensitiveFileError, sensitiveShellCommandReason } from "../security/sensitive-files.js";
+import {
+  sensitiveBoundaryRemediation,
+  sensitiveFileError,
+  sensitiveShellCommandReason,
+} from "../security/sensitive-files.js";
 import { createToolOutputLineRedactor, redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { isReadOnlyCommand, splitCompound } from "../security/permissions.js";
 import { loadConfig } from "../config.js";
@@ -355,7 +359,7 @@ registerTool({
     if (protectedReason) {
       return (
         `Blocked: Python source crosses Hara's protected secret boundary (${protectedReason}). ` +
-        "This deny is not bypassed by direct stdin execution or full-auto."
+        "This deny is not bypassed by direct stdin execution or full-auto. " + sensitiveBoundaryRemediation(protectedReason)
       );
     }
     const command = pythonStdinCommand();
@@ -449,7 +453,7 @@ registerTool({
     if (protectedReason) {
       return (
         `Blocked: shell command crosses Hara's protected secret boundary (${protectedReason}). ` +
-        "This deny is not bypassed by full-auto. Restart hara with HARA_ALLOW_SENSITIVE_FILES=1 only for an intentional, user-approved exposure."
+        "This deny is not bypassed by full-auto. " + sensitiveBoundaryRemediation(protectedReason)
       );
     }
     if (isNgrokTunnelCommand(input.command) && !ngrokAuthConfigured()) {

@@ -27,6 +27,7 @@ import {
   existingSensitiveSeatbeltMasks,
   isSensitiveFilePath,
   SENSITIVE_SEARCH_GLOBS,
+  sensitiveBoundaryRemediation,
   sensitiveFileReason,
   sensitiveShellCommandReason,
   sensitiveStructuredInputReason,
@@ -230,6 +231,17 @@ test("sensitive path policy covers Hara control-plane state, NTFS aliases, and n
     else process.env.USERPROFILE = previousUserProfile;
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("private Hara state rejection points to the masked control-plane command instead of the global bypass", () => {
+  const message = sensitiveBoundaryRemediation("private Hara state");
+  assert.match(message, /hara profile add <id>/);
+  assert.match(message, /openai-compatible/);
+  assert.match(message, /masked input/);
+  assert.doesNotMatch(message, /HARA_ALLOW_SENSITIVE_FILES/);
+
+  const ordinarySecret = sensitiveBoundaryRemediation("environment file");
+  assert.match(ordinarySecret, /HARA_ALLOW_SENSITIVE_FILES=1/);
 });
 
 test("prospective writes reject a protected parent symlink with a multi-level missing tail", { skip: process.platform === "win32" }, async () => {

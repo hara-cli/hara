@@ -99,21 +99,32 @@ export ANTHROPIC_API_KEY=sk-ant-...
 hara login qwen      # device login: open the printed URL, approve — token auto-refreshes
 ```
 
-**Qwen — DashScope API key** (Alibaba Model Studio, OpenAI-compatible)
+**Alibaba Model Studio Token Plan** (recommended subscription route)
+```bash
+hara profile add tokenplan --byok \
+  --provider openai-compatible \
+  --base-url https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1 \
+  --model qwen3.8-max
+# Enter the Token Plan key at Hara's masked prompt, then:
+hara profile use tokenplan
+```
+
+`/model` reads the Key's live Token Plan catalog and hides image/audio/video generators that need their
+own API or Skill. Hara chooses the wire protocol per model on the shared endpoint: the documented Qwen
+3.8/3.7/3.6 families use Responses; GLM, DeepSeek, Kimi, and other catalog entries conservatively use
+Chat unless Alibaba documents Responses support. Existing Coding Plan endpoints remain available for
+legacy subscriptions, but new Token Plan Keys and Base URLs are isolated and cannot be mixed with them.
+For non-interactive setup, omit the stored key with `--no-key-prompt` and provide `OPENAI_API_KEY` only in
+the trusted launcher environment. Do not place a Token Plan key in Hara Control or another shared application
+backend: the subscription is licensed for interactive coding/agent tools, and each Key must stay paired with
+its Token Plan endpoint.
+
+**Qwen — pay-as-you-go DashScope API key**
 ```bash
 hara config set provider qwen
-hara config set apiKey   sk-...      # your DashScope model-studio key
-hara config set model    qwen-plus   # or qwen-max, qwen3-coder-plus, …
-# endpoint defaults to dashscope compatible-mode/v1
-#
-# coding-plan keys (sk-sp-…) use the coding endpoint instead:
-#   hara config set baseURL https://coding.dashscope.aliyuncs.com/v1
-#   hara config set model   qwen3.7-plus
-#   supported exact ids (2026-07-18):
-#     qwen3.7-plus, qwen3.6-plus, qwen3.5-plus, qwen3-max-2026-01-23,
-#     qwen3-coder-next, qwen3-coder-plus, kimi-k2.5, glm-5, glm-4.7,
-#     MiniMax-M2.5
-#   /model uses the endpoint's live list first and this official list only as a fallback.
+hara config set apiKey   sk-...
+hara config set baseURL  https://dashscope.aliyuncs.com/compatible-mode/v1
+hara config set model    qwen-plus
 ```
 
 > Plan keys (Coding Plan / Token Plan) are licensed **only** for use inside AI coding agents /
@@ -238,6 +249,7 @@ hara --cwd /path/to/project      # explicitly select a workspace without changin
 hara -c                    # resume the most recent session in this directory
 hara --profile work        # use a named profile from ~/.hara/config.json
 hara profile add work --gateway https://control.example.com --code <one-time-code>  # user-added org route
+hara profile add custom --byok --provider openai-compatible --base-url https://provider.example/v1 --model model-id  # masked key prompt
 hara -m glm-5              # pick a model
 ```
 

@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.148.3 — 2026-08-19 — model-aware Token Plan routing
+
+- Read the exact Key-scoped Token Plan `/models` catalog while filtering image, audio, and video generators
+  that require separate APIs or Skills. Hara no longer guesses whether a Key is Personal or Team when live
+  entitlement discovery is unavailable, and legacy Coding Plan discovery remains isolated to its own hosts.
+- Select the wire protocol per model on the shared Token Plan endpoint. Qwen 3.8 Max, Qwen 3.7 Max/Plus,
+  and Qwen 3.6 Plus/Flash use Responses; GLM, DeepSeek, Kimi, and other catalog entries use Chat unless the
+  vendor explicitly documents Responses support. This fixes `glm-5.2` being sent to `/responses` merely
+  because it shared a Token Plan Base URL.
+- Add the complete Responses reasoning dial for Qwen 3.6 Plus/Flash, recognize Token Plan Qwen 3.8 Max and
+  Qwen 3.6 Plus/Flash as native image-capable models, and apply the documented one-million-token context
+  window to Qwen 3.6/3.7 Flash. Upgrade with `npm i -g @nanhara/hara@0.148.3`.
+- Fix `hara profile add ... --model <id>` being captured by the root command and silently replaced by the
+  provider default. The success message now reports the value actually persisted, and
+  `--provider openai-compatible` makes arbitrary compatible endpoints explicit without constraining model IDs.
+- Prompt for missing BYOK credentials with masked terminal input, while `--no-key-prompt` preserves a clean
+  environment-only automation path. Attempts by the Agent to edit private Hara credential state now direct
+  the user to this trusted control-plane command instead of suggesting the all-or-nothing sensitive-file bypass.
+
 ## 0.148.2 — 2026-08-19 — Token Plan and Windows execution fidelity
 
 - Recognize Alibaba Model Studio Token Plan as a native Responses endpoint without treating its shared

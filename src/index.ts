@@ -2518,11 +2518,12 @@ profileCmd
   .option("--code <code>", "(gateway) enrollment code from your admin")
   .option("--label <label>", "human-friendly label for the profile")
   .option("--byok", "(byok) BYOK profile — bring your own provider key")
-  .option("--provider <id>", "(byok/local) anthropic | openai | glm | deepseek | openrouter | qwen | qwen-oauth | ollama | lmstudio")
-  .option("--key <key>", "(byok) API key (else read from the provider's env var at use-time)")
+  .option("--provider <id>", "(byok/local) anthropic | openai-compatible | openai | glm | deepseek | openrouter | qwen | qwen-oauth | ollama | lmstudio")
+  .option("--key <key>", "(byok) API key for scripts; omit in a terminal for masked input")
+  .option("--no-key-prompt", "(byok) do not prompt for a missing API key; resolve it from the provider environment at use-time")
   .option("--base-url <url>", "(byok) override the provider base URL (OpenAI-compatible endpoints)")
   .option("--model <model>", "(byok) default model for this profile")
-  .action(async (id: string, opts: { gateway?: string; code?: string; label?: string; byok?: boolean; provider?: string; key?: string; baseUrl?: string; model?: string }) => {
+  .action(async (id: string, opts: { gateway?: string; code?: string; label?: string; byok?: boolean; provider?: string; key?: string; keyPrompt?: boolean; baseUrl?: string; model?: string }, command: Command) => {
     if (opts.gateway) {
       if (!opts.code) return void out(c.red("gateway profile add needs --code <code> from your hara-control admin\n"));
       try {
@@ -2543,19 +2544,57 @@ profileCmd
     }
     if (opts.byok || opts.provider) {
       const requestedProvider = opts.provider || "anthropic";
-      if (!isProviderId(requestedProvider)) {
-        return void out(c.red(`Unknown provider '${requestedProvider}'. Run \`hara setup\` to see supported providers.\n`));
+      const providerAlias = requestedProvider === "openai-compatible";
+      const resolvedProvider = providerAlias ? "openai" : requestedProvider;
+      if (!isProviderId(resolvedProvider)) {
+        out(c.red(`Unknown provider '${requestedProvider}'. Run \`hara setup\` to see supported providers.\n`));
+        process.exit(1);
       }
-      const provider = requestedProvider;
-      if (provider === "hara-gateway") return void out(c.red("`--provider hara-gateway` is retired — use --gateway <url> --code <code> instead.\n"));
+      const provider = resolvedProvider;
+      if (provider === "hara-gateway") {
+        out(c.red("`--provider hara-gateway` is retired — use --gateway <url> --code <code> instead.\n"));
+        process.exit(1);
+      }
+      if (providerAlias && !opts.baseUrl?.trim()) {
+        out(c.red("`--provider openai-compatible` requires --base-url <https-url>.\n"));
+        process.exit(1);
+      }
       const preset = providerCatalog().find((entry) => entry.id === provider)!;
+      // Commander assigns an option name shared with the root command to the root even when it appears
+      // after this subcommand. Read the merged option view so `profile add ... --model X` cannot silently
+      // fall back to the provider preset while the success message claims X was stored.
+      const requestedModel = opts.model ?? command.optsWithGlobals().model;
+      let providedApiKey = opts.key;
+      if (
+        providedApiKey === undefined
+        && opts.keyPrompt !== false
+        && providerRequiresApiKey(provider)
+        && stdin.isTTY
+      ) {
+        const rl = createInterface({ input: stdin, output: stdout });
+        try {
+          providedApiKey = (await readSecret(
+            `API key ${c.dim(`(masked; blank = use the ${providerEnvKey(provider)} env var)`)}: `,
+            rl,
+          )).trim() || undefined;
+        } catch (error) {
+          if (error instanceof Error && error.message === "cancelled") {
+            out(c.dim("(cancelled)\n"));
+            process.exitCode = 130;
+            return;
+          }
+          throw error;
+        } finally {
+          rl.close();
+        }
+      }
       let normalized;
       try {
         normalized = normalizePersonalProviderConfig({
           provider,
-          apiKey: opts.key,
+          apiKey: providedApiKey,
           baseURL: opts.baseUrl ?? preset.defaultBaseURL,
-          model: opts.model ?? preset.defaultModel,
+          model: requestedModel ?? preset.defaultModel,
         });
       } catch (err) {
         out(c.red(`Invalid provider profile: ${err instanceof Error ? err.message : String(err)}\n`));
@@ -2575,11 +2614,12 @@ profileCmd
         out(c.red(r.reason + "\n"));
         process.exit(1);
       }
-      out(c.green(`✓ added BYOK profile '${id}'`) + c.dim(` · provider ${provider}${opts.model ? " · model " + opts.model : ""}\n`));
+      const providerLabel = providerAlias ? "openai-compatible" : provider;
+      out(c.green(`✓ added BYOK profile '${id}'`) + c.dim(` · provider ${providerLabel} · model ${normalized.model}\n`));
       out(c.dim(`Switch to it with \`hara profile use ${id}\`.\n`));
       return;
     }
-    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|openai|glm|deepseek|openrouter|qwen|qwen-oauth|ollama|lmstudio [--key … --base-url … --model …]\n"));
+    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|openai-compatible|openai|glm|deepseek|openrouter|qwen|qwen-oauth|ollama|lmstudio [--base-url … --model …]\n"));
     process.exit(1);
   });
 

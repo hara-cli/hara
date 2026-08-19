@@ -3,6 +3,10 @@ import {
   DEEPSEEK_RESPONSES_MODELS,
   isOfficialDeepSeekResponsesEndpoint,
 } from "./deepseek.js";
+import {
+  isOfficialTokenPlanOpenAIEndpoint,
+  isTokenPlanInteractiveAgentModel,
+} from "./alibaba.js";
 
 // Alibaba Coding Plan's documented exact ids (verified 2026-07-18). Live `/models` remains authoritative;
 // this list is only a usability fallback because the coding endpoint/key combinations do not all enumerate.
@@ -42,7 +46,7 @@ export function deepSeekFallbackModels(baseURL: string | undefined): string[] {
     : [];
 }
 
-// Model discovery — "what can this key run?" A coding-plan / OpenAI-compatible key usually exposes many
+// Model discovery — "what can this key run?" A plan / OpenAI-compatible key usually exposes many
 // models (Qwen, GLM, Kimi, …) via `GET {baseURL}/models`; the /model picker lists them so you switch by
 // arrow keys, not by memorizing ids. Live results win. A bounded request falls back to Alibaba's documented
 // exact Coding Plan ids only on the two official coding hosts; other endpoints keep the existing [] →
@@ -66,7 +70,11 @@ export async function listModels(
     const j = (await r.json()) as { data?: { id?: unknown }[] };
     const ids = (j?.data ?? []).map((m) => m?.id).filter((x): x is string => typeof x === "string" && x.length > 0);
     // Stable order + de-dup so the picker list doesn't jump around between opens.
-    return ids.length ? [...new Set(ids)].sort((a, b) => a.localeCompare(b)) : fallback;
+    const discovered = [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+    const selectable = isOfficialTokenPlanOpenAIEndpoint(baseURL)
+      ? discovered.filter(isTokenPlanInteractiveAgentModel)
+      : discovered;
+    return selectable.length ? selectable : fallback;
   } catch {
     return fallback;
   }

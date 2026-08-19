@@ -92,6 +92,19 @@ export function sensitiveFilesAllowed(env: NodeJS.ProcessEnv = process.env): boo
   return env.HARA_ALLOW_SENSITIVE_FILES === "1";
 }
 
+/** Give the user a safe control-plane path when the model tries to edit Hara's own credential state.
+ * Provider enrollment belongs to the trusted CLI/Desktop UI, not to an agent filesystem exception. */
+export function sensitiveBoundaryRemediation(reason: string): string {
+  if (/private Hara (?:state|token state|enrollment key)/i.test(reason)) {
+    return (
+      "Do not disable this boundary to configure a provider. Run `hara profile add <id> --byok " +
+      "--provider openai-compatible --base-url <https-url> --model <model>` in your own terminal; " +
+      "Hara will request the API key with masked input."
+    );
+  }
+  return "Restart hara with HARA_ALLOW_SENSITIVE_FILES=1 only for an intentional, user-approved exposure.";
+}
+
 function envFileReason(name: string): string | null {
   // NTFS alternate data streams (`.env::$DATA`) and trailing-dot/space aliases resolve to the same
   // underlying file on Windows. Normalize them on every OS so the policy is testable everywhere.
@@ -480,8 +493,7 @@ export function sensitiveFileError(path: string, action = "access", env: NodeJS.
   return (
     `Blocked: refusing to ${action} protected ${reason} '${path}'. ` +
     "Hara's built-in file, context, and search paths block this before approval; trusted external extensions " +
-    "and non-macOS arbitrary shells are separate trust boundaries. " +
-    "If you intentionally want its contents sent to the model, restart hara with HARA_ALLOW_SENSITIVE_FILES=1."
+    "and non-macOS arbitrary shells are separate trust boundaries. " + sensitiveBoundaryRemediation(reason)
   );
 }
 

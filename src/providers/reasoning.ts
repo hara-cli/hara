@@ -4,6 +4,8 @@
 // platform that reuses a style is pure data in the registry — no new code here. New code only when a
 // genuinely new style appears (a new provider param shape).
 
+import { isTokenPlanQwenResponsesModel } from "./alibaba.js";
+
 export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
 
 /** How a platform expresses the thinking dial on the wire:
@@ -40,7 +42,7 @@ const bareModel = (model: string): string => model.split("/").at(-1) ?? model;
  * allow-list family-shaped: the Token Plan endpoint also serves GLM/DeepSeek models, which must not
  * receive Qwen-only values merely because they share a base URL. */
 export function isQwenResponsesReasoningModel(model: string): boolean {
-  return /^qwen3\.(?:7|8)-(?:max|plus)(?:-|$)/i.test(bareModel(model));
+  return isTokenPlanQwenResponsesModel(model);
 }
 
 /** Endpoint capability is not enough: Alibaba's Coding Plan serves qwen3-coder-next/plus on the same

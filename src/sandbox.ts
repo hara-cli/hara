@@ -13,6 +13,7 @@ import { platform } from "node:os";
 import { win32 as winPath } from "node:path";
 import {
   existingSensitiveSeatbeltMasks,
+  sensitiveBoundaryRemediation,
   sensitiveFilesAllowed,
   sensitiveShellCommandReason,
 } from "./security/sensitive-files.js";
@@ -262,7 +263,7 @@ export function shellCommand(command: string, cwd: string, mode: SandboxMode): {
   if (protectedReason) {
     throw new Error(
       `shell command crosses Hara's protected secret boundary (${protectedReason}). ` +
-      "Restart hara with HARA_ALLOW_SENSITIVE_FILES=1 only for an intentional, user-approved exposure.",
+      sensitiveBoundaryRemediation(protectedReason),
     );
   }
   // sandbox=off still retains the narrow secret-file read mask on macOS. It places no restriction on

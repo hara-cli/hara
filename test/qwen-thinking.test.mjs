@@ -9,6 +9,10 @@ import {
   isDeepSeekResponsesModel,
   resolvePlatform,
 } from "../dist/providers/registry.js";
+import {
+  isOfficialTokenPlanOpenAIEndpoint,
+  isTokenPlanQwenResponsesModel,
+} from "../dist/providers/alibaba.js";
 
 const DS = "https://coding.dashscope.aliyuncs.com/v1"; // the reporter's custom endpoint
 
@@ -42,6 +46,8 @@ test("reasoningParams reasoning_object (Responses API): reasoning:{effort} on re
 test("Token Plan Qwen Responses uses documented model-specific reasoning levels", () => {
   assert.equal(isQwenResponsesReasoningModel("qwen3.8-max"), true);
   assert.equal(isQwenResponsesReasoningModel("qwen/qwen3.7-max"), true);
+  assert.equal(isQwenResponsesReasoningModel("qwen3.6-plus"), true);
+  assert.equal(isQwenResponsesReasoningModel("qwen3.6-flash"), true);
   assert.equal(isQwenResponsesReasoningModel("deepseek-v4-pro"), false, "shared Token Plan host is not a Qwen capability");
   assert.deepEqual(reasoningParams("qwen_responses", "low", "qwen3.8-max"), { reasoning: { effort: "low" } });
   assert.deepEqual(reasoningParams("qwen_responses", "medium", "qwen3.8-max"), { reasoning: { effort: "medium" } });
@@ -49,6 +55,7 @@ test("Token Plan Qwen Responses uses documented model-specific reasoning levels"
   assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.8-max"), { reasoning: { effort: "xhigh" } });
   assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.8-max"), { reasoning: { effort: "low" } });
   assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.7-max"), { reasoning: { effort: "none" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.6-flash"), { reasoning: { effort: "max" } });
   assert.deepEqual(reasoningParams("qwen_responses", "high", "deepseek-v4-pro"), {});
 });
 
@@ -147,12 +154,29 @@ test("resolvePlatform: a custom DashScope baseURL → chat + enable_thinking (cu
   assert.equal(caps.cache, "auto");
 });
 
+test("resolvePlatform: Token Plan selects Responses per model and keeps other catalog models on Chat", () => {
+  const tokenPlan = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+  assert.equal(isOfficialTokenPlanOpenAIEndpoint(tokenPlan), true);
+  assert.equal(isOfficialTokenPlanOpenAIEndpoint(`${tokenPlan}/`), true);
+  assert.equal(isOfficialTokenPlanOpenAIEndpoint("https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"), false);
+  assert.equal(isOfficialTokenPlanOpenAIEndpoint("https://token-plan.cn-beijing.maas.aliyuncs.com.example/compatible-mode/v1"), false);
+  for (const model of ["qwen3.8-max", "qwen3.8-max-preview", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash"]) {
+    assert.equal(isTokenPlanQwenResponsesModel(model), true, model);
+    assert.equal(resolvePlatform("qwen", tokenPlan, undefined, model).wireApi, "responses", model);
+    assert.equal(resolvePlatform("qwen", tokenPlan, undefined, model).reasoning, "qwen_responses", model);
+  }
+  for (const model of ["glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash-0731", "kimi-k2.7-code", "MiniMax-M2.5"]) {
+    assert.equal(isTokenPlanQwenResponsesModel(model), false, model);
+    assert.equal(resolvePlatform("qwen", tokenPlan, undefined, model).wireApi, "chat", model);
+    assert.equal(resolvePlatform("qwen", tokenPlan, undefined, model).reasoning, "none", model);
+  }
+  assert.equal(resolvePlatform("qwen", tokenPlan).wireApi, "chat", "missing model fails closed to Chat");
+});
+
 test("resolvePlatform: DashScope endpoint variants + built-in providers", () => {
   assert.equal(resolvePlatform("qwen").reasoning, "enable_thinking", "built-in qwen provider");
   assert.equal(resolvePlatform(undefined, "https://coding.dashscope.aliyuncs.com/apps/anthropic").wireApi, "anthropic");
   assert.equal(resolvePlatform(undefined, "https://coding.dashscope.aliyuncs.com/apps/anthropic").cache, "cache_control");
-  assert.equal(resolvePlatform(undefined, "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1").wireApi, "responses");
-  assert.equal(resolvePlatform(undefined, "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1").reasoning, "qwen_responses");
   assert.equal(resolvePlatform("anthropic").wireApi, "anthropic");
   assert.equal(resolvePlatform("openai").reasoning, "reasoning_effort");
 });

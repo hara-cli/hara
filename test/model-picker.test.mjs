@@ -95,6 +95,49 @@ test("Coding Plan model discovery uses live ids first and the documented exact l
   );
 });
 
+test("Token Plan discovery follows the key-scoped live catalog but hides models that need separate media APIs", async () => {
+  const tokenPlan = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
+  const live = async () => ({
+    ok: true,
+    json: async () => ({
+      data: [
+        { id: "qwen3.8-max" },
+        { id: "glm-5.2" },
+        { id: "deepseek-v4-pro" },
+        { id: "wan2.7-image" },
+        { id: "wan2.7-image-pro" },
+        { id: "qwen-audio-3.0-tts-plus" },
+        { id: "qwen-audio-3.0-realtime-plus" },
+        { id: "happyhorse-1.1-t2v" },
+      ],
+    }),
+  });
+  assert.deepEqual(
+    await listModels(tokenPlan, "k", live),
+    ["deepseek-v4-pro", "glm-5.2", "qwen3.8-max"],
+  );
+  assert.deepEqual(
+    await listModels("https://another.example/v1", "k", live),
+    [
+      "deepseek-v4-pro",
+      "glm-5.2",
+      "happyhorse-1.1-t2v",
+      "qwen-audio-3.0-realtime-plus",
+      "qwen-audio-3.0-tts-plus",
+      "qwen3.8-max",
+      "wan2.7-image",
+      "wan2.7-image-pro",
+    ],
+    "media filtering is scoped to the exact Token Plan endpoint",
+  );
+  const unavailable = async () => ({ ok: false, json: async () => ({}) });
+  assert.deepEqual(
+    await listModels(tokenPlan, "k", unavailable),
+    [],
+    "when entitlement discovery is unavailable Hara must not guess a personal/team catalog",
+  );
+});
+
 test("DeepSeek model discovery falls back to the official V4 Responses catalog on the exact host", async () => {
   assert.deepEqual([...DEEPSEEK_FALLBACK_MODELS], ["deepseek-v4-flash", "deepseek-v4-pro"]);
   assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com/v1"), [...DEEPSEEK_FALLBACK_MODELS]);

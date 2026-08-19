@@ -34,6 +34,83 @@ function runCli(args, cwd, home, extraEnv = {}) {
   });
 }
 
+test("profile add preserves --model and accepts the explicit OpenAI-compatible alias", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-profile-add-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "ollama",
+      model: "qwen3",
+      guardian: "off",
+      updateCheck: false,
+    }), { mode: 0o600 });
+
+    const exactReport = await runCli([
+      "profile", "add", "tokenplan-openai", "--byok",
+      "--provider", "openai",
+      "--base-url", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "--model", "deepseek-v4-pro",
+      "--no-key-prompt",
+    ], project, home);
+    assert.equal(exactReport.code, 0, exactReport.stderr || exactReport.stdout);
+    assert.match(exactReport.stdout, /model deepseek-v4-pro/);
+
+    const explicitAlias = await runCli([
+      "profile", "add", "tokenplan-compatible", "--byok",
+      "--provider", "openai-compatible",
+      "--base-url", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "--model", "qwen3.8-max",
+      "--no-key-prompt",
+    ], project, home);
+    assert.equal(explicitAlias.code, 0, explicitAlias.stderr || explicitAlias.stdout);
+    assert.match(explicitAlias.stdout, /provider openai-compatible · model qwen3\.8-max/);
+
+    const stored = JSON.parse(readFileSync(join(haraHome, "profiles.json"), "utf8"));
+    const direct = stored.profiles.find((profile) => profile.id === "tokenplan-openai");
+    const compatible = stored.profiles.find((profile) => profile.id === "tokenplan-compatible");
+    assert.equal(direct.defaultModel, "deepseek-v4-pro", "the root/subcommand option collision must not replace the requested model");
+    assert.equal(compatible.provider, "openai", "the user-facing alias keeps the existing generic dispatch internally");
+    assert.equal(compatible.defaultModel, "qwen3.8-max");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("openai-compatible profile add requires an explicit endpoint", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-profile-add-endpoint-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  try {
+    mkdirSync(join(home, ".hara"), { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    const result = await runCli([
+      "profile", "add", "missing-endpoint", "--byok",
+      "--provider", "openai-compatible",
+      "--model", "fixture-model",
+      "--no-key-prompt",
+    ], project, home);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stdout + result.stderr, /requires --base-url/);
+
+    const unknown = await runCli([
+      "profile", "add", "unknown-provider", "--byok",
+      "--provider", "tokenplan",
+      "--model", "fixture-model",
+      "--no-key-prompt",
+    ], project, home);
+    assert.notEqual(unknown.code, 0);
+    assert.match(unknown.stdout + unknown.stderr, /Unknown provider 'tokenplan'/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 async function gatewayFixture(label, roles = []) {
   const requests = [];
   const server = createServer((req, res) => {

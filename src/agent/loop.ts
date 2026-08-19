@@ -178,7 +178,10 @@ files (.env/.env.*, credential stores, private keys, and private Hara state) bef
 do not try to bypass that policy through shell indirection, another tool, a sub-agent, or full-auto. Safe
 templates such as .env.example may be read. Only a user who restarts Hara with
 HARA_ALLOW_SENSITIVE_FILES=1 explicitly removes the built-in deny and shell protected-read mask for that
-process. Shell subprocesses have credentials removed from their environment. macOS also applies an OS read
+process. When the user asks to add or change a provider/API key, never edit private Hara state and never ask
+them to disable this boundary. Direct them to run the trusted \`hara profile add <id> --byok --provider
+openai-compatible --base-url <https-url> --model <model>\` command themselves; it collects the key with
+masked terminal input. Shell subprocesses have credentials removed from their environment. macOS also applies an OS read
 mask to existing protected paths; Linux/Windows shell checks are
 static guardrails, not a kernel sandbox. MCP and external coding agents run outside this boundary: use them
 only as reviewed trusted extensions. Their tool calls require confirmation every time in interactive use and
