@@ -142,7 +142,7 @@ registerTool({
       } catch (error) {
         return `Error: ${error instanceof Error ? error.message : String(error)}`;
       }
-      const warn = isInstalled() ? "" : "\n⚠ The OS scheduler isn't installed yet — tell the user to run `hara cron install` once, or jobs won't fire.";
+      const warn = isInstalled() ? "" : "\n⚠ The OS scheduler isn't installed yet. The job was saved but will not fire automatically. If installation is within the accepted task and approval policy, run `hara cron install` and verify it; otherwise record the exact missing_authority dependency.";
       return `✓ scheduled ${job.id} · ${describeSchedule(sched)}${tz ? ` @ ${tz}` : ""} · mode ${mode}${deliver ? ` · → ${deliver} (${deliverMode ?? "always"})` : ""}${alertAfter !== undefined ? ` · alert ≥${alertAfter}` : ""} · next ${fmt(nextRun(job, Date.now()))}${warn}`;
     }
     // id-based actions

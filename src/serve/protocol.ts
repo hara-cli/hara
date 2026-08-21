@@ -41,6 +41,12 @@
 //   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
 //   plugins.set       {name,enabled}              → {name,enabled}   (applies to future sessions/turns)
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}
+//   learning.list     {cwd?,scope?,status?,limit?} → {learnings:[reviewable redacted candidates],summary}
+//   learning.review   {id,decision,expectedRevision?,note?,cwd?}
+//   learning.submit   {id,cwd?}                    → explicit redacted organization proposal upload
+//   learning.sync     {cwd?}                       → versioned Control-approved organization bundle
+//                                                    → {learning}; approve/reject/revoke local personal/project
+//                                                    records only; organization records require Control review.
 //   automation.list   {sessionCursor?,sessionLimit?} → {jobs:[{id,name,mode,enabled,task,scheduleSpec,
 //                                                    delivery:{kind,label,mode?},nextRunAt?,nextRunDeferred?,…}],
 //                                                    sessions:[{id,title,source,sourceName,jobId?,updatedAt,…}],

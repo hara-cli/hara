@@ -204,6 +204,64 @@ const assertPortCanListen = (port) => new Promise((resolve, reject) => {
   server.listen(port, "127.0.0.1", () => server.close((error) => error ? reject(error) : resolve()));
 });
 
+test("serve exposes explicit organization learning submit/sync without exposing device credentials", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-learning-"));
+  const calls = [];
+  const candidate = {
+    version: 1,
+    id: "local-learning",
+    clientId: "local-learning",
+    remoteId: "remote-learning",
+    patternKey: "agent.authorized_action_execution",
+    kind: "action_ownership",
+    scope: "organization",
+    summary: "Execute authorized work and verify it.",
+    status: "submitted",
+    stability: "stable",
+    occurrenceCount: 3,
+    distinctTaskCount: 2,
+    evidence: [],
+    revision: 2,
+    createdAt: "2026-08-22T00:00:00.000Z",
+    updatedAt: "2026-08-22T00:00:00.000Z",
+    sourceVersion: "0.150.0",
+  };
+  const deps = {
+    ...baseDeps(textProvider, memStore()),
+    runtimeInfo: () => ({ providerId: "hara-gateway", model: "managed", profileId: "acme", profileKind: "gateway" }),
+    organizationLearningSubmit: async (profileId, candidateId, cwd) => {
+      calls.push(["submit", profileId, candidateId, cwd]);
+      return { remoteId: "remote-learning", status: "pending", revision: 1, candidate };
+    },
+    organizationLearningSync: async (profileId, cwd) => {
+      calls.push(["sync", profileId, cwd]);
+      return { version: 4, learnings: [{ ...candidate, status: "approved" }] };
+    },
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "learning-token", cwd: dir }, deps);
+  const client = await connect(server.port);
+  try {
+    const initialized = await client.call("initialize", { token: "learning-token" });
+    assert.ok(initialized.result.capabilities.methods.includes("learning.submit"));
+    assert.ok(initialized.result.capabilities.methods.includes("learning.sync"));
+    assert.ok(initialized.result.capabilities.features.includes("learning.organization-review.v1"));
+
+    const submitted = await client.call("learning.submit", { id: "local-learning" });
+    assert.equal(submitted.result.status, "pending");
+    const synced = await client.call("learning.sync", {});
+    assert.equal(synced.result.version, 4);
+    assert.deepEqual(calls, [
+      ["submit", "acme", "local-learning", dir],
+      ["sync", "acme", dir],
+    ]);
+    assert.equal(JSON.stringify(submitted).includes("device-token"), false);
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 const hangingCompactProvider = () => {
   let calls = 0;
   let markStarted;
@@ -433,8 +491,10 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "models.capabilities.v1",
         "sessions.readonly-history.v1",
         "sessions.cross-profile-fork.v1",
+        "learning.review.v1",
+        "agent.action-ownership.v1",
       ],
-      "persistent clients can negotiate attachments, model descriptors, and safe session recovery",
+      "persistent clients can negotiate attachments, model descriptors, safe recovery, reviewed learning, and action ownership",
     );
     for (const method of [
       "artifact.import",

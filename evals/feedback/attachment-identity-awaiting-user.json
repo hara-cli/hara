@@ -21,8 +21,13 @@
     "rounds": 2,
     "completion": {
       "state": "awaiting_user",
-      "evidence": [],
-      "waitingFor": "the user must attach the missing source image again"
+      "evidence": ["the verified attachment intake found no source image identity in this session"],
+      "waitingFor": "the user must attach the missing source image again",
+      "dependency": {
+        "kind": "physical_action",
+        "detail": "the user must attach the missing source image again",
+        "evidence": ["the source image bytes are not present in the current attachment store"]
+      }
     },
     "events": [
       {

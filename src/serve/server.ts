@@ -62,6 +62,13 @@ import {
 } from "../context/mentions.js";
 import { describeImages, type EffectiveAttachmentCapabilities } from "../vision.js";
 import { memoryDigest } from "../memory/store.js";
+import {
+  listLearnings,
+  reviewLearning,
+  type LearningCandidate,
+  type LearningScope,
+  type LearningStatus,
+} from "../learning/store.js";
 import { listInstalled, enabledPlugins, setPluginEnabled, panelsForProject } from "../plugins/plugins.js";
 import { loadSkillIndex, loadSkillBody } from "../skills/skills.js";
 import {
@@ -218,6 +225,17 @@ export interface ServeDeps {
   useOrganizationConnection?: (id: string, cwd?: string) => OrganizationConnectionsState;
   removeOrganizationConnection?: (id: string, cwd?: string) => OrganizationConnectionsState;
   checkOrganizationConnection?: (id: string, cwd?: string) => Promise<OrganizationConnectionCheck>;
+  /** Organization learning is a reviewed outbox: submit is explicit and sync pulls only Control-approved
+   * records. Device credentials remain behind these callbacks and never cross the Desktop protocol. */
+  organizationLearningSubmit?: (
+    profileId: string,
+    candidateId: string,
+    cwd?: string,
+  ) => Promise<{ remoteId: string; status: string; revision: number; candidate: LearningCandidate }>;
+  organizationLearningSync?: (
+    profileId: string,
+    cwd?: string,
+  ) => Promise<{ version: number; learnings: LearningCandidate[] }>;
   /** Organization-scoped Desk data. Connections are a private local read; snapshot/detail are explicit,
    * bounded remote reads. Every remote call carries a captured profileId so an in-flight request cannot
    * cross organizations if the global default changes. Desk bearer credentials never enter these DTOs. */
@@ -233,6 +251,7 @@ export interface ServeDeps {
     model: string;
     /** Effective identity route. Persisted into each new session and reused on resume. */
     profileId?: string;
+    profileKind?: "byok" | "gateway";
     effortLevels?: string[];
     /** Finite server-authorized set for a scoped gateway token. Missing means unconstrained discovery. */
     availableModels?: string[];
@@ -935,6 +954,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     providerId: string;
     model: string;
     profileId?: string;
+    profileKind?: "byok" | "gateway";
     effortLevels: string[];
     availableModels?: string[];
     attachmentCapabilities?: EffectiveAttachmentCapabilities;
@@ -944,6 +964,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       providerId: live?.providerId ?? deps.providerId,
       model: live?.model ?? model ?? deps.model,
       ...(live?.profileId ? { profileId: live.profileId } : profileId ? { profileId } : {}),
+      ...(live?.profileKind ? { profileKind: live.profileKind } : {}),
       effortLevels: live?.effortLevels ?? deps.effortLevels ?? [],
       ...(live?.availableModels ? { availableModels: live.availableModels } : {}),
       ...(live?.attachmentCapabilities
@@ -1449,7 +1470,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         autoApprove: s.autoApprove,
         projectApprovals: projectApprovalPolicy(s.meta.cwd),
         projectContext: s.projectContext,
-        memory: memoryDigest(s.meta.cwd),
+        memory: memoryDigest(s.meta.cwd, s.meta.profileId),
         continuationSession: s.continuationSession,
         executionContext,
         ...(slashSkillPolicy ? { skillPolicies: [slashSkillPolicy] } : {}),
@@ -1868,6 +1889,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
             "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
             "settings.organizations.remove", "settings.organizations.check",
+            "learning.list", "learning.review",
             "automation.list", "automation.validate", "automation.add", "automation.update",
             "automation.run", "automation.toggle", "automation.delete", "automation.scheduler.install",
             "artifact.import", "artifact.commit", "artifact.revert", "artifact.validate", "artifact.export",
@@ -1884,13 +1906,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
           }
           if (deps.unpinProjectProfile) methods.push("settings.profiles.unpin");
+          if (deps.organizationLearningSubmit) methods.push("learning.submit");
+          if (deps.organizationLearningSync) methods.push("learning.sync");
           const features = [
             "composer.attachments.v1",
             "models.capabilities.v1",
             "sessions.readonly-history.v1",
             "sessions.cross-profile-fork.v1",
+            "learning.review.v1",
+            "agent.action-ownership.v1",
           ];
           if (collaborationRemote) features.push("collaboration.remote.v1");
+          if (deps.organizationLearningSubmit && deps.organizationLearningSync) {
+            features.push("learning.organization-review.v1");
+          }
           const runtime = runtimeInfo();
           const setupState = deps.providerSettings
             ? (deps.providerSettings(opts.cwd).current.authenticated ? "ready" : "needs-credentials")
@@ -2771,6 +2800,107 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               id!,
               automationScheduleValidation(schedule, timezone, now, existing),
             ));
+          }
+          case "learning.list": {
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const scopes = new Set<LearningScope>(["personal", "project", "organization"]);
+            const states = new Set<LearningStatus>(["pending", "approved", "rejected", "revoked", "submitted"]);
+            if (p.scope !== undefined && (typeof p.scope !== "string" || !scopes.has(p.scope as LearningScope))) {
+              return reply(rpcError(id, ERR.PARAMS, "scope must be personal, project, or organization"));
+            }
+            if (p.status !== undefined && (typeof p.status !== "string" || !states.has(p.status as LearningStatus))) {
+              return reply(rpcError(id, ERR.PARAMS, "status must be pending, approved, rejected, revoked, or submitted"));
+            }
+            if (p.limit !== undefined && (!Number.isInteger(p.limit) || p.limit < 1 || p.limit > 1_000)) {
+              return reply(rpcError(id, ERR.PARAMS, "limit must be an integer from 1 to 1000"));
+            }
+            const runtime = runtimeInfo(targetCwd);
+            const profileId = runtime.profileKind === "gateway" ? runtime.profileId : undefined;
+            const learnings = listLearnings({
+              cwd: targetCwd,
+              ...(profileId ? { profileId } : {}),
+              ...(p.scope ? { scope: p.scope as LearningScope } : {}),
+              ...(p.status ? { status: p.status as LearningStatus } : {}),
+              ...(p.limit ? { limit: p.limit } : {}),
+            });
+            return reply(rpcResult(id!, {
+              learnings,
+              summary: {
+                total: learnings.length,
+                pending: learnings.filter((item) => item.status === "pending").length,
+                approved: learnings.filter((item) => item.status === "approved").length,
+                stable: learnings.filter((item) => item.stability === "stable").length,
+              },
+              organization: {
+                active: Boolean(profileId),
+                profileId,
+                submitAvailable: Boolean(profileId && deps.organizationLearningSubmit),
+                syncAvailable: Boolean(profileId && deps.organizationLearningSync),
+              },
+            }));
+          }
+          case "learning.review": {
+            if (typeof p.id !== "string" || !p.id.trim()) {
+              return reply(rpcError(id, ERR.PARAMS, "learning id is required"));
+            }
+            if (p.decision !== "approve" && p.decision !== "reject" && p.decision !== "revoke") {
+              return reply(rpcError(id, ERR.PARAMS, "decision must be approve, reject, or revoke"));
+            }
+            if (p.expectedRevision !== undefined && (!Number.isSafeInteger(p.expectedRevision) || p.expectedRevision < 1)) {
+              return reply(rpcError(id, ERR.PARAMS, "expectedRevision must be a positive integer"));
+            }
+            if (p.note !== undefined && (typeof p.note !== "string" || p.note.length > 500)) {
+              return reply(rpcError(id, ERR.PARAMS, "note must be a string up to 500 characters"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const runtime = runtimeInfo(targetCwd);
+            const profileId = runtime.profileKind === "gateway" ? runtime.profileId : undefined;
+            try {
+              const learning = reviewLearning(p.id, p.decision, {
+                cwd: targetCwd,
+                ...(profileId ? { profileId } : {}),
+                ...(p.expectedRevision !== undefined ? { expectedRevision: p.expectedRevision } : {}),
+                ...(p.note ? { note: p.note } : {}),
+              });
+              return reply(rpcResult(id!, { learning }));
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              const code = /revision changed|changed; refresh/.test(message) ? ERR.CONFLICT : ERR.PARAMS;
+              return reply(rpcError(id, code, message));
+            }
+          }
+          case "learning.submit": {
+            if (!deps.organizationLearningSubmit) return reply(rpcError(id, ERR.METHOD, "organization learning submission is unavailable"));
+            if (typeof p.id !== "string" || !p.id.trim()) {
+              return reply(rpcError(id, ERR.PARAMS, "learning id is required"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const runtime = runtimeInfo(targetCwd);
+            const profileId = runtime.profileKind === "gateway" ? runtime.profileId : undefined;
+            if (!profileId) return reply(rpcError(id, ERR.PARAMS, "an organization connection must be active"));
+            try {
+              const result = await deps.organizationLearningSubmit(profileId, p.id.trim(), targetCwd);
+              return reply(rpcResult(id!, result));
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              const code = /changed during|refresh and retry/.test(message) ? ERR.CONFLICT : ERR.PARAMS;
+              return reply(rpcError(id, code, message));
+            }
+          }
+          case "learning.sync": {
+            if (!deps.organizationLearningSync) return reply(rpcError(id, ERR.METHOD, "organization learning sync is unavailable"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const runtime = runtimeInfo(targetCwd);
+            const profileId = runtime.profileKind === "gateway" ? runtime.profileId : undefined;
+            if (!profileId) return reply(rpcError(id, ERR.PARAMS, "an organization connection must be active"));
+            try {
+              const result = await deps.organizationLearningSync(profileId, targetCwd);
+              return reply(rpcResult(id!, result));
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              const code = /changed during|refresh and retry/.test(message) ? ERR.CONFLICT : ERR.PARAMS;
+              return reply(rpcError(id, code, message));
+            }
           }
           case "tasks.list": {
             // The project's persistent task pool (the `task` tool's file store) — desktop's tasks panel.

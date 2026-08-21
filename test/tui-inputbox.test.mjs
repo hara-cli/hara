@@ -160,7 +160,10 @@ test("InputBox backspace deletes before the cursor", async () => {
 test("InputBox shows an @path popup with file matches", async () => {
   const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5" }));
   stdin.write("@src");
-  await tick(120);
+  await waitUntil(() => {
+    const frame = strip(lastFrame());
+    return /src/.test(frame) && (frame.includes("insert") || frame.includes("select"));
+  }, "@path popup did not settle");
   const frame = strip(lastFrame());
   assert.ok(/src/.test(frame), "shows src path candidates");
   assert.ok(frame.includes("insert") || frame.includes("select"), "popup hint shown");

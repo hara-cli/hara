@@ -169,16 +169,27 @@ test("an accepted brief requires a fresh engine-readable completion receipt", ()
   assert.match(missing.checkpoint.currentStep, /verify the accepted completion checks/);
 
   const waiting = applyTaskCheckpoint(briefed.task, {
+    capabilities: [{
+      name: "release_authority",
+      state: "blocked",
+      detail: "the authenticated account lacks release-owner authority",
+    }],
     completion: {
       state: "awaiting_user",
       evidence: ["the release candidate was built locally"],
-      waiting_for: "approval to publish the public release",
+      dependency: {
+        kind: "missing_authority",
+        detail: "approval to publish the public release",
+        evidence: ["the release endpoint returned an authority-required decision"],
+        capability: "release_authority",
+      },
     },
   }, "2026-08-14T00:02:30.000Z");
   assert.equal(waiting.ok, true);
   const paused = finishTaskExecution(waiting.task, { status: "completed" }, [], false, "2026-08-14T00:03:00.000Z");
   assert.equal(paused.status, "paused");
   assert.equal(paused.checkpoint.completion.state, "awaiting_user");
+  assert.equal(paused.checkpoint.completion.dependency.kind, "missing_authority");
   assert.match(paused.checkpoint.blockReason, /approval to publish/);
 
   const verified = applyTaskCheckpoint(briefed.task, {
@@ -199,6 +210,36 @@ test("an accepted brief requires a fresh engine-readable completion receipt", ()
   );
   assert.equal(continued.ok, true);
   assert.equal(continued.task.checkpoint.completion, undefined, "continuation invalidates stale success evidence");
+});
+
+test("awaiting_user rejects free-form handoff and available capabilities", () => {
+  const interaction = newTurnInteraction();
+  const task = createTaskExecution("change the deployment", interaction.turnId);
+  const freeForm = applyTaskCheckpoint(task, {
+    completion: {
+      state: "awaiting_user",
+      evidence: ["the model preferred to provide instructions"],
+      waiting_for: "please run the deployment command yourself",
+    },
+  });
+  assert.equal(freeForm.ok, false);
+  assert.match(freeForm.reason, /structured dependency/);
+
+  const available = applyTaskCheckpoint(task, {
+    capabilities: [{ name: "deployment_access", state: "available", detail: "authenticated preflight succeeded" }],
+    completion: {
+      state: "awaiting_user",
+      evidence: ["deployment access is available"],
+      dependency: {
+        kind: "missing_authority",
+        detail: "please deploy it",
+        evidence: ["the tool is available"],
+        capability: "deployment_access",
+      },
+    },
+  });
+  assert.equal(available.ok, false);
+  assert.match(available.reason, /blocked or unavailable/);
 });
 
 test("verified completion cannot coexist with a persisted blocker", () => {

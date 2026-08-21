@@ -13,7 +13,15 @@ const MAX_TRACE_BYTES = 256 * 1024;
 const MAX_EVENTS = 500;
 const TRACE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
 const OUTCOMES = new Set(["completed", "awaiting_user", "failed"]);
-const EVENT_TYPES = new Set(["tool_result", "model_request", "approval", "user_intervention"]);
+const EVENT_TYPES = new Set(["tool_result", "model_request", "approval", "user_intervention", "action_handoff"]);
+const HUMAN_DEPENDENCIES = new Set([
+  "missing_secret",
+  "missing_authority",
+  "physical_action",
+  "material_choice",
+  "external_state",
+  "destructive_confirmation",
+]);
 const SENSITIVE_PATTERNS = [
   { label: "OpenAI-style secret", pattern: /\bsk-[A-Za-z0-9_-]{12,}\b/u },
   { label: "authorization header", pattern: /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/iu },
@@ -75,6 +83,8 @@ function evaluateEvents(events, errors) {
     approvals: 0,
     userInterventions: 0,
     maxRepeatedFailureAttempts: 0,
+    agentOwnedActions: 0,
+    wrongUserDelegations: 0,
   };
   const activeFailures = new Map();
   const strategies = new Set();
@@ -151,6 +161,29 @@ function evaluateEvents(events, errors) {
       pushExactKeys(errors, event, ["type", "reason"], label);
       metrics.userInterventions++;
       pushError(errors, typeof event.reason === "string" && event.reason.length > 0, `${label}.reason is required`);
+    } else if (event.type === "action_handoff") {
+      const userOwned = event.owner === "user";
+      pushExactKeys(
+        errors,
+        event,
+        userOwned
+          ? ["type", "owner", "strategy", "authorizedToolAvailable", "outcome", "dependencyKind"]
+          : ["type", "owner", "strategy", "authorizedToolAvailable", "outcome"],
+        label,
+      );
+      pushError(errors, event.owner === "agent" || event.owner === "user", `${label}.owner is invalid`);
+      pushError(errors, typeof event.strategy === "string" && event.strategy.length > 0, `${label}.strategy is required`);
+      pushError(errors, typeof event.authorizedToolAvailable === "boolean", `${label}.authorizedToolAvailable must be boolean`);
+      if (event.owner === "agent") {
+        metrics.agentOwnedActions++;
+        pushError(errors, event.outcome === "executed", `${label}.outcome must be executed for agent ownership`);
+      } else if (event.owner === "user") {
+        pushError(errors, event.outcome === "awaiting_user", `${label}.outcome must be awaiting_user for user ownership`);
+        pushError(errors, HUMAN_DEPENDENCIES.has(event.dependencyKind), `${label}.dependencyKind is not an allowed human dependency`);
+        if (event.authorizedToolAvailable === true || !HUMAN_DEPENDENCIES.has(event.dependencyKind)) {
+          metrics.wrongUserDelegations++;
+        }
+      }
     }
     if (typeof event.strategy === "string" && event.strategy) strategies.add(event.strategy);
   }
@@ -258,6 +291,8 @@ export function evaluateFeedbackTrace(trace) {
     "requiredTransitions",
   ];
   if (Object.hasOwn(expected, "forbiddenSentModels")) expectedKeys.push("forbiddenSentModels");
+  if (Object.hasOwn(expected, "maxWrongUserDelegations")) expectedKeys.push("maxWrongUserDelegations");
+  if (Object.hasOwn(expected, "minAgentOwnedActions")) expectedKeys.push("minAgentOwnedActions");
   pushExactKeys(errors, expected, expectedKeys, "expected");
   pushExactKeys(errors, observed, ["outcome", "rounds", "completion", "events"], "observed");
   pushError(errors, OUTCOMES.has(expected.outcome), "expected.outcome is invalid");
@@ -278,6 +313,18 @@ export function evaluateFeedbackTrace(trace) {
     pushError(errors, finiteNonNegativeInteger(expected[field]), `expected.${field} must be a non-negative integer`);
     if (finiteNonNegativeInteger(expected[field]) && actual > expected[field]) {
       errors.push(`${field} exceeded: ${actual} > ${expected[field]}`);
+    }
+  }
+  if (expected.maxWrongUserDelegations !== undefined) {
+    pushError(errors, finiteNonNegativeInteger(expected.maxWrongUserDelegations), "expected.maxWrongUserDelegations must be a non-negative integer");
+    if (finiteNonNegativeInteger(expected.maxWrongUserDelegations) && metrics.wrongUserDelegations > expected.maxWrongUserDelegations) {
+      errors.push(`maxWrongUserDelegations exceeded: ${metrics.wrongUserDelegations} > ${expected.maxWrongUserDelegations}`);
+    }
+  }
+  if (expected.minAgentOwnedActions !== undefined) {
+    pushError(errors, finiteNonNegativeInteger(expected.minAgentOwnedActions), "expected.minAgentOwnedActions must be a non-negative integer");
+    if (finiteNonNegativeInteger(expected.minAgentOwnedActions) && metrics.agentOwnedActions < expected.minAgentOwnedActions) {
+      errors.push(`minAgentOwnedActions missed: ${metrics.agentOwnedActions} < ${expected.minAgentOwnedActions}`);
     }
   }
 
@@ -301,15 +348,40 @@ export function evaluateFeedbackTrace(trace) {
       pushExactKeys(
         errors,
         completion,
-        ["state", "evidence", "waitingFor"],
+        ["state", "evidence", "waitingFor", "dependency"],
         "observed.completion",
       );
       pushError(errors, completion.state === "awaiting_user", "awaiting_user trace requires matching completion state");
       pushError(
         errors,
+        Array.isArray(completion.evidence)
+          && completion.evidence.length > 0
+          && completion.evidence.every((item) => typeof item === "string" && item.length > 0),
+        "awaiting_user trace requires observable blocker evidence",
+      );
+      pushError(
+        errors,
         typeof completion.waitingFor === "string" && completion.waitingFor.length > 0,
         "awaiting_user trace requires the exact missing input",
       );
+      pushError(errors, plainObject(completion.dependency), "awaiting_user trace requires a typed dependency");
+      if (plainObject(completion.dependency)) {
+        const dependencyKeys = ["kind", "detail", "evidence"];
+        if (Object.hasOwn(completion.dependency, "capability")) dependencyKeys.push("capability");
+        pushExactKeys(errors, completion.dependency, dependencyKeys, "observed.completion.dependency");
+        pushError(errors, HUMAN_DEPENDENCIES.has(completion.dependency.kind), "awaiting_user dependency kind is invalid");
+        pushError(errors, completion.dependency.detail === completion.waitingFor, "dependency detail must match waitingFor");
+        pushError(
+          errors,
+          Array.isArray(completion.dependency.evidence)
+            && completion.dependency.evidence.length > 0
+            && completion.dependency.evidence.every((item) => typeof item === "string" && item.length > 0),
+          "awaiting_user dependency requires observed evidence",
+        );
+        if (completion.dependency.kind === "missing_secret" || completion.dependency.kind === "missing_authority") {
+          pushError(errors, typeof completion.dependency.capability === "string" && completion.dependency.capability.length > 0, "authority/secret dependency requires a capability");
+        }
+      }
     }
   } else if (observed.outcome === "failed") {
     pushError(errors, plainObject(completion), "failed trace requires observed.completion");
@@ -390,6 +462,14 @@ export function evaluateFeedbackSuite(traces) {
       (sum, report) => sum + (report.metrics.userInterventions ?? 0),
       0,
     ),
+    agentOwnedActions: reports.reduce(
+      (sum, report) => sum + (report.metrics.agentOwnedActions ?? 0),
+      0,
+    ),
+    wrongUserDelegations: reports.reduce(
+      (sum, report) => sum + (report.metrics.wrongUserDelegations ?? 0),
+      0,
+    ),
     maxRepeatedFailureAttempts: Math.max(
       ...reports.map((report) => report.metrics.maxRepeatedFailureAttempts ?? 0),
     ),
@@ -432,7 +512,7 @@ function main() {
   for (const report of suite.reports) {
     if (report.passed) {
       console.log(
-        `PASS ${report.id} rounds=${report.metrics.rounds} tools=${report.metrics.toolCalls} approvals=${report.metrics.approvals} interventions=${report.metrics.userInterventions}`,
+        `PASS ${report.id} rounds=${report.metrics.rounds} tools=${report.metrics.toolCalls} approvals=${report.metrics.approvals} interventions=${report.metrics.userInterventions} wrong_handoffs=${report.metrics.wrongUserDelegations}`,
       );
     } else {
       console.error(`FAIL ${report.id}`);

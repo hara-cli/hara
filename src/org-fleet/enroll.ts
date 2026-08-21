@@ -43,6 +43,12 @@ import {
   writePrivateStateFileSync,
 } from "../security/private-state.js";
 import { userModelFetch } from "../network/model-fetch.js";
+import {
+  applyOrganizationLearningBundle,
+  markLearningSubmitted,
+  type LearningCandidate,
+  type OrganizationLearningWire,
+} from "../learning/store.js";
 
 export interface Enrollment {
   gatewayUrl: string; // e.g. https://hara-gw.acme.internal  (no trailing slash)
@@ -76,6 +82,8 @@ export interface GatewayProfileEnrollmentInput {
 
 const MAX_ENROLL_RESPONSE_BYTES = 1024 * 1024;
 const MAX_HEARTBEAT_RESPONSE_BYTES = 64 * 1024;
+const MAX_LEARNING_RESPONSE_BYTES = 2 * 1024 * 1024;
+const LEARNING_REQUEST_TIMEOUT_MS = 20_000;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const THINKING_EFFORTS = new Set(["off", "low", "medium", "high", "max"]);
 const loopbackHostname = (hostname: string): boolean => hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
@@ -709,4 +717,194 @@ export async function syncOrgRoles(signal?: AbortSignal): Promise<number> {
   const legacy = loadEnrollment();
   if (!legacy) return 0;
   return syncOrgRolesEnrollment(DEFAULT_ORG_ID, legacy, signal);
+}
+
+// ── Reviewable organization learning ─────────────────────────────────────────────────────────────
+
+function exactGatewayProfile(profileId: string): Profile {
+  const profile = getProfile(profileId);
+  if (!profile || profile.kind !== "gateway" || !profile.gatewayUrl || !profile.deviceToken) {
+    throw new Error(`organization connection '${profileId}' is unavailable; re-enroll it before syncing learning`);
+  }
+  if (deviceTokenExpired(profile.tokenExpiresAt)) {
+    throw new Error(`organization connection '${profileId}' has expired; re-enroll it before syncing learning`);
+  }
+  return profile;
+}
+
+function sameGatewayIdentity(expected: Profile): boolean {
+  const current = getProfile(expected.id);
+  return Boolean(
+    current
+    && current.kind === "gateway"
+    && current.gatewayUrl === expected.gatewayUrl
+    && current.deviceId === expected.deviceId
+    && current.deviceToken === expected.deviceToken
+    && current.enrolledAt === expected.enrolledAt,
+  );
+}
+
+async function boundedControlJson(
+  url: string,
+  profile: Profile,
+  init: RequestInit,
+  failureLabel: string,
+): Promise<Record<string, unknown>> {
+  let response: Response;
+  const deadline = AbortSignal.timeout(LEARNING_REQUEST_TIMEOUT_MS);
+  const requestSignal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
+  try {
+    response = await userModelFetch(url, {
+      ...init,
+      signal: requestSignal,
+      redirect: "error",
+      headers: {
+        ...(init.body ? { "content-type": "application/json" } : {}),
+        authorization: `Bearer ${profile.deviceToken}`,
+        ...(init.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new Error(`${failureLabel} request failed`);
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`${failureLabel} failed (HTTP ${response.status})`);
+  }
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_LEARNING_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(`${failureLabel} response is too large`);
+  }
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > MAX_LEARNING_RESPONSE_BYTES) {
+    throw new Error(`${failureLabel} response is too large`);
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid");
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new Error(`${failureLabel} response is invalid`);
+  }
+}
+
+export interface OrganizationLearningSubmitResult {
+  remoteId: string;
+  status: string;
+  revision: number;
+  candidate: LearningCandidate;
+}
+
+/** Submit one already-redacted local proposal. This is always an explicit user action: runtime capture
+ * creates a local candidate only, and Control remains the sole authority that can approve it. */
+export async function submitOrganizationLearning(
+  profileId: string,
+  candidate: LearningCandidate,
+  context: { cwd: string; stateHome?: string },
+  signal?: AbortSignal,
+): Promise<OrganizationLearningSubmitResult> {
+  if (candidate.scope !== "organization") throw new Error("only organization learning can be submitted to Hara Control");
+  if (candidate.stability !== "stable") throw new Error("organization learning needs recurring evidence before submission");
+  const localEvidence = candidate.evidence.filter((item) => item.source !== "organization");
+  if (!localEvidence.length) throw new Error("organization learning has no local reviewable evidence");
+  const profile = exactGatewayProfile(profileId);
+  const payload = {
+    client_id: candidate.clientId,
+    pattern_key: candidate.patternKey,
+    kind: candidate.kind,
+    summary: candidate.summary,
+    ...(candidate.rationale ? { rationale: candidate.rationale } : {}),
+    source_version: candidate.sourceVersion,
+    evidence: localEvidence.map((item) => ({
+      task_hash: item.taskHash,
+      fingerprint: item.fingerprint,
+      summary: item.summary,
+      source: item.source,
+      source_version: item.sourceVersion,
+      observed_at: item.observedAt,
+    })),
+  };
+  const result = await boundedControlJson(
+    `${profile.gatewayUrl}/v1/learnings/candidates`,
+    profile,
+    { method: "POST", body: JSON.stringify(payload), signal },
+    "organization learning submission",
+  );
+  if (!sameGatewayIdentity(profile)) {
+    throw new Error("organization connection changed during learning submission; refresh and retry");
+  }
+  const remoteId = result.id;
+  const remoteStatus = result.status;
+  const revision = result.revision;
+  if (
+    typeof remoteId !== "string"
+    || !remoteId
+    || remoteId.length > 100
+    || typeof remoteStatus !== "string"
+    || !["pending", "approved", "rejected", "revoked"].includes(remoteStatus)
+    || !Number.isSafeInteger(revision)
+    || Number(revision) < 1
+  ) {
+    throw new Error("organization learning submission response is invalid");
+  }
+  const local = markLearningSubmitted(candidate.id, remoteId, {
+    cwd: context.cwd,
+    stateHome: context.stateHome,
+    profileId,
+  });
+  return { remoteId, status: remoteStatus, revision: Number(revision), candidate: local };
+}
+
+function organizationLearningItem(value: unknown): value is OrganizationLearningWire {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.id === "string" && item.id.length > 0 && item.id.length <= 100
+    && typeof item.pattern_key === "string"
+    && typeof item.kind === "string"
+    && typeof item.summary === "string"
+    && (item.rationale === undefined || typeof item.rationale === "string")
+    && Number.isSafeInteger(item.occurrence_count)
+    && Number.isSafeInteger(item.distinct_task_count)
+    && Number.isSafeInteger(item.revision)
+    && typeof item.updated_at === "string";
+}
+
+/** Pull one full, versioned approved bundle. Missing remote IDs revoke their local projection on the
+ * same atomic write, so a Control revocation cannot linger in a future prompt. */
+export async function syncOrganizationLearnings(
+  profileId: string,
+  context: { cwd: string; stateHome?: string },
+  signal?: AbortSignal,
+): Promise<{ version: number; learnings: LearningCandidate[] }> {
+  const profile = exactGatewayProfile(profileId);
+  const result = await boundedControlJson(
+    `${profile.gatewayUrl}/v1/learnings`,
+    profile,
+    { method: "GET", signal },
+    "organization learning sync",
+  );
+  if (!sameGatewayIdentity(profile)) {
+    throw new Error("organization connection changed during learning sync; refresh and retry");
+  }
+  const version = result.version;
+  const learnings = result.learnings;
+  if (
+    !Number.isSafeInteger(version)
+    || Number(version) < 0
+    || !Array.isArray(learnings)
+    || learnings.length > 5_000
+    || !learnings.every(organizationLearningItem)
+  ) {
+    throw new Error("organization learning sync response is invalid");
+  }
+  return {
+    version: Number(version),
+    learnings: applyOrganizationLearningBundle(
+      profileId,
+      Number(version),
+      learnings as OrganizationLearningWire[],
+      context,
+    ),
+  };
 }

@@ -28,9 +28,11 @@ function provider(turns) {
     id: "intake-fixture",
     model: "intake-fixture",
     systems,
-    async turn({ system }) {
+    async turn({ system, onText }) {
       systems.push(system);
-      return turns[Math.min(index++, turns.length - 1)];
+      const result = turns[Math.min(index++, turns.length - 1)];
+      if (result.text) onText?.(result.text);
+      return result;
     },
   };
 }
@@ -63,6 +65,15 @@ test("understanding gate blocks a direct edit, checkpoints task_intake, then per
     { text: "", toolUses: [{ id: "e0", name: edit.name, input: { path: "a.ts" } }], stop: "tool_use" },
     { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
     { text: "", toolUses: [{ id: "e1", name: edit.name, input: { path: "a.ts" } }], stop: "tool_use" },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: { completion: { state: "verified", evidence: ["the edit completed and targeted verification passed"] } },
+      }],
+      stop: "tool_use",
+    },
     { text: "done", toolUses: [], stop: "end" },
   ]);
   const history = [{ role: "user", content: "fix the parser" }];
@@ -78,16 +89,18 @@ test("understanding gate blocks a direct edit, checkpoints task_intake, then per
       onUpdate(next) {
         task = next;
         const tail = history.at(-1);
-        updateSawClosedRound =
+        updateSawClosedRound ||= Boolean(
           tail?.role === "tool" &&
-          tail.results.some((result) => result.name === "task_intake" && result.content.includes("Task brief accepted"));
+          tail.results.some((result) => result.name === "task_intake" && result.content.includes("Task brief accepted"))
+        );
       },
       onCheckpoint(next) {
         task = next;
         const tail = history.at(-1);
-        checkpointSawClosedRound =
+        checkpointSawClosedRound ||= Boolean(
           tail?.role === "tool" &&
-          tail.results.some((result) => result.name === "task_intake" && result.content.includes("Task brief accepted"));
+          tail.results.some((result) => result.name === "task_intake" && result.content.includes("Task brief accepted"))
+        );
       },
     },
   });
@@ -101,6 +114,106 @@ test("understanding gate blocks a direct edit, checkpoints task_intake, then per
   assert.match(JSON.stringify(history), /Understanding gate: this action was NOT executed/);
   assert.match(p.systems[0], /Do not jump from a raw request straight into side effects/);
   assert.match(p.systems.at(-1), /The task brief below is the accepted interpretation/);
+});
+
+test("an accepted change task cannot end as advice when an authorized tool can act", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("apply the available change", turn.turnId);
+  let edits = 0;
+  const visible = [];
+  const notices = [];
+  const edit = {
+    name: "fixture_owned_edit",
+    description: "test-only authorized edit",
+    input_schema: { type: "object", properties: {} },
+    kind: "edit",
+    async run() {
+      edits += 1;
+      return "edited and verified";
+    },
+  };
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    { text: "You can run the edit yourself with this command.", toolUses: [], stop: "end" },
+    { text: "I'll handle the edit and verify it now.", toolUses: [{ id: "e1", name: edit.name, input: {} }], stop: "tool_use" },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: { completion: { state: "verified", evidence: ["fixture edit returned edited and verified"] } },
+      }],
+      stop: "tool_use",
+    },
+    { text: "The requested change is verified.", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "apply the available change" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: {
+      cwd: process.cwd(),
+      ui: {
+        text: (value) => visible.push(value),
+        reasoning: () => {},
+        tool: () => {},
+        diff: () => {},
+        notice: (value) => notices.push(value),
+      },
+    },
+    approval: "full-auto",
+    confirm: async () => true,
+    extraTools: [edit],
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        task = next;
+      },
+    },
+  });
+  assert.equal(outcome.status, "completed");
+  assert.equal(edits, 1);
+  assert.equal(task.checkpoint.completion.state, "verified");
+  assert.doesNotMatch(visible.join(""), /run the edit yourself/);
+  assert.match(visible.join(""), /I'll handle the edit/, "a tool-backed acknowledgement remains visible before execution");
+  assert.match(visible.join(""), /requested change is verified/);
+  assert.match(notices.join("\n"), /action ownership guard/);
+  assert.doesNotMatch(JSON.stringify(history), /run the edit yourself/);
+  assert.match(JSON.stringify(history), /Execution ownership correction/);
+});
+
+test("the action ownership guard fails closed when a model refuses to act twice", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("perform the available change", turn.turnId);
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    { text: "Do it yourself.", toolUses: [], stop: "end" },
+    { text: "Still do it yourself.", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "perform the available change" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        task = next;
+      },
+    },
+  });
+  assert.equal(outcome.status, "error");
+  assert.match(outcome.error, /execution ownership guard/);
+  assert.doesNotMatch(JSON.stringify(history), /Do it yourself|Still do it yourself/);
 });
 
 test("task_intake and an edit in the same model response cannot bypass the round boundary", async () => {

@@ -98,7 +98,11 @@ test("task lifecycle event exposes an awaiting-user completion receipt without c
     completion: {
       state: "awaiting_user",
       evidence: ["the signed candidate passed local verification"],
-      waiting_for: "release-owner approval",
+      dependency: {
+        kind: "material_choice",
+        detail: "release-owner approval",
+        evidence: ["publishing changes the public release channel and no approval choice was supplied"],
+      },
     },
   }, "2026-08-14T00:01:00.000Z");
   assert.equal(applied.ok, true);
@@ -115,6 +119,11 @@ test("task lifecycle event exposes an awaiting-user completion receipt without c
     state: "awaiting_user",
     evidence: ["the signed candidate passed local verification"],
     waitingFor: "release-owner approval",
+    dependency: {
+      kind: "material_choice",
+      detail: "release-owner approval",
+      evidence: ["publishing changes the public release channel and no approval choice was supplied"],
+    },
   });
 });
 

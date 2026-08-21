@@ -188,6 +188,18 @@ test("server.shutdown leaves a pending approval intact, then succeeds after it r
           usage: { input: 1, output: 1 },
         };
       }
+      if (turns === 3) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "verify",
+            name: "task_checkpoint",
+            input: { completion: { state: "verified", evidence: ["write_file applied approved.txt with safe content"] } },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
       onText("done");
       return { text: "done", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
     },

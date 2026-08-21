@@ -14,6 +14,13 @@ import {
 } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
 import { memoryDigest, memoryDir, readRecentLogs, scaffoldMemory, type Scope } from "./memory/store.js";
+import {
+  formatLearningList,
+  listLearnings,
+  reviewLearning,
+  type LearningScope,
+  type LearningStatus,
+} from "./learning/store.js";
 import { nextMode as cycleMode, type Approval } from "./tui/InputBox.js";
 import { stdin, stdout } from "node:process";
 import { readFileSync, existsSync, realpathSync, statSync, writeFileSync, rmSync } from "node:fs";
@@ -69,6 +76,8 @@ import {
   gatewayBaseURL,
   syncOrgRoles,
   syncOrgRolesForProfile,
+  submitOrganizationLearning as submitOrganizationLearningToControl,
+  syncOrganizationLearnings as syncOrganizationLearningsFromControl,
   deviceTokenExpired,
   deviceTokenExpiryWarning,
 } from "./org-fleet/enroll.js";
@@ -159,7 +168,7 @@ import { installScheduler, uninstallScheduler, isInstalled } from "./cron/instal
 import { getTools, type Tool, type ToolContext } from "./tools/registry.js";
 import { resetReachability } from "./tools/net-reachability.js";
 import { resetRepeatGuard } from "./agent/repeat-guard.js";
-import { allowsEvolutionTool, EVOLUTION_SYSTEM, evolutionStatus, shouldAutoEvolve } from "./agent/evolution.js";
+import { allowsEvolutionTool, allowsMemoryDistillTool, EVOLUTION_SYSTEM, evolutionStatus, shouldAutoEvolve } from "./agent/evolution.js";
 import {
   createNativeSubagentProvider,
   NATIVE_SUBAGENT_PROVIDER_ID,
@@ -296,6 +305,7 @@ import "./tools/patch.js"; // register apply_patch
 import "./tools/web.js"; // register web_fetch
 import "./tools/agent.js"; // register agent (subagent spawn)
 import "./tools/memory.js"; // register memory_search/get/write/forget/skill_create
+import "./tools/learning.js"; // register reviewable execution-time learning capture
 import { automaticSessionRecall } from "./tools/session-search.js"; // register + deterministic explicit-cue recall
 import "./tools/skill.js"; // register the skill loader tool
 import "./tools/codebase.js"; // register codebase_search (repo as a knowledge base)
@@ -1275,7 +1285,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
       approval: o.approval,
       confirm: o.confirm,
       projectContext: o.projectContext,
-      memory: memoryDigest(o.cwd),
+      memory: memoryDigest(o.cwd, o.profileId),
       stats: o.stats,
       systemOverride: role.system,
       toolFilter,
@@ -1324,7 +1334,7 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
       approval: "full-auto", // reviewer is read-only via revTools, so nothing to confirm
       confirm: o.confirm,
       projectContext: o.projectContext,
-      memory: memoryDigest(o.cwd),
+      memory: memoryDigest(o.cwd, o.profileId),
       stats: o.stats,
       systemOverride: revSystem,
       toolFilter: revTools,
@@ -1382,7 +1392,7 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
       approval: o.approval,
       confirm: o.confirm,
       projectContext: o.projectContext,
-      memory: memoryDigest(o.cwd),
+      memory: memoryDigest(o.cwd, o.profileId),
       stats: o.stats,
       systemOverride: role?.system,
       toolFilter,
@@ -2900,7 +2910,7 @@ program
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const gatewayLogins = new GatewayLoginManager();
     const controlPlaneRefreshAt = new Map<string, number>();
-    const refreshSessionControlPlane = (profile: Profile): void => {
+    const refreshSessionControlPlane = (profile: Profile, targetCwd: string): void => {
       const enrollment = enrollmentFromProfile(profile);
       if (!enrollment) return;
       const now = Date.now();
@@ -2908,6 +2918,7 @@ program
       controlPlaneRefreshAt.set(profile.id, now);
       void heartbeatEnrollment(enrollment, undefined, { profileId: profile.id });
       void syncOrgRolesForProfile(profile);
+      void syncOrganizationLearningsFromControl(profile.id, { cwd: targetCwd }).catch(() => undefined);
     };
     const handle = await startServe(
       { host: o.host, port: Number(o.port) || 8790, token: o.token, cwd },
@@ -2922,14 +2933,14 @@ program
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
           if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
-          refreshSessionControlPlane(profile);
+          refreshSessionControlPlane(profile, targetCwd ?? cwd);
           return withRouting(await buildProvider(live, undefined, profileId), live, profileId);
         },
         buildProviderFor: async (model, effort, targetCwd, profileId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
           if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
-          refreshSessionControlPlane(profile);
+          refreshSessionControlPlane(profile, targetCwd ?? cwd);
           if (
             profile.kind === "gateway"
             && profile.availableModels?.length
@@ -3086,6 +3097,21 @@ program
             && await heartbeatEnrollment(enrollment, AbortSignal.timeout(15_000), { profileId: id });
           return { id, ok, checkedAt: Date.now() };
         },
+        organizationLearningSubmit: async (profileId, candidateId, targetCwd) => {
+          const learningCwd = targetCwd ?? cwd;
+          const candidate = listLearnings({
+            cwd: learningCwd,
+            profileId,
+            scope: "organization",
+            limit: 1_000,
+          }).find((item) => item.id === candidateId || item.clientId === candidateId || item.remoteId === candidateId);
+          if (!candidate) throw new Error("organization learning candidate not found");
+          return submitOrganizationLearningToControl(profileId, candidate, { cwd: learningCwd });
+        },
+        organizationLearningSync: (profileId, targetCwd) => syncOrganizationLearningsFromControl(
+          profileId,
+          { cwd: targetCwd ?? cwd },
+        ),
         deskConnections: () => localDeskConnectionsSnapshot(
           listProfiles()
             .filter((profile) => profile.kind === "gateway")
@@ -3180,6 +3206,7 @@ program
             providerId: current.provider,
             model,
             profileId: profile.id,
+            profileKind: profile.kind,
             effortLevels: advertisedEfforts ?? inferredEfforts,
             attachmentCapabilities: effectiveAttachmentCapabilities(
               current.provider,
@@ -3353,7 +3380,7 @@ program
       toolFilter: (n) => READONLY_TOOLS.has(n), // read-only: the reviewer can inspect, never edit
       hooks: false,
       projectContext: loadAgentContext(cfg.cwd) || undefined,
-      memory: memoryDigest(cfg.cwd),
+      memory: memoryDigest(cfg.cwd, learningContext(cfg.cwd).profileId),
       stats,
       ...agentRunLimits(cfg),
     });
@@ -3626,7 +3653,8 @@ cronCmd
 
 const memoryCmd = program.command("memory").description("inspect + consolidate hara's durable memory (~/.hara/memory + project .hara/memory)");
 memoryCmd.command("show").description("print the memory digest injected at session start").action(() => {
-  const d = memoryDigest(process.cwd());
+  const cwd = process.cwd();
+  const d = memoryDigest(cwd, learningContext(cwd).profileId);
   out(d ? d + "\n" : c.dim("(memory is empty — `hara memory init`, or let the agent write via memory_write)\n"));
 });
 memoryCmd.command("init").description("scaffold the memory dirs + seed files (global + project)").action(async () => {
@@ -3654,18 +3682,115 @@ memoryCmd
     if (!logs.trim()) return void out(c.dim(`No daily logs in the last ${days} day(s) to distill. (The agent jots them via memory_write target=log.)\n`));
     out(c.dim(`Distilling ${days}-day logs → durable memory…\n`));
     const stats = { input: 0, output: 0, lastInput: 0 };
-    const history: NeutralMsg[] = [{ role: "user", content: `Current durable memory:\n\n${memoryDigest(cfg.cwd) || "(empty)"}\n\n---\n\nRecent daily logs (last ${days} days):\n\n${logs.slice(0, 80_000)}` }];
+    const history: NeutralMsg[] = [{ role: "user", content: `Current durable memory:\n\n${memoryDigest(cfg.cwd, undefined, undefined, { includeReviewedLearning: false }) || "(empty)"}\n\n---\n\nRecent daily logs (last ${days} days):\n\n${logs.slice(0, 80_000)}` }];
     await runAgent(history, {
       provider,
       ctx: { cwd: cfg.cwd, sandbox: cfg.sandbox },
       approval: "full-auto",
       confirm: async () => true,
-      toolFilter: (n) => allowsEvolutionTool(n, "off"),
+      toolFilter: allowsMemoryDistillTool,
       systemOverride: MEMORY_DISTILL_SYSTEM,
       stats,
       ...agentRunLimits(cfg),
     });
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
+  });
+
+const learningContext = (cwd: string): { cwd: string; profileId?: string } => {
+  const resolution = resolveActive(cwd);
+  const profile = getProfile(resolution.id);
+  return { cwd, ...(profile?.kind === "gateway" ? { profileId: profile.id } : {}) };
+};
+const learningCmd = program.command("learning").description("review, approve, reject, or revoke execution-time business learning");
+learningCmd
+  .command("list")
+  .alias("ls")
+  .description("list reviewable and active learning for this project/profile")
+  .option("--scope <scope>", "personal | project | organization")
+  .option("--status <state>", "pending | approved | rejected | revoked | submitted")
+  .option("--limit <n>", "maximum rows (default 200)", (value) => Number.parseInt(value, 10))
+  .action((options: { scope?: string; status?: string; limit?: number }) => {
+    const cwd = process.cwd();
+    const scopes = new Set<LearningScope>(["personal", "project", "organization"]);
+    const states = new Set<LearningStatus>(["pending", "approved", "rejected", "revoked", "submitted"]);
+    if (options.scope && !scopes.has(options.scope as LearningScope)) {
+      return void out(c.red("scope must be personal, project, or organization\n"));
+    }
+    if (options.status && !states.has(options.status as LearningStatus)) {
+      return void out(c.red("status must be pending, approved, rejected, revoked, or submitted\n"));
+    }
+    const items = listLearnings({
+      ...learningContext(cwd),
+      ...(options.scope ? { scope: options.scope as LearningScope } : {}),
+      ...(options.status ? { status: options.status as LearningStatus } : {}),
+      ...(Number.isSafeInteger(options.limit) ? { limit: options.limit } : {}),
+    });
+    out(formatLearningList(items) + "\n");
+  });
+for (const decision of ["approve", "reject", "revoke"] as const) {
+  learningCmd
+    .command(`${decision} <id>`)
+    .description(`${decision} one personal/project learning candidate (organization learning is reviewed in Control)`)
+    .option("--revision <n>", "optimistic candidate revision", (value) => Number.parseInt(value, 10))
+    .option("--note <text>", "short review note")
+    .action((id: string, options: { revision?: number; note?: string }) => {
+      try {
+        const item = reviewLearning(id, decision, {
+          ...learningContext(process.cwd()),
+          ...(Number.isSafeInteger(options.revision) ? { expectedRevision: options.revision } : {}),
+          ...(options.note ? { note: options.note } : {}),
+        });
+        out(c.green(`✓ ${item.id.slice(0, 8)} ${item.status} · revision ${item.revision}\n`));
+      } catch (error) {
+        out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
+        process.exitCode = 1;
+      }
+    });
+}
+learningCmd
+  .command("submit <id>")
+  .description("submit one stable, redacted organization candidate to Hara Control for admin review")
+  .action(async (id: string) => {
+    const cwd = process.cwd();
+    const context = learningContext(cwd);
+    if (!context.profileId) {
+      out(c.red("an organization connection must be active before submitting organization learning\n"));
+      process.exitCode = 1;
+      return;
+    }
+    const candidate = listLearnings({ ...context, scope: "organization", limit: 1_000 })
+      .find((item) => item.id === id || item.clientId === id || item.remoteId === id);
+    if (!candidate) {
+      out(c.red("organization learning candidate not found\n"));
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const result = await submitOrganizationLearningToControl(context.profileId, candidate, { cwd });
+      out(c.green(`✓ submitted ${candidate.id.slice(0, 8)} · Control ${result.status} · remote revision ${result.revision}\n`));
+    } catch (error) {
+      out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
+      process.exitCode = 1;
+    }
+  });
+learningCmd
+  .command("sync")
+  .description("pull the versioned, Control-approved organization learning bundle")
+  .action(async () => {
+    const cwd = process.cwd();
+    const context = learningContext(cwd);
+    if (!context.profileId) {
+      out(c.red("an organization connection must be active before syncing organization learning\n"));
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const result = await syncOrganizationLearningsFromControl(context.profileId, { cwd });
+      out(c.green(`✓ organization learning v${result.version} · ${result.learnings.length} approved\n`));
+    } catch (error) {
+      out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
+      process.exitCode = 1;
+    }
   });
 
 const rolesCmd = program.command("roles").description("list/manage Hara roles and compatible Claude Code agents");
@@ -4800,7 +4925,7 @@ program.action(async (opts) => {
       approval: "full-auto" as const,
       confirm: async () => true,
       projectContext,
-      memory: memoryDigest(cwd),
+      memory: memoryDigest(cwd, meta?.profileId ?? sessionRouteProfileId),
       continuationSession,
       executionContext: taskExecutionContext(task, headlessInteraction, meta?.todos ?? []),
       taskIntake: {
@@ -5150,7 +5275,7 @@ program.action(async (opts) => {
     resumeTaskPending = Boolean(task && task.status !== "completed");
   };
   let continuationSession = Boolean(resumed?.history.length);
-  const memorySnap = memoryDigest(cwd); // durable memory, read once (frozen snapshot)
+  const memorySnap = memoryDigest(cwd, meta.profileId); // durable reviewed context, read once (frozen snapshot)
   const buildMemory = (): string =>
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
   if (resumed) out(c.dim(`(resumed ${shortId(meta.id)} · ${history.length} msgs · model = ${cfg.model})\n`));

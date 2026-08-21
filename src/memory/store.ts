@@ -8,6 +8,7 @@ import { findProjectRoot } from "../context/agents-md.js";
 import { readModelContextFileSync, readVerifiedRegularFileSnapshot, type RegularFileSnapshot } from "../fs-read.js";
 import { atomicWriteText, bindAtomicWritePath, type AtomicWriteBoundary } from "../fs-write.js";
 import { sanitizeMemoryForPrompt } from "./guard.js";
+import { learningDigest } from "../learning/store.js";
 
 export type Scope = "global" | "project";
 export type Target = "memory" | "user" | "log";
@@ -148,7 +149,12 @@ export async function forgetMemory(scope: Scope, target: Target, match: string, 
 /** MEMORY + USER digest (project + global) for frozen-snapshot injection at session start. Each source is
  *  capped independently (SOURCE_CAP) at a line boundary, so every source is represented (project memory
  *  never starves USER prefs) and no entry is cut mid-line. Daily logs are reached via memory_search. */
-export function memoryDigest(cwd: string): string {
+export function memoryDigest(
+  cwd: string,
+  profileId?: string,
+  stateHome?: string,
+  options: { includeReviewedLearning?: boolean } = {},
+): string {
   const sources: [Scope, Target, string][] = [
     ["project", "memory", "project MEMORY"],
     ["project", "user", "project USER preferences"],
@@ -165,6 +171,10 @@ export function memoryDigest(cwd: string): string {
     } catch {
       /* skip unreadable */
     }
+  }
+  if (options.includeReviewedLearning !== false) {
+    const reviewedLearning = learningDigest(cwd, profileId, stateHome);
+    if (reviewedLearning) parts.push(reviewedLearning);
   }
   return parts.join("\n\n");
 }

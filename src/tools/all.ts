@@ -11,6 +11,7 @@ import "./patch.js"; // apply_patch
 import "./web.js"; // web_search / web_fetch
 import "./agent.js"; // agent (subagent spawn)
 import "./memory.js"; // memory_search/get/write/forget + skill_create
+import "./learning.js"; // reviewable execution-time business learning capture
 import "./session-search.js"; // bounded cross-session transcript recall
 import "./skill.js"; // skill loader
 import "./codebase.js"; // codebase_search

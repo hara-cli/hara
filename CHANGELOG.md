@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.150.0 — 2026-08-22 — agent-owned execution and reviewed business learning
+
+- Make execution ownership an engine contract for accepted change tasks. A model can no longer finish by
+  telling the user to run an available, authorized action: Hara buffers unverified prose, keeps a short
+  tool-backed acknowledgement visible, executes and verifies, retries once with an optional provider
+  fallback, then fails closed if the model still refuses to act.
+- Replace vague “waiting for user” prose with six typed, evidenced dependencies: missing secret, missing
+  authority, unavoidable physical action, material business choice, unresolved external state, or destructive
+  confirmation. Desktop and Serve expose the same structured blocker, and fresh observable completion
+  evidence remains mandatory.
+- Add execution-time business learning across personal, project, and organization scopes. Runtime observations
+  become bounded, redacted, deduplicated candidates; only explicitly approved local rules or Control-approved
+  organization rules enter future prompts. The private atomic store includes recurrence scoring, optimistic
+  review revisions, revocation, and a tamper-evident audit chain.
+- Add `hara learning list|approve|reject|revoke|submit|sync`, Serve review RPCs, and versioned Hara Control
+  submission/sync. Organization proposals stay local until the user submits a stable candidate, Control remains
+  the sole approval authority, and a revoked rule disappears on the next full-bundle sync. The feedback eval
+  gate now budgets wrong user delegations at zero. Upgrade with `npm i -g @nanhara/hara@0.150.0`.
+
 ## 0.149.0 — 2026-08-21 — native DeepSeek vision and scored feedback improvement
 
 - Add the official `deepseek-v4-flash-vision-exp` model to personal DeepSeek setup and `/model`

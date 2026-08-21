@@ -19,8 +19,9 @@ npm run eval:feedback
 Each trace fixes an expected outcome and budgets for rounds, tool calls, approvals, user interventions,
 and repeated no-progress failures. It can also require a strategy transition within a bounded number of
 tool calls, forbid sending to a retired model, and require engine-readable completion evidence or the
-exact missing user input. The command exits non-zero on any regression and prints aggregate completion
-success rate and cost-shaped metrics.
+exact typed/evidenced human dependency. Action-ownership receipts also enforce zero wrongful delegation:
+an authorized action with an available tool must remain owned by the Agent. The command exits non-zero on
+any regression and prints aggregate completion success rate, wrong-handoff count, and cost-shaped metrics.
 
 To add a trace, redact it first and use `traceKind: "sanitized-feedback"` plus a `redacted-...` source
 reference. The evaluator rejects common secret shapes and macOS, Linux, or Windows user-home paths. A

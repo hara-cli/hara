@@ -459,7 +459,7 @@ registerTool({
     if (isNgrokTunnelCommand(input.command) && !ngrokAuthConfigured()) {
       return (
         "Skipped ngrok tunnel: no authentication was found in NGROK_AUTHTOKEN/NGROK_API_KEY or the standard ngrok config files. " +
-        "Configure ngrok authentication first, then retry. Do not rotate through other tunnel providers blindly; ask the user which authenticated provider to use."
+        "Ngrok authentication is missing. Do not rotate through other tunnel providers blindly. If no authorized credential source is available, record a missing_secret dependency naming the blocked tunnel_auth capability."
       );
     }
     const longRunningTunnel = isLongRunningTunnelCommand(input.command);
@@ -533,7 +533,7 @@ registerTool({
         base +=
           `\n⏱ hara: the command hit its ${timeout}ms cap and was killed. Pick ONE: ` +
           `a long build/transform → re-run with a larger timeout_ms; a server/watcher → background:true; ` +
-          `a network op (git/curl/npm) → do NOT just retry — check connectivity/proxy or skip this step and tell the user.`;
+          `a network op (git/curl/npm) → do NOT just retry — check connectivity/proxy or choose a verified local path. If external network state truly blocks completion, record an evidenced external_state dependency.`;
         if (packageInstall && !registry && !commandHasPackageRegistry(String(input.command ?? ""))) {
           base +=
             " For public npm dependencies, an explicit retry may set bash.registry=\"npmmirror\" (or launch with --registry npmmirror). " +

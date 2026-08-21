@@ -39,6 +39,9 @@ export interface ToolContext {
   /** Current durable conversation, when this run has one. Transcript recall uses it to exclude the active
    * session and enforce interactive/gateway/cron audience boundaries. */
   sessionId?: string;
+  /** Engine-owned execution identity for evidence deduplication. Tools may use it for opaque provenance;
+   * models never provide or override it. */
+  taskId?: string;
   /** One-run cancellation boundary. Built-in tools must stop owned subprocesses/work promptly when fired. */
   signal?: AbortSignal;
   /** Isolate the in-memory todo_write checklist for concurrent agent runs (serve sessions/sub-agents). */

@@ -67,6 +67,12 @@ export interface TaskLifecycleEvent {
       state: "verified" | "awaiting_user";
       evidence: string[];
       waitingFor?: string;
+      dependency?: {
+        kind: "missing_secret" | "missing_authority" | "physical_action" | "material_choice" | "external_state" | "destructive_confirmation";
+        detail: string;
+        evidence: string[];
+        capability?: string;
+      };
     };
   };
   detail?: string;
@@ -162,6 +168,18 @@ export function taskLifecycleEvent(
               evidence: persisted.completion.evidence.map((item) => item.slice(0, 1_000)),
               ...(persisted.completion.waitingFor
                 ? { waitingFor: bounded(persisted.completion.waitingFor, 500) }
+                : {}),
+              ...(persisted.completion.dependency
+                ? {
+                    dependency: {
+                      kind: persisted.completion.dependency.kind,
+                      detail: bounded(persisted.completion.dependency.detail, 500)!,
+                      evidence: persisted.completion.dependency.evidence.map((item) => item.slice(0, 1_000)),
+                      ...(persisted.completion.dependency.capability
+                        ? { capability: persisted.completion.dependency.capability }
+                        : {}),
+                    },
+                  }
                 : {}),
             },
           }

@@ -107,7 +107,7 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
       approval: "full-auto",
       confirm: async () => true,
       projectContext: request.projectContext,
-      memory: memoryDigest(request.cwd),
+      memory: memoryDigest(request.cwd, request.profileId),
       stats: localStats,
       systemOverride: role?.system ?? builtinSystem,
       toolFilter,

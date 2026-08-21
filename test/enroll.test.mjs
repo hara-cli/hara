@@ -13,12 +13,19 @@ import {
   parseEnrollResponse,
   syncOrgRoles,
   syncOrgRolesForProfile,
+  submitOrganizationLearning,
+  syncOrganizationLearnings,
   deviceTokenExpired,
   deviceTokenExpiryWarning,
   normalizeGatewayUrl,
   enrollGatewayProfile,
   upsertGatewayProfileFromEnrollment,
 } from "../dist/org-fleet/enroll.js";
+import {
+  captureLearning,
+  listLearnings,
+  learningDigest,
+} from "../dist/learning/store.js";
 import {
   deskConnectionsSnapshot,
   loadProfileCreds,
@@ -556,6 +563,104 @@ test("managed role bundles stay isolated by the session's exact organization pro
     server.close();
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("organization learning is explicitly submitted, version-synced, injected only after approval, and revocable", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-learning-control-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "hara-learning-control-cwd-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  let bundleVersion = 1;
+  let bundleItems = [];
+  let submittedBody;
+  const server = createServer(async (req, res) => {
+    if (req.headers.authorization !== "Bearer learning-device-token") {
+      res.writeHead(401);
+      return res.end();
+    }
+    if (req.url === "/v1/learnings/candidates" && req.method === "POST") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      submittedBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({
+        id: "11111111-1111-4111-8111-111111111111",
+        status: "pending",
+        revision: 1,
+      }));
+    }
+    if (req.url === "/v1/learnings" && req.method === "GET") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ version: bundleVersion, learnings: bundleItems }));
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const gatewayUrl = `http://127.0.0.1:${server.address().port}`;
+  const profile = {
+    id: "learning-org",
+    kind: "gateway",
+    label: "Learning Org",
+    gatewayUrl,
+    deviceToken: "learning-device-token",
+    deviceId: "learning-device",
+    defaultModel: "managed-model",
+    enrolledAt: "2026-08-22T00:00:00.000Z",
+  };
+  try {
+    upsertProfile(profile);
+    const capture = (taskId, evidence) => captureLearning({
+      patternKey: "agent.authorized_action_execution",
+      kind: "action_ownership",
+      scope: "organization",
+      summary: "Execute authorized, tool-supported work and report verified results.",
+      evidence,
+      source: "runtime_guard",
+    }, { cwd, stateHome: home, profileId: profile.id, taskId });
+    capture("task-a", "The guard rejected advice and requested an execution tool call.");
+    capture("task-a", "The agent used the available edit tool after the runtime reminder.");
+    const stable = capture("task-b", "A second task executed and verified instead of delegating to the user.").candidate;
+    assert.equal(stable.stability, "stable");
+
+    const submitted = await submitOrganizationLearning(profile.id, stable, { cwd, stateHome: home });
+    assert.equal(submitted.status, "pending");
+    assert.equal(submitted.candidate.status, "submitted");
+    assert.equal(submittedBody.pattern_key, stable.patternKey);
+    assert.equal(JSON.stringify(submittedBody).includes("learning-device-token"), false);
+
+    bundleItems = [{
+      id: submitted.remoteId,
+      pattern_key: stable.patternKey,
+      kind: stable.kind,
+      summary: stable.summary,
+      occurrence_count: 3,
+      distinct_task_count: 2,
+      revision: 2,
+      updated_at: new Date().toISOString(),
+    }];
+    const synced = await syncOrganizationLearnings(profile.id, { cwd, stateHome: home });
+    assert.equal(synced.version, 1);
+    assert.equal(synced.learnings.length, 1);
+    assert.match(learningDigest(cwd, profile.id, home), /authorized_action_execution/);
+
+    bundleVersion = 2;
+    bundleItems = [];
+    await syncOrganizationLearnings(profile.id, { cwd, stateHome: home });
+    assert.equal(
+      listLearnings({ cwd, profileId: profile.id, stateHome: home, scope: "organization" })
+        .some((item) => item.remoteId === submitted.remoteId && item.status === "approved"),
+      false,
+    );
+    assert.doesNotMatch(learningDigest(cwd, profile.id, home), /authorized_action_execution/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    resetPrivateHaraStateForTests();
     rmSync(home, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   }

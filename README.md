@@ -14,7 +14,12 @@
 - **An org, not just an agent** — `hara org "<task>"` routes work to the role that *owns* it; `hara plan "<task>"` decomposes a task into a verified DAG of atoms (frame → atomize → sequence → execute → **verify gate**), and `hara plan --parallel` runs independent atoms concurrently.
 - **Drive it from chat** — `hara gateway` runs your local hara from **Telegram · WeChat · Discord · Feishu/Lark · Slack · Mattermost · Matrix · DingTalk · WeCom · Signal** (10 platforms), with **two-way images where the platform has a byte-upload API**, resumable per-chat sessions, project/agent roaming, bounded per-thread queues, and approval-gated group automations. Connects out — no public webhook. See **[docs/gateway.md](docs/gateway.md)**.
 - **Real terminal UX** — an **ink TUI**: bottom-pinned input box, **plan mode** (read-only investigation → the model submits its plan via `exit_plan` → approve → execute), narrowly scoped project approvals, private model reasoning, **paste images** (Ctrl+V) for vision models, light/dark theme.
-- **Persistent memory + auditable self-evolution** — `memory_*` tools over global/project `MEMORY.md`; the agent recalls before acting and can curate evidence-backed facts/preferences plus verified reusable skills. Durable writes are deduplicated and re-sanitized on load; raw prior chats stay separate behind bounded `session_search`. `/evolve status|now` shows or runs the curation policy; it never grants permission to rewrite product code, permissions, config, or system prompts. Inspect/consolidate with **`hara memory show`** and **`hara memory distill`**. Chinese-aware lexical search works without setup; semantic search remains opt-in.
+- **Reviewed business learning + durable memory** — while tasks run, `learning_capture` records only bounded,
+  redacted evidence as personal/project candidates or local organization proposals. Nothing changes future
+  behavior until the user approves it, or an administrator approves and versions it in Hara Control; learning
+  never expands permissions. Inspect with **`hara learning list`** and approve/reject/revoke explicitly. The
+  separate `memory_*` layer retains curated facts/preferences, while `/evolve status|now` distills reviewable
+  candidates and verified skills without rewriting product code, permissions, config, or system prompts.
 - **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI), with live Markdown answers while provider reasoning stays private.
 - **Delegate to other agents** — the **`external_agent`** tool hands a self-contained task to **Claude Code** or **Codex** running headless, and returns the result — so you pick the best engine per task. It is a trusted extension outside Hara's protected-file boundary: every interactive call requires confirmation, and non-interactive use is disabled by default.
 - **Honest under a slow network** — a live "waiting for the model… Ns" status, a stall watchdog that
@@ -294,6 +299,14 @@ long file rather than its header. Because these Markdown files are editable and 
 them on injection, retrieval, log distillation, and semantic indexing; unsafe lines and secret-shaped values
 never become trusted prompt or embedding input.
 
+Execution-time learning is a separate reviewed ledger under private Hara state. `hara learning list` shows
+personal, project, and active-organization candidates with recurrence and revision evidence;
+`approve|reject|revoke <id>` controls local rules. An organization candidate must recur at least three times
+across two tasks in 30 days before `hara learning submit <id>` can send its already-redacted receipts to
+Control. Administrators approve or reject there, and `hara learning sync` pulls one versioned full bundle so
+revocations remove rules from prompt context. Raw conversations, credentials, user paths, and files are never
+stored in this ledger, and approval supplies context only—not tool authority.
+
 Assistant output is **rendered as Markdown** (headers, bold, inline code, lists; code fences verbatim),
 and a model's **reasoning** shows dimmed before the answer when available. Both are interactive-terminal
 only; `HARA_MD=0` disables Markdown rendering.
@@ -356,6 +369,10 @@ idle session or steers its authoritative live turn, serializes concurrent submis
 returns an explicit non-submission reason when attachments or a forced `newTask` must wait for the next turn.
 When Desktop has staged a model or thinking change, `expectedModel` + `expectedEffort` also keep an idle
 transition from starting that input on the previous provider configuration.
+For an accepted change task, Core owns execution: if an in-scope action is authorized, tool-supported, and
+risk-controlled, Hara must perform and verify it instead of ending with instructions for the user. A handoff is
+accepted only as a fresh structured dependency for a missing secret/authority, unavoidable physical action,
+material choice, external state, or destructive confirmation, with observed evidence shown by Desktop.
 Older protocol-v1 clients remain compatible through strict `session.send` and expected-turn
 `session.steer`; accepted steering is durable before ACK. The `hara resume` launcher preserves terminal input
 in both npm/Node and standalone-binary installs.

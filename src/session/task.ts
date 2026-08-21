@@ -15,6 +15,7 @@ export const MAX_TASK_CHECKPOINT_ARTIFACT_CHARS = 1_000;
 export const MAX_TASK_CHECKPOINT_FACTS = 64;
 export const MAX_TASK_CHECKPOINT_CAPABILITIES = 32;
 export const MAX_TASK_COMPLETION_EVIDENCE = 12;
+export const MAX_TASK_DEPENDENCY_EVIDENCE = 8;
 export const MAX_TASK_STATE_KEY_CHARS = 120;
 export const MAX_TASK_FACT_STRING_CHARS = 2_000;
 export const MAX_TASK_EVIDENCE_CHARS = 1_000;
@@ -71,6 +72,22 @@ export interface TaskCapability {
 }
 
 export type TaskCompletionState = "verified" | "awaiting_user";
+export type TaskUserDependencyKind =
+  | "missing_secret"
+  | "missing_authority"
+  | "physical_action"
+  | "material_choice"
+  | "external_state"
+  | "destructive_confirmation";
+
+/** The only engine-recognized reasons an accepted action may be handed back to a human. A typed,
+ * evidenced dependency prevents free-form model reluctance from masquerading as a real blocker. */
+export interface TaskUserDependency {
+  kind: TaskUserDependencyKind;
+  detail: string;
+  evidence: string[];
+  capability?: string;
+}
 
 /** Engine-readable completion receipt. Free-form assistant prose is never treated as proof that the accepted
  * brief succeeded. A verified task names observable evidence; a task waiting on the user names the exact
@@ -79,6 +96,7 @@ export interface TaskCompletion {
   state: TaskCompletionState;
   evidence: string[];
   waitingFor?: string;
+  dependency?: TaskUserDependency;
   updatedAt: string;
 }
 
@@ -262,6 +280,14 @@ interface TaskCompletionInput {
   state?: unknown;
   evidence?: unknown;
   waiting_for?: unknown;
+  dependency?: unknown;
+}
+
+interface TaskUserDependencyInput {
+  kind?: unknown;
+  detail?: unknown;
+  evidence?: unknown;
+  capability?: unknown;
 }
 
 function taskStateKey(value: unknown, label: string): { ok: true; value: string } | { ok: false; reason: string } {
@@ -315,6 +341,7 @@ function requiredCapabilityList(value: unknown): { ok: true; value: string[] } |
 function completionInput(
   value: unknown,
   at: string,
+  capabilities: Record<string, TaskCapability>,
 ): { ok: true; value: TaskCompletion } | { ok: false; reason: string } {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { ok: false, reason: "completion must be an object" };
@@ -347,15 +374,86 @@ function completionInput(
   if (input.state === "verified" && !evidence.length) {
     return { ok: false, reason: "verified completion requires at least one observable evidence item" };
   }
-  if (input.state === "awaiting_user" && !waitingFor) {
-    return { ok: false, reason: "awaiting_user completion requires waiting_for" };
+  if (input.state === "verified" && input.dependency !== undefined) {
+    return { ok: false, reason: "verified completion cannot include a user dependency" };
+  }
+  let dependency: TaskUserDependency | undefined;
+  if (input.state === "awaiting_user") {
+    if (!evidence.length) {
+      return { ok: false, reason: "awaiting_user completion requires observable evidence of the blocker" };
+    }
+    if (!input.dependency || typeof input.dependency !== "object" || Array.isArray(input.dependency)) {
+      return {
+        ok: false,
+        reason: "awaiting_user requires a structured dependency; advice or model reluctance is not a user dependency",
+      };
+    }
+    const raw = input.dependency as TaskUserDependencyInput;
+    const allowedKinds = new Set<TaskUserDependencyKind>([
+      "missing_secret",
+      "missing_authority",
+      "physical_action",
+      "material_choice",
+      "external_state",
+      "destructive_confirmation",
+    ]);
+    if (typeof raw.kind !== "string" || !allowedKinds.has(raw.kind as TaskUserDependencyKind)) {
+      return { ok: false, reason: "dependency kind is not an allowed human-only blocker" };
+    }
+    if (typeof raw.detail !== "string" || !raw.detail.trim()) {
+      return { ok: false, reason: "dependency detail must name the exact human input or action required" };
+    }
+    const detail = raw.detail.replace(/\r\n?/g, "\n").trim().slice(0, MAX_TASK_CHECKPOINT_STEP_CHARS);
+    if (waitingFor && waitingFor !== detail) {
+      return { ok: false, reason: "deprecated waiting_for must match dependency.detail when both are supplied" };
+    }
+    if (!Array.isArray(raw.evidence)) {
+      return { ok: false, reason: "dependency evidence must be an array of observed facts" };
+    }
+    const dependencyEvidence: string[] = [];
+    const dependencySeen = new Set<string>();
+    for (const item of raw.evidence) {
+      if (typeof item !== "string") return { ok: false, reason: "every dependency evidence item must be a string" };
+      const normalized = item.replace(/\r\n?/g, "\n").trim().slice(0, MAX_TASK_EVIDENCE_CHARS);
+      if (!normalized || dependencySeen.has(normalized)) continue;
+      dependencySeen.add(normalized);
+      dependencyEvidence.push(normalized);
+      if (dependencyEvidence.length > MAX_TASK_DEPENDENCY_EVIDENCE) {
+        return { ok: false, reason: `dependency evidence cannot exceed ${MAX_TASK_DEPENDENCY_EVIDENCE} entries` };
+      }
+    }
+    if (!dependencyEvidence.length) {
+      return { ok: false, reason: "dependency requires at least one observed evidence item" };
+    }
+    let capability: string | undefined;
+    if (raw.capability !== undefined) {
+      const parsedCapability = taskStateKey(raw.capability, "dependency capability");
+      if (!parsedCapability.ok) return parsedCapability;
+      capability = parsedCapability.value;
+      const observed = capabilities[capability];
+      if (!observed || (observed.state !== "blocked" && observed.state !== "unavailable")) {
+        return {
+          ok: false,
+          reason: `dependency capability '${capability}' must first be checkpointed as blocked or unavailable`,
+        };
+      }
+    }
+    if ((raw.kind === "missing_secret" || raw.kind === "missing_authority") && !capability) {
+      return { ok: false, reason: `${raw.kind} dependency requires the blocked/unavailable capability name` };
+    }
+    dependency = {
+      kind: raw.kind as TaskUserDependencyKind,
+      detail,
+      evidence: dependencyEvidence,
+      ...(capability ? { capability } : {}),
+    };
   }
   return {
     ok: true,
     value: {
       state: input.state,
       evidence,
-      ...(waitingFor ? { waitingFor } : {}),
+      ...(dependency ? { waitingFor: dependency.detail, dependency } : {}),
       updatedAt: at,
     },
   };
@@ -513,7 +611,7 @@ export function applyTaskCheckpoint(
   }
 
   if (input.completion !== undefined) {
-    const parsed = completionInput(input.completion, now);
+    const parsed = completionInput(input.completion, now, next.capabilities);
     if (!parsed.ok) return parsed;
     if (parsed.value.state === "verified" && (next.blockedStep || next.blockReason)) {
       return {
@@ -717,6 +815,15 @@ export function requestsTaskContinuation(text: string): boolean {
   return /^(?:\/continue(?:\s|$)|(?:continue|resume|go\s+on)(?:[\s,.:;!?，。：；！？]|$)|(?:继续|接着|接着做|继续处理|重新执行|现在去执行任务)(?:[\s,.:;!?，。：；！？]|$))/.test(value);
 }
 
+/** A receipt is authoritative only for the current execution tranche and the latest accepted brief. */
+export function freshTaskCompletion(task: TaskExecution | undefined): TaskCompletion | undefined {
+  const completion = task?.checkpoint?.completion;
+  if (!task || !completion) return undefined;
+  if (Date.parse(completion.updatedAt) < Date.parse(task.startedAt)) return undefined;
+  if (task.brief && Date.parse(completion.updatedAt) < Date.parse(task.brief.createdAt)) return undefined;
+  return completion;
+}
+
 export function finishTaskExecution(
   task: TaskExecution | undefined,
   outcome: RunOutcome | undefined,
@@ -727,12 +834,8 @@ export function finishTaskExecution(
   if (!task) return undefined;
   const now = iso(at);
   const incomplete = todos.some((todo) => todo.status !== "done");
-  const completion = task.checkpoint?.completion;
-  const completionIsFresh = Boolean(
-    completion
-    && Date.parse(completion.updatedAt) >= Date.parse(task.startedAt)
-    && (!task.brief || Date.parse(completion.updatedAt) >= Date.parse(task.brief.createdAt)),
-  );
+  const completion = freshTaskCompletion(task);
+  const completionIsFresh = Boolean(completion);
   const acceptedBriefVerified = !task.brief
     || (completionIsFresh && completion?.state === "verified");
   const lastOutcome = interrupted ? "interrupted" : (outcome?.status ?? "interrupted");
@@ -771,7 +874,7 @@ export function finishTaskExecution(
   } else if (outcome?.status === "completed" && task.brief && !acceptedBriefVerified) {
     if (completionIsFresh && completion?.state === "awaiting_user") {
       checkpoint.blockedStep ??= "complete the accepted task";
-      checkpoint.blockReason ??= completion.waitingFor ?? "required user input is missing";
+      checkpoint.blockReason ??= completion.dependency?.detail ?? completion.waitingFor ?? "required user input is missing";
       checkpoint.nextStep ??= completion.waitingFor
         ? `Continue after the user provides: ${completion.waitingFor}`
         : "continue after the required user input arrives";
@@ -864,6 +967,15 @@ export function taskCheckpointContext(checkpoint: TaskCheckpoint | undefined): s
       "## Completion receipt",
       `- state: ${checkpoint.completion.state}`,
       ...(checkpoint.completion.waitingFor ? [`- waiting for: ${checkpoint.completion.waitingFor}`] : []),
+      ...(checkpoint.completion.dependency
+        ? [
+            `- dependency kind: ${checkpoint.completion.dependency.kind}`,
+            ...(checkpoint.completion.dependency.capability
+              ? [`- blocked capability: ${checkpoint.completion.dependency.capability}`]
+              : []),
+            ...checkpoint.completion.dependency.evidence.map((item) => `- dependency evidence: ${item}`),
+          ]
+        : []),
       ...checkpoint.completion.evidence.map((item) => `- evidence: ${item}`),
     );
   }
@@ -962,6 +1074,30 @@ function validTaskCheckpoint(value: unknown): value is TaskCheckpoint {
   if (checkpoint.completion !== undefined) {
     if (!checkpoint.completion || typeof checkpoint.completion !== "object" || Array.isArray(checkpoint.completion)) return false;
     const completion = checkpoint.completion as Record<string, unknown>;
+    const dependency = completion.dependency;
+    const dependencyObject = dependency && typeof dependency === "object" && !Array.isArray(dependency)
+      ? dependency as Record<string, unknown>
+      : undefined;
+    const dependencyKind = dependencyObject?.kind;
+    const dependencyCapability = dependencyObject?.capability;
+    const dependencyCapabilityState = typeof dependencyCapability === "string"
+      ? (checkpoint.capabilities as Record<string, TaskCapability>)[dependencyCapability]?.state
+      : undefined;
+    const dependencyValid = dependency === undefined || (
+      dependencyObject
+      && ["missing_secret", "missing_authority", "physical_action", "material_choice", "external_state", "destructive_confirmation"].includes(dependencyKind as string)
+      && typeof dependencyObject.detail === "string" && validCheckpointText(dependencyObject.detail)
+      && Array.isArray(dependencyObject.evidence)
+      && dependencyObject.evidence.length > 0
+      && dependencyObject.evidence.length <= MAX_TASK_DEPENDENCY_EVIDENCE
+      && dependencyObject.evidence.every((item) => typeof item === "string" && item.length > 0 && item.length <= MAX_TASK_EVIDENCE_CHARS)
+      && (dependencyCapability === undefined
+        || (typeof dependencyCapability === "string"
+          && taskStateKey(dependencyCapability, "dependency capability").ok
+          && (dependencyCapabilityState === "blocked" || dependencyCapabilityState === "unavailable")))
+      && ((dependencyKind !== "missing_secret" && dependencyKind !== "missing_authority")
+        || typeof dependencyCapability === "string")
+    );
     if (
       (completion.state !== "verified" && completion.state !== "awaiting_user")
       || !Array.isArray(completion.evidence)
@@ -970,6 +1106,10 @@ function validTaskCheckpoint(value: unknown): value is TaskCheckpoint {
       || (completion.waitingFor !== undefined && !validCheckpointText(completion.waitingFor))
       || (completion.state === "verified" && completion.evidence.length === 0)
       || (completion.state === "awaiting_user" && !completion.waitingFor)
+      || !dependencyValid
+      || (completion.state === "verified" && dependency !== undefined)
+      || (completion.state === "awaiting_user" && dependency !== undefined
+        && dependencyObject?.detail !== completion.waitingFor)
       || !validTimestamp(completion.updatedAt)
     ) return false;
   }

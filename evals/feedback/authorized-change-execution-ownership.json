@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "id": "authorized-change-execution-ownership",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-08-agent-execution-ownership"
+  },
+  "expected": {
+    "outcome": "completed",
+    "maxRounds": 5,
+    "maxToolCalls": 3,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 0,
+    "maxWrongUserDelegations": 0,
+    "minAgentOwnedActions": 1,
+    "requiredStrategies": ["execution-ownership-guard", "verified-agent-action"],
+    "requiredTransitions": []
+  },
+  "observed": {
+    "outcome": "completed",
+    "rounds": 4,
+    "completion": {
+      "state": "verified",
+      "evidence": ["the authorized change was applied and its observable acceptance check passed"]
+    },
+    "events": [
+      {
+        "type": "action_handoff",
+        "owner": "agent",
+        "strategy": "execution-ownership-guard",
+        "authorizedToolAvailable": true,
+        "outcome": "executed"
+      },
+      {
+        "type": "tool_result",
+        "tool": "edit_file",
+        "strategy": "verified-agent-action",
+        "outcome": "success"
+      },
+      {
+        "type": "tool_result",
+        "tool": "read_file",
+        "strategy": "verified-agent-action",
+        "outcome": "success"
+      }
+    ]
+  }
+}
