@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "id": "release-upload-reconciliation",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-08-release-upload"
+  },
+  "expected": {
+    "outcome": "completed",
+    "maxRounds": 4,
+    "maxToolCalls": 4,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 1,
+    "requiredStrategies": ["remote-digest-reconcile"],
+    "requiredTransitions": [
+      {
+        "fromFailureClass": "upload.response-uncertain",
+        "toStrategy": "remote-digest-reconcile",
+        "withinToolCalls": 1
+      }
+    ]
+  },
+  "observed": {
+    "outcome": "completed",
+    "rounds": 3,
+    "completion": {
+      "state": "verified",
+      "evidence": ["the public release asset size and SHA-256 matched the signed local bytes"]
+    },
+    "events": [
+      {
+        "type": "tool_result",
+        "tool": "release_upload",
+        "strategy": "signed-asset-upload",
+        "outcome": "failure",
+        "failureClass": "upload.response-uncertain"
+      },
+      {
+        "type": "tool_result",
+        "tool": "github_release_metadata",
+        "strategy": "remote-digest-reconcile",
+        "outcome": "success"
+      },
+      {
+        "type": "tool_result",
+        "tool": "release_publish",
+        "strategy": "verified-draft-promotion",
+        "outcome": "success"
+      }
+    ]
+  }
+}

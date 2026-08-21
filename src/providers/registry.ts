@@ -97,7 +97,7 @@ export function resolvePlatform(
     : baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
   const managedDeepSeekGateway =
     providerId === "hara-gateway"
-    && /^(?:deepseek-v4-(?:flash|pro)|deepseek-(?:chat|reasoner|pro))$/i.test(modelId ?? "");
+    && /^(?:deepseek-v4-(?:flash|pro|flash-vision-exp)|deepseek-(?:chat|reasoner|pro))$/i.test(modelId ?? "");
   const byProv = managedDeepSeekGateway
     ? { ...BY_PROVIDER["hara-gateway"], reasoning: "deepseek" as const }
     : providerId ? BY_PROVIDER[providerId] : undefined;

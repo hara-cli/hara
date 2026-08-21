@@ -154,7 +154,11 @@ test("Token Plan setup suggestions stay separate from live entitlement and stale
 });
 
 test("DeepSeek model discovery falls back to the official V4 Responses catalog on the exact host", async () => {
-  assert.deepEqual([...DEEPSEEK_FALLBACK_MODELS], ["deepseek-v4-flash", "deepseek-v4-pro"]);
+  assert.deepEqual([...DEEPSEEK_FALLBACK_MODELS], [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash-vision-exp",
+  ]);
   assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com/v1"), [...DEEPSEEK_FALLBACK_MODELS]);
   assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com./v1"), [...DEEPSEEK_FALLBACK_MODELS]);
   assert.deepEqual(deepSeekFallbackModels("https://api.deepseek.com.example/v1"), []);

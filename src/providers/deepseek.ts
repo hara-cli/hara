@@ -3,7 +3,19 @@
 export const DEEPSEEK_RESPONSES_MODELS = Object.freeze([
   "deepseek-v4-flash",
   "deepseek-v4-pro",
+  "deepseek-v4-flash-vision-exp",
 ] as const);
+
+/** DeepSeek's exact official Responses model ids that accept input_image blocks. Keep this separate from
+ * transport support: Flash and Pro use Responses too, but remain text-only. */
+export const DEEPSEEK_RESPONSES_VISION_MODELS = Object.freeze([
+  "deepseek-v4-flash-vision-exp",
+] as const);
+
+export function deepSeekResponsesSupportsImages(modelId?: string): boolean {
+  const normalizedModel = modelId?.trim().toLowerCase();
+  return DEEPSEEK_RESPONSES_VISION_MODELS.some((model) => model === normalizedModel);
+}
 
 function parsedDeepSeekEndpoint(baseURL: string | undefined): URL | undefined {
   if (!baseURL) return undefined;

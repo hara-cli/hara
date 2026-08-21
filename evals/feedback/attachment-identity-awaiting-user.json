@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "id": "attachment-identity-awaiting-user",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-08-attachment-identity"
+  },
+  "expected": {
+    "outcome": "awaiting_user",
+    "maxRounds": 2,
+    "maxToolCalls": 1,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 1,
+    "requiredStrategies": ["verified-attachment-intake"],
+    "requiredTransitions": []
+  },
+  "observed": {
+    "outcome": "awaiting_user",
+    "rounds": 2,
+    "completion": {
+      "state": "awaiting_user",
+      "evidence": [],
+      "waitingFor": "the user must attach the missing source image again"
+    },
+    "events": [
+      {
+        "type": "tool_result",
+        "tool": "inspect_image",
+        "strategy": "verified-attachment-intake",
+        "outcome": "failure",
+        "failureClass": "attachment.identity-missing"
+      }
+    ]
+  }
+}

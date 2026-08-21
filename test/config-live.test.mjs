@@ -591,6 +591,16 @@ test("provider catalog: Ollama and LM Studio are first-class local no-key preset
   );
 });
 
+test("provider catalog: DeepSeek exposes the official visual model while retaining custom ids", () => {
+  const deepseek = providerCatalog().find((provider) => provider.id === "deepseek");
+  assert.equal(deepseek?.customBaseURL, true);
+  assert.deepEqual(deepseek?.knownModels, [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash-vision-exp",
+  ]);
+});
+
 test("provider catalog: Token Plan is the single current Alibaba setup entry and legacy Qwen routes stay loadable", () => {
   const catalog = providerCatalog();
   const tokenPlan = catalog.find((provider) => provider.id === "token-plan");

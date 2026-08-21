@@ -54,7 +54,8 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   // GLM / Zhipu — 4v/4.5v see images; glm-5, glm-4.7, glm-4-flash are text-only.
   { rx: /glm-?\d(?:\.\d+)?v|cogvlm|glm.*vision/i, cap: "vision" },
   { rx: /glm-?\d(?:\.\d+)?(?:-(?:air|flash|plus|long|x|0520))?\b|glm-z|chatglm/i, cap: "text" },
-  // DeepSeek (VL first, then the text families)
+  // DeepSeek (the exact official V4 vision model and VL families first, then the text families)
+  { rx: /^deepseek-v4-flash-vision-exp$/i, cap: "vision" },
   { rx: /deepseek.*vl/i, cap: "vision" },
   { rx: /deepseek/i, cap: "text" },
   // Google

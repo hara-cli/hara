@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "id": "token-plan-stale-model",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-08-token-plan-stale-model"
+  },
+  "expected": {
+    "outcome": "completed",
+    "maxRounds": 4,
+    "maxToolCalls": 2,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 0,
+    "requiredStrategies": ["live-catalog-preflight", "live-authorized-model-migration"],
+    "requiredTransitions": [],
+    "forbiddenSentModels": ["glm-5"]
+  },
+  "observed": {
+    "outcome": "completed",
+    "rounds": 4,
+    "completion": {
+      "state": "verified",
+      "evidence": ["the migrated session sent successfully with the live-authorized replacement model"]
+    },
+    "events": [
+      {
+        "type": "model_request",
+        "model": "glm-5",
+        "strategy": "live-catalog-preflight",
+        "outcome": "blocked"
+      },
+      {
+        "type": "tool_result",
+        "tool": "model_catalog",
+        "strategy": "live-catalog-preflight",
+        "outcome": "success"
+      },
+      {
+        "type": "tool_result",
+        "tool": "session_migrate_model",
+        "strategy": "live-authorized-model-migration",
+        "outcome": "success"
+      },
+      {
+        "type": "model_request",
+        "model": "glm-5.2",
+        "strategy": "live-authorized-model-request",
+        "outcome": "sent"
+      }
+    ]
+  }
+}

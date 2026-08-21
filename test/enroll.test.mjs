@@ -76,6 +76,15 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
   }]);
   assert.equal(gatewayBaseURL(e), "https://gw/v1");
   assert.equal(gatewayBaseURL({ ...e, baseURL: "https://gw/openai" }), "https://gw/openai");
+  assert.deepEqual(
+    parseEnrollResponse("https://gw", {
+      device_token: "vision-token",
+      model: "deepseek-v4-flash-vision-exp",
+      available_models: ["deepseek-v4-flash-vision-exp"],
+    }, "2026-01-01").thinkingEfforts,
+    ["off", "low", "high", "max"],
+    "older gateways that omit thinking_efforts still expose the complete Vision-Exp dial",
+  );
   assert.throws(() => parseEnrollResponse("https://gw", {}, "t"), /device_token/);
   assert.throws(
     () => parseEnrollResponse("https://gw", { device_token: "t1", expires_at: "not-a-date" }, "t"),

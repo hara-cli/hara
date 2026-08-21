@@ -40,6 +40,7 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("openai", "glm-4v");
   V("openai", "glm-4.5v");
   V("openai", "deepseek-vl2");
+  V("deepseek", "deepseek-v4-flash-vision-exp");
   V("openai", "gemini-2.5-pro");
   V("openai", "pixtral-12b");
   V("openai", "llava-1.6");
@@ -106,6 +107,10 @@ test("effective attachment capabilities distinguish native, sidecar, unsupported
   assert.equal(
     effectiveAttachmentCapabilities("openai", "deepseek-v4-pro").image.mode,
     "unsupported",
+  );
+  assert.equal(
+    effectiveAttachmentCapabilities("hara-gateway", "deepseek-v4-flash-vision-exp").image.mode,
+    "native",
   );
   assert.equal(
     effectiveAttachmentCapabilities("openai", "unlisted-private-model").image.mode,

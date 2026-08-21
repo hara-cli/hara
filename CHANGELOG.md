@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.149.0 — 2026-08-21 — native DeepSeek vision and scored feedback improvement
+
+- Add the official `deepseek-v4-flash-vision-exp` model to personal DeepSeek setup and `/model`
+  fallback discovery. Direct DeepSeek connections route it through Responses with native `input_image`
+  blocks, while Flash and Pro retain their text-only boundary and optional image-describer fallback.
+- Recognize Vision-Exp as image-capable throughout attachment routing and preserve DeepSeek's native
+  off / low / high / max thinking controls. A model-level transport regression proves an attached image
+  reaches the exact official Responses request instead of being silently converted to text or omitted.
+- Add a deterministic, credential-free feedback evaluation gate modeled on Codex's scored iteration loop.
+  Sanitized receipts from the canonical Hara feedback channel now enforce outcome, round, tool, approval,
+  intervention, repeated-failure, strategy-transition, model-routing, and observable-completion budgets in
+  every test run; raw prompts, message IDs, credentials, and user paths are rejected. Upgrade with
+  `npm i -g @nanhara/hara@0.149.0`.
+
 ## 0.148.4 — 2026-08-20 — first-class Token Plan and stale-model recovery
 
 - Add Alibaba Cloud Model Studio Token Plan as the single current Alibaba setup entry, with its fixed

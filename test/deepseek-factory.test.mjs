@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createProviderForTarget } from "../dist/providers/factory.js";
 
 const OFFICIAL_DEEPSEEK_BASE = "https://api.deepseek.com";
@@ -100,6 +103,48 @@ test("official DeepSeek V4 Pro factory keeps every thinking level on Responses",
       assert.equal(result.stop, "end", result.errorMsg);
       assert.equal(requestPath, "/responses");
       assert.deepEqual(requestBody.reasoning, { effort: "none" });
+    });
+
+    await t.test("Vision-Exp sends attached images through Responses input_image", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "hara-deepseek-vision-"));
+      const imagePath = join(dir, "fixture.png");
+      writeFileSync(imagePath, Buffer.from("synthetic-image-bytes"));
+      try {
+        const provider = await createProviderForTarget({
+          provider: "deepseek",
+          apiKey: "synthetic-deepseek-key",
+          model: "deepseek-v4-flash-vision-exp",
+          baseURL: OFFICIAL_DEEPSEEK_BASE,
+        }, "low");
+        assert.ok(provider);
+        const result = await provider.turn({
+          system: "inspect the image",
+          history: [{
+            role: "user",
+            content: "What is attached?",
+            images: [{ path: imagePath, mediaType: "image/png" }],
+          }],
+          tools: [],
+          onText: () => {},
+        });
+        assert.equal(result.stop, "end", result.errorMsg);
+        assert.equal(requestPath, "/responses");
+        assert.equal(requestBody.model, "deepseek-v4-flash-vision-exp");
+        assert.deepEqual(requestBody.reasoning, { effort: "low" });
+        assert.deepEqual(requestBody.input, [{
+          role: "user",
+          content: [
+            { type: "input_text", text: "What is attached?" },
+            {
+              type: "input_image",
+              image_url: `data:image/png;base64,${Buffer.from("synthetic-image-bytes").toString("base64")}`,
+              detail: "auto",
+            },
+          ],
+        }]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
   } finally {
     globalThis.fetch = originalFetch;

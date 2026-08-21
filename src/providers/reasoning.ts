@@ -16,7 +16,7 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `qwen_responses` — Alibaba Model Studio Responses API for Qwen: `reasoning: { effort }`, with
  *                         model-specific levels. qwen3.8-max accepts low|medium|xhigh; older supported
  *                         Qwen Responses models also accept `none` and the wider graded dial.
- *  - `deepseek_responses` — DeepSeek V4 Flash/Pro Responses API: `reasoning: { effort }`, with DeepSeek's
+ *  - `deepseek_responses` — DeepSeek V4 Responses API: `reasoning: { effort }`, with DeepSeek's
  *                         documented none|low|high|max values (`none` disables thinking).
  *  - `deepseek`         — DeepSeek V4 OpenAI-compat chat: a `thinking: { type }` on/off object PLUS a
  *                         `reasoning_effort` enum whose native values are `low`|`high`|`max` (the server

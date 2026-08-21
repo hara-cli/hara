@@ -6,6 +6,7 @@ import { getValidQwenAuth } from "./qwen-oauth.js";
 import { createAnthropicProvider } from "./anthropic.js";
 import { createOpenAIProvider } from "./openai.js";
 import { createResponsesProvider } from "./responses.js";
+import { deepSeekResponsesSupportsImages } from "./deepseek.js";
 import { resolvePlatform } from "./registry.js";
 import type { Provider } from "./types.js";
 import type { ProviderTarget } from "./target.js";
@@ -47,7 +48,7 @@ export async function createProviderForTarget(
       label: provider,
       reasoningEffort,
       reasoningStyle: caps.reasoning,
-      supportsImages: caps.reasoning !== "deepseek_responses",
+      supportsImages: caps.reasoning !== "deepseek_responses" || deepSeekResponsesSupportsImages(model),
       omitAuthorization: providerIsLocal(provider),
       fetch,
     });

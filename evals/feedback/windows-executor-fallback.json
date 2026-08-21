@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "id": "windows-executor-fallback",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-08-windows-executor"
+  },
+  "expected": {
+    "outcome": "completed",
+    "maxRounds": 4,
+    "maxToolCalls": 3,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 2,
+    "requiredStrategies": ["powershell-native"],
+    "requiredTransitions": [
+      {
+        "fromFailureClass": "executor.unavailable",
+        "toStrategy": "powershell-native",
+        "withinToolCalls": 1
+      }
+    ]
+  },
+  "observed": {
+    "outcome": "completed",
+    "rounds": 3,
+    "completion": {
+      "state": "verified",
+      "evidence": ["the native Windows command completed and its expected output was observed"]
+    },
+    "events": [
+      {
+        "type": "tool_result",
+        "tool": "bash",
+        "strategy": "git-bash",
+        "outcome": "failure",
+        "failureClass": "executor.unavailable"
+      },
+      {
+        "type": "tool_result",
+        "tool": "powershell",
+        "strategy": "powershell-native",
+        "outcome": "success"
+      }
+    ]
+  }
+}

@@ -25,7 +25,7 @@ export const CODING_PLAN_FALLBACK_MODELS = Object.freeze([
 ]);
 
 /** DeepSeek's official Responses catalog. Live `/models` still wins, but its availability should not be
- * required for the model picker to expose the two documented V4 choices. */
+ * required for the model picker to expose the three documented V4 choices. */
 export const DEEPSEEK_FALLBACK_MODELS = DEEPSEEK_RESPONSES_MODELS;
 
 export function codingPlanFallbackModels(baseURL: string | undefined): string[] {

@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "id": "video-upload-strategy-switch",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-08-video-upload"
+  },
+  "expected": {
+    "outcome": "completed",
+    "maxRounds": 8,
+    "maxToolCalls": 5,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 2,
+    "requiredStrategies": ["workspace-tool-scan", "existing-python-uploader"],
+    "requiredTransitions": [
+      {
+        "fromFailureClass": "upload.multipart-params",
+        "toStrategy": "existing-python-uploader",
+        "withinToolCalls": 2
+      }
+    ]
+  },
+  "observed": {
+    "outcome": "completed",
+    "rounds": 6,
+    "completion": {
+      "state": "verified",
+      "evidence": [
+        "the existing workspace uploader returned a successful remote object receipt"
+      ]
+    },
+    "events": [
+      {
+        "type": "tool_result",
+        "tool": "workspace_search",
+        "strategy": "workspace-tool-scan",
+        "outcome": "success"
+      },
+      {
+        "type": "tool_result",
+        "tool": "powershell",
+        "strategy": "curl-multipart",
+        "outcome": "failure",
+        "failureClass": "upload.multipart-params"
+      },
+      {
+        "type": "tool_result",
+        "tool": "powershell",
+        "strategy": "curl-multipart",
+        "outcome": "failure",
+        "failureClass": "upload.multipart-params"
+      },
+      {
+        "type": "tool_result",
+        "tool": "python",
+        "strategy": "existing-python-uploader",
+        "outcome": "success"
+      }
+    ]
+  }
+}

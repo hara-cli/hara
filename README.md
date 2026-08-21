@@ -129,9 +129,9 @@ On the official `https://api.deepseek.com` endpoint, `deepseek-v4-flash` and `de
 Responses API. Hara resends the complete durable message/tool history on every request because this
 endpoint is stateless: it never depends on `previous_response_id`, `conversation`, or server-side storage.
 Explicit custom or legacy ids are not silently remapped; their availability remains provider-side.
-DeepSeek Responses does not accept image/file input, so Hara keeps the existing
-text-only model boundary and uses an explicitly configured image describer when needed.
-If live model discovery is unavailable, `/model` still offers the two documented V4 models as a
+DeepSeek V4 Flash and Pro remain text-only, while `deepseek-v4-flash-vision-exp` accepts native image
+input. Hara keeps the existing image-describer fallback only for the text-only models.
+If live model discovery is unavailable, `/model` still offers the three documented V4 models as a
 host-scoped fallback; a successful live `/models` response remains authoritative.
 
 **Any OpenAI-compatible endpoint** (GLM, Kimi, OpenAI, local servers)
@@ -178,8 +178,9 @@ Replies follow the latest user message's language by default. Use `hara --lang z
 launch, and `hara --lang auto` to restore per-message matching.
 
 **Vision** — hara **auto-detects** whether your main model can see images. A vision model (Claude, gpt-4o,
-qwen-vl, glm-4v…) gets pasted images **inline**. For a **text-only** model (DeepSeek, coding models), set a
-describer — the "eyes" — and hara OCRs/describes each pasted image into text first:
+qwen-vl, glm-4v, `deepseek-v4-flash-vision-exp`…) gets pasted images **inline**. For a **text-only** model
+(including DeepSeek V4 Flash/Pro and text-only coding models), set a describer — the "eyes" — and hara
+OCRs/describes each pasted image into text first:
 ```bash
 hara config set visionModel qwen-vl-max   # a vision model on the same plan/key
 # point it elsewhere if your endpoint doesn't serve vision:
@@ -195,8 +196,9 @@ hara config set reasoningEffort high     # or off / low / medium / max
 ```
 hara expresses it the way each endpoint wants (OpenAI `reasoning_effort`, Anthropic thinking budget,
 DashScope `enable_thinking`, **DeepSeek** Chat `thinking` + `reasoning_effort`, or DeepSeek V4 Responses
-`reasoning.effort`). DeepSeek Flash/Pro expose three thinking grades—`low`, `high`, `max`—plus `off`;
-on Responses, Hara maps `off` to the documented `none` value without changing transport. The shared
+`reasoning.effort`). DeepSeek V4 Flash, Pro, and Vision-Exp expose three thinking grades—`low`, `high`,
+`max`—plus `off`; Vision-Exp also accepts native image attachments through Responses `input_image`.
+On Responses, Hara maps `off` to the documented `none` value without changing transport. The shared
 cross-provider `medium` value normalizes to DeepSeek `high`. In the TUI, bare `/model` opens a picker —
 ↑↓ pick a model, **←→ set the thinking level**.
 

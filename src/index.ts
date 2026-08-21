@@ -1067,7 +1067,7 @@ async function runSetup(): Promise<void> {
     if (modelChoices.length) {
       out(liveModels.length
         ? c.dim("\nModels authorized for this key:\n")
-        : c.yellow("\nKnown Token Plan text models (not yet verified for this key):\n"));
+        : c.yellow("\nKnown provider models (not yet verified for this key):\n"));
       modelChoices.forEach((modelId, i) => out(`  ${c.bold(String(i + 1))}) ${modelId}\n`));
       const defaultIndex = Math.max(0, modelChoices.indexOf(defaultModel));
       while (true) {

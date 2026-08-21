@@ -18,6 +18,7 @@ import {
   TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
   TOKEN_PLAN_OPENAI_BASE_URL,
 } from "./providers/alibaba.js";
+import { DEEPSEEK_RESPONSES_MODELS } from "./providers/deepseek.js";
 
 export type ProviderId =
   | "anthropic"
@@ -107,7 +108,7 @@ export interface HaraConfig {
    *   - "low"    → small budget (anthropic budget_tokens, openai reasoning_effort:"low")
    *   - "medium" → balanced (anthropic adaptive, openai reasoning_effort:"medium")
    *   - "high"   → large budget (anthropic budget_tokens up, openai reasoning_effort:"high")
-   *  Provider adapters map this to the closest supported control. Official DeepSeek V4 Flash/Pro use
+   *  Provider adapters map this to the closest supported control. Official DeepSeek V4 models use
    *  Responses for the complete native none/low/high/max set (`off` maps to `none`). */
   reasoningEffort: "off" | "low" | "medium" | "high" | "max" | undefined;
   /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
@@ -143,8 +144,8 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
   },
   "qwen-oauth": { model: "coder-model", envKey: "QWEN_OAUTH_TOKEN" },
   openai: { model: "gpt-4o-mini", envKey: "OPENAI_API_KEY" },
-  // GLM / DeepSeek / OpenRouter expose OpenAI-compatible endpoints. Official DeepSeek V4 Flash/Pro
-  // models are routed through Responses; its other model ids keep using Chat. The preset baseURL is
+  // GLM / DeepSeek / OpenRouter expose OpenAI-compatible endpoints. Official DeepSeek V4 models are
+  // routed through Responses; its other model ids keep using Chat. The preset baseURL is
   // applied by loadConfig (merged.baseURL ?? d.baseURL), so the setup wizard never asks for a URL.
   glm: {
     model: "glm-4.6",
@@ -204,7 +205,13 @@ const PROVIDER_LABELS: Record<ProviderId, Omit<ProviderCatalogEntry, "id" | "def
   qwen: { label: "Qwen (legacy DashScope)", location: "cloud", auth: "api-key", customBaseURL: true, legacy: true },
   "qwen-oauth": { label: "Qwen Code OAuth (legacy, not Token Plan)", location: "cloud", auth: "oauth", customBaseURL: false, legacy: true },
   glm: { label: "GLM (Zhipu)", location: "cloud", auth: "api-key", customBaseURL: true },
-  deepseek: { label: "DeepSeek", location: "cloud", auth: "api-key", customBaseURL: true },
+  deepseek: {
+    label: "DeepSeek",
+    location: "cloud",
+    auth: "api-key",
+    customBaseURL: true,
+    knownModels: DEEPSEEK_RESPONSES_MODELS,
+  },
   openrouter: { label: "OpenRouter", location: "cloud", auth: "api-key", customBaseURL: true },
   ollama: { label: "Ollama", location: "local", auth: "none", customBaseURL: true },
   lmstudio: { label: "LM Studio", location: "local", auth: "none", customBaseURL: true },

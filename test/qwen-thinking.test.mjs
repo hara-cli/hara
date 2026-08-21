@@ -110,8 +110,12 @@ test("resolvePlatform: ANY vendor's /anthropic endpoint → anthropic wire + thi
   }
 });
 
-test("resolvePlatform: DeepSeek V4 Flash/Pro use Responses; legacy ids keep Chat", () => {
-  assert.deepEqual([...DEEPSEEK_RESPONSES_MODELS], ["deepseek-v4-flash", "deepseek-v4-pro"]);
+test("resolvePlatform: official DeepSeek V4 models use Responses; legacy ids keep Chat", () => {
+  assert.deepEqual([...DEEPSEEK_RESPONSES_MODELS], [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash-vision-exp",
+  ]);
   for (const model of DEEPSEEK_RESPONSES_MODELS) {
     const caps = resolvePlatform("deepseek", "https://api.deepseek.com/v1", undefined, model);
     assert.equal(caps.wireApi, "responses", model);
@@ -125,6 +129,11 @@ test("resolvePlatform: DeepSeek V4 Flash/Pro use Responses; legacy ids keep Chat
     resolvePlatform("hara-gateway", "https://gw.nanhara.tech/v1", undefined, "deepseek-v4-pro").reasoning,
     "deepseek",
     "a canonical managed model keeps DeepSeek thinking controls through Hara Control",
+  );
+  assert.equal(
+    resolvePlatform("hara-gateway", "https://gw.nanhara.tech/v1", undefined, "deepseek-v4-flash-vision-exp").reasoning,
+    "deepseek",
+    "the managed vision model keeps DeepSeek thinking controls through Hara Control",
   );
   assert.equal(
     resolvePlatform("hara-gateway", "https://gw.nanhara.tech/v1", undefined, "glm-5").reasoning,
