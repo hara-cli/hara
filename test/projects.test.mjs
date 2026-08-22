@@ -115,27 +115,32 @@ test("projects registry canonicalizes homes and indexes every material role over
     assert.deepEqual(resolveAgent("shared"), {
       name: "shared",
       description: "global shared",
+      identity: { version: 1, displayName: "Shared", bio: "global shared", source: "hara" },
       home: "",
     }, "a global role wins an unqualified collision");
     assert.deepEqual(resolveAgent("global:shared"), {
       name: "shared",
       description: "global shared",
+      identity: { version: 1, displayName: "Shared", bio: "global shared", source: "hara" },
       home: "",
     }, "the explicit global namespace resolves the same canonical role gateway sessions persist");
     assert.deepEqual(resolveAgent(" GLOBAL : shared "), {
       name: "shared",
       description: "global shared",
+      identity: { version: 1, displayName: "Shared", bio: "global shared", source: "hara" },
       home: "",
     }, "qualified namespaces are case/whitespace friendly");
     assert.deepEqual(resolveAgent("shared", alphaAlias), {
       name: "shared",
       description: "alpha override",
+      identity: { version: 1, displayName: "Shared", bio: "alpha override", source: "hara" },
       home: alphaReal,
       project: "alpha",
     }, "a caller with a current home prefers that project's override before the global fallback");
     assert.deepEqual(resolveAgent("ALPHA:shared"), {
       name: "shared",
       description: "alpha override",
+      identity: { version: 1, displayName: "Shared", bio: "alpha override", source: "hara" },
       home: alphaReal,
       project: "alpha",
     });

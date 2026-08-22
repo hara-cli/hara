@@ -18,6 +18,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { loadRoles, loadGlobalRoles, type Role } from "./roles.js";
+import type { AgentPublicIdentity } from "./agent-identity.js";
 import { sleepSync } from "../sync-sleep.js";
 
 export interface RegisteredProject {
@@ -28,6 +29,7 @@ export interface RegisteredProject {
 export interface AgentIndexEntry {
   name: string;
   description: string;
+  identity?: AgentPublicIdentity;
   home: string;
   project?: string;
 }
@@ -297,6 +299,8 @@ function sameRoleDefinition(a: Role, b: Role): boolean {
     sameList(a.denyTools, b.denyTools) &&
     a.readOnly === b.readOnly &&
     a.modelInvocable === b.modelInvocable &&
+    a.home === b.home &&
+    JSON.stringify(a.identity) === JSON.stringify(b.identity) &&
     sameList(a.compatibilityWarnings, b.compatibilityWarnings)
   );
 }
@@ -305,7 +309,12 @@ function sameRoleDefinition(a: Role, b: Role): boolean {
 export function buildAgentsIndex(profileId?: string): AgentIndexEntry[] {
   const globals = loadGlobalRoles(profileId);
   const globalById = new Map(globals.map((role) => [role.id, role]));
-  const out: AgentIndexEntry[] = globals.map((role) => ({ name: role.id, description: role.description, home: "" }));
+  const out: AgentIndexEntry[] = globals.map((role) => ({
+    name: role.id,
+    description: role.description,
+    identity: role.identity,
+    home: role.home ?? "",
+  }));
   for (const project of loadProjects()) {
     let roles: Role[] = [];
     try {
@@ -316,7 +325,13 @@ export function buildAgentsIndex(profileId?: string): AgentIndexEntry[] {
     for (const role of roles) {
       const global = globalById.get(role.id);
       if (global && sameRoleDefinition(global, role)) continue;
-      out.push({ name: role.id, description: role.description, home: project.path, project: project.name });
+      out.push({
+        name: role.id,
+        description: role.description,
+        identity: role.identity,
+        home: project.path,
+        project: project.name,
+      });
     }
   }
   return out;

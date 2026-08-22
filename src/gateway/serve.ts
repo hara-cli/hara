@@ -55,6 +55,33 @@ export async function resolveGatewayAgent(ref: string, cwd: string, sessionId: s
   return resolveAgent(ref, cwd, loadSession(sessionId)?.meta.profileId);
 }
 
+/** Bounded chat-friendly agent catalog. Role bodies and tool policy never enter the connector response. */
+export async function listGatewayAgents(query: string, cwd: string, sessionId: string): Promise<Array<{
+  ref: string;
+  description: string;
+  home: string;
+}>> {
+  const { buildAgentsIndex, canonicalProjectPath } = await import("../org/projects.js");
+  const profileId = loadSession(sessionId)?.meta.profileId;
+  const preferred = canonicalProjectPath(cwd);
+  const needle = query.trim().toLowerCase();
+  return buildAgentsIndex(profileId)
+    .filter((entry) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(entry.name))
+    .map((entry) => ({
+      ref: entry.project ? `${entry.project}:${entry.name}` : `global:${entry.name}`,
+      description: entry.description.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120),
+      home: entry.home,
+      local: Boolean(preferred && entry.home && canonicalProjectPath(entry.home) === preferred),
+      global: !entry.project,
+    }))
+    .filter((entry) => !needle || `${entry.ref} ${entry.description}`.toLowerCase().includes(needle))
+    .sort((left, right) => Number(right.local) - Number(left.local)
+      || Number(right.global) - Number(left.global)
+      || left.ref.localeCompare(right.ref))
+    .slice(0, 16)
+    .map(({ ref, description, home }) => ({ ref, description, home }));
+}
+
 /** Whether a user may drive the gateway. Empty allowlist = nobody (safe default — never wide-open). */
 export function isAllowed(userId: number | string, allowlist: Set<string>): boolean {
   return allowlist.size > 0 && allowlist.has(String(userId));
@@ -1186,8 +1213,18 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       if (cmd.cmd === "help")
         return sendMessage(
           m.chatId,
-          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/agent <name|project:name|main> — who answers this thread (default: main)\n/voice · /say <text> — speech · /send <path> — send a file\n/detach — stop injecting replies into bound tmux panes\n/help\nanything else = run hara here",
+          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/agents [search] — available agents\n/agent <name|project:name|main> — switch to that agent's independent thread\n/voice · /say <text> — speech · /send <path> — send a file\n/detach — stop injecting replies into bound tmux panes\n/help\nanything else = run hara here",
         );
+      if (cmd.cmd === "agents") {
+        const agents = await listGatewayAgents(cmd.arg, ctx.cwd, ctx.sessionId);
+        const rows = ["main — built-in Hara", ...agents.map((agent) => (
+          `${agent.ref}${agent.description ? ` — ${agent.description}` : ""}`
+        ))];
+        return sendMessage(
+          m.chatId,
+          `🤖 available agents${cmd.arg ? ` matching '${cmd.arg}'` : ""}:\n${rows.join("\n")}\n\nUse /agent <exact ref>. Each agent keeps separate history.`,
+        );
+      }
       if (cmd.cmd === "agent") {
         // Per-thread agent switch, resolved via the GLOBAL index: an agent with a home also /cd's the thread
         // there (its data + AGENTS.md context — correctness over chat continuity; /agent main switches back,
@@ -1196,7 +1233,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         if (cmd.arg === "main" || cmd.arg === "off") {
           setChatAgent(adapter.name, m.chatId, undefined, who);
           const restored = chatContext(adapter.name, m.chatId, cwd, who);
-          return sendMessage(m.chatId, `🤖 back to the main agent.\n📂 ${restored.cwd}`);
+          return sendMessage(m.chatId, `🤖 back to the main agent's independent thread.\n📂 ${restored.cwd}\n🧵 ${restored.sessionId.slice(-18)}`);
         }
         // A bare name means the override in the thread's current project when one exists; explicit
         // `global:name` and `project:name` remain deterministic. This avoids making a local reviewer
@@ -1206,7 +1243,8 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         if ("ambiguous" in hit) return sendMessage(m.chatId, `'${cmd.arg}' exists in several projects — pick one:\n${hit.ambiguous.map((e) => `${e.project}:${e.name}`).join("\n")}`);
         const agentRef = hit.project ? `${hit.project}:${hit.name}` : `global:${hit.name}`;
         setChatAgent(adapter.name, m.chatId, agentRef, who, hit.home || undefined);
-        return sendMessage(m.chatId, `🤖 this thread now talks to ${agentRef}${hit.home ? `\n📂 ${hit.home}` : ""}\n/agent main switches back`);
+        const selected = chatContext(adapter.name, m.chatId, cwd, who);
+        return sendMessage(m.chatId, `🤖 now talking to ${agentRef} in its independent thread\n📂 ${selected.cwd}\n🧵 ${selected.sessionId.slice(-18)}\n/agent main switches back`);
       }
       if (cmd.cmd === "detach") {
         const { unbindBinds } = await import("./tmux-routes.js");
@@ -1239,6 +1277,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
           idPrefix,
           limit: 10,
         }).filter((session) => ownsChatSession(adapter.name, m.chatId, session.id, who))
+          .filter((session) => session.agentRef === ctx.agent)
           .map((x) => `${x.id}  ${x.title || "(untitled)"}`)
           .join("\n");
         return sendMessage(
@@ -1247,9 +1286,11 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         );
       }
       if (cmd.cmd === "resume") {
+        const exactSession = loadSession(cmd.arg);
         const exactOwned =
-          loadSession(cmd.arg)?.meta.id === cmd.arg
+          exactSession?.meta.id === cmd.arg
           && ownsChatSession(adapter.name, m.chatId, cmd.arg, who)
+          && exactSession.meta.agentRef === ctx.agent
             ? [cmd.arg]
             : [];
         const candidates = exactOwned.length
@@ -1259,7 +1300,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
               sourceName: adapter.name,
               idPrefix: chatSessionIdPrefix(adapter.name, m.chatId, who),
               includeArchived: true,
-            }).map((session) => session.id);
+            }).filter((session) => session.agentRef === ctx.agent).map((session) => session.id);
         const match = resolveOwnedSessionId(adapter.name, m.chatId, cmd.arg, candidates, who);
         if (!match) return sendMessage(m.chatId, `no session '${cmd.arg}' in this chat thread`);
         if ("ambiguous" in match) return sendMessage(m.chatId, `ambiguous session '${cmd.arg}' — use more characters`);

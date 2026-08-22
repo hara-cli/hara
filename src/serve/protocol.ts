@@ -12,7 +12,8 @@
 //                                                        page:{hasMore,limit,nextCursor?}}
 //                                                        Interactive sessions only; automation history has
 //                                                        its own cursor under automation.list.
-//   session.create    {cwd?,approval?}           → {sessionId,model,profileId,approval}
+//   session.create    {cwd?,approval?,agentRef?} → {sessionId,model,profileId,approval,agentRef?}
+//   agents.list       {cwd?,sessionId?}          → {agents,offices,currentOfficeId}
 //   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    approval only migrates legacy sessions with no saved choice.
 //   session.history   {sessionId}                → {sessionId,model,profileId,approval?,history:[{role,text}],readOnly:true}

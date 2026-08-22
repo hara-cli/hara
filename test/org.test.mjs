@@ -60,6 +60,40 @@ test("org: scaffold + load roles (frontmatter + tool restriction)", () => {
   }
 });
 
+test("loadRoles keeps public identity separate from the private role body", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-org-identity-"));
+  try {
+    mkdirSync(join(dir, ".git"));
+    mkdirSync(join(dir, ".hara", "roles"), { recursive: true });
+    writeFileSync(join(dir, ".hara", "roles", "designer.md"), [
+      "---",
+      "name: designer",
+      "description: Owns product design",
+      "display-name: Jony",
+      "role: 首席设计官",
+      "vibe: 极简、温和、对细节偏执",
+      "traits: [极简, 温和, 细节偏执]",
+      "emoji: 🎨",
+      "accent: #4f9c8f",
+      "character: designer",
+      "---",
+      "PRIVATE DESIGNER SYSTEM PROMPT",
+      "",
+    ].join("\n"));
+    const designer = loadRoles(dir).find((role) => role.id === "designer");
+    assert.equal(designer.identity.displayName, "Jony");
+    assert.equal(designer.identity.title, "首席设计官");
+    assert.equal(designer.identity.bio, "极简、温和、对细节偏执");
+    assert.deepEqual(designer.identity.traits, ["极简", "温和", "细节偏执"]);
+    assert.equal(designer.identity.emoji, "🎨");
+    assert.equal(designer.identity.accent, "#4f9c8f");
+    assert.doesNotMatch(JSON.stringify(designer.identity), /PRIVATE DESIGNER SYSTEM PROMPT/);
+    assert.equal(designer.system, "PRIVATE DESIGNER SYSTEM PROMPT");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("loadRoles: a role markdown symlink to .env never becomes a model persona", () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-org-protected-"));
   try {

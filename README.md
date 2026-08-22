@@ -442,8 +442,10 @@ Personal.
 
 ### The org — what makes hara different
 
-Define role-agents in `.hara/roles/*.md` — each is a persona (the file body) plus frontmatter: `owns`
-(keywords that route a task here), optional `rejects`, `model`, and `allowTools`/`denyTools`. `hara org
+Define role-agents in `.hara/roles/*.md` — each is a private persona (the file body) plus frontmatter:
+`owns` (keywords that route a task here), optional `rejects`, `model`, `allowTools`/`denyTools`, and a
+bounded public profile (`display-name`, `title`, `bio`, `traits`, `emoji`, `avatar`, `identity-theme`,
+`accent`, `character`). `hara org
 "<task>"` routes the task to the role that **owns** it (keyword match, LLM fallback) and runs that role's
 agent — e.g. a read-only `reviewer` that reports issues vs an `implementer` that edits code. `hara roles`
 lists them, `hara roles init` scaffolds a starter set, and `--role <id>` forces a specific role. Add
@@ -457,10 +459,16 @@ structured completion/cancellation/error state, and a bounded queue; the native 
 on an isolated checklist and read-only tool floor. Concurrency defaults to 8 (`HARA_MAX_CONCURRENCY`), and
 delegated token totals count toward usage without changing the parent conversation's context gauge.
 
+OpenClaw and Hermes identities work in place too. Hara reads the installed OpenClaw Agent registry,
+maps each workspace's `IDENTITY.md` (plus safe local avatar) into the public Agent directory, and keeps
+`SOUL.md`/`AGENTS.md` private until that Agent is selected. A personal Hermes `SOUL.md` appears as a
+Hermes Agent with the same private boundary. Remote avatar URLs are never fetched automatically. Hara
+does not import provider keys, channel bindings, user memory, sessions, or credentials from either tool.
+
 Claude Code role collections work in place: Hara discovers both `~/.claude/agents/*.md` and project
 `.claude/agents/*.md`, translates common Claude tool names (`Read`, `Edit`, `Bash`, `WebSearch`, …), and
 treats Claude aliases and Claude-only model ids as “inherit the current Hara model” (a role cannot silently
-switch the active provider). Precedence is plugin < managed org < personal Claude < personal Hara < project
+switch the active provider). Precedence is plugin < installed interop identity < managed org < personal Claude < personal Hara < project
 Claude < project Hara. Ordinary Hara turns receive only a compact,
 guarded catalog of role names and descriptions; a role's full prompt is loaded only after that role is
 selected. This lets the main agent ask an architect, debugger, tester, or reviewer for bounded independent
@@ -473,8 +481,9 @@ Register project homes with `hara projects add <name> <absolute-path>`, then `ha
 address book across `~/.hara/roles` and each registered project's roles. A qualified address such as
 `shop:reviewer` is unambiguous; both `hara org --role shop:reviewer "<task>"` and one-shot `hara -p "<task>"
 --role shop:reviewer` execute at that agent's home, with its own `AGENTS.md`, live project config, role model,
-and allow/deny/read-only tool policy. `global:<name>` is portable and runs in the current project. A bare name
-uses the local role first and otherwise must resolve unambiguously.
+and allow/deny/read-only tool policy. A native `global:<name>` is portable and runs in the current project;
+an imported OpenClaw global keeps its declared Agent workspace. A bare name uses the local role first and
+otherwise must resolve unambiguously.
 
 Beyond routing, **`hara plan "<task>"`** makes the org *plan*: it decomposes the task into atoms,
 sequences them as a DAG, and executes each step (optionally routed to a role) behind a per-step

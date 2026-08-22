@@ -89,6 +89,10 @@ export interface RegularFileSnapshot {
   nlink: number;
 }
 
+export interface RegularFileBytesSnapshot extends Omit<RegularFileSnapshot, "text"> {
+  bytes: Buffer;
+}
+
 /** A context-loader rejected a protected path before any bytes could enter a model prompt. */
 export class ProtectedContextFileError extends Error {
   readonly code = "HARA_PROTECTED_CONTEXT_FILE";
@@ -241,6 +245,23 @@ export function readVerifiedRegularFileSnapshotSync(
   maxBytes = MAX_EDIT_READ_BYTES,
   options: VerifiedRegularFileReadOptions = {},
 ): RegularFileSnapshot {
+  const snapshot = readVerifiedRegularFileBytesSync(path, maxBytes, options);
+  return {
+    text: decodeUtf8Strict(snapshot.bytes, path),
+    dev: snapshot.dev,
+    ino: snapshot.ino,
+    mode: snapshot.mode,
+    nlink: snapshot.nlink,
+  };
+}
+
+/** Binary-safe synchronous counterpart for bounded local presentation assets. It retains the same
+ * no-follow, hard-link, canonical-path, and before/after identity guarantees as the text reader. */
+export function readVerifiedRegularFileBytesSync(
+  path: string,
+  maxBytes = MAX_EDIT_READ_BYTES,
+  options: VerifiedRegularFileReadOptions = {},
+): RegularFileBytesSnapshot {
   const action = options.action ?? "read";
   if (options.protectSensitive !== false) {
     const denied = sensitiveFileError(path, action);
@@ -277,7 +298,7 @@ export function readVerifiedRegularFileSnapshotSync(
       || latest.ctimeMs !== info.ctimeMs
     ) throw new Error(`refusing to read ${path}: file changed while reading it`);
     return {
-      text: decodeUtf8Strict(bytes, path),
+      bytes,
       dev: info.dev,
       ino: info.ino,
       mode: info.mode & 0o777,

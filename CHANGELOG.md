@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.151.0 — 2026-08-22 — first-class Agent identities and independent conversations
+
+- Add a bounded public Agent identity contract and a first-class `agents.list` Serve catalog with project,
+  workspace, and global-office membership. Names, titles, bios, traits, emoji, safe avatars, and visual themes
+  can cross into Desktop, while role bodies, memories, tool policy, provider details, and credentials remain
+  private execution state.
+- Import installed OpenClaw Agent workspaces and Hermes `SOUL.md` identities read-only. OpenClaw
+  `IDENTITY.md` supplies the public profile, workspace-local avatars are verified and embedded safely, and
+  private `SOUL.md` / `AGENTS.md` instructions apply only after that exact Agent is selected. Native Hara roles
+  retain collision precedence and can define the same public fields in frontmatter.
+- Bind every selected Agent to its own persisted session identity and working home across Serve, Desktop, and
+  chat gateways. Two Agents in one directory can no longer reuse a transcript; Feishu and other gateways add
+  `/agents [search]`, exact `/agent <ref>` switching, Agent-scoped `/sessions` and `/resume`, and safe migration
+  away from legacy mixed-persona routing pointers. Upgrade with `npm i -g @nanhara/hara@0.151.0`.
+
 ## 0.150.0 — 2026-08-22 — agent-owned execution and reviewed business learning
 
 - Make execution ownership an engine contract for accepted change tasks. A model can no longer finish by

@@ -916,17 +916,19 @@ test("chat ctx: /cd round trips restore each cwd thread and mutations preserve c
     const def = "/work/default";
     const a = chatContext("telegram", 42, def);
     assert.equal(a.cwd, def);
-    assert.equal(a.sessionId, `telegram-42-${cwdTag(def)}`);
+    assert.equal(a.sessionId, `telegram-42-${cwdTag(def)}-m2`);
     assert.deepEqual(chatContext("telegram", 42, def), a); // stable
 
     assert.equal(toggleVoice("telegram", 42), true);
     assert.equal(setChatAgent("telegram", 42, "reviewer"), "reviewer");
+    const reviewerDefault = chatContext("telegram", 42, def);
+    assert.notEqual(reviewerDefault.sessionId, a.sessionId, "selecting an agent leaves main history untouched");
     const beforeSwitch = JSON.parse(readFileSync(join(home, ".hara", "gateway", "chats.json"), "utf8"))["telegram:42"].lastUsed;
 
     const projSid = chatCd("telegram", 42, "/work/projB"); // /cd → that project's own thread
     const afterSwitch = JSON.parse(readFileSync(join(home, ".hara", "gateway", "chats.json"), "utf8"))["telegram:42"];
     assert.equal(afterSwitch.lastUsed, beforeSwitch, "/cd preserves lastUsed instead of replacing the entry");
-    assert.equal(projSid, `telegram-42-${cwdTag("/work/projB")}`);
+    assert.match(projSid, new RegExp(`^telegram-42-${cwdTag("/work/projB")}-a[a-f0-9]{16}$`));
     assert.notEqual(cwdTag("/work/projB"), cwdTag(def)); // different dirs → different threads
     const b = chatContext("telegram", 42, def);
     assert.equal(b.cwd, "/work/projB");
@@ -935,10 +937,10 @@ test("chat ctx: /cd round trips restore each cwd thread and mutations preserve c
     assert.equal(b.agent, "reviewer", "/cd preserves agent selection");
 
     const forked = newChatSession("telegram", 42, def); // /new forks the CURRENT dir's thread
-    assert.equal(forked, `telegram-42-${cwdTag("/work/projB")}-1`);
+    assert.match(forked, new RegExp(`^telegram-42-${cwdTag("/work/projB")}-a[a-f0-9]{16}-1$`));
     assert.equal(chatContext("telegram", 42, def).sessionId, forked);
 
-    assert.equal(chatCd("telegram", 42, def), a.sessionId, "returning to a cwd restores its original thread");
+    assert.equal(chatCd("telegram", 42, def), reviewerDefault.sessionId, "returning to a cwd restores this agent's original thread");
     assert.equal(chatCd("telegram", 42, "/work/projB"), forked, "returning again restores its forked thread");
 
     setChatSession("telegram", 42, "explicit-session", "/work/other"); // /resume sets id + follows its cwd
@@ -991,6 +993,11 @@ test("chat agent homes preserve their own threads and /agent main restores the p
 
     setChatAgent("feishu", "dm-1", "coder", undefined, "/agents/coder");
     assert.equal(chatContext("feishu", "dm-1", "/ignored").sessionId, coderFork, "role home restores its prior fork");
+    setChatAgent("feishu", "dm-1", "reviewer", undefined, "/agents/coder");
+    const sameHomeReviewer = chatContext("feishu", "dm-1", "/ignored");
+    assert.notEqual(sameHomeReviewer.sessionId, coderFork, "two agents in one home have different transcripts");
+    setChatAgent("feishu", "dm-1", "coder", undefined, "/agents/coder");
+    assert.equal(chatContext("feishu", "dm-1", "/ignored").sessionId, coderFork, "switching back restores the exact agent thread");
     setChatAgent("feishu", "dm-1", undefined);
     assert.equal(chatContext("feishu", "dm-1", "/ignored").sessionId, main.sessionId);
 
@@ -1001,7 +1008,48 @@ test("chat agent homes preserve their own threads and /agent main restores the p
     setChatAgent("feishu", "dm-1", undefined);
     const afterGlobal = chatContext("feishu", "dm-1", "/ignored");
     assert.equal(afterGlobal.cwd, "/work/portable", "clearing a global role does not resurrect a stale project-role return cwd");
-    assert.equal(afterGlobal.sessionId, portableThread);
+    assert.notEqual(afterGlobal.sessionId, portableThread, "main does not reuse the global agent's project thread");
+  } finally {
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("legacy selected-Agent stores retire ambiguous cwd pointers instead of leaking them into main", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-gw-agent-migration-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const gatewayDir = join(home, ".hara", "gateway");
+    mkdirSync(gatewayDir, { recursive: true });
+    writeFileSync(join(gatewayDir, "chats.json"), JSON.stringify({
+      "feishu:dm-legacy": {
+        cwd: "/work/mixed",
+        sessionId: "legacy-mixed-session",
+        fork: 3,
+        agent: "global:reviewer",
+        threads: {
+          "/work/mixed": { sessionId: "legacy-mixed-session", fork: 3 },
+          "/work/other": { sessionId: "legacy-other-session", fork: 1 },
+        },
+      },
+    }));
+
+    const migrated = chatContext("feishu", "dm-legacy", "/work/default");
+    assert.equal(migrated.agent, "global:reviewer");
+    assert.match(migrated.sessionId, new RegExp(`^feishu-dm-legacy-${cwdTag("/work/mixed")}-a[a-f0-9]{16}$`));
+    assert.notEqual(migrated.sessionId, "legacy-mixed-session");
+
+    setChatAgent("feishu", "dm-legacy", undefined);
+    const main = chatContext("feishu", "dm-legacy", "/work/default");
+    assert.equal(main.agent, undefined);
+    assert.notEqual(main.sessionId, "legacy-mixed-session");
+    assert.notEqual(chatCd("feishu", "dm-legacy", "/work/other"), "legacy-other-session");
+
+    const stored = JSON.parse(readFileSync(join(gatewayDir, "chats.json"), "utf8"))["feishu:dm-legacy"];
+    assert.equal(stored.threadKeysVersion, 2);
+    assert.ok(Object.keys(stored.threads).every((key) => key.startsWith("v2:")));
   } finally {
     if (prev === undefined) delete process.env.HOME;
     else process.env.HOME = prev;

@@ -29,6 +29,7 @@ interface ChatThread {
 interface ChatEntry extends ChatThread {
   cwd: string;
   threads: Record<string, ChatThread>;
+  threadKeysVersion?: 2;
   voice?: boolean; // /voice toggle — speak replies as TTS audio
   lastUsed?: number; // last inbound message ts — drives idle auto-rotation (session hygiene)
   agent?: string; // /agent — pin an org role / indexed agent for this chat
@@ -231,6 +232,10 @@ function normalizeEntry(value: unknown, key: string): ChatEntry {
     fork: normalizeFork(value.fork, key),
     threads,
   };
+  if (value.threadKeysVersion !== undefined && value.threadKeysVersion !== 2) {
+    throw new Error(`Invalid thread key version in gateway session store (${key})`);
+  }
+  if (value.threadKeysVersion === 2) entry.threadKeysVersion = 2;
   if (typeof value.voice === "boolean") entry.voice = value.voice;
   if (typeof value.lastUsed === "number" && Number.isFinite(value.lastUsed)) entry.lastUsed = value.lastUsed;
   if (typeof value.agent === "string" && value.agent) entry.agent = value.agent;
@@ -324,12 +329,35 @@ export function cwdTag(cwd: string): string {
   return createHash("sha256").update(cwd).digest("hex").slice(0, 6);
 }
 
-/** Derived session id for a (chat[, user], cwd, fork): `<platform>-<chatId>[-u<userTag>]-<cwdTag>[-fork]`. */
-function deriveId(platform: string, chatId: number | string, cwd: string, fork: number, userId?: number | string): string {
+function agentTag(agent: string): string {
+  return createHash("sha256").update("hara-gateway-agent-v1\0").update(agent).digest("hex").slice(0, 16);
+}
+
+function threadKey(cwd: string, agent?: string): string {
+  // JSON's length-delimited strings keep a real path such as `/work#agent=deadbeef` from colliding with
+  // an Agent-qualified key. The v2 prefix also makes legacy raw-cwd entries identifiable during migration.
+  return `v2:${JSON.stringify([cwd, agent ? agentTag(agent) : null])}`;
+}
+
+function threadFor(entry: ChatEntry, cwd: string, agent?: string): ChatThread | undefined {
+  return entry.threads[threadKey(cwd, agent)];
+}
+
+/** Derived session id for a (chat[, user], cwd, agent, fork). Agent identity is hashed into the id so two
+ * personas in one project can never collide or append into one another's transcript. */
+function deriveId(
+  platform: string,
+  chatId: number | string,
+  cwd: string,
+  fork: number,
+  userId?: number | string,
+  agent?: string,
+): string {
   const u = userId === undefined
     ? ""
     : `-u${createHash("sha256").update(String(userId)).digest("hex").slice(0, 24)}`;
-  return `${platform}-${chatId}${u}-${cwdTag(cwd)}${fork ? `-${fork}` : ""}`;
+  const identity = agent ? `-a${agentTag(agent)}` : "-m2";
+  return `${platform}-${chatId}${u}-${cwdTag(cwd)}${identity}${fork ? `-${fork}` : ""}`;
 }
 
 /** Stable index prefix for one chat actor's derived session ids. */
@@ -350,7 +378,9 @@ export function ownsChatSession(platform: string, chatId: number | string, sessi
       .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     // Anchor the complete derived-id grammar. A raw startsWith check lets chat "room" accidentally own
     // chat "room-extra"; the cwd hash + optional numeric fork make the namespace boundary unambiguous.
-    return new RegExp(`^${namespace}-[a-f0-9]{6}(?:-[1-9]\\d*)?$`).test(sessionId);
+    // The absent identity segment is accepted for pre-v2 main sessions. Every newly derived id carries
+    // `-m2` or an Agent hash so a legacy mixed transcript can never be selected by a fresh identity.
+    return new RegExp(`^${namespace}-[a-f0-9]{6}(?:-m2|-a[a-f0-9]{16})?(?:-[1-9]\\d*)?$`).test(sessionId);
   } catch {
     return false;
   }
@@ -378,27 +408,56 @@ export function resolveOwnedSessionId(
 
 function rememberCurrent(entry: ChatEntry): void {
   if (!entry.cwd || !entry.sessionId) return;
-  entry.threads[entry.cwd] = { sessionId: entry.sessionId, fork: entry.fork };
+  entry.threads[threadKey(entry.cwd, entry.agent)] = { sessionId: entry.sessionId, fork: entry.fork };
 }
 
 function freshEntry(platform: string, chatId: number | string, cwd: string, userId?: number | string): ChatEntry {
   const sessionId = deriveId(platform, chatId, cwd, 0, userId);
-  const entry: ChatEntry = { cwd, sessionId, fork: 0, threads: emptyThreads() };
+  const entry: ChatEntry = { cwd, sessionId, fork: 0, threads: emptyThreads(), threadKeysVersion: 2 };
   rememberCurrent(entry);
   return entry;
 }
 
 function migrateEntry(entry: ChatEntry, platform: string, chatId: number | string, defaultCwd: string, userId?: number | string): void {
   if (!entry.cwd) entry.cwd = defaultCwd;
-  if (!entry.sessionId) entry.sessionId = deriveId(platform, chatId, entry.cwd, entry.fork, userId);
+  if (!entry.sessionId) entry.sessionId = deriveId(platform, chatId, entry.cwd, entry.fork, userId, entry.agent);
+  if (entry.threadKeysVersion !== 2) {
+    // Raw cwd keys can collide with any delimiter-based Agent suffix. Retire legacy routing pointers once;
+    // their session files remain searchable/resumable. The current main session is safe to retain, but a
+    // current selected-Agent session may already contain mixed persona history and therefore starts clean.
+    entry.threads = emptyThreads();
+    entry.threadKeysVersion = 2;
+    if (entry.agent) {
+      entry.fork = 0;
+      entry.sessionId = deriveId(platform, chatId, entry.cwd, 0, userId, entry.agent);
+    }
+  }
   rememberCurrent(entry);
 }
 
 function switchCwd(entry: ChatEntry, platform: string, chatId: number | string, cwd: string, userId?: number | string): void {
   rememberCurrent(entry);
-  const prior = entry.threads[cwd];
+  const prior = threadFor(entry, cwd, entry.agent);
   entry.cwd = cwd;
-  entry.sessionId = prior?.sessionId ?? deriveId(platform, chatId, cwd, 0, userId);
+  entry.sessionId = prior?.sessionId ?? deriveId(platform, chatId, cwd, 0, userId, entry.agent);
+  entry.fork = prior?.fork ?? 0;
+  rememberCurrent(entry);
+}
+
+function switchAgentContext(
+  entry: ChatEntry,
+  platform: string,
+  chatId: number | string,
+  cwd: string,
+  agent: string | undefined,
+  userId?: number | string,
+): void {
+  rememberCurrent(entry);
+  entry.cwd = cwd;
+  if (agent) entry.agent = agent;
+  else delete entry.agent;
+  const prior = threadFor(entry, cwd, agent);
+  entry.sessionId = prior?.sessionId ?? deriveId(platform, chatId, cwd, 0, userId, agent);
   entry.fork = prior?.fork ?? 0;
   rememberCurrent(entry);
 }
@@ -429,7 +488,7 @@ export function chatContext(
     if (idleMs > 0 && typeof entry.lastUsed === "number" && now - entry.lastUsed > idleMs && entry.sessionId) {
       rotatedFrom = entry.sessionId;
       entry.fork += 1;
-      entry.sessionId = deriveId(platform, chatId, entry.cwd, entry.fork, uid);
+      entry.sessionId = deriveId(platform, chatId, entry.cwd, entry.fork, uid, entry.agent);
       rememberCurrent(entry);
     }
     entry.lastUsed = now;
@@ -458,21 +517,21 @@ export function setChatAgent(
     const entry = map[key];
     if (!entry) return undefined; // chatContext normally initializes the entry
     if (agent) {
+      let targetCwd = entry.cwd;
       if (home && home !== entry.cwd) {
         if (!entry.agentReturnCwd) entry.agentReturnCwd = entry.cwd;
-        switchCwd(entry, platform, chatId, home, uid);
+        targetCwd = home;
       } else if (agent.startsWith("global:")) {
         // Moving from a project-pinned role to a portable global role makes the current directory the
         // user's real working directory again. Drop the old return point so a later `/agent main` does
         // not unexpectedly jump back past subsequent `/cd` changes.
         delete entry.agentReturnCwd;
       }
-      entry.agent = agent;
+      switchAgentContext(entry, platform, chatId, targetCwd, agent, uid);
     } else {
-      delete entry.agent;
       const restore = entry.agentReturnCwd;
       delete entry.agentReturnCwd;
-      if (restore && restore !== entry.cwd) switchCwd(entry, platform, chatId, restore, uid);
+      switchAgentContext(entry, platform, chatId, restore || entry.cwd, undefined, uid);
     }
     return entry.agent;
   });
@@ -525,7 +584,7 @@ export function newChatSession(
       migrateEntry(entry, platform, chatId, defaultCwd, uid);
     }
     entry.fork += 1;
-    entry.sessionId = deriveId(platform, chatId, entry.cwd, entry.fork, uid);
+    entry.sessionId = deriveId(platform, chatId, entry.cwd, entry.fork, uid, entry.agent);
     rememberCurrent(entry);
     return entry.sessionId;
   });

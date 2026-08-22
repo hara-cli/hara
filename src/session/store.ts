@@ -111,6 +111,10 @@ export interface SessionMeta {
   archived?: boolean;
   /** Gateway thread ownership marker; absent for interactive/cron and legacy sessions. */
   gatewayOwner?: string;
+  /** Persistent conversational identity. Absence means the built-in main Hara agent; qualified refs bind
+   * one transcript to one explicit project/global role so clients never silently reuse history as another
+   * persona. */
+  agentRef?: string;
 }
 export interface SessionData {
   meta: SessionMeta;
@@ -1022,6 +1026,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   if (data.meta.approval !== undefined) safe.meta.approval = data.meta.approval;
   if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
+  if (data.meta.agentRef !== undefined) safe.meta.agentRef = data.meta.agentRef;
   if (data.task && safe.task) {
     // Task objective/steering are free-form and stay redacted. Execution identity and transition metadata
     // are structural: preserve them exactly so resume/expectedTurnId validation cannot be corrupted by a
@@ -1311,7 +1316,13 @@ function isSessionMeta(value: unknown): value is SessionMeta {
       || meta.approval === "auto-edit"
       || meta.approval === "full-auto") &&
     (meta.archived === undefined || typeof meta.archived === "boolean") &&
-    (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string")
+    (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string") &&
+    (meta.agentRef === undefined || (
+      typeof meta.agentRef === "string"
+      && meta.agentRef.length >= 3
+      && meta.agentRef.length <= 160
+      && /^(?:global|[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?):[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(meta.agentRef)
+    ))
   );
 }
 

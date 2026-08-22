@@ -2185,11 +2185,13 @@ program
   .action(() => {
     const idx = buildAgentsIndex();
     if (!idx.length) {
-      out(c.dim("(no agents — add roles to ~/.hara/roles or ~/.claude/agents, or register projects: hara projects add <name> <path>)\n"));
+      out(c.dim("(no agents — add roles to ~/.hara/roles or ~/.claude/agents, install OpenClaw/Hermes identities, or register projects: hara projects add <name> <path>)\n"));
       return;
     }
     for (const e of idx) {
-      out(c.bold(e.project ? `${e.project}:${e.name}` : `global:${e.name}`) + c.dim(e.home ? `  · ${e.home}` : "  · current project") + "\n");
+      const ref = e.project ? `${e.project}:${e.name}` : `global:${e.name}`;
+      const displayName = e.identity?.displayName;
+      out(c.bold(ref) + (displayName && displayName !== e.name ? `  ${displayName}` : "") + c.dim(e.home ? `  · ${e.home}` : "  · current project") + "\n");
       if (e.description) out(c.dim(`  ${e.description.slice(0, 120)}\n`));
     }
     out(c.dim(`\n${idx.length} agent(s). Run one: hara org --role <global:name|project:name> "<task>"\n`));
@@ -4408,6 +4410,7 @@ program.action(async (opts) => {
   // stdio subprocesses, so a read-only persona must not start them merely by launching a turn. Reusing this
   // object later also closes the resolve→connect→re-resolve race where a role could disappear or change policy.
   let requestedHeadlessRole: Role | undefined;
+  let requestedHeadlessAgentRef: string | undefined;
   if (opts.print && opts.role) {
     const requestedRole = String(opts.role).trim();
     requestedHeadlessRole = requestedHeadlessAgent?.project
@@ -4419,6 +4422,11 @@ program.action(async (opts) => {
       process.stderr.write(`hara: role '${opts.role}' disappeared from its declared home (${cwd}); refusing to start providers or MCP servers under the wrong persona.\n`);
       process.exitCode = 2;
       return;
+    }
+    if (requestedHeadlessAgent) {
+      requestedHeadlessAgentRef = requestedHeadlessAgent.project
+        ? `${requestedHeadlessAgent.project}:${requestedHeadlessAgent.name}`
+        : `global:${requestedHeadlessAgent.name}`;
     }
   }
   const launchProfile = profileByIdForConfig(cfg, sessionRouteProfileId);
@@ -4750,6 +4758,32 @@ program.action(async (opts) => {
         requiresAudienceBindingSave = true;
       }
       meta.profileId = authoritativeProfileId;
+      if (requestedHeadlessAgentRef) {
+        if (meta.agentRef && meta.agentRef !== requestedHeadlessAgentRef) {
+          process.stderr.write(
+            `hara: session ${shortId(rid)} belongs to agent '${meta.agentRef}', not '${requestedHeadlessAgentRef}'; refusing to mix persona history. Start or resume that agent's own thread.\n`,
+          );
+          process.exitCode = 2;
+          return;
+        }
+        if (!meta.agentRef) {
+          if (prior?.history.length) {
+            process.stderr.write(
+              `hara: session ${shortId(rid)} already has unbound history; refusing to relabel it as '${requestedHeadlessAgentRef}'. Start a fresh agent thread.\n`,
+            );
+            process.exitCode = 2;
+            return;
+          }
+          meta.agentRef = requestedHeadlessAgentRef;
+          requiresAudienceBindingSave = true;
+        }
+      } else if (meta.agentRef) {
+        process.stderr.write(
+          `hara: session ${shortId(rid)} is bound to agent '${meta.agentRef}'; resume it with --role ${meta.agentRef} so its persona cannot be dropped.\n`,
+        );
+        process.exitCode = 2;
+        return;
+      }
       // Checklist continuity remains in meta; execution identity is restored independently in top-level
       // SessionData.task so transcript/interaction changes cannot silently replace the active objective.
       restoreTodos(meta.todos);

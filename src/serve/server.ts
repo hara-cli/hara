@@ -126,6 +126,16 @@ import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.j
 import { projectApprovalPolicy } from "../security/project-approvals.js";
 import { tokenPlanModelReplacement } from "../providers/alibaba.js";
 import {
+  buildAgentsIndex,
+  canonicalProjectPath,
+  loadProjects,
+  resolveAgent,
+  type AgentIndexEntry,
+} from "../org/projects.js";
+import { loadGlobalRoles, loadRoles, roleToolFilter, type Role } from "../org/roles.js";
+import { agentIdentityFromMetadata, type AgentPublicIdentity } from "../org/agent-identity.js";
+import { effectiveRoleModel } from "../session/session-model.js";
+import {
   DeskClientError,
   type DeskConnectionsSnapshot,
   type DeskSnapshot,
@@ -288,6 +298,190 @@ export interface ServeAutoCompactDecision {
   compact: boolean;
   pct: number;
   tokenCap: number;
+}
+
+export interface ServeAgentInfo {
+  ref: string;
+  name: string;
+  description: string;
+  identity: AgentPublicIdentity;
+  home: string;
+  scope: "main" | "global" | "project";
+  project?: string;
+  model?: string;
+  readOnly?: boolean;
+}
+
+export interface ServeAgentOffice {
+  id: string;
+  name: string;
+  cwd: string;
+  kind: "workspace" | "project" | "lobby";
+  project?: string;
+  agentRefs: string[];
+}
+
+export interface ServeAgentCatalog {
+  agents: ServeAgentInfo[];
+  offices: ServeAgentOffice[];
+  currentOfficeId: string;
+}
+
+interface ResolvedServeAgent {
+  ref: string;
+  cwd: string;
+  entry: AgentIndexEntry;
+  role: Role;
+}
+
+const SAFE_AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+const SERVE_AGENT_LIMIT = 512;
+const SERVE_OFFICE_LIMIT = 128;
+const SERVE_OFFICE_AGENT_LIMIT = 24;
+
+function boundedOfficeAgentRefs(...groups: string[][]): string[] {
+  const refs = ["main"];
+  const seen = new Set(refs);
+  for (const group of groups) {
+    for (const ref of group) {
+      if (seen.has(ref)) continue;
+      seen.add(ref);
+      refs.push(ref);
+      if (refs.length >= SERVE_OFFICE_AGENT_LIMIT) return refs;
+    }
+  }
+  return refs;
+}
+
+function canonicalAgentRef(entry: AgentIndexEntry): string {
+  return entry.project ? `${entry.project}:${entry.name}` : `global:${entry.name}`;
+}
+
+function safeAgentDescription(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 240);
+}
+
+function projectHomeHint(ref: string, fallback: string): string {
+  const separator = ref.indexOf(":");
+  if (separator <= 0) return fallback;
+  const namespace = ref.slice(0, separator).trim().toLowerCase();
+  if (namespace === "global") return fallback;
+  return loadProjects().find((project) => project.name === namespace)?.path ?? fallback;
+}
+
+function resolveServeAgent(ref: string, cwd: string, profileId?: string): ResolvedServeAgent | { ambiguous: string[] } | null {
+  const hit = resolveAgent(ref, cwd, profileId);
+  if (!hit) return null;
+  if ("ambiguous" in hit) {
+    return { ambiguous: hit.ambiguous.map(canonicalAgentRef).sort() };
+  }
+  if (!SAFE_AGENT_NAME.test(hit.name)) return null;
+  const role = hit.project
+    ? loadRoles(hit.home, profileId).find((candidate) => candidate.id === hit.name)
+    : loadGlobalRoles(profileId).find((candidate) => candidate.id === hit.name);
+  if (!role) return null;
+  return {
+    ref: canonicalAgentRef(hit),
+    cwd: hit.home || cwd,
+    entry: hit,
+    role,
+  };
+}
+
+function serveAgentCatalog(cwd: string, profileId?: string): ServeAgentCatalog {
+  const allProjects = loadProjects();
+  const canonicalCwd = canonicalProjectPath(cwd);
+  const currentProject = allProjects.find((project) => canonicalProjectPath(project.path) === canonicalCwd);
+  const projects = [
+    ...(currentProject ? [currentProject] : []),
+    ...allProjects.filter((project) => project.name !== currentProject?.name),
+  ].slice(0, SERVE_OFFICE_LIMIT);
+  const visibleProjectNames = new Set(projects.map((project) => project.name));
+  const indexed = buildAgentsIndex(profileId)
+    .filter((entry) => SAFE_AGENT_NAME.test(entry.name) && (!entry.project || visibleProjectNames.has(entry.project)))
+    .sort((left, right) => Number(right.project === currentProject?.name) - Number(left.project === currentProject?.name)
+      || Number(!right.project) - Number(!left.project)
+      || canonicalAgentRef(left).localeCompare(canonicalAgentRef(right)))
+    .slice(0, SERVE_AGENT_LIMIT - 1);
+  const globalRoles = new Map(loadGlobalRoles(profileId).map((role) => [role.id, role]));
+  const projectRoles = new Map(projects.map((project) => [
+    project.name,
+    new Map(loadRoles(project.path, profileId).map((role) => [role.id, role])),
+  ]));
+  const agents: ServeAgentInfo[] = [{
+    ref: "main",
+    name: "Hara",
+    description: "Hara main agent",
+    identity: {
+      version: 1,
+      displayName: "Hara",
+      title: "Main Agent",
+      bio: "Coordinates the team, owns the conversation, and turns requests into verified work.",
+      traits: ["direct", "resourceful", "evidence-led"],
+      emoji: "✦",
+      theme: "warm editorial studio",
+      accent: "#ff695f",
+      character: "orchestrator",
+      source: "hara",
+    },
+    home: cwd,
+    scope: "main",
+  }];
+  for (const entry of indexed) {
+    const targetCwd = entry.home || cwd;
+    const role = entry.project
+      ? projectRoles.get(entry.project)?.get(entry.name)
+      : globalRoles.get(entry.name);
+    agents.push({
+      ref: canonicalAgentRef(entry),
+      name: entry.name,
+      description: safeAgentDescription(entry.description),
+      identity: role?.identity
+        ?? agentIdentityFromMetadata({}, entry.name, entry.description, role?.source),
+      home: targetCwd,
+      scope: entry.project ? "project" : "global",
+      ...(entry.project ? { project: entry.project } : {}),
+      ...(role?.model ? { model: role.model } : {}),
+      ...(role?.readOnly ? { readOnly: true } : {}),
+    });
+  }
+
+  const globalAgentRefs = agents
+    .filter((agent) => agent.scope === "global")
+    .map((agent) => agent.ref);
+  const projectOffices: ServeAgentOffice[] = projects.map((project) => ({
+    id: `project:${project.name}`,
+    name: project.name,
+    cwd: project.path,
+    kind: "project",
+    project: project.name,
+    agentRefs: boundedOfficeAgentRefs(
+      agents.filter((agent) => agent.project === project.name).map((agent) => agent.ref),
+      globalAgentRefs,
+    ),
+  }));
+  const currentOffice: ServeAgentOffice = currentProject
+    ? projectOffices.find((office) => office.project === currentProject.name)!
+    : {
+        id: "workspace",
+        name: basename(cwd) || "Workspace",
+        cwd,
+        kind: "workspace",
+        agentRefs: boundedOfficeAgentRefs(globalAgentRefs),
+      };
+  const lobby: ServeAgentOffice = {
+    id: "global",
+    name: "Hara Lobby",
+    cwd,
+    kind: "lobby",
+    agentRefs: boundedOfficeAgentRefs(globalAgentRefs),
+  };
+  const offices = [
+    currentOffice,
+    ...(currentOffice.id === lobby.id ? [] : [lobby]),
+    ...projectOffices.filter((office) => office.id !== currentOffice.id),
+  ];
+  return { agents, offices, currentOfficeId: currentOffice.id };
 }
 
 /** Shared, deterministic trigger for Desktop/Serve auto-compaction. Keep it separate from the provider
@@ -981,6 +1175,21 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     session.meta.provider = fresh.id;
     return true;
   };
+  const roleForSession = (session: ServeSession): Role | undefined => {
+    if (!session.meta.agentRef) return undefined;
+    const resolved = resolveServeAgent(session.meta.agentRef, session.meta.cwd, session.meta.profileId);
+    if (!resolved) throw new Error(`agent '${session.meta.agentRef}' is no longer available for this session connection`);
+    if ("ambiguous" in resolved) {
+      throw new Error(`agent '${session.meta.agentRef}' became ambiguous; expected its persisted qualified identity`);
+    }
+    if (
+      resolved.ref !== session.meta.agentRef
+      || canonicalProjectPath(resolved.cwd) !== canonicalProjectPath(session.meta.cwd)
+    ) {
+      throw new Error(`agent '${session.meta.agentRef}' no longer resolves to this session workspace`);
+    }
+    return resolved.role;
+  };
   const wss = new WebSocketServer({ host: opts.host, port: opts.port, maxPayload: 10 * 1024 * 1024 });
   await new Promise<void>((res, rej) => {
     wss.once("listening", res);
@@ -1311,6 +1520,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       });
     let stopTodoEvents = (): void => {};
     try {
+      const sessionRole = roleForSession(s);
+      const sessionRoleToolFilter = roleToolFilter(sessionRole);
       if (!(await refreshSessionProvider(s))) {
         throw new Error(`provider not authenticated for pinned model '${s.meta.model}' at ${s.meta.cwd}`);
       }
@@ -1473,6 +1684,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         memory: memoryDigest(s.meta.cwd, s.meta.profileId),
         continuationSession: s.continuationSession,
         executionContext,
+        ...(sessionRole ? { systemOverride: sessionRole.system } : {}),
+        ...(sessionRoleToolFilter ? { toolFilter: sessionRoleToolFilter } : {}),
+        ...(sessionRole?.readOnly ? { hooks: false } : {}),
         ...(slashSkillPolicy ? { skillPolicies: [slashSkillPolicy] } : {}),
         taskIntake: {
           task: s.task,
@@ -1882,7 +2096,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "server.shutdown",
             "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
-            "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "files.search", "project.panels",
+            "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
@@ -1986,6 +2200,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 sourceName: m.sourceName,
                 jobId: m.jobId,
                 archived: m.archived ?? false,
+                agentRef: m.agentRef,
               })),
               page: {
                 hasMore: page.hasMore,
@@ -1994,19 +2209,74 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               },
             }));
           }
+          case "agents.list": {
+            if (p.sessionId !== undefined && (typeof p.sessionId !== "string" || !p.sessionId)) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId must be a non-empty string"));
+            }
+            const sessionMeta = typeof p.sessionId === "string" ? hub.peekMeta(p.sessionId) : undefined;
+            if (typeof p.sessionId === "string" && !sessionMeta) {
+              return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            }
+            const cwd = sessionMeta?.cwd ?? (typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd);
+            const profileId = sessionMeta?.profileId ?? runtimeInfo(cwd).profileId ?? "personal";
+            return reply(rpcResult(id!, serveAgentCatalog(cwd, profileId)));
+          }
           case "session.create": {
-            const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            let cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            if (p.agentRef !== undefined && (typeof p.agentRef !== "string" || !p.agentRef.trim())) {
+              return reply(rpcError(id, ERR.PARAMS, "agentRef must be a non-empty qualified agent reference"));
+            }
+            const requestedAgentRef = typeof p.agentRef === "string" && p.agentRef.trim() !== "main"
+              ? p.agentRef.trim()
+              : undefined;
+            if (requestedAgentRef) cwd = projectHomeHint(requestedAgentRef, cwd);
             const activeRuntime = runtimeInfo(cwd);
             const profileId = activeRuntime.profileId ?? "personal";
-            const provider = await deps.buildSessionProvider(cwd, profileId);
+            let resolvedAgent: ResolvedServeAgent | undefined;
+            if (requestedAgentRef) {
+              const resolved = resolveServeAgent(requestedAgentRef, cwd, profileId);
+              if (!resolved) return reply(rpcError(id, ERR.PARAMS, `no agent '${requestedAgentRef}' is available for this connection`));
+              if ("ambiguous" in resolved) {
+                return reply(rpcError(id, ERR.PARAMS, `agent '${requestedAgentRef}' is ambiguous; choose one of: ${resolved.ambiguous.join(", ")}`));
+              }
+              resolvedAgent = resolved;
+              cwd = resolved.cwd;
+            }
+            let provider = await deps.buildSessionProvider(cwd, profileId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
+            const roleModel = resolvedAgent ? effectiveRoleModel(resolvedAgent.role.model, provider.model) : undefined;
+            if (roleModel) {
+              const roleProvider = deps.buildProviderFor
+                ? await deps.buildProviderFor(roleModel, undefined, cwd, profileId)
+                : null;
+              if (closing) return;
+              if (!roleProvider) {
+                return reply(rpcError(id, ERR.INTERNAL, `agent '${resolvedAgent!.ref}' requires unavailable model '${roleModel}'`));
+              }
+              provider = roleProvider;
+            }
             if (p.approval !== undefined && !isApprovalMode(p.approval)) {
               return reply(rpcError(id, ERR.PARAMS, "approval must be suggest, auto-edit, or full-auto"));
             }
             const approval = isApprovalMode(p.approval) ? p.approval : deps.approval;
-            const s = hub.create({ cwd, profileId, provider, providerId: provider.id, model: provider.model, approval, projectContext: loadAgentContext(cwd) || undefined });
-            return reply(rpcResult(id!, { sessionId: s.meta.id, model: s.meta.model, profileId: s.meta.profileId, approval: s.approval }));
+            const s = hub.create({
+              cwd,
+              profileId,
+              provider,
+              providerId: provider.id,
+              model: provider.model,
+              approval,
+              projectContext: loadAgentContext(cwd) || undefined,
+              ...(resolvedAgent ? { agentRef: resolvedAgent.ref } : {}),
+            });
+            return reply(rpcResult(id!, {
+              sessionId: s.meta.id,
+              model: s.meta.model,
+              profileId: s.meta.profileId,
+              approval: s.approval,
+              agentRef: s.meta.agentRef,
+            }));
           }
           case "session.resume": {
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
@@ -2063,6 +2333,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               model: r.session.meta.model,
               profileId: r.session.meta.profileId,
               approval: r.session.approval,
+              agentRef: r.session.meta.agentRef,
               history: historyForClient(r.session.history),
               task: r.session.task ? {
                 id: r.session.task.id,
@@ -2086,6 +2357,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               model: snapshot.meta.model,
               profileId: snapshot.meta.profileId,
               approval: snapshot.meta.approval,
+              agentRef: snapshot.meta.agentRef,
               history: historyForClient(snapshot.history),
               readOnly: true,
             }));
@@ -2359,6 +2631,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               model: r.session.meta.model,
               profileId: r.session.meta.profileId,
               approval: r.session.approval,
+              agentRef: r.session.meta.agentRef,
               history: historyForClient(r.session.history),
             }));
           }

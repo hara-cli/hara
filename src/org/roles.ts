@@ -1,6 +1,6 @@
 // Org roles — markdown agent definitions from Hara and Claude Code.
-// Frontmatter: name, description, owns[], rejects[], model?, allowTools[]/tools, denyTools[],
-// readOnly?, disable-model-invocation?. Body = persona/system, loaded only for the selected role.
+// Frontmatter: execution metadata plus a bounded public identity. Body = private persona/system and is
+// loaded only for the selected role; it must never be exposed through the Agent catalog.
 import { writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -10,12 +10,14 @@ import { pluginRoleDirs } from "../plugins/plugins.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { scanMemory } from "../memory/guard.js";
 import { isValidProfileId, resolveActive } from "../profile/profile.js";
+import { agentIdentityFromMetadata, type AgentPublicIdentity } from "./agent-identity.js";
+import { loadExternalAgentRoles } from "./external-agent-roles.js";
 
 const MAX_ROLE_BYTES = 512 * 1024;
 const ROLE_DIGEST_CAP = 16_000;
 const ROLE_DESCRIPTION_CAP = 180;
 
-export type RoleSource = "plugin" | "org" | "claude-global" | "global" | "claude-project" | "project";
+export type RoleSource = "plugin" | "openclaw" | "hermes" | "org" | "claude-global" | "global" | "claude-project" | "project";
 
 export interface Role {
   id: string;
@@ -33,6 +35,10 @@ export interface Role {
   compatibilityWarnings?: string[];
   source?: RoleSource;
   file?: string;
+  /** Safe presentation identity. The private persona remains in `system` and never enters catalogs. */
+  identity?: AgentPublicIdentity;
+  /** Optional execution workspace owned by an imported global Agent. */
+  home?: string;
   system: string;
 }
 
@@ -149,21 +155,46 @@ export function roleToolFilter(role: Role | undefined): ((name: string) => boole
   return role.allowTools || role.denyTools ? declared : undefined;
 }
 
+function externalRoles(): Role[] {
+  return loadExternalAgentRoles().map((role): Role => ({
+    id: role.id,
+    description: role.description,
+    owns: [],
+    rejects: [],
+    source: role.source,
+    file: role.home || undefined,
+    identity: role.identity,
+    home: role.home || undefined,
+    system: role.system,
+  }));
+}
+
+function mergedRoles(...layers: Iterable<Role>[]): Role[] {
+  const byId = new Map<string, Role>();
+  for (const layer of layers) {
+    for (const role of layer) byId.set(role.id, role);
+  }
+  return [...byId.values()];
+}
+
 export function loadRoles(cwd: string, profileId?: string): Role[] {
   const selectedProfileId = profileId ?? resolveActive(cwd).id;
   const managedRoleDirs: RoleDir[] = isValidProfileId(selectedProfileId)
     ? [{ dir: orgRolesDir(selectedProfileId), source: "org" }]
     : [];
-  // lowest→highest precedence: plugins < org(B-end push) < personal Claude < personal Hara
-  // < project Claude < project Hara. A user's native Hara definition intentionally wins an id collision.
-  return [...rolesFromDirs([
-    ...pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" })),
-    ...managedRoleDirs,
-    { dir: globalClaudeAgentsDir(), source: "claude-global" },
-    { dir: globalRolesDir(), source: "global" },
-    { dir: claudeAgentsDir(cwd), source: "claude-project" },
-    { dir: rolesDir(cwd), source: "project" },
-  ]).values()];
+  // lowest→highest precedence: plugins < installed interop identities < org(B-end push)
+  // < personal Claude < personal Hara < project Claude < project Hara. Native Hara wins collisions.
+  return mergedRoles(
+    rolesFromDirs(pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" }))).values(),
+    externalRoles(),
+    rolesFromDirs([
+      ...managedRoleDirs,
+      { dir: globalClaudeAgentsDir(), source: "claude-global" },
+      { dir: globalRolesDir(), source: "global" },
+      { dir: claudeAgentsDir(cwd), source: "claude-project" },
+      { dir: rolesDir(cwd), source: "project" },
+    ]).values(),
+  );
 }
 
 /** The project-independent layers only — what the global agent index lists as "runs anywhere".
@@ -173,12 +204,15 @@ export function loadGlobalRoles(profileId?: string): Role[] {
   const managedRoleDirs: RoleDir[] = isValidProfileId(selectedProfileId)
     ? [{ dir: orgRolesDir(selectedProfileId), source: "org" }]
     : [];
-  return [...rolesFromDirs([
-    ...pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" })),
-    ...managedRoleDirs,
-    { dir: globalClaudeAgentsDir(), source: "claude-global" },
-    { dir: globalRolesDir(), source: "global" },
-  ]).values()];
+  return mergedRoles(
+    rolesFromDirs(pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" }))).values(),
+    externalRoles(),
+    rolesFromDirs([
+      ...managedRoleDirs,
+      { dir: globalClaudeAgentsDir(), source: "claude-global" },
+      { dir: globalRolesDir(), source: "global" },
+    ]).values(),
+  );
 }
 
 interface RoleDir {
@@ -237,6 +271,7 @@ function rolesFromDirs(dirs: RoleDir[]): Map<string, Role> {
           compatibilityWarnings,
           source,
           file,
+          identity: agentIdentityFromMetadata(fm, id, String(fm.description ?? ""), source),
           system: body,
         });
       } catch {
@@ -266,7 +301,9 @@ export function roleCatalog(roles: Role[], cap = ROLE_DIGEST_CAP): string {
     global: 2,
     "claude-global": 3,
     org: 4,
-    plugin: 5,
+    openclaw: 5,
+    hermes: 6,
+    plugin: 7,
   };
   const ordered = [...roles].sort((a, b) => {
     const source = (sourceRank[a.source ?? "plugin"] ?? 9) - (sourceRank[b.source ?? "plugin"] ?? 9);
@@ -352,6 +389,11 @@ Each \`*.md\` here is a role-agent. Frontmatter:
 - \`allowTools\` / \`denyTools\` — restrict the role's tools
 - \`readOnly\` — enforce read/search-only tools (defaults on for a role named \`reviewer\`)
 - \`disable-model-invocation\` — hide the role from automatic routing while keeping explicit \`--role\` use
+- public identity — \`display-name\`, \`title\`/\`role\`, \`bio\`/\`vibe\`, \`traits\`, \`emoji\`,
+  \`avatar\`/\`logo\`, \`identity-theme\`, \`accent\`, and \`character\`/\`sprite\`
+
+Installed OpenClaw Agent workspaces (\`IDENTITY.md\` + private \`SOUL.md\`/\`AGENTS.md\`) and a personal
+Hermes \`SOUL.md\` are discovered read-only. A native Hara role with the same id always wins.
 
 Run \`hara org "<task>"\` to dispatch a task to the owning role, or \`hara org --role <id> "<task>"\`.
 `,

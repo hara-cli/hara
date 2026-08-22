@@ -55,8 +55,8 @@ model or consume tokens.
   `/agent <name|project:name|main>` · `/voice` · `/say <text>` · `/send <path>` · `/detach`.
   `/agent` uses the host's `hara agents` index. A bare name prefers an override in the current project;
   `project:name` pins the thread to that registered home and `/agent main` returns to the previous project/thread.
-  `global:name` is portable, stays in the current project, and may continue to roam with `/cd`. Anything else
-  runs hara on that session.
+  A native `global:name` is portable, stays in the current project, and may continue to roam with `/cd`;
+  an installed OpenClaw Agent keeps its configured workspace. Anything else runs hara on that session.
 - **Two-way images**: send the bot a photo and it sees it (inline for a vision model, else described via your
   configured `visionModel`); ask it to send a file/image back and it uses the `send_file` tool — both work in
   plain conversation, no slash command needed (on platforms marked ✅ for outbound above). Authorization is checked before

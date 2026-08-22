@@ -92,7 +92,7 @@ export class SessionHub {
     }
   }
 
-  create(o: { cwd: string; profileId?: string; provider: Provider; providerId: string; model: string; approval: ApprovalMode; projectContext?: string }): ServeSession {
+  create(o: { cwd: string; profileId?: string; provider: Provider; providerId: string; model: string; approval: ApprovalMode; projectContext?: string; agentRef?: string }): ServeSession {
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: o.cwd,
@@ -105,6 +105,7 @@ export class SessionHub {
       createdAt: new Date().toISOString(),
       updatedAt: "",
       source: "interactive", // serve sessions are user-driven (desktop/IDE clients)
+      ...(o.agentRef ? { agentRef: o.agentRef } : {}),
     };
     const lock = this.store.acquire(meta.id); // fresh UUID, but filesystem errors must still fail closed
     if (!lock.ok) throw new Error(`could not acquire session lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
@@ -337,6 +338,7 @@ export class SessionHub {
       ...(src.meta.workingSet ? { workingSet: [...src.meta.workingSet] } : {}),
       ...(src.meta.todos ? { todos: src.meta.todos.map((todo) => ({ ...todo, ...(todo.blockedBy ? { blockedBy: [...todo.blockedBy] } : {}) })) } : {}),
       ...(preservesRoute && src.meta.effort ? { effort: src.meta.effort } : {}),
+      ...(targetProfileId === sourceProfileId && src.meta.agentRef ? { agentRef: src.meta.agentRef } : {}),
     };
     const lock = this.store.acquire(meta.id);
     if (!lock.ok) throw new Error(`could not acquire fork lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
