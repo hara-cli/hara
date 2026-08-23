@@ -100,7 +100,7 @@ import { listPending, resolvePending } from "../gateway/flows-pending.js";
 import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from "../tools/todo.js";
 import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
-import { ensureSessionMetadataIndex } from "../session/store.js";
+import { ensureSessionMetadataIndex, type SessionMeta } from "../session/store.js";
 import {
   parseFrame,
   rpcResult,
@@ -132,7 +132,20 @@ import {
   resolveAgent,
   type AgentIndexEntry,
 } from "../org/projects.js";
-import { loadGlobalRoles, loadRoles, roleToolFilter, type Role } from "../org/roles.js";
+import {
+  loadGlobalRoles,
+  archiveNativeRoleAgent,
+  createNativeGlobalAgent,
+  loadMainAgentIdentity,
+  loadOrganizationExecutionPolicy,
+  loadRoles,
+  mainAgentIdentityRevision,
+  nativeRoleIdentityRevision,
+  roleToolFilter,
+  updateMainAgentIdentity,
+  updateNativeRoleIdentity,
+  type Role,
+} from "../org/roles.js";
 import { agentIdentityFromMetadata, type AgentPublicIdentity } from "../org/agent-identity.js";
 import { effectiveRoleModel } from "../session/session-model.js";
 import {
@@ -204,6 +217,7 @@ export interface ServeDeps {
       cwd: string;
       model: string;
       profileId?: string;
+      spaceId: string;
       signal: AbortSignal;
       hint?: string;
     },
@@ -235,15 +249,21 @@ export interface ServeDeps {
   useOrganizationConnection?: (id: string, cwd?: string) => OrganizationConnectionsState;
   removeOrganizationConnection?: (id: string, cwd?: string) => OrganizationConnectionsState;
   checkOrganizationConnection?: (id: string, cwd?: string) => Promise<OrganizationConnectionCheck>;
+  /** Unified Personal / Company Space directory. A Space is an authorization and data boundary; a
+   * profile is only the concrete provider route used inside that Space. */
+  spaces?: (cwd?: string) => SpaceDirectory;
+  useSpace?: (spaceId: string, cwd?: string) => SpaceDirectory;
   /** Organization learning is a reviewed outbox: submit is explicit and sync pulls only Control-approved
    * records. Device credentials remain behind these callbacks and never cross the Desktop protocol. */
   organizationLearningSubmit?: (
     profileId: string,
+    organizationScopeId: string,
     candidateId: string,
     cwd?: string,
   ) => Promise<{ remoteId: string; status: string; revision: number; candidate: LearningCandidate }>;
   organizationLearningSync?: (
     profileId: string,
+    organizationScopeId: string,
     cwd?: string,
   ) => Promise<{ version: number; learnings: LearningCandidate[] }>;
   /** Organization-scoped Desk data. Connections are a private local read; snapshot/detail are explicit,
@@ -262,6 +282,8 @@ export interface ServeDeps {
     /** Effective identity route. Persisted into each new session and reused on resume. */
     profileId?: string;
     profileKind?: "byok" | "gateway";
+    /** Durable audience frozen into every new session. */
+    spaceId?: string;
     effortLevels?: string[];
     /** Finite server-authorized set for a scoped gateway token. Missing means unconstrained discovery. */
     availableModels?: string[];
@@ -282,9 +304,10 @@ export interface ServeDeps {
       onSubagentLifecycle?: SubagentLifecycleObserver;
     },
     profileId?: string,
+    spaceId?: string,
   ) => Promise<string>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
-  buildGuardian?: (cwd?: string, profileId?: string) => Promise<{ provider?: Provider | null; enabled?: boolean } | undefined>;
+  buildGuardian?: (cwd?: string, profileId?: string, spaceId?: string) => Promise<{ provider?: Provider | null; enabled?: boolean } | undefined>;
   sandbox: SandboxMode;
   approval: ApprovalMode;
   store?: SessionStore; // tests inject a hermetic store
@@ -310,6 +333,12 @@ export interface ServeAgentInfo {
   project?: string;
   model?: string;
   readOnly?: boolean;
+  /** Space that owns the Agent catalog entry and every conversation created from it. */
+  spaceId: string;
+  owner: "personal" | "organization" | "external";
+  allowedActions: Array<"chat" | "edit_profile" | "archive">;
+  /** Optimistic-concurrency token for editable public identity metadata. */
+  revision?: string;
 }
 
 export interface ServeAgentOffice {
@@ -338,6 +367,10 @@ const SAFE_AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const SERVE_AGENT_LIMIT = 512;
 const SERVE_OFFICE_LIMIT = 128;
 const SERVE_OFFICE_AGENT_LIMIT = 24;
+
+function failClosedSpaceId(profileId?: string): string {
+  return profileId && profileId !== "personal" ? `org-profile:${profileId}` : "personal";
+}
 
 function boundedOfficeAgentRefs(...groups: string[][]): string[] {
   const refs = ["main"];
@@ -388,7 +421,7 @@ function resolveServeAgent(ref: string, cwd: string, profileId?: string): Resolv
   };
 }
 
-function serveAgentCatalog(cwd: string, profileId?: string): ServeAgentCatalog {
+function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: string): ServeAgentCatalog {
   const allProjects = loadProjects();
   const canonicalCwd = canonicalProjectPath(cwd);
   const currentProject = allProjects.find((project) => canonicalProjectPath(project.path) === canonicalCwd);
@@ -412,20 +445,24 @@ function serveAgentCatalog(cwd: string, profileId?: string): ServeAgentCatalog {
     ref: "main",
     name: "Hara",
     description: "Hara main agent",
-    identity: {
+    identity: spaceId === "personal" ? loadMainAgentIdentity() : {
       version: 1,
       displayName: "Hara",
-      title: "Main Agent",
-      bio: "Coordinates the team, owns the conversation, and turns requests into verified work.",
-      traits: ["direct", "resourceful", "evidence-led"],
+      title: "Company Coordinator",
+      bio: "Coordinates work inside this company Space under organization policy.",
+      traits: ["governed", "evidence-led", "team-aware"],
       emoji: "✦",
-      theme: "warm editorial studio",
+      theme: "company operations studio",
       accent: "#ff695f",
       character: "orchestrator",
-      source: "hara",
+      source: "organization",
     },
     home: cwd,
     scope: "main",
+    spaceId,
+    owner: spaceId === "personal" ? "personal" : "organization",
+    allowedActions: spaceId === "personal" ? ["chat", "edit_profile"] : ["chat"],
+    ...(spaceId === "personal" ? { revision: mainAgentIdentityRevision() } : {}),
   }];
   for (const entry of indexed) {
     const targetCwd = entry.home || cwd;
@@ -443,6 +480,16 @@ function serveAgentCatalog(cwd: string, profileId?: string): ServeAgentCatalog {
       ...(entry.project ? { project: entry.project } : {}),
       ...(role?.model ? { model: role.model } : {}),
       ...(role?.readOnly ? { readOnly: true } : {}),
+      spaceId,
+      owner: role?.source === "org"
+        ? "organization"
+        : role?.source === "global" || role?.source === "project"
+          ? "personal"
+          : "external",
+      allowedActions: spaceId === "personal" && (role?.source === "global" || role?.source === "project")
+        ? ["chat", "edit_profile", "archive"]
+        : ["chat"],
+      ...(spaceId === "personal" && role ? { revision: nativeRoleIdentityRevision(role) } : {}),
     });
   }
 
@@ -577,7 +624,11 @@ export type OrganizationAccessState = "valid" | "permanent" | "expiring" | "expi
 
 export interface OrganizationConnectionSummary {
   id: string;
+  /** Immutable company audience; local connection ids can be replaced in place. */
+  spaceId: string;
   label: string;
+  tenantId?: string;
+  tenantName?: string;
   active: boolean;
   gatewayUrl: string;
   gatewayHost: string;
@@ -617,6 +668,29 @@ export interface OrganizationConnectionCheck {
   id: string;
   ok: boolean;
   checkedAt: number;
+}
+
+export interface SpaceSummary {
+  id: string;
+  name: string;
+  kind: "personal" | "organization";
+  /** Concrete provider connection selected when this Space becomes active. */
+  profileId: string;
+  /** Every known provider route inside this Space, used only to migrate legacy session ownership. */
+  profileIds: string[];
+  active: boolean;
+  tenantId?: string;
+  /** False only for pre-Space Control enrollments that did not return a tenant id. */
+  authoritative: boolean;
+  agentProfilePermission: "edit" | "view";
+}
+
+export interface SpaceDirectory {
+  activeId: string;
+  activeProfileId: string;
+  activeSource: "flag" | "env" | "pin" | "default" | "fallback";
+  switchLocked: boolean;
+  spaces: SpaceSummary[];
 }
 
 export interface ProjectProfileUnpinResult {
@@ -1149,6 +1223,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     model: string;
     profileId?: string;
     profileKind?: "byok" | "gateway";
+    spaceId?: string;
     effortLevels: string[];
     availableModels?: string[];
     attachmentCapabilities?: EffectiveAttachmentCapabilities;
@@ -1159,6 +1234,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       model: live?.model ?? model ?? deps.model,
       ...(live?.profileId ? { profileId: live.profileId } : profileId ? { profileId } : {}),
       ...(live?.profileKind ? { profileKind: live.profileKind } : {}),
+      ...(live?.spaceId ? { spaceId: live.spaceId } : {}),
       effortLevels: live?.effortLevels ?? deps.effortLevels ?? [],
       ...(live?.availableModels ? { availableModels: live.availableModels } : {}),
       ...(live?.attachmentCapabilities
@@ -1166,11 +1242,60 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         : {}),
     };
   };
+  type SessionSpaceBinding = {
+    profileId: string;
+    spaceId: string;
+    runtime: ReturnType<typeof runtimeInfo>;
+    migrateLegacyPersonal: boolean;
+  };
+  class SessionSpaceBoundaryError extends Error {}
+  /** Resolve a persisted session audience against the current authoritative route. A connection id is
+   * mutable (re-enrollment can replace its tenant), while SessionMeta.spaceId is immutable. Legacy
+   * company transcripts therefore fail closed instead of being silently claimed by whichever tenant
+   * currently owns the same local profile id. Only a route explicitly proven to be BYOK Personal may
+   * acquire a missing legacy Space binding. */
+  const sessionSpaceBinding = (meta: SessionMeta): SessionSpaceBinding => {
+    const profileId = meta.profileId ?? runtimeInfo(meta.cwd, meta.model).profileId ?? "personal";
+    const runtime = runtimeInfo(meta.cwd, meta.model, profileId);
+    if (runtime.profileId && runtime.profileId !== profileId) {
+      throw new SessionSpaceBoundaryError("this session's provider connection identity changed; start a new conversation");
+    }
+    const currentSpaceId = runtime.spaceId ?? failClosedSpaceId(runtime.profileId ?? profileId);
+    if (!meta.spaceId) {
+      const provenPersonal = meta.profileId === "personal"
+        && meta.provider !== "hara-gateway"
+        && currentSpaceId === "personal"
+        && (runtime.profileKind === "byok" || !runtime.profileKind);
+      if (!provenPersonal) {
+        throw new SessionSpaceBoundaryError(
+          "this legacy organization session has no verifiable Space binding; its history remains local and read-only — start a new conversation in the intended company",
+        );
+      }
+      return { profileId, spaceId: "personal", runtime, migrateLegacyPersonal: true };
+    }
+    if (meta.spaceId !== currentSpaceId) {
+      throw new SessionSpaceBoundaryError(
+        `this session belongs to Space '${meta.spaceId}', but its provider connection now resolves to '${currentSpaceId}'; old history will not be sent across companies`,
+      );
+    }
+    return { profileId, spaceId: meta.spaceId, runtime, migrateLegacyPersonal: false };
+  };
+  const bindSafeLegacyPersonalSession = (session: ServeSession, binding: SessionSpaceBinding): void => {
+    if (!binding.migrateLegacyPersonal) return;
+    session.meta.profileId = binding.profileId;
+    session.meta.spaceId = binding.spaceId;
+    hub.save(session);
+  };
   const refreshSessionProvider = async (session: ServeSession): Promise<boolean> => {
+    const binding = sessionSpaceBinding(session.meta);
+    bindSafeLegacyPersonalSession(session, binding);
     const fresh = deps.buildProviderFor
       ? await deps.buildProviderFor(session.meta.model, session.effort, session.meta.cwd, session.meta.profileId)
       : await deps.buildSessionProvider(session.meta.cwd, session.meta.profileId);
     if (!fresh || fresh.model !== session.meta.model) return false;
+    // Re-check after the asynchronous provider build. Re-enrollment can replace a local route while
+    // authentication is in flight; never install that provider onto a differently scoped transcript.
+    sessionSpaceBinding(session.meta);
     session.provider = fresh;
     session.meta.provider = fresh.id;
     return true;
@@ -1386,6 +1511,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     stopReason?: "deadline" | "task_round_budget";
   }> => {
     const sessionId = s.meta.id;
+    const spaceBinding = sessionSpaceBinding(s.meta);
+    bindSafeLegacyPersonalSession(s, spaceBinding);
     // Serve sessions can stay attached to Desktop for days. Refresh project instructions at the
     // boundary of each idle turn so an AGENTS.md edit takes effect without restarting the server or
     // discarding conversation history. Active steering never enters runTurn, so a file change cannot
@@ -1520,14 +1647,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       });
     let stopTodoEvents = (): void => {};
     try {
-      const sessionRole = roleForSession(s);
-      const sessionRoleToolFilter = roleToolFilter(sessionRole);
       if (!(await refreshSessionProvider(s))) {
         throw new Error(`provider not authenticated for pinned model '${s.meta.model}' at ${s.meta.cwd}`);
       }
+      // Resolve company-managed roles only after the session/provider audience has been revalidated.
+      const sessionRole = roleForSession(s);
+      const sessionRolePolicyVersion = sessionRole && s.meta.spaceId && s.meta.spaceId !== "personal"
+        ? sessionRole.organizationPolicyVersion
+        : undefined;
+      sessionSpaceBinding(s.meta);
+      const sessionRoleToolFilter = roleToolFilter(sessionRole);
       const turnGuardian = deps.buildGuardian
-        ? await deps.buildGuardian(s.meta.cwd, s.meta.profileId)
+        ? await deps.buildGuardian(s.meta.cwd, s.meta.profileId, s.meta.spaceId)
         : deps.guardian;
+      sessionSpaceBinding(s.meta);
       restoreTodos(s.meta.todos, sessionId);
       stopTodoEvents = onTodosChange((todos) => {
         // Keep the session snapshot current while the turn runs. Steering and task-intake checkpoints can
@@ -1544,6 +1677,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       let imageDescription: string | undefined;
       let imageContext = "";
       if (preparedImages.length) {
+        sessionSpaceBinding(s.meta);
         const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId);
         const imageMode = runtime.attachmentCapabilities?.image.mode;
         if (deps.prepareImages) {
@@ -1551,8 +1685,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             cwd: s.meta.cwd,
             model: s.meta.model,
             profileId: s.meta.profileId,
+            spaceId: s.meta.spaceId!,
             signal: turnAbort.signal,
           });
+          sessionSpaceBinding(s.meta);
           preparedImages = prepared.images ?? [];
           imageDescription = prepared.description?.trim() || undefined;
           if (imageDescription) {
@@ -1609,16 +1745,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       do {
         outcome = await runAgent(s.history, {
         provider: s.provider,
+        organizationPolicyVersion: sessionRolePolicyVersion,
         ctx: {
           cwd: s.meta.cwd,
           sandbox: deps.sandbox,
           profileId: s.meta.profileId,
+          spaceId: s.meta.spaceId,
           todoScope: sessionId,
           sessionId,
-          spawn: (t, role, signal) => {
+          spawn: async (t, role, signal) => {
             const taskId = s.task?.id;
             const turnId = s.task?.turnId;
-            return deps.spawnSubagent(
+            sessionSpaceBinding(s.meta);
+            const result = await deps.spawnSubagent(
               s.provider,
               s.meta.cwd,
               s.projectContext,
@@ -1636,10 +1775,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 },
               },
               s.meta.profileId,
+              s.meta.spaceId,
             );
+            sessionSpaceBinding(s.meta);
+            return result;
           },
           ui: sink,
           inspectImage: async (image, hint, signal) => {
+            sessionSpaceBinding(s.meta);
             const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId);
             let images = [image];
             if (deps.prepareImages) {
@@ -1647,9 +1790,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 cwd: s.meta.cwd,
                 model: s.meta.model,
                 profileId: s.meta.profileId,
+                spaceId: s.meta.spaceId!,
                 signal: signal ?? turnAbort.signal,
                 hint,
               });
+              sessionSpaceBinding(s.meta);
               if (prepared.description?.trim()) {
                 return {
                   text: prepared.description.trim(),
@@ -1667,6 +1812,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!images.length) {
               throw new Error(`model '${s.meta.model}' has no authorized image route for this session`);
             }
+            sessionSpaceBinding(s.meta);
             return {
               text: await describeImages(s.provider, images, {
                 hint,
@@ -1677,11 +1823,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           },
         },
         approval: s.approval,
+        approvalChannel: true,
         confirm,
         autoApprove: s.autoApprove,
         projectApprovals: projectApprovalPolicy(s.meta.cwd),
         projectContext: s.projectContext,
-        memory: memoryDigest(s.meta.cwd, s.meta.profileId),
+        memory: memoryDigest(s.meta.cwd, s.meta.spaceId),
         continuationSession: s.continuationSession,
         executionContext,
         ...(sessionRole ? { systemOverride: sessionRole.system } : {}),
@@ -2096,7 +2243,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "server.shutdown",
             "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
-            "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "files.search", "project.panels",
+            "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
@@ -2120,6 +2267,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
           }
           if (deps.unpinProjectProfile) methods.push("settings.profiles.unpin");
+          if (deps.spaces && deps.useSpace) methods.push("spaces.list", "spaces.use");
           if (deps.organizationLearningSubmit) methods.push("learning.submit");
           if (deps.organizationLearningSync) methods.push("learning.sync");
           const features = [
@@ -2129,7 +2277,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "sessions.cross-profile-fork.v1",
             "learning.review.v1",
             "agent.action-ownership.v1",
+            "agent.public-profile-edit.v1",
           ];
+          if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
           if (deps.organizationLearningSubmit && deps.organizationLearningSync) {
             features.push("learning.organization-review.v1");
@@ -2195,6 +2345,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 model: m.model,
                 approval: m.approval,
                 profileId: m.profileId,
+                spaceId: m.spaceId,
                 updatedAt: m.updatedAt,
                 source: m.source ?? "interactive",
                 sourceName: m.sourceName,
@@ -2209,6 +2360,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               },
             }));
           }
+          case "spaces.list": {
+            if (!deps.spaces) return reply(rpcError(id, ERR.METHOD, "Spaces are not supported by this server"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, deps.spaces(targetCwd)));
+          }
+          case "spaces.use": {
+            if (!deps.useSpace) return reply(rpcError(id, ERR.METHOD, "Space switching is not supported by this server"));
+            if (typeof p.spaceId !== "string" || !p.spaceId.trim() || p.spaceId.length > 160) {
+              return reply(rpcError(id, ERR.PARAMS, "spaceId must be a non-empty bounded string"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, deps.useSpace(p.spaceId.trim(), targetCwd)));
+          }
           case "agents.list": {
             if (p.sessionId !== undefined && (typeof p.sessionId !== "string" || !p.sessionId)) {
               return reply(rpcError(id, ERR.PARAMS, "sessionId must be a non-empty string"));
@@ -2218,8 +2382,161 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             }
             const cwd = sessionMeta?.cwd ?? (typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd);
-            const profileId = sessionMeta?.profileId ?? runtimeInfo(cwd).profileId ?? "personal";
-            return reply(rpcResult(id!, serveAgentCatalog(cwd, profileId)));
+            const runtime = runtimeInfo(cwd, undefined, sessionMeta?.profileId);
+            let profileId = sessionMeta?.profileId ?? runtime.profileId ?? "personal";
+            let spaceId = runtime.spaceId ?? failClosedSpaceId(profileId);
+            if (sessionMeta) {
+              try {
+                const binding = sessionSpaceBinding(sessionMeta);
+                profileId = binding.profileId;
+                spaceId = binding.spaceId;
+              } catch (error) {
+                return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+              }
+            }
+            return reply(rpcResult(id!, serveAgentCatalog(cwd, profileId, spaceId)));
+          }
+          case "agents.update-profile": {
+            if (typeof p.ref !== "string" || !p.ref.trim() || typeof p.expectedRevision !== "string" || !/^[a-f0-9]{32}$/.test(p.expectedRevision)) {
+              return reply(rpcError(id, ERR.PARAMS, "ref and a valid expectedRevision are required"));
+            }
+            if (!p.profile || typeof p.profile !== "object" || Array.isArray(p.profile)) {
+              return reply(rpcError(id, ERR.PARAMS, "profile must be an object"));
+            }
+            if (p.sessionId !== undefined && (typeof p.sessionId !== "string" || !p.sessionId)) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId must be a non-empty string"));
+            }
+            const sessionMeta = typeof p.sessionId === "string" ? hub.peekMeta(p.sessionId) : undefined;
+            if (typeof p.sessionId === "string" && !sessionMeta) {
+              return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            }
+            const cwd = sessionMeta?.cwd ?? (typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd);
+            const runtime = runtimeInfo(cwd, undefined, sessionMeta?.profileId);
+            let profileId = sessionMeta?.profileId ?? runtime.profileId ?? "personal";
+            let spaceId = runtime.spaceId ?? failClosedSpaceId(profileId);
+            if (sessionMeta) {
+              try {
+                const binding = sessionSpaceBinding(sessionMeta);
+                profileId = binding.profileId;
+                spaceId = binding.spaceId;
+              } catch (error) {
+                return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+              }
+            }
+            if (spaceId !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "company Agent profiles are managed by organization administrators"));
+            }
+            const ref = p.ref.trim();
+            const before = serveAgentCatalog(cwd, profileId, spaceId);
+            const target = before.agents.find((agent) => agent.ref === ref);
+            if (!target) return reply(rpcError(id, ERR.PARAMS, `no Agent '${ref}' is available in this Space`));
+            if (!target.allowedActions.includes("edit_profile") || target.revision !== p.expectedRevision) {
+              return reply(rpcError(id, ERR.CONFLICT, "Agent profile changed or is not editable; refresh and retry"));
+            }
+            try {
+              if (ref === "main") {
+                await updateMainAgentIdentity(p.profile, p.expectedRevision);
+              } else {
+                const resolved = resolveServeAgent(ref, cwd, profileId);
+                if (!resolved || "ambiguous" in resolved) {
+                  return reply(rpcError(id, ERR.PARAMS, `Agent '${ref}' could not be resolved`));
+                }
+                await updateNativeRoleIdentity(resolved.role, p.profile, p.expectedRevision);
+              }
+              const catalog = serveAgentCatalog(cwd, profileId, spaceId);
+              return reply(rpcResult(id!, {
+                agent: catalog.agents.find((agent) => agent.ref === ref),
+                catalog,
+              }));
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              const conflict = /changed|refresh|retry/i.test(message);
+              return reply(rpcError(id, conflict ? ERR.CONFLICT : ERR.PARAMS, message));
+            }
+          }
+          case "agents.create": {
+            if (
+              typeof p.id !== "string"
+              || !p.profile
+              || typeof p.profile !== "object"
+              || Array.isArray(p.profile)
+              || (p.description !== undefined && typeof p.description !== "string")
+              || (p.instructions !== undefined && typeof p.instructions !== "string")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "id and profile are required; description and instructions must be strings"));
+            }
+            const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const runtime = runtimeInfo(cwd);
+            const profileId = runtime.profileId ?? "personal";
+            const spaceId = runtime.spaceId ?? failClosedSpaceId(profileId);
+            if (spaceId !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "company Agents must be created by an organization administrator"));
+            }
+            const username = p.id.trim().toLowerCase();
+            const before = serveAgentCatalog(cwd, profileId, spaceId);
+            if (before.agents.some((agent) => agent.name.toLowerCase() === username || agent.ref.toLowerCase() === `global:${username}`)) {
+              return reply(rpcError(id, ERR.CONFLICT, "Agent username is already in use"));
+            }
+            try {
+              await createNativeGlobalAgent({
+                id: username,
+                description: p.description,
+                instructions: p.instructions,
+                profile: p.profile,
+              });
+              const catalog = serveAgentCatalog(cwd, profileId, spaceId);
+              return reply(rpcResult(id!, {
+                agent: catalog.agents.find((agent) => agent.ref === `global:${username}`),
+                catalog,
+              }));
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              const conflict = /already|exist|changed/i.test(message);
+              return reply(rpcError(id, conflict ? ERR.CONFLICT : ERR.PARAMS, message));
+            }
+          }
+          case "agents.archive": {
+            if (typeof p.ref !== "string" || !p.ref.trim() || typeof p.expectedRevision !== "string" || !/^[a-f0-9]{32}$/.test(p.expectedRevision)) {
+              return reply(rpcError(id, ERR.PARAMS, "ref and a valid expectedRevision are required"));
+            }
+            if (p.sessionId !== undefined && (typeof p.sessionId !== "string" || !p.sessionId)) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId must be a non-empty string"));
+            }
+            const sessionMeta = typeof p.sessionId === "string" ? hub.peekMeta(p.sessionId) : undefined;
+            if (typeof p.sessionId === "string" && !sessionMeta) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            const cwd = sessionMeta?.cwd ?? (typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd);
+            const runtime = runtimeInfo(cwd, undefined, sessionMeta?.profileId);
+            let profileId = sessionMeta?.profileId ?? runtime.profileId ?? "personal";
+            let spaceId = runtime.spaceId ?? failClosedSpaceId(profileId);
+            if (sessionMeta) {
+              try {
+                const binding = sessionSpaceBinding(sessionMeta);
+                profileId = binding.profileId;
+                spaceId = binding.spaceId;
+              } catch (error) {
+                return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+              }
+            }
+            if (spaceId !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "company Agents must be managed by an organization administrator"));
+            }
+            const ref = p.ref.trim();
+            if (ref === "main") return reply(rpcError(id, ERR.PARAMS, "the main Hara Agent cannot be dismissed"));
+            const before = serveAgentCatalog(cwd, profileId, spaceId);
+            const target = before.agents.find((agent) => agent.ref === ref);
+            if (!target?.allowedActions.includes("archive") || target.revision !== p.expectedRevision) {
+              return reply(rpcError(id, ERR.CONFLICT, "Agent changed or is not dismissible; refresh and retry"));
+            }
+            const resolved = resolveServeAgent(ref, cwd, profileId);
+            if (!resolved || "ambiguous" in resolved) return reply(rpcError(id, ERR.PARAMS, `Agent '${ref}' could not be resolved`));
+            try {
+              await archiveNativeRoleAgent(resolved.role, p.expectedRevision);
+              const catalog = serveAgentCatalog(cwd, profileId, spaceId);
+              return reply(rpcResult(id!, { ref, archived: true, catalog }));
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              return reply(rpcError(id, /changed|retry/i.test(message) ? ERR.CONFLICT : ERR.PARAMS, message));
+            }
           }
           case "session.create": {
             let cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
@@ -2232,6 +2549,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (requestedAgentRef) cwd = projectHomeHint(requestedAgentRef, cwd);
             const activeRuntime = runtimeInfo(cwd);
             const profileId = activeRuntime.profileId ?? "personal";
+            const spaceId = activeRuntime.spaceId ?? failClosedSpaceId(profileId);
+            // Building the session provider performs the required Control bundle sync for a company
+            // connection. Resolve the requested Agent only afterwards so its persona/model/tool policy
+            // comes from the same current bundle that authorizes this new conversation.
+            let provider = await deps.buildSessionProvider(cwd, profileId);
+            if (closing) return;
+            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             let resolvedAgent: ResolvedServeAgent | undefined;
             if (requestedAgentRef) {
               const resolved = resolveServeAgent(requestedAgentRef, cwd, profileId);
@@ -2240,11 +2564,21 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 return reply(rpcError(id, ERR.PARAMS, `agent '${requestedAgentRef}' is ambiguous; choose one of: ${resolved.ambiguous.join(", ")}`));
               }
               resolvedAgent = resolved;
-              cwd = resolved.cwd;
+              const resolvedCwd = resolved.cwd;
+              if (canonicalProjectPath(resolvedCwd) !== canonicalProjectPath(cwd)) {
+                cwd = resolvedCwd;
+                provider = await deps.buildSessionProvider(cwd, profileId);
+                if (closing) return;
+                if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated for the Agent workspace"));
+                const refreshed = resolveServeAgent(requestedAgentRef, cwd, profileId);
+                if (!refreshed || "ambiguous" in refreshed || refreshed.ref !== resolved.ref) {
+                  return reply(rpcError(id, ERR.CONFLICT, `agent '${requestedAgentRef}' changed while its company policy was being synchronized`));
+                }
+                resolvedAgent = refreshed;
+              } else {
+                cwd = resolvedCwd;
+              }
             }
-            let provider = await deps.buildSessionProvider(cwd, profileId);
-            if (closing) return;
-            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
             const roleModel = resolvedAgent ? effectiveRoleModel(resolvedAgent.role.model, provider.model) : undefined;
             if (roleModel) {
               const roleProvider = deps.buildProviderFor
@@ -2263,6 +2597,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const s = hub.create({
               cwd,
               profileId,
+              spaceId,
               provider,
               providerId: provider.id,
               model: provider.model,
@@ -2274,6 +2609,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               sessionId: s.meta.id,
               model: s.meta.model,
               profileId: s.meta.profileId,
+              spaceId: s.meta.spaceId,
               approval: s.approval,
               agentRef: s.meta.agentRef,
             }));
@@ -2286,7 +2622,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const live = hub.get(p.sessionId);
             if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
             const priorMeta = hub.peekMeta(p.sessionId);
-            const boundProfileId = priorMeta?.profileId ?? runtimeInfo(priorMeta?.cwd).profileId ?? "personal";
+            const defaultRoute = priorMeta?.profileId ? undefined : runtimeInfo(priorMeta?.cwd);
+            let boundProfileId = priorMeta?.profileId ?? defaultRoute?.profileId ?? "personal";
+            let boundSpaceId = defaultRoute?.spaceId ?? failClosedSpaceId(boundProfileId);
+            if (priorMeta) {
+              try {
+                const binding = sessionSpaceBinding(priorMeta);
+                boundProfileId = binding.profileId;
+                boundSpaceId = binding.spaceId;
+              } catch (error) {
+                return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+              }
+            }
             const resumeModel = priorMeta?.model || runtimeInfo(priorMeta?.cwd, undefined, boundProfileId).model;
             const provider = priorMeta && deps.buildProviderFor
               ? await deps.buildProviderFor(resumeModel, undefined, priorMeta.cwd, boundProfileId)
@@ -2307,9 +2654,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               hub.detach(r.session.meta.id);
               return reply(rpcError(id, ERR.BUSY, "session identity changed while resume was starting — retry resume"));
             }
+            if (r.session.meta.spaceId && r.session.meta.spaceId !== boundSpaceId) {
+              hub.detach(r.session.meta.id);
+              return reply(rpcError(id, ERR.BUSY, "session Space changed while resume was starting — retry resume"));
+            }
             const migratedProfileBinding = !r.session.meta.profileId;
+            const migratedSpaceBinding = !r.session.meta.spaceId;
             const migratedRuntimeDefaults = !r.session.meta.model;
             r.session.meta.profileId = boundProfileId;
+            r.session.meta.spaceId = boundSpaceId;
             if (migratedRuntimeDefaults) {
               r.session.meta.model = provider.model;
               r.session.meta.provider = provider.id;
@@ -2318,6 +2671,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             let refreshed = false;
             try {
               refreshed = await refreshSessionProvider(r.session);
+            } catch (error) {
+              hub.detach(r.session.meta.id);
+              return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
             } finally {
               r.session.configuring = false;
             }
@@ -2325,13 +2681,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               hub.detach(r.session.meta.id);
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
-            if (migratedProfileBinding || migratedRuntimeDefaults || migratedApproval) hub.save(r.session);
+            if (migratedProfileBinding || migratedSpaceBinding || migratedRuntimeDefaults || migratedApproval) hub.save(r.session);
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
             broadcastTaskState(r.session, { phase: "restored" });
             return reply(rpcResult(id!, {
               sessionId: r.session.meta.id,
               model: r.session.meta.model,
               profileId: r.session.meta.profileId,
+              spaceId: r.session.meta.spaceId,
               approval: r.session.approval,
               agentRef: r.session.meta.agentRef,
               history: historyForClient(r.session.history),
@@ -2356,6 +2713,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               cwd: snapshot.meta.cwd,
               model: snapshot.meta.model,
               profileId: snapshot.meta.profileId,
+              spaceId: snapshot.meta.spaceId,
               approval: snapshot.meta.approval,
               agentRef: snapshot.meta.agentRef,
               history: historyForClient(snapshot.history),
@@ -2544,9 +2902,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const source = hub.read(p.sessionId);
             if (!source) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
-            const sourceProfileId = source.meta.profileId
-              ?? runtimeInfo(source.meta.cwd).profileId
-              ?? "personal";
+            // A same-route fork is inference and requires the route to remain authoritative. An explicit
+            // recovery transfer is different: its source may intentionally be an unavailable/retired
+            // connection. In that case the durable Space label is the source authority, and only a target
+            // resolving to that exact Space may receive the history.
+            let sourceProfileId: string;
+            let sourceSpaceId: string;
+            if (targetRequested) {
+              if (!source.meta.profileId || !source.meta.spaceId) {
+                return reply(rpcError(
+                  id,
+                  ERR.UNAUTHORIZED,
+                  "legacy history without a verifiable Space binding cannot be transferred",
+                ));
+              }
+              sourceProfileId = source.meta.profileId;
+              sourceSpaceId = source.meta.spaceId;
+            } else {
+              try {
+                const sourceBinding = sessionSpaceBinding(source.meta);
+                sourceProfileId = sourceBinding.profileId;
+                sourceSpaceId = sourceBinding.spaceId;
+              } catch (error) {
+                return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+              }
+            }
             const sourceModel = source.meta.model
               || runtimeInfo(source.meta.cwd, undefined, sourceProfileId).model;
             const targetProfileId = targetRequested ? p.targetProfileId as string : sourceProfileId;
@@ -2554,8 +2934,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const targetRuntime = targetRequested
               ? runtimeInfo(source.meta.cwd, targetModel, targetProfileId)
               : undefined;
+            const targetSpaceId = targetRequested
+              ? targetRuntime?.spaceId ?? failClosedSpaceId(targetProfileId)
+              : sourceSpaceId;
             if (targetRuntime?.profileId && targetRuntime.profileId !== targetProfileId) {
               return reply(rpcError(id, ERR.PARAMS, "target organization connection could not be resolved"));
+            }
+            if (targetRequested && targetSpaceId !== sourceSpaceId) {
+              return reply(rpcError(
+                id,
+                ERR.UNAUTHORIZED,
+                "cross-Space conversation transfer is blocked; organization export requires a separately approved and audited policy",
+              ));
             }
             if (targetRuntime?.availableModels?.length && !targetRuntime.availableModels.includes(targetModel)) {
               return reply(rpcError(
@@ -2602,8 +2992,38 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (provider.model !== targetModel) {
               return reply(rpcError(id, ERR.INTERNAL, `provider did not honor requested model ${targetModel}`));
             }
+            try {
+              if (targetRequested) {
+                const currentSource = hub.read(p.sessionId);
+                if (
+                  !currentSource
+                  || currentSource.meta.profileId !== sourceProfileId
+                  || currentSource.meta.spaceId !== sourceSpaceId
+                ) {
+                  return reply(rpcError(id, ERR.UNAUTHORIZED, "source session Space changed while the fork was starting; retry"));
+                }
+              } else {
+                const currentSource = sessionSpaceBinding(source.meta);
+                if (currentSource.profileId !== sourceProfileId || currentSource.spaceId !== sourceSpaceId) {
+                  return reply(rpcError(id, ERR.UNAUTHORIZED, "source session Space changed while the fork was starting; retry"));
+                }
+              }
+              if (targetRequested) {
+                const currentTarget = runtimeInfo(source.meta.cwd, targetModel, targetProfileId);
+                const currentTargetSpace = currentTarget.spaceId ?? failClosedSpaceId(currentTarget.profileId ?? targetProfileId);
+                if (currentTarget.profileId && currentTarget.profileId !== targetProfileId) {
+                  return reply(rpcError(id, ERR.UNAUTHORIZED, "target connection identity changed while the fork was starting; retry"));
+                }
+                if (currentTargetSpace !== sourceSpaceId || currentTargetSpace !== targetSpaceId) {
+                  return reply(rpcError(id, ERR.UNAUTHORIZED, "target connection Space changed while the fork was starting; retry"));
+                }
+              }
+            } catch (error) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+            }
             const r = hub.fork(p.sessionId, {
               profileId: targetProfileId,
+              spaceId: targetSpaceId,
               model: targetModel,
               provider,
               providerId: provider.id,
@@ -2617,6 +3037,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             let refreshed = false;
             try {
               refreshed = await refreshSessionProvider(r.session);
+            } catch (error) {
+              hub.delete(r.session.meta.id);
+              return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
             } finally {
               r.session.configuring = false;
             }
@@ -2630,6 +3053,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               title: r.session.meta.title,
               model: r.session.meta.model,
               profileId: r.session.meta.profileId,
+              spaceId: r.session.meta.spaceId,
               approval: r.session.approval,
               agentRef: r.session.meta.agentRef,
               history: historyForClient(r.session.history),
@@ -2913,10 +3337,21 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
             if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — switch after it finishes"));
+            try {
+              const binding = sessionSpaceBinding(s.meta);
+              bindSafeLegacyPersonalSession(s, binding);
+            } catch (error) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+            }
             const model = typeof p.model === "string" && p.model ? p.model : s.meta.model;
             const effort = typeof p.effort === "string" && p.effort ? p.effort : undefined;
             if (!deps.buildProviderFor) return reply(rpcError(id, ERR.METHOD, "model switching not supported by this server"));
             const requestedRuntime = runtimeInfo(s.meta.cwd, model, s.meta.profileId);
+            const requestedSpaceId = requestedRuntime.spaceId
+              ?? failClosedSpaceId(requestedRuntime.profileId ?? s.meta.profileId);
+            if (requestedSpaceId !== s.meta.spaceId) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "the selected model route belongs to a different Space"));
+            }
             if (requestedRuntime.availableModels?.length && !requestedRuntime.availableModels.includes(model)) {
               return reply(rpcError(id, ERR.PARAMS, `model '${model}' is not authorized for the active organization connection`));
             }
@@ -2947,6 +3382,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               if (closing) return;
               if (!provider) return reply(rpcError(id, ERR.INTERNAL, `could not build provider for ${model}`));
               if (provider.model !== model) return reply(rpcError(id, ERR.INTERNAL, `provider did not honor requested model ${model}`));
+              try {
+                sessionSpaceBinding(s.meta);
+              } catch (error) {
+                return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+              }
               s.provider = provider;
               s.meta.provider = provider.id;
               s.meta.model = model;
@@ -3089,9 +3529,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const runtime = runtimeInfo(targetCwd);
             const profileId = runtime.profileKind === "gateway" ? runtime.profileId : undefined;
+            const organizationScopeId = profileId ? runtime.spaceId : undefined;
             const learnings = listLearnings({
               cwd: targetCwd,
-              ...(profileId ? { profileId } : {}),
+              ...(organizationScopeId ? { profileId: organizationScopeId } : {}),
               ...(p.scope ? { scope: p.scope as LearningScope } : {}),
               ...(p.status ? { status: p.status as LearningStatus } : {}),
               ...(p.limit ? { limit: p.limit } : {}),
@@ -3105,10 +3546,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 stable: learnings.filter((item) => item.stability === "stable").length,
               },
               organization: {
-                active: Boolean(profileId),
+                active: Boolean(profileId && organizationScopeId),
                 profileId,
-                submitAvailable: Boolean(profileId && deps.organizationLearningSubmit),
-                syncAvailable: Boolean(profileId && deps.organizationLearningSync),
+                spaceId: organizationScopeId,
+                submitAvailable: Boolean(profileId && organizationScopeId && deps.organizationLearningSubmit),
+                syncAvailable: Boolean(profileId && organizationScopeId && deps.organizationLearningSync),
               },
             }));
           }
@@ -3128,10 +3570,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const runtime = runtimeInfo(targetCwd);
             const profileId = runtime.profileKind === "gateway" ? runtime.profileId : undefined;
+            const organizationScopeId = profileId ? runtime.spaceId : undefined;
             try {
               const learning = reviewLearning(p.id, p.decision, {
                 cwd: targetCwd,
-                ...(profileId ? { profileId } : {}),
+                ...(organizationScopeId ? { profileId: organizationScopeId } : {}),
                 ...(p.expectedRevision !== undefined ? { expectedRevision: p.expectedRevision } : {}),
                 ...(p.note ? { note: p.note } : {}),
               });
@@ -3150,9 +3593,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const runtime = runtimeInfo(targetCwd);
             const profileId = runtime.profileKind === "gateway" ? runtime.profileId : undefined;
-            if (!profileId) return reply(rpcError(id, ERR.PARAMS, "an organization connection must be active"));
+            const organizationScopeId = profileId ? runtime.spaceId : undefined;
+            if (!profileId || !organizationScopeId) return reply(rpcError(id, ERR.PARAMS, "an organization connection with a verified Space must be active"));
             try {
-              const result = await deps.organizationLearningSubmit(profileId, p.id.trim(), targetCwd);
+              const result = await deps.organizationLearningSubmit(profileId, organizationScopeId, p.id.trim(), targetCwd);
               return reply(rpcResult(id!, result));
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
@@ -3165,9 +3609,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const runtime = runtimeInfo(targetCwd);
             const profileId = runtime.profileKind === "gateway" ? runtime.profileId : undefined;
-            if (!profileId) return reply(rpcError(id, ERR.PARAMS, "an organization connection must be active"));
+            const organizationScopeId = profileId ? runtime.spaceId : undefined;
+            if (!profileId || !organizationScopeId) return reply(rpcError(id, ERR.PARAMS, "an organization connection with a verified Space must be active"));
             try {
-              const result = await deps.organizationLearningSync(profileId, targetCwd);
+              const result = await deps.organizationLearningSync(profileId, organizationScopeId, targetCwd);
               return reply(rpcResult(id!, result));
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
@@ -3870,7 +4315,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcError(id, ERR.METHOD, `unknown method ${req.method}`));
         }
         } catch (e: any) {
-          return reply(rpcError(id, ERR.INTERNAL, redactSensitiveText(String(e?.message ?? e)).text));
+          const code = e instanceof SessionSpaceBoundaryError ? ERR.UNAUTHORIZED : ERR.INTERNAL;
+          return reply(rpcError(id, code, redactSensitiveText(String(e?.message ?? e)).text));
         }
       })();
       inFlightRequests.add(task);

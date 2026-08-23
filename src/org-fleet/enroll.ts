@@ -13,15 +13,23 @@
 //   GET  {gateway}/v1/roles       Bearer <device_token> -> {version, org_policy, roles:[…]}  (B3 digital-employee push-down)
 //   POST {gateway}/v1/chat/completions  (OpenAI-compatible; the normal agent traffic, Bearer <device_token>)
 import { homedir, hostname, platform } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { basename, dirname, join, resolve } from "node:path";
+import { readdirSync } from "node:fs";
 import {
   normalizeDeskBaseUrl,
   removeMismatchedProfileCreds,
   saveProfileCreds,
   type DeskCreds,
 } from "../desk.js";
-import { invalidateRolesCache, orgRolesDir } from "../org/roles.js";
+import {
+  invalidateRolesCache,
+  orgRolesDir,
+  parseOrganizationRoleBundleEnvelope,
+  type OrganizationBundleRole,
+  type OrganizationRoleBundleEnvelope,
+  type OrganizationRoleBundleSnapshot,
+} from "../org/roles.js";
 import {
   loadActiveProfile,
   removeProfile,
@@ -30,6 +38,7 @@ import {
   getProfile,
   DEFAULT_ORG_ID,
   isValidProfileId,
+  spaceIdForProfile,
   type Profile,
 } from "../profile/profile.js";
 import {
@@ -40,9 +49,11 @@ import {
   bindPrivateHaraStateFile,
   readPrivateStateFileSnapshotSync,
   removePrivateStateFile,
+  withPrivateStateLockSync,
   writePrivateStateFileSync,
 } from "../security/private-state.js";
 import { userModelFetch } from "../network/model-fetch.js";
+import { readBoundedResponseText } from "../network/bounded-response.js";
 import {
   applyOrganizationLearningBundle,
   markLearningSubmitted,
@@ -54,6 +65,9 @@ export interface Enrollment {
   gatewayUrl: string; // e.g. https://hara-gw.acme.internal  (no trailing slash)
   deviceToken: string; // scoped + revocable; issued by hara-control, NOT a provider key
   deviceId: string;
+  /** Control-authoritative company identity. Local connection ids are presentation/routing aliases only. */
+  tenantId?: string;
+  tenantName?: string;
   model: string; // default model the gateway routes to ("" = gateway decides)
   /** Server-authoritative models permitted by this scoped token. Legacy servers omit this field. */
   availableModels?: string[];
@@ -82,6 +96,8 @@ export interface GatewayProfileEnrollmentInput {
 
 const MAX_ENROLL_RESPONSE_BYTES = 1024 * 1024;
 const MAX_HEARTBEAT_RESPONSE_BYTES = 64 * 1024;
+const MAX_ROLE_BUNDLE_RESPONSE_BYTES = 2 * 1024 * 1024;
+const ROLE_BUNDLE_REQUEST_TIMEOUT_MS = 20_000;
 const MAX_LEARNING_RESPONSE_BYTES = 2 * 1024 * 1024;
 const LEARNING_REQUEST_TIMEOUT_MS = 20_000;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
@@ -277,11 +293,25 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
   }
   const rawDeviceId = j.device_id ?? j.deviceId ?? "";
   const rawModel = j.model ?? "";
+  const rawTenantId = j.tenant_id ?? j.tenantId;
+  const rawTenantName = j.tenant_name ?? j.tenantName;
   if (typeof rawDeviceId !== "string" || rawDeviceId.length > 256 || CONTROL_CHARACTERS.test(rawDeviceId)) {
     throw new Error("enroll response contains an invalid device_id");
   }
   if (typeof rawModel !== "string" || rawModel.length > 512 || CONTROL_CHARACTERS.test(rawModel)) {
     throw new Error("enroll response contains an invalid model");
+  }
+  if (
+    rawTenantId !== undefined
+    && (typeof rawTenantId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(rawTenantId))
+  ) {
+    throw new Error("enroll response contains an invalid tenant_id");
+  }
+  if (
+    rawTenantName !== undefined
+    && (typeof rawTenantName !== "string" || !rawTenantName.trim() || rawTenantName.length > 80 || CONTROL_CHARACTERS.test(rawTenantName))
+  ) {
+    throw new Error("enroll response contains an invalid tenant_name");
   }
   const availableModels = parseAdvertisedStringList(
     j.available_models ?? j.availableModels,
@@ -313,6 +343,8 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     gatewayUrl: normalizeGatewayUrl(gatewayUrl),
     deviceToken,
     deviceId: rawDeviceId,
+    ...(rawTenantId ? { tenantId: rawTenantId } : {}),
+    ...(typeof rawTenantName === "string" ? { tenantName: rawTenantName.trim() } : {}),
     model: rawModel,
     availableModels,
     thinkingEfforts,
@@ -374,12 +406,7 @@ export async function exchangeEnrollment(gatewayUrl: string, code: string, signa
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}${res.status === 401 || res.status === 403 ? " — bad or expired code" : ""}`);
   }
-  const declaredLength = Number(res.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_ENROLL_RESPONSE_BYTES) {
-    throw new Error("enroll response is too large");
-  }
-  const raw = await res.text();
-  if (Buffer.byteLength(raw, "utf8") > MAX_ENROLL_RESPONSE_BYTES) throw new Error("enroll response is too large");
+  const raw = await readBoundedResponseText(res, MAX_ENROLL_RESPONSE_BYTES, "enroll response is too large");
   let payload: Record<string, unknown>;
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -402,7 +429,10 @@ export function gatewayProfileFromEnrollment(id: string, label: string | undefin
   return {
     id,
     kind: "gateway",
-    label: label || id,
+    label: label || e.tenantName || id,
+    tenantId: e.tenantId,
+    ...(!e.tenantId ? { enrollmentAudience: randomBytes(16).toString("hex") } : {}),
+    tenantName: e.tenantName,
     gatewayUrl: e.gatewayUrl,
     deviceId: e.deviceId,
     deviceToken: e.deviceToken,
@@ -475,6 +505,8 @@ export function enrollmentFromProfile(profile: Profile): Enrollment | null {
     gatewayUrl: profile.gatewayUrl,
     deviceToken: profile.deviceToken,
     deviceId: profile.deviceId || "",
+    tenantId: profile.tenantId,
+    tenantName: profile.tenantName,
     model: profile.defaultModel || "",
     availableModels: profile.availableModels,
     thinkingEfforts: profile.thinkingEfforts,
@@ -576,9 +608,8 @@ export async function heartbeatEnrollment(
       return false;
     }
     if (res.status === 204) return true;
-    const text = await res.text();
+    const text = await readBoundedResponseText(res, MAX_HEARTBEAT_RESPONSE_BYTES, "heartbeat response is too large");
     if (!text.trim()) return true;
-    if (Buffer.byteLength(text, "utf8") > MAX_HEARTBEAT_RESPONSE_BYTES) return false;
     const body = JSON.parse(text) as unknown;
     if (!body || typeof body !== "object" || Array.isArray(body)) return false;
     const next = updatedEnrollmentFromHeartbeat(e, body as Record<string, unknown>);
@@ -618,44 +649,9 @@ export async function heartbeat(signal?: AbortSignal): Promise<boolean> {
 // them (model/tool/approval floors), and serves them at GET /v1/roles. Wire types are snake_case (server
 // convention); we map them to the camelCase frontmatter keys the CLI role loader expects.
 
-export interface BundleRole {
-  name: string;
-  description?: string;
-  owns?: string[];
-  rejects?: string[];
-  model?: string;
-  allow_tools?: string[];
-  deny_tools?: string[];
-  system: string;
-}
-export interface RoleBundle {
-  version?: number;
-  org_policy?: Record<string, unknown>;
-  roles?: BundleRole[];
-}
-
-const SAFE_ORG_ROLE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-const WINDOWS_RESERVED_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
-
-function isSafeBundleRole(value: unknown): value is BundleRole {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const role = value as Record<string, unknown>;
-  if (
-    typeof role.name !== "string" || !SAFE_ORG_ROLE_NAME.test(role.name) || WINDOWS_RESERVED_NAME.test(role.name) ||
-    typeof role.system !== "string" || !role.system.trim()
-  ) return false;
-  for (const key of ["description", "model"] as const) {
-    if (role[key] !== undefined && typeof role[key] !== "string") return false;
-  }
-  for (const key of ["owns", "rejects", "allow_tools", "deny_tools"] as const) {
-    if (role[key] !== undefined && (!Array.isArray(role[key]) || !(role[key] as unknown[]).every((item) => typeof item === "string"))) return false;
-  }
-  return true;
-}
-
 /** Render one bundle role into the markdown frontmatter the CLI role loader expects
  *  (src/org/roles.ts parseFrontmatter): name/description/owns/rejects/model/allowTools/denyTools, body=system. */
-function renderRoleMd(r: BundleRole): string {
+function renderRoleMd(r: OrganizationBundleRole): string {
   const fm: string[] = ["---", `name: ${r.name}`];
   if (r.description) fm.push(`description: ${r.description}`);
   if (r.owns?.length) fm.push(`owns: [${r.owns.join(", ")}]`);
@@ -667,56 +663,169 @@ function renderRoleMd(r: BundleRole): string {
   return fm.join("\n");
 }
 
+function writeManagedBundleFile(
+  stateHome: string,
+  storageKey: string,
+  filename: string,
+  text: string,
+): void {
+  // The hardened private-state CAS move-claims an old inode while replacing it. Serialize both readers and
+  // writers for the authoritative bundle so separate Serve/Desktop/gateway processes never observe that
+  // internal gap or collide while committing the same Space snapshot.
+  withPrivateStateLockSync(stateHome, ["org-roles", storageKey], `${filename}.snapshot`, () => {
+    const binding = bindPrivateHaraStateFile(stateHome, ["org-roles", storageKey], filename);
+    writePrivateStateFileSync(binding, text);
+  }, { busyMessage: `managed organization bundle '${filename}' is busy; retry the sync` });
+}
+
 /** Pull one exact profile's governed role bundle and materialize it into the profile-scoped managed
  * directory. The bundle is authoritative for that profile only: another active connection can never
  * overwrite or supply role prompts to a resumed session. */
 async function syncOrgRolesEnrollment(
   profileId: string,
+  expectedSpaceId: string,
   e: Enrollment,
   signal?: AbortSignal,
-): Promise<number> {
+  required = false,
+): Promise<OrganizationRoleBundleSnapshot | null> {
   try {
-    const res = await userModelFetch(`${e.gatewayUrl}/v1/roles`, { signal, headers: { authorization: `Bearer ${e.deviceToken}` } });
-    if (!res.ok) return 0;
-    const bundle = (await res.json()) as RoleBundle;
-    const roles = Array.isArray(bundle.roles)
-      ? [...new Map(bundle.roles.filter(isSafeBundleRole).map((role) => [role.name, role])).values()]
-      : [];
-    const dir = orgRolesDir(profileId);
-    rmSync(dir, { recursive: true, force: true }); // authoritative replace
-    mkdirSync(dir, { recursive: true });
-    const root = resolve(dir);
-    for (const r of roles) {
-      const target = resolve(root, `${r.name}.md`);
-      if (dirname(target) !== root) continue;
-      writeFileSync(target, renderRoleMd(r), "utf8");
+    const enrollmentIsCurrent = (): boolean => {
+      const current = getProfile(profileId);
+      const currentEnrollment = current ? enrollmentFromProfile(current) : null;
+      return current?.kind === "gateway"
+        && currentEnrollment !== null
+        && spaceIdForProfile(current) === expectedSpaceId
+        && currentEnrollment.gatewayUrl === e.gatewayUrl
+        && currentEnrollment.deviceId === e.deviceId
+        && currentEnrollment.deviceToken === e.deviceToken
+        && currentEnrollment.enrolledAt === e.enrolledAt;
+    };
+    // The profile id is a mutable route alias. Freeze both its immutable audience and enrollment
+    // generation before issuing a request so an in-flight A response cannot populate B after re-enroll.
+    if (!enrollmentIsCurrent()) throw new Error("organization connection changed before role sync");
+    const deadline = AbortSignal.timeout(ROLE_BUNDLE_REQUEST_TIMEOUT_MS);
+    const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    const res = await userModelFetch(`${e.gatewayUrl}/v1/roles`, {
+      signal: requestSignal,
+      redirect: "error",
+      headers: { authorization: `Bearer ${e.deviceToken}` },
+    });
+    if (!res.ok) throw new Error(`organization role sync failed with HTTP ${res.status}`);
+    const raw = await readBoundedResponseText(
+      res,
+      MAX_ROLE_BUNDLE_RESPONSE_BYTES,
+      "organization role sync response is too large",
+    );
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("organization role sync response is not valid JSON");
     }
-    // org policy sidecar (model/tool/approval floors the CLI enforces; skipped by the .md-only role loader)
-    writeFileSync(join(dir, "_policy.json"), JSON.stringify({ version: bundle.version ?? 0, org_policy: bundle.org_policy ?? {} }, null, 2) + "\n", "utf8");
+    const snapshot = parseOrganizationRoleBundleEnvelope(parsed);
+    const bundle: OrganizationRoleBundleEnvelope = snapshot.envelope;
+    const roles = bundle.roles;
+    if (!enrollmentIsCurrent()) throw new Error("organization connection changed during role sync");
+    const dir = orgRolesDir(expectedSpaceId);
+    const storageKey = basename(dir);
+    // Security authority is one atomically replaced envelope. Readers never derive company roles from the
+    // compatibility .md files below, so a concurrent refresh cannot mix persona v1 with policy v2.
+    writeManagedBundleFile(homedir(), storageKey, "_bundle.json", `${JSON.stringify(bundle, null, 2)}\n`);
+    if (!enrollmentIsCurrent()) throw new Error("organization connection changed while role bundle was committed");
+
+    // Keep the old on-disk presentation for one release (`hara roles` tooling and operator inspection),
+    // but it is derived/non-authoritative. Remove only verified regular .md files in the bound private dir.
+    try {
+      const directoryBinding = bindPrivateHaraStateFile(homedir(), ["org-roles", storageKey], "_bundle.json");
+      for (const filename of readdirSync(directoryBinding.directory.path)) {
+        if (!filename.endsWith(".md")) continue;
+        const target = join(directoryBinding.directory.path, filename);
+        try {
+          const existing = readPrivateStateFileSnapshotSync(target);
+          if (existing) removePrivateStateFile(target, existing, directoryBinding.directory);
+        } catch {
+          // Derived compatibility files never participate in authorization; a concurrent refresher wins.
+        }
+      }
+      for (const r of roles) {
+        try { writeManagedBundleFile(homedir(), storageKey, `${r.name}.md`, renderRoleMd(r)); } catch { /* derived */ }
+      }
+      // Compatibility sidecar only; execution always parses the atomic `_bundle.json` envelope.
+      try {
+        writeManagedBundleFile(
+          homedir(),
+          storageKey,
+          "_policy.json",
+          `${JSON.stringify({ version: bundle.version, org_policy: bundle.org_policy }, null, 2)}\n`,
+        );
+      } catch {
+        /* derived */
+      }
+    } catch {
+      /* The authoritative atomic bundle is already durable; presentation materialization is best-effort. */
+    }
     invalidateRolesCache();
-    return roles.length;
-  } catch {
-    return 0;
+    return snapshot;
+  } catch (error) {
+    if (required) throw error;
+    return null;
   }
 }
 
-/** Exact-profile variant used by persisted sessions and Desktop Serve. */
-export async function syncOrgRolesForProfile(profile: Profile, signal?: AbortSignal): Promise<number> {
+/** Exact authenticated snapshot used by company provider/tool authorization. Returning the in-memory
+ * response prevents another local Hara process from swapping the cache between sync and policy use. */
+export async function syncOrganizationRoleBundleForProfile(
+  profile: Profile,
+  signal?: AbortSignal,
+  options: { required?: boolean } = {},
+): Promise<OrganizationRoleBundleSnapshot | null> {
   const e = enrollmentFromProfile(profile);
-  if (!e) return 0;
-  return syncOrgRolesEnrollment(profile.id, e, signal);
+  if (!e) return null;
+  return syncOrgRolesEnrollment(
+    profile.id,
+    spaceIdForProfile(profile),
+    e,
+    signal,
+    options.required === true,
+  );
+}
+
+/** Count-only compatibility API used by explicit role-sync commands and older embedders. */
+export async function syncOrgRolesForProfile(
+  profile: Profile,
+  signal?: AbortSignal,
+  options: { required?: boolean } = {},
+): Promise<number> {
+  return (await syncOrganizationRoleBundleForProfile(profile, signal, options))?.roles.length ?? 0;
 }
 
 /** Active-profile compatibility wrapper for explicit `hara roles sync`-style commands. */
 export async function syncOrgRoles(signal?: AbortSignal): Promise<number> {
   const active = loadActiveProfile();
   const exact = enrollmentFromProfile(active);
-  if (exact) return syncOrgRolesEnrollment(active.id, exact, signal);
+  if (exact) return (await syncOrgRolesEnrollment(active.id, spaceIdForProfile(active), exact, signal))?.roles.length ?? 0;
   // A legacy caller can create ~/.hara/org.json after profiles.json was already initialized. Preserve that
-  // pre-profile flow without exposing its bundle to Personal: materialize it only under default-org.
+  // pre-profile flow without exposing its bundle to Personal: migrate it into a real immutable-Space
+  // gateway profile before materializing policy. Never replace an unrelated existing default-org route.
   const legacy = loadEnrollment();
   if (!legacy) return 0;
-  return syncOrgRolesEnrollment(DEFAULT_ORG_ID, legacy, signal);
+  let migrated = getProfile(DEFAULT_ORG_ID);
+  if (!migrated) {
+    migrated = upsertGatewayProfileFromEnrollment(
+      DEFAULT_ORG_ID,
+      legacy.tenantName || "Default Org",
+      legacy,
+    );
+  }
+  if (!migrated || migrated.kind !== "gateway") return 0;
+  const migratedEnrollment = enrollmentFromProfile(migrated);
+  if (
+    !migratedEnrollment
+    || migratedEnrollment.gatewayUrl !== legacy.gatewayUrl
+    || migratedEnrollment.deviceToken !== legacy.deviceToken
+    || migratedEnrollment.deviceId !== legacy.deviceId
+  ) return 0;
+  return (await syncOrgRolesEnrollment(DEFAULT_ORG_ID, spaceIdForProfile(migrated), migratedEnrollment, signal))?.roles.length ?? 0;
 }
 
 // ── Reviewable organization learning ─────────────────────────────────────────────────────────────
@@ -771,15 +880,11 @@ async function boundedControlJson(
     await response.body?.cancel().catch(() => undefined);
     throw new Error(`${failureLabel} failed (HTTP ${response.status})`);
   }
-  const declared = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > MAX_LEARNING_RESPONSE_BYTES) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new Error(`${failureLabel} response is too large`);
-  }
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > MAX_LEARNING_RESPONSE_BYTES) {
-    throw new Error(`${failureLabel} response is too large`);
-  }
+  const text = await readBoundedResponseText(
+    response,
+    MAX_LEARNING_RESPONSE_BYTES,
+    `${failureLabel} response is too large`,
+  );
   try {
     const parsed = JSON.parse(text) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid");
@@ -801,7 +906,7 @@ export interface OrganizationLearningSubmitResult {
 export async function submitOrganizationLearning(
   profileId: string,
   candidate: LearningCandidate,
-  context: { cwd: string; stateHome?: string },
+  context: { cwd: string; stateHome?: string; organizationScopeId?: string },
   signal?: AbortSignal,
 ): Promise<OrganizationLearningSubmitResult> {
   if (candidate.scope !== "organization") throw new Error("only organization learning can be submitted to Hara Control");
@@ -809,6 +914,10 @@ export async function submitOrganizationLearning(
   const localEvidence = candidate.evidence.filter((item) => item.source !== "organization");
   if (!localEvidence.length) throw new Error("organization learning has no local reviewable evidence");
   const profile = exactGatewayProfile(profileId);
+  const organizationScopeId = context.organizationScopeId ?? spaceIdForProfile(profile);
+  if (organizationScopeId !== spaceIdForProfile(profile)) {
+    throw new Error("organization connection changed before learning submission; refresh and retry");
+  }
   const payload = {
     client_id: candidate.clientId,
     pattern_key: candidate.patternKey,
@@ -851,7 +960,7 @@ export async function submitOrganizationLearning(
   const local = markLearningSubmitted(candidate.id, remoteId, {
     cwd: context.cwd,
     stateHome: context.stateHome,
-    profileId,
+    profileId: organizationScopeId,
   });
   return { remoteId, status: remoteStatus, revision: Number(revision), candidate: local };
 }
@@ -874,10 +983,14 @@ function organizationLearningItem(value: unknown): value is OrganizationLearning
  * same atomic write, so a Control revocation cannot linger in a future prompt. */
 export async function syncOrganizationLearnings(
   profileId: string,
-  context: { cwd: string; stateHome?: string },
+  context: { cwd: string; stateHome?: string; organizationScopeId?: string },
   signal?: AbortSignal,
 ): Promise<{ version: number; learnings: LearningCandidate[] }> {
   const profile = exactGatewayProfile(profileId);
+  const organizationScopeId = context.organizationScopeId ?? spaceIdForProfile(profile);
+  if (organizationScopeId !== spaceIdForProfile(profile)) {
+    throw new Error("organization connection changed before learning sync; refresh and retry");
+  }
   const result = await boundedControlJson(
     `${profile.gatewayUrl}/v1/learnings`,
     profile,
@@ -901,7 +1014,7 @@ export async function syncOrganizationLearnings(
   return {
     version: Number(version),
     learnings: applyOrganizationLearningBundle(
-      profileId,
+      organizationScopeId,
       Number(version),
       learnings as OrganizationLearningWire[],
       context,

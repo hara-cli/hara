@@ -6,7 +6,13 @@ import { resetRepeatGuard } from "../agent/repeat-guard.js";
 import { clearTouched } from "../agent/touched.js";
 import { memoryDigest } from "../memory/store.js";
 import { resolveAgent } from "../org/projects.js";
-import { loadGlobalRoles, loadRoles, subagentToolFilter, type Role } from "../org/roles.js";
+import {
+  loadGlobalRoles,
+  loadOrganizationExecutionPolicy,
+  loadRoles,
+  subagentToolFilter,
+  type Role,
+} from "../org/roles.js";
 import type { Provider, NeutralMsg } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
 import { effectiveRoleModel } from "../session/session-model.js";
@@ -29,11 +35,14 @@ export interface NativeSubagentRequest extends SubagentRequest {
   sandbox: SandboxMode;
   projectContext?: string;
   profileId?: string;
+  spaceId?: string;
   parentStats: { input: number; output: number; lastInput?: number };
   timeoutMs: number;
   maxRounds: number;
   observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun">;
   isReadonlyTool: (name: string) => boolean;
+  /** Revalidates the parent conversation's immutable audience around lazy role/provider work. */
+  assertAudience?: () => void;
   resolveProvider: (model: string, profileId?: string) => Promise<Provider | null>;
 }
 
@@ -61,6 +70,7 @@ function aggregateUsage(
 }
 
 async function executeNative(request: NativeSubagentRequest): Promise<SubagentSettlement> {
+  request.assertAudience?.();
   const roles = loadRoles(request.cwd, request.profileId);
   const roleRef = request.role?.trim();
   if (request.role !== undefined && !roleRef) return roleError("role cannot be blank");
@@ -81,15 +91,20 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
   } else if (roleRef) {
     role = roles.find((candidate) => candidate.id === roleRef);
   }
+  request.assertAudience?.();
   const builtinSystem = !role && roleRef === "explore" ? EXPLORE_SYSTEM : undefined;
   if (roleRef && !role && !builtinSystem) {
     return roleError(`no role '${roleRef}' is available in ${request.cwd}. Use a local role id, global:<name>, or role "explore".`);
   }
 
   const requestedModel = effectiveRoleModel(role?.model, request.baseProvider.model);
+  const rolePolicyVersion = role && request.spaceId && request.spaceId !== "personal"
+    ? role.organizationPolicyVersion
+    : undefined;
   const provider = requestedModel
     ? ((await request.resolveProvider(requestedModel, request.profileId)) ?? request.baseProvider)
     : request.baseProvider;
+  request.assertAudience?.();
   const toolFilter = subagentToolFilter(role, request.isReadonlyTool);
   const history: NeutralMsg[] = [{ role: "user", content: request.task }];
   const todoScope = `subagent:${randomUUID()}`;
@@ -103,13 +118,16 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
         sandbox: request.sandbox,
         todoScope,
         profileId: request.profileId,
+        spaceId: request.spaceId,
       },
       approval: "full-auto",
+      approvalChannel: false,
       confirm: async () => true,
       projectContext: request.projectContext,
-      memory: memoryDigest(request.cwd, request.profileId),
+      memory: memoryDigest(request.cwd, request.spaceId),
       stats: localStats,
       systemOverride: role?.system ?? builtinSystem,
+      organizationPolicyVersion: rolePolicyVersion,
       toolFilter,
       hooks: false,
       quiet: true,

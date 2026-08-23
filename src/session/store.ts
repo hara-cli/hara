@@ -31,7 +31,7 @@ import { redactSensitiveValue } from "../security/secrets.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
-import { isValidProfileId } from "../profile/profile.js";
+import { isValidProfileId, isValidSpaceId } from "../profile/profile.js";
 import { sleepSync } from "../sync-sleep.js";
 import { isTaskExecution, type TaskExecution } from "./task.js";
 import type { ApprovalMode } from "../config.js";
@@ -83,6 +83,9 @@ export interface SessionMeta {
   /** Identity route that owns this conversation. New sessions always persist it; legacy sessions may
    * omit it and bind to the active profile once on their next successful resume/save. */
   profileId?: string;
+  /** Immutable data/audience boundary. A profile is a route; this is Personal or one authoritative
+   * organization Space. Legacy sessions acquire it once when safely resumed. */
+  spaceId?: string;
   provider: string;
   /** Per-session pinned model. Set at session creation from cfg.model, **updated by `/model X`**,
    *  and restored into cfg.model on resume so a session keeps the model the user picked.
@@ -1016,6 +1019,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   safe.meta.id = data.meta.id;
   safe.meta.cwd = data.meta.cwd;
   if (data.meta.profileId !== undefined) safe.meta.profileId = data.meta.profileId;
+  if (data.meta.spaceId !== undefined) safe.meta.spaceId = data.meta.spaceId;
   safe.meta.provider = data.meta.provider;
   safe.meta.model = data.meta.model;
   safe.meta.createdAt = data.meta.createdAt;
@@ -1300,6 +1304,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
     typeof meta.cwd === "string" &&
     (meta.haraVersion === undefined || isValidHaraVersion(meta.haraVersion)) &&
     (meta.profileId === undefined || isValidProfileId(meta.profileId)) &&
+    (meta.spaceId === undefined || isValidSpaceId(meta.spaceId)) &&
     typeof meta.provider === "string" &&
     typeof meta.model === "string" &&
     typeof meta.title === "string" &&

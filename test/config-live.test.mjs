@@ -1,7 +1,7 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { linkSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -514,7 +514,7 @@ test("global config refuses hard-link aliases and never rewrites their external 
   const savedHome = process.env.HOME;
   try {
     process.env.HOME = home;
-    assert.deepEqual(readRawConfig(), {}, "unsafe global aliases are not loaded into routing state");
+    assert.throws(() => readRawConfig(), /hard-linked/i, "unsafe global aliases fail closed instead of becoming an empty config");
     assert.throws(() => writeConfigValue("model", "attacker-write"), /hard-linked/i);
     assert.equal(readFileSync(outside, "utf8"), original, "the external hard-link target is unchanged");
   } finally {
@@ -524,7 +524,7 @@ test("global config refuses hard-link aliases and never rewrites their external 
   }
 });
 
-test("loadConfig: non-object config roots and blank overlay env fail soft", () => {
+test("loadConfig: invalid global roots fail closed while project roots and blank overlays fail soft", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-config-shape-"));
   const home = join(root, "home");
   const project = join(root, "project");
@@ -538,6 +538,8 @@ test("loadConfig: non-object config roots and blank overlay env fail soft", () =
   try {
     process.env.HOME = home;
     process.env.HARA_OVERLAY = " ";
+    assert.throws(() => loadConfig({ cwd: project, overlay: "missing" }), /must contain a JSON object/);
+    writeFileSync(join(home, ".hara", "config.json"), "{}");
     const cfg = loadConfig({ cwd: project, overlay: "missing" });
     assert.equal(cfg.provider, "anthropic");
     assert.equal(cfg.cwd, project);
@@ -546,6 +548,142 @@ test("loadConfig: non-object config roots and blank overlay env fail soft", () =
     else process.env.HOME = savedHome;
     if (savedOverlay === undefined) delete process.env.HARA_OVERLAY;
     else process.env.HARA_OVERLAY = savedOverlay;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent config updates preserve both processes' keys", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-process-race-"));
+  const home = join(root, "home");
+  const haraHome = join(home, ".hara");
+  const config = join(haraHome, "config.json");
+  mkdirSync(haraHome, { recursive: true });
+  writeFileSync(config, JSON.stringify({
+    provider: "openai",
+    model: "stable-model",
+    apiKey: "fixture-key",
+    sentinel: "preserve-me",
+  }), { mode: 0o600 });
+  const runChild = (key, holdMs, delayMs = 0) => new Promise((resolve, reject) => {
+    const script = `import { updateRawConfig } from "./dist/config.js";
+      ${delayMs ? `await new Promise((resolve) => setTimeout(resolve, ${delayMs}));` : ""}
+      updateRawConfig((config) => {
+        const end = Date.now() + ${holdMs};
+        while (Date.now() < end) {}
+        config[${JSON.stringify(key)}] = true;
+      });`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => (stderr += String(chunk)));
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`${key} child failed (${code}): ${stderr}`)));
+  });
+  try {
+    const results = await Promise.allSettled([
+      runChild("fromA", 500),
+      runChild("fromB", 50, 100),
+    ]);
+    assert.deepEqual(results.filter((result) => result.status === "rejected").map((result) => String(result.reason)), []);
+    const stored = JSON.parse(readFileSync(config, "utf8"));
+    assert.equal(stored.provider, "openai");
+    assert.equal(stored.model, "stable-model");
+    assert.equal(stored.apiKey, "fixture-key");
+    assert.equal(stored.sentinel, "preserve-me");
+    assert.equal(stored.fromA, true);
+    assert.equal(stored.fromB, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a publisher crash between lock link and staging cleanup is recovered", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-dead-publication-"));
+  const home = join(root, "home");
+  const haraHome = join(home, ".hara");
+  mkdirSync(haraHome, { recursive: true });
+  writeFileSync(join(haraHome, "config.json"), JSON.stringify({ sentinel: "preserve-me" }), { mode: 0o600 });
+  const deadPid = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    const childPid = child.pid;
+    child.once("error", reject);
+    child.once("close", () => resolve(childPid));
+  });
+  assert.equal(Number.isInteger(deadPid), true);
+  const token = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const staging = join(haraHome, `.hara-lock-${deadPid}-${token}.tmp`);
+  const lock = join(haraHome, "config.lock");
+  writeFileSync(staging, `${JSON.stringify({
+    pid: deadPid,
+    token,
+  })}\n`, { mode: 0o600 });
+  linkSync(staging, lock);
+  const savedHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    writeConfigValue("recovered", "yes");
+    const stored = JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8"));
+    assert.equal(stored.sentinel, "preserve-me");
+    assert.equal(stored.recovered, "yes");
+    assert.deepEqual(
+      readdirSync(haraHome).filter((name) => name.includes(".hara-lock-") || name.endsWith(".lock") || name.endsWith(".reclaim")),
+      [],
+      "the dead publication and reclaim guard leave no lock artifacts",
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("many live config lock publishers preserve every update", { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-publisher-pressure-"));
+  const home = join(root, "home");
+  const haraHome = join(home, ".hara");
+  mkdirSync(haraHome, { recursive: true });
+  writeFileSync(join(haraHome, "config.json"), JSON.stringify({ count: 0 }), { mode: 0o600 });
+  const workers = 8;
+  const updates = 10;
+  const activeChildren = new Set();
+  const runWorker = (index) => new Promise((resolve, reject) => {
+    const script = `import { updateRawConfig } from "./dist/config.js";
+      for (let i = 0; i < ${updates}; i++) updateRawConfig((config) => {
+        config.count = Number(config.count ?? 0) + 1;
+        config["worker-${index}"] = i + 1;
+      });`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    activeChildren.add(child);
+    let stderr = "";
+    child.stderr.on("data", (chunk) => (stderr += String(chunk)));
+    child.once("error", reject);
+    child.once("close", (code) => {
+      activeChildren.delete(child);
+      if (code === 0) resolve();
+      else reject(new Error(`worker ${index} failed (${code}): ${stderr}`));
+    });
+  });
+  try {
+    const results = await Promise.allSettled(Array.from({ length: workers }, (_, index) => runWorker(index)));
+    assert.deepEqual(results.filter((result) => result.status === "rejected").map((result) => String(result.reason)), []);
+    const stored = JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8"));
+    assert.equal(stored.count, workers * updates);
+    for (let index = 0; index < workers; index++) assert.equal(stored[`worker-${index}`], updates);
+    assert.deepEqual(
+      readdirSync(haraHome).filter((name) => name.includes(".hara-lock-") || name.endsWith(".lock") || name.endsWith(".reclaim")),
+      [],
+    );
+  } finally {
+    for (const child of activeChildren) {
+      try { child.kill("SIGKILL"); } catch { /* already exited */ }
+    }
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -60,6 +60,11 @@ import { captureLearning } from "../learning/store.js";
 import { askUserTool } from "../tools/ask_user.js";
 import { PromptAssembler, type AssembledSystemPrompt } from "./prompt.js";
 import {
+  assertOrganizationModelAllowed,
+  loadOrganizationExecutionPolicy,
+  type OrganizationExecutionPolicy,
+} from "../org/roles.js";
+import {
   activateSkillToolPolicy,
   skillToolAllowed,
   skillToolPolicyLabel,
@@ -360,6 +365,10 @@ export interface RunOpts {
   provider: Provider;
   ctx: ToolContext;
   approval: ApprovalMode;
+  /** Whether `confirm` is backed by a real interactive/RPC approval channel. Organization policy may
+   * require human approval even when the caller requested full-auto; headless auto-yes callbacks must set
+   * this false so governed writes fail closed instead of impersonating a person. */
+  approvalChannel: boolean;
   /** Interactive approval channel. Implementations should actively dismiss their prompt when `signal`
    *  aborts; the loop still races the Promise as a hard boundary for non-cooperative embedders. */
   confirm: (
@@ -397,6 +406,9 @@ export interface RunOpts {
   stats?: { input: number; output: number; lastInput?: number };
   /** role persona used instead of the default hara system prompt */
   systemOverride?: string;
+  /** Version of the Control bundle from which systemOverride/toolFilter were resolved. If a fresh policy
+   * sync observes another version, halt this run instead of mixing an old persona with new authority. */
+  organizationPolicyVersion?: number;
   /** restrict which tools this run may use (by name) */
   toolFilter?: (name: string) => boolean;
   /** Skills explicitly loaded before this run (for example `/design` or `/skill foo`). A declared
@@ -746,6 +758,18 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
 async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLifecycle): Promise<RunOutcome> {
   const { provider, ctx } = opts;
   const runSignal = life.signal;
+  const companyExecution = Boolean(ctx.spaceId && ctx.spaceId !== "personal");
+  // Local/plugin hooks are arbitrary shell programs. Until Control has an explicit hook allow/approval
+  // policy, a company run must not let a harmless-looking read tool trigger an unmanaged write through
+  // PreToolUse/PostToolUse.
+  const hooksEnabled = opts.hooks !== false && !companyExecution;
+  let organizationPolicy: OrganizationExecutionPolicy | null = null;
+  let organizationPolicyVersion = opts.organizationPolicyVersion;
+  const organizationAllowsTool = (name: string): boolean =>
+    !organizationPolicy?.toolDeny?.includes(name);
+  const runtimeToolAllowed = (name: string): boolean =>
+    organizationAllowsTool(name)
+    && (!opts.toolFilter || RUNTIME_HELPER_TOOLS.has(name) || opts.toolFilter(name));
   const activatedDeferredTools = new Set<string>();
   let activeSkillToolPolicy: SkillToolPolicy | undefined;
   const restrictToolsForSkill = (skillId: string, allowedTools: readonly string[]) => {
@@ -777,7 +801,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       for (const name of names) {
         const tool = getTool(name);
         if (!tool || tool.visibility !== "deferred") continue;
-        if (opts.toolFilter && !opts.toolFilter(name)) continue;
+        if (!runtimeToolAllowed(name)) continue;
         if (!skillToolAllowed(activeSkillToolPolicy, name)) continue;
         activatedDeferredTools.add(name);
         accepted.push(name);
@@ -950,8 +974,36 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     ...(taskIntakeTool ? [taskIntakeTool] : []),
     ...(taskCheckpointTool ? [taskCheckpointTool] : []),
   ];
+  const runExtraToolNames = new Set(runExtraTools.map((tool) => tool.name));
+  const runtimeDispatchAllowed = (name: string): boolean =>
+    organizationAllowsTool(name) && (runExtraToolNames.has(name) || runtimeToolAllowed(name));
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
+  const refreshOrganizationAuthorization = async (): Promise<void> => {
+    if (!companyExecution) return;
+    if (!activeProvider.prepareTurn) {
+      throw new Error("company provider is not bound to a fresh Control policy lease");
+    }
+    const prepared = await activeProvider.prepareTurn(history, runSignal);
+    organizationPolicy = prepared?.organizationPolicy ?? loadOrganizationExecutionPolicy(ctx.spaceId!);
+    if (!organizationPolicy) {
+      throw new Error("organization execution policy is unavailable; company execution is blocked until Control sync succeeds");
+    }
+    if (
+      prepared?.organizationPolicyVersion !== undefined
+      && prepared.organizationPolicyVersion !== organizationPolicy.version
+    ) throw new Error("organization provider returned an inconsistent policy snapshot");
+    if (
+      organizationPolicyVersion !== undefined
+      && organizationPolicy.version !== organizationPolicyVersion
+    ) {
+      throw new Error(
+        `organization role bundle changed from version ${organizationPolicyVersion} to ${organizationPolicy.version}; retry this turn so persona and policy use one snapshot`,
+      );
+    }
+    organizationPolicyVersion ??= organizationPolicy.version;
+    assertOrganizationModelAllowed(organizationPolicy, activeProvider.model);
+  };
   let triedFallback = false;
   let contextOverflowRetried = false;
   let contextBudgetScale = 1;
@@ -1069,12 +1121,25 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       const reminders = drainReminders(ctx.todoScope);
       if (reminders.length) history.push({ role: "user", content: wrapReminders(reminders) });
     }
+    if (companyExecution) {
+      try {
+        // Company policy is a per-request authorization lease, not startup configuration. A persistent
+        // terminal/Desktop session must observe a newly tightened model/tool/approval rule on its next
+        // provider round without being restarted.
+        await refreshOrganizationAuthorization();
+      } catch (error) {
+        return {
+          status: "error",
+          error: `Organization policy blocked this run: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
     const visibleSpecs = toolSpecs({ activatedDeferred: activatedDeferredTools })
       .filter((tool) => skillToolAllowed(activeSkillToolPolicy, tool.name));
-    const baseSpecs = opts.toolFilter
-      ? visibleSpecs.filter((t) => RUNTIME_HELPER_TOOLS.has(t.name) || opts.toolFilter!(t.name))
-      : visibleSpecs;
-    const visibleExtraTools = runExtraTools.filter((tool) => skillToolAllowed(activeSkillToolPolicy, tool.name));
+    const baseSpecs = visibleSpecs.filter((tool) => runtimeToolAllowed(tool.name));
+    const visibleExtraTools = runExtraTools.filter((tool) =>
+      skillToolAllowed(activeSkillToolPolicy, tool.name)
+      && organizationAllowsTool(tool.name));
     let specs = visibleExtraTools.length
       ? [...baseSpecs, ...visibleExtraTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.input_schema }))]
       : baseSpecs;
@@ -1193,6 +1258,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           systemParts: assembledSystem.parts,
           history: prepared.history,
           tools: specs,
+          ...(organizationPolicyVersion !== undefined ? { organizationPolicyVersion } : {}),
       // Any stream chunk keeps the connection considered alive — even suppressed reasoning_content, so a
       // reasoning model thinking for a long while before its first `content` token can't be false-timed-out.
       onActivity: () => {
@@ -1268,6 +1334,23 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
+    if (ctx.spaceId && ctx.spaceId !== "personal") {
+      try {
+        organizationPolicy = loadOrganizationExecutionPolicy(ctx.spaceId);
+        if (!organizationPolicy) throw new Error("organization execution policy disappeared during inference");
+        if (organizationPolicy.version !== organizationPolicyVersion) {
+          throw new Error(
+            `organization role bundle changed from version ${organizationPolicyVersion} to ${organizationPolicy.version}; retry this turn so persona and policy use one snapshot`,
+          );
+        }
+        assertOrganizationModelAllowed(organizationPolicy, activeProvider.model);
+      } catch (error) {
+        return {
+          status: "error",
+          error: `Organization policy blocked this response: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
     history.push({
       role: "assistant",
       text: r.text,
@@ -1291,6 +1374,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       if (failoverAction(kind, { hasFallback: !!opts.fallback?.provider, triedFallback }) === "fallback") {
         triedFallback = true;
         history.pop(); // drop the errored (partial/empty) assistant turn before retrying
+        try {
+          if (organizationPolicy) {
+            assertOrganizationModelAllowed(organizationPolicy, opts.fallback!.provider!.model);
+          }
+        } catch (error) {
+          return {
+            status: "error",
+            error: `Organization policy blocked fallback model: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
         activeProvider = opts.fallback!.provider!;
         if (!opts.quiet) {
           const note = `✻ ${kind} → falling back to ${activeProvider.model}…`;
@@ -1539,6 +1632,18 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         });
         continue;
       }
+      // Provider schemas are guidance, never authorization. A malicious or malformed provider can still
+      // name a hidden tool directly, so enforce the composed organization/role filter again at dispatch.
+      if (!runtimeDispatchAllowed(tu.name)) {
+        plans.push({
+          tu,
+          tool: resolveTool(tu.name),
+          denied: organizationAllowsTool(tu.name)
+            ? `Runtime tool policy denied '${tu.name}'. The tool was not executed.`
+            : `Organization policy denied '${tu.name}'. The tool was not executed.`,
+        });
+        continue;
+      }
       const tool = resolveTool(tu.name);
       if (!tool) {
         plans.push({ tu, tool: undefined, denied: `Unknown tool: ${tu.name}` });
@@ -1664,6 +1769,19 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       // Screen control and opaque host extensions are gated on EVERY action — a prior "don't ask again"
       // and even full-auto must never silently turn them into a side channel.
       const alwaysGate = approvalKind === "computer" || tool.trustBoundary === "external";
+      const organizationApprovalRequired = Boolean(
+        organizationPolicy?.requireApprovalForWrites
+        && approvalKind !== "read",
+      );
+      if (organizationApprovalRequired && !opts.approvalChannel) {
+        plans.push({
+          tu,
+          tool,
+          denied:
+            "Organization policy requires a live human approval for this side effect, but this headless run has no approval channel. The action was not executed.",
+        });
+        continue;
+      }
       if (tool.trustBoundary === "external" && !ctx.ask && process.env.HARA_ALLOW_TRUSTED_EXTENSIONS !== "1") {
         plans.push({
           tu,
@@ -1771,7 +1889,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         approvalScope
         && (opts.autoApprove?.has(approvalScope.key) || opts.projectApprovals?.has(approvalScope.key)),
       );
-      const shouldConfirm = alwaysGate || (
+      const shouldConfirm = alwaysGate || organizationApprovalRequired || (
         cmdDecision !== "allow"
         && needsConfirm(approvalKind, opts.approval)
         && !scopeAlreadyApproved
@@ -1783,7 +1901,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           replyResult = await bounded(waitForHuman(opts, life, () => Promise.resolve().then(() => opts.confirm(
             `${c.yellow("⚠")}  ${c.bold(tu.name)} ${c.dim(preview)} — run?${scopeHint}`,
             runSignal,
-            { allowAlways: Boolean(approvalScope) && !alwaysGate },
+            { allowAlways: Boolean(approvalScope) && !alwaysGate && !organizationApprovalRequired },
           ))));
         } catch (error) {
           if (runSignal.aborted) return finalizeStoppedToolRound();
@@ -1795,7 +1913,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           plans.push({ tu, tool, denied: "User denied this action." });
           continue;
         }
-        if (reply === "always" && approvalScope && !alwaysGate) {
+        if (reply === "always" && approvalScope && !alwaysGate && !organizationApprovalRequired) {
           opts.autoApprove?.add(approvalScope.key);
           try {
             if (!opts.projectApprovals) throw new Error("no durable project approval policy is attached");
@@ -1841,6 +1959,39 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         };
         return;
       }
+      if (!runtimeDispatchAllowed(p.tu.name)) {
+        results[idx] = {
+          id: p.tu.id,
+          name: p.tu.name,
+          content: `Error: runtime tool policy denied '${p.tu.name}' immediately before execution. The tool was not executed.`,
+          isError: true,
+        };
+        return;
+      }
+      if (companyExecution) {
+        try {
+          // Approval and guardian waits may be long. Re-acquire Control immediately before the actual
+          // tool boundary; a newly denied tool/write floor must win over the model's older tool call.
+          await refreshOrganizationAuthorization();
+        } catch (error) {
+          results[idx] = {
+            id: p.tu.id,
+            name: p.tu.name,
+            content: `Error: organization policy changed before execution; the tool was not run (${error instanceof Error ? error.message : String(error)}).`,
+            isError: true,
+          };
+          return;
+        }
+        if (!runtimeDispatchAllowed(p.tu.name)) {
+          results[idx] = {
+            id: p.tu.id,
+            name: p.tu.name,
+            content: `Error: organization policy denied '${p.tu.name}' immediately before execution. The tool was not run.`,
+            isError: true,
+          };
+          return;
+        }
+      }
       activity.inc();
       try {
         // Defensive parameter gate — some models drop required tool parameters outright (observed:
@@ -1855,7 +2006,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           return;
         }
         if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
-        const pre = opts.hooks === false
+        const pre = !hooksEnabled
           ? { block: false, message: "" }
           : await runHooks("PreToolUse", p.tu.name, p.tu.input, ctx.cwd, 30_000, runSignal); // a hook may veto the call
         if (pre.block) {
@@ -1899,7 +2050,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         // The tool may have completed a side effect and then triggered/observed cancellation. Preserve its
         // actual result in the closing tool round, but do not run any post hook or later tool afterward.
         if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
-        if (opts.hooks !== false) {
+        if (hooksEnabled) {
           await runHooks("PostToolUse", p.tu.name, { input: p.tu.input, result: res }, ctx.cwd, 30_000, runSignal); // observe-only
         }
       } catch (e: any) {

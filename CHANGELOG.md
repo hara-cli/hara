@@ -5,6 +5,25 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.152.0 — 2026-08-23 — Personal/company Spaces and managed Agent profiles
+
+- Add a first-class Personal/company Space directory backed by Control-authoritative tenant identity. Every
+  new session freezes its Space alongside the provider route. Legacy Personal history migrates only when its
+  origin can be proved; unverifiable company history remains local and read-only, and a re-enrolled route
+  cannot send an old company's transcript into a replacement tenant.
+- Keep Agent catalogs, prompts, sessions, and model routes inside the active Space. Company Spaces expose only
+  Control-managed roles and require a freshly synchronized organization model/tool/write policy before any
+  inference. Explicit history transfer may still change models or connections inside one Space, but
+  personal/company and company/company transcript export is rejected pending a separately approved, audited
+  policy.
+- Add optimistic-concurrency profile editing for the main and native personal Agents, including bounded
+  display identity and safe embedded avatars. Personal users can hire a uniquely named Agent with a private
+  work brief and dismiss it through recoverable archive; private prompts, memory, tools, and credentials never
+  enter the public Agent catalog. Upgrade with `npm i -g @nanhara/hara@0.152.0`.
+- Make profile, configuration, and managed role-bundle updates safe across concurrent CLI, Desktop, Serve,
+  and gateway processes. Cross-process locks fail closed, recover from interrupted publishers, preserve
+  compare-and-swap semantics, and avoid silently dropping company routes or credentials under contention.
+
 ## 0.151.0 — 2026-08-22 — first-class Agent identities and independent conversations
 
 - Add a bounded public Agent identity contract and a first-class `agents.list` Serve catalog with project,

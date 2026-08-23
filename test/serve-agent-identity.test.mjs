@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
@@ -130,6 +130,7 @@ test("serve persists Agent identity, lists offices, and runs the selected person
           providerId: "fake",
           model: model ?? "fake-main",
           profileId: "personal",
+          spaceId: "personal",
           effortLevels: [],
         }),
         spawnSubagent: async () => "disabled",
@@ -142,6 +143,7 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     client = await connect(handle.port);
     const initialized = await client.call("initialize", { token: "agent-test-token" });
     assert.ok(initialized.result.capabilities.methods.includes("agents.list"));
+    assert.ok(initialized.result.capabilities.methods.includes("agents.update-profile"));
 
     const catalog = await client.call("agents.list", { cwd: workspace });
     assert.ok(catalog.result.agents.some((agent) => agent.ref === "main"));
@@ -157,11 +159,74 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     assert.equal(architectIdentity.emoji, "◇");
     assert.equal(architectIdentity.accent, "#4f9c8f");
     assert.equal(architectIdentity.character, "architect");
+    const architect = catalog.result.agents.find((agent) => agent.ref === "global:architect");
+    assert.equal(architect.spaceId, "personal");
+    assert.equal(architect.owner, "personal");
+    assert.deepEqual(architect.allowedActions, ["chat", "edit_profile", "archive"]);
+    assert.match(architect.revision, /^[a-f0-9]{32}$/);
     assert.doesNotMatch(JSON.stringify(catalog.result.agents), /YOU ARE THE ARCHITECT PERSONA/);
     assert.deepEqual(
       catalog.result.offices.find((office) => office.id === "project:alpha").agentRefs,
       ["main", "alpha:coder", "global:architect"],
     );
+
+    const updatedProfile = await client.call("agents.update-profile", {
+      ref: "global:architect",
+      expectedRevision: architect.revision,
+      cwd: workspace,
+      profile: {
+        displayName: "Ada Lin",
+        title: "Principal Systems Architect",
+        bio: "Designs calm, reliable systems.",
+        traits: ["calm", "rigorous", "kind"],
+        emoji: "◇",
+        theme: "quiet systems studio",
+        accent: "#4f9c8f",
+        character: "architect",
+      },
+    });
+    assert.equal(updatedProfile.result.agent.identity.displayName, "Ada Lin");
+    assert.notEqual(updatedProfile.result.agent.revision, architect.revision);
+    const updatedRoleText = readFileSync(join(roles, "architect.md"), "utf8");
+    assert.match(updatedRoleText, /display-name: "Ada Lin"/);
+    assert.match(updatedRoleText, /YOU ARE THE ARCHITECT PERSONA/);
+    const staleUpdate = await client.call("agents.update-profile", {
+      ref: "global:architect",
+      expectedRevision: architect.revision,
+      cwd: workspace,
+      profile: { displayName: "Stale overwrite" },
+    });
+    assert.equal(staleUpdate.error.code, -32005);
+
+    const hired = await client.call("agents.create", {
+      id: "product-designer",
+      cwd: workspace,
+      description: "Owns product experience",
+      instructions: "PRIVATE PRODUCT DESIGNER BRIEF",
+      profile: {
+        displayName: "Mina",
+        title: "Product Designer",
+        bio: "Owns product experience",
+        traits: ["curious", "meticulous"],
+        emoji: "✎",
+        accent: "#4f9c8f",
+        character: "designer",
+      },
+    });
+    assert.ok(hired.result, `Agent hire failed: ${JSON.stringify(hired.error)}`);
+    assert.ok(hired.result.agent, `newly hired Agent missing from catalog: ${JSON.stringify(hired.result.catalog)}`);
+    assert.equal(hired.result.agent.ref, "global:product-designer");
+    assert.doesNotMatch(JSON.stringify(hired.result.catalog), /PRIVATE PRODUCT DESIGNER BRIEF/);
+    const hiredFile = join(roles, "product-designer.md");
+    assert.match(readFileSync(hiredFile, "utf8"), /PRIVATE PRODUCT DESIGNER BRIEF/);
+    const dismissed = await client.call("agents.archive", {
+      ref: "global:product-designer",
+      expectedRevision: hired.result.agent.revision,
+      cwd: workspace,
+    });
+    assert.equal(dismissed.result.archived, true);
+    assert.ok(!dismissed.result.catalog.agents.some((agent) => agent.ref === "global:product-designer"));
+    assert.match(readFileSync(hiredFile, "utf8"), /^archived: true$/m);
     assert.deepEqual(
       catalog.result.offices.find((office) => office.id === "project:beta").agentRefs,
       ["main", "beta:designer", "global:architect"],
@@ -179,6 +244,7 @@ test("serve persists Agent identity, lists offices, and runs the selected person
       agentRef: "global:architect",
     });
     assert.equal(created.result.agentRef, "global:architect");
+    assert.equal(created.result.spaceId, "personal");
     assert.equal(created.result.model, "fake-role");
     const sessionId = created.result.sessionId;
     const sent = await client.call("session.send", { sessionId, text: "hello" });
@@ -187,6 +253,7 @@ test("serve persists Agent identity, lists offices, and runs the selected person
 
     const listed = await client.call("session.list", {});
     assert.equal(listed.result.sessions.find((session) => session.id === sessionId).agentRef, "global:architect");
+    assert.equal(listed.result.sessions.find((session) => session.id === sessionId).spaceId, "personal");
     const resumed = await client.call("session.resume", { sessionId });
     assert.equal(resumed.result.agentRef, "global:architect");
 

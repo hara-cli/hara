@@ -134,6 +134,8 @@ test("Home-root resume reuses history and halts after the first model-initiated 
         meta: {
           id: sessionId,
           cwd: home,
+          profileId: "personal",
+          spaceId: "personal",
           provider: "openai",
           model: "mock-model",
           title: "continue prior task",

@@ -54,7 +54,10 @@ registerTool({
   classify: () => ({ effect: "state", concurrencySafe: false }),
   async run(input, ctx) {
     try {
-      if (input.scope === "organization" && (!ctx.profileId || getProfile(ctx.profileId)?.kind !== "gateway")) {
+      if (
+        input.scope === "organization"
+        && (!ctx.profileId || !ctx.spaceId || ctx.spaceId === "personal" || getProfile(ctx.profileId)?.kind !== "gateway")
+      ) {
         return "Error: organization learning requires a session bound to an enrolled Hara Control profile.";
       }
       const result = captureLearning({
@@ -68,7 +71,9 @@ registerTool({
       }, {
         cwd: ctx.cwd,
         stateHome: ctx.stateHome,
-        profileId: ctx.profileId,
+        // `profileId` is the historical name of the local organization-store selector. The provider
+        // route can be replaced in place; the immutable Space is the only safe learning audience.
+        profileId: input.scope === "organization" ? ctx.spaceId : ctx.profileId,
         taskId: ctx.taskId,
         sessionId: ctx.sessionId,
       });

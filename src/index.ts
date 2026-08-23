@@ -103,6 +103,7 @@ import {
   DEFAULT_ORG_ID,
   PERSONAL_ID,
   isValidProfileId,
+  spaceIdForProfile,
   type Profile,
   type ActiveResolution,
 } from "./profile/profile.js";
@@ -282,17 +283,31 @@ import {
 } from "./session/transfer.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
 import { createPhysicalOperationDrain } from "./session/operation-drain.js";
-import { loadGlobalRoles, loadRoles, orgRolesDir, roleToolFilter, scaffoldRoles, type Role } from "./org/roles.js";
+import {
+  assertOrganizationModelAllowed,
+  loadGlobalRoles,
+  loadOrganizationExecutionPolicy,
+  loadRoles,
+  orgRolesDir,
+  roleToolFilter,
+  scaffoldRoles,
+  type OrganizationExecutionPolicy,
+  type Role,
+} from "./org/roles.js";
 import { buildAgentsIndex, canonicalProjectPath, resolveAgent, loadProjects, addProject, removeProject, type AgentIndexEntry } from "./org/projects.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks, haraBinDir } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
-import { decompose, topoOrder, topoWaves, savePlan, loadPlan, atomPrompt, verify, runCheck, type Atom, type Plan } from "./org/planner.js";
+import { decompose, topoOrder, topoWaves, savePlan, loadPlan, atomPrompt, verify, type Atom, type Plan } from "./org/planner.js";
 import { closeMcp, registerLazyMcpServers } from "./mcp/client.js";
 import { sandboxSupported, runShell, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
 import { searchAssets, scaffoldAssets, assetsDir, assetSearchRoots } from "./recall.js";
 import type { Provider, NeutralMsg, ImageAttachment } from "./providers/types.js";
+import {
+  bindOrganizationProvider,
+  refreshOrganizationExecutionPolicy,
+} from "./providers/organization-bound.js";
 import { c, out, statusLine } from "./ui.js";
 import * as bar from "./statusbar.js";
 import { nearest } from "./fuzzy.js";
@@ -387,7 +402,10 @@ async function buildProvider(
       model,
       ...(cfg.proxy ? { proxy: cfg.proxy } : {}),
     };
-    const built = await createProviderForTarget(target, cfg.reasoningEffort);
+    const rawProvider = await createProviderForTarget(target, cfg.reasoningEffort);
+    const built = rawProvider
+      ? bindOrganizationProvider(rawProvider, { ...ap }, () => profileByIdForConfig(cfg, ap.id))
+      : null;
     if (!targetOverride && built) {
       cfg.provider = target.provider;
       cfg.model = target.model;
@@ -458,6 +476,74 @@ async function buildSessionBoundRuntime(
     cfg.apiKey = target.apiKey;
   }
   return { provider: (await withRouting(primary, cfg, profileId)) ?? primary, profile };
+}
+
+/** Re-resolve a persisted session's mutable local connection and prove it still names the same durable
+ * audience. Call before and after every asynchronously built auxiliary provider. A provider created before
+ * a later re-enrollment remains frozen to the old credential; a provider created after it is rejected. */
+function assertProfileAudience(
+  cfg: HaraConfig,
+  profileId: string,
+  expectedSpaceId: string,
+): Profile {
+  const profile = profileByIdForConfig(cfg, profileId);
+  if (!profile) {
+    throw new Error(`session profile '${profileId}' is no longer available; start a new conversation`);
+  }
+  const currentSpaceId = spaceIdForProfile(profile);
+  if (currentSpaceId !== expectedSpaceId) {
+    throw new Error(
+      `session belongs to Space '${expectedSpaceId}', but connection '${profileId}' now resolves to '${currentSpaceId}'; old history will not be sent across companies`,
+    );
+  }
+  return profile;
+}
+
+/** Synchronize and validate the Control-reviewed execution floor before any company turn. Cached policy is
+ * not treated as authoritative when Control is reachable through the same gateway used for inference: a
+ * newly added deny/approval rule must take effect before the next request, not after a background refresh. */
+async function ensureOrganizationExecutionPolicy(
+  cfg: HaraConfig,
+  profile: Profile,
+  expectedSpaceId = spaceIdForProfile(profile),
+): Promise<OrganizationExecutionPolicy | null> {
+  if (profile.kind !== "gateway") return null;
+  return refreshOrganizationExecutionPolicy(
+    profile,
+    expectedSpaceId,
+    () => profileByIdForConfig(cfg, profile.id),
+  );
+}
+
+/** One company-aware authorization guard for every built-in Git staging/commit path. The returned closure
+ * freezes the first observed bundle revision, then required-syncs before each side effect and enforces both
+ * shell denial and the availability of a real approval channel. */
+function companyCommitGuard(
+  cfg: HaraConfig,
+  profile: Profile,
+  options: { expectedVersion?: number; approvalChannel: boolean },
+): () => Promise<string | null> {
+  const expectedSpaceId = spaceIdForProfile(profile);
+  let expectedVersion = options.expectedVersion;
+  return async (): Promise<string | null> => {
+    if (profile.kind !== "gateway") return null;
+    try {
+      const current = assertProfileAudience(cfg, profile.id, expectedSpaceId);
+      const policy = await ensureOrganizationExecutionPolicy(cfg, current, expectedSpaceId);
+      if (!policy) return "organization execution policy is unavailable";
+      if (expectedVersion === undefined) expectedVersion = policy.version;
+      else if (policy.version !== expectedVersion) {
+        return `organization policy changed from version ${expectedVersion} to ${policy.version}`;
+      }
+      if (policy.toolDeny?.includes("bash")) return "organization policy denies shell execution";
+      if (policy.requireApprovalForWrites && !options.approvalChannel) {
+        return "organization policy requires a live human approval channel";
+      }
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
 }
 
 /** Guardian veto model: the CHEAP tier if `routeModel` is configured (a small classifier call, not real
@@ -733,7 +819,10 @@ function organizationConnectionsSnapshot(targetCwd: string) {
       const endpoint = publicGatewayIdentity(profile.gatewayUrl);
       return {
         id: profile.id,
+        spaceId: spaceIdForProfile(profile),
         label: profile.label || profile.id,
+        ...(profile.tenantId ? { tenantId: profile.tenantId } : {}),
+        ...(profile.tenantName ? { tenantName: profile.tenantName } : {}),
         active: profile.id === resolution.id,
         ...endpoint,
         model: effectiveModel(profile) || "",
@@ -763,6 +852,75 @@ function organizationConnectionsSnapshot(targetCwd: string) {
     switchLocked: resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin",
     connections,
   };
+}
+
+/** A provider profile is a route; a Space is the durable Personal/company data boundary presented by
+ * Desktop. Multiple connections that resolve to the same Control tenant intentionally collapse to one
+ * company Space so reconnecting cannot fork identity or mix history. */
+function spaceDirectorySnapshot(targetCwd: string) {
+  const resolution = resolveActive(targetCwd);
+  const profiles = listProfiles();
+  const activeProfile = profiles.find((profile) => profile.id === resolution.id)
+    ?? profiles.find((profile) => profile.id === PERSONAL_ID)!;
+  const activeSpaceId = spaceIdForProfile(activeProfile);
+  const organizationSpaces = new Map<string, { profile: Profile; profileIds: string[] }>();
+  for (const profile of profiles) {
+    if (profile.kind !== "gateway") continue;
+    const spaceId = spaceIdForProfile(profile);
+    const existing = organizationSpaces.get(spaceId);
+    if (!existing) {
+      organizationSpaces.set(spaceId, { profile, profileIds: [profile.id] });
+      continue;
+    }
+    existing.profileIds.push(profile.id);
+    if (profile.id === resolution.id) existing.profile = profile;
+  }
+  const personalRoute = activeProfile.kind === "byok" ? activeProfile : profiles.find((profile) => profile.id === PERSONAL_ID)!;
+  const personalProfileIds = profiles.filter((profile) => profile.kind === "byok").map((profile) => profile.id);
+  const spaces = [
+    {
+      id: PERSONAL_ID,
+      name: personalRoute.label || "Personal",
+      kind: "personal" as const,
+      profileId: personalRoute.id,
+      profileIds: personalProfileIds,
+      active: activeSpaceId === PERSONAL_ID,
+      authoritative: true,
+      agentProfilePermission: "edit" as const,
+    },
+    ...[...organizationSpaces.entries()].map(([spaceId, entry]) => ({
+      id: spaceId,
+      name: entry.profile.tenantName || entry.profile.label || entry.profile.id,
+      kind: "organization" as const,
+      profileId: entry.profile.id,
+      profileIds: entry.profileIds,
+      active: spaceId === activeSpaceId,
+      ...(entry.profile.tenantId ? { tenantId: entry.profile.tenantId } : {}),
+      authoritative: Boolean(entry.profile.tenantId),
+      // Until Control returns a membership role/capability, company Agent profiles fail closed as view-only.
+      agentProfilePermission: "view" as const,
+    })),
+  ];
+  return {
+    activeId: activeSpaceId,
+    activeProfileId: activeProfile.id,
+    activeSource: resolution.source,
+    switchLocked: resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin",
+    spaces,
+  };
+}
+
+function useSpaceConnection(spaceId: string, targetCwd: string) {
+  const current = spaceDirectorySnapshot(targetCwd);
+  if (current.switchLocked) {
+    throw new Error("the active Space is locked by a flag, environment variable, or project pin; remove that override before switching");
+  }
+  const target = current.spaces.find((space) => space.id === spaceId);
+  if (!target) throw new Error("Space was not found");
+  const profileId = target.kind === "personal" ? PERSONAL_ID : target.profileId;
+  const switched = useProfile(profileId);
+  if (!switched.ok) throw new Error(switched.reason);
+  return spaceDirectorySnapshot(targetCwd);
 }
 
 function assertOrganizationId(value: string): string {
@@ -1133,13 +1291,15 @@ async function runInit(
   sandbox: SandboxMode = "off",
   cfg?: HaraConfig,
   profileId?: string,
+  spaceId?: string,
 ): Promise<void> {
   if (isUnsafeProjectWorkspace(cwd)) throw new Error(homeWorkspaceActionError("initialize AGENTS.md"));
   const history: NeutralMsg[] = [{ role: "user", content: INIT_PROMPT }];
   await runAgent(history, {
     provider,
-    ctx: { cwd, sandbox, ...(profileId ? { profileId } : {}) },
+    ctx: { cwd, sandbox, ...(profileId ? { profileId } : {}), ...(spaceId ? { spaceId } : {}) },
     approval: "full-auto",
+    approvalChannel: false,
     confirm: async () => true,
     ...(cfg ? agentRunLimits(cfg) : {}),
   });
@@ -1150,9 +1310,12 @@ interface OrgOpts {
   baseProvider: Provider;
   /** Exact identity route for every managed role, role model, nested agent, and control-plane request. */
   profileId: string;
+  /** Immutable audience for organization learning and prompt memory. */
+  spaceId: string;
   cwd: string;
   sandbox: SandboxMode;
   approval: ApprovalMode;
+  approvalChannel: boolean;
   confirm: (q: string) => Promise<boolean>;
   projectContext?: string;
   stats: { input: number; output: number };
@@ -1161,30 +1324,69 @@ interface OrgOpts {
   review?: boolean; // after implementing, loop a reviewer role until it approves (implement → review → fix)
   rounds?: number; // max review rounds (default 3)
   commit?: boolean; // commit the result (with --review: only after approval) — guarded to a clean start tree
+  /** Control bundle snapshot from which every managed role in this operation was resolved. */
+  organizationPolicyVersion?: number;
+}
+
+async function acquireOrganizationSnapshot(o: OrgOpts): Promise<string | null> {
+  try {
+    const profile = assertProfileAudience(o.cfg, o.profileId, o.spaceId);
+    const policy = await ensureOrganizationExecutionPolicy(o.cfg, profile, o.spaceId);
+    o.organizationPolicyVersion = policy?.version;
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+function organizationSnapshotChanged(o: OrgOpts): string | null {
+  try {
+    assertProfileAudience(o.cfg, o.profileId, o.spaceId);
+    const policy = loadOrganizationExecutionPolicy(o.spaceId);
+    if (o.spaceId !== PERSONAL_ID && !policy) return "organization execution policy is unavailable";
+    if (policy && policy.version !== o.organizationPolicyVersion) {
+      return `organization role bundle changed from version ${o.organizationPolicyVersion} to ${policy.version}; retry so persona and policy use one snapshot`;
+    }
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+function bindRolesToOrganizationSnapshot(roles: Role[], o: OrgOpts): string | null {
+  if (o.spaceId === PERSONAL_ID) return null;
+  const roleVersions = new Set(
+    roles.map((role) => role.organizationPolicyVersion).filter((version): version is number => version !== undefined),
+  );
+  if (roleVersions.size > 1) return "managed roles came from multiple organization bundle versions";
+  const roleVersion = roleVersions.values().next().value as number | undefined;
+  if (roleVersion !== undefined && roleVersion !== o.organizationPolicyVersion) {
+    return `organization role bundle changed from version ${o.organizationPolicyVersion} to ${roleVersion}; retry so persona and policy use one snapshot`;
+  }
+  return organizationSnapshotChanged(o);
 }
 
 /** Stage everything and commit with an AI-written message. Returns a one-line summary or "error: …".
  *  Used by `hara org --commit`; the caller guards on a clean start tree so this only captures the run's work. */
-async function autoCommit(provider: Provider, cwd: string, signal?: AbortSignal): Promise<string> {
+async function autoCommit(
+  provider: Provider,
+  cwd: string,
+  signal?: AbortSignal,
+  authorizationGuard?: () => string | null | Promise<string | null>,
+): Promise<string> {
   if (signal?.aborted) return "error: commit interrupted before staging";
+  const beforeAuthorization = await authorizationGuard?.();
+  if (beforeAuthorization) return `error: commit authorization changed (${beforeAuthorization})`;
   const before = protectedWorkingTreePaths(cwd);
   if (before.length) return `error: refusing to stage protected path(s): ${before.map((p) => JSON.stringify(p)).join(", ")}`;
-  try {
-    await runShell("git add -A", cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000, signal });
-  } catch {
-    /* fall through — empty diff is reported below */
+  // Generate the message from the unstaged candidate first. A long model request must not leave the Git
+  // index modified when Control tightens company policy while that request is in flight.
+  const candidate = captureChanges(cwd, 120_000, { includeUntracked: true });
+  if (candidate.error) return `error: git diff failed closed (${candidate.error})`;
+  if (candidate.skippedFiles.length) {
+    return `error: refusing to inspect or commit protected path(s): ${candidate.skippedFiles.map((p) => JSON.stringify(p)).join(", ")}`;
   }
-  const protectedAfterStage = protectedStagedPaths(cwd);
-  if (signal?.aborted) return "error: commit interrupted after staging; nothing was committed";
-  if (protectedAfterStage.length) {
-    return `error: refusing to inspect or commit protected staged path(s): ${protectedAfterStage.map((p) => JSON.stringify(p)).join(", ")}`;
-  }
-  const staged = captureChanges(cwd, 120_000, { staged: true, includeUntracked: false });
-  if (staged.error) return `error: git diff failed closed (${staged.error})`;
-  if (staged.skippedFiles.length) {
-    return `error: refusing to inspect or commit protected staged path(s): ${staged.skippedFiles.map((p) => JSON.stringify(p)).join(", ")}`;
-  }
-  const changeInput = commitMessageInput(staged);
+  const changeInput = commitMessageInput(candidate);
   if (!changeInput.trim()) return "nothing to commit";
   const r = await boundedProviderTurn(provider, {
     system: COMMIT_SYSTEM,
@@ -1194,8 +1396,22 @@ async function autoCommit(provider: Provider, cwd: string, signal?: AbortSignal)
   }, { timeoutMs: 30_000, label: "commit message generation", signal });
   if (signal?.aborted) return "error: commit interrupted; nothing was committed";
   if (r.stop === "error") return `error: commit message generation failed (${r.errorMsg ?? "provider error"})`;
+  const afterAuthorization = await authorizationGuard?.();
+  if (afterAuthorization) return `error: commit authorization changed (${afterAuthorization})`;
   const msg = stripCommitFence(r.text);
   if (!msg) return "error: no commit message produced";
+  const stagingAuthorization = await authorizationGuard?.();
+  if (stagingAuthorization) return `error: commit authorization changed (${stagingAuthorization})`;
+  try {
+    await runShell("git add -A", cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000, signal });
+  } catch (error) {
+    return `error: git add failed (${error instanceof Error ? error.message : String(error)})`;
+  }
+  const protectedAfterStage = protectedStagedPaths(cwd);
+  if (signal?.aborted) return "error: commit interrupted after staging; nothing was committed";
+  if (protectedAfterStage.length) {
+    return `error: refusing to inspect or commit protected staged path(s): ${protectedAfterStage.map((p) => JSON.stringify(p)).join(", ")}`;
+  }
   const tmp = join(tmpdir(), `hara-org-commit-${process.pid}.txt`);
   writeFileSync(tmp, msg + "\n", "utf8");
   try {
@@ -1204,6 +1420,8 @@ async function autoCommit(provider: Provider, cwd: string, signal?: AbortSignal)
     if (protectedBeforeCommit.length) {
       return `error: staged paths changed while writing the message; protected path(s) will not be committed: ${protectedBeforeCommit.map((p) => JSON.stringify(p)).join(", ")}`;
     }
+    const finalAuthorization = await authorizationGuard?.();
+    if (finalAuthorization) return `error: commit authorization changed (${finalAuthorization})`;
     const res = await runShell(`git commit -F ${JSON.stringify(tmp)}`, cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000, signal });
     return (res.stdout || "").trim().split("\n")[0] || "committed";
   } catch (e) {
@@ -1218,9 +1436,14 @@ async function autoCommit(provider: Provider, cwd: string, signal?: AbortSignal)
 }
 
 /** Format an autoCommit result + emit it. */
-async function commitStep(provider: Provider, cwd: string, signal?: AbortSignal): Promise<void> {
+async function commitStep(
+  provider: Provider,
+  cwd: string,
+  signal?: AbortSignal,
+  authorizationGuard?: () => string | null | Promise<string | null>,
+): Promise<void> {
   if (signal?.aborted) return;
-  const r = await autoCommit(provider, cwd, signal);
+  const r = await autoCommit(provider, cwd, signal, authorizationGuard);
   if (r.startsWith("error:")) out(c.red(`✗ ${r}\n`));
   else if (r === "nothing to commit") out(c.dim("(nothing to commit)\n"));
   else out(c.green(`✓ committed · ${r.slice(0, 100)}\n`));
@@ -1236,7 +1459,11 @@ function runFailureDetail(outcome: RunOutcome): string | null {
 }
 
 async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
+  const snapshotError = await acquireOrganizationSnapshot(o);
+  if (snapshotError) return { status: "error", error: `organization policy sync failed: ${snapshotError}` };
   const roles = loadRoles(o.cwd, o.profileId);
+  const roleSnapshotError = bindRolesToOrganizationSnapshot(roles, o);
+  if (roleSnapshotError) return { status: "error", error: roleSnapshotError };
   if (!roles.length) {
     out(c.yellow("No roles defined — run ") + c.bold("hara roles init") + c.yellow(" to scaffold some.\n"));
     return { status: "error", error: "no roles are defined" };
@@ -1264,6 +1491,8 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
         tools: [],
         onText: () => {},
       }, { timeoutMs: 20_000, label: "role dispatch" });
+      const changed = organizationSnapshotChanged(o);
+      if (changed) return { status: "error", error: changed };
       if (r.stop === "error") out(c.yellow(`(role dispatch unavailable — using ${routableRoles[0].id})\n`));
       role = parseRoleId(r.text, routableRoles) ?? routableRoles[0];
     }
@@ -1281,13 +1510,15 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   const runImplementer = async (): Promise<RunOutcome> => {
     return runAgent(history, {
       provider: roleProvider,
-      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId },
+      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId, spaceId: o.spaceId },
       approval: o.approval,
+      approvalChannel: o.approvalChannel,
       confirm: o.confirm,
       projectContext: o.projectContext,
-      memory: memoryDigest(o.cwd, o.profileId),
+      memory: memoryDigest(o.cwd, o.spaceId),
       stats: o.stats,
       systemOverride: role.system,
+      organizationPolicyVersion: o.organizationPolicyVersion,
       toolFilter,
       ...agentRunLimits(o.cfg),
       ...(role.readOnly ? { hooks: false } : {}),
@@ -1298,7 +1529,14 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
     if (!o.commit) return;
     if (!ok) return void out(c.yellow("(not committing — review didn't approve; changes left in your working tree)\n"));
     if (!wasClean) return void out(c.yellow("(not auto-committing — the tree wasn't clean before this run; commit manually)\n"));
-    await commitStep(o.baseProvider, o.cwd);
+    const commitProfile = assertProfileAudience(o.cfg, o.profileId, o.spaceId);
+    const commitAuthorization = companyCommitGuard(o.cfg, commitProfile, {
+      expectedVersion: o.organizationPolicyVersion,
+      approvalChannel: o.approvalChannel,
+    });
+    const authorizationError = await commitAuthorization();
+    if (authorizationError) return void out(c.yellow(`(not auto-committing — ${authorizationError})\n`));
+    await commitStep(o.baseProvider, o.cwd, undefined, commitAuthorization);
   };
   let implementerOutcome = await runImplementer();
   if (implementerOutcome.status !== "completed") return implementerOutcome;
@@ -1330,13 +1568,15 @@ async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
     const rHist: NeutralMsg[] = [{ role: "user", content: reviewPrompt(task, changes) }];
     const reviewerOutcome = await runAgent(rHist, {
       provider: revProvider,
-      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId },
+      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId, spaceId: o.spaceId },
       approval: "full-auto", // reviewer is read-only via revTools, so nothing to confirm
+      approvalChannel: o.approvalChannel,
       confirm: o.confirm,
       projectContext: o.projectContext,
-      memory: memoryDigest(o.cwd, o.profileId),
+      memory: memoryDigest(o.cwd, o.spaceId),
       stats: o.stats,
       systemOverride: revSystem,
+      organizationPolicyVersion: o.organizationPolicyVersion,
       toolFilter: revTools,
       hooks: false,
       ...agentRunLimits(o.cfg),
@@ -1388,13 +1628,15 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
   try {
     const outcome = await runAgent(history, {
       provider: roleProvider,
-      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId },
+      ctx: { cwd: o.cwd, sandbox: o.sandbox, profileId: o.profileId, spaceId: o.spaceId },
       approval: o.approval,
+      approvalChannel: o.approvalChannel,
       confirm: o.confirm,
       projectContext: o.projectContext,
-      memory: memoryDigest(o.cwd, o.profileId),
+      memory: memoryDigest(o.cwd, o.spaceId),
       stats: o.stats,
       systemOverride: role?.system,
+      organizationPolicyVersion: o.organizationPolicyVersion,
       toolFilter,
       ...(role?.readOnly ? { hooks: false } : {}),
       quiet: o.parallel, // concurrent atoms would otherwise interleave their streamed output
@@ -1415,7 +1657,19 @@ async function executeAtom(atom: Atom, plan: Plan, done: Atom[], roles: Role[], 
     out(c.red(`  ✗ ${atom.id} errored: ${e.message}\n`));
     return false;
   }
-  const v = atom.check ? await runCheck(atom.check, o.cwd, o.sandbox) : await verify(o.baseProvider, atom, lastAssistantText(history));
+  // `atom.check` is untrusted model output. Executing it through runShell would bypass the ordinary bash
+  // tool policy, approvals, hooks, and organization write floor. The implementation Agent may run an
+  // appropriate check through its governed tools; this independent verifier remains model-only.
+  if (atom.check) out(c.dim(`  · proposed check kept as plan metadata (not auto-executed): ${atom.check.slice(0, 160)}\n`));
+  const v = await verify(o.baseProvider, atom, lastAssistantText(history));
+  const changed = organizationSnapshotChanged(o);
+  if (changed) {
+    atom.status = "failed";
+    atom.note = changed;
+    await savePlan(o.cwd, plan);
+    out(c.red(`  ✗ ${atom.id} ${changed}\n`));
+    return false;
+  }
   atom.status = v.ok ? "done" : "failed";
   atom.note = v.reason;
   await savePlan(o.cwd, plan);
@@ -1487,9 +1741,15 @@ async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<RunOu
 /** Decompose a task into atoms, sequence them (DAG), and execute each with a verify gate.
  *  With `parallel`, independent atoms (the same dependency wave) run concurrently. */
 async function runPlan(task: string, o: OrgOpts): Promise<RunOutcome> {
+  const snapshotError = await acquireOrganizationSnapshot(o);
+  if (snapshotError) return { status: "error", error: `organization policy sync failed: ${snapshotError}` };
   const roles = loadRoles(o.cwd, o.profileId);
+  const roleSnapshotError = bindRolesToOrganizationSnapshot(roles, o);
+  if (roleSnapshotError) return { status: "error", error: roleSnapshotError };
   out(c.dim("Planning…\n"));
   const plan = await decompose(o.baseProvider, task, roles);
+  const changed = organizationSnapshotChanged(o);
+  if (changed) return { status: "error", error: changed };
   if (!plan.atoms.length) {
     out(c.red("Planner returned no atoms — try rephrasing the task.\n"));
     return { status: "error", error: "planner returned no atoms" };
@@ -1516,7 +1776,11 @@ async function runPlan(task: string, o: OrgOpts): Promise<RunOutcome> {
 
 /** Resume the saved plan (.hara/org/plan.json): re-run atoms that aren't done; completed atoms are skipped. */
 async function runResume(o: OrgOpts): Promise<RunOutcome> {
+  const snapshotError = await acquireOrganizationSnapshot(o);
+  if (snapshotError) return { status: "error", error: `organization policy sync failed: ${snapshotError}` };
   const roles = loadRoles(o.cwd, o.profileId);
+  const roleSnapshotError = bindRolesToOrganizationSnapshot(roles, o);
+  if (roleSnapshotError) return { status: "error", error: roleSnapshotError };
   const plan = loadPlan(o.cwd);
   if (!plan) {
     out(c.red('No saved plan at .hara/org/plan.json — run `hara plan "<task>"` first.\n'));
@@ -1636,9 +1900,13 @@ async function curateSessionLearning(
   options: {
     cwd: string;
     sandbox: SandboxMode;
+    profileId?: string;
+    spaceId?: string;
+    sessionId?: string;
     spawn?: ToolContext["spawn"];
     ui?: ToolContext["ui"];
     confirm: (question: string, signal?: AbortSignal) => Promise<boolean | "always">;
+    approvalChannel: boolean;
     memory: string;
     stats: { input: number; output: number; lastInput?: number };
     signal?: AbortSignal;
@@ -1652,8 +1920,17 @@ async function curateSessionLearning(
   ];
   return runAgent(curationHistory, {
     provider,
-    ctx: { cwd: options.cwd, sandbox: options.sandbox, spawn: options.spawn, ui: options.ui },
+    ctx: {
+      cwd: options.cwd,
+      sandbox: options.sandbox,
+      profileId: options.profileId,
+      spaceId: options.spaceId,
+      sessionId: options.sessionId,
+      spawn: options.spawn,
+      ui: options.ui,
+    },
     approval: cfg.assetCapture === "auto" ? "full-auto" : "suggest",
+    approvalChannel: options.approvalChannel,
     confirm: options.confirm,
     toolFilter: (name) => allowsEvolutionTool(name, cfg.assetCapture),
     systemOverride: EVOLUTION_SYSTEM,
@@ -1775,8 +2052,15 @@ async function runSubagent(
     onSubagentLifecycle?: SubagentLifecycleObserver;
   },
   boundProfileId?: string,
+  expectedSpaceId?: string,
 ): Promise<string> {
   const executionProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
+  const assertAudience = (): void => {
+    if (!expectedSpaceId) return;
+    if (!executionProfileId) throw new Error("subagent session has no bound provider identity");
+    assertProfileAudience(cfg, executionProfileId, expectedSpaceId);
+  };
+  assertAudience();
   const result = await subagentRuntimeFor(stats).run(NATIVE_SUBAGENT_PROVIDER_ID, {
     task,
     ...(roleId !== undefined ? { role: roleId } : {}),
@@ -1786,6 +2070,7 @@ async function runSubagent(
     sandbox,
     projectContext,
     profileId: executionProfileId,
+    spaceId: expectedSpaceId,
     parentStats: stats,
     timeoutMs: cfg.runTimeoutMs,
     maxRounds: cfg.maxAgentRounds,
@@ -1796,7 +2081,13 @@ async function runSubagent(
       },
     } : {}),
     isReadonlyTool: (name) => READONLY_TOOLS.has(name),
-    resolveProvider: (model, profileId) => buildProvider(cfg, { model }, profileId),
+    assertAudience,
+    resolveProvider: async (model, profileId) => {
+      assertAudience();
+      const resolved = await buildProvider(cfg, { model }, profileId);
+      assertAudience();
+      return resolved;
+    },
   }, observers?.onSubagentLifecycle);
   return subagentResultText(result);
 }
@@ -1868,21 +2159,55 @@ async function runUpdateCommand(checkOnly: boolean): Promise<void> {
   }
 }
 
+function doctorRuntime(cfg: HaraConfig): { live: HaraConfig; profile: Profile } {
+  const boundProfileId = runtimeProfileBindings.get(cfg);
+  const profile = boundProfileId
+    ? profileByIdForConfig(cfg, boundProfileId)
+    : profileForConfig(cfg).profile;
+  if (!profile) throw new Error(`active profile '${boundProfileId}' is no longer available`);
+  if (profile.kind === "gateway") {
+    const requestedModel = boundProfileId ? cfg.model : undefined;
+    return {
+      profile,
+      live: {
+        ...cfg,
+        provider: "hara-gateway",
+        model: resolveGatewayModel(cfg, profile, process.env, requestedModel),
+        baseURL: profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined),
+        apiKey: profile.deviceToken,
+      },
+    };
+  }
+  const target = resolveByokProviderTarget(cfg, profile, false);
+  return {
+    profile,
+    live: {
+      ...cfg,
+      provider: target.provider,
+      model: target.model,
+      baseURL: target.baseURL,
+      apiKey: target.apiKey,
+    },
+  };
+}
+
 function runDoctor(cfg: HaraConfig): string {
+  const { live, profile } = doctorRuntime(cfg);
   const ok = (b: boolean): string => (b ? c.green("✓") : c.red("✗"));
   const dot = c.dim("·");
   const nodeSupported = unsupportedNodeMessage() === null;
-  const envKey = providerEnvKey(cfg.provider);
-  const hasKey = !!(cfg.apiKey || (envKey ? process.env[envKey] : undefined) || process.env.HARA_API_KEY);
-  const oauthOk = cfg.provider === "qwen-oauth" && loadQwenToken() !== null;
-  const authed = hasKey || oauthOk || providerIsLocal(cfg.provider);
+  const envKey = providerEnvKey(live.provider);
+  const hasKey = !!(live.apiKey || (envKey ? process.env[envKey] : undefined) || process.env.HARA_API_KEY);
+  const oauthOk = live.provider === "qwen-oauth" && loadQwenToken() !== null;
+  const gatewayOk = profile.kind === "gateway" && !!profile.deviceToken && !deviceTokenExpired(profile.tokenExpiresAt);
+  const authed = hasKey || oauthOk || gatewayOk || providerIsLocal(live.provider);
   const ad = assetsDir();
-  const roles = loadRoles(cfg.cwd);
-  const vcap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
+  const roles = loadRoles(live.cwd, profile.id);
+  const vcap = classifyVision(live.provider, live.model, live.modelVision);
   const imageStatus = vcap === "vision"
     ? c.dim("native on the main model")
-    : cfg.visionModel
-      ? c.dim("advanced compatibility fallback · ") + c.bold(cfg.visionModel)
+    : live.visionModel
+      ? c.dim("advanced compatibility fallback · ") + c.bold(live.visionModel)
       : vcap === "text"
         ? c.dim("off for this text-only model")
         : c.dim("checked on first image");
@@ -1892,23 +2217,23 @@ function runDoctor(cfg: HaraConfig): string {
     `${ok(nodeSupported)} node ${process.versions.node} ${c.dim(`(need ≥${MIN_NODE_VERSION})`)}`,
     `${dot} install ${c.bold(installationLabel(installation))} · ${c.dim(installation.launchPath)}`,
     ...shadowInstallLines(installation),
-    `${dot} provider ${c.bold(cfg.provider)} · model ${c.bold(cfg.model)}${cfg.baseURL ? c.dim(" · " + cfg.baseURL) : ""}`,
-    `${ok(authed)} auth ${providerIsLocal(cfg.provider) ? c.dim("not required (local endpoint)") : authed ? c.dim("configured") : c.yellow("missing — " + authHint(cfg))}`,
+    `${dot} provider ${c.bold(live.provider)} · model ${c.bold(live.model)}${live.baseURL ? c.dim(" · " + live.baseURL) : ""}`,
+    `${ok(authed)} auth ${providerIsLocal(live.provider) ? c.dim("not required (local endpoint)") : authed ? c.dim("configured") : c.yellow("missing — " + authHint(live, profile))}`,
     `${ok(existsSync(configPath()))} config ${c.dim(configPath())}`,
     `${dot} code-assets ${existsSync(ad) ? c.dim(ad) : c.dim("none — run: hara recall --init")}`,
     `${dot} roles ${roles.length ? c.dim(`${roles.length} (${roles.slice(0, 8).map((r) => r.id).join(", ")}${roles.length > 8 ? ", …" : ""})`) : c.dim("none — run: hara roles init")}`,
-    `${dot} skills ${(() => { const n = loadSkillIndex(cfg.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(cfg.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
-    `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(cfg.evolve)} ${c.dim("· capture")} ${c.bold(cfg.assetCapture)}`,
-    `${dot} search ${c.dim("lexical (always on)")}${cfg.embedProvider === "off" ? c.dim(" · semantic off (hara config set embedProvider ollama|qwen)") : c.dim(" · semantic ") + c.bold(cfg.embedProvider) + (() => { const idx = ["repo", "assets", "memory"].filter((n) => indexExists(n, cfg.cwd)); return c.dim(" · indexed: ") + (idx.length ? c.green(idx.join(", ")) : c.yellow("none — run: hara index --all")); })()}`,
+    `${dot} skills ${(() => { const n = loadSkillIndex(live.cwd).length; return n ? c.dim(`${n} (${loadSkillIndex(live.cwd).map((s) => s.id).slice(0, 6).join(", ")})`) : c.dim("none — run: hara skills init"); })()}`,
+    `${dot} memory ${existsSync(join(homedir(), ".hara", "memory")) ? c.dim("~/.hara/memory + project") : c.dim("none yet (created on first write)")} ${c.dim("· evolve")} ${c.bold(live.evolve)} ${c.dim("· capture")} ${c.bold(live.assetCapture)}`,
+    `${dot} search ${c.dim("lexical (always on)")}${live.embedProvider === "off" ? c.dim(" · semantic off (hara config set embedProvider ollama|qwen)") : c.dim(" · semantic ") + c.bold(live.embedProvider) + (() => { const idx = ["repo", "assets", "memory"].filter((n) => indexExists(n, live.cwd)); return c.dim(" · indexed: ") + (idx.length ? c.green(idx.join(", ")) : c.yellow("none — run: hara index --all")); })()}`,
     `${dot} images ${imageStatus}`,
-    `${dot} screen ${cfg.computerUse === "off" ? c.dim("off (hara config set computerUse read|click|full)") : c.bold(cfg.computerUse) + c.dim(` · ${computerBackends()}${cfg.computerApps.length ? " · apps: " + cfg.computerApps.join(", ") : " · no app allowlist"}`)}`,
+    `${dot} screen ${live.computerUse === "off" ? c.dim("off (hara config set computerUse read|click|full)") : c.bold(live.computerUse) + c.dim(` · ${computerBackends()}${live.computerApps.length ? " · apps: " + live.computerApps.join(", ") : " · no app allowlist"}`)}`,
     `${dot} plugins ${(() => { const inst = listInstalled(); const on = enabledPlugins().length; return inst.length ? c.dim(`${on}/${inst.length} enabled: ${inst.map((p) => p.name).slice(0, 6).join(", ")}`) : c.dim("none — hara plugin add <source>"); })()}`,
-    `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...cfg.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
-    `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (cfg.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (cfg.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
-    `${dot} run-limits ${c.bold(formatAgentDuration(cfg.runTimeoutMs))}${c.dim(" active execution · ")}${c.bold(String(cfg.maxAgentRounds))}${c.dim(" rounds · sub-agents ≤8m/24")}`,
-    `${dot} notify ${cfg.notify === "off" ? c.dim("off — hara config set notify bell|system") : c.bold(cfg.notify)}`,
+    `${dot} mcp ${c.dim(`client: ${Object.keys({ ...pluginMcpServers(), ...live.mcpServers }).length} server(s) · serve: ${mcpServeToolNames().length} read tools via \`hara mcp\``)}`,
+    `${dot} hooks ${(() => { const ph = pluginHooks(); const pre = (live.hooks.PreToolUse ?? []).length + (ph.PreToolUse ?? []).length; const post = (live.hooks.PostToolUse ?? []).length + (ph.PostToolUse ?? []).length; return pre + post ? c.dim(`${pre} pre · ${post} post`) : c.dim("none — config.json \"hooks\""); })()}`,
+    `${dot} run-limits ${c.bold(formatAgentDuration(live.runTimeoutMs))}${c.dim(" active execution · ")}${c.bold(String(live.maxAgentRounds))}${c.dim(" rounds · sub-agents ≤8m/24")}`,
+    `${dot} notify ${live.notify === "off" ? c.dim("off — hara config set notify bell|system") : c.bold(live.notify)}`,
     `${dot} cron ${(() => { try { const n = loadJobs().length; return n ? `${n} job(s) · ${isInstalled() ? c.green("scheduler installed") : c.yellow("scheduler off — hara cron install")}` : c.dim("no jobs — hara cron add"); } catch { return c.red("job store invalid — run hara cron list"); } })()}`,
-    `${dot} input ${cfg.vimMode ? c.bold("vim") + c.dim(" (modal)") : c.dim("default — hara config set vimMode true for vim keys")}`,
+    `${dot} input ${live.vimMode ? c.bold("vim") + c.dim(" (modal)") : c.dim("default — hara config set vimMode true for vim keys")}`,
   ];
   return lines.join("\n");
 }
@@ -2032,7 +2357,8 @@ program
   .description("analyze the project and (re)generate AGENTS.md")
   .action(async () => {
     const cfg = loadConfig();
-    const profileId = profileForConfig(cfg).profile.id;
+    const planProfile = profileForConfig(cfg).profile;
+    const profileId = planProfile.id;
     if (isUnsafeProjectWorkspace(cfg.cwd)) {
       out(c.red(homeWorkspaceActionError("initialize AGENTS.md")) + "\n");
       process.exitCode = 2;
@@ -2044,7 +2370,7 @@ program
       process.exit(1);
     }
     out(c.dim("Analyzing project to generate AGENTS.md…\n"));
-    await runInit(provider, cfg.cwd, cfg.sandbox, cfg, profileId);
+    await runInit(provider, cfg.cwd, cfg.sandbox, cfg, profileId, spaceIdForProfile(planProfile));
   });
 
 program
@@ -2123,6 +2449,16 @@ program
     const opts2 = command.optsWithGlobals() as { role?: string; review?: boolean; rounds?: number; commit?: boolean };
     let cfg = loadConfig();
     let orgProfileId = profileForConfig(cfg).profile.id;
+    const initialOrgProfile = profileByIdForConfig(cfg, orgProfileId);
+    if (initialOrgProfile?.kind === "gateway") {
+      try {
+        await ensureOrganizationExecutionPolicy(cfg, initialOrgProfile, spaceIdForProfile(initialOrgProfile));
+      } catch (error) {
+        process.stderr.write(`hara: organization policy sync failed — ${error instanceof Error ? error.message : String(error)}\n`);
+        process.exitCode = 2;
+        return;
+      }
+    }
     // Home dispatch (globally addressable, executes at home): a --role of "project:name" — or a bare name
     // that only exists in a REGISTERED project — resolves via the global agent index and runs with cwd =
     // that project (its AGENTS.md/data context), instead of failing or running context-blind here.
@@ -2155,14 +2491,21 @@ program
       out(c.red(`Not authenticated for provider '${cfg.provider}' at ${orgCwd}.\n`) + authHint(cfg) + "\n");
       process.exit(1);
     }
+    const orgProfile = profileByIdForConfig(cfg, orgProfileId);
+    if (!orgProfile) {
+      out(c.red(`Organization connection '${orgProfileId}' is no longer available.\n`));
+      process.exit(1);
+    }
     const stats = { input: 0, output: 0, lastInput: 0 };
     const outcome = await runOrg(taskParts.join(" "), {
       cfg,
       baseProvider: provider,
       profileId: orgProfileId,
+      spaceId: spaceIdForProfile(orgProfile),
       cwd: orgCwd,
       sandbox: cfg.sandbox,
       approval: "full-auto",
+      approvalChannel: false,
       confirm: async () => true,
       projectContext: loadAgentContext(orgCwd) || undefined,
       stats,
@@ -2217,7 +2560,8 @@ program
   .option("--parallel", "run independent atoms (same dependency wave) concurrently")
   .action(async (taskParts: string[], opts: { parallel?: boolean }) => {
     const cfg = loadConfig();
-    const profileId = profileForConfig(cfg).profile.id;
+    const planProfile = profileForConfig(cfg).profile;
+    const profileId = planProfile.id;
     const provider = await buildProvider(cfg, undefined, profileId);
     if (!provider) {
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
@@ -2228,9 +2572,11 @@ program
       cfg,
       baseProvider: provider,
       profileId,
+      spaceId: spaceIdForProfile(planProfile),
       cwd: cfg.cwd,
       sandbox: cfg.sandbox,
       approval: "full-auto",
+      approvalChannel: false,
       confirm: async () => true,
       projectContext: loadAgentContext(cfg.cwd) || undefined,
       stats,
@@ -2904,6 +3250,10 @@ program
   .action(async (o) => {
     const cwd = o.cwd ? (await import("node:path")).resolve(o.cwd) : process.cwd();
     const cfg = loadConfig({ cwd });
+    const initialProfile = profileForConfig(cfg).profile;
+    if (initialProfile.kind === "gateway") {
+      await ensureOrganizationExecutionPolicy(cfg, initialProfile);
+    }
     const provider0 = await withRouting(await buildProvider(cfg), cfg);
     const guardianOpt = await buildGuardian(cfg, provider0);
     const sandbox = (process.env.HARA_SANDBOX ?? cfg.sandbox ?? "off") as SandboxMode;
@@ -2912,15 +3262,22 @@ program
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const gatewayLogins = new GatewayLoginManager();
     const controlPlaneRefreshAt = new Map<string, number>();
-    const refreshSessionControlPlane = (profile: Profile, targetCwd: string): void => {
+    const refreshSessionControlPlane = async (
+      profile: Profile,
+      targetCwd: string,
+      live: HaraConfig,
+    ): Promise<void> => {
       const enrollment = enrollmentFromProfile(profile);
       if (!enrollment) return;
+      await ensureOrganizationExecutionPolicy(live, profile);
       const now = Date.now();
       if (now - (controlPlaneRefreshAt.get(profile.id) ?? 0) < 60_000) return;
       controlPlaneRefreshAt.set(profile.id, now);
       void heartbeatEnrollment(enrollment, undefined, { profileId: profile.id });
-      void syncOrgRolesForProfile(profile);
-      void syncOrganizationLearningsFromControl(profile.id, { cwd: targetCwd }).catch(() => undefined);
+      void syncOrganizationLearningsFromControl(profile.id, {
+        cwd: targetCwd,
+        organizationScopeId: spaceIdForProfile(profile),
+      }).catch(() => undefined);
     };
     const handle = await startServe(
       { host: o.host, port: Number(o.port) || 8790, token: o.token, cwd },
@@ -2935,14 +3292,14 @@ program
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
           if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
-          refreshSessionControlPlane(profile, targetCwd ?? cwd);
+          await refreshSessionControlPlane(profile, targetCwd ?? cwd, live);
           return withRouting(await buildProvider(live, undefined, profileId), live, profileId);
         },
         buildProviderFor: async (model, effort, targetCwd, profileId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
           if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
-          refreshSessionControlPlane(profile, targetCwd ?? cwd);
+          await refreshSessionControlPlane(profile, targetCwd ?? cwd, live);
           if (
             profile.kind === "gateway"
             && profile.availableModels?.length
@@ -2963,18 +3320,27 @@ program
             profileId,
           );
         },
-        listModels: (targetCwd, profileId) => {
+        listModels: async (targetCwd, profileId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
-          if (!profile) return Promise.reject(new Error(`session profile '${profileId}' is no longer available`));
+          if (!profile) throw new Error(`session profile '${profileId}' is no longer available`);
           if (profile.kind === "gateway") {
-            if (profile.availableModels?.length) return Promise.resolve([...profile.availableModels]);
+            const policy = await ensureOrganizationExecutionPolicy(live, profile);
+            const allowed = (models: string[]): string[] => models.filter((model) => {
+              try {
+                if (policy) assertOrganizationModelAllowed(policy, model);
+                return true;
+              } catch {
+                return false;
+              }
+            });
+            if (profile.availableModels?.length) return allowed([...profile.availableModels]);
             const baseURL = profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined);
-            return listModels(
+            return allowed(await listModels(
               baseURL,
               profile.deviceToken ?? "",
               createModelFetch(live.proxy),
-            );
+            ));
           }
           const target = resolveByokProviderTarget(live, profile, false);
           return listModels(
@@ -2985,15 +3351,8 @@ program
         },
         prepareImages: async (images, opts) => {
           const live = loadConfig({ cwd: opts.cwd });
-          const profile = opts.profileId
-            ? profileByIdForConfig(live, opts.profileId)
-            : profileForConfig(live).profile;
-          if (!profile) {
-            throw new Error(
-              `session profile '${opts.profileId}' is no longer available; ` +
-              "re-enroll that connection or start a new session with an existing profile",
-            );
-          }
+          const profileId = opts.profileId ?? PERSONAL_ID;
+          const profile = assertProfileAudience(live, profileId, opts.spaceId);
           const target = profile.kind === "gateway"
             ? { provider: "hara-gateway", model: opts.model }
             : { ...resolveByokProviderTarget(live, profile, false), model: opts.model };
@@ -3023,7 +3382,8 @@ program
             model: live.visionModel,
             ...(live.visionBaseURL ? { baseURL: live.visionBaseURL } : {}),
             ...(live.visionApiKey ? { apiKey: live.visionApiKey } : {}),
-          }, opts.profileId);
+          }, profileId);
+          assertProfileAudience(live, profileId, opts.spaceId);
           if (!visionProvider) {
             throw new Error(
               `the advanced image fallback is not authenticated for profile '${profile.id}'`,
@@ -3033,6 +3393,7 @@ program
             signal: opts.signal,
             hint: opts.hint,
           });
+          assertProfileAudience(live, profileId, opts.spaceId);
           return {
             description,
             viaModel: live.visionModel,
@@ -3057,6 +3418,8 @@ program
         cancelGatewayLogin: (platform, id) => gatewayLogins.cancel(platform, id),
         closeGatewayLogins: () => gatewayLogins.close(),
         organizationConnections: (targetCwd) => organizationConnectionsSnapshot(targetCwd ?? cwd),
+        spaces: (targetCwd) => spaceDirectorySnapshot(targetCwd ?? cwd),
+        useSpace: (spaceId, targetCwd) => useSpaceConnection(spaceId, targetCwd ?? cwd),
         enrollOrganizationConnection: async (input, targetCwd) => {
           const settingsCwd = targetCwd ?? cwd;
           const resolution = resolveActive(settingsCwd);
@@ -3099,20 +3462,23 @@ program
             && await heartbeatEnrollment(enrollment, AbortSignal.timeout(15_000), { profileId: id });
           return { id, ok, checkedAt: Date.now() };
         },
-        organizationLearningSubmit: async (profileId, candidateId, targetCwd) => {
+        organizationLearningSubmit: async (profileId, organizationScopeId, candidateId, targetCwd) => {
           const learningCwd = targetCwd ?? cwd;
           const candidate = listLearnings({
             cwd: learningCwd,
-            profileId,
+            profileId: organizationScopeId,
             scope: "organization",
             limit: 1_000,
           }).find((item) => item.id === candidateId || item.clientId === candidateId || item.remoteId === candidateId);
           if (!candidate) throw new Error("organization learning candidate not found");
-          return submitOrganizationLearningToControl(profileId, candidate, { cwd: learningCwd });
+          return submitOrganizationLearningToControl(profileId, candidate, {
+            cwd: learningCwd,
+            organizationScopeId,
+          });
         },
-        organizationLearningSync: (profileId, targetCwd) => syncOrganizationLearningsFromControl(
+        organizationLearningSync: (profileId, organizationScopeId, targetCwd) => syncOrganizationLearningsFromControl(
           profileId,
-          { cwd: targetCwd ?? cwd },
+          { cwd: targetCwd ?? cwd, organizationScopeId },
         ),
         deskConnections: () => localDeskConnectionsSnapshot(
           listProfiles()
@@ -3209,6 +3575,7 @@ program
             model,
             profileId: profile.id,
             profileKind: profile.kind,
+            spaceId: spaceIdForProfile(profile),
             effortLevels: advertisedEfforts ?? inferredEfforts,
             attachmentCapabilities: effectiveAttachmentCapabilities(
               current.provider,
@@ -3230,15 +3597,21 @@ program
           };
         },
         runLimits: (targetCwd) => agentRunLimits(loadConfig({ cwd: targetCwd ?? cwd })),
-        spawnSubagent: (provider, scwd, projectContext, stats, task, role, signal, observers, profileId) => {
+        spawnSubagent: (provider, scwd, projectContext, stats, task, role, signal, observers, profileId, spaceId) => {
           const live = loadConfig({ cwd: scwd });
-          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role, signal, observers, profileId);
+          return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role, signal, observers, profileId, spaceId);
         },
         guardian: guardianOpt,
-        buildGuardian: async (targetCwd, profileId) => {
+        buildGuardian: async (targetCwd, profileId, spaceId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
+          const boundProfileId = profileId ?? PERSONAL_ID;
+          if (!spaceId) throw new Error("session has no durable Space binding");
+          assertProfileAudience(live, boundProfileId, spaceId);
           const base = await withRouting(await buildProvider(live, undefined, profileId), live, profileId);
-          return buildGuardian(live, base, profileId);
+          assertProfileAudience(live, boundProfileId, spaceId);
+          const guardian = await buildGuardian(live, base, profileId);
+          assertProfileAudience(live, boundProfileId, spaceId);
+          return guardian;
         },
         sandbox,
         approval,
@@ -3354,7 +3727,8 @@ program
   .option("--base <ref>", "review against a base ref (e.g. main) instead of just the working tree")
   .action(async (opts: { staged?: boolean; base?: string }) => {
     const cfg = loadConfig();
-    const provider = await buildProvider(cfg);
+    const reviewProfile = profileForConfig(cfg).profile;
+    const provider = await buildProvider(cfg, undefined, reviewProfile.id);
     if (!provider) {
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
       process.exit(1);
@@ -3375,8 +3749,14 @@ program
     const stats = { input: 0, output: 0, lastInput: 0 };
     await runAgent([{ role: "user", content: standaloneReviewPrompt(changes) }], {
       provider,
-      ctx: { cwd: cfg.cwd, sandbox: cfg.sandbox },
+      ctx: {
+        cwd: cfg.cwd,
+        sandbox: cfg.sandbox,
+        profileId: reviewProfile.id,
+        spaceId: spaceIdForProfile(reviewProfile),
+      },
       approval: "full-auto",
+      approvalChannel: false,
       confirm: async () => true,
       systemOverride: REVIEW_SYSTEM,
       toolFilter: (n) => READONLY_TOOLS.has(n), // read-only: the reviewer can inspect, never edit
@@ -3396,32 +3776,29 @@ program
   .action(async (opts: { all?: boolean }) => {
     const skipConfirm = !!program.opts().yes; // reuse the global -y/--yes (auto-approve)
     const cfg = loadConfig();
-    const provider = await buildProvider(cfg);
+    const commitProfile = profileForConfig(cfg).profile;
+    const provider = await buildProvider(cfg, undefined, commitProfile.id);
     if (!provider) {
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
       process.exit(1);
     }
+    const authorizeCommit = companyCommitGuard(cfg, commitProfile, { approvalChannel: !skipConfirm });
+    const initialAuthorization = await authorizeCommit();
+    if (initialAuthorization) return void out(c.red(`Commit blocked: ${initialAuthorization}.\n`));
     if (opts.all) {
       const protectedTracked = protectedTrackedWorkingTreePaths(cfg.cwd);
       if (protectedTracked.length) {
         return void out(c.red(`Refusing to stage protected path(s): ${protectedTracked.map((p) => JSON.stringify(p)).join(", ")}\n`));
       }
-      try {
-        await runShell("git add -u", cfg.cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
-      } catch {
-        /* report below if nothing is staged */
-      }
     }
-    const protectedStaged = protectedStagedPaths(cfg.cwd);
-    if (protectedStaged.length) {
-      return void out(c.red(`Refusing to inspect or commit protected staged path(s): ${protectedStaged.map((p) => JSON.stringify(p)).join(", ")}\n`));
+    const candidate = captureChanges(cfg.cwd, 120_000, opts.all
+      ? { includeUntracked: false }
+      : { staged: true, includeUntracked: false });
+    if (candidate.error) return void out(c.red(`git diff failed closed: ${candidate.error}\n`) + c.dim("(is this a git repo?)\n"));
+    if (candidate.skippedFiles.length) {
+      return void out(c.red(`Refusing to inspect or commit protected path(s): ${candidate.skippedFiles.map((p) => JSON.stringify(p)).join(", ")}\n`));
     }
-    const staged = captureChanges(cfg.cwd, 120_000, { staged: true, includeUntracked: false });
-    if (staged.error) return void out(c.red(`git diff failed closed: ${staged.error}\n`) + c.dim("(is this a git repo?)\n"));
-    if (staged.skippedFiles.length) {
-      return void out(c.red(`Refusing to inspect or commit protected staged path(s): ${staged.skippedFiles.map((p) => JSON.stringify(p)).join(", ")}\n`));
-    }
-    const changeInput = commitMessageInput(staged);
+    const changeInput = commitMessageInput(candidate);
     if (!changeInput.trim()) return void out(c.dim("Nothing staged. Stage changes with `git add`, or use `hara commit -a`.\n"));
     out(c.dim("Writing a commit message…\n"));
     const r = await boundedProviderTurn(provider, {
@@ -3440,6 +3817,19 @@ program
       rl.close();
       if (ans === "n" || ans === "no") return void out(c.dim("(cancelled — nothing committed)\n"));
     }
+    const beforeMutationAuthorization = await authorizeCommit();
+    if (beforeMutationAuthorization) return void out(c.red(`Commit blocked: ${beforeMutationAuthorization}.\n`));
+    if (opts.all) {
+      try {
+        await runShell("git add -u", cfg.cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
+      } catch (error) {
+        return void out(c.red(`git add failed: ${error instanceof Error ? error.message : String(error)}\n`));
+      }
+    }
+    const protectedStaged = protectedStagedPaths(cfg.cwd);
+    if (protectedStaged.length) {
+      return void out(c.red(`Refusing to inspect or commit protected staged path(s): ${protectedStaged.map((p) => JSON.stringify(p)).join(", ")}\n`));
+    }
     const tmp = join(tmpdir(), `hara-commit-${process.pid}.txt`);
     writeFileSync(tmp, msg + "\n", "utf8");
     try {
@@ -3447,6 +3837,8 @@ program
       if (protectedBeforeCommit.length) {
         return void out(c.red(`Staged paths changed; refusing to commit protected path(s): ${protectedBeforeCommit.map((p) => JSON.stringify(p)).join(", ")}\n`));
       }
+      const finalAuthorization = await authorizeCommit();
+      if (finalAuthorization) return void out(c.red(`Commit blocked: ${finalAuthorization}.\n`));
       const res = await runShell(`git commit -F ${JSON.stringify(tmp)}`, cfg.cwd, "off", { timeout: 30_000, maxBuffer: 1_000_000 });
       out(c.green("✓ committed ") + c.dim(((res.stdout || "").trim().split("\n")[0] || "").slice(0, 100)) + "\n");
     } catch (e) {
@@ -3670,7 +4062,8 @@ memoryCmd
   .option("--scope <s>", "global | project | all (default all)")
   .action(async (opts: { days?: number; scope?: string }) => {
     const cfg = loadConfig();
-    const provider = await buildProvider(cfg);
+    const distillProfile = profileForConfig(cfg).profile;
+    const provider = await buildProvider(cfg, undefined, distillProfile.id);
     if (!provider) {
       out(c.red(`Not authenticated for provider '${cfg.provider}'.\n`) + authHint(cfg) + "\n");
       process.exit(1);
@@ -3687,8 +4080,14 @@ memoryCmd
     const history: NeutralMsg[] = [{ role: "user", content: `Current durable memory:\n\n${memoryDigest(cfg.cwd, undefined, undefined, { includeReviewedLearning: false }) || "(empty)"}\n\n---\n\nRecent daily logs (last ${days} days):\n\n${logs.slice(0, 80_000)}` }];
     await runAgent(history, {
       provider,
-      ctx: { cwd: cfg.cwd, sandbox: cfg.sandbox },
+      ctx: {
+        cwd: cfg.cwd,
+        sandbox: cfg.sandbox,
+        profileId: distillProfile.id,
+        spaceId: spaceIdForProfile(distillProfile),
+      },
       approval: "full-auto",
+      approvalChannel: false,
       confirm: async () => true,
       toolFilter: allowsMemoryDistillTool,
       systemOverride: MEMORY_DISTILL_SYSTEM,
@@ -3698,10 +4097,15 @@ memoryCmd
     if (stats.input || stats.output) out(statusLine(cfg.model, stats.input, stats.output) + "\n");
   });
 
-const learningContext = (cwd: string): { cwd: string; profileId?: string } => {
+const learningContext = (cwd: string): { cwd: string; profileId?: string; routeProfileId?: string } => {
   const resolution = resolveActive(cwd);
   const profile = getProfile(resolution.id);
-  return { cwd, ...(profile?.kind === "gateway" ? { profileId: profile.id } : {}) };
+  return {
+    cwd,
+    ...(profile?.kind === "gateway"
+      ? { profileId: spaceIdForProfile(profile), routeProfileId: profile.id }
+      : {}),
+  };
 };
 const learningCmd = program.command("learning").description("review, approve, reject, or revoke execution-time business learning");
 learningCmd
@@ -3755,7 +4159,7 @@ learningCmd
   .action(async (id: string) => {
     const cwd = process.cwd();
     const context = learningContext(cwd);
-    if (!context.profileId) {
+    if (!context.profileId || !context.routeProfileId) {
       out(c.red("an organization connection must be active before submitting organization learning\n"));
       process.exitCode = 1;
       return;
@@ -3768,7 +4172,10 @@ learningCmd
       return;
     }
     try {
-      const result = await submitOrganizationLearningToControl(context.profileId, candidate, { cwd });
+      const result = await submitOrganizationLearningToControl(context.routeProfileId, candidate, {
+        cwd,
+        organizationScopeId: context.profileId,
+      });
       out(c.green(`✓ submitted ${candidate.id.slice(0, 8)} · Control ${result.status} · remote revision ${result.revision}\n`));
     } catch (error) {
       out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
@@ -3781,13 +4188,16 @@ learningCmd
   .action(async () => {
     const cwd = process.cwd();
     const context = learningContext(cwd);
-    if (!context.profileId) {
+    if (!context.profileId || !context.routeProfileId) {
       out(c.red("an organization connection must be active before syncing organization learning\n"));
       process.exitCode = 1;
       return;
     }
     try {
-      const result = await syncOrganizationLearningsFromControl(context.profileId, { cwd });
+      const result = await syncOrganizationLearningsFromControl(context.routeProfileId, {
+        cwd,
+        organizationScopeId: context.profileId,
+      });
       out(c.green(`✓ organization learning v${result.version} · ${result.learnings.length} approved\n`));
     } catch (error) {
       out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
@@ -4373,8 +4783,14 @@ program.action(async (opts) => {
     // owned those files: refresh the exact authenticated profile before the first post-upgrade lookup so
     // an explicit `--role` can seed its new identity-scoped directory and start on the first attempt.
     const roleRouteProfile = getProfile(roleRouteProfileId);
-    if (roleRouteProfile?.kind === "gateway" && !existsSync(orgRolesDir(roleRouteProfile.id))) {
-      await syncOrgRolesForProfile(roleRouteProfile);
+    if (roleRouteProfile?.kind === "gateway") {
+      try {
+        await syncOrgRolesForProfile(roleRouteProfile, undefined, { required: true });
+      } catch (error) {
+        process.stderr.write(`hara: organization role sync failed — ${error instanceof Error ? error.message : String(error)}\n`);
+        process.exitCode = 2;
+        return;
+      }
     }
     const isLocalRole = !ref.includes(":")
       && loadRoles(process.cwd(), roleRouteProfileId).some((role) => role.id === ref);
@@ -4438,6 +4854,9 @@ program.action(async (opts) => {
   const launchModel = opts.model ? cfg.model : launchResume?.meta.model || freshProfileModel;
   let initialRuntime: { provider: Provider; profile: Profile } | null = null;
   try {
+    if (launchProfile?.kind === "gateway") {
+      await ensureOrganizationExecutionPolicy(cfg, launchProfile);
+    }
     initialRuntime = await buildSessionBoundRuntime(cfg, sessionRouteProfileId, launchModel, launchResume?.meta.effort);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -4474,7 +4893,19 @@ program.action(async (opts) => {
   // credential or managed role from whichever connection happened to be active during startup.
   let fbOpt: { provider: Provider } | undefined;
   let guardianOpt: Awaited<ReturnType<typeof buildGuardian>>;
-  const bindAuxiliaryRuntime = async (primary: Provider, profile: Profile): Promise<void> => {
+  const bindAuxiliaryRuntime = async (
+    primary: Provider,
+    profile: Profile,
+    expectedSpaceId?: string,
+  ): Promise<void> => {
+    const assertAudience = (): void => {
+      if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
+    };
+    assertAudience();
+    if (profile.kind === "gateway") {
+      await ensureOrganizationExecutionPolicy(cfg, profile, expectedSpaceId ?? spaceIdForProfile(profile));
+      assertAudience();
+    }
     // Fallback provider, built correctly for CROSS-PROVIDER failover. Passing profile.id is essential:
     // every sidecar request of a persisted session stays inside the same identity boundary.
     let fallbackProv: Provider | null = null;
@@ -4497,15 +4928,17 @@ program.action(async (opts) => {
           ...(cfg.fallbackBaseURL ? { baseURL: cfg.fallbackBaseURL } : {}),
           ...(cross ? { apiKey: crossKey } : cfg.fallbackApiKey ? { apiKey: cfg.fallbackApiKey } : {}),
         }, profile.id);
+        assertAudience();
       }
     }
-    fbOpt = fallbackProv ? { provider: fallbackProv } : undefined;
-    guardianOpt = await buildGuardian(cfg, primary, profile.id);
+    const nextGuardian = await buildGuardian(cfg, primary, profile.id);
+    assertAudience();
     if (profile.kind === "gateway" || primary.id === "hara-gateway") {
       const boundEnrollment = enrollmentFromProfile(profile);
       if (boundEnrollment) void heartbeatEnrollment(boundEnrollment, undefined, { profileId: profile.id });
-      void syncOrgRolesForProfile(profile);
     }
+    fbOpt = fallbackProv ? { provider: fallbackProv } : undefined;
+    guardianOpt = nextGuardian;
   };
   /** The engine owns local-file validation; this selector owns provider identity. Prefer the current main
    * model whenever it sees images natively. A compatibility helper is used only for a text-only main model
@@ -4516,7 +4949,9 @@ program.action(async (opts) => {
     image: ImageAttachment,
     hint?: string,
     signal?: AbortSignal,
+    expectedSpaceId?: string,
   ): Promise<{ text: string; model: string }> => {
+    if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
     const native = classifyVision(primary.id, primary.model, cfg.modelVision);
     let imageProvider: Provider | null = native === "vision" ? primary : null;
     if (!imageProvider && cfg.visionModel) {
@@ -4530,6 +4965,7 @@ program.action(async (opts) => {
           ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
           ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
         }, profile.id);
+        if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
       }
     }
     if (!imageProvider) {
@@ -4538,8 +4974,10 @@ program.action(async (opts) => {
         "switch this conversation to an image-capable model or configure an authorized compatibility helper",
       );
     }
+    const text = await describeImages(imageProvider, [image], { hint, signal });
+    if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
     return {
-      text: await describeImages(imageProvider, [image], { hint, signal }),
+      text,
       model: imageProvider.model,
     };
   };
@@ -4605,6 +5043,8 @@ program.action(async (opts) => {
   // one-shot
   if (opts.print) {
     let headlessLockId: string | null = null;
+    let meta: SessionMeta | null = null;
+    const headlessLaunchSpaceId = spaceIdForProfile(__activeP);
     const headlessOperations = createPhysicalOperationDrain(() => {
       if (!headlessLockId) return;
       const lockId = headlessLockId;
@@ -4614,31 +5054,41 @@ program.action(async (opts) => {
     const trackHeadlessOperation = headlessOperations.observe;
     try {
     const projectContext = loadAgentContext(cwd) || undefined;
+    const assertHeadlessAudience = (): Profile => {
+      const profileId = meta?.profileId ?? sessionRouteProfileId;
+      const spaceId = meta?.spaceId ?? headlessLaunchSpaceId;
+      if (!profileId || !spaceId) throw new Error("headless session has no durable Space binding");
+      return assertProfileAudience(cfg, profileId, spaceId);
+    };
     // Vision sidecar for headless runs (gateway/cron): without it the computer tool's screenshots come back
     // "configure a vision model" even when one is set, leaving a headless agent blind. Mirrors the interactive
     // describeScreenshot — a configured visionModel, else the main model if it's vision-capable.
     const describeImage = async (path: string, hint?: string, signal?: AbortSignal): Promise<string> => {
+      assertHeadlessAudience();
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
       const vp = cfg.visionModel
         ? ((await buildProvider(cfg, {
             model: cfg.visionModel,
             ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
             ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
-          })) ?? null)
+          }, meta?.profileId ?? sessionRouteProfileId)) ?? null)
         : cap === "vision"
           ? provider
           : null;
+      assertHeadlessAudience();
       if (!vp) return "";
       try {
-        return await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
+        const description = await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
+        assertHeadlessAudience();
+        return description;
       } catch {
+        assertHeadlessAudience();
         return "";
       }
     };
     // Headless session continuity: --resume <id> / --continue loads the session, appends this prompt, and
     // saves it back — so `hara -p … --resume <id>` continues a thread (used by cron, scripts, the chat gateway).
     // Plain `hara -p` stays stateless. A --resume id with no match is created WITH that id (stable per caller).
-    let meta: SessionMeta | null = null;
     let continuationSession = false;
     let task: TaskExecution | undefined;
     let requiresAudienceBindingSave = false;
@@ -4714,11 +5164,36 @@ program.action(async (opts) => {
         return;
       }
       const authoritativeProfileId = prior?.meta.profileId ?? profileForConfig(cfg).profile.id;
+      const authoritativeProfile = getProfile(authoritativeProfileId) ?? profileForConfig(cfg).profile;
+      const authoritativeSpaceId = spaceIdForProfile(authoritativeProfile);
+      if (
+        prior
+        && !prior.meta.spaceId
+        && !(
+          prior.meta.profileId === PERSONAL_ID
+          && prior.meta.provider !== "hara-gateway"
+          && authoritativeProfile.kind === "byok"
+        )
+      ) {
+        process.stderr.write(
+          `hara: legacy organization session ${shortId(rid)} has no verifiable Space binding; its history remains local and read-only. Start a new conversation in the intended company.\n`,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      if (prior?.meta.spaceId && prior.meta.spaceId !== authoritativeSpaceId) {
+        process.stderr.write(
+          `hara: session ${shortId(rid)} belongs to Space '${prior.meta.spaceId}', but profile '${authoritativeProfileId}' now resolves to '${authoritativeSpaceId}'; refusing to send old history across companies.\n`,
+        );
+        process.exitCode = 2;
+        return;
+      }
       meta = prior?.meta ?? {
         id: rid,
         cwd,
         haraVersion: pkg.version,
         profileId: authoritativeProfileId,
+        spaceId: authoritativeSpaceId,
         provider: cfg.provider,
         model: cfg.model,
         title: src.source === "interactive" ? "" : automatedTitle(src.source, src.sourceName),
@@ -4758,6 +5233,10 @@ program.action(async (opts) => {
         requiresAudienceBindingSave = true;
       }
       meta.profileId = authoritativeProfileId;
+      if (!meta.spaceId) {
+        meta.spaceId = authoritativeSpaceId;
+        requiresAudienceBindingSave = true;
+      }
       if (requestedHeadlessAgentRef) {
         if (meta.agentRef && meta.agentRef !== requestedHeadlessAgentRef) {
           process.stderr.write(
@@ -4807,8 +5286,11 @@ program.action(async (opts) => {
         return;
       }
     }
+    assertHeadlessAudience();
+    await bindAuxiliaryRuntime(provider, __activeP, meta?.spaceId ?? headlessLaunchSpaceId);
+    assertHeadlessAudience();
     if (!(await reloadRequestedHeadlessRole(__activeP))) return;
-    await bindAuxiliaryRuntime(provider, __activeP);
+    assertHeadlessAudience();
     registerRunMcp();
     // --schema: schema-enforced structured output. The schema (inline JSON or a file path) becomes a run-scoped
     // structured_output tool the model MUST call; stdout is then exactly that JSON (streaming suppressed), so
@@ -4871,15 +5353,27 @@ program.action(async (opts) => {
       history.push({ role: "user", content: userText, images: inboundImgs }); // native vision → inline
     } else if (inboundImgs.length && cfg.visionModel) {
       let desc = "";
+      let vp: Provider | null = null;
+      const visionProfileId = meta?.profileId ?? sessionRouteProfileId;
+      assertHeadlessAudience();
       try {
-        const vp = await buildProvider(cfg, {
+        vp = (await buildProvider(cfg, {
           model: cfg.visionModel,
           ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
           ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
-        });
-        if (vp) desc = await describeImages(vp, inboundImgs);
+        }, visionProfileId)) ?? null;
       } catch {
-        /* describe is best-effort — fall back to the marker-only text */
+        /* provider setup is best-effort; the audience checks remain mandatory */
+      }
+      assertHeadlessAudience();
+      if (vp) {
+        assertHeadlessAudience();
+        try {
+          desc = await describeImages(vp, inboundImgs);
+        } catch {
+          /* describe is best-effort — fall back to the marker-only text */
+        }
+        assertHeadlessAudience();
       }
       const n = inboundImgs.length;
       history.push({
@@ -4912,13 +5406,18 @@ program.action(async (opts) => {
     let headlessProvider = provider;
     let headlessToolFilter: ((name: string) => boolean) | undefined;
     let headlessHooks = true;
+    const headlessRolePolicyVersion = requestedHeadlessRole && (meta?.spaceId ?? headlessLaunchSpaceId) !== PERSONAL_ID
+      ? requestedHeadlessRole.organizationPolicyVersion
+      : undefined;
     if (requestedHeadlessRole) {
       roleOverride = requestedHeadlessRole.system;
       headlessToolFilter = roleToolFilter(requestedHeadlessRole);
       if (requestedHeadlessRole.readOnly) headlessHooks = false;
       const roleModel = effectiveRoleModel(requestedHeadlessRole.model, cfg.model);
       if (roleModel && roleModel !== provider.model) {
+        assertHeadlessAudience();
         const selected = await buildProvider(cfg, { model: roleModel }, meta?.profileId ?? sessionRouteProfileId);
+        assertHeadlessAudience();
         if (!selected) {
           process.stderr.write(`hara: role '${opts.role}' requires model '${roleModel}', but that provider is not authenticated.\n`);
           process.exitCode = 2;
@@ -4936,6 +5435,7 @@ program.action(async (opts) => {
         cwd,
         sandbox,
         profileId: meta?.profileId ?? sessionRouteProfileId,
+        spaceId: meta?.spaceId ?? headlessLaunchSpaceId,
         ...(meta ? { sessionId: meta.id } : {}),
         spawn: (t: string, role?: string, signal?: AbortSignal) => runSubagent(
           cfg,
@@ -4951,15 +5451,18 @@ program.action(async (opts) => {
             onProviderTurn: trackHeadlessOperation,
             onToolRun: trackHeadlessOperation,
           },
+          meta?.profileId ?? sessionRouteProfileId,
+          meta?.spaceId ?? headlessLaunchSpaceId,
         ),
         describeImage,
         inspectImage: (image: ImageAttachment, hint?: string, signal?: AbortSignal) =>
-          inspectImageWithCurrentRoute(headlessProvider, __activeP, image, hint, signal),
+          inspectImageWithCurrentRoute(headlessProvider, __activeP, image, hint, signal, meta?.spaceId ?? headlessLaunchSpaceId),
       },
       approval: "full-auto" as const,
+      approvalChannel: false,
       confirm: async () => true,
       projectContext,
-      memory: memoryDigest(cwd, meta?.profileId ?? sessionRouteProfileId),
+      memory: memoryDigest(cwd, meta?.spaceId ?? headlessLaunchSpaceId),
       continuationSession,
       executionContext: taskExecutionContext(task, headlessInteraction, meta?.todos ?? []),
       taskIntake: {
@@ -4978,6 +5481,9 @@ program.action(async (opts) => {
         },
       },
       ...(roleOverride ? { systemOverride: roleOverride } : {}),
+      ...(headlessRolePolicyVersion !== undefined
+        ? { organizationPolicyVersion: headlessRolePolicyVersion }
+        : {}),
       ...(headlessToolFilter ? { toolFilter: headlessToolFilter } : {}),
       hooks: headlessHooks,
       stats,
@@ -5121,7 +5627,7 @@ program.action(async (opts) => {
     if (ans === "" || ans.startsWith("y")) {
       out(c.dim("Analyzing project…\n"));
       try {
-        await runInit(provider, cwd, sandbox, cfg, __activeP.id);
+        await runInit(provider, cwd, sandbox, cfg, __activeP.id, spaceIdForProfile(__activeP));
       } catch (e: any) {
         out(c.red(`[init error] ${e.message}\n`));
       }
@@ -5132,7 +5638,20 @@ program.action(async (opts) => {
     projectContext = loadAgentContext(cwd) || undefined;
     return projectContext;
   };
-  const spawn = (t: string, role?: string, signal?: AbortSignal) => runSubagent(cfg, provider, cwd, sandbox, projectContext, stats, t, role, signal);
+  const spawn = (t: string, role?: string, signal?: AbortSignal) => runSubagent(
+    cfg,
+    provider,
+    cwd,
+    sandbox,
+    projectContext,
+    stats,
+    t,
+    role,
+    signal,
+    undefined,
+    meta.profileId,
+    meta.spaceId,
+  );
 
   // session: --resume <id> / --continue (latest in this cwd) / new
   let resumeId: string | null = null;
@@ -5184,6 +5703,7 @@ program.action(async (opts) => {
     cwd,
     haraVersion: pkg.version,
     profileId: sessionRouteProfileId,
+    spaceId: spaceIdForProfile(profileForConfig(cfg).profile),
     provider: cfg.provider,
     model: cfg.model,
     title: "",
@@ -5194,6 +5714,28 @@ program.action(async (opts) => {
   meta.haraVersion = pkg.version;
   const authoritativeProfileId = meta.profileId ?? profileForConfig(cfg).profile.id;
   meta.profileId = authoritativeProfileId;
+  const currentBoundProfile = getProfile(authoritativeProfileId) ?? profileForConfig(cfg).profile;
+  const currentSpaceId = spaceIdForProfile(currentBoundProfile);
+  if (
+    resumed
+    && !resumed.meta.spaceId
+    && !(
+      resumed.meta.profileId === PERSONAL_ID
+      && resumed.meta.provider !== "hara-gateway"
+      && currentBoundProfile.kind === "byok"
+    )
+  ) {
+    releaseSessionLock(sessionId);
+    out(c.red(`Legacy organization session ${shortId(sessionId)} has no verifiable Space binding; its history remains local and read-only. Start a new conversation in the intended company.\n`));
+    process.exit(2);
+  }
+  if (meta.spaceId && meta.spaceId !== currentSpaceId) {
+    releaseSessionLock(sessionId);
+    out(c.red(`Session ${shortId(sessionId)} belongs to Space '${meta.spaceId}', but its provider connection now resolves to '${currentSpaceId}'; refusing to send old history across companies.\n`));
+    process.exit(2);
+  }
+  const legacySpaceBinding = Boolean(resumed && !resumed.meta.spaceId);
+  meta.spaceId = currentSpaceId;
   // Conversation transcript and task execution are restored independently. A process that disappeared
   // mid-run leaves `running`; recovery turns it into an explicit paused/interrupted task.
   let task: TaskExecution | undefined = recoverTaskExecution(resumed?.task);
@@ -5222,13 +5764,48 @@ program.action(async (opts) => {
       process.exit(2);
     }
   }
-  if (legacyProfileBinding) {
+  if (legacyProfileBinding || legacySpaceBinding) {
     // Migration is an identity decision, not a turn side effect. Persist it as soon as the selected
     // provider has validated so opening and immediately exiting cannot leave the transcript unbound.
     saveSession(meta, resumed?.history ?? [], task);
   }
+  const assertInteractiveAudience = (): Profile => {
+    if (!meta.spaceId) throw new Error("session has no durable Space binding");
+    return assertProfileAudience(cfg, authoritativeProfileId, meta.spaceId);
+  };
+  const rebuildInteractiveProvider = async (
+    model: string,
+    effort: HaraConfig["reasoningEffort"] = cfg.reasoningEffort,
+  ): Promise<Provider | null> => {
+    assertInteractiveAudience();
+    const candidateCfg: HaraConfig = { ...cfg, reasoningEffort: effort };
+    const nextProvider = await buildProvider(candidateCfg, { model }, authoritativeProfileId);
+    const currentProfile = assertInteractiveAudience();
+    if (!nextProvider) return null;
+    await bindAuxiliaryRuntime(nextProvider, currentProfile, meta.spaceId);
+    assertInteractiveAudience();
+    cfg.provider = nextProvider.id as ProviderId;
+    cfg.model = nextProvider.model;
+    cfg.reasoningEffort = effort;
+    if (currentProfile.kind === "gateway") {
+      cfg.baseURL = currentProfile.baseURL
+        || (currentProfile.gatewayUrl ? `${currentProfile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined);
+      cfg.apiKey = undefined;
+    } else {
+      const target = overrideProviderTarget(
+        resolveByokProviderTarget(cfg, currentProfile, false),
+        { model: nextProvider.model },
+      );
+      cfg.baseURL = target.baseURL;
+      cfg.apiKey = target.apiKey;
+    }
+    __activeP = currentProfile;
+    return nextProvider;
+  };
   try {
-    await bindAuxiliaryRuntime(provider, __activeP);
+    assertInteractiveAudience();
+    await bindAuxiliaryRuntime(provider, __activeP, meta.spaceId);
+    assertInteractiveAudience();
   } catch (error) {
     releaseSessionLock(sessionId);
     out(c.red(`Cannot initialize session ${shortId(sessionId)}: ${error instanceof Error ? error.message : String(error)}.\n`));
@@ -5309,7 +5886,7 @@ program.action(async (opts) => {
     resumeTaskPending = Boolean(task && task.status !== "completed");
   };
   let continuationSession = Boolean(resumed?.history.length);
-  const memorySnap = memoryDigest(cwd, meta.profileId); // durable reviewed context, read once (frozen snapshot)
+  const memorySnap = memoryDigest(cwd, meta.spaceId); // durable reviewed context, read once (frozen snapshot)
   const buildMemory = (): string =>
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
   if (resumed) out(c.dim(`(resumed ${shortId(meta.id)} · ${history.length} msgs · model = ${cfg.model})\n`));
@@ -5398,7 +5975,7 @@ program.action(async (opts) => {
       run: async () => {
         out(c.dim("Analyzing project…\n"));
         try {
-          await runInit(provider, cwd, sandbox, cfg, authoritativeProfileId);
+          await runInit(provider, cwd, sandbox, cfg, authoritativeProfileId, meta.spaceId);
           projectContext = loadAgentContext(cwd) || undefined;
           out(c.green("AGENTS.md updated.\n"));
         } catch (e: any) {
@@ -5419,6 +5996,11 @@ program.action(async (opts) => {
       name: "model",
       desc: "show or switch model: /model [id [--force|all]]",
       run: async (a) => {
+        try {
+          assertInteractiveAudience();
+        } catch (error) {
+          return void out(c.red(`(${error instanceof Error ? error.message : String(error)})\n`));
+        }
         const parts = (a || "").trim().split(/\s+/).filter(Boolean);
         const force = parts.some((p) => p === "--force" || p === "all" || p === "-f");
         const id = parts.find((p) => p !== "--force" && p !== "all" && p !== "-f");
@@ -5443,18 +6025,20 @@ program.action(async (opts) => {
           }
           return void out(__lines.join("\n") + "\n");
         }
-        cfg.model = id;
-        meta.model = id;
-        setSessionForceModel(force);
-        visionProvider = undefined;
-        remindedVision = false;
-        const p = await buildProvider(cfg, { model: cfg.model });
-        if (p) {
-          provider = p;
-          if (bar.isActive()) bar.update({ model: id });
-          persistSession(); // persist the session-pinned model so resume restores it
-          out(c.dim(`(model → ${cfg.provider}:${id}${force ? " · forced (all roles)" : ""})\n`));
-        } else out(c.red("(could not rebuild provider)\n"));
+        try {
+          const nextProvider = await rebuildInteractiveProvider(id);
+          if (!nextProvider) return void out(c.red("(could not rebuild provider)\n"));
+          provider = nextProvider;
+          meta.model = nextProvider.model;
+          setSessionForceModel(force);
+          visionProvider = undefined;
+          remindedVision = false;
+          if (bar.isActive()) bar.update({ model: nextProvider.model });
+          persistSession(); // persist only after provider + Space checks both succeed
+          out(c.dim(`(model → ${cfg.provider}:${nextProvider.model}${force ? " · forced (all roles)" : ""})\n`));
+        } catch (error) {
+          out(c.red(`(${error instanceof Error ? error.message : String(error)})\n`));
+        }
       },
     },
     {
@@ -5525,9 +6109,11 @@ program.action(async (opts) => {
           cfg,
           baseProvider: provider,
           profileId: authoritativeProfileId,
+          spaceId: meta.spaceId!,
           cwd,
           sandbox,
           approval,
+          approvalChannel: true,
           confirm,
           projectContext,
           stats,
@@ -5544,9 +6130,11 @@ program.action(async (opts) => {
           cfg,
           baseProvider: provider,
           profileId: authoritativeProfileId,
+          spaceId: meta.spaceId!,
           cwd,
           sandbox,
           approval,
+          approvalChannel: true,
           confirm,
           projectContext,
           stats,
@@ -5650,8 +6238,12 @@ program.action(async (opts) => {
         const outcome = await curateSessionLearning(provider, history, cfg, {
           cwd,
           sandbox,
+          profileId: authoritativeProfileId,
+          spaceId: meta.spaceId,
+          sessionId: meta.id,
           spawn,
           confirm,
+          approvalChannel: true,
           memory: buildMemory(),
           stats,
         });
@@ -5672,8 +6264,12 @@ program.action(async (opts) => {
             const distill = await curateSessionLearning(provider, history, cfg, {
               cwd,
               sandbox,
+              profileId: authoritativeProfileId,
+              spaceId: meta.spaceId,
+              sessionId: meta.id,
               spawn,
               confirm,
+              approvalChannel: true,
               memory: buildMemory(),
               stats,
               signal: compactTurn.signal,
@@ -5740,7 +6336,18 @@ program.action(async (opts) => {
         if (shouldAutoEvolve(cfg.evolve, history.length)) {
           out(c.dim("Distilling session learnings…\n"));
           try {
-            await curateSessionLearning(provider, history, cfg, { cwd, sandbox, spawn, confirm, memory: buildMemory(), stats });
+            await curateSessionLearning(provider, history, cfg, {
+              cwd,
+              sandbox,
+              profileId: authoritativeProfileId,
+              spaceId: meta.spaceId,
+              sessionId: meta.id,
+              spawn,
+              confirm,
+              approvalChannel: true,
+              memory: buildMemory(),
+              stats,
+            });
             persistSession();
           } catch {
             /* exiting remains available if optional curation fails */
@@ -5765,7 +6372,7 @@ program.action(async (opts) => {
       if (await askConfirm("No AGENTS.md here — analyze this project and create one?")) {
         out(c.dim("Analyzing project…\n"));
         try {
-          await runInit(provider, cwd, sandbox, cfg, authoritativeProfileId);
+          await runInit(provider, cwd, sandbox, cfg, authoritativeProfileId, meta.spaceId);
         } catch (e: any) {
           out(c.red(`[init error] ${e.message}\n`));
         }
@@ -5777,12 +6384,14 @@ program.action(async (opts) => {
     // vision-capable main model gets them inline (describer auto-suspended). Unknown models are asked
     // once and remembered per-model in cfg.modelVision. See classifyVision for the capability map.
     const getVisionProvider = async (): Promise<Provider | null> => {
+      assertInteractiveAudience();
       if (visionProvider !== undefined) return visionProvider;
       visionProvider = await buildProvider(cfg, {
         model: cfg.visionModel!,
         ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
         ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
-      });
+      }, authoritativeProfileId);
+      assertInteractiveAudience();
       return visionProvider;
     };
     // lets the computer tool return a screenshot as text (describe via the vision sidecar / a vision main model).
@@ -5793,13 +6402,16 @@ program.action(async (opts) => {
       const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
       if (!vp) return "";
       try {
-        return await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
+        const description = await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
+        assertInteractiveAudience();
+        return description;
       } catch {
+        assertInteractiveAudience();
         return "";
       }
     };
     const inspectImage = (image: ImageAttachment, hint?: string, signal?: AbortSignal) =>
-      inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal);
+      inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId);
     // grounding for accurate RPA: ask the vision model WHERE an element is (0..1 fractions) so the computer
     // tool can click it precisely instead of guessing pixels from a text description.
     const locateScreenshot = async (path: string, target: string, signal?: AbortSignal): Promise<{ x: number; y: number } | null> => {
@@ -5807,8 +6419,11 @@ program.action(async (opts) => {
       const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
       if (!vp) return null;
       try {
-        return await locateImage(vp, { path, mediaType: "image/png" }, target, { signal });
+        const location = await locateImage(vp, { path, mediaType: "image/png" }, target, { signal });
+        assertInteractiveAudience();
+        return location;
       } catch {
+        assertInteractiveAudience();
         return null;
       }
     };
@@ -5914,6 +6529,16 @@ program.action(async (opts) => {
       onClipboardImage: readClipboardImage,
       vim: cfg.vimMode,
       onSubmit: async (line, h, images, interaction) => {
+        try {
+          assertInteractiveAudience();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (/^\/(?:exit|quit)\b/i.test(line.trim())) {
+            h.sink.notice(`(${message})`);
+            return void h.exit();
+          }
+          return void h.sink.notice(`(${message})`);
+        }
         // `/continue` is a task interaction, not a control-only command: turn it into a model message before
         // slash dispatch, preserving the submitted turn id while explicitly targeting the unfinished task.
         const continueCommand = /^\/continue(?:\s+([\s\S]+))?$/i.exec(line.trim());
@@ -5999,9 +6624,13 @@ program.action(async (opts) => {
                 await curateSessionLearning(provider, history, cfg, {
                   cwd,
                   sandbox,
+                  profileId: authoritativeProfileId,
+                  spaceId: meta.spaceId,
+                  sessionId: meta.id,
                   spawn,
                   ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice },
                   confirm: h.confirm,
+                  approvalChannel: true,
                   memory: buildMemory(),
                   stats,
                   signal: h.signal,
@@ -6025,9 +6654,13 @@ program.action(async (opts) => {
             const outcome = await curateSessionLearning(provider, history, cfg, {
               cwd,
               sandbox,
+              profileId: authoritativeProfileId,
+              spaceId: meta.spaceId,
+              sessionId: meta.id,
               spawn,
               ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice },
               confirm: h.confirm,
+              approvalChannel: true,
               memory: buildMemory(),
               stats,
               signal: h.signal,
@@ -6055,47 +6688,47 @@ program.action(async (opts) => {
             return void h.sink.notice("error" in r ? `(${r.error})` : `↩ reverted: ${r.files.join(", ")}`);
           }
           if (nm === "model") {
-            const parts = (arg || "").trim().split(/\s+/).filter(Boolean);
-            const force = parts.some((p) => p === "--force" || p === "all" || p === "-f");
-            const id = parts.find((p) => p !== "--force" && p !== "all" && p !== "-f");
-            if (!id) {
-              // Bare /model → the interactive picker: the endpoint's live model list (↑↓) + its thinking
-              // level (←→, per the registry's reasoning style). Falls back to typing an id if the endpoint
-              // doesn't enumerate models.
-              const bURL = cfg.baseURL ?? providerDefaultBaseURL(cfg.provider);
-              const models = await listModels(
-                bURL,
-                cfg.apiKey ?? "",
-                createModelFetch(cfg.proxy),
-              );
-              const style = resolvePlatform(cfg.provider, bURL, undefined, cfg.model).reasoning;
-              const chosen = await h.pickModel({ models, style, current: cfg.model, effort: cfg.reasoningEffort });
-              if (!chosen) return; // esc — no change
-              if (chosen.model) {
-                cfg.model = chosen.model;
-                meta.model = chosen.model;
+            try {
+              assertInteractiveAudience();
+              const parts = (arg || "").trim().split(/\s+/).filter(Boolean);
+              const force = parts.some((p) => p === "--force" || p === "all" || p === "-f");
+              const id = parts.find((p) => p !== "--force" && p !== "all" && p !== "-f");
+              if (!id) {
+                // Bare /model → the interactive picker: the endpoint's live model list (↑↓) + its thinking
+                // level (←→, per the registry's reasoning style). Falls back to typing an id if the endpoint
+                // doesn't enumerate models.
+                const bURL = cfg.baseURL ?? providerDefaultBaseURL(cfg.provider);
+                const models = await listModels(
+                  bURL,
+                  cfg.apiKey ?? "",
+                  createModelFetch(cfg.proxy),
+                );
+                assertInteractiveAudience();
+                const style = resolvePlatform(cfg.provider, bURL, undefined, cfg.model).reasoning;
+                const chosen = await h.pickModel({ models, style, current: cfg.model, effort: cfg.reasoningEffort });
+                if (!chosen) return; // esc — no change
+                const nextModel = chosen.model || cfg.model;
+                const nextProvider = await rebuildInteractiveProvider(nextModel, chosen.effort);
+                if (!nextProvider) return void h.sink.notice("(could not rebuild provider)");
+                provider = nextProvider;
+                meta.model = nextProvider.model;
+                visionProvider = undefined;
+                remindedVision = false;
+                persistSession();
+                return void h.sink.notice(`(model → ${cfg.provider}:${nextProvider.model} · thinking ${chosen.effort ?? "default"})`);
               }
-              cfg.reasoningEffort = chosen.effort;
-              visionProvider = undefined;
+              const nextProvider = await rebuildInteractiveProvider(id);
+              if (!nextProvider) return void h.sink.notice("(could not rebuild provider)");
+              provider = nextProvider;
+              meta.model = nextProvider.model;
+              setSessionForceModel(force);
+              visionProvider = undefined; // new model may resolve a different describer / capability
               remindedVision = false;
-              const p2 = await buildProvider(cfg, { model: cfg.model });
-              if (!p2) return void h.sink.notice("(could not rebuild provider)");
-              provider = p2;
-              persistSession();
-              return void h.sink.notice(`(model → ${cfg.provider}:${cfg.model} · thinking ${chosen.effort ?? "default"})`);
+              persistSession(); // persist only after provider + Space checks both succeed
+              return void h.sink.notice(`(model → ${cfg.provider}:${nextProvider.model}${force ? " · forced (all roles)" : ""})`);
+            } catch (error) {
+              return void h.sink.notice(`(${error instanceof Error ? error.message : String(error)})`);
             }
-            cfg.model = id;
-            meta.model = id;
-            setSessionForceModel(force);
-            visionProvider = undefined; // new model may resolve a different describer / capability
-            remindedVision = false;
-            const p = await buildProvider(cfg, { model: cfg.model });
-            if (p) {
-              provider = p;
-              persistSession(); // persist the session-pinned model so resume restores it
-              return void h.sink.notice(`(model → ${cfg.provider}:${id}${force ? " · forced (all roles)" : ""})`);
-            }
-            return void h.sink.notice("(could not rebuild provider)");
           }
           if (nm === "recall") {
             if (!arg) return void h.sink.notice("usage: /recall <query>");
@@ -6164,9 +6797,13 @@ program.action(async (opts) => {
                 distillOutcome = await curateSessionLearning(provider, history, cfg, {
                   cwd,
                   sandbox,
+                  profileId: authoritativeProfileId,
+                  spaceId: meta.spaceId,
+                  sessionId: meta.id,
                   spawn,
                   ui: cui,
                   confirm: h.confirm,
+                  approvalChannel: true,
                   memory: buildMemory(),
                   stats,
                   signal: h.signal,
@@ -6232,7 +6869,14 @@ program.action(async (opts) => {
           }
           if (nm === "commit") {
             h.sink.notice("✻ writing a commit message…");
-            const r = await autoCommit(provider, cwd, h.signal); // stages all + commits with an AI message
+            const commitProfile = profileByIdForConfig(cfg, authoritativeProfileId);
+            if (!commitProfile) return void h.sink.notice("✗ active identity connection is unavailable; commit was not started");
+            const r = await autoCommit(
+              provider,
+              cwd,
+              h.signal,
+              companyCommitGuard(cfg, commitProfile, { approvalChannel: true }),
+            ); // stages all + commits with an AI message
             return void h.sink.notice(r.startsWith("error:") ? `✗ ${r}` : r === "nothing to commit" ? "(nothing to commit — make or stage changes first)" : `✓ committed · ${r.slice(0, 100)}`);
           }
           if (nm === "review") {
@@ -6249,8 +6893,9 @@ program.action(async (opts) => {
             const xout = stats.output;
             await runAgent([{ role: "user", content: standaloneReviewPrompt(changes) }], {
               provider,
-              ctx: { cwd, sandbox, profileId: authoritativeProfileId, ui: rui },
+              ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, ui: rui },
               approval: "full-auto", // read-only via the tool filter, so nothing prompts
+              approvalChannel: true,
               confirm: h.confirm,
               toolFilter: (n) => READONLY_TOOLS.has(n),
               hooks: false,
@@ -6295,7 +6940,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot }, approval: __skApproval, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot }, approval: __skApproval, approvalChannel: true, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -6381,8 +7026,9 @@ program.action(async (opts) => {
           };
           let planOutcome = await runAgent(history, {
             provider,
-            ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
+            ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
             approval: "suggest",
+            approvalChannel: true,
             confirm: h.confirm,
             toolFilter: (n) => READONLY_TOOLS.has(n) || n === "memory_search" || n === "memory_get" || n === "session_search",
             hooks: false,
@@ -6439,8 +7085,9 @@ program.action(async (opts) => {
             const xout = stats.output;
             planOutcome = await runAgent(history, {
               provider,
-              ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
+              ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
               approval: choice as ApprovalMode,
+              approvalChannel: true,
               memory: buildMemory(),
               confirm: h.confirm,
               autoApprove,
@@ -6487,8 +7134,9 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         const turnOutcome = await runAgent(history, {
           provider,
-          ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
+          ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
           approval: appr,
+          approvalChannel: true,
           memory: buildMemory(),
           confirm: h.confirm,
           autoApprove,
@@ -6554,6 +7202,14 @@ program.action(async (opts) => {
     }
     bar.renderBottom(); // bottom border + modes/usage
     if (!line) continue;
+    try {
+      assertInteractiveAudience();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      out(c.red(`(${message})\n`));
+      if (/^\/(?:exit|quit)\b/i.test(line)) break;
+      continue;
+    }
     let forcedContinuation: Extract<TaskInteraction, { kind: "steer" }> | undefined;
     const continueCommand = /^\/continue(?:\s+([\s\S]+))?$/i.exec(line);
     if (continueCommand) {
@@ -6588,7 +7244,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal) }, approval, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -6655,7 +7311,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal) }, approval, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

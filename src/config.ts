@@ -9,7 +9,9 @@ import {
   bindPrivateHaraStateFile,
   ensurePrivateHaraState,
   readPrivateStateFileSnapshotSync,
+  withPrivateStateLockSync,
   writePrivateStateFileSync,
+  type PrivateStateFileSnapshot,
 } from "./security/private-state.js";
 import { readVerifiedRegularFileSnapshotSync } from "./fs-read.js";
 import { projectRepositoryTrustedAtStartup } from "./security/project-trust.js";
@@ -316,20 +318,47 @@ export function configPath(): string {
   return join(homedir(), ".hara", "config.json");
 }
 
+interface RawConfigState {
+  value: Record<string, any>;
+  snapshot: PrivateStateFileSnapshot;
+}
+
+function readRawConfigState(): RawConfigState | null {
+  ensurePrivateHaraState();
+  const binding = bindPrivateHaraStateFile(homedir(), [], "config.json");
+  const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_GLOBAL_CONFIG_BYTES);
+  if (!snapshot) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(snapshot.text);
+  } catch {
+    throw new Error("global Hara config is not valid JSON; refusing to replace or ignore it");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("global Hara config must contain a JSON object; refusing to replace or ignore it");
+  }
+  return { value: parsed as Record<string, any>, snapshot };
+}
+
+function withConfigLock<T>(fn: () => T): T {
+  return withPrivateStateLockSync(homedir(), [], "config", fn, {
+    busyMessage: "global Hara config is busy; retry the operation",
+  });
+}
+
 function configRecord(value: unknown): Record<string, any> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, any>) : {};
 }
 
 export function readRawConfig(): Record<string, any> {
-  ensurePrivateHaraState();
   try {
-    const binding = bindPrivateHaraStateFile(homedir(), [], "config.json");
-    const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_GLOBAL_CONFIG_BYTES);
-    if (!snapshot) return {};
-    return configRecord(JSON.parse(snapshot.text));
+    const current = readRawConfigState();
+    if (current) return current.value;
   } catch {
-    return {};
+    // Retry once under the writer fence. A namespace race succeeds here; a static malformed/unsafe config
+    // throws again and can never be mistaken for an empty file by a later update.
   }
+  return withConfigLock(() => readRawConfigState()?.value ?? {});
 }
 
 const ROUTING_CONFIG_KEYS = new Set([
@@ -437,19 +466,22 @@ function readProjectConfig(cwd: string): Record<string, any> {
 }
 
 /** Atomically replace the global 0600 config through the shared private-state CAS boundary. */
-function persistConfig(cfg: Record<string, unknown>): void {
+function persistConfig(cfg: Record<string, unknown>, expectedText?: string, expectedMissing = false): void {
   ensurePrivateHaraState();
   const binding = bindPrivateHaraStateFile(homedir(), [], "config.json");
-  writePrivateStateFileSync(binding, JSON.stringify(cfg, null, 2) + "\n");
+  writePrivateStateFileSync(binding, JSON.stringify(cfg, null, 2) + "\n", { expectedText, expectedMissing });
 }
 
 /** Mutate global config without exposing a second direct-write implementation to feature modules. */
 export function updateRawConfig(
   mutate: (config: Record<string, any>) => Record<string, any> | void,
 ): void {
-  const config = readRawConfig();
-  const replacement = mutate(config);
-  persistConfig(replacement ?? config);
+  withConfigLock(() => {
+    const state = readRawConfigState();
+    const config = state?.value ?? {};
+    const replacement = mutate(config);
+    persistConfig(replacement ?? config, state?.snapshot.text, !state);
+  });
 }
 
 export function writeConfigValue(key: string, value: string): void {

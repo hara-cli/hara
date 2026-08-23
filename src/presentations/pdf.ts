@@ -133,7 +133,8 @@ function renderWithBrowser(
       clearTimeout(timer);
       clearInterval(outputPoll);
       // Chromium may finish printing while its helper processes remain alive. The verified file is the
-      // success boundary; once it is stable, explicitly reap the isolated browser process group.
+      // success boundary; once it is stable, explicitly reap the isolated browser process group. Cleanup
+      // below has its own bounded retry for the kernel's asynchronous process/file teardown window.
       if (!error && child.exitCode === null && !cancelTree) {
         cancelTree = terminateSubprocessTree(child, { processGroup, force: true });
       }
@@ -179,7 +180,10 @@ function renderWithBrowser(
 }
 
 async function removePresentationPdfTemporary(path: string): Promise<void> {
-  const deadline = Date.now() + (platform() === "win32" ? 2_000 : 0);
+  // A stable PDF can be observed just before Chromium's forcibly-terminated helper processes finish
+  // closing their profile files. APFS can return ENOTEMPTY during that short teardown window too, so the
+  // bounded retry is cross-platform rather than a Windows-only exception.
+  const deadline = Date.now() + 10_000;
   do {
     try {
       rmSync(path, { recursive: true, force: true });

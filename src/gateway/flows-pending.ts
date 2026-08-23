@@ -29,11 +29,14 @@ import { resolveAgent } from "../org/projects.js";
 import { loadConfig } from "../config.js";
 import { createProviderForTarget } from "../providers/factory.js";
 import {
+  profileByIdForConfig,
   profileForConfig,
   resolveByokProviderTarget,
   resolveGatewayModel,
 } from "../providers/target.js";
+import { isValidProfileId, isValidSpaceId, spaceIdForProfile } from "../profile/profile.js";
 import type { Provider, TurnResult } from "../providers/types.js";
+import { bindOrganizationProvider } from "../providers/organization-bound.js";
 import { validateAgainstSchema } from "../agent/structured.js";
 import { terminateSubprocessTree } from "../security/subprocess-env.js";
 import { sleepSync } from "../sync-sleep.js";
@@ -56,7 +59,16 @@ export interface PendingAction {
   /** Opaque SHA-256 identity of the inbound source + flow/stage. Replayed flow evaluation reuses the same
    * pending record without persisting the source message, target credentials, or model output in this key. */
   sourceKey?: string;
+  /** Immutable inference audience that created this draft. Free-form approval judging must stay on this
+   * route even when the operator later switches the globally active company connection. */
+  routeProfileId?: string;
+  spaceId?: string;
   status: "pending" | "executing" | "done" | "rejected" | "failed" | "expired";
+}
+
+export interface NoToolAudience {
+  profileId: string;
+  spaceId: string;
 }
 
 export interface PendingExecutionOptions {
@@ -87,6 +99,10 @@ function isPendingAction(value: unknown): value is PendingAction {
     (action.notify === undefined || typeof action.notify === "string" || (Array.isArray(action.notify) && action.notify.every((item) => typeof item === "string"))) &&
     (action.origin === undefined || typeof action.origin === "string") &&
     (action.sourceKey === undefined || (typeof action.sourceKey === "string" && /^[a-f0-9]{64}$/.test(action.sourceKey))) &&
+    (
+      (action.routeProfileId === undefined && action.spaceId === undefined)
+      || (isValidProfileId(action.routeProfileId) && isValidSpaceId(action.spaceId))
+    ) &&
     typeof action.status === "string" && PENDING_STATUSES.has(action.status as PendingAction["status"])
   );
 }
@@ -285,16 +301,32 @@ export function addPending(p: {
   notify?: string | string[];
   origin?: string;
   sourceKey?: string;
+  routeProfileId?: string;
+  spaceId?: string;
 }): PendingAction {
   if (!p.owner.trim()) throw new Error("pending action requires a concrete owner identity");
   if (p.sourceKey !== undefined && !/^[a-f0-9]{64}$/.test(p.sourceKey)) {
     throw new Error("pending action sourceKey must be an opaque SHA-256 value");
   }
+  const suppliedAudience = p.routeProfileId !== undefined || p.spaceId !== undefined;
+  if (suppliedAudience && (!isValidProfileId(p.routeProfileId) || !isValidSpaceId(p.spaceId))) {
+    throw new Error("pending action audience requires a valid route profile and Space");
+  }
+  const audience = suppliedAudience
+    ? { profileId: p.routeProfileId!, spaceId: p.spaceId! }
+    : captureNoToolAudience();
   return withStoreLock(() => {
     const list = loadAll(true);
     const existing = p.sourceKey ? list.find((action) => action.sourceKey === p.sourceKey) : undefined;
     if (existing) return { ...existing };
-    const action: PendingAction = { ...p, id: `p${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`, createdMs: Date.now(), status: "pending" };
+    const action: PendingAction = {
+      ...p,
+      routeProfileId: audience.profileId,
+      spaceId: audience.spaceId,
+      id: `p${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`,
+      createdMs: Date.now(),
+      status: "pending",
+    };
     list.push(action);
     saveAll(list);
     return action;
@@ -600,18 +632,29 @@ function spawnOrgTask(
 /** Build the same active provider identity as the main CLI, without importing index.ts (which would execute
  * Commander). This path is intentionally provider-only: no agent loop, MCP connection, tools, session,
  * project context, or approval mode exists for untrusted flow/judge input to reach. */
-async function buildNoToolProvider(): Promise<Provider | null> {
+export function captureNoToolAudience(): NoToolAudience {
   const cfg = loadConfig();
   const { profile } = profileForConfig(cfg);
+  return { profileId: profile.id, spaceId: spaceIdForProfile(profile) };
+}
+
+async function buildNoToolProvider(audience?: NoToolAudience): Promise<Provider | null> {
+  const cfg = loadConfig();
+  const profile = audience
+    ? profileByIdForConfig(cfg, audience.profileId)
+    : profileForConfig(cfg).profile;
+  if (!profile) return null;
+  if (audience && spaceIdForProfile(profile) !== audience.spaceId) return null;
   if (profile.kind === "gateway") {
     if (!profile.gatewayUrl || !profile.deviceToken) return null;
-    return createProviderForTarget({
+    const provider = await createProviderForTarget({
       provider: "hara-gateway",
       apiKey: profile.deviceToken,
       baseURL: profile.baseURL || `${profile.gatewayUrl.replace(/\/$/, "")}/v1`,
       model: resolveGatewayModel(cfg, profile),
       ...(cfg.proxy ? { proxy: cfg.proxy } : {}),
     }, cfg.reasoningEffort);
+    return provider ? bindOrganizationProvider(provider, { ...profile }) : null;
   }
   return createProviderForTarget(
     resolveByokProviderTarget(cfg, profile, false),
@@ -642,6 +685,8 @@ export interface NoToolTurnOptions {
   timeoutMs?: number;
   /** Gateway lifecycle signal. Shutdown is authoritative even if the provider returns a late response. */
   signal?: AbortSignal;
+  /** Frozen route for pending/flow data. Ordinary one-shot callers may omit it and use the active route. */
+  audience?: NoToolAudience;
 }
 
 /** Run one bounded provider turn with an explicit empty tool list. Exported for focused security tests.
@@ -708,7 +753,7 @@ export async function runNoToolTurn(provider: Provider, prompt: string, opts: No
  * callers then fail closed (no pending action is executed and no unsafe subprocess fallback is attempted). */
 export async function runNoToolModel(prompt: string, opts: NoToolTurnOptions = {}): Promise<string> {
   try {
-    const provider = await buildNoToolProvider();
+    const provider = await buildNoToolProvider(opts.audience);
     return provider ? await runNoToolTurn(provider, prompt, opts) : "";
   } catch {
     return "";
@@ -757,6 +802,9 @@ async function judgeOwnerReply(
   pending: PendingAction,
   reply: string,
 ): Promise<{ verdict: "approve" | "reject" | "edit" | "unrelated" | "unclear"; draft?: string }> {
+  // Historical pending records predate audience binding. Explicit /approve|/reject|/edit remains usable,
+  // but sending their contents to whichever company happens to be active now would cross a tenant boundary.
+  if (!pending.routeProfileId || !pending.spaceId) return { verdict: "unclear" };
   const schema = {
     type: "object",
     required: ["verdict"],
@@ -771,7 +819,11 @@ async function judgeOwnerReply(
     `${JSON.stringify({ context: pending.context.slice(0, 300), draft: pending.draft.slice(0, 1_000), reply: reply.slice(0, 2_000) })}\n\n` +
     `判断 reply 对该待批动作的意图：approve=同意执行；` +
     `reject=拒绝/不要发；edit=想改内容后再执行（把改后的完整内容放进 draft 字段）；unrelated=在说别的事，与这单无关；unclear=实在无法判断。`;
-  const out = await runNoToolModel(prompt, { schema, timeoutMs: 15_000 });
+  const out = await runNoToolModel(prompt, {
+    schema,
+    timeoutMs: 15_000,
+    audience: { profileId: pending.routeProfileId, spaceId: pending.spaceId },
+  });
   try {
     const j = JSON.parse(out || "{}");
     const ok = ["approve", "reject", "edit", "unrelated", "unclear"].includes(j.verdict);

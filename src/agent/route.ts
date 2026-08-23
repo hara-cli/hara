@@ -46,12 +46,16 @@ export function isTrivialTurn(text: string): boolean {
 /** Wrap a primary + alternate provider so each turn routes to the alternate when the latest user message is
  *  trivial, else the primary. Decided per turn from history (stable across tool rounds). */
 export function routingProvider(primary: Provider, alt: Provider): Provider {
+  const selected = (history: NeutralMsg[]): Provider =>
+    isTrivialTurn(lastUserText(history)) ? alt : primary;
   return {
     id: primary.id,
     model: primary.model, // reported model = primary; routing is transparent
+    async prepareTurn(history: NeutralMsg[], signal?: AbortSignal) {
+      return selected(history).prepareTurn?.(history, signal);
+    },
     turn(args: TurnArgs) {
-      const useAlt = isTrivialTurn(lastUserText(args.history));
-      return (useAlt ? alt : primary).turn(args);
+      return selected(args.history).turn(args);
     },
   };
 }

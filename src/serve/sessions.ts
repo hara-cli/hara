@@ -66,6 +66,13 @@ export interface ServeSession {
   effort?: string;
 }
 
+/** Embedders predating Space metadata may still pass only a profile id. Treat every non-default route
+ * as its own organization boundary until a runtime supplies an authoritative Space id; misclassifying a
+ * named personal route is recoverable, while misclassifying a company route as Personal can leak history. */
+function failClosedSpaceId(profileId?: string): string {
+  return profileId && profileId !== "personal" ? `org-profile:${profileId}` : "personal";
+}
+
 export class SessionHub {
   private sessions = new Map<string, ServeSession>();
   constructor(private store: SessionStore = realStore, private haraVersion?: string) {}
@@ -92,12 +99,14 @@ export class SessionHub {
     }
   }
 
-  create(o: { cwd: string; profileId?: string; provider: Provider; providerId: string; model: string; approval: ApprovalMode; projectContext?: string; agentRef?: string }): ServeSession {
+  create(o: { cwd: string; profileId?: string; spaceId?: string; provider: Provider; providerId: string; model: string; approval: ApprovalMode; projectContext?: string; agentRef?: string }): ServeSession {
+    const profileId = o.profileId ?? "personal";
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: o.cwd,
       ...(this.haraVersion ? { haraVersion: this.haraVersion } : {}),
-      profileId: o.profileId ?? "personal",
+      profileId,
+      spaceId: o.spaceId ?? failClosedSpaceId(profileId),
       provider: o.providerId,
       model: o.model,
       approval: o.approval,
@@ -303,6 +312,7 @@ export class SessionHub {
     id: string,
     o: {
       profileId?: string;
+      spaceId?: string;
       model?: string;
       provider: Provider;
       providerId: string;
@@ -320,6 +330,9 @@ export class SessionHub {
     if (!src) return { missing: true };
     const sourceProfileId = src.meta.profileId ?? "personal";
     const targetProfileId = o.profileId ?? sourceProfileId;
+    const sourceSpaceId = src.meta.spaceId ?? failClosedSpaceId(sourceProfileId);
+    const targetSpaceId = o.spaceId
+      ?? (targetProfileId === sourceProfileId ? sourceSpaceId : failClosedSpaceId(targetProfileId));
     const targetModel = o.model ?? (src.meta.model || o.provider.model);
     const preservesRoute = targetProfileId === sourceProfileId && targetModel === src.meta.model;
     const approval = src.meta.approval ?? o.approval;
@@ -328,6 +341,7 @@ export class SessionHub {
       cwd: src.meta.cwd,
       ...(this.haraVersion ? { haraVersion: this.haraVersion } : {}),
       profileId: targetProfileId,
+      spaceId: targetSpaceId,
       provider: o.providerId,
       model: targetModel,
       approval,
@@ -338,7 +352,9 @@ export class SessionHub {
       ...(src.meta.workingSet ? { workingSet: [...src.meta.workingSet] } : {}),
       ...(src.meta.todos ? { todos: src.meta.todos.map((todo) => ({ ...todo, ...(todo.blockedBy ? { blockedBy: [...todo.blockedBy] } : {}) })) } : {}),
       ...(preservesRoute && src.meta.effort ? { effort: src.meta.effort } : {}),
-      ...(targetProfileId === sourceProfileId && src.meta.agentRef ? { agentRef: src.meta.agentRef } : {}),
+      ...(targetProfileId === sourceProfileId && targetSpaceId === sourceSpaceId && src.meta.agentRef
+        ? { agentRef: src.meta.agentRef }
+        : {}),
     };
     const lock = this.store.acquire(meta.id);
     if (!lock.ok) throw new Error(`could not acquire fork lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);

@@ -1,6 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deadlineCheckpointReminder, runAgent, taskRoundCheckpointReminder } from "../dist/agent/loop.js";
@@ -16,6 +16,7 @@ import { runShell } from "../dist/sandbox.js";
 import { getTool } from "../dist/tools/registry.js";
 import { onTurnPhase, setTurnPhase } from "../dist/agent/phase.js";
 import { createTaskExecution } from "../dist/session/task.js";
+import { loadOrganizationExecutionPolicy, orgRolesDir } from "../dist/org/roles.js";
 import "../dist/tools/builtin.js";
 import "../dist/tools/memory.js";
 
@@ -33,14 +34,164 @@ after(() => {
 const tick = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function base(provider, extra = {}) {
+  const spaceId = extra.ctx?.spaceId;
+  const executionProvider = spaceId && spaceId !== "personal" && !provider.prepareTurn
+    ? {
+        ...provider,
+        async prepareTurn() {
+          const policy = loadOrganizationExecutionPolicy(spaceId);
+          return policy ? { organizationPolicyVersion: policy.version } : undefined;
+        },
+      }
+    : provider;
   return {
-    provider,
+    provider: executionProvider,
     ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice() {} } },
     approval: "full-auto",
     confirm: async () => true,
     ...extra,
   };
 }
+
+function writeOrganizationPolicy(spaceId, version, orgPolicy) {
+  const dir = orgRolesDir(spaceId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "_bundle.json"),
+    `${JSON.stringify({ version, org_policy: orgPolicy, roles: [] }, null, 2)}\n`,
+  );
+}
+
+test("organization tool deny is enforced when a provider names an unadvertised tool", async () => {
+  const spaceId = "org:runtime-deny-test";
+  writeOrganizationPolicy(spaceId, 1, { toolDeny: ["forbidden_probe"] });
+  let ran = 0;
+  let advertised = true;
+  let turns = 0;
+  const provider = {
+    id: "malicious-fixture",
+    model: "allowed-model",
+    async turn(args) {
+      turns += 1;
+      advertised = args.tools.some((tool) => tool.name === "forbidden_probe");
+      return turns === 1
+        ? { text: "", toolUses: [{ id: "forbidden-call", name: "forbidden_probe", input: {} }], stop: "tool_use" }
+        : { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "try the hidden tool" }];
+  const outcome = await runAgent(history, base(provider, {
+    ctx: { cwd: process.cwd(), spaceId },
+    approvalChannel: false,
+    extraTools: [{
+      name: "forbidden_probe",
+      description: "must never execute",
+      input_schema: { type: "object", properties: {} },
+      kind: "read",
+      async run() { ran += 1; return "unsafe"; },
+    }],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(advertised, false);
+  assert.equal(ran, 0);
+  assert.match(history.find((message) => message.role === "tool").results[0].content, /Organization policy denied/);
+});
+
+test("organization write approval fails closed without a real approval channel", async () => {
+  const spaceId = "org:approval-channel-test";
+  writeOrganizationPolicy(spaceId, 1, { requireApprovalForWrites: true });
+  let ran = 0;
+  let turns = 0;
+  const provider = {
+    id: "approval-fixture",
+    model: "allowed-model",
+    async turn() {
+      turns += 1;
+      return turns === 1
+        ? { text: "", toolUses: [{ id: "write-call", name: "write_probe", input: {} }], stop: "tool_use" }
+        : { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "write something" }];
+  const outcome = await runAgent(history, base(provider, {
+    ctx: { cwd: process.cwd(), spaceId },
+    approvalChannel: false,
+    extraTools: [{
+      name: "write_probe",
+      description: "test write",
+      input_schema: { type: "object", properties: {} },
+      kind: "edit",
+      async run() { ran += 1; return "unsafe"; },
+    }],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(ran, 0);
+  assert.match(history.find((message) => message.role === "tool").results[0].content, /requires a live human approval/);
+});
+
+test("a managed role halts when Control changes its bundle before inference", async () => {
+  const spaceId = "org:role-snapshot-test";
+  writeOrganizationPolicy(spaceId, 1, {});
+  let turns = 0;
+  const provider = {
+    id: "role-snapshot-fixture",
+    model: "allowed-model",
+    async prepareTurn() {
+      writeOrganizationPolicy(spaceId, 2, { toolDeny: ["bash"] });
+    },
+    async turn() {
+      turns += 1;
+      return { text: "unsafe", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "use the stale persona" }], base(provider, {
+    ctx: { cwd: process.cwd(), spaceId },
+    approvalChannel: false,
+    organizationPolicyVersion: 1,
+    systemOverride: "old managed persona",
+  }));
+  assert.equal(outcome.status, "error");
+  assert.match(outcome.error, /bundle changed from version 1 to 2/);
+  assert.equal(turns, 0);
+});
+
+test("a policy tightened during human approval blocks the tool at the execution boundary", async () => {
+  const spaceId = "org:approval-race-test";
+  writeOrganizationPolicy(spaceId, 1, {});
+  let ran = 0;
+  let turns = 0;
+  const provider = {
+    id: "approval-race-fixture",
+    model: "allowed-model",
+    async turn() {
+      turns += 1;
+      return turns === 1
+        ? { text: "", toolUses: [{ id: "write-call", name: "write_probe", input: {} }], stop: "tool_use" }
+        : { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "write after approval" }];
+  const outcome = await runAgent(history, base(provider, {
+    ctx: { cwd: process.cwd(), spaceId },
+    approval: "suggest",
+    approvalChannel: true,
+    confirm: async () => {
+      writeOrganizationPolicy(spaceId, 2, { toolDeny: ["write_probe"] });
+      return true;
+    },
+    organizationPolicyVersion: 1,
+    extraTools: [{
+      name: "write_probe",
+      description: "test write",
+      input_schema: { type: "object", properties: {} },
+      kind: "edit",
+      run: async () => { ran += 1; return "wrote"; },
+    }],
+  }));
+  assert.equal(ran, 0, "policy change after approval wins before tool.run");
+  assert.notEqual(outcome.status, "completed");
+  assert.match(outcome.error ?? "", /bundle changed from version 1 to 2|policy changed before execution/i);
+});
 
 test("agent lifecycle limit parsers accept friendly durations and cannot be disabled", () => {
   assert.equal(agentRunTimeoutMs("30m"), 30 * 60_000);
@@ -631,6 +782,8 @@ test("a late non-cooperative wrapper cannot commit through built-in write_file a
   const dir = mkdtempSync(join(tmpdir(), "hara-late-write-"));
   const target = join(dir, "late.txt");
   let lateResult = "";
+  let lateSettled;
+  const lateDone = new Promise((resolve) => { lateSettled = resolve; });
   const provider = {
     id: "late-write",
     model: "late-write",
@@ -649,14 +802,18 @@ test("a late non-cooperative wrapper cannot commit through built-in write_file a
         input_schema: { type: "object", properties: {} },
         kind: "edit",
         async run(_input, ctx) {
-          await tick(1_200); // deliberately ignores cancellation while waiting
-          lateResult = await getTool("write_file").run({ path: "late.txt", content: "must not land\n" }, ctx);
-          return lateResult;
+          try {
+            await tick(1_200); // deliberately ignores cancellation while waiting
+            lateResult = await getTool("write_file").run({ path: "late.txt", content: "must not land\n" }, ctx);
+            return lateResult;
+          } finally {
+            lateSettled();
+          }
         },
       }],
     }));
     assert.equal(outcome.stopReason, "deadline");
-    await tick(350);
+    await lateDone;
     assert.equal(existsSync(target), false, "the physical late tool cannot cross the atomic commit gate");
     assert.match(lateResult, /cancel|No changes written/i);
   } finally {
@@ -668,6 +825,8 @@ test("a late non-cooperative wrapper cannot start another registered edit tool a
   const dir = mkdtempSync(join(tmpdir(), "hara-late-memory-"));
   const target = join(dir, ".hara", "memory", "MEMORY.md");
   let lateResult = "";
+  let lateSettled;
+  const lateDone = new Promise((resolve) => { lateSettled = resolve; });
   const provider = {
     id: "late-memory",
     model: "late-memory",
@@ -686,14 +845,18 @@ test("a late non-cooperative wrapper cannot start another registered edit tool a
         input_schema: { type: "object", properties: {} },
         kind: "edit",
         async run(_input, ctx) {
-          await tick(1_200); // deliberately ignores cancellation while waiting
-          lateResult = await getTool("memory_write").run({ content: "must not land", scope: "project" }, ctx);
-          return lateResult;
+          try {
+            await tick(1_200); // deliberately ignores cancellation while waiting
+            lateResult = await getTool("memory_write").run({ content: "must not land", scope: "project" }, ctx);
+            return lateResult;
+          } finally {
+            lateSettled();
+          }
         },
       }],
     }));
     assert.equal(outcome.stopReason, "deadline");
-    await tick(350);
+    await lateDone;
     assert.equal(existsSync(target), false, "the registry boundary refuses delayed cross-tool side effects");
     assert.match(lateResult, /cancelled before execution/i);
   } finally {

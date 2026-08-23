@@ -4,10 +4,12 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { addPending, approvalPolicy, handleOwnerReply, latestPending, listPending, parseApprovalCommand, resolvePending, runNoToolTurn } from "../dist/gateway/flows-pending.js";
+import { createServer } from "node:http";
+import { addPending, approvalPolicy, handleOwnerReply, latestPending, listPending, parseApprovalCommand, resolvePending, runNoToolModel, runNoToolTurn } from "../dist/gateway/flows-pending.js";
 import { appendFlowLog, dispatchFlows, loadFlows, parseAgentResult, resetFlowRateStateForTests } from "../dist/gateway/flows.js";
 import { isPrivateApprovalMessage, resolveAllowlist, resolveApprovalOwner } from "../dist/gateway/serve.js";
 import { gatewayRuntimeScope, GatewayFlowRunStore, GatewayMessageDeduper } from "../dist/gateway/runtime-state.js";
+import { upsertProfile } from "../dist/profile/profile.js";
 
 async function withTempHome(fn) {
   const home = mkdtempSync(join(tmpdir(), "hara-flow-security-"));
@@ -84,6 +86,115 @@ test("runNoToolTurn does not start a provider cancelled before its invocation mi
   controller.abort();
   assert.equal(await running, "");
   assert.equal(turns, 0);
+});
+
+test("gateway no-tool model obeys the active company model policy before sending", async () => {
+  await withTempHome(async (home) => {
+    let chatRequests = 0;
+    const server = createServer((req, res) => {
+      if (req.url === "/v1/roles") {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({
+          version: 3,
+          org_policy: { modelDeny: ["denied-model"] },
+          roles: [],
+        }));
+      }
+      if (req.url === "/v1/chat/completions") chatRequests += 1;
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "must not reach inference" }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const gatewayUrl = `http://127.0.0.1:${address.port}`;
+    try {
+      const haraHome = join(home, ".hara");
+      mkdirSync(haraHome, { recursive: true });
+      writeFileSync(join(haraHome, "config.json"), JSON.stringify({ provider: "openai", model: "personal-model" }));
+      writeFileSync(join(haraHome, "profiles.json"), JSON.stringify({
+        active: "flow-org",
+        profiles: [
+          { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+          {
+            id: "flow-org",
+            kind: "gateway",
+            label: "Flow Org",
+            tenantId: "flow-tenant",
+            gatewayUrl,
+            baseURL: `${gatewayUrl}/v1`,
+            deviceId: "flow-device",
+            deviceToken: "flow-device-token",
+            defaultModel: "denied-model",
+            availableModels: ["denied-model"],
+            enrolledAt: "2026-08-23T00:00:00.000Z",
+          },
+        ],
+      }), { mode: 0o600 });
+      assert.equal(await runNoToolModel("judge this"), "");
+      assert.equal(chatRequests, 0, "denied company model never reaches the gateway inference endpoint");
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+test("pending free-form judge never sends company A draft to a replacement company B route", async () => {
+  await withTempHome(async (home) => {
+    let companyBRequests = 0;
+    const server = createServer((req, res) => {
+      if (req.url === "/v1/roles") {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ version: 2, org_policy: {}, roles: [] }));
+      }
+      if (req.url === "/v1/chat/completions") companyBRequests += 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: '{"verdict":"approve"}' }, finish_reason: "stop" }] }));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const gatewayUrl = `http://127.0.0.1:${server.address().port}`;
+    try {
+      const haraHome = join(home, ".hara");
+      mkdirSync(haraHome, { recursive: true });
+      writeFileSync(join(haraHome, "config.json"), JSON.stringify({ provider: "openai", model: "personal-model" }), { mode: 0o600 });
+      writeFileSync(join(haraHome, "flows.json"), JSON.stringify({ approval: { judge: true, windowHours: 4 } }), { mode: 0o600 });
+      const companyA = {
+        id: "company",
+        kind: "gateway",
+        tenantId: "tenant-a",
+        gatewayUrl,
+        baseURL: `${gatewayUrl}/v1`,
+        deviceId: "device-a",
+        deviceToken: "token-a",
+        defaultModel: "company-model",
+        enrolledAt: "2026-08-23T00:00:00.000Z",
+      };
+      upsertProfile(companyA);
+      writeFileSync(join(haraHome, "profiles.json"), JSON.stringify({
+        active: "company",
+        profiles: [
+          { id: "personal", kind: "byok", label: "Personal", provider: "openai" },
+          companyA,
+        ],
+      }), { mode: 0o600 });
+      const pending = addPending({ owner: "feishu:boss", target: "feishu:chat", draft: "company A private draft", context: "company A" });
+      assert.equal(pending.spaceId, "org:tenant-a");
+
+      upsertProfile({
+        ...companyA,
+        tenantId: "tenant-b",
+        deviceId: "device-b",
+        deviceToken: "token-b",
+        enrolledAt: "2026-08-23T00:01:00.000Z",
+      });
+      assert.equal(await handleOwnerReply("feishu:boss", "可以，发吧"), null);
+      assert.equal(companyBRequests, 0, "replacement company receives neither the old draft nor approval reply");
+      assert.match(await handleOwnerReply("feishu:boss", `/reject ${pending.id}`), /已取消/, "explicit deterministic commands remain available");
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
 });
 
 test("flow result parsing drops model values with unsafe shapes", () => {
@@ -182,7 +293,7 @@ test("pending store uses private atomic files, collision-resistant ids, and one-
     assert.equal(latestPending("feishu:boss").id, actions.at(-1).id);
 
     // Exercise the on-disk lock, not just single-process serialization: gateway + desktop can write at once.
-    await Promise.all(
+    const childResults = await Promise.allSettled(
       Array.from({ length: 8 }, (_, i) =>
         new Promise((resolve, reject) => {
           const script = `import { addPending } from "./dist/gateway/flows-pending.js"; addPending({ owner: "feishu:boss", target: "feishu:child-${i}", draft: "d", context: "child-${i}" });`;
@@ -197,6 +308,10 @@ test("pending store uses private atomic files, collision-resistant ids, and one-
           child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`child ${i} failed (${code}): ${stderr}`))));
         }),
       ),
+    );
+    assert.deepEqual(
+      childResults.filter((result) => result.status === "rejected").map((result) => String(result.reason)),
+      [],
     );
     assert.equal(listPending().length, 28, "cross-process writers do not lose updates");
 

@@ -31,6 +31,7 @@
 // ────────────────────────────────────────────────────────────────────────────────
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { join, dirname, parse as parsePath, relative, resolve as resolvePath } from "node:path";
 import { lstatSync, realpathSync } from "node:fs";
 import { readRawConfig, updateRawConfig, type ProviderId } from "../config.js";
@@ -46,6 +47,7 @@ import {
   bindPrivateHaraStateFile,
   readPrivateStateFileSnapshotSync,
   removePrivateStateFile,
+  withPrivateStateLockSync,
   writePrivateStateFileSync,
   type PrivateStateFileBinding,
   type PrivateStateFileSnapshot,
@@ -61,6 +63,14 @@ export interface Profile {
   id: string;
   kind: ProfileKind;
   label?: string;
+  /** Control-authoritative organization identity. Unlike the local profile id, this survives a
+   * connection rename or re-enrollment and is safe to use as the company Space boundary. */
+  tenantId?: string;
+  /** Locally generated immutable audience generation for legacy Controls that do not return tenantId.
+   * Rotated on every enrollment so reusing the same profile id can never reuse a conversation boundary. */
+  enrollmentAudience?: string;
+  /** Public organization display name returned by Control. Never used for authorization. */
+  tenantName?: string;
   // byok-only
   provider?: ProviderId; // anthropic | qwen | openai | qwen-oauth (NOT hara-gateway)
   apiKey?: string;
@@ -103,11 +113,41 @@ const DEFAULT_ORG_ID = "default-org";
 const MAX_PROFILE_STATE_BYTES = 4 * 1024 * 1024;
 export const PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const PROFILE_ID_ERROR = "profile id must use 1-64 letters, numbers, dots, underscores, or dashes";
+export const SPACE_ID_PATTERN = /^(?:personal|org:[A-Za-z0-9][A-Za-z0-9._-]{0,127}|org-enrollment:[a-f0-9]{32}|org-profile:[A-Za-z0-9][A-Za-z0-9._-]{0,63})$/;
 
 /** Profile ids cross persistence, filesystem, and routing boundaries. Keep one validator for every
  * producer and consumer so an id accepted at setup can always be resumed safely later. */
 export function isValidProfileId(value: unknown): value is string {
   return typeof value === "string" && PROFILE_ID_PATTERN.test(value);
+}
+
+/** Space ids are durable authorization/audience labels, not filesystem paths. Modern organization
+ * profiles use Control's tenant id; legacy Control enrollments use a credential generation that changes
+ * on re-enrollment. The local profile id is only a last-resort fail-closed label for incomplete embedders. */
+export function isValidSpaceId(value: unknown): value is string {
+  return typeof value === "string" && SPACE_ID_PATTERN.test(value);
+}
+
+export function spaceIdForProfile(
+  profile: Pick<Profile, "id" | "kind" | "tenantId" | "enrollmentAudience" | "deviceToken">,
+): string {
+  if (profile.kind === "byok") return PERSONAL_ID;
+  const tenantId = profile.tenantId?.trim();
+  if (tenantId && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(tenantId)) return `org:${tenantId}`;
+  const storedAudience = profile.enrollmentAudience?.trim().toLowerCase();
+  if (storedAudience && /^[a-f0-9]{32}$/.test(storedAudience)) return `org-enrollment:${storedAudience}`;
+  // Existing pre-generation profiles are still made safe immediately: their credential fingerprint is
+  // one-way and changes when an old Control re-enrolls/rotates the device token. New enrollments always
+  // persist a random generation and never rely on this compatibility branch.
+  if (profile.deviceToken) {
+    const credentialAudience = createHash("sha256")
+      .update("hara-organization-audience\0")
+      .update(profile.deviceToken)
+      .digest("hex")
+      .slice(0, 32);
+    return `org-enrollment:${credentialAudience}`;
+  }
+  return `org-profile:${profile.id}`;
 }
 
 interface PrivateJsonState<T> {
@@ -117,20 +157,55 @@ interface PrivateJsonState<T> {
 }
 
 function readPrivateJSON<T>(filename: string): PrivateJsonState<T> | null {
+  const binding = bindPrivateHaraStateFile(homedir(), [], filename);
+  const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_PROFILE_STATE_BYTES);
+  if (!snapshot) return null;
   try {
-    const binding = bindPrivateHaraStateFile(homedir(), [], filename);
-    const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_PROFILE_STATE_BYTES);
-    if (!snapshot) return null;
     return { binding, snapshot, value: JSON.parse(snapshot.text) as T };
   } catch {
-    return null;
+    throw new Error(`private Hara state '${filename}' is not valid JSON; refusing to replace it`);
   }
 }
 
 /** Write the profiles file 0600 (it can hold device tokens / api keys). */
-function persistProfilesFile(f: ProfilesFile): void {
+function persistProfilesFile(f: ProfilesFile, expectedText?: string, expectedMissing = false): PrivateStateFileSnapshot {
   const binding = bindPrivateHaraStateFile(homedir(), [], "profiles.json");
-  writePrivateStateFileSync(binding, JSON.stringify(f, null, 2) + "\n");
+  writePrivateStateFileSync(binding, JSON.stringify(f, null, 2) + "\n", { expectedText, expectedMissing });
+  const snapshot = readPrivateStateFileSnapshotSync(binding.path, MAX_PROFILE_STATE_BYTES);
+  if (!snapshot) throw new Error("profiles registry disappeared after commit");
+  return snapshot;
+}
+
+function validProfilesFile(value: unknown): value is ProfilesFile {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const file = value as Partial<ProfilesFile>;
+  // Legacy releases accepted a wider id alphabet. Keep those records readable so the command layer can
+  // produce its focused "legacy invalid id" migration error without rewriting or discarding credentials.
+  if (typeof file.active !== "string" || !file.active || !Array.isArray(file.profiles) || file.profiles.length === 0) return false;
+  const ids = new Set<string>();
+  for (const entry of file.profiles) {
+    if (
+      !entry
+      || typeof entry !== "object"
+      || typeof entry.id !== "string"
+      || !entry.id
+      || (entry.kind !== "byok" && entry.kind !== "gateway")
+      || ids.has(entry.id)
+    ) return false;
+    ids.add(entry.id);
+  }
+  return ids.has(file.active) && ids.has(PERSONAL_ID);
+}
+
+interface ProfilesState {
+  value: ProfilesFile;
+  snapshot: PrivateStateFileSnapshot;
+}
+
+function withProfilesLock<T>(fn: () => T): T {
+  return withPrivateStateLockSync(homedir(), [], "profiles", fn, {
+    busyMessage: "profiles registry is busy; retry the operation",
+  });
 }
 
 /** Synthesize the "personal" profile view from the legacy config.json. The config.json itself
@@ -173,6 +248,8 @@ function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | nul
     id: DEFAULT_ORG_ID,
     kind: "gateway",
     label: "Default Org",
+    tenantId: typeof e.tenantId === "string" ? e.tenantId : undefined,
+    tenantName: typeof e.tenantName === "string" ? e.tenantName : undefined,
     gatewayUrl: e.gatewayUrl,
     deviceId: e.deviceId || "",
     deviceToken: e.deviceToken,
@@ -189,10 +266,17 @@ function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | nul
   };
 }
 
-/** First-time migration. Idempotent — running again is a no-op (profiles.json already present). */
-function maybeMigrate(): ProfilesFile {
-  const existing = readPrivateJSON<ProfilesFile>("profiles.json")?.value;
-  if (existing && Array.isArray(existing.profiles) && existing.profiles.length > 0) return existing;
+/** First-time migration, called only while holding the profiles mutex. A present but malformed or
+ * transiently unreadable file is never treated as absence: losing an organization credential is worse
+ * than asking the caller to retry. */
+function maybeMigrateUnlocked(): ProfilesState {
+  const existing = readPrivateJSON<ProfilesFile>("profiles.json");
+  if (existing) {
+    if (!validProfilesFile(existing.value)) {
+      throw new Error("profiles registry contains invalid data; refusing automatic migration or replacement");
+    }
+    return { value: existing.value, snapshot: existing.snapshot };
+  }
 
   const personal = readPersonalFromConfig();
   const legacyOrg = readPrivateJSON<Record<string, any>>("org.json");
@@ -204,7 +288,7 @@ function maybeMigrate(): ProfilesFile {
     active = DEFAULT_ORG_ID; // legacy enrolled user IS using the gateway right now — preserve
   }
   const f: ProfilesFile = { active, profiles };
-  persistProfilesFile(f);
+  const snapshot = persistProfilesFile(f, undefined, true);
 
   // Park the exact verified legacy bytes without ever following/replacing an alias. If archival races or
   // fails, leave org.json untouched; profiles.json already makes the migration idempotent.
@@ -217,7 +301,29 @@ function maybeMigrate(): ProfilesFile {
       /* best-effort */
     }
   }
-  return f;
+  return { value: f, snapshot };
+}
+
+/** Every profiles read shares the same cross-process mutex as writers because the hardened CAS writer
+ * temporarily move-claims the old inode. Without this read fence, an innocent concurrent getProfile()
+ * could observe that intentional gap as ENOENT and recreate a Personal-only registry. */
+function maybeMigrate(): ProfilesFile {
+  // Existing registries are read lock-free from one verified inode. The CAS writer may replace the path,
+  // but an already-open descriptor still yields the complete previous snapshot. Only absence or a racing
+  // namespace change enters the exclusive path, which rechecks before any first-run migration.
+  try {
+    const existing = readPrivateJSON<ProfilesFile>("profiles.json");
+    if (existing) {
+      if (!validProfilesFile(existing.value)) {
+        throw new Error("profiles registry contains invalid data; refusing automatic migration or replacement");
+      }
+      return existing.value;
+    }
+  } catch {
+    // Retry once while serialized. A permanently malformed/unsafe file throws again from the authoritative
+    // read below; only a transient writer gap is recovered.
+  }
+  return withProfilesLock(() => maybeMigrateUnlocked().value);
 }
 
 export function listProfiles(): Profile[] {
@@ -494,12 +600,14 @@ export function loadActiveProfile(): Profile {
 }
 
 export function useProfile(id: string): { ok: true; profile: Profile } | { ok: false; reason: string } {
-  const f = maybeMigrate();
-  const p = f.profiles.find((x) => x.id === id);
-  if (!p) return { ok: false, reason: `no profile '${id}' — try \`hara profile list\`` };
-  f.active = id;
-  persistProfilesFile(f);
-  return { ok: true, profile: p };
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const p = state.value.profiles.find((x) => x.id === id);
+    if (!p) return { ok: false, reason: `no profile '${id}' — try \`hara profile list\`` };
+    state.value.active = id;
+    persistProfilesFile(state.value, state.snapshot.text);
+    return { ok: true, profile: p };
+  });
 }
 
 export function addProfile(
@@ -507,41 +615,47 @@ export function addProfile(
   options: { activate?: boolean } = {},
 ): { ok: true } | { ok: false; reason: string } {
   if (!isValidProfileId(p.id)) return { ok: false, reason: PROFILE_ID_ERROR };
-  const f = maybeMigrate();
-  if (f.profiles.some((x) => x.id === p.id)) return { ok: false, reason: `profile '${p.id}' already exists` };
   if (p.kind === "gateway" && (!p.gatewayUrl || !p.deviceToken)) return { ok: false, reason: "gateway profile needs gatewayUrl + deviceToken" };
   if (p.kind === "byok" && !p.provider) return { ok: false, reason: "byok profile needs a provider" };
-  f.profiles.push(p);
-  if (options.activate) f.active = p.id;
-  persistProfilesFile(f);
-  return { ok: true };
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    if (state.value.profiles.some((x) => x.id === p.id)) return { ok: false, reason: `profile '${p.id}' already exists` };
+    state.value.profiles.push(p);
+    if (options.activate) state.value.active = p.id;
+    persistProfilesFile(state.value, state.snapshot.text);
+    return { ok: true };
+  });
 }
 
 /** Replace an existing profile (same id) — used by `hara enroll <url> --code` when the
  *  default-org profile already exists (re-enrollment / token rotation). */
 export function upsertProfile(p: Profile): void {
   if (!isValidProfileId(p.id)) throw new Error(PROFILE_ID_ERROR);
-  const f = maybeMigrate();
-  const i = f.profiles.findIndex((x) => x.id === p.id);
-  if (i >= 0) f.profiles[i] = p;
-  else f.profiles.push(p);
-  persistProfilesFile(f);
+  withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const i = state.value.profiles.findIndex((x) => x.id === p.id);
+    if (i >= 0) state.value.profiles[i] = p;
+    else state.value.profiles.push(p);
+    persistProfilesFile(state.value, state.snapshot.text);
+  });
 }
 
 export function removeProfile(id: string): { ok: true; activeChanged: boolean; removedKind: ProfileKind; removed: Profile } | { ok: false; reason: string } {
   if (id === PERSONAL_ID) return { ok: false, reason: "personal is your base profile — switch away with `hara profile use <other>`; it stays." };
-  const f = maybeMigrate();
-  const i = f.profiles.findIndex((x) => x.id === id);
-  if (i < 0) return { ok: false, reason: `no profile '${id}' — list with \`hara profile list\`` };
-  const removed = f.profiles[i];
-  f.profiles.splice(i, 1);
-  let activeChanged = false;
-  if (f.active === id) {
-    f.active = PERSONAL_ID;
-    activeChanged = true;
-  }
-  persistProfilesFile(f);
-  return { ok: true, activeChanged, removedKind: removed.kind, removed };
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const i = state.value.profiles.findIndex((x) => x.id === id);
+    if (i < 0) return { ok: false, reason: `no profile '${id}' — list with \`hara profile list\`` };
+    const removed = state.value.profiles[i];
+    state.value.profiles.splice(i, 1);
+    let activeChanged = false;
+    if (state.value.active === id) {
+      state.value.active = PERSONAL_ID;
+      activeChanged = true;
+    }
+    persistProfilesFile(state.value, state.snapshot.text);
+    return { ok: true, activeChanged, removedKind: removed.kind, removed };
+  });
 }
 
 /** Override the effective model within a profile. For "personal" this writes to config.json
@@ -552,16 +666,18 @@ export function setModel(id: string, model: string): { ok: true } | { ok: false;
     // delegate to config.ts so this stays single-storage for personal
     return setModelOnPersonal(model);
   }
-  const f = maybeMigrate();
-  const i = f.profiles.findIndex((x) => x.id === id);
-  if (i < 0) return { ok: false, reason: `no profile '${id}'` };
-  const p = f.profiles[i];
-  if (p.kind === "gateway" && p.availableModels && p.availableModels.length > 0 && !p.availableModels.includes(model)) {
-    return { ok: false, reason: `'${model}' not in this profile's availableModels (${p.availableModels.join(", ")})` };
-  }
-  f.profiles[i] = { ...p, model };
-  persistProfilesFile(f);
-  return { ok: true };
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const i = state.value.profiles.findIndex((x) => x.id === id);
+    if (i < 0) return { ok: false, reason: `no profile '${id}'` };
+    const p = state.value.profiles[i];
+    if (p.kind === "gateway" && p.availableModels && p.availableModels.length > 0 && !p.availableModels.includes(model)) {
+      return { ok: false, reason: `'${model}' not in this profile's availableModels (${p.availableModels.join(", ")})` };
+    }
+    state.value.profiles[i] = { ...p, model };
+    persistProfilesFile(state.value, state.snapshot.text);
+    return { ok: true };
+  });
 }
 
 /** Clear a per-profile model override (revert to defaultModel). */
@@ -571,13 +687,15 @@ export function resetModel(id: string): { ok: true } | { ok: false; reason: stri
     // remove the model line from config.json so the provider default kicks in.
     return clearModelOnPersonal();
   }
-  const f = maybeMigrate();
-  const i = f.profiles.findIndex((x) => x.id === id);
-  if (i < 0) return { ok: false, reason: `no profile '${id}'` };
-  const { model: _drop, ...rest } = f.profiles[i];
-  f.profiles[i] = rest;
-  persistProfilesFile(f);
-  return { ok: true };
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const i = state.value.profiles.findIndex((x) => x.id === id);
+    if (i < 0) return { ok: false, reason: `no profile '${id}'` };
+    const { model: _drop, ...rest } = state.value.profiles[i];
+    state.value.profiles[i] = rest;
+    persistProfilesFile(state.value, state.snapshot.text);
+    return { ok: true };
+  });
 }
 
 /** The effective model for a profile = override (model) || defaultModel || "" (caller decides default). */

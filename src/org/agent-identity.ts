@@ -18,6 +18,18 @@ export interface AgentPublicIdentity {
   source: "hara" | "openclaw" | "hermes" | "claude" | "organization" | "plugin" | "derived";
 }
 
+export interface AgentPublicIdentityInput {
+  displayName: string;
+  title?: string;
+  bio?: string;
+  traits?: string[];
+  emoji?: string;
+  avatar?: string;
+  theme?: string;
+  accent?: string;
+  character?: string;
+}
+
 const TEXT_CAPS = {
   displayName: 64,
   title: 80,
@@ -28,6 +40,7 @@ const TEXT_CAPS = {
 } as const;
 const TRAIT_LIMIT = 6;
 const DATA_AVATAR_LIMIT = 128 * 1024;
+const DATA_AVATAR_TEXT_LIMIT = Math.ceil(DATA_AVATAR_LIMIT * 4 / 3) + 128;
 const SAFE_CHARACTER = /^[a-z0-9](?:[a-z0-9._-]{0,31})?$/;
 const SAFE_ACCENT = /^#[0-9a-f]{6}$/i;
 const SAFE_DATA_AVATAR = /^data:image\/(?:png|jpeg|webp|gif);base64,[a-z0-9+/=]+$/i;
@@ -67,10 +80,13 @@ function identitySource(value: unknown, roleSource?: string): AgentPublicIdentit
 }
 
 function safeAvatar(value: unknown): string | undefined {
-  const avatar = compactText(value, DATA_AVATAR_LIMIT);
+  const avatar = compactText(value, DATA_AVATAR_TEXT_LIMIT);
   if (!avatar) return undefined;
   if (SAFE_PACKAGED_AVATAR.test(avatar)) return avatar;
-  if (avatar.length <= DATA_AVATAR_LIMIT && SAFE_DATA_AVATAR.test(avatar)) return avatar;
+  if (avatar.length <= DATA_AVATAR_TEXT_LIMIT && SAFE_DATA_AVATAR.test(avatar)) {
+    const payload = avatar.slice(avatar.indexOf(",") + 1);
+    if (Buffer.from(payload, "base64").byteLength <= DATA_AVATAR_LIMIT) return avatar;
+  }
   // Remote and arbitrary local paths intentionally remain private metadata. Automatically loading them
   // would turn an untrusted role catalog into a tracking request or a local-file disclosure channel.
   return undefined;
@@ -122,6 +138,42 @@ export function agentIdentityFromMetadata(
     ...(characterValue && SAFE_CHARACTER.test(characterValue) ? { character: characterValue } : {}),
     source: identitySource(field(metadata, "identity-source", "identitySource"), roleSource),
   };
+}
+
+/** Validate a user-authored public profile before it is persisted. Normalization keeps display data
+ * bounded, while unsafe avatar sources and malformed CSS/sprite tokens fail explicitly instead of being
+ * silently stored and later interpreted by a client. */
+export function normalizeAgentPublicIdentityInput(
+  value: unknown,
+  fallbackId: string,
+  roleSource: string,
+): AgentPublicIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("agent profile must be an object");
+  }
+  const input = value as Record<string, unknown>;
+  if (typeof input.displayName !== "string" || !input.displayName.trim()) {
+    throw new Error("agent display name is required");
+  }
+  for (const key of ["title", "bio", "emoji", "avatar", "theme", "accent", "character"] as const) {
+    if (input[key] !== undefined && typeof input[key] !== "string") {
+      throw new Error(`agent profile ${key} must be a string`);
+    }
+  }
+  if (input.traits !== undefined && (!Array.isArray(input.traits) || input.traits.some((trait) => typeof trait !== "string"))) {
+    throw new Error("agent profile traits must be a string array");
+  }
+  const identity = agentIdentityFromMetadata(input, fallbackId, "", roleSource);
+  if (typeof input.avatar === "string" && input.avatar.trim() && !identity.avatar) {
+    throw new Error("agent avatar must be a packaged /avatars or /pets path, or a bounded PNG/JPEG/WebP/GIF data image");
+  }
+  if (typeof input.accent === "string" && input.accent.trim() && !identity.accent) {
+    throw new Error("agent accent must be a six-digit hex color");
+  }
+  if (typeof input.character === "string" && input.character.trim() && !identity.character) {
+    throw new Error("agent character must use 1-32 lowercase letters, numbers, dots, underscores, or dashes");
+  }
+  return identity;
 }
 
 /** Parse the small public subset used by OpenClaw IDENTITY.md and Hermes-style profile documents. */

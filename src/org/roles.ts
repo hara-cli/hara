@@ -1,19 +1,38 @@
 // Org roles — markdown agent definitions from Hara and Claude Code.
 // Frontmatter: execution metadata plus a bounded public identity. Body = private persona/system and is
 // loaded only for the selected role; it must never be exposed through the Agent catalog.
-import { writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { writeFileSync, existsSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { findProjectRoot } from "../context/agents-md.js";
 import { pluginRoleDirs } from "../plugins/plugins.js";
-import { readModelContextFileSync } from "../fs-read.js";
+import {
+  readModelContextFileSync,
+  readRegularFileSnapshotNoFollow,
+  type RegularFileSnapshot,
+} from "../fs-read.js";
+import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
 import { scanMemory } from "../memory/guard.js";
-import { isValidProfileId, resolveActive } from "../profile/profile.js";
-import { agentIdentityFromMetadata, type AgentPublicIdentity } from "./agent-identity.js";
+import {
+  getProfile,
+  isValidProfileId,
+  isValidSpaceId,
+  resolveActive,
+  spaceIdForProfile,
+} from "../profile/profile.js";
+import {
+  agentIdentityFromMetadata,
+  normalizeAgentPublicIdentityInput,
+  type AgentPublicIdentity,
+  type AgentPublicIdentityInput,
+} from "./agent-identity.js";
 import { loadExternalAgentRoles } from "./external-agent-roles.js";
+import { withPrivateStateLockSync } from "../security/private-state.js";
 
 const MAX_ROLE_BYTES = 512 * 1024;
+const MAX_ORG_POLICY_BYTES = 128 * 1024;
+const MAX_ORG_BUNDLE_BYTES = 2 * 1024 * 1024;
 const ROLE_DIGEST_CAP = 16_000;
 const ROLE_DESCRIPTION_CAP = 180;
 
@@ -34,12 +53,22 @@ export interface Role {
   /** Why a foreign role stays explicit-only instead of entering automatic routing. */
   compatibilityWarnings?: string[];
   source?: RoleSource;
+  /** Exact immutable Control bundle that supplied this managed persona. Company execution compares this
+   *  with the freshly synchronized policy immediately before inference and every tool side effect. */
+  organizationPolicyVersion?: number;
   file?: string;
   /** Safe presentation identity. The private persona remains in `system` and never enters catalogs. */
   identity?: AgentPublicIdentity;
   /** Optional execution workspace owned by an imported global Agent. */
   home?: string;
   system: string;
+}
+
+export interface CreateNativeAgentInput {
+  id: string;
+  description?: string;
+  instructions?: string;
+  profile: AgentPublicIdentityInput;
 }
 
 export function rolesDir(cwd: string): string {
@@ -54,20 +83,256 @@ export function globalRolesDir(): string {
 export function globalClaudeAgentsDir(): string {
   return join(homedir(), ".claude", "agents");
 }
-/** Org-pushed roles are identity-scoped. Two organization connections can advertise the same role id
- * with different policy/persona text, so a global shared directory would let the active connection inject
- * prompts into a resumed session owned by another connection. */
-export function orgRolesDir(profileId?: string): string {
-  const selected = profileId ?? resolveActive().id;
-  if (!isValidProfileId(selected)) throw new Error("invalid profile id for organization role storage");
-  // Profile ids are case-sensitive in profiles.json, while common macOS/Windows filesystems are not.
-  // A fixed lowercase digest prevents OrgA/orga, trailing-dot, and device-name aliases from sharing a
-  // managed prompt directory. Domain separation keeps this namespace independent of other identity hashes.
+/** Org-pushed roles are immutable-Space-scoped. A local profile id is only a mutable route alias and can be
+ * re-enrolled into another company, so using it as the prompt directory key would let the replacement
+ * company inherit the previous tenant's persona/tool policy. Callers may pass either a profile id (resolved
+ * to its current Space) or an already-authoritative Space id. */
+export function orgRolesDir(profileOrSpaceId?: string): string {
+  const selected = profileOrSpaceId ?? resolveActive().id;
+  const profile = isValidProfileId(selected) ? getProfile(selected) : undefined;
+  const storageScope = profile?.kind === "gateway" ? spaceIdForProfile(profile) : selected;
+  if (!isValidProfileId(storageScope) && !isValidSpaceId(storageScope)) {
+    throw new Error("invalid profile or Space id for organization role storage");
+  }
+  // Scope ids are case-sensitive while common macOS/Windows filesystems are not. A fixed lowercase digest
+  // prevents aliases from sharing a managed prompt directory. v2 deliberately separates old profile-keyed
+  // bundles so a pre-upgrade stale directory can never be mistaken for current company policy.
   const storageKey = createHash("sha256")
-    .update("hara-org-roles-v1\0")
-    .update(selected, "utf8")
+    .update("hara-org-roles-v2\0")
+    .update(storageScope, "utf8")
     .digest("hex");
   return join(homedir(), ".hara", "org-roles", storageKey);
+}
+
+export interface OrganizationExecutionPolicy {
+  /** Monotonic Control bundle revision. A role persona and its execution floor are one snapshot. */
+  version: number;
+  modelAllow?: string[];
+  modelDeny?: string[];
+  toolDeny?: string[];
+  requireApprovalForWrites?: boolean;
+}
+
+export interface OrganizationBundleRole {
+  name: string;
+  description?: string;
+  owns?: string[];
+  rejects?: string[];
+  model?: string;
+  allow_tools?: string[];
+  deny_tools?: string[];
+  system: string;
+}
+
+export interface OrganizationRoleBundleEnvelope {
+  version: number;
+  org_policy: Record<string, unknown>;
+  roles: OrganizationBundleRole[];
+}
+
+export interface OrganizationRoleBundleSnapshot {
+  version: number;
+  policy: OrganizationExecutionPolicy;
+  roles: Role[];
+  envelope: OrganizationRoleBundleEnvelope;
+}
+
+function organizationPolicyList(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 128) {
+    throw new Error(`managed organization policy '${field}' must be a bounded string array`);
+  }
+  const result: string[] = [];
+  for (const entry of value) {
+    if (
+      typeof entry !== "string"
+      || !entry.trim()
+      || entry.length > 256
+      || /[\u0000-\u001f\u007f]/.test(entry)
+    ) throw new Error(`managed organization policy '${field}' contains an invalid value`);
+    const normalized = entry.trim();
+    if (!result.includes(normalized)) result.push(normalized);
+  }
+  return result;
+}
+
+/** Read the Control-reviewed execution floor for one immutable company Space. Missing or malformed policy
+ * is intentionally distinguishable from an empty policy: company inference must not silently run before
+ * its authenticated bundle has been synchronized. */
+export function parseOrganizationExecutionPolicyEnvelope(parsed: unknown): OrganizationExecutionPolicy {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("managed organization policy envelope is invalid");
+  }
+  const policy = (parsed as Record<string, unknown>).org_policy;
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+    throw new Error("managed organization policy payload is invalid");
+  }
+  const input = policy as Record<string, unknown>;
+  const version = (parsed as Record<string, unknown>).version;
+  if (!Number.isSafeInteger(version) || Number(version) < 0) {
+    throw new Error("managed organization policy version is invalid");
+  }
+  const supported = new Set(["modelAllow", "modelDeny", "toolDeny", "requireApprovalForWrites", "budget"]);
+  const unknown = Object.keys(input).filter((key) => !supported.has(key));
+  if (unknown.length) throw new Error(`managed organization policy contains unsupported field '${unknown[0]}'`);
+  if (
+    input.requireApprovalForWrites !== undefined
+    && typeof input.requireApprovalForWrites !== "boolean"
+  ) throw new Error("managed organization policy 'requireApprovalForWrites' must be boolean");
+  return {
+    version: Number(version),
+    ...(input.modelAllow !== undefined ? { modelAllow: organizationPolicyList(input.modelAllow, "modelAllow") } : {}),
+    ...(input.modelDeny !== undefined ? { modelDeny: organizationPolicyList(input.modelDeny, "modelDeny") } : {}),
+    ...(input.toolDeny !== undefined ? { toolDeny: organizationPolicyList(input.toolDeny, "toolDeny") } : {}),
+    ...(input.requireApprovalForWrites === true ? { requireApprovalForWrites: true } : {}),
+  };
+}
+
+const SAFE_ORG_ROLE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const WINDOWS_RESERVED_ROLE_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+const ORG_BUNDLE_KEYS = new Set(["version", "org_policy", "roles"]);
+const ORG_ROLE_KEYS = new Set([
+  "name", "description", "owns", "rejects", "model", "allow_tools", "deny_tools", "system",
+]);
+
+function organizationRoleString(value: unknown, field: string, required = false): string | undefined {
+  if (value === undefined && !required) return undefined;
+  if (
+    typeof value !== "string"
+    || (required && !value.trim())
+    || value.length > MAX_ROLE_BYTES
+    || value.includes("\0")
+  ) throw new Error(`managed organization role '${field}' is invalid`);
+  return value;
+}
+
+function organizationRoleList(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 128) {
+    throw new Error(`managed organization role '${field}' must be a bounded string array`);
+  }
+  return value.map((entry) => {
+    if (
+      typeof entry !== "string"
+      || !entry.trim()
+      || entry.length > 256
+      || /[\u0000-\u001f\u007f]/.test(entry)
+    ) throw new Error(`managed organization role '${field}' contains an invalid value`);
+    return entry.trim();
+  });
+}
+
+function parseOrganizationBundleRole(value: unknown): OrganizationBundleRole {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("managed organization role entry is invalid");
+  }
+  const input = value as Record<string, unknown>;
+  const unknown = Object.keys(input).filter((key) => !ORG_ROLE_KEYS.has(key));
+  if (unknown.length) throw new Error(`managed organization role contains unsupported field '${unknown[0]}'`);
+  const name = organizationRoleString(input.name, "name", true)!;
+  if (!SAFE_ORG_ROLE_NAME.test(name) || WINDOWS_RESERVED_ROLE_NAME.test(name)) {
+    throw new Error(`managed organization role name '${name}' is unsafe`);
+  }
+  return {
+    name,
+    ...(input.description !== undefined ? { description: organizationRoleString(input.description, "description") } : {}),
+    ...(input.owns !== undefined ? { owns: organizationRoleList(input.owns, "owns") } : {}),
+    ...(input.rejects !== undefined ? { rejects: organizationRoleList(input.rejects, "rejects") } : {}),
+    ...(input.model !== undefined ? { model: organizationRoleString(input.model, "model") } : {}),
+    ...(input.allow_tools !== undefined ? { allow_tools: organizationRoleList(input.allow_tools, "allow_tools") } : {}),
+    ...(input.deny_tools !== undefined ? { deny_tools: organizationRoleList(input.deny_tools, "deny_tools") } : {}),
+    system: organizationRoleString(input.system, "system", true)!,
+  };
+}
+
+/** Strictly validate one authenticated Control response before it can replace the last known-good
+ * company snapshot. Roles and policy live in this single envelope so readers can never combine persona
+ * v1 with policy v2 while concurrent refreshes race. */
+export function parseOrganizationRoleBundleEnvelope(raw: unknown): OrganizationRoleBundleSnapshot {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("managed organization role bundle is invalid");
+  }
+  const input = raw as Record<string, unknown>;
+  const unknown = Object.keys(input).filter((key) => !ORG_BUNDLE_KEYS.has(key));
+  if (unknown.length) throw new Error(`managed organization role bundle contains unsupported field '${unknown[0]}'`);
+  if (!Number.isSafeInteger(input.version) || Number(input.version) < 0) {
+    throw new Error("managed organization role bundle version is invalid");
+  }
+  if (!input.org_policy || typeof input.org_policy !== "object" || Array.isArray(input.org_policy)) {
+    throw new Error("managed organization role bundle policy is missing or invalid");
+  }
+  if (!Array.isArray(input.roles) || input.roles.length > 256) {
+    throw new Error("managed organization role bundle roles are missing or invalid");
+  }
+  const version = Number(input.version);
+  const orgPolicy = { ...(input.org_policy as Record<string, unknown>) };
+  const wireRoles = input.roles.map(parseOrganizationBundleRole);
+  const names = new Set<string>();
+  for (const role of wireRoles) {
+    if (names.has(role.name)) throw new Error(`managed organization role '${role.name}' is duplicated`);
+    names.add(role.name);
+  }
+  const envelope = { version, org_policy: orgPolicy, roles: wireRoles } satisfies OrganizationRoleBundleEnvelope;
+  const policy = parseOrganizationExecutionPolicyEnvelope({ version, org_policy: orgPolicy });
+  const roles = wireRoles.map((role): Role => {
+    const metadata: Record<string, unknown> = {
+      name: role.name,
+      description: role.description ?? "",
+      owns: role.owns ?? [],
+      rejects: role.rejects ?? [],
+      ...(role.model ? { model: role.model } : {}),
+      ...(role.allow_tools ? { allowTools: role.allow_tools } : {}),
+      ...(role.deny_tools ? { denyTools: role.deny_tools } : {}),
+    };
+    return {
+      id: role.name,
+      description: role.description ?? "",
+      owns: role.owns ?? [],
+      rejects: role.rejects ?? [],
+      ...(role.model ? { model: role.model } : {}),
+      ...(role.allow_tools ? { allowTools: role.allow_tools } : {}),
+      ...(role.deny_tools ? { denyTools: role.deny_tools } : {}),
+      source: "org",
+      organizationPolicyVersion: version,
+      identity: agentIdentityFromMetadata(metadata, role.name, role.description ?? "", "org"),
+      system: role.system.trim(),
+    };
+  });
+  return { version, policy, roles, envelope };
+}
+
+export function loadOrganizationRoleBundle(spaceId: string): OrganizationRoleBundleSnapshot | null {
+  if (spaceId === "personal") return null;
+  if (!isValidSpaceId(spaceId)) throw new Error("invalid Space id for managed organization role bundle");
+  const directory = orgRolesDir(spaceId);
+  const storageKey = directory.split(/[\\/]/).pop()!;
+  return withPrivateStateLockSync(homedir(), ["org-roles", storageKey], "_bundle.json.snapshot", () => {
+    const file = join(directory, "_bundle.json");
+    if (!existsSync(file)) return null;
+    const raw = readModelContextFileSync(file, MAX_ORG_BUNDLE_BYTES);
+    try {
+      return parseOrganizationRoleBundleEnvelope(JSON.parse(raw));
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error("managed organization role bundle is not valid JSON");
+      throw error;
+    }
+  }, { busyMessage: "managed organization role bundle is busy; retry the operation" });
+}
+
+export function loadOrganizationExecutionPolicy(spaceId: string): OrganizationExecutionPolicy | null {
+  return loadOrganizationRoleBundle(spaceId)?.policy ?? null;
+}
+
+export function assertOrganizationModelAllowed(
+  policy: OrganizationExecutionPolicy,
+  model: string,
+): void {
+  if (policy.modelDeny?.includes(model)) {
+    throw new Error(`model '${model}' is denied by organization policy`);
+  }
+  if (policy.modelAllow && !policy.modelAllow.includes(model)) {
+    throw new Error(`model '${model}' is not allowed by organization policy`);
+  }
 }
 /** Claude-Code subagents (`.claude/agents/*.md`) — consumed for ecosystem interop (project scope). */
 export function claudeAgentsDir(cwd: string): string {
@@ -117,16 +382,221 @@ function parseFrontmatter(text: string): { fm: Record<string, any>; body: string
     const key = kv[1];
     const val = kv[2].trim();
     if (val.startsWith("[") && val.endsWith("]")) {
-      fm[key] = val
-        .slice(1, -1)
-        .split(",")
-        .map((s) => s.trim().replace(/^["']|["']$/g, ""))
-        .filter(Boolean);
+      try {
+        const parsed = JSON.parse(val);
+        fm[key] = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        fm[key] = val
+          .slice(1, -1)
+          .split(",")
+          .map((s) => s.trim().replace(/^["']|["']$/g, ""))
+          .filter(Boolean);
+      }
+    } else if (val.startsWith('"') && val.endsWith('"')) {
+      try { fm[key] = JSON.parse(val); } catch { fm[key] = val.slice(1, -1); }
     } else {
       fm[key] = val.replace(/^["']|["']$/g, "");
     }
   }
   return { fm, body: m[2].trim() };
+}
+
+const DEFAULT_MAIN_AGENT_IDENTITY: AgentPublicIdentity = {
+  version: 1,
+  displayName: "Hara",
+  title: "Main Agent",
+  bio: "Coordinates the team, owns the conversation, and turns requests into verified work.",
+  traits: ["direct", "resourceful", "evidence-led"],
+  emoji: "✦",
+  theme: "warm editorial studio",
+  accent: "#ff695f",
+  character: "orchestrator",
+  source: "hara",
+};
+
+const PUBLIC_IDENTITY_KEYS = new Set([
+  "displayName", "display-name", "public-name", "chinese-name",
+  "title", "role", "bio", "vibe", "traits", "personality-traits",
+  "emoji", "avatar", "logo", "identity-theme", "theme", "vibe-theme",
+  "accent", "accent-color", "character", "sprite", "creature",
+]);
+
+function identityRevision(text: string): string {
+  return createHash("sha256").update("hara-agent-public-profile-v1\0").update(text).digest("hex").slice(0, 32);
+}
+
+function mainAgentIdentityPath(): string {
+  return join(globalRolesDir(), ".main-agent.json");
+}
+
+export function loadMainAgentIdentity(): AgentPublicIdentity {
+  try {
+    const parsed = JSON.parse(readModelContextFileSync(mainAgentIdentityPath(), MAX_ROLE_BYTES));
+    return normalizeAgentPublicIdentityInput(parsed, "main", "global");
+  } catch {
+    return { ...DEFAULT_MAIN_AGENT_IDENTITY, traits: [...(DEFAULT_MAIN_AGENT_IDENTITY.traits ?? [])] };
+  }
+}
+
+export function mainAgentIdentityRevision(): string {
+  try {
+    return identityRevision(readModelContextFileSync(mainAgentIdentityPath(), MAX_ROLE_BYTES));
+  } catch {
+    return identityRevision(JSON.stringify(DEFAULT_MAIN_AGENT_IDENTITY));
+  }
+}
+
+export function nativeRoleIdentityRevision(role: Role): string | undefined {
+  if ((role.source !== "global" && role.source !== "project") || !role.file) return undefined;
+  try { return identityRevision(readModelContextFileSync(role.file, MAX_ROLE_BYTES)); } catch { return undefined; }
+}
+
+function identityFrontmatterLines(identity: AgentPublicIdentity): string[] {
+  const lines = [`display-name: ${JSON.stringify(identity.displayName)}`];
+  if (identity.title) lines.push(`title: ${JSON.stringify(identity.title)}`);
+  if (identity.bio) lines.push(`bio: ${JSON.stringify(identity.bio)}`);
+  if (identity.traits?.length) lines.push(`traits: ${JSON.stringify(identity.traits)}`);
+  if (identity.emoji) lines.push(`emoji: ${JSON.stringify(identity.emoji)}`);
+  if (identity.avatar) lines.push(`avatar: ${JSON.stringify(identity.avatar)}`);
+  if (identity.theme) lines.push(`identity-theme: ${JSON.stringify(identity.theme)}`);
+  if (identity.accent) lines.push(`accent: ${JSON.stringify(identity.accent)}`);
+  if (identity.character) lines.push(`character: ${JSON.stringify(identity.character)}`);
+  return lines;
+}
+
+function replacePublicIdentityFrontmatter(text: string, identity: AgentPublicIdentity): string {
+  const match = /^---(\r?\n)([\s\S]*?)(\r?\n)---(\r?\n?)([\s\S]*)$/.exec(text);
+  if (!match) throw new Error("native Agent file has no editable top-level frontmatter");
+  const newline = match[1];
+  const retained = match[2].split(/\r?\n/).filter((line) => {
+    if (/^\s/.test(line)) return true;
+    const key = /^([A-Za-z0-9_-]+)\s*:/.exec(line)?.[1];
+    return !key || !PUBLIC_IDENTITY_KEYS.has(key);
+  });
+  return `---${newline}${[...retained, ...identityFrontmatterLines(identity)].join(newline)}${match[3]}---${match[4]}${match[5]}`;
+}
+
+function setTopLevelFrontmatterField(text: string, key: string, value: string): string {
+  const match = /^---(\r?\n)([\s\S]*?)(\r?\n)---(\r?\n?)([\s\S]*)$/.exec(text);
+  if (!match) throw new Error("native Agent file has no editable top-level frontmatter");
+  const newline = match[1];
+  const retained = match[2].split(/\r?\n/).filter((line) => {
+    if (/^\s/.test(line)) return true;
+    return /^([A-Za-z0-9_-]+)\s*:/.exec(line)?.[1] !== key;
+  });
+  return `---${newline}${[...retained, `${key}: ${value}`].join(newline)}${match[3]}---${match[4]}${match[5]}`;
+}
+
+export async function createNativeGlobalAgent(
+  input: CreateNativeAgentInput,
+): Promise<{ id: string; identity: AgentPublicIdentity; revision: string }> {
+  const id = input.id.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(id) || id === "main" || id === "readme") {
+    throw new Error("Agent username must use 1-64 lowercase letters, numbers, dots, underscores, or dashes and cannot be reserved");
+  }
+  const identity = normalizeAgentPublicIdentityInput(input.profile, id, "global");
+  const description = String(input.description ?? identity.bio ?? identity.title ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, ROLE_DESCRIPTION_CAP);
+  const rawInstructions = String(input.instructions ?? "").trim();
+  if (rawInstructions.length > 16_000 || rawInstructions.includes("\0")) {
+    throw new Error("Agent instructions must be 16,000 characters or fewer and contain no NUL bytes");
+  }
+  const instructions = rawInstructions || [
+    `You are ${identity.displayName}${identity.title ? `, ${identity.title}` : ""}.`,
+    identity.bio || description,
+    identity.traits?.length ? `Work style: ${identity.traits.join(", ")}.` : "",
+    "Take ownership of assigned work, use available tools, and return verified outcomes instead of handing routine execution back to the user.",
+  ].filter(Boolean).join("\n\n");
+  const file = join(globalRolesDir(), `${id}.md`);
+  const content = [
+    "---",
+    `name: ${id}`,
+    `description: ${JSON.stringify(description || `${identity.displayName} Agent`)}`,
+    ...identityFrontmatterLines(identity),
+    "---",
+    instructions,
+    "",
+  ].join("\n");
+  const boundary = bindAtomicWritePath(file, "hire personal Agent");
+  await atomicWriteText(boundary.target, content, {
+    expected: null,
+    boundary,
+    mode: 0o600,
+  });
+  invalidateRolesCache();
+  return { id, identity, revision: identityRevision(content) };
+}
+
+/** "Dismiss" is a recoverable archive: the prompt stays on disk with `archived: true`, while all role
+ * loaders omit it. This avoids an irreversible delete from a one-click game/social surface. */
+export async function archiveNativeRoleAgent(role: Role, expectedRevision: string): Promise<void> {
+  if ((role.source !== "global" && role.source !== "project") || !role.file) {
+    throw new Error("this Agent is managed by an organization or external tool and cannot be dismissed here");
+  }
+  const target = realpathSync.native(role.file);
+  const snapshot = await readRegularFileSnapshotNoFollow(target, MAX_ROLE_BYTES);
+  if (identityRevision(snapshot.text) !== expectedRevision) throw new Error("agent profile changed; refresh and retry");
+  const content = setTopLevelFrontmatterField(snapshot.text, "archived", "true");
+  await atomicWriteText(target, content, {
+    expected: snapshot.text,
+    expectedIdentity: snapshot,
+    boundary: bindAtomicWritePath(target, "archive personal Agent"),
+    mode: snapshot.mode & 0o777,
+  });
+  invalidateRolesCache();
+}
+
+export async function updateMainAgentIdentity(
+  input: AgentPublicIdentityInput,
+  expectedRevision: string,
+): Promise<{ identity: AgentPublicIdentity; revision: string }> {
+  const identity = normalizeAgentPublicIdentityInput(input, "main", "global");
+  const path = mainAgentIdentityPath();
+  const boundary = bindAtomicWritePath(path, "update main Agent profile");
+  let snapshot: RegularFileSnapshot | null = null;
+  try {
+    snapshot = await readRegularFileSnapshotNoFollow(boundary.target, MAX_ROLE_BYTES);
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const currentRevision = snapshot
+    ? identityRevision(snapshot.text)
+    : identityRevision(JSON.stringify(DEFAULT_MAIN_AGENT_IDENTITY));
+  if (currentRevision !== expectedRevision) throw new Error("agent profile changed; refresh and retry");
+  const content = JSON.stringify(identity, null, 2) + "\n";
+  await atomicWriteText(boundary.target, content, {
+    expected: snapshot?.text ?? null,
+    expectedIdentity: snapshot ?? undefined,
+    boundary,
+    mode: 0o600,
+  });
+  return { identity, revision: identityRevision(content) };
+}
+
+export async function updateNativeRoleIdentity(
+  role: Role,
+  input: AgentPublicIdentityInput,
+  expectedRevision: string,
+): Promise<{ identity: AgentPublicIdentity; revision: string }> {
+  if ((role.source !== "global" && role.source !== "project") || !role.file) {
+    throw new Error("this Agent is managed by an organization or external tool and is read-only here");
+  }
+  const target = realpathSync.native(role.file);
+  const snapshot = await readRegularFileSnapshotNoFollow(target, MAX_ROLE_BYTES);
+  if (identityRevision(snapshot.text) !== expectedRevision) throw new Error("agent profile changed; refresh and retry");
+  const identity = normalizeAgentPublicIdentityInput(input, role.id, role.source);
+  const content = replacePublicIdentityFrontmatter(snapshot.text, identity);
+  await atomicWriteText(target, content, {
+    expected: snapshot.text,
+    expectedIdentity: snapshot,
+    boundary: bindAtomicWritePath(target, "update Agent public profile"),
+    mode: snapshot.mode & 0o777,
+  });
+  invalidateRolesCache();
+  return { identity, revision: identityRevision(content) };
 }
 
 /** Tool filter for a fan-out sub-agent: ALWAYS read-only (sub-agents run full-auto + unconfirmed +
@@ -177,18 +647,31 @@ function mergedRoles(...layers: Iterable<Role>[]): Role[] {
   return [...byId.values()];
 }
 
+/** A persisted gateway profile is authoritative. The profile-scoped managed-role directory is also a
+ * fail-closed legacy signal: older enrollments and embedders can sync a verified Control bundle before
+ * the corresponding profile record is migrated into profiles.json. In that state, exposing personal or
+ * imported prompts would widen the company audience, while treating it as managed keeps the safer side. */
+function isOrganizationRoleProfile(profileId: string): boolean {
+  return getProfile(profileId)?.kind === "gateway"
+    || (isValidProfileId(profileId) && existsSync(orgRolesDir(profileId)));
+}
+
 export function loadRoles(cwd: string, profileId?: string): Role[] {
   const selectedProfileId = profileId ?? resolveActive(cwd).id;
-  const managedRoleDirs: RoleDir[] = isValidProfileId(selectedProfileId)
-    ? [{ dir: orgRolesDir(selectedProfileId), source: "org" }]
-    : [];
+  const organizationProfile = isOrganizationRoleProfile(selectedProfileId);
+  // Company Spaces expose only Control-managed Agents. Personal/global/imported prompts must never
+  // silently enter a company audience merely because their local name is available on the device.
+  if (organizationProfile) {
+    const profile = getProfile(selectedProfileId);
+    const spaceId = profile?.kind === "gateway" ? spaceIdForProfile(profile) : selectedProfileId;
+    return isValidSpaceId(spaceId) ? (loadOrganizationRoleBundle(spaceId)?.roles ?? []) : [];
+  }
   // lowest→highest precedence: plugins < installed interop identities < org(B-end push)
   // < personal Claude < personal Hara < project Claude < project Hara. Native Hara wins collisions.
   return mergedRoles(
     rolesFromDirs(pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" }))).values(),
     externalRoles(),
     rolesFromDirs([
-      ...managedRoleDirs,
       { dir: globalClaudeAgentsDir(), source: "claude-global" },
       { dir: globalRolesDir(), source: "global" },
       { dir: claudeAgentsDir(cwd), source: "claude-project" },
@@ -201,14 +684,16 @@ export function loadRoles(cwd: string, profileId?: string): Role[] {
  *  Personal Claude Code agents participate directly; no copy/import step is required. */
 export function loadGlobalRoles(profileId?: string): Role[] {
   const selectedProfileId = profileId ?? resolveActive().id;
-  const managedRoleDirs: RoleDir[] = isValidProfileId(selectedProfileId)
-    ? [{ dir: orgRolesDir(selectedProfileId), source: "org" }]
-    : [];
+  const organizationProfile = isOrganizationRoleProfile(selectedProfileId);
+  if (organizationProfile) {
+    const profile = getProfile(selectedProfileId);
+    const spaceId = profile?.kind === "gateway" ? spaceIdForProfile(profile) : selectedProfileId;
+    return isValidSpaceId(spaceId) ? (loadOrganizationRoleBundle(spaceId)?.roles ?? []) : [];
+  }
   return mergedRoles(
     rolesFromDirs(pluginRoleDirs().map((dir): RoleDir => ({ dir, source: "plugin" }))).values(),
     externalRoles(),
     rolesFromDirs([
-      ...managedRoleDirs,
       { dir: globalClaudeAgentsDir(), source: "claude-global" },
       { dir: globalRolesDir(), source: "global" },
     ]).values(),
@@ -245,6 +730,7 @@ function rolesFromDirs(dirs: RoleDir[]): Map<string, Role> {
         const file = join(dir, f);
         const { fm, body } = parseFrontmatter(readModelContextFileSync(file, MAX_ROLE_BYTES));
         const id = (fm.name as string) || f.replace(/\.md$/, "");
+        if (isTrue(fm.archived)) continue;
         const explicitReadOnly = /^(true|false)$/i.test(String(fm.readOnly ?? ""))
           ? String(fm.readOnly).toLowerCase() === "true"
           : undefined;

@@ -14,6 +14,7 @@ import { historyForClient, serveAutoCompactDecision, startServe } from "../dist/
 import { addJob, cronDir, findJob, loadJobs, removeJob, saveJobs } from "../dist/cron/store.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
+import { orgRolesDir } from "../dist/org/roles.js";
 
 test("serve client history hides internal steering triage wrappers", () => {
   const history = historyForClient([
@@ -186,6 +187,36 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
   sandbox: "off",
   approval,
   store,
+  spaces: () => ({
+    activeId: "personal",
+    activeProfileId: "personal",
+    activeSource: "default",
+    switchLocked: false,
+    spaces: [{
+      id: "personal",
+      name: "Personal",
+      kind: "personal",
+      profileId: "personal",
+      active: true,
+      authoritative: true,
+      agentProfilePermission: "edit",
+    }],
+  }),
+  useSpace: () => ({
+    activeId: "personal",
+    activeProfileId: "personal",
+    activeSource: "default",
+    switchLocked: false,
+    spaces: [{
+      id: "personal",
+      name: "Personal",
+      kind: "personal",
+      profileId: "personal",
+      active: true,
+      authoritative: true,
+      agentProfilePermission: "edit",
+    }],
+  }),
   quietDiscovery: true,
 });
 
@@ -228,13 +259,13 @@ test("serve exposes explicit organization learning submit/sync without exposing 
   };
   const deps = {
     ...baseDeps(textProvider, memStore()),
-    runtimeInfo: () => ({ providerId: "hara-gateway", model: "managed", profileId: "acme", profileKind: "gateway" }),
-    organizationLearningSubmit: async (profileId, candidateId, cwd) => {
-      calls.push(["submit", profileId, candidateId, cwd]);
+    runtimeInfo: () => ({ providerId: "hara-gateway", model: "managed", profileId: "acme", profileKind: "gateway", spaceId: "org:acme" }),
+    organizationLearningSubmit: async (profileId, spaceId, candidateId, cwd) => {
+      calls.push(["submit", profileId, spaceId, candidateId, cwd]);
       return { remoteId: "remote-learning", status: "pending", revision: 1, candidate };
     },
-    organizationLearningSync: async (profileId, cwd) => {
-      calls.push(["sync", profileId, cwd]);
+    organizationLearningSync: async (profileId, spaceId, cwd) => {
+      calls.push(["sync", profileId, spaceId, cwd]);
       return { version: 4, learnings: [{ ...candidate, status: "approved" }] };
     },
   };
@@ -251,8 +282,8 @@ test("serve exposes explicit organization learning submit/sync without exposing 
     const synced = await client.call("learning.sync", {});
     assert.equal(synced.result.version, 4);
     assert.deepEqual(calls, [
-      ["submit", "acme", "local-learning", dir],
-      ["sync", "acme", dir],
+      ["submit", "acme", "org:acme", "local-learning", dir],
+      ["sync", "acme", "org:acme", dir],
     ]);
     assert.equal(JSON.stringify(submitted).includes("device-token"), false);
   } finally {
@@ -493,9 +524,14 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "sessions.cross-profile-fork.v1",
         "learning.review.v1",
         "agent.action-ownership.v1",
+        "agent.public-profile-edit.v1",
+        "spaces.tenant-boundary.v1",
       ],
-      "persistent clients can negotiate attachments, model descriptors, safe recovery, reviewed learning, and action ownership",
+      "persistent clients can negotiate attachments, model descriptors, safe recovery, reviewed learning, action ownership, Agent profiles, and tenant Spaces",
     );
+    for (const method of ["spaces.list", "spaces.use", "agents.create", "agents.update-profile", "agents.archive"]) {
+      assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
+    }
     for (const method of [
       "artifact.import",
       "artifact.commit",
@@ -1393,6 +1429,8 @@ test("serve e2e: an early-failed cron occurrence resumes with current runtime de
   store.save({
     id: sessionId,
     cwd: dir,
+    profileId: "personal",
+    spaceId: "personal",
     provider: "",
     model: "",
     title: "failed scheduled run",
@@ -1413,6 +1451,8 @@ test("serve e2e: an early-failed cron occurrence resumes with current runtime de
       providerId: "fake",
       model: model || "fake-1",
       profileId: "personal",
+      profileKind: "byok",
+      spaceId: "personal",
       effortLevels: [],
     }),
   };
@@ -1546,6 +1586,10 @@ test("serve e2e: persisted sessions keep their organization profile across activ
   const store = memStore();
   const availableProfiles = new Set(["flash-org", "pro-org"]);
   const models = { "flash-org": "deepseek-v4-flash", "pro-org": "deepseek-v4-pro" };
+  const spaces = {
+    "flash-org": `org:test-flash-${randomUUID()}`,
+    "pro-org": `org:test-pro-${randomUUID()}`,
+  };
   const providerRequests = [];
   const auxiliaryRequests = [];
   let auxiliaryRound = 0;
@@ -1565,6 +1609,13 @@ test("serve e2e: persisted sessions keep their organization profile across activ
     },
   };
   let activeProfile = "flash-org";
+  const withPolicyLease = (provider, model) => ({
+    ...provider,
+    model,
+    async prepareTurn() {
+      return { organizationPolicyVersion: 1, organizationPolicy: { version: 1 } };
+    },
+  });
   const profileFor = (profileId) => profileId ?? activeProfile;
   const requireProfile = (profileId) => {
     const selected = profileFor(profileId);
@@ -1576,12 +1627,12 @@ test("serve e2e: persisted sessions keep their organization profile across activ
     buildSessionProvider: async (_cwd, profileId) => {
       const selected = requireProfile(profileId);
       providerRequests.push({ operation: "create", profileId: selected });
-      return { ...auxiliaryProvider, model: models[selected] };
+      return withPolicyLease(auxiliaryProvider, models[selected]);
     },
     buildProviderFor: async (model, _effort, _cwd, profileId) => {
       const selected = requireProfile(profileId);
       providerRequests.push({ operation: "resume", profileId: selected, model });
-      return { ...auxiliaryProvider, model };
+      return withPolicyLease(auxiliaryProvider, model);
     },
     listModels: async (_cwd, profileId) => [models[requireProfile(profileId)]],
     runtimeInfo: (_cwd, model, profileId) => {
@@ -1590,6 +1641,8 @@ test("serve e2e: persisted sessions keep their organization profile across activ
       return {
         providerId: "hara-gateway",
         profileId: selected,
+        profileKind: "gateway",
+        spaceId: spaces[selected],
         model: selectedModel,
         effortLevels: ["off", "low", "high", "max"],
         availableModels: [models[selected]],
@@ -1604,6 +1657,14 @@ test("serve e2e: persisted sessions keep their organization profile across activ
       return "subagent stayed bound";
     },
   };
+
+  const flashRolesDir = orgRolesDir(spaces["flash-org"]);
+  mkdirSync(flashRolesDir, { recursive: true });
+  writeFileSync(join(flashRolesDir, "_bundle.json"), `${JSON.stringify({
+    version: 1,
+    org_policy: {},
+    roles: [],
+  }, null, 2)}\n`);
 
   let sessionId;
   const first = await startServe({ host: "127.0.0.1", port: 0, token: "tok-1", cwd: dir }, deps);
@@ -1633,7 +1694,7 @@ test("serve e2e: persisted sessions keep their organization profile across activ
     const forbidden = await client.call("session.set-model", { sessionId, model: "deepseek-v4-pro" });
     assert.match(forbidden.error.message, /not authorized/);
     const sent = await client.call("session.send", { sessionId, text: "exercise auxiliary routes" });
-    assert.equal(sent.result.reply, "bound");
+    assert.equal(sent.result?.reply, "bound", JSON.stringify(sent));
     assert.ok(auxiliaryRequests.some((request) => request.operation === "guardian" && request.profileId === "flash-org"));
     assert.ok(auxiliaryRequests.some((request) => request.operation === "subagent" && request.profileId === "flash-org"));
     assert.equal(auxiliaryRequests.some((request) => request.profileId === "pro-org"), false);
@@ -1652,11 +1713,13 @@ test("serve e2e: persisted sessions keep their organization profile across activ
   } finally {
     client.close();
     await third.close();
+    rmSync(orgRolesDir(spaces["flash-org"]), { recursive: true, force: true });
+    rmSync(orgRolesDir(spaces["pro-org"]), { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("serve e2e: an unavailable organization session stays readable and transfers only with explicit consent", { timeout: 10000 }, async () => {
+test("serve e2e: unavailable history stays readable, same-Space recovery is explicit, and company export is blocked", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-readonly-history-"));
   const store = memStore();
   const sessionId = "stale-key-session";
@@ -1669,9 +1732,26 @@ test("serve e2e: an unavailable organization session stays readable and transfer
       id: sessionId,
       cwd: dir,
       profileId: "key",
+      spaceId: "org:tenant-key",
       provider: "hara-gateway",
       model: "deepseek-chat",
       title: "Older task",
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T01:00:00.000Z",
+      source: "interactive",
+    },
+    history: structuredClone(originalHistory),
+  });
+  const personalSourceId = "stale-personal-session";
+  store.saved.set(personalSourceId, {
+    meta: {
+      id: personalSourceId,
+      cwd: dir,
+      profileId: "retired-personal-route",
+      spaceId: "personal",
+      provider: "qwen",
+      model: "qwen-old",
+      title: "Older personal task",
       createdAt: "2026-08-01T00:00:00.000Z",
       updatedAt: "2026-08-01T01:00:00.000Z",
       source: "interactive",
@@ -1699,6 +1779,7 @@ test("serve e2e: an unavailable organization session stays readable and transfer
         return {
           providerId: "hara-gateway",
           profileId: "key",
+          spaceId: "org:tenant-key",
           model: model ?? "deepseek-v4-pro",
           effortLevels: [],
           availableModels: ["deepseek-v4-pro"],
@@ -1707,6 +1788,7 @@ test("serve e2e: an unavailable organization session stays readable and transfer
       return {
         providerId: "qwen",
         profileId: "personal",
+        spaceId: "personal",
         model: model ?? "qwen3.7-plus",
         effortLevels: [],
         availableModels: ["qwen3.7-plus"],
@@ -1748,8 +1830,18 @@ test("serve e2e: an unavailable organization session stays readable and transfer
     assert.equal(missingConsent.error.code, -32602);
     assert.match(missingConsent.error.message, /explicit history-transfer consent required/i);
 
-    const forked = await client.call("session.fork", {
+    const blockedExport = await client.call("session.fork", {
       sessionId,
+      targetProfileId: "personal",
+      targetModel: "qwen3.7-plus",
+      transferHistory: true,
+    });
+    assert.equal(blockedExport.error.code, -32001);
+    assert.match(blockedExport.error.message, /cross-Space conversation transfer is blocked/i);
+    assert.equal(store.saved.size, 2, "a denied company export creates no copied session");
+
+    const forked = await client.call("session.fork", {
+      sessionId: personalSourceId,
       targetProfileId: "personal",
       targetModel: "qwen3.7-plus",
       transferHistory: true,
@@ -1760,9 +1852,11 @@ test("serve e2e: an unavailable organization session stays readable and transfer
     assert.equal(forked.result.approval, "full-auto", "legacy source inherits the server policy when forked");
     assert.deepEqual(forked.result.history, history.result.history);
     assert.equal(store.saved.get(forked.result.sessionId).meta.profileId, "personal");
+    assert.equal(store.saved.get(forked.result.sessionId).meta.spaceId, "personal");
     assert.equal(store.saved.get(forked.result.sessionId).meta.model, "qwen3.7-plus");
     assert.deepEqual(store.saved.get(sessionId).history, originalHistory, "the unavailable source remains unchanged");
     assert.equal(store.saved.get(sessionId).meta.profileId, "key");
+    assert.equal(store.saved.get(sessionId).meta.spaceId, "org:tenant-key");
 
     const continued = await client.call("session.send", {
       sessionId: forked.result.sessionId,
@@ -1785,6 +1879,7 @@ test("serve e2e: resume refuses an identity changed between provider preflight a
       id: sessionId,
       cwd: dir,
       profileId: "flash-org",
+      spaceId: "org:tenant-acme",
       provider: "hara-gateway",
       model: "deepseek-v4-flash",
       title: "Profile race",
@@ -1809,6 +1904,8 @@ test("serve e2e: resume refuses an identity changed between provider preflight a
     runtimeInfo: (_cwd, model, profileId) => ({
       providerId: "hara-gateway",
       profileId: profileId ?? "pro-org",
+      profileKind: "gateway",
+      spaceId: "org:tenant-acme",
       model: model ?? (profileId === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro"),
       availableModels: [profileId === "flash-org" ? "deepseek-v4-flash" : "deepseek-v4-pro"],
       effortLevels: ["off", "low", "high", "max"],
@@ -2547,6 +2644,8 @@ test("serve e2e: only an explicit continuation resumes an unfinished task", { ti
     meta: {
       id: sessionId,
       cwd: dir,
+      profileId: "personal",
+      spaceId: "personal",
       provider: "fake",
       model: "fake-1",
       title: "migration",
@@ -2761,6 +2860,8 @@ test("serve e2e: cumulative task rounds pause at 100 and explicit continuation o
     meta: {
       id: sessionId,
       cwd: dir,
+      profileId: "personal",
+      spaceId: "personal",
       provider: "fake",
       model: "fake-1",
       title: "bounded task",

@@ -36,6 +36,9 @@ export interface ToolContext {
   /** Identity route that owns the current persisted conversation. Auxiliary prompts/providers must use
    * this instead of consulting whichever profile is globally active at the moment. */
   profileId?: string;
+  /** Immutable Personal/company audience for data that must survive a mutable provider connection.
+   * Organization learning is keyed by this value, never by the reusable local profile id. */
+  spaceId?: string;
   /** Current durable conversation, when this run has one. Transcript recall uses it to exclude the active
    * session and enforce interactive/gateway/cron audience boundaries. */
   sessionId?: string;

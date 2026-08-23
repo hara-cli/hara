@@ -55,6 +55,29 @@ test("private-state migration does not chmod an external hard-link target", { sk
   }
 });
 
+test("private-state migration leaves already-private file ctime unchanged", { skip: process.platform === "win32" }, () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-private-stable-mode-"));
+  const state = join(home, ".hara");
+  const receipt = join(state, "plugin-receipt.json");
+  mkdirSync(state, { mode: 0o700 });
+  writeFileSync(receipt, "{}\n", { mode: 0o600 });
+  chmodSync(state, 0o700);
+  chmodSync(receipt, 0o600);
+  const before = statSync(receipt, { bigint: true }).ctimeNs;
+
+  try {
+    tightenPrivateHaraState(home);
+    assert.equal(
+      statSync(receipt, { bigint: true }).ctimeNs,
+      before,
+      "a correct 0600 receipt is not touched and remains valid for concurrent CAS removal",
+    );
+  } finally {
+    resetPrivateHaraStateForTests();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("private-state cap failures are explicit and a later startup call retries", { skip: process.platform === "win32" }, () => {
   const home = mkdtempSync(join(tmpdir(), "hara-private-cap-"));
   const state = join(home, ".hara");

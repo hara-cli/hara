@@ -6,7 +6,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import { dispatchFlows, flowSourceKey } from "./flows.js";
-import { handleOwnerReply, runNoToolModel } from "./flows-pending.js";
+import { captureNoToolAudience, handleOwnerReply, runNoToolModel, type NoToolAudience } from "./flows-pending.js";
 import { chatContext, chatCd, chatSessionIdPrefix, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, toggleVoice } from "./sessions.js";
 import { plainChat } from "../cron/deliver.js";
 import { pickPaneForReply, capturePane, injectTmux, outputDelta } from "./tmux-routes.js";
@@ -568,8 +568,8 @@ export function runHara(
 /** Run a one-off FLOW text task directly against the provider with `tools: []`. The old subprocess path
  * launched the full coding agent with `--approval full-auto`, allowing a prompt-injected group message to
  * reach bash/edit/MCP tools. `cwd` is intentionally ignored: isolated flow judgments cannot read a project. */
-function runFlowAgent(prompt: string, _cwd: string, schema?: object, signal?: AbortSignal): Promise<string> {
-  return runNoToolModel(prompt, { schema, timeoutMs: 60_000, signal });
+function runFlowAgent(prompt: string, _cwd: string, schema?: object, signal?: AbortSignal, audience?: NoToolAudience): Promise<string> {
+  return runNoToolModel(prompt, { schema, timeoutMs: 60_000, signal, audience });
 }
 
 /** Re-exported so `hara gateway --platform weixin --login` can run the QR flow. */
@@ -1115,16 +1115,18 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     // BEFORE the allowlist/DM-driver logic. A matched flow is authorized by its own presence in the user's config
     // (group senders won't be in the allowlist), so this must run first. dispatchFlows settles every claimed
     // run/delivery before returning, keeping the inbound tracker and persistent message claim truthful.
+    const flowAudience = captureNoToolAudience();
     const flowRan = existingRunOutcome ? false : await dispatchFlows(
       m,
       platform,
-      (prompt, home, schema, signal) => runFlowAgent(prompt, home ?? cwd, schema, signal), // stateless per trigger; rule cwd = agent's home
+      (prompt, home, schema, signal, audience) => runFlowAgent(prompt, home ?? cwd, schema, signal, audience), // stateless per trigger; rule cwd = agent's home
       (text, idempotencyKey) => adapter.send(m.chatId, plainChat(text), ac.signal, idempotencyKey),
       // Flow replies are chat bubbles too — flatten markdown; an opaque effect key lets Feishu deduplicate
       // an externally-successful request whose local response/receipt was interrupted.
       approvalOwner,
       ac.signal,
       { scope: runtimeScope, receipts: flowEffectReceipts, runs: flowRuns },
+      flowAudience,
     );
     if (flowRan) return;
     // The gateway's default is a DM driver. Unknown channel shapes fail closed too: older/third-party adapters

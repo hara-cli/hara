@@ -141,6 +141,15 @@ export async function walkFilesAsync(root: string, options: FileWalkOptions = {}
   let sinceYield = 0;
   const timedOut = (): boolean => Date.now() - startedAt >= cfg.timeoutMs;
 
+  // A contended filesystem can consume a tiny wall budget in the synchronous Home-boundary preflight.
+  // Yield once before returning that entry-time timeout so already-due cancellation/deadline timers are
+  // observable even though no directory descriptor was opened.
+  if (timedOut()) {
+    await yieldToEventLoop();
+    throwIfAborted(cfg.signal);
+    return result(files, directoriesVisited, entriesVisited, "time_limit");
+  }
+
   while (stack.length) {
     throwIfAborted(cfg.signal);
     if (timedOut()) return result(files, directoriesVisited, entriesVisited, "time_limit");

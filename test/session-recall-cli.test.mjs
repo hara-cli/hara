@@ -81,6 +81,7 @@ test("real headless CLI injects an older session when the user explicitly asks t
       id,
       cwd: project,
       provider: "openai",
+      profileId: "personal",
       model: "test-model",
       title,
       createdAt: "2026-07-20T00:00:00.000Z",

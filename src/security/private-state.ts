@@ -3,7 +3,6 @@
 // other local users before credentials/session state are read.
 import {
   closeSync,
-  chmodSync,
   constants,
   fstatSync,
   fsyncSync,
@@ -18,6 +17,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import type { Stats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -32,6 +32,7 @@ import {
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
+import { sleepSync } from "../sync-sleep.js";
 
 const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin", "tool-results", "plugin-receipts", "artifacts"]);
 const tightenedHomes = new Set<string>();
@@ -65,6 +66,15 @@ export interface PrivateStateWriteOptions {
    * before replacement; otherwise no caller data is written.
    */
   expectedText?: string;
+  /** Require that the target is still absent. Used by first-run registries after taking their resource lock. */
+  expectedMissing?: boolean;
+}
+
+export interface PrivateStateLockOptions {
+  /** Total acquisition attempts. Each attempt waits at most `waitMs`; defaults to roughly five seconds. */
+  attempts?: number;
+  waitMs?: number;
+  busyMessage?: string;
 }
 
 export class PrivateStateConflictError extends Error {
@@ -76,16 +86,6 @@ export class PrivateStateConflictError extends Error {
 
 function isMissing(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
-}
-
-function chmodPrivate(path: string, mode: number): void {
-  try {
-    chmodSync(path, mode);
-  } catch (error) {
-    // Windows does not implement POSIX ownership modes. On POSIX, a failed repair is a security failure:
-    // propagate it so startup can retry instead of permanently caching an incomplete migration.
-    if (process.platform !== "win32") throw error;
-  }
 }
 
 function checkedPrivateComponent(component: string): string {
@@ -224,6 +224,389 @@ export function bindPrivateHaraStateFile(
   return { directory, path };
 }
 
+interface PrivateStateLockRecord {
+  pid: number;
+  token: string;
+}
+
+interface PrivateStateLockSnapshot {
+  record: PrivateStateLockRecord | null;
+  snapshot: PrivateStateFileSnapshot;
+  /** Exact second name for the same inode while the stable two-link lock is held. */
+  companion?: string;
+}
+
+function parsePrivateStateLockRecord(text: string): PrivateStateLockRecord | null {
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    return Number.isInteger(parsed?.pid)
+      && Number(parsed.pid) > 0
+      && typeof parsed?.token === "string"
+      && /^[a-f0-9-]{16,64}$/i.test(parsed.token)
+      ? { pid: Number(parsed.pid), token: parsed.token }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function privateStateLockCompanion(
+  binding: PrivateStateFileBinding,
+  record: PrivateStateLockRecord,
+): string {
+  return join(
+    binding.directory.path,
+    checkedPrivateComponent(`.hara-lock-${record.pid}-${record.token}.tmp`),
+  );
+}
+
+function readPrivateStateLock(binding: PrivateStateFileBinding): PrivateStateLockSnapshot | null {
+  let before;
+  try {
+    before = lstatSync(binding.path);
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  if (before.isFile() && !before.isSymbolicLink() && before.nlink === 0) {
+    throw new Error(`private Hara state lock changed while opening: '${binding.path}'`);
+  }
+  if (
+    !before.isFile()
+    || before.isSymbolicLink()
+    || (before.nlink !== 1 && before.nlink !== 2)
+    || (process.platform !== "win32" && (before.mode & 0o777) !== 0o600)
+  ) throw new Error(
+    `private Hara state lock is unsafe: '${binding.path}'`
+    + ` (file=${before.isFile()}, symlink=${before.isSymbolicLink()}, nlink=${before.nlink}, mode=${(before.mode & 0o777).toString(8)})`,
+  );
+  const fd = openSync(
+    binding.path,
+    constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+  );
+  try {
+    const opened = fstatSync(fd);
+    if (
+      !opened.isFile()
+      || opened.nlink !== before.nlink
+      || !sameOpenedFileIdentity(opened, before)
+      || (process.platform !== "win32" && (opened.mode & 0o777) !== 0o600)
+    ) {
+      throw new Error(`private Hara state lock changed while opening: '${binding.path}'`);
+    }
+    if (opened.size > 4096) throw new Error(`private Hara state lock is too large: '${binding.path}'`);
+    const bytes = readFdBytes(fd, opened.size);
+    const latest = fstatSync(fd);
+    if (
+      latest.dev !== opened.dev
+      || latest.ino !== opened.ino
+      || latest.nlink !== opened.nlink
+      || latest.size !== opened.size
+      || latest.mtimeMs !== opened.mtimeMs
+      || latest.ctimeMs !== opened.ctimeMs
+    ) throw new Error(`private Hara state lock changed while reading: '${binding.path}'`);
+    let current;
+    try {
+      current = lstatSync(binding.path);
+    } catch (error: any) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    if (!sameOpenedFileIdentity(current, latest) || current.nlink !== latest.nlink) {
+      throw new Error(`private Hara state lock changed after reading: '${binding.path}'`);
+    }
+    const snapshot: PrivateStateFileSnapshot = {
+      text: decodeUtf8Strict(bytes, binding.path),
+      dev: latest.dev,
+      ino: latest.ino,
+      mode: latest.mode & 0o777,
+      nlink: latest.nlink,
+      size: latest.size,
+      mtimeMs: latest.mtimeMs,
+      ctimeMs: latest.ctimeMs,
+    };
+    const record = parsePrivateStateLockRecord(snapshot.text);
+    let companion: string | undefined;
+    if (snapshot.nlink === 2) {
+      if (!record) throw new Error(`private Hara state lock has an invalid two-link record: '${binding.path}'`);
+      companion = privateStateLockCompanion(binding, record);
+      let alias;
+      try {
+        alias = lstatSync(companion);
+      } catch (error: any) {
+        if (error?.code === "ENOENT") {
+          // A release removes the companion first. If the target made the corresponding 2→1 transition,
+          // this is an ordinary namespace race; a stable two-link target without its exact alias is unsafe.
+          let target;
+          try { target = lstatSync(binding.path); } catch { /* classified below as a changed generation */ }
+          if (!target || !sameOpenedFileIdentity(target, snapshot) || target.nlink !== 2) {
+            throw new Error(`private Hara state lock changed after reading: '${binding.path}'`);
+          }
+          throw new Error(`private Hara state lock companion is missing: '${binding.path}'`);
+        }
+        throw error;
+      }
+      const aliasValid = (
+        !alias.isFile()
+        ? false
+        : !alias.isSymbolicLink()
+          && alias.nlink === 2
+          && sameOpenedFileIdentity(alias, snapshot)
+          && (process.platform === "win32" || (alias.mode & 0o777) === 0o600)
+      );
+      if (!aliasValid) {
+        // lstat may resolve the companion immediately before release unlinks it, yet return the inode's
+        // post-unlink nlink=1 state. Distinguish that changing generation from a stable attacker-supplied
+        // alias: re-read both names and retry only when an identity/link/mode actually transitioned.
+        let targetAfter;
+        let aliasAfter;
+        try {
+          targetAfter = lstatSync(binding.path);
+          aliasAfter = lstatSync(companion);
+        } catch (error: any) {
+          if (error?.code === "ENOENT") {
+            throw new Error(`private Hara state lock changed after reading companion: '${binding.path}'`);
+          }
+          throw error;
+        }
+        const targetChanged = !sameOpenedFileIdentity(targetAfter, snapshot) || targetAfter.nlink !== 2;
+        const aliasChanged = !sameOpenedFileIdentity(aliasAfter, alias)
+          || aliasAfter.nlink !== alias.nlink
+          || aliasAfter.isFile() !== alias.isFile()
+          || aliasAfter.isSymbolicLink() !== alias.isSymbolicLink()
+          || (process.platform !== "win32" && (aliasAfter.mode & 0o777) !== (alias.mode & 0o777));
+        const becameValid = aliasAfter.isFile()
+          && !aliasAfter.isSymbolicLink()
+          && aliasAfter.nlink === 2
+          && sameOpenedFileIdentity(aliasAfter, snapshot)
+          && (process.platform === "win32" || (aliasAfter.mode & 0o777) === 0o600);
+        if (targetChanged || aliasChanged || becameValid) {
+          throw new Error(`private Hara state lock changed after reading companion: '${binding.path}'`);
+        }
+        throw new Error(`private Hara state lock companion is unsafe: '${companion}'`);
+      }
+    }
+    return { record, snapshot, companion };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function privateStateLockOwnerAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code === "EPERM";
+  }
+}
+
+/** Create one immutable O_EXCL lock entry. The record is never replaced in place, so readers never observe
+ * the move-claim window used by the general private-state CAS writer. */
+function createPrivateStateLock(
+  binding: PrivateStateFileBinding,
+  record: PrivateStateLockRecord,
+): PrivateStateFileSnapshot | null {
+  verifyPrivateDirectory(binding.directory);
+  const staging = privateStateLockCompanion(binding, record);
+  let fd: number | undefined;
+  let staged: Pick<RegularFileSnapshot, "dev" | "ino" | "mode" | "nlink"> | undefined;
+  let published = false;
+  let acquired = false;
+  try {
+    fd = openSync(staging, "wx", 0o600);
+    writeFileSync(fd, `${JSON.stringify(record)}\n`, "utf8");
+    tightenPrivateDescriptorMode(fd, 0o600);
+    fsyncSync(fd);
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1) throw new Error("unsafe private Hara state lock inode");
+    staged = { dev: opened.dev, ino: opened.ino, mode: opened.mode & 0o777, nlink: opened.nlink };
+    closeSync(fd);
+    fd = undefined;
+    verifyPrivateDirectory(binding.directory);
+    try {
+      linkSync(staging, binding.path);
+      published = true;
+    } catch (error: any) {
+      if (error?.code === "EEXIST") return null;
+      throw error;
+    }
+    const linked = { ...staged, nlink: 2 };
+    if (!samePrivateFile(staging, linked) || !samePrivateFile(binding.path, linked)) {
+      throw new Error(`private Hara state lock changed during publication: '${binding.path}'`);
+    }
+    const created = readPrivateStateLock(binding);
+    if (
+      !created?.record
+      || created.record.pid !== record.pid
+      || created.record.token !== record.token
+      || created.companion !== staging
+    ) {
+      throw new Error(`private Hara state lock changed during acquisition: '${binding.path}'`);
+    }
+    acquired = true;
+    return created.snapshot;
+  } catch (error) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* preserve the original error */ }
+      fd = undefined;
+    }
+    // Remove only an entry that still contains our exact token. A malformed or replaced entry is retained
+    // for inspection instead of unlinking a successor owned by another process.
+    try {
+      const current = readPrivateStateLock(binding);
+      if (current?.record?.pid === record.pid && current.record.token === record.token) {
+        removePrivateStateLock(binding, current);
+      }
+    } catch {
+      /* fail closed; the bounded stale-owner recovery below can reclaim a complete dead record */
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* preserve the original result */ }
+    if (staged && !acquired) {
+      try {
+        const current = lstatSync(staging);
+        if (sameOpenedFileIdentity(current, staged) && current.nlink === 1) unlinkSync(staging);
+      } catch {
+        /* already removed, still published for dead-owner recovery, or an unexpected replacement */
+      }
+    }
+    if (published) syncPrivateDirectory(binding.directory.path);
+  }
+}
+
+function privateStateLockReadRaced(error: unknown): boolean {
+  const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+  if (code === "ENOENT") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /private Hara state lock changed (?:while|after)/.test(message);
+}
+
+function removePrivateStateLock(
+  binding: PrivateStateFileBinding,
+  current: PrivateStateLockSnapshot,
+): void {
+  if (current.snapshot.nlink === 2) {
+    if (!current.companion) throw new Error(`private Hara state lock companion is missing: '${binding.path}'`);
+    verifyPrivateDirectory(binding.directory);
+    const target = lstatSync(binding.path);
+    const alias = lstatSync(current.companion);
+    if (
+      !sameOpenedFileIdentity(target, current.snapshot)
+      || !sameOpenedFileIdentity(alias, current.snapshot)
+      || target.nlink !== 2
+      || alias.nlink !== 2
+    ) throw new Error(`private Hara state lock changed while releasing: '${binding.path}'`);
+    unlinkSync(current.companion);
+    syncPrivateDirectory(binding.directory.path);
+    const remaining = readPrivateStateLock(binding);
+    if (!remaining) return;
+    if (
+      !sameOpenedFileIdentity(remaining.snapshot, current.snapshot)
+      || remaining.record?.pid !== current.record?.pid
+      || remaining.record?.token !== current.record?.token
+    ) throw new Error(`private Hara state lock changed after companion release: '${binding.path}'`);
+    removePrivateStateFile(binding.path, remaining.snapshot, binding.directory);
+    return;
+  }
+  removePrivateStateFile(binding.path, current.snapshot, binding.directory);
+}
+
+function releasePrivateStateLock(
+  binding: PrivateStateFileBinding,
+  record: PrivateStateLockRecord,
+): void {
+  const current = readPrivateStateLock(binding);
+  if (current?.record?.pid === record.pid && current.record.token === record.token) {
+    removePrivateStateLock(binding, current);
+  }
+}
+
+/**
+ * Bounded cross-process mutex for one private Hara state resource.
+ *
+ * The primary record is created with O_EXCL and removed only after a no-follow identity snapshot. A dead
+ * owner can be reclaimed only while holding a second O_EXCL guard; malformed records fail closed. This is
+ * intentionally synchronous because profile/config readers and startup authorization APIs are synchronous.
+ */
+export function withPrivateStateLockSync<T>(
+  home: string,
+  subdirectories: readonly string[],
+  resource: string,
+  fn: () => T,
+  options: PrivateStateLockOptions = {},
+): T {
+  const attempts = Math.max(1, Math.min(5_000, Math.floor(options.attempts ?? 500)));
+  const waitMs = Math.max(1, Math.min(100, Math.floor(options.waitMs ?? 10)));
+  const lock = bindPrivateHaraStateFile(home, subdirectories, `${checkedPrivateComponent(resource)}.lock`);
+  const reclaim = bindPrivateHaraStateFile(home, subdirectories, `${checkedPrivateComponent(resource)}.lock.reclaim`);
+  let claim: PrivateStateLockRecord | undefined;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    let reclaimState: PrivateStateLockSnapshot | null;
+    try {
+      reclaimState = readPrivateStateLock(reclaim);
+    } catch (error) {
+      if (!privateStateLockReadRaced(error)) throw error;
+      sleepSync(waitMs);
+      continue;
+    }
+    if (reclaimState) {
+      if (reclaimState.record && !privateStateLockOwnerAlive(reclaimState.record.pid)) {
+        try {
+          removePrivateStateLock(reclaim, reclaimState);
+          continue;
+        } catch {
+          // Another contender changed/reclaimed the guard. Retry without guessing ownership.
+        }
+      }
+      sleepSync(waitMs);
+      continue;
+    }
+
+    const candidate = { pid: process.pid, token: randomUUID() } satisfies PrivateStateLockRecord;
+    const acquired = createPrivateStateLock(lock, candidate);
+    if (acquired) {
+      claim = candidate;
+      break;
+    }
+
+    let held: PrivateStateLockSnapshot | null;
+    try {
+      held = readPrivateStateLock(lock);
+    } catch (error) {
+      if (!privateStateLockReadRaced(error)) throw error;
+      sleepSync(waitMs);
+      continue;
+    }
+    if (held?.record && !privateStateLockOwnerAlive(held.record.pid)) {
+      const guard = { pid: process.pid, token: randomUUID() } satisfies PrivateStateLockRecord;
+      if (createPrivateStateLock(reclaim, guard)) {
+        try {
+          const current = readPrivateStateLock(lock);
+          if (
+            current?.record
+            && current.record.pid === held.record.pid
+            && current.record.token === held.record.token
+            && !privateStateLockOwnerAlive(current.record.pid)
+          ) removePrivateStateLock(lock, current);
+        } finally {
+          try { releasePrivateStateLock(reclaim, guard); } catch { /* successor/reclaimer wins */ }
+        }
+      }
+    }
+    sleepSync(waitMs);
+  }
+
+  if (!claim) throw new Error(options.busyMessage ?? `private Hara state '${resource}' is busy; retry the operation`);
+  try {
+    return fn();
+  } finally {
+    try { releasePrivateStateLock(lock, claim); } catch { /* never remove a successor lock */ }
+  }
+}
+
 function privateReadLimit(maxBytes: number): number {
   const requested = Number.isFinite(maxBytes) ? Math.floor(maxBytes) : MAX_EDIT_READ_BYTES;
   return Math.min(MAX_EDIT_READ_BYTES, Math.max(1, requested));
@@ -265,9 +648,11 @@ export function readPrivateStateFileSnapshotSync(
       rejectHardLinks: true,
       protectSensitive: false,
     });
-    tightenPrivateDescriptorMode(fd, 0o600);
-    // chmod may update ctime; capture the authoritative baseline afterwards.
-    info = fstatSync(fd);
+    if (process.platform === "win32" || (info.mode & 0o777) !== 0o600) {
+      tightenPrivateDescriptorMode(fd, 0o600);
+      // chmod may update ctime; capture the authoritative baseline afterwards.
+      info = fstatSync(fd);
+    }
     if (info.size > limit) throw new FileReadLimitError(path, limit);
     const bytes = readFdBytes(fd, Math.min(limit + 1, info.size + 1));
     if (bytes.length > limit) throw new FileReadLimitError(path, limit);
@@ -491,6 +876,9 @@ export function writePrivateStateFileSync(
     throw new Error(`private Hara state file is outside '${directory.path}'`);
   }
   const existing = readPrivateStateFileSnapshotSync(path);
+  if (options.expectedMissing === true && existing) {
+    throw new PrivateStateConflictError(`private Hara state file appeared before create: '${path}'`);
+  }
   if (options.expectedText !== undefined && existing?.text !== options.expectedText) {
     throw new PrivateStateConflictError(`private Hara state file no longer matches the expected version: '${path}'`);
   }
@@ -637,12 +1025,15 @@ export async function readPrivateStateFileSnapshot(
   }
   try {
     const { handle } = verified;
-    try {
-      await handle.chmod(0o600);
-    } catch (error) {
-      if (process.platform !== "win32") throw error;
+    let before = await handle.stat();
+    if (process.platform === "win32" || (before.mode & 0o777) !== 0o600) {
+      try {
+        await handle.chmod(0o600);
+      } catch (error) {
+        if (process.platform !== "win32") throw error;
+      }
+      before = await handle.stat();
     }
-    const before = await handle.stat();
     if (before.size > limit) throw new FileReadLimitError(path, limit);
     const chunks: Buffer[] = [];
     let total = 0;
@@ -720,6 +1111,77 @@ function consumeBudget(path: string, budget: MigrationBudget): void {
   }
 }
 
+function privateStateTransientEntry(name: string): boolean {
+  return /^(?:\.hara-(?:lock|private|claim)-[A-Za-z0-9-]+\.tmp|.+\.lock(?:\.reclaim)?)$/.test(name);
+}
+
+function tightenExistingDirectoryMode(path: string, expected: Stats): boolean {
+  if (process.platform === "win32" || (expected.mode & 0o777) === 0o700) return true;
+  let fd: number;
+  try {
+    fd = openSync(
+      path,
+      constants.O_RDONLY
+        | optionalPosixOpenFlag("O_NONBLOCK")
+        | optionalPosixOpenFlag("O_NOFOLLOW")
+        | optionalPosixOpenFlag("O_DIRECTORY"),
+    );
+  } catch (error) {
+    if (isMissing(error)) return false;
+    throw error;
+  }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isDirectory() || !sameOpenedFileIdentity(opened, expected)) {
+      throw new Error(`private Hara state directory changed while tightening: '${path}'`);
+    }
+    if ((opened.mode & 0o777) !== 0o700) tightenPrivateDescriptorMode(fd, 0o700);
+    const latest = fstatSync(fd);
+    if (
+      !latest.isDirectory()
+      || !sameOpenedFileIdentity(latest, opened)
+      || (latest.mode & 0o777) !== 0o700
+    ) {
+      throw new Error(`private Hara state directory changed while tightening: '${path}'`);
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return true;
+}
+
+function tightenExistingFileMode(path: string, expected: Stats): void {
+  if (process.platform === "win32" || (expected.mode & 0o777) === 0o600) return;
+  let fd: number;
+  try {
+    fd = openSync(
+      path,
+      constants.O_RDONLY | optionalPosixOpenFlag("O_NONBLOCK") | optionalPosixOpenFlag("O_NOFOLLOW"),
+    );
+  } catch (error) {
+    if (isMissing(error)) return;
+    throw error;
+  }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || !sameOpenedFileIdentity(opened, expected)) {
+      throw new Error(`private Hara state file changed while tightening: '${path}'`);
+    }
+    if ((opened.mode & 0o777) !== 0o600) tightenPrivateDescriptorMode(fd, 0o600);
+    const latest = fstatSync(fd);
+    if (
+      !latest.isFile()
+      || latest.nlink !== 1
+      || !sameOpenedFileIdentity(latest, opened)
+      || (latest.mode & 0o777) !== 0o600
+    ) {
+      throw new Error(`private Hara state file changed while tightening: '${path}'`);
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function tightenTree(root: string, budget: MigrationBudget): void {
   const stack = [root];
   while (stack.length) {
@@ -732,15 +1194,25 @@ function tightenTree(root: string, budget: MigrationBudget): void {
       if (isMissing(error)) continue; // a concurrently removed derived file needs no repair
       throw error;
     }
+    if (privateStateTransientEntry(basename(path))) continue;
     if (info.isSymbolicLink()) continue; // never chmod a target chosen through a replaceable link
     if (info.isDirectory()) {
-      chmodPrivate(path, 0o700);
-      const entries = readdirSync(path);
+      if (!tightenExistingDirectoryMode(path, info)) continue;
+      let current;
+      let entries: string[];
+      try {
+        current = lstatSync(path);
+        if (!current.isDirectory() || current.isSymbolicLink() || !sameOpenedFileIdentity(current, info)) {
+          throw new Error(`private Hara state directory changed before migration read: '${path}'`);
+        }
+        entries = readdirSync(path);
+      } catch (error) {
+        if (isMissing(error)) continue;
+        throw error;
+      }
       for (const entry of entries) stack.push(join(path, entry));
     } else if (info.isFile() && info.nlink === 1) {
-      // chmod follows hard links at the inode level. An attacker-controlled alias must not let startup
-      // tighten (and thereby mutate) an unrelated file outside ~/.hara; dedicated readers reject it later.
-      chmodPrivate(path, 0o600);
+      tightenExistingFileMode(path, info);
     }
   }
 }
@@ -761,7 +1233,16 @@ export function tightenPrivateHaraState(home = homedir(), cap = DEFAULT_MIGRATIO
   // redirected to an unrelated user directory by a local link/race left from an older installation.
   if (rootInfo.isSymbolicLink()) throw new Error(`refusing private Hara state migration: '${root}' is a symbolic link`);
   if (!rootInfo.isDirectory()) throw new Error(`refusing private Hara state migration: '${root}' is not a directory`);
-  chmodPrivate(root, 0o700);
+  if (!tightenExistingDirectoryMode(root, rootInfo)) {
+    throw new Error(`private Hara state migration root disappeared: '${root}'`);
+  }
+
+  const rootAfter = lstatSync(root);
+  if (
+    !rootAfter.isDirectory()
+    || rootAfter.isSymbolicLink()
+    || !sameOpenedFileIdentity(rootAfter, rootInfo)
+  ) throw new Error(`private Hara state migration root changed: '${root}'`);
 
   const budget: MigrationBudget = { seen: 0, cap };
   const entries = readdirSync(root, { withFileTypes: true });

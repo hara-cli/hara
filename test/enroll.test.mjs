@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { mkdtempSync, rmSync, statSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import {
   enrollDevice,
   loadEnrollment,
@@ -20,6 +21,7 @@ import {
   normalizeGatewayUrl,
   enrollGatewayProfile,
   upsertGatewayProfileFromEnrollment,
+  gatewayProfileFromEnrollment,
 } from "../dist/org-fleet/enroll.js";
 import {
   captureLearning,
@@ -31,8 +33,8 @@ import {
   loadProfileCreds,
   saveProfileCreds,
 } from "../dist/desk.js";
-import { orgRolesDir, loadRoles } from "../dist/org/roles.js";
-import { addProfile, listProfiles, loadActiveProfile, upsertProfile } from "../dist/profile/profile.js";
+import { orgRolesDir, loadRoles, parseOrganizationRoleBundleEnvelope } from "../dist/org/roles.js";
+import { addProfile, getProfile, listProfiles, loadActiveProfile, spaceIdForProfile, upsertProfile } from "../dist/profile/profile.js";
 import { resetPrivateHaraStateForTests } from "../dist/security/private-state.js";
 
 test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry, requires a token", () => {
@@ -154,6 +156,53 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
     "2026-01-01",
   );
   assert.equal(legacy.tokenNeverExpires, undefined, "legacy servers that omit expiry remain distinguishable");
+});
+
+test("organization role bundles require one complete strict policy/persona snapshot", () => {
+  for (const malformed of [
+    {},
+    { version: 1, roles: [] },
+    { version: 1, org_policy: {} },
+    { version: -1, org_policy: {}, roles: [] },
+    { version: 1, org_policy: {}, roles: [{ name: "../escape", system: "bad" }] },
+    { version: 1, org_policy: {}, roles: [{ name: "duplicate", system: "one" }, { name: "duplicate", system: "two" }] },
+  ]) assert.throws(() => parseOrganizationRoleBundleEnvelope(malformed));
+  const snapshot = parseOrganizationRoleBundleEnvelope({
+    version: 7,
+    org_policy: { toolDeny: ["bash"] },
+    roles: [{ name: "auditor", system: "Review safely." }],
+  });
+  assert.equal(snapshot.version, 7);
+  assert.deepEqual(snapshot.policy.toolDeny, ["bash"]);
+  assert.equal(snapshot.roles[0].organizationPolicyVersion, 7);
+});
+
+test("legacy Control enrollments receive a non-reusable Space generation while tenant Spaces stay stable", () => {
+  const legacyEnrollment = {
+    gatewayUrl: "https://control.example.test",
+    deviceToken: "legacy-token-a",
+    deviceId: "device-a",
+    model: "managed-model",
+    enrolledAt: "2026-08-23T00:00:00.000Z",
+  };
+  const first = gatewayProfileFromEnrollment("same-local-name", "Company A", legacyEnrollment);
+  const second = gatewayProfileFromEnrollment("same-local-name", "Company B", {
+    ...legacyEnrollment,
+    deviceToken: "legacy-token-b",
+    deviceId: "device-b",
+  });
+  assert.match(spaceIdForProfile(first), /^org-enrollment:[a-f0-9]{32}$/);
+  assert.match(spaceIdForProfile(second), /^org-enrollment:[a-f0-9]{32}$/);
+  assert.notEqual(spaceIdForProfile(first), spaceIdForProfile(second));
+
+  const tenantA = gatewayProfileFromEnrollment("alias-a", "Acme", { ...legacyEnrollment, tenantId: "tenant-acme" });
+  const tenantB = gatewayProfileFromEnrollment("alias-b", "Acme renamed", {
+    ...legacyEnrollment,
+    tenantId: "tenant-acme",
+    deviceToken: "rotated-token",
+  });
+  assert.equal(spaceIdForProfile(tenantA), "org:tenant-acme");
+  assert.equal(spaceIdForProfile(tenantB), "org:tenant-acme");
 });
 
 test("organization URL validation requires HTTPS outside loopback and rejects embedded credentials or paths", () => {
@@ -467,11 +516,13 @@ test("syncOrgRoles: pulls /v1/roles → ~/.hara/org-roles/*.md, maps snake→cam
   }
 });
 
-test("syncOrgRoles rejects traversal and Windows-special role names without writing outside org-roles", async () => {
+test("syncOrgRoles rejects an entire malformed bundle without writing any role", async () => {
   const home = mkdtempSync(join(tmpdir(), "hara-roles-traversal-"));
   const prev = process.env.HOME;
   process.env.HOME = home;
   const bundle = {
+    version: 1,
+    org_policy: {},
     roles: [
       { name: "../../escaped", system: "bad" },
       { name: "..\\escaped", system: "bad" },
@@ -495,8 +546,8 @@ test("syncOrgRoles rejects traversal and Windows-special role names without writ
   const url = `http://127.0.0.1:${server.address().port}`;
   try {
     await enrollDevice(url, "CODE");
-    assert.equal(await syncOrgRoles(), 1);
-    assert.ok(existsSync(join(orgRolesDir(), "safe-auditor.md")));
+    assert.equal(await syncOrgRoles(), 0, "one unsafe role invalidates the authenticated snapshot");
+    assert.equal(existsSync(join(orgRolesDir(), "safe-auditor.md")), false);
     assert.equal(existsSync(join(home, "escaped.md")), false);
     assert.equal(existsSync(join(home, ".hara", "escaped.md")), false);
     assert.equal(existsSync(join(orgRolesDir(), "CON.md")), false);
@@ -523,7 +574,7 @@ test("managed role bundles stay isolated by the session's exact organization pro
       ? { name: "managed-a-only", description: "A role", system: "You belong to organization A." }
       : { name: "managed-b-only", description: "B role", system: "You belong to organization B." };
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ roles: [role] }));
+    res.end(JSON.stringify({ version: token === "Bearer token-a" ? 1 : 2, org_policy: {}, roles: [role] }));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const gatewayUrl = `http://127.0.0.1:${server.address().port}`;
@@ -544,6 +595,8 @@ test("managed role bundles stay isolated by the session's exact organization pro
     defaultModel: "model-b",
   };
   try {
+    upsertProfile(profileA);
+    upsertProfile(profileB);
     assert.equal(await syncOrgRolesForProfile(profileA), 1);
     assert.equal(await syncOrgRolesForProfile(profileB), 1);
     assert.notEqual(
@@ -565,6 +618,230 @@ test("managed role bundles stay isolated by the session's exact organization pro
     else process.env.HOME = previousHome;
     rmSync(home, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("concurrent company role refreshes leave one complete atomic snapshot", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-role-concurrent-"));
+  const cwd = mkdtempSync(join(tmpdir(), "hara-role-concurrent-cwd-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  let requests = 0;
+  let release;
+  const bothStarted = new Promise((resolve) => { release = resolve; });
+  const server = createServer(async (req, res) => {
+    if (req.url !== "/v1/roles") {
+      res.writeHead(404);
+      return res.end();
+    }
+    const ordinal = ++requests;
+    if (requests === 2) release();
+    await bothStarted;
+    const version = ordinal;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      version,
+      org_policy: { toolDeny: version === 1 ? ["bash"] : ["write_file"] },
+      roles: [{ name: `agent-v${version}`, system: `Persona version ${version}.` }],
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const profile = {
+    id: "concurrent-org",
+    kind: "gateway",
+    tenantId: "tenant-concurrent",
+    gatewayUrl: `http://127.0.0.1:${server.address().port}`,
+    deviceToken: "concurrent-token",
+    deviceId: "concurrent-device",
+    defaultModel: "model",
+    enrolledAt: "2026-08-23T00:00:00.000Z",
+  };
+  try {
+    upsertProfile(profile);
+    assert.deepEqual(
+      await Promise.all([
+        syncOrgRolesForProfile(profile, undefined, { required: true }),
+        syncOrgRolesForProfile(profile, undefined, { required: true }),
+      ]),
+      [1, 1],
+    );
+    const raw = JSON.parse(readFileSync(join(orgRolesDir("concurrent-org"), "_bundle.json"), "utf8"));
+    const snapshot = parseOrganizationRoleBundleEnvelope(raw);
+    assert.equal(snapshot.roles.length, 1);
+    assert.equal(snapshot.roles[0].organizationPolicyVersion, snapshot.version);
+    assert.equal(loadRoles(cwd, "concurrent-org")[0].organizationPolicyVersion, snapshot.version);
+  } finally {
+    server.close();
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an in-flight role sync cannot populate a replacement company's Space", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-role-reenroll-race-"));
+  const cwd = mkdtempSync(join(tmpdir(), "hara-role-reenroll-cwd-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  let releaseFirstResponse;
+  let markFirstRequest;
+  const firstRequest = new Promise((resolve) => { markFirstRequest = resolve; });
+  const firstResponse = new Promise((resolve) => { releaseFirstResponse = resolve; });
+  const server = createServer(async (req, res) => {
+    if (req.url !== "/v1/roles") {
+      res.writeHead(404);
+      return res.end();
+    }
+    if (req.headers.authorization === "Bearer token-a") {
+      markFirstRequest();
+      await firstResponse;
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ version: 1, org_policy: {}, roles: [{ name: "agent-a", system: "Company A private policy." }] }));
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ version: 2, org_policy: {}, roles: [{ name: "agent-b", system: "Company B private policy." }] }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const gatewayUrl = `http://127.0.0.1:${server.address().port}`;
+  const profileA = {
+    id: "company",
+    kind: "gateway",
+    gatewayUrl,
+    deviceToken: "token-a",
+    deviceId: "device-a",
+    defaultModel: "model-a",
+    enrolledAt: "2026-08-23T00:00:00.000Z",
+  };
+  const profileB = {
+    ...profileA,
+    deviceToken: "token-b",
+    deviceId: "device-b",
+    defaultModel: "model-b",
+    enrolledAt: "2026-08-23T00:01:00.000Z",
+  };
+  try {
+    upsertProfile(profileA);
+    const spaceA = spaceIdForProfile(profileA);
+    const pending = syncOrgRolesForProfile(profileA);
+    await firstRequest;
+    upsertProfile(profileB);
+    const spaceB = spaceIdForProfile(profileB);
+    assert.notEqual(spaceA, spaceB);
+    releaseFirstResponse();
+    assert.equal(await pending, 0, "stale response is discarded after re-enrollment");
+    assert.equal(existsSync(join(orgRolesDir(spaceB), "agent-a.md")), false);
+
+    assert.equal(await syncOrgRolesForProfile(profileB), 1);
+    const roles = loadRoles(cwd, "company");
+    assert.ok(roles.some((role) => role.id === "agent-b"));
+    assert.equal(roles.some((role) => role.id === "agent-a"), false);
+  } finally {
+    releaseFirstResponse();
+    server.close();
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("managed role bundle sync is safe across real concurrent Hara processes", { timeout: 60_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-role-bundle-process-race-"));
+  const previousHome = process.env.HOME;
+  let requests = 0;
+  const server = createServer((req, res) => {
+    if (req.url !== "/v1/roles") {
+      res.writeHead(404);
+      return res.end();
+    }
+    requests += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      version: requests,
+      org_policy: { toolDeny: ["bash"] },
+      roles: [{ name: "safe-agent", system: "Use the current atomic company snapshot." }],
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const gatewayUrl = `http://127.0.0.1:${server.address().port}`;
+  try {
+    process.env.HOME = home;
+    upsertProfile({
+      id: "company",
+      kind: "gateway",
+      tenantId: "tenant-process-race",
+      gatewayUrl,
+      deviceId: "device-process-race",
+      deviceToken: "token-process-race",
+      defaultModel: "company-model",
+      enrolledAt: "2026-08-23T00:00:00.000Z",
+    });
+    const runChild = (index) => new Promise((resolve, reject) => {
+      const script = `import { syncOrgRolesForProfile } from "./dist/org-fleet/enroll.js";
+        import { getProfile } from "./dist/profile/profile.js";
+        const profile = getProfile("company");
+        if (!profile) throw new Error("missing company profile");
+        for (let i = 0; i < 12; i++) await syncOrgRolesForProfile(profile, undefined, { required: true });`;
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        cwd: process.cwd(),
+        env: { ...process.env, HOME: home, USERPROFILE: home },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.on("data", (chunk) => (stderr += String(chunk)));
+      child.once("error", reject);
+      child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`bundle child ${index} failed (${code}): ${stderr}`)));
+    });
+    await Promise.all(Array.from({ length: 4 }, (_, index) => runChild(index)));
+    const spaceId = spaceIdForProfile(getProfile("company"));
+    const roles = loadRoles(process.cwd(), "company");
+    assert.deepEqual(roles.map((role) => role.id), ["safe-agent"]);
+    const dir = orgRolesDir(spaceId);
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes(".hara-claim-") || name.endsWith(".lock") || name.endsWith(".reclaim")),
+      [],
+      "clean concurrent syncs leave no claim or lock debris",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("required role sync obeys caller cancellation while Control is stalled", { timeout: 10_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-role-sync-cancel-"));
+  const previousHome = process.env.HOME;
+  const server = createServer(() => { /* deliberately never respond */ });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const profile = {
+    id: "company",
+    kind: "gateway",
+    tenantId: "tenant-cancel",
+    gatewayUrl: `http://127.0.0.1:${server.address().port}`,
+    deviceId: "device-cancel",
+    deviceToken: "token-cancel",
+    defaultModel: "company-model",
+    enrolledAt: "2026-08-23T00:00:00.000Z",
+  };
+  try {
+    process.env.HOME = home;
+    upsertProfile(profile);
+    const controller = new AbortController();
+    const started = Date.now();
+    const pending = syncOrgRolesForProfile(profile, controller.signal, { required: true });
+    setTimeout(() => controller.abort(), 30);
+    await assert.rejects(pending);
+    assert.ok(Date.now() - started < 1_000, "caller abort interrupts the Control preflight promptly");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -613,6 +890,7 @@ test("organization learning is explicitly submitted, version-synced, injected on
   };
   try {
     upsertProfile(profile);
+    const organizationScopeId = spaceIdForProfile(profile);
     const capture = (taskId, evidence) => captureLearning({
       patternKey: "agent.authorized_action_execution",
       kind: "action_ownership",
@@ -620,13 +898,17 @@ test("organization learning is explicitly submitted, version-synced, injected on
       summary: "Execute authorized, tool-supported work and report verified results.",
       evidence,
       source: "runtime_guard",
-    }, { cwd, stateHome: home, profileId: profile.id, taskId });
+    }, { cwd, stateHome: home, profileId: organizationScopeId, taskId });
     capture("task-a", "The guard rejected advice and requested an execution tool call.");
     capture("task-a", "The agent used the available edit tool after the runtime reminder.");
     const stable = capture("task-b", "A second task executed and verified instead of delegating to the user.").candidate;
     assert.equal(stable.stability, "stable");
 
-    const submitted = await submitOrganizationLearning(profile.id, stable, { cwd, stateHome: home });
+    const submitted = await submitOrganizationLearning(profile.id, stable, {
+      cwd,
+      stateHome: home,
+      organizationScopeId,
+    });
     assert.equal(submitted.status, "pending");
     assert.equal(submitted.candidate.status, "submitted");
     assert.equal(submittedBody.pattern_key, stable.patternKey);
@@ -642,20 +924,21 @@ test("organization learning is explicitly submitted, version-synced, injected on
       revision: 2,
       updated_at: new Date().toISOString(),
     }];
-    const synced = await syncOrganizationLearnings(profile.id, { cwd, stateHome: home });
+    const synced = await syncOrganizationLearnings(profile.id, { cwd, stateHome: home, organizationScopeId });
     assert.equal(synced.version, 1);
     assert.equal(synced.learnings.length, 1);
-    assert.match(learningDigest(cwd, profile.id, home), /authorized_action_execution/);
+    assert.match(learningDigest(cwd, organizationScopeId, home), /authorized_action_execution/);
+    assert.doesNotMatch(learningDigest(cwd, "org:another-company", home), /authorized_action_execution/);
 
     bundleVersion = 2;
     bundleItems = [];
-    await syncOrganizationLearnings(profile.id, { cwd, stateHome: home });
+    await syncOrganizationLearnings(profile.id, { cwd, stateHome: home, organizationScopeId });
     assert.equal(
-      listLearnings({ cwd, profileId: profile.id, stateHome: home, scope: "organization" })
+      listLearnings({ cwd, profileId: organizationScopeId, stateHome: home, scope: "organization" })
         .some((item) => item.remoteId === submitted.remoteId && item.status === "approved"),
       false,
     );
-    assert.doesNotMatch(learningDigest(cwd, profile.id, home), /authorized_action_execution/);
+    assert.doesNotMatch(learningDigest(cwd, organizationScopeId, home), /authorized_action_execution/);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     if (previousHome === undefined) delete process.env.HOME;

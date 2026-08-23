@@ -118,15 +118,15 @@ test("gateway /agent discovery uses the persisted chat session profile", async (
     for (const [profileId, roleName] of [["org-a", "agent-a"], ["org-b", "agent-b"]]) {
       const dir = orgRolesDir(profileId);
       mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, `${roleName}.md`), [
-        "---",
-        `name: ${roleName}`,
-        `description: Managed role for ${profileId}.`,
-        "---",
-        "",
-        `You belong to ${profileId}.`,
-        "",
-      ].join("\n"));
+      writeFileSync(join(dir, "_bundle.json"), `${JSON.stringify({
+        version: 1,
+        org_policy: {},
+        roles: [{
+          name: roleName,
+          description: `Managed role for ${profileId}.`,
+          system: `You belong to ${profileId}.`,
+        }],
+      }, null, 2)}\n`);
     }
     saveSession({
       id: sessionId,

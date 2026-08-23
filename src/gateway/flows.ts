@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { chunkText, type InboundMsg } from "./telegram.js";
 import { deliverResult, parseDeliver } from "../cron/deliver.js";
-import { addPending } from "./flows-pending.js";
+import { addPending, captureNoToolAudience, type NoToolAudience } from "./flows-pending.js";
 import { redactSensitiveValue } from "../security/secrets.js";
 import type { GatewayFlowRunClaim, GatewayFlowRunStore, GatewayMessageDeduper } from "./runtime-state.js";
 
@@ -553,11 +553,12 @@ export function buildFlowPrompt(r: FlowRule, m: InboundMsg): string {
 export async function dispatchFlows(
   m: InboundMsg,
   platform: string,
-  runAgent: (prompt: string, cwd?: string, schema?: object, signal?: AbortSignal) => Promise<string>,
+  runAgent: (prompt: string, cwd?: string, schema?: object, signal?: AbortSignal, audience?: NoToolAudience) => Promise<string>,
   reply?: (text: string, idempotencyKey?: string) => Promise<void>,
   approvalOwner?: string,
   signal?: AbortSignal,
   effects?: FlowEffectContext,
+  frozenAudience: NoToolAudience = captureNoToolAudience(),
 ): Promise<boolean> {
   const flowOccurrences = new Map<string, number>();
   const matched = loadFlows()
@@ -618,7 +619,7 @@ export async function dispatchFlows(
           : undefined;
         let output = durableClaim?.output;
         if (output === undefined) {
-          output = (await runAgent(buildFlowPrompt(r, m), home, r.schema, signal)).trim();
+          output = (await runAgent(buildFlowPrompt(r, m), home, r.schema, signal, frozenAudience)).trim();
           if (!signal?.aborted) await durableClaim?.saveOutput(output);
         }
         if (signal?.aborted) return;
@@ -647,7 +648,12 @@ export async function dispatchFlows(
               return undefined;
             }
           }
-          return addPending({ ...action, owner: approvalOwner });
+          return addPending({
+            ...action,
+            owner: approvalOwner,
+            routeProfileId: frozenAudience.profileId,
+            spaceId: frozenAudience.spaceId,
+          });
         };
         // Every judged run lands in the log — the reviewable trail even when the noise policy stays silent.
         if (r.log !== false) {

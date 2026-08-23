@@ -1,4 +1,5 @@
 /** Provider-neutral conversation + provider interface (multi-provider core). */
+import type { OrganizationExecutionPolicy } from "../org/roles.js";
 
 export type ToolUse = { id: string; name: string; input: any };
 export type ToolResult = { id: string; name: string; content: string; isError?: boolean };
@@ -98,10 +99,25 @@ export interface TurnArgs {
   onActivity?: () => void;
   /** abort the in-flight request (user interrupt) */
   signal?: AbortSignal;
+  /** Company persona/policy snapshot expected by the caller. Organization-bound providers refresh Control
+   * immediately before the network request and refuse to send when this version has changed. */
+  organizationPolicyVersion?: number;
+}
+
+export interface ProviderExecutionSnapshot {
+  organizationPolicyVersion?: number;
+  /** Exact in-memory policy returned by the same authenticated Control response as the version above.
+   * Callers must not reconstruct the authorization receipt by rereading a concurrently refreshed cache. */
+  organizationPolicy?: OrganizationExecutionPolicy;
 }
 
 export interface Provider {
   id: string;
   model: string;
+  /** Optional preflight for providers bound to a mutable external authorization boundary. Agent loops
+   * call this before composing every model round so a freshly tightened organization policy can change
+   * the advertised tool surface and approval floor before any prompt leaves the machine. Direct callers
+   * remain protected by the provider's own turn() implementation. */
+  prepareTurn?(history: NeutralMsg[], signal?: AbortSignal): Promise<ProviderExecutionSnapshot | void>;
   turn(args: TurnArgs): Promise<TurnResult>;
 }
