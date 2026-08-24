@@ -188,8 +188,20 @@ test("an accepted change task cannot end as advice when an authorized tool can a
 test("the action ownership guard fails closed when a model refuses to act twice", async () => {
   const turn = newTurnInteraction();
   let task = createTaskExecution("perform the available change", turn.turnId);
+  let reads = 0;
+  const read = {
+    name: "fixture_ownership_read",
+    description: "test-only read",
+    input_schema: { type: "object", properties: {} },
+    kind: "read",
+    async run() {
+      reads += 1;
+      return "inspected current state";
+    },
+  };
   const p = provider([
     { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    { text: "", toolUses: [{ id: "r1", name: read.name, input: {} }], stop: "tool_use" },
     { text: "Do it yourself.", toolUses: [], stop: "end" },
     { text: "Still do it yourself.", toolUses: [], stop: "end" },
   ]);
@@ -200,6 +212,7 @@ test("the action ownership guard fails closed when a model refuses to act twice"
     approval: "full-auto",
     confirm: async () => true,
     quiet: true,
+    extraTools: [read],
     taskIntake: {
       task,
       current: () => task,
@@ -212,8 +225,69 @@ test("the action ownership guard fails closed when a model refuses to act twice"
     },
   });
   assert.equal(outcome.status, "error");
+  assert.equal(reads, 1, "read-only investigation does not satisfy a change task's execution ownership");
   assert.match(outcome.error, /execution ownership guard/);
   assert.doesNotMatch(JSON.stringify(history), /Do it yourself|Still do it yourself/);
+});
+
+test("successful owned work is preserved when the model omits its completion receipt twice", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("save the requested records", turn.turnId);
+  let writes = 0;
+  const visible = [];
+  const notices = [];
+  const write = {
+    name: "fixture_owned_write",
+    description: "test-only write",
+    input_schema: { type: "object", properties: {} },
+    kind: "edit",
+    async run() {
+      writes += 1;
+      return "records saved successfully";
+    },
+  };
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use" },
+    { text: "", toolUses: [{ id: "w1", name: write.name, input: {} }], stop: "tool_use" },
+    { text: "The records were saved successfully.", toolUses: [], stop: "end" },
+    { text: "The records were saved successfully.", toolUses: [], stop: "end" },
+  ]);
+  const history = [{ role: "user", content: "save the requested records" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: {
+      cwd: process.cwd(),
+      ui: {
+        text: (value) => visible.push(value),
+        reasoning: () => {},
+        tool: () => {},
+        diff: () => {},
+        notice: (value) => notices.push(value),
+      },
+    },
+    approval: "full-auto",
+    confirm: async () => true,
+    extraTools: [write],
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        task = next;
+      },
+    },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(writes, 1, "finished work is not repeated merely to satisfy a missing receipt");
+  assert.equal(task.checkpoint.completion, undefined, "the engine never fabricates verified evidence");
+  assert.match(notices.join("\n"), /completion receipt guard/);
+  assert.match(notices.join("\n"), /resumable checkpoint/);
+  assert.doesNotMatch(notices.join("\n"), /advice was not accepted|twice returned advice/);
+  assert.equal(visible.join("").match(/records were saved successfully/gi)?.length, 1);
+  assert.match(JSON.stringify(history), /Completion receipt correction/);
 });
 
 test("task_intake and an edit in the same model response cannot bypass the round boundary", async () => {

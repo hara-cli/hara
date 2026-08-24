@@ -1037,6 +1037,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   let contextGuardNotified = false;
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
   let actionOwnershipRetries = 0; // accepted change tasks may not terminate as advice without a typed blocker
+  let completionReceiptRetries = 0; // performed work gets one bounded chance to record final verification
+  let successfulOwnedActionObserved = false; // reads alone never satisfy execution ownership
   let recallExhausted = false; // after three empty attempts, hide only recall and allow a natural final answer
   const interruptedOutcome = (): RunOutcome => {
     const msg = "(interrupted)";
@@ -1173,7 +1175,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     if (recallExhausted) specs = specs.filter((tool) => !RECALL_TOOLS.has(tool.name));
     const sink = ctx.ui; // TUI mode: route output to ink instead of stdout
     syncIntakeTask();
-    const suppressUnverifiedActionProse = intakeTask?.brief?.intent === "change" && !freshTaskCompletion(intakeTask);
+    const suppressUnverifiedActionProse =
+      intakeTask?.brief?.intent === "change"
+      && !freshTaskCompletion(intakeTask)
+      && !(successfulOwnedActionObserved && completionReceiptRetries > 0);
     const assembledSystem = composeSystem(
       ctx.cwd,
       opts.projectContext,
@@ -1474,6 +1479,28 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       && intakeTask?.brief?.intent === "change"
       && !freshTaskCompletion(intakeTask)
     ) {
+      if (successfulOwnedActionObserved) {
+        if (completionReceiptRetries < 1) {
+          completionReceiptRetries += 1;
+          history.pop();
+          showRunNotice(
+            opts,
+            "✻ completion receipt guard: work was performed; asking the Agent to verify and record the result…",
+          );
+          history.push({
+            role: "user",
+            content: wrapReminders([
+              "Completion receipt correction: you already completed at least one concrete change action in this task. Do not repeat finished work and do not hand remaining work to the user. If the accepted checks now pass, record task_checkpoint completion.state=verified with concise observable evidence in its own tool round. If work remains, take the next concrete action. Use awaiting_user only for a currently observed typed human-only dependency.",
+            ]),
+          });
+          continue;
+        }
+        showRunNotice(
+          opts,
+          "✻ work was performed, but final verification was not recorded; keeping the result as a resumable checkpoint.",
+        );
+        return { status: "completed" };
+      }
       history.pop();
       try {
         captureLearning({
@@ -2109,6 +2136,15 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           if (!settled.ok) throw settled.error;
         }
         const res = toolResult === RUN_STOPPED ? (settled as { ok: true; value: string }).value : toolResult;
+        const resultLooksFailed = looksFailed(res, p.tu.name);
+        if (
+          !resultLooksFailed
+          && intakeTask?.brief?.intent === "change"
+          && (p.operation?.effect === "edit" || p.operation?.effect === "exec" || p.operation?.effect === "computer")
+        ) {
+          successfulOwnedActionObserved = true;
+          completionReceiptRetries = 0;
+        }
         // append any not-yet-seen subdirectory AGENTS.md/CLAUDE.md this call touched (monorepo-local conventions)
         // + the repeat-guard's anti-spinning note when this exact call keeps failing (repeat-guard.ts)
         results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) + noteCall(p.tu.name, p.tu.input, res) };

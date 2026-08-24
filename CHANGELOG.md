@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.152.2 — 2026-08-24 — execution ownership completion recovery
+
+- Distinguish a real post-action completion receipt omission from advice-only delegation. After a successful
+  edit, execution, or computer action, Hara asks once for the final verified task receipt; if the model still
+  omits it, the completed tool result and final summary remain as a resumable checkpoint instead of being
+  mislabeled as “the model twice returned advice instead of acting.”
+- Keep the ownership boundary strict before any real action: reads and investigation alone never satisfy an
+  accepted change task, so a model that keeps handing executable work back to the user is still stopped.
+- Add deterministic coverage for both paths and a sanitized feedback receipt for post-action completion
+  recovery. Upgrade with `npm i -g @nanhara/hara@0.152.2`.
+
 ## 0.152.1 — 2026-08-24 — Python syntax-aware Agent recovery
 
 - Recognize Python `SyntaxError`, `IndentationError`, and `TabError` from both shell helpers and the direct

@@ -16,17 +16,17 @@ test("sanitized real-feedback regression suite passes its budgets", () => {
   const suite = evaluateFeedbackSuite(loadFeedbackTraces(traceDirectory));
   assert.equal(suite.passed, true, JSON.stringify(suite.reports));
   assert.deepEqual(suite.summary, {
-    cases: 7,
-    passed: 7,
+    cases: 8,
+    passed: 8,
     failed: 0,
-    expectedCompleted: 6,
-    completed: 6,
+    expectedCompleted: 7,
+    completed: 7,
     completionSuccessRate: 1,
     averageRounds: 4,
-    averageToolCalls: 2.71,
+    averageToolCalls: 2.63,
     approvals: 0,
     userInterventions: 0,
-    agentOwnedActions: 1,
+    agentOwnedActions: 2,
     wrongUserDelegations: 0,
     maxRepeatedFailureAttempts: 2,
   });

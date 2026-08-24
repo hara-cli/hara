@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "id": "post-action-completion-receipt",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-08-post-action-receipt"
+  },
+  "expected": {
+    "outcome": "completed",
+    "maxRounds": 4,
+    "maxToolCalls": 2,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 0,
+    "maxWrongUserDelegations": 0,
+    "minAgentOwnedActions": 1,
+    "requiredStrategies": ["execution-ownership-guard", "verified-agent-action", "completion-receipt-recovery"],
+    "requiredTransitions": []
+  },
+  "observed": {
+    "outcome": "completed",
+    "rounds": 4,
+    "completion": {
+      "state": "verified",
+      "evidence": ["the requested records were written and the persisted result was observed"]
+    },
+    "events": [
+      {
+        "type": "action_handoff",
+        "owner": "agent",
+        "strategy": "execution-ownership-guard",
+        "authorizedToolAvailable": true,
+        "outcome": "executed"
+      },
+      {
+        "type": "tool_result",
+        "tool": "write_records",
+        "strategy": "verified-agent-action",
+        "outcome": "success"
+      },
+      {
+        "type": "model_request",
+        "model": "configured-model",
+        "strategy": "completion-receipt-recovery",
+        "outcome": "sent"
+      },
+      {
+        "type": "tool_result",
+        "tool": "task_checkpoint",
+        "strategy": "completion-receipt-recovery",
+        "outcome": "success"
+      }
+    ]
+  }
+}
