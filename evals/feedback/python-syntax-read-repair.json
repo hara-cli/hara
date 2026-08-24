@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "id": "python-syntax-read-repair",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-08-python-syntax-repair"
+  },
+  "expected": {
+    "outcome": "completed",
+    "maxRounds": 7,
+    "maxToolCalls": 5,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 2,
+    "requiredStrategies": [
+      "generated-python-helper",
+      "current-source-read",
+      "exact-source-repair",
+      "syntax-only-validation"
+    ],
+    "requiredTransitions": [
+      {
+        "fromFailureClass": "python.syntax",
+        "toStrategy": "current-source-read",
+        "withinToolCalls": 1
+      }
+    ]
+  },
+  "observed": {
+    "outcome": "completed",
+    "rounds": 6,
+    "completion": {
+      "state": "verified",
+      "evidence": [
+        "the repaired source passed syntax-only validation before the requested operation ran"
+      ]
+    },
+    "events": [
+      {
+        "type": "tool_result",
+        "tool": "write_file",
+        "strategy": "generated-python-helper",
+        "outcome": "success"
+      },
+      {
+        "type": "tool_result",
+        "tool": "bash",
+        "strategy": "generated-python-helper",
+        "outcome": "failure",
+        "failureClass": "python.syntax"
+      },
+      {
+        "type": "tool_result",
+        "tool": "read_file",
+        "strategy": "current-source-read",
+        "outcome": "success"
+      },
+      {
+        "type": "tool_result",
+        "tool": "edit_file",
+        "strategy": "exact-source-repair",
+        "outcome": "success"
+      },
+      {
+        "type": "tool_result",
+        "tool": "bash",
+        "strategy": "syntax-only-validation",
+        "outcome": "success"
+      }
+    ]
+  }
+}

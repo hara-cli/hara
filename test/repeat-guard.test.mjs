@@ -2,7 +2,16 @@
 // this" note appended to its result; successes never warn and reset the streak.
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { failureIdentities, failureIdentity, recordCall, looksFailed, keyOf, resetRepeatGuard } from "../dist/agent/repeat-guard.js";
+import {
+  failureIdentities,
+  failureIdentity,
+  keyOf,
+  looksFailed,
+  pythonSyntaxDiagnostic,
+  pythonSyntaxRecoveryNote,
+  recordCall,
+  resetRepeatGuard,
+} from "../dist/agent/repeat-guard.js";
 
 beforeEach(() => resetRepeatGuard());
 
@@ -18,6 +27,7 @@ test("looksFailed: hara's failure-string shapes; success output is not a failure
 });
 
 test("looksFailed: recognizes tool-specific built-in diagnostics without classifying ordinary prose", () => {
+  assert.equal(looksFailed('Python failed: exit code 1.\n  File "<stdin>", line 1\nSyntaxError: invalid syntax', "python"), true);
   assert.equal(looksFailed("Search failed across available providers (Google: timeout). Check connectivity.", "web_search"), true);
   assert.equal(looksFailed("[codex exit 1]\nbackend failed", "external_agent"), true);
   assert.equal(looksFailed("[claude] failed to start: spawn ENOENT", "external_agent"), true);
@@ -34,6 +44,7 @@ test("looksFailed: recognizes tool-specific built-in diagnostics without classif
   assert.equal(looksFailed("The cron output was: ✗ a1 failed: exit 7", "read_file"), false);
   assert.equal(looksFailed("A user may write Refused: in ordinary prose.", "web_fetch"), false);
   assert.equal(looksFailed("Search failed across available providers (quoted example)."), false, "tool identity is required for ambiguous prose-like shapes");
+  assert.equal(looksFailed("Python failed is an article title.", "read_file"), false, "Python diagnostics require the python tool identity");
 });
 
 test("three empty recall queries coalesce across changed arguments and both recall tools", () => {
@@ -90,6 +101,38 @@ test("three parameter variants sharing one command strategy and API error force 
   assert.match(recordCall("bash", { command: commands[2] }, failure), /3 variants.*without intervening progress.*stop this strategy now/is);
   const identities = failureIdentities("bash", { command: commands[0] }, failure);
   assert.equal(identities.find((identity) => identity.kind === "strategy")?.hardStopAfter, 3);
+});
+
+test("Python syntax failures expose a bounded read-before-repair instruction", () => {
+  assert.equal(
+    pythonSyntaxDiagnostic("Command failed: assertion expected SyntaxError but received ValueError"),
+    undefined,
+    "an exception name mentioned in ordinary failure prose is not a parser receipt",
+  );
+  const failure = [
+    "Command failed: exit code 1",
+    String.raw`  File "D:\Work\automation\upload_helper.py", line 51`,
+    "    target = “broken”",
+    "             ^",
+    "SyntaxError: invalid character '“' (U+201C)",
+  ].join("\n");
+  assert.deepEqual(pythonSyntaxDiagnostic(failure), {
+    kind: "SyntaxError",
+    file: "D:\\Work\\automation\\upload_helper.py",
+    line: 51,
+    label: "upload_helper.py",
+  });
+  const note = pythonSyntaxRecoveryNote(failure);
+  assert.match(note, /SyntaxError at upload_helper\.py:51/);
+  assert.match(note, /call read_file for that exact file and the reported line region/);
+  assert.match(note, /straight ASCII quotes/);
+  assert.doesNotMatch(note, /D:\\Work/, "the repeated instruction does not expose the full local path");
+  const strategy = failureIdentities(
+    "bash",
+    { command: "python upload_helper.py" },
+    failure,
+  ).find((identity) => identity.kind === "strategy");
+  assert.match(strategy?.key ?? "", /Python SyntaxError/);
 });
 
 test("two unusable SPA fetch variants stop the text-fetch strategy and direct the agent to a real browser", () => {

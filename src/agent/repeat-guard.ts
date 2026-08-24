@@ -14,6 +14,8 @@ const HOME_WORKSPACE_BOUNDARY_KEY = "root-cause:home-workspace-boundary";
 const EMPTY_RECALL_KEY = "root-cause:empty-memory-or-session-recall";
 
 function stableFailureSignal(content: string): string | undefined {
+  const pythonSyntax = pythonSyntaxDiagnostic(content);
+  if (pythonSyntax) return `Python ${pythonSyntax.kind}`;
   if (/web_fetch (?:received only a JavaScript SPA shell|could not verify the rendered page)/iu.test(content)) {
     return "browser rendering unavailable";
   }
@@ -25,6 +27,57 @@ function stableFailureSignal(content: string): string | undefined {
     return "parameter validation error";
   }
   return undefined;
+}
+
+export interface PythonSyntaxDiagnostic {
+  kind: "SyntaxError" | "IndentationError" | "TabError";
+  /** Omitted for stdin/string compilation diagnostics such as File "<stdin>". */
+  file?: string;
+  /** One-based source line reported by Python, when present. */
+  line?: number;
+  /** Basename-only label safe to repeat in a recovery instruction. */
+  label?: string;
+}
+
+/** Extract Python's parse-time diagnostic without executing or interpreting any source text. */
+export function pythonSyntaxDiagnostic(content: string): PythonSyntaxDiagnostic | undefined {
+  const kindMatch = /(?:^|\r?\n)\s*(SyntaxError|IndentationError|TabError)(?=:|\s*$)/u.exec(content);
+  if (!kindMatch) return undefined;
+  const kind = kindMatch[1] as PythonSyntaxDiagnostic["kind"];
+  const fileMatches = [...content.matchAll(/\bFile\s+["']([^"'\r\n]+)["']\s*,\s*line\s+(\d+)/gu)];
+  const fileMatch = fileMatches.at(-1);
+  const rawFile = fileMatch?.[1]?.trim();
+  const file = rawFile && !/^<[^>]+>$/u.test(rawFile) ? rawFile : undefined;
+  const lineValue = fileMatch ? Number(fileMatch[2]) : undefined;
+  const line = Number.isSafeInteger(lineValue) && (lineValue ?? 0) > 0 ? lineValue : undefined;
+  const rawLabel = file
+    ? file.replace(/\\/gu, "/").split("/").filter(Boolean).at(-1)
+    : undefined;
+  const label = rawLabel?.replace(/[\u0000-\u001f\u007f]/gu, "").slice(0, 160) || undefined;
+  return {
+    kind,
+    ...(file ? { file } : {}),
+    ...(line ? { line } : {}),
+    ...(label ? { label } : {}),
+  };
+}
+
+/** Deterministic recovery instruction appended to a failed execution result. It deliberately names only
+ * the basename: full local paths and source lines already remain in the private tool transcript. */
+export function pythonSyntaxRecoveryNote(content: string): string {
+  const diagnostic = pythonSyntaxDiagnostic(content);
+  if (!diagnostic) return "";
+  const location = diagnostic.label
+    ? `${diagnostic.label}${diagnostic.line ? `:${diagnostic.line}` : ""}`
+    : "the submitted Python source";
+  const inspect = diagnostic.file
+    ? "Before another edit, call read_file for that exact file and the reported line region; repair from the current bytes, not from an earlier draft or a guessed old_string. "
+    : "Revise the submitted source materially instead of resending the same code. ";
+  return (
+    `\n\n↺ hara syntax recovery: Python reported ${diagnostic.kind} at ${location}. ${inspect}` +
+    "Use straight ASCII quotes as Python delimiters (typographic quotes may appear only inside an already quoted string/comment), " +
+    "then run syntax validation again. For one-shot library work, prefer the python tool's stdin source instead of a durable helper .py file."
+  );
 }
 
 function webFetchStrategyAnchor(name: string, input: unknown): string | undefined {
@@ -113,6 +166,7 @@ export function looksFailed(content: string, name?: string): boolean {
   const text = content.trimStart();
   if (/^(Command failed|Error:|Failed:|Blocked:|Skipped without running)/.test(text)) return true;
 
+  if (name === "python") return /^Python failed:/u.test(text);
   if (name === "memory_search" || name === "session_search") {
     return /^\(no (?:memory|session) matches\)\s*$/.test(text);
   }

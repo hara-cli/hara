@@ -59,6 +59,9 @@ test("system prompt edits existing documents in place without durable helper scr
   assert.match(system, /Do not invent suffix copies/);
   assert.match(system, /call the python tool with source directly/);
   assert.match(system, /never write a durable helper \.py file/);
+  assert.match(system, /later\s+syntax\/validation\/execution failure[\s\S]*read the exact current file/);
+  assert.match(system, /straight ASCII quote characters as language delimiters/);
+  assert.match(system, /syntax-only validation before the first[\s\S]*execution/);
   assert.match(system, /remove it in finally\/on failure/);
   assert.match(system, /visually inspect representative pages/);
   assert.match(system, /clipped\/overlapping[\s\S]*cramped tables[\s\S]*stray template language/);

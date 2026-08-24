@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.152.1 — 2026-08-24 — Python syntax-aware Agent recovery
+
+- Recognize Python `SyntaxError`, `IndentationError`, and `TabError` from both shell helpers and the direct
+  Python tool, retain the reported basename and source line, and give the model a concrete bounded recovery
+  instruction instead of treating a failed direct Python call as progress.
+- Require the Agent to read the exact current file and reported line region before it may edit or rewrite a
+  generated Python file that failed to parse. Guessed repairs based on an earlier draft are rejected before
+  they can mutate the file; the existing repeated-call circuit breaker still bounds a model that ignores the
+  recovery path.
+- Clarify the execution contract for generated code: use straight ASCII delimiters, syntax-check durable
+  executable source before side effects, and keep one-shot library work in the direct Python tool. The same
+  conversation remains usable after a failed turn; no new session is required. Upgrade with
+  `npm i -g @nanhara/hara@0.152.1`.
+
 ## 0.152.0 — 2026-08-23 — Personal/company Spaces and managed Agent profiles
 
 - Add a first-class Personal/company Space directory backed by Control-authoritative tenant identity. Every

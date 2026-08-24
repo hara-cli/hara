@@ -274,6 +274,80 @@ test("one retry of an identical failed tool call trips the repeat-loop circuit b
   assert.equal(history.at(-1).role, "tool", "the last assistant tool_use remains protocol-complete");
 });
 
+test("a Python syntax failure requires an exact read before a repair edit", async () => {
+  let turns = 0;
+  let edits = 0;
+  const helperPath = join(testHomeRoot, "upload_helper.py");
+  const provider = {
+    id: "python-syntax-recovery",
+    model: "python-syntax-recovery",
+    async turn() {
+      turns += 1;
+      if (turns === 1) {
+        return { text: "", toolUses: [{ id: "run-bad", name: "fixture_python_exec", input: { command: `python ${helperPath}` } }], stop: "tool_use" };
+      }
+      if (turns === 2) {
+        return { text: "", toolUses: [{ id: "guess-edit", name: "edit_file", input: { path: helperPath, old_string: "guessed", new_string: "fixed" } }], stop: "tool_use" };
+      }
+      if (turns === 3) {
+        return { text: "", toolUses: [{ id: "read-current", name: "read_file", input: { path: helperPath, offset: 45, limit: 12 } }], stop: "tool_use" };
+      }
+      if (turns === 4) {
+        return { text: "", toolUses: [{ id: "exact-edit", name: "edit_file", input: { path: helperPath, old_string: "target = “broken”", new_string: 'target = "fixed"' } }], stop: "tool_use" };
+      }
+      return { text: "repaired", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "repair the generated helper" }];
+  const outcome = await runAgent(history, base(provider, {
+    maxRounds: 10,
+    timeoutMs: "10s",
+    quiet: true,
+    extraTools: [
+      {
+        name: "fixture_python_exec",
+        description: "sanitized Python execution fixture",
+        input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+        kind: "exec",
+        async run() {
+          return [
+            "Command failed: exit code 1",
+            `  File "${helperPath}", line 51`,
+            "    target = “broken”",
+            "             ^",
+            "SyntaxError: invalid character '“' (U+201C)",
+          ].join("\n");
+        },
+      },
+      {
+        name: "read_file",
+        description: "read current helper source",
+        input_schema: { type: "object", properties: { path: { type: "string" }, offset: { type: "number" }, limit: { type: "number" } }, required: ["path"] },
+        kind: "read",
+        concurrencySafe: true,
+        async run() { return "    51\ttarget = “broken”"; },
+      },
+      {
+        name: "edit_file",
+        description: "repair current helper source",
+        input_schema: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" } }, required: ["path", "old_string", "new_string"] },
+        kind: "edit",
+        async run() { edits += 1; return "Edited upload_helper.py: 1 edit, 1 replacement."; },
+      },
+    ],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(turns, 5);
+  assert.equal(edits, 1, "the guessed edit is denied before execution; only the post-read repair runs");
+  const toolText = history
+    .filter((message) => message.role === "tool")
+    .flatMap((message) => message.results)
+    .map((result) => result.content)
+    .join("\n");
+  assert.match(toolText, /Python syntax recovery gate/);
+  assert.match(toolText, /current upload_helper\.py around line 51 has now been read/);
+});
+
 test("three changed command variants with one stable API failure trip the strategy breaker", async () => {
   let turns = 0;
   const provider = {

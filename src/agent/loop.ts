@@ -31,7 +31,13 @@ import {
   type ProjectApprovalScope,
 } from "../security/project-approvals.js";
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
-import { failureIdentities, looksFailed, recordCall } from "./repeat-guard.js";
+import {
+  failureIdentities,
+  looksFailed,
+  pythonSyntaxDiagnostic,
+  pythonSyntaxRecoveryNote,
+  recordCall,
+} from "./repeat-guard.js";
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
@@ -138,7 +144,11 @@ pyproject.toml / go.mod), README, build/CI config — then chase only what the t
 grep/glob; don't read whole large files when a targeted search answers the question. For a long file,
 grep to locate then read_file just that region with offset/limit — not the whole file. After a successful
 edit_file/write_file do NOT re-read the file to verify — the tool already applied and diffed the change;
-re-reading a big file after every edit is the slowest habit an agent can have.
+re-reading a big file after every edit is the slowest habit an agent can have. The exception is a later
+syntax/validation/execution failure: then read the exact current file and reported line region before repairing,
+because an earlier draft or guessed old_string is no longer authoritative. For generated executable source,
+use straight ASCII quote characters as language delimiters and run a syntax-only validation before the first
+side-effecting execution; typographic quotes belong only inside an already quoted string or comment.
 Before creating a new integration, upload, conversion, or automation script, make one targeted search of
 the manifest and conventional tools/, scripts/, bin/, and lib/ locations for an existing SDK/client/helper;
 reuse or extend it when it already owns the workflow. Do not recursively dump the workspace. When Bash or
@@ -494,10 +504,27 @@ interface RunLifecycle {
   limitAnnounced: boolean;
   disposed: boolean;
   failedCalls: Map<string, number>;
+  pythonSyntaxRecovery?: {
+    file: string;
+    label: string;
+    line?: number;
+    readObserved: boolean;
+  };
   taskRoundsUsed: number;
   taskRoundLimit?: number;
   taskRoundCheckpointAt?: number;
   taskRoundCheckpointInjected: boolean;
+}
+
+function normalizedRecoveryPath(value: string): string {
+  return value.trim().replace(/\\/gu, "/").replace(/\/+/gu, "/").replace(/^\.\//u, "").toLowerCase();
+}
+
+function sameRecoveryFile(expected: string, candidate: unknown): boolean {
+  if (typeof candidate !== "string" || !candidate.trim()) return false;
+  const left = normalizedRecoveryPath(expected);
+  const right = normalizedRecoveryPath(candidate);
+  return left === right || left.endsWith(`/${right}`) || right.endsWith(`/${left}`);
 }
 
 export function deadlineCheckpointReminder(timeoutMs: number): string {
@@ -1530,9 +1557,19 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
     let repeatHalt: { label: string; count: number } | null = null;
     const noteCall = (name: string, input: unknown, content: string, isError = false): string => {
-      const note = recordCall(name, input, content, isError, ctx.todoScope);
+      let note = recordCall(name, input, content, isError, ctx.todoScope);
       const identities = failureIdentities(name, input, content, isError);
       if (isError || looksFailed(content, name)) {
+        const syntax = pythonSyntaxDiagnostic(content);
+        if (syntax?.file) {
+          life.pythonSyntaxRecovery = {
+            file: syntax.file,
+            label: syntax.label ?? "Python source",
+            ...(syntax.line ? { line: syntax.line } : {}),
+            readObserved: false,
+          };
+        }
+        note += pythonSyntaxRecoveryNote(content);
         const counts = identities.map((identity) => ({
           identity,
           count: (life.failedCalls.get(identity.key) ?? 0) + 1,
@@ -1561,6 +1598,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           }
         }
       } else {
+        const recovery = life.pythonSyntaxRecovery;
+        const inputPath = (input as { path?: unknown } | null)?.path;
+        if (recovery && name === "read_file" && sameRecoveryFile(recovery.file, inputPath)) {
+          recovery.readObserved = true;
+          note += (
+            `\n\n↺ hara syntax recovery: current ${recovery.label}` +
+            `${recovery.line ? ` around line ${recovery.line}` : ""} has now been read. ` +
+            "Repair using this exact text with materially different edit arguments, then validate syntax before execution."
+          );
+        }
         // Any successful action is progress (in particular edit/exec calls that may have fixed the
         // underlying cause), so a later retry starts a fresh failure streak.
         life.failedCalls.clear();
@@ -1650,6 +1697,24 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         continue;
       }
       const input = tu.input as Record<string, unknown>;
+      const syntaxRecovery = life.pythonSyntaxRecovery;
+      if (
+        syntaxRecovery
+        && !syntaxRecovery.readObserved
+        && (tu.name === "edit_file" || tu.name === "write_file")
+        && sameRecoveryFile(syntaxRecovery.file, input.path)
+      ) {
+        plans.push({
+          tu,
+          tool,
+          denied:
+            `Python syntax recovery gate: ${syntaxRecovery.label}` +
+            `${syntaxRecovery.line ? ` failed near line ${syntaxRecovery.line}` : " failed to parse"}. ` +
+            "This edit was NOT executed. Read the exact current file and reported line region with read_file first; " +
+            "then repair from those bytes with materially different edit arguments and validate syntax again.",
+        });
+        continue;
+      }
       if (tu.name === "task_checkpoint" && input.completion !== undefined && r.toolUses.length > 1) {
         plans.push({
           tu,
