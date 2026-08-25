@@ -59,6 +59,8 @@ export interface Role {
   file?: string;
   /** Safe presentation identity. The private persona remains in `system` and never enters catalogs. */
   identity?: AgentPublicIdentity;
+  /** Immutable, public install provenance for a hired catalog blueprint. It never grants tools. */
+  blueprint?: AgentBlueprintProvenance;
   /** Optional execution workspace owned by an imported global Agent. */
   home?: string;
   system: string;
@@ -69,6 +71,21 @@ export interface CreateNativeAgentInput {
   description?: string;
   instructions?: string;
   profile: AgentPublicIdentityInput;
+  blueprint?: AgentBlueprintInstallInput;
+}
+
+export interface AgentBlueprintInstallInput {
+  id: string;
+  version: string;
+  publisher: string;
+  source: string;
+  sourceRevision: string;
+  license: string;
+}
+
+export interface AgentBlueprintProvenance extends AgentBlueprintInstallInput {
+  /** SHA-256 over normalized provenance plus the installed private prompt body. */
+  digest: string;
 }
 
 export function rolesDir(cwd: string): string {
@@ -464,6 +481,89 @@ function identityFrontmatterLines(identity: AgentPublicIdentity): string[] {
   return lines;
 }
 
+const BLUEPRINT_ID_RE = /^[a-z0-9][a-z0-9._/-]{0,159}$/;
+const BLUEPRINT_VERSION_RE = /^[a-z0-9][a-z0-9._+-]{0,63}$/i;
+const BLUEPRINT_REVISION_RE = /^[a-z0-9][a-z0-9._:-]{0,127}$/i;
+const BLUEPRINT_DIGEST_RE = /^[a-f0-9]{64}$/;
+
+function boundedBlueprintText(value: unknown, field: string, cap: number): string {
+  if (typeof value !== "string") throw new Error(`Agent blueprint ${field} must be a string`);
+  const normalized = value.trim();
+  if (!normalized || normalized.length > cap || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new Error(`Agent blueprint ${field} must be non-empty, bounded, and contain no control characters`);
+  }
+  return normalized;
+}
+
+function normalizeBlueprintInstallInput(input: AgentBlueprintInstallInput): AgentBlueprintInstallInput {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("Agent blueprint provenance must be an object");
+  }
+  const id = boundedBlueprintText(input.id, "id", 160).toLowerCase();
+  const version = boundedBlueprintText(input.version, "version", 64);
+  const publisher = boundedBlueprintText(input.publisher, "publisher", 100);
+  const source = boundedBlueprintText(input.source, "source", 512);
+  const sourceRevision = boundedBlueprintText(input.sourceRevision, "sourceRevision", 128);
+  const license = boundedBlueprintText(input.license, "license", 64);
+  if (!BLUEPRINT_ID_RE.test(id)) throw new Error("Agent blueprint id is invalid");
+  if (!BLUEPRINT_VERSION_RE.test(version)) throw new Error("Agent blueprint version is invalid");
+  if (!BLUEPRINT_REVISION_RE.test(sourceRevision)) throw new Error("Agent blueprint sourceRevision is invalid");
+  let sourceUrl: URL;
+  try {
+    sourceUrl = new URL(source);
+  } catch {
+    throw new Error("Agent blueprint source must be an absolute HTTPS URL");
+  }
+  if (sourceUrl.protocol !== "https:" || sourceUrl.username || sourceUrl.password || sourceUrl.search || sourceUrl.hash) {
+    throw new Error("Agent blueprint source must be a credential-free HTTPS URL");
+  }
+  return { id, version, publisher, source: sourceUrl.toString(), sourceRevision, license };
+}
+
+function blueprintInstallDigest(input: AgentBlueprintInstallInput, instructions: string): string {
+  return createHash("sha256")
+    .update("hara-agent-blueprint-install-v1\0")
+    .update(JSON.stringify(input))
+    .update("\0")
+    .update(instructions)
+    .digest("hex");
+}
+
+function blueprintFrontmatterLines(blueprint: AgentBlueprintProvenance): string[] {
+  return [
+    `blueprint-id: ${JSON.stringify(blueprint.id)}`,
+    `blueprint-version: ${JSON.stringify(blueprint.version)}`,
+    `blueprint-publisher: ${JSON.stringify(blueprint.publisher)}`,
+    `blueprint-source: ${JSON.stringify(blueprint.source)}`,
+    `blueprint-source-revision: ${JSON.stringify(blueprint.sourceRevision)}`,
+    `blueprint-license: ${JSON.stringify(blueprint.license)}`,
+    `blueprint-digest: ${JSON.stringify(blueprint.digest)}`,
+  ];
+}
+
+function blueprintFromMetadata(
+  metadata: Record<string, unknown>,
+  instructions: string,
+): AgentBlueprintProvenance | undefined {
+  try {
+    const normalized = normalizeBlueprintInstallInput({
+      id: metadata["blueprint-id"] as string,
+      version: metadata["blueprint-version"] as string,
+      publisher: metadata["blueprint-publisher"] as string,
+      source: metadata["blueprint-source"] as string,
+      sourceRevision: metadata["blueprint-source-revision"] as string,
+      license: metadata["blueprint-license"] as string,
+    });
+    const digest = String(metadata["blueprint-digest"] ?? "").trim().toLowerCase();
+    if (!BLUEPRINT_DIGEST_RE.test(digest) || digest !== blueprintInstallDigest(normalized, instructions)) {
+      return undefined;
+    }
+    return { ...normalized, digest };
+  } catch {
+    return undefined;
+  }
+}
+
 function replacePublicIdentityFrontmatter(text: string, identity: AgentPublicIdentity): string {
   const match = /^---(\r?\n)([\s\S]*?)(\r?\n)---(\r?\n?)([\s\S]*)$/.exec(text);
   if (!match) throw new Error("native Agent file has no editable top-level frontmatter");
@@ -510,12 +610,17 @@ export async function createNativeGlobalAgent(
     identity.traits?.length ? `Work style: ${identity.traits.join(", ")}.` : "",
     "Take ownership of assigned work, use available tools, and return verified outcomes instead of handing routine execution back to the user.",
   ].filter(Boolean).join("\n\n");
+  const blueprintInput = input.blueprint ? normalizeBlueprintInstallInput(input.blueprint) : undefined;
+  const blueprint = blueprintInput
+    ? { ...blueprintInput, digest: blueprintInstallDigest(blueprintInput, instructions) }
+    : undefined;
   const file = join(globalRolesDir(), `${id}.md`);
   const content = [
     "---",
     `name: ${id}`,
     `description: ${JSON.stringify(description || `${identity.displayName} Agent`)}`,
     ...identityFrontmatterLines(identity),
+    ...(blueprint ? blueprintFrontmatterLines(blueprint) : []),
     "---",
     instructions,
     "",
@@ -758,6 +863,7 @@ function rolesFromDirs(dirs: RoleDir[]): Map<string, Role> {
           source,
           file,
           identity: agentIdentityFromMetadata(fm, id, String(fm.description ?? ""), source),
+          blueprint: blueprintFromMetadata(fm, body),
           system: body,
         });
       } catch {

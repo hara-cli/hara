@@ -144,6 +144,7 @@ import {
   roleToolFilter,
   updateMainAgentIdentity,
   updateNativeRoleIdentity,
+  type AgentBlueprintProvenance,
   type Role,
 } from "../org/roles.js";
 import { agentIdentityFromMetadata, type AgentPublicIdentity } from "../org/agent-identity.js";
@@ -333,6 +334,8 @@ export interface ServeAgentInfo {
   project?: string;
   model?: string;
   readOnly?: boolean;
+  /** Verified install provenance only; private blueprint prompt text is never serialized. */
+  blueprint?: AgentBlueprintProvenance;
   /** Space that owns the Agent catalog entry and every conversation created from it. */
   spaceId: string;
   owner: "personal" | "organization" | "external";
@@ -480,6 +483,7 @@ function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: 
       ...(entry.project ? { project: entry.project } : {}),
       ...(role?.model ? { model: role.model } : {}),
       ...(role?.readOnly ? { readOnly: true } : {}),
+      ...(role?.blueprint ? { blueprint: role.blueprint } : {}),
       spaceId,
       owner: role?.source === "org"
         ? "organization"
@@ -2278,6 +2282,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "learning.review.v1",
             "agent.action-ownership.v1",
             "agent.public-profile-edit.v1",
+            "agent.blueprint-provenance.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
@@ -2462,8 +2467,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               || Array.isArray(p.profile)
               || (p.description !== undefined && typeof p.description !== "string")
               || (p.instructions !== undefined && typeof p.instructions !== "string")
+              || (p.blueprint !== undefined && (!p.blueprint || typeof p.blueprint !== "object" || Array.isArray(p.blueprint)))
             ) {
-              return reply(rpcError(id, ERR.PARAMS, "id and profile are required; description and instructions must be strings"));
+              return reply(rpcError(id, ERR.PARAMS, "id and profile are required; description and instructions must be strings; blueprint must be an object"));
             }
             const cwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const runtime = runtimeInfo(cwd);
@@ -2483,6 +2489,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 description: p.description,
                 instructions: p.instructions,
                 profile: p.profile,
+                blueprint: p.blueprint,
               });
               const catalog = serveAgentCatalog(cwd, profileId, spaceId);
               return reply(rpcResult(id!, {

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
@@ -203,6 +203,14 @@ test("serve persists Agent identity, lists offices, and runs the selected person
       cwd: workspace,
       description: "Owns product experience",
       instructions: "PRIVATE PRODUCT DESIGNER BRIEF",
+      blueprint: {
+        id: "agency-agents/design/ui-designer",
+        version: "1.0.0",
+        publisher: "Hara curated",
+        source: "https://github.com/msitarzewski/agency-agents/blob/ebe9c99/design/design-ui-designer.md",
+        sourceRevision: "ebe9c99",
+        license: "MIT",
+      },
       profile: {
         displayName: "Mina",
         title: "Product Designer",
@@ -216,9 +224,57 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     assert.ok(hired.result, `Agent hire failed: ${JSON.stringify(hired.error)}`);
     assert.ok(hired.result.agent, `newly hired Agent missing from catalog: ${JSON.stringify(hired.result.catalog)}`);
     assert.equal(hired.result.agent.ref, "global:product-designer");
+    assert.equal(hired.result.agent.blueprint.id, "agency-agents/design/ui-designer");
+    assert.equal(hired.result.agent.blueprint.version, "1.0.0");
+    assert.equal(hired.result.agent.blueprint.sourceRevision, "ebe9c99");
+    assert.match(hired.result.agent.blueprint.digest, /^[a-f0-9]{64}$/);
     assert.doesNotMatch(JSON.stringify(hired.result.catalog), /PRIVATE PRODUCT DESIGNER BRIEF/);
     const hiredFile = join(roles, "product-designer.md");
-    assert.match(readFileSync(hiredFile, "utf8"), /PRIVATE PRODUCT DESIGNER BRIEF/);
+    const hiredText = readFileSync(hiredFile, "utf8");
+    assert.match(hiredText, /PRIVATE PRODUCT DESIGNER BRIEF/);
+    assert.match(hiredText, /^blueprint-id: "agency-agents\/design\/ui-designer"$/m);
+    assert.match(hiredText, /^blueprint-license: "MIT"$/m);
+    assert.match(hiredText, /^blueprint-digest: "[a-f0-9]{64}"$/m);
+    writeFileSync(hiredFile, hiredText.replace("PRIVATE PRODUCT DESIGNER BRIEF", "LOCALLY MODIFIED BRIEF"), { mode: 0o600 });
+    const modifiedCatalog = await client.call("agents.list", { cwd: workspace });
+    assert.equal(
+      modifiedCatalog.result.agents.find((agent) => agent.ref === "global:product-designer").blueprint,
+      undefined,
+      "a locally modified prompt must not retain verified blueprint provenance",
+    );
+    writeFileSync(hiredFile, hiredText, { mode: 0o600 });
+    const rejectedBlueprint = await client.call("agents.create", {
+      id: "untrusted-blueprint",
+      cwd: workspace,
+      instructions: "must not be installed",
+      blueprint: {
+        id: "agency-agents/design/untrusted",
+        version: "1.0.0",
+        publisher: "Untrusted",
+        source: "http://user:secret@example.test/agent.md",
+        sourceRevision: "bad-source",
+        license: "MIT",
+      },
+      profile: { displayName: "Untrusted" },
+    });
+    assert.equal(rejectedBlueprint.error.code, -32602);
+    assert.ok(!existsSync(join(roles, "untrusted-blueprint.md")));
+    const rejectedQueryBlueprint = await client.call("agents.create", {
+      id: "query-secret-blueprint",
+      cwd: workspace,
+      instructions: "must not be installed",
+      blueprint: {
+        id: "agency-agents/design/query-secret",
+        version: "1.0.0",
+        publisher: "Untrusted",
+        source: "https://example.test/agent.md?api_key=must-not-persist",
+        sourceRevision: "bad-query-source",
+        license: "MIT",
+      },
+      profile: { displayName: "Query Secret" },
+    });
+    assert.equal(rejectedQueryBlueprint.error.code, -32602);
+    assert.ok(!existsSync(join(roles, "query-secret-blueprint.md")));
     const dismissed = await client.call("agents.archive", {
       ref: "global:product-designer",
       expectedRevision: hired.result.agent.revision,
