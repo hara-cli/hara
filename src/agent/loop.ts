@@ -10,6 +10,7 @@ import {
   type ToolOperationTraits,
 } from "../tools/registry.js";
 import { limitToolResultBatch } from "../tools/result-limit.js";
+import { createHash } from "node:crypto";
 import { stdout } from "node:process";
 import { hostname as executionHostname } from "node:os";
 import { c, out } from "../ui.js";
@@ -33,6 +34,7 @@ import {
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
 import {
   failureIdentities,
+  keyOf,
   looksFailed,
   pythonSyntaxDiagnostic,
   pythonSyntaxRecoveryNote,
@@ -482,6 +484,23 @@ export interface RunLimitEvent {
 
 const RUN_STOPPED = Symbol("agent-run-stopped");
 const REPEATED_FAILURE_LIMIT = 2;
+const NO_PROGRESS_NUDGE_ROUNDS = 2;
+const NO_PROGRESS_STOP_ROUNDS = 6;
+const MAX_PROGRESS_OBSERVATIONS = 512;
+
+/** Keep successful-call observations opaque and run-local. Tool arguments/results can contain project data;
+ *  only their digest is retained for loop detection, never logged or persisted. */
+function successfulObservationKey(name: string, input: unknown, content: string): string {
+  return createHash("sha256")
+    .update(keyOf(name, input))
+    .update("\0")
+    .update(content)
+    .digest("hex");
+}
+
+function recoverableMalformedToolCall(error: string | undefined): boolean {
+  return /(?:Tool call dropped — .*arguments were incomplete|Responses generation was incomplete)/iu.test(error ?? "");
+}
 
 interface RunLifecycle {
   signal: AbortSignal;
@@ -747,7 +766,12 @@ function disposeRunLifecycle(life: RunLifecycle): void {
   life.removeStopListener();
 }
 
-function hardStop(opts: RunOpts, life: RunLifecycle, kind: RunStopReason, detail?: { label?: string; count?: number }): RunOutcome {
+function hardStop(
+  opts: RunOpts,
+  life: RunLifecycle,
+  kind: RunStopReason,
+  detail?: { label?: string; count?: number; mode?: "failure" | "no_progress" },
+): RunOutcome {
   const elapsedMs = runActiveElapsedMs(life);
   const message = kind === "deadline"
     ? `⏸ agent run paused: active-execution deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). Waiting for your answers did not consume this budget. No further model or tool calls will start in this turn. Session-backed work keeps its task and checklist checkpoint; type \`/continue\` to resume in a fresh bounded turn. Only for intentionally long single turns, use \`hara config set runTimeoutMs 45m\` (maximum 2h).`
@@ -755,6 +779,8 @@ function hardStop(opts: RunOpts, life: RunLifecycle, kind: RunStopReason, detail
       ? `⏸ task paused after ${life.taskRoundsUsed + life.rounds} cumulative provider round(s), reaching its ${life.taskRoundLimit}-round task budget. This is a recoverable evidence checkpoint, not completion. Review the task state and type \`/continue\` to explicitly open the next bounded tranche.`
     : kind === "max_rounds"
       ? `⛔ agent run stopped: ${life.maxRounds}-round safety limit reached after ${formatAgentDuration(elapsedMs)}. This usually means the model is looping. Increase it with \`hara config set maxAgentRounds <n>\` (maximum 256) only if the extra rounds are intentional.`
+      : detail?.mode === "no_progress"
+        ? `⛔ agent run stopped early: ${detail.label ?? "the same tool/evidence cycle"} produced no new evidence for ${detail.count ?? NO_PROGRESS_STOP_ROUNDS} consecutive round(s). Hara stopped before the general round limit to prevent a model loop and unnecessary token use. Review the last verified checkpoint, then retry with a materially different strategy.`
       : detail?.count === 1 && detail.label === "Home workspace boundary"
         ? "⛔ agent run stopped after the first Home workspace boundary rejection. Switch with `/cd <project>` before retrying; the current conversation will continue in that project, and no other filesystem/search tool will be tried from Home in this turn."
         : `⛔ agent run stopped: the same failing ${detail?.label ?? "tool call"} repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
@@ -1033,6 +1059,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   };
   let triedFallback = false;
   let contextOverflowRetried = false;
+  let malformedToolCallRetried = false;
   let contextBudgetScale = 1;
   let contextGuardNotified = false;
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
@@ -1080,6 +1107,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   const toolCounts = new Map<string, number>();
   let blindShots = 0;
   let nudged = false;
+  // Max-rounds is a last-resort lifetime boundary. This guard catches the more specific production
+  // failure where tools keep reporting success but the exact observations do not change (for example,
+  // rewriting/running the same OCR or MCP helper until Desktop reaches 64 rounds). A digest-only bounded
+  // set prevents project data from becoming diagnostic state.
+  const successfulObservations = new Map<string, true>();
+  let noProgressRounds = 0;
+  let noProgressNudged = false;
 
   // Guardian: engaged only on HIGH-RISK actions (see classifyRisk). `on` gates the whole layer so normal
   // work never pays for it; the breaker is per-run (a hard stop after repeated blocks).
@@ -1391,6 +1425,22 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     });
 
     if (r.stop === "error") {
+      if (recoverableMalformedToolCall(r.errorMsg) && !malformedToolCallRetried) {
+        malformedToolCallRetried = true;
+        history.pop(); // no partial tool call was executed; discard the invalid assistant protocol row
+        history.push({
+          role: "user",
+          content: wrapReminders([
+            "Provider protocol recovery: the previous tool call had incomplete or malformed JSON arguments and was not executed. Retry this model once with one small, complete tool call. Include every required parameter; split large writes/commands into bounded calls. Do not repeat the truncated payload.",
+          ]),
+        });
+        if (!opts.quiet) {
+          const note = "✻ malformed tool call — retrying this model once with a smaller complete call…";
+          if (sink) sink.notice(note);
+          else out(c.dim(`${note}\n`));
+        }
+        continue;
+      }
       const kind = classifyError(r.errorMsg ?? "");
       if (kind === "context_overflow" && !contextOverflowRetried) {
         contextOverflowRetried = true;
@@ -2027,6 +2077,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
 
     // Execute: read-only tools run concurrently; edit/exec run alone, in order.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
+    const successfulRoundObservations: string[] = [];
     const runOne = async (idx: number, p: Plan): Promise<void> => {
       if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
       if (recallExhausted && RECALL_TOOLS.has(p.tu.name)) {
@@ -2145,6 +2196,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           successfulOwnedActionObserved = true;
           completionReceiptRetries = 0;
         }
+        if (!resultLooksFailed) {
+          successfulRoundObservations.push(successfulObservationKey(p.tu.name, p.tu.input, res));
+        }
         // append any not-yet-seen subdirectory AGENTS.md/CLAUDE.md this call touched (monorepo-local conventions)
         // + the repeat-guard's anti-spinning note when this exact call keeps failing (repeat-guard.ts)
         results[idx] = { id: p.tu.id, name: p.tu.name, content: res + subdirHint(p.tu.input, ctx.cwd) + noteCall(p.tu.name, p.tu.input, res) };
@@ -2218,6 +2272,47 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
     }
     if (repeatHalt) return hardStop(opts, life, "repeat_loop", repeatHalt);
+
+    const roundHasNewEvidence = successfulRoundObservations.some((key) => !successfulObservations.has(key));
+    for (const key of successfulRoundObservations) {
+      successfulObservations.delete(key);
+      successfulObservations.set(key, true);
+    }
+    while (successfulObservations.size > MAX_PROGRESS_OBSERVATIONS) {
+      const oldest = successfulObservations.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      successfulObservations.delete(oldest);
+    }
+    if (roundHasNewEvidence) {
+      noProgressRounds = 0;
+      noProgressNudged = false;
+    } else {
+      noProgressRounds += 1;
+      if (noProgressRounds >= NO_PROGRESS_STOP_ROUNDS) {
+        return hardStop(opts, life, "repeat_loop", {
+          label: "the repeated successful tool/evidence cycle",
+          count: noProgressRounds,
+          mode: "no_progress",
+        });
+      }
+      if (noProgressRounds >= NO_PROGRESS_NUDGE_ROUNDS && !noProgressNudged) {
+        noProgressNudged = true;
+        // Quiet sub-agents deliberately receive no injected reminders and never drain the main loop's
+        // reminder channel. Their hard stop still applies below if unchanged evidence continues.
+        if (!opts.quiet) {
+          history.push({
+            role: "user",
+            content: wrapReminders([
+              "No-progress correction: recent tool rounds completed but reproduced observations already seen in this run. Stop repeating the same OCR, file, command, MCP, or UI cycle. Re-check the original acceptance criteria and take a materially different bounded step, record a typed blocker with evidence, or finish with a verified checkpoint.",
+            ]),
+          });
+          showRunNotice(
+            opts,
+            "✻ no-progress guard: unchanged successful tool evidence repeated; asking the Agent to change strategy…",
+          );
+        }
+      }
+    }
 
     // Synthesis nudge (CC's KN5, hara-shaped): a round that fanned out to several parallel agents just
     // produced N independent reports — remind the model to merge/reconcile them before acting, instead

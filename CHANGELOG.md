@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.153.1 — 2026-08-25 — bounded Agent loop and tool-protocol recovery
+
+- Detect successful-but-stagnant Agent rounds by retaining only bounded, run-local SHA-256 digests of tool
+  identity, arguments, and observations. After repeated unchanged evidence Hara asks for a materially different
+  strategy once, then stops before the general 64-round limit with a recoverable checkpoint and a token-saving
+  explanation instead of recommending a larger round budget.
+- Treat changing tool observations as real progress and keep quiet sub-agents free of injected reminder rows;
+  every run still receives the same bounded hard stop if unchanged successful evidence continues.
+- Recover once on incomplete or malformed provider tool-call arguments by discarding the unexecuted partial
+  call and retrying the same model with one smaller complete call. A second malformed response follows the
+  existing fallback/error path rather than looping or executing truncated input. Upgrade with
+  `npm i -g @nanhara/hara@0.153.1`.
+
 ## 0.153.0 — 2026-08-25 — verified Agent talent blueprints
 
 - Add an explicit Agent blueprint provenance contract for talent-market hires. Hara persists the bounded

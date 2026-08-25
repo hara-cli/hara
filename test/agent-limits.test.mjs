@@ -244,6 +244,127 @@ test("an active tool loop hard-stops at maxRounds and alerts exactly once", asyn
   assert.equal(notices.filter((message) => /agent run stopped/.test(message)).length, 1);
 });
 
+test("unchanged successful tool evidence stops before the general round limit", async () => {
+  let turns = 0;
+  let tools = 0;
+  const notices = [];
+  const provider = {
+    id: "successful-no-progress-loop",
+    model: "successful-no-progress-loop",
+    async turn() {
+      turns += 1;
+      return {
+        text: "",
+        toolUses: [{ id: `same-success-${turns}`, name: "rewrite_helper", input: { path: "ocr-helper.mjs" } }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "finish the OCR helper" }], base(provider, {
+    ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
+    maxRounds: 20,
+    timeoutMs: "10s",
+    extraTools: [{
+      name: "rewrite_helper",
+      description: "idempotent helper rewrite fixture",
+      input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      kind: "edit",
+      async run() { tools += 1; return "Helper already contains the requested content."; },
+    }],
+  }));
+  assert.equal(turns, 7, "the guard allows bounded rethink rounds, then stops the unchanged cycle");
+  assert.equal(tools, 7);
+  assert.equal(outcome.status, "halted");
+  assert.equal(outcome.stopReason, "repeat_loop");
+  assert.match(outcome.error, /produced no new evidence for 6 consecutive round\(s\)/);
+  assert.doesNotMatch(outcome.error, /increase.*maxAgentRounds/i);
+  assert.ok(notices.some((message) => /no-progress guard/.test(message)));
+});
+
+test("changing successful observations are progress and do not trip the no-progress guard", async () => {
+  let turns = 0;
+  let tools = 0;
+  const provider = {
+    id: "changing-progress",
+    model: "changing-progress",
+    async turn() {
+      turns += 1;
+      return turns <= 6
+        ? { text: "", toolUses: [{ id: `poll-${turns}`, name: "changing_probe", input: { target: "job" } }], stop: "tool_use" }
+        : { text: "verified", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "wait for changing evidence" }], base(provider, {
+    maxRounds: 10,
+    timeoutMs: "10s",
+    quiet: true,
+    extraTools: [{
+      name: "changing_probe",
+      description: "returns a new observable state",
+      input_schema: { type: "object", properties: { target: { type: "string" } }, required: ["target"] },
+      kind: "read",
+      async run() { tools += 1; return `state-${tools}`; },
+    }],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(turns, 7);
+  assert.equal(tools, 6);
+});
+
+test("a malformed tool call gets one bounded retry on the same model", async () => {
+  let turns = 0;
+  const provider = {
+    id: "malformed-once",
+    model: "malformed-once",
+    async turn() {
+      turns += 1;
+      return turns === 1
+        ? {
+            text: "",
+            toolUses: [],
+            stop: "error",
+            errorMsg: "Tool call dropped — the model emitted malformed tool-call arguments, so its arguments were incomplete.",
+          }
+        : { text: "recovered", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "make one complete call" }];
+  const outcome = await runAgent(history, base(provider, {
+    maxRounds: 10,
+    timeoutMs: "10s",
+    quiet: true,
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(turns, 2);
+  assert.equal(history.some((message) => message.role === "assistant" && message.text === "recovered"), true);
+  assert.equal(history.some((message) => message.role === "user" && /Provider protocol recovery/.test(message.content)), true);
+});
+
+test("persistent malformed tool calls stop after the single same-model retry", async () => {
+  let turns = 0;
+  const provider = {
+    id: "malformed-persistent",
+    model: "malformed-persistent",
+    async turn() {
+      turns += 1;
+      return {
+        text: "",
+        toolUses: [],
+        stop: "error",
+        errorMsg: "Tool call dropped — the model emitted malformed tool-call arguments, so its arguments were incomplete.",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "do not loop" }], base(provider, {
+    maxRounds: 10,
+    timeoutMs: "10s",
+    quiet: true,
+  }));
+  assert.equal(outcome.status, "error");
+  assert.equal(turns, 2);
+  assert.match(outcome.error, /malformed tool-call arguments/);
+});
+
 test("one retry of an identical failed tool call trips the repeat-loop circuit breaker", async () => {
   let turns = 0;
   const provider = {
