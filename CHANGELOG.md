@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.153.0 — 2026-08-25 — verified Agent talent blueprints
+
+- Add an explicit Agent blueprint provenance contract for talent-market hires. Hara persists the bounded
+  blueprint ID, version, publisher, credential-free HTTPS source, exact source revision, and license beside
+  the private installed work brief without returning that private prompt through the public Agent catalog.
+- Bind verified provenance to the installed prompt body with a server-computed SHA-256 digest. A local prompt
+  modification removes the verified provenance marker instead of presenting changed instructions as the
+  original reviewed role; credential-bearing, query-bearing, malformed, or non-HTTPS sources fail closed
+  before an Agent file is created.
+- Advertise `agent.blueprint-provenance.v1` so persistent clients can distinguish a verified talent-market
+  install from the older free-form hire API. Blueprint metadata never grants tools, memory, model access, or
+  organization authority. Upgrade with `npm i -g @nanhara/hara@0.153.0`.
+
 ## 0.152.2 — 2026-08-24 — execution ownership completion recovery
 
 - Distinguish a real post-action completion receipt omission from advice-only delegation. After a successful
