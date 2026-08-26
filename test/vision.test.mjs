@@ -8,7 +8,6 @@ import {
   SCREENSHOT_SYSTEM,
   classifyVision,
   parseLocate,
-  visionSidecarAuthorized,
 } from "../dist/vision.js";
 
 test("parseLocate: grounding coords (per-mille / percent / fraction) → 0..1 fractions", () => {
@@ -47,6 +46,8 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("openai", "internvl2-8b");
   V("openai", "llama-3.2-90b-vision");
   V("openai", "grok-vision-beta");
+  V("minimax-token-plan", "MiniMax-M3");
+  V("openai", "MiniMax-M3");
 });
 
 test("classifyVision: text-only families → 'text'", () => {
@@ -85,7 +86,7 @@ test("classifyVision: per-model overrides win and don't leak across models", () 
   assert.equal(classifyVision("openai", "deepseek-chat", { "glm-5": "yes" }), "text");
 });
 
-test("effective attachment capabilities distinguish native, sidecar, unsupported, and unknown image routes", () => {
+test("effective attachment capabilities use only the selected model's native image route", () => {
   assert.deepEqual(
     effectiveAttachmentCapabilities("openai", "gpt-5.4"),
     {
@@ -98,11 +99,12 @@ test("effective attachment capabilities distinguish native, sidecar, unsupported
   assert.deepEqual(
     effectiveAttachmentCapabilities("openai", "deepseek-v4-pro", {}, "qwen3.7-plus"),
     {
-      image: { mode: "vision-sidecar", maxBytes: 3_600_000, viaModel: "qwen3.7-plus" },
+      image: { mode: "unsupported", maxBytes: 3_600_000 },
       textFile: "inline-text",
       directory: "bounded-inventory-and-tools",
       binaryFile: "agent-tool",
     },
+    "legacy sidecar settings never reroute a conversation image",
   );
   assert.equal(
     effectiveAttachmentCapabilities("openai", "deepseek-v4-pro").image.mode,
@@ -127,25 +129,6 @@ test("effective attachment capabilities distinguish native, sidecar, unsupported
     "unsupported",
     "an unrelated global sidecar cannot widen a scoped organization connection",
   );
-  assert.equal(
-    effectiveAttachmentCapabilities(
-      "hara-gateway",
-      "deepseek-v4-pro",
-      {},
-      "qwen3.7-plus",
-      ["deepseek-v4-pro", "qwen3.7-plus"],
-    ).image.mode,
-    "vision-sidecar",
-    "an organization-advertised sidecar is usable through that scoped key",
-  );
-});
-
-test("vision sidecar authorization never widens a scoped organization credential", () => {
-  assert.equal(visionSidecarAuthorized("qwen3.7-plus"), true, "BYOK has no server catalog constraint");
-  assert.equal(visionSidecarAuthorized("qwen3.7-plus", []), false, "unknown organization capability fails closed");
-  assert.equal(visionSidecarAuthorized("qwen3.7-plus", ["deepseek-v4-pro"]), false);
-  assert.equal(visionSidecarAuthorized("qwen3.7-plus", ["deepseek-v4-pro", "qwen3.7-plus"]), true);
-  assert.equal(visionSidecarAuthorized(undefined, ["qwen3.7-plus"]), false);
 });
 
 function fakeProvider(result) {

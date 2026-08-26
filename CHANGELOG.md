@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.154.0 — 2026-08-26 — first-class model plans and durable Agent recovery
+
+- Add MiniMax Token Plan as a first-class provider. Hara pins the documented Codex/Responses endpoint,
+  discovers the Key-authorized catalog with `MiniMax-M3` as a bounded fallback, exposes Adaptive Thinking,
+  and sends supported image attachments natively through the selected conversation model.
+- Remove the legacy secondary image-model route. Images, screenshots, and image-inspection tools now stay on
+  the session-pinned multimodal model; text-only or unverified models request an explicit switch instead of
+  silently sending company or personal context to Qwen or another provider.
+- Separate company data ownership from model funding. A Control-admin policy can allow a member's personal
+  connection inside the same company Space while company Agents, history, model/tool restrictions, approvals,
+  and per-turn policy refresh remain authoritative. Cross-Space history transfer stays blocked.
+- Preserve the newest narrow tool evidence under context pressure, reject truncated Hara output as a human
+  dependency, and direct the Agent to page its own reads instead of asking the user to rerun scripts or paste
+  tool output. Changing-command churn now receives a durable strategy checkpoint and pauses before exhausting
+  the general round limit; recoverable round boundaries remain continuable in the same task.
+- Present expired authentication as a retained, resumable checkpoint and require a capability preflight after
+  sign-in before business work resumes. Upgrade with `npm i -g @nanhara/hara@0.154.0`.
+
 ## 0.153.1 — 2026-08-25 — bounded Agent loop and tool-protocol recovery
 
 - Detect successful-but-stagnant Agent rounds by retaining only bounded, run-local SHA-256 digests of tool

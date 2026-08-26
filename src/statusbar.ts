@@ -42,6 +42,7 @@ export function contextWindow(model: string): number {
   if (/^qwen3\.[67]-flash(?:-|$)/.test(m)) return 1_000_000;
   if (/^(?:qwen3-max-2026-01-23|qwen3-coder-next)(?:-|$)/.test(m) || /^kimi-k2\.5(?:-|$)/.test(m)) return 262_144;
   if (/^glm-(?:5|4\.7)(?:-|$)/.test(m)) return 202_752;
+  if (/^minimax-m3(?:-|$)/.test(m)) return 1_000_000;
   if (/^minimax-m2\.5(?:-|$)/.test(m)) return 196_608;
   if (/qwen3\.6[-:]27b/.test(m)) return 262_144;
   if (/(opus|sonnet|fable)|claude-4|1m/.test(m)) return 1_000_000;

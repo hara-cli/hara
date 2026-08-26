@@ -761,6 +761,26 @@ test("provider catalog: Token Plan is the single current Alibaba setup entry and
   assert.equal(catalog.find((provider) => provider.id === "qwen-oauth")?.legacy, true);
 });
 
+test("provider catalog: MiniMax Token Plan exposes its fixed Codex endpoint and M3 model", () => {
+  const miniMax = providerCatalog().find((provider) => provider.id === "minimax-token-plan");
+  assert.deepEqual(
+    {
+      auth: miniMax?.auth,
+      baseURL: miniMax?.defaultBaseURL,
+      model: miniMax?.defaultModel,
+      customBaseURL: miniMax?.customBaseURL,
+      knownModels: miniMax?.knownModels,
+    },
+    {
+      auth: "api-key",
+      baseURL: "https://api.minimaxi.com/v1",
+      model: "MiniMax-M3",
+      customBaseURL: false,
+      knownModels: ["MiniMax-M3"],
+    },
+  );
+});
+
 test("provider settings pin Token Plan credentials to the official Beijing endpoint", () => {
   assert.equal(
     normalizePersonalProviderConfig({
@@ -777,6 +797,25 @@ test("provider settings pin Token Plan credentials to the official Beijing endpo
       baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     }),
     /fixed Beijing endpoint/,
+  );
+});
+
+test("provider settings pin MiniMax Token Plan credentials to the official Codex endpoint", () => {
+  assert.equal(
+    normalizePersonalProviderConfig({
+      provider: "minimax-token-plan",
+      model: "MiniMax-M3",
+      baseURL: "https://api.minimaxi.com/v1/",
+    }).baseURL,
+    "https://api.minimaxi.com/v1",
+  );
+  assert.throws(
+    () => normalizePersonalProviderConfig({
+      provider: "minimax-token-plan",
+      model: "MiniMax-M3",
+      baseURL: "https://api.minimaxi.com/anthropic",
+    }),
+    /fixed endpoint/,
   );
 });
 

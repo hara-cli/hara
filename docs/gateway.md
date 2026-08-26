@@ -57,8 +57,9 @@ model or consume tokens.
   `project:name` pins the thread to that registered home and `/agent main` returns to the previous project/thread.
   A native `global:name` is portable, stays in the current project, and may continue to roam with `/cd`;
   an installed OpenClaw Agent keeps its configured workspace. Anything else runs hara on that session.
-- **Two-way images**: send the bot a photo and it sees it (inline for a vision model, else described via your
-  configured `visionModel`); ask it to send a file/image back and it uses the `send_file` tool — both work in
+- **Two-way images**: send the bot a photo and the selected multimodal conversation model sees it inline;
+  text-only routes ask for a model switch rather than forwarding media to a second provider. Ask it to send
+  a file/image back and it uses the `send_file` tool — both work in
   plain conversation, no slash command needed (on platforms marked ✅ for outbound above). Authorization is checked before
   any inbound download. One message may claim at most four attachments, each streamed with a 20 MiB/60-second
   limit into private random paths; process-wide/per-platform concurrency and retention quotas fail closed, and

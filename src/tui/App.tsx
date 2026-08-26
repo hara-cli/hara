@@ -141,7 +141,7 @@ export interface AppProps {
   onClipboardImage?: () => ImageAttachment | null;
   /** modal (vim) keybindings in the input box */
   vim?: boolean;
-  /** Image compatibility notice text (e.g. "glm-5 is text-only — attached images use Hara's compatibility helper").
+  /** Image capability notice text (e.g. "glm-5 is text-only — switch models before attaching images").
    *  When set, the FIRST image attachment in this session triggers a one-shot inline notice.
    *  Header doesn't display it (顾雅: kill the always-on vision line). Undefined = native vision
    *  (no notice) or no describer configured (a different path warns when an image actually arrives). */

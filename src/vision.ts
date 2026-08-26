@@ -1,22 +1,20 @@
-// Vision sidecar — "the eyes" for a text-only main model. When `visionModel` is configured, pasted
-// images are sent to that model (e.g. qwen-vl on the same Alibaba plan) and turned into text the main
-// model can act on. Provider-agnostic: it takes a pre-built Provider, so it reuses the normal image
-// encoding path (base64 blocks for Anthropic, image_url data-URLs for OpenAI-compatible endpoints).
+// Native image capability and bounded image-inspection helpers. Images stay on the model selected for
+// the conversation: Hara must never silently reroute company context, screenshots, or user attachments
+// to a legacy secondary "vision" model. `describeImages` still gives the current multimodal model a
+// focused inspection turn for computer-use/OCR tasks; it is not a second provider route.
 import type { ImageAttachment, Provider } from "./providers/types.js";
 import { boundedProviderTurn } from "./providers/bounded-turn.js";
 
 export type VisionCap = "vision" | "text" | "unknown";
-export type ImageInputMode = "native" | "vision-sidecar" | "unsupported" | "unknown";
+export type ImageInputMode = "native" | "unsupported" | "unknown";
 /** Keeps base64-encoded provider payloads below the common 5 MB request-item boundary. */
 export const MAX_NATIVE_IMAGE_BYTES = 3_600_000;
 
 export interface EffectiveAttachmentCapabilities {
   image: {
     mode: ImageInputMode;
-    /** Maximum bytes accepted by Hara before any model or vision sidecar is called. */
+    /** Maximum bytes accepted by Hara before the current model is called. */
     maxBytes: number;
-    /** Present only when a configured vision sidecar will translate images for the main model. */
-    viaModel?: string;
   };
   /** Text/code attachments are expanded locally before the provider request. */
   textFile: "inline-text";
@@ -24,19 +22,6 @@ export interface EffectiveAttachmentCapabilities {
   directory: "bounded-inventory-and-tools";
   /** Binary documents need a document/artifact tool rather than pretending the model received bytes. */
   binaryFile: "agent-tool";
-}
-
-/** A configured sidecar can use the current credential only when that credential is unconstrained (BYOK)
- * or its server-authoritative catalog contains the exact model. Passing [] means capability is unknown and
- * therefore unavailable — persistent UIs must not advertise a route they cannot prove. */
-export function visionSidecarAuthorized(
-  visionModel?: string,
-  authorizedModels?: readonly string[],
-): boolean {
-  return Boolean(visionModel) && (
-    authorizedModels === undefined
-    || authorizedModels.includes(visionModel!)
-  );
 }
 
 // Built-in capability map for the major model families. First matching rule wins, so each family's
@@ -73,7 +58,8 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   // xAI Grok
   { rx: /grok.*vision|grok-[\d.]*v\b|grok-4/i, cap: "vision" },
   { rx: /grok/i, cap: "text" },
-  // MiniMax — VL models see images; the M-series chat (e.g. MiniMax-M2.5) is text-only.
+  // MiniMax — M3 is natively multimodal on the current Token Plan/Responses route; M2.x remains text-only.
+  { rx: /^minimax-m3(?:[-.]|$)/i, cap: "vision" },
   { rx: /minimax.*(?:vl|vision)|abab.*vl/i, cap: "vision" },
   { rx: /minimax|abab/i, cap: "text" },
   // Other well-known vision families
@@ -95,29 +81,22 @@ export function classifyVision(provider: string, model: string, overrides: Recor
 }
 
 /**
- * Resolve the complete image-processing route exposed to persistent clients.
- * This is deliberately different from a model-only `vision` boolean: a text-only
- * main model can still accept an image when Hara has a configured vision sidecar.
+ * Resolve the image-processing route exposed to persistent clients. The selected conversation model is
+ * the only possible route: unsupported and unknown models must be switched or explicitly classified.
  */
 export function effectiveAttachmentCapabilities(
   provider: string,
   model: string,
   overrides: Record<string, "yes" | "no"> = {},
-  visionModel?: string,
-  authorizedModels?: readonly string[],
+  _legacyVisionModel?: string,
+  _legacyAuthorizedModels?: readonly string[],
 ): EffectiveAttachmentCapabilities {
   const native = classifyVision(provider, model, overrides);
-  // A gateway credential is scoped to its advertised model catalog. A global sidecar name must never
-  // make a Desktop organization session claim image support unless that exact model is authorized by the
-  // current connection. BYOK callers omit the catalog and retain their configured fallback behavior.
-  const sidecarAuthorized = visionSidecarAuthorized(visionModel, authorizedModels);
   const image = native === "vision"
     ? { mode: "native" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES }
-    : sidecarAuthorized
-      ? { mode: "vision-sidecar" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES, viaModel: visionModel! }
-      : native === "text"
-        ? { mode: "unsupported" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES }
-        : { mode: "unknown" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES };
+    : native === "text"
+      ? { mode: "unsupported" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES }
+      : { mode: "unknown" as const, maxBytes: MAX_NATIVE_IMAGE_BYTES };
   return {
     image,
     textFile: "inline-text",

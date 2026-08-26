@@ -2,8 +2,8 @@
 // heavy deps: mac = screencapture + cliclick · windows = PowerShell + .NET/user32 · linux = scrot + xdotool.
 // Safety: opt-in tier (config computerUse off|read|click|full) + per-app allowlist (config computerApps:
 // frontmost-window check before any pointer/keyboard action) + dangerous-key blocklist + a once-per-session
-// grant (tool kind "computer" always confirms once, even in full-auto). Screenshots are read via the vision
-// sidecar (ctx.describeImage) so a text main model can still "see" them.
+// grant (tool kind "computer" always confirms once, even in full-auto). Screenshots are read only by the
+// selected conversation model when it has native image input; text-only models must be switched first.
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -425,7 +425,7 @@ registerTool({
           /* fall through to path */
         }
       }
-      return ok(`Screenshot saved to ${s.path}. Configure a vision model so I can read it: \`hara config set visionModel <model>\`.`);
+      return ok(`Screenshot saved to ${s.path}. The current conversation model cannot read it; switch to a model with native image input.`);
     }
 
     // Grounding: locate a described element and turn it into screen coordinates (more reliable than guessing
@@ -434,7 +434,7 @@ registerTool({
     if (needsLocate) {
       const target = String(input.target ?? "");
       if (!target) return action === "find" ? "find needs a `target` (what to locate)." : "click/move needs `x,y` or a `target`.";
-      if (!ctx.locate) return "Grounding needs a vision model that can see images — set one: `hara config set visionModel <model>`.";
+      if (!ctx.locate) return "Grounding needs native image input — switch this conversation to an image-capable model.";
       const s = await screenshot(ctx.signal);
       if (s.error) return fail(`screenshot — ${s.error}`);
       const loc = await ctx.locate(s.path!, target, ctx.signal);

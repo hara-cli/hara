@@ -149,6 +149,24 @@ test("legacy Qwen/OpenAI profiles on the exact Token Plan endpoint canonicalize 
   });
 });
 
+test("legacy OpenAI profiles on the exact MiniMax endpoint canonicalize without losing their saved key", () => {
+  const target = resolveByokProviderTarget(personalConfig, {
+    id: "legacy-minimax",
+    kind: "byok",
+    label: "MiniMax",
+    provider: "openai",
+    apiKey: "saved-minimax-key",
+    baseURL: "https://api.minimaxi.com/v1",
+    defaultModel: "MiniMax-M3",
+  }, false, {});
+  assert.deepEqual(target, {
+    provider: "minimax-token-plan",
+    apiKey: "saved-minimax-key",
+    baseURL: "https://api.minimaxi.com/v1",
+    model: "MiniMax-M3",
+  });
+});
+
 test("local targets discard flat and environment cloud credentials", () => {
   const target = resolveByokProviderTarget(
     {

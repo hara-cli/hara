@@ -15,7 +15,7 @@ import {
 import { runShell } from "../dist/sandbox.js";
 import { getTool } from "../dist/tools/registry.js";
 import { onTurnPhase, setTurnPhase } from "../dist/agent/phase.js";
-import { createTaskExecution } from "../dist/session/task.js";
+import { applyTaskBrief, createTaskExecution } from "../dist/session/task.js";
 import { loadOrganizationExecutionPolicy, orgRolesDir } from "../dist/org/roles.js";
 import "../dist/tools/builtin.js";
 import "../dist/tools/memory.js";
@@ -237,11 +237,13 @@ test("an active tool loop hard-stops at maxRounds and alerts exactly once", asyn
   assert.equal(tools, 3);
   assert.equal(outcome.status, "halted");
   assert.equal(outcome.stopReason, "max_rounds");
-  assert.match(outcome.error, /3-round safety limit/);
+  assert.match(outcome.error, /3-round safety boundary/);
+  assert.doesNotMatch(outcome.error, /config set maxAgentRounds|increase.*round/i);
+  assert.match(outcome.error, /\/continue/);
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0].kind, "max_rounds");
   assert.ok(notices.some((message) => /still actively working/.test(message)), "75% round warning is visible");
-  assert.equal(notices.filter((message) => /agent run stopped/.test(message)).length, 1);
+  assert.equal(notices.filter((message) => /agent paused/.test(message)).length, 1);
 });
 
 test("unchanged successful tool evidence stops before the general round limit", async () => {
@@ -309,6 +311,69 @@ test("changing successful observations are progress and do not trip the no-progr
   assert.equal(outcome.status, "completed");
   assert.equal(turns, 7);
   assert.equal(tools, 6);
+});
+
+test("changing command fragments pause at a strategy checkpoint instead of consuming all 64 rounds", async () => {
+  let turns = 0;
+  let tools = 0;
+  const createdTask = createTaskExecution("finish one generated integration script", "strategy-stall-turn");
+  const acceptedTask = applyTaskBrief(createdTask, {
+    intent: "change",
+    goal: "finish one generated integration script",
+    acceptance: ["the generated script passes syntax validation"],
+    steps: ["edit the script", "validate it"],
+  });
+  assert.equal(acceptedTask.ok, true);
+  let task = acceptedTask.task;
+  const notices = [];
+  const provider = {
+    id: "changing-command-churn",
+    model: "changing-command-churn",
+    async turn() {
+      turns += 1;
+      return {
+        text: "",
+        toolUses: [{
+          id: `fragment-${turns}`,
+          name: "changing_fragment",
+          input: { fragment: turns, path: "fetch-comment.mjs" },
+        }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "finish the script" }], base(provider, {
+    ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
+    maxRounds: 64,
+    timeoutMs: "10s",
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate: (next) => { task = next; },
+      onRoundUsage: (next) => { task = next; },
+    },
+    extraTools: [{
+      name: "changing_fragment",
+      description: "nominally different source fragments that never produce a durable stage checkpoint",
+      input_schema: {
+        type: "object",
+        properties: { fragment: { type: "number" }, path: { type: "string" } },
+        required: ["fragment", "path"],
+      },
+      kind: "edit",
+      async run(input) {
+        tools += 1;
+        return `applied unique fragment ${input.fragment}`;
+      },
+    }],
+  }));
+  assert.equal(turns, 20, "the strategy checkpoint boundary stops well before the 64-round fallback");
+  assert.equal(tools, 20);
+  assert.equal(outcome.status, "halted");
+  assert.equal(outcome.stopReason, "strategy_stall");
+  assert.match(outcome.error, /without a durable task checkpoint/);
+  assert.doesNotMatch(outcome.error, /maxAgentRounds/i);
+  assert.ok(notices.some((message) => /strategy checkpoint/i.test(message)));
 });
 
 test("a malformed tool call gets one bounded retry on the same model", async () => {

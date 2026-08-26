@@ -21,10 +21,15 @@ import {
   TOKEN_PLAN_OPENAI_BASE_URL,
 } from "./providers/alibaba.js";
 import { DEEPSEEK_RESPONSES_MODELS } from "./providers/deepseek.js";
+import {
+  MINIMAX_TOKEN_PLAN_BASE_URL,
+  MINIMAX_TOKEN_PLAN_MODELS,
+} from "./providers/minimax.js";
 
 export type ProviderId =
   | "anthropic"
   | "token-plan"
+  | "minimax-token-plan"
   | "qwen"
   | "qwen-oauth"
   | "openai"
@@ -62,11 +67,12 @@ export interface HaraConfig {
   computerUse: "off" | "read" | "click" | "full";
   /** apps the agent may click/type into (frontmost-window allowlist; empty = no interaction allowed). */
   computerApps: string[];
-  /** Optional vision "sidecar": when set, pasted images are OCR'd/described by this model into text
-   *  so a text-only main model (DeepSeek, coding models…) can use them. Endpoint/key default to the
-   *  main provider's; override only if vision lives elsewhere. */
+  /** @deprecated Read only for backward-compatible config parsing. Image routing always uses the current
+   *  conversation model; a legacy secondary model must never receive attachments or task context. */
   visionModel: string | undefined;
+  /** @deprecated See visionModel. */
   visionBaseURL: string | undefined;
+  /** @deprecated See visionModel. */
   visionApiKey: string | undefined;
   /** Per-model vision-capability overrides the user has confirmed (model id → "yes"|"no"). Built-in
    *  detection (classifyVision) handles known families; this records answers for unknown ones so we
@@ -139,6 +145,11 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
     baseURL: TOKEN_PLAN_OPENAI_BASE_URL,
     envKey: "OPENAI_API_KEY",
   },
+  "minimax-token-plan": {
+    model: "MiniMax-M3",
+    baseURL: MINIMAX_TOKEN_PLAN_BASE_URL,
+    envKey: "MINIMAX_API_KEY",
+  },
   qwen: {
     model: "qwen-plus",
     baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -202,6 +213,13 @@ const PROVIDER_LABELS: Record<ProviderId, Omit<ProviderCatalogEntry, "id" | "def
     auth: "api-key",
     customBaseURL: false,
     knownModels: TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
+  },
+  "minimax-token-plan": {
+    label: "MiniMax Token Plan",
+    location: "cloud",
+    auth: "api-key",
+    customBaseURL: false,
+    knownModels: MINIMAX_TOKEN_PLAN_MODELS,
   },
   openai: { label: "OpenAI / compatible", location: "cloud", auth: "api-key", customBaseURL: true },
   qwen: { label: "Qwen (legacy DashScope)", location: "cloud", auth: "api-key", customBaseURL: true, legacy: true },
@@ -551,6 +569,18 @@ function cleanProviderBaseURL(provider: ProviderId, value: string | undefined): 
       throw new Error(`token-plan uses the fixed Beijing endpoint ${TOKEN_PLAN_OPENAI_BASE_URL}`);
     }
     return TOKEN_PLAN_OPENAI_BASE_URL;
+  }
+  if (provider === "minimax-token-plan") {
+    const expected = new URL(MINIMAX_TOKEN_PLAN_BASE_URL);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (
+      url.protocol !== expected.protocol
+      || url.host.toLowerCase() !== expected.host.toLowerCase()
+      || pathname !== expected.pathname.replace(/\/+$/, "")
+    ) {
+      throw new Error(`minimax-token-plan uses the fixed endpoint ${MINIMAX_TOKEN_PLAN_BASE_URL}`);
+    }
+    return MINIMAX_TOKEN_PLAN_BASE_URL;
   }
   return normalized;
 }

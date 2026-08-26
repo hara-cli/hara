@@ -128,6 +128,8 @@ export interface OrganizationExecutionPolicy {
   modelDeny?: string[];
   toolDeny?: string[];
   requireApprovalForWrites?: boolean;
+  /** Company-admin consent for member-owned BYOK routes. Omitted/false remains fail-closed. */
+  allowPersonalModelConnections?: boolean;
 }
 
 export interface OrganizationBundleRole {
@@ -189,19 +191,33 @@ export function parseOrganizationExecutionPolicyEnvelope(parsed: unknown): Organ
   if (!Number.isSafeInteger(version) || Number(version) < 0) {
     throw new Error("managed organization policy version is invalid");
   }
-  const supported = new Set(["modelAllow", "modelDeny", "toolDeny", "requireApprovalForWrites", "budget"]);
+  const supported = new Set([
+    "modelAllow",
+    "modelDeny",
+    "toolDeny",
+    "requireApprovalForWrites",
+    "allowPersonalModelConnections",
+    "budget",
+  ]);
   const unknown = Object.keys(input).filter((key) => !supported.has(key));
   if (unknown.length) throw new Error(`managed organization policy contains unsupported field '${unknown[0]}'`);
   if (
     input.requireApprovalForWrites !== undefined
     && typeof input.requireApprovalForWrites !== "boolean"
   ) throw new Error("managed organization policy 'requireApprovalForWrites' must be boolean");
+  if (
+    input.allowPersonalModelConnections !== undefined
+    && typeof input.allowPersonalModelConnections !== "boolean"
+  ) throw new Error("managed organization policy 'allowPersonalModelConnections' must be boolean");
   return {
     version: Number(version),
     ...(input.modelAllow !== undefined ? { modelAllow: organizationPolicyList(input.modelAllow, "modelAllow") } : {}),
     ...(input.modelDeny !== undefined ? { modelDeny: organizationPolicyList(input.modelDeny, "modelDeny") } : {}),
     ...(input.toolDeny !== undefined ? { toolDeny: organizationPolicyList(input.toolDeny, "toolDeny") } : {}),
     ...(input.requireApprovalForWrites === true ? { requireApprovalForWrites: true } : {}),
+    ...(input.allowPersonalModelConnections !== undefined
+      ? { allowPersonalModelConnections: input.allowPersonalModelConnections }
+      : {}),
   };
 }
 

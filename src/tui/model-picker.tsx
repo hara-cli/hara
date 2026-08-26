@@ -6,11 +6,13 @@ import { Box, Text, useInput } from "ink";
 import { useState } from "react";
 import { supportsReasoningStyle, type ReasoningStyle, type Effort } from "../providers/reasoning.js";
 
-/** The levels ←→ cycles for a style. Binary thinking toggles (DashScope enable_thinking, Ollama think)
+/** The levels ←→ cycles for a style. Binary thinking toggles (DashScope, MiniMax adaptive, Ollama)
  *  show off/on; graded styles (OpenAI/Anthropic effort/budget) show the full dial; `none` → no control. */
 export function levelsFor(style: ReasoningStyle, model = ""): Effort[] {
   if (!supportsReasoningStyle(style, model)) return [];
-  if (style === "enable_thinking" || style === "ollama_think") return ["off", "high"]; // "high" renders as "on"
+  if (style === "enable_thinking" || style === "minimax_responses" || style === "ollama_think") {
+    return ["off", "high"]; // "high" renders as "on"
+  }
   if (style === "deepseek" || style === "deepseek_responses") {
     return ["off", "low", "high", "max"];
   }
@@ -25,7 +27,9 @@ export function levelsFor(style: ReasoningStyle, model = ""): Effort[] {
 
 /** Label a level for display — binary styles read as on/off, graded ones as the level name. */
 export function levelLabel(style: ReasoningStyle, e: Effort, model = ""): string {
-  if (style === "enable_thinking" || style === "ollama_think") return e === "off" ? "off" : "on";
+  if (style === "enable_thinking" || style === "minimax_responses" || style === "ollama_think") {
+    return e === "off" ? "off" : "on";
+  }
   const bare = model.split("/").at(-1) ?? model;
   if (style === "qwen_responses" && e === "max" && /^qwen3\.8-max(?:-|$)/i.test(bare)) return "xhigh";
   return String(e);

@@ -15,6 +15,7 @@ import {
   type Profile,
 } from "../profile/profile.js";
 import { isOfficialTokenPlanOpenAIEndpoint } from "./alibaba.js";
+import { isOfficialMiniMaxEndpoint } from "./minimax.js";
 
 export interface ProviderTarget {
   provider: ProviderId;
@@ -75,15 +76,15 @@ export function profileForConfig(cfg: HaraConfig): {
  *
  * A named Profile is an identity boundary: its vendor, credential and endpoint must not be replaced by
  * the always-populated personal/global config. Explicit HARA_* values remain one-shot overrides. The
- * personal profile and explicit sidecars continue to use the merged config.
+ * personal profile and explicit auxiliary routes continue to use the merged config.
  */
 export function resolveByokProviderTarget(
   cfg: HaraConfig,
   profile: Profile,
-  sidecarOverride: boolean,
+  auxiliaryOverride: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): ProviderTarget {
-  const personalOrOverride = profile.id === "personal" || sidecarOverride;
+  const personalOrOverride = profile.id === "personal" || auxiliaryOverride;
   const profileProvider: ProviderId =
     profile.provider && profile.provider !== "hara-gateway" ? profile.provider : "anthropic";
   const environmentProvider: ProviderId | undefined =
@@ -105,7 +106,9 @@ export function resolveByokProviderTarget(
   // converge on the new first-class provider without rewriting the user's private profile on read.
   const provider: ProviderId = isOfficialTokenPlanOpenAIEndpoint(baseURL)
     ? "token-plan"
-    : configuredProvider;
+    : isOfficialMiniMaxEndpoint(baseURL)
+      ? "minimax-token-plan"
+      : configuredProvider;
   const envKey = providerEnvKey(provider);
   const providerEnvApiKey = envKey ? env[envKey] : undefined;
   const candidateApiKey = personalOrOverride
@@ -130,7 +133,7 @@ export function resolveByokProviderTarget(
 }
 
 /**
- * Apply an explicit runtime selection (session model, role model, vision/route sidecar, fallback).
+ * Apply an explicit runtime selection (session model, role model, router, fallback).
  *
  * A provider switch starts a fresh credential/endpoint boundary; absent fields use that provider's public
  * defaults and never inherit the previous profile's key or host.

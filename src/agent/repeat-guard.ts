@@ -176,8 +176,8 @@ export function looksFailed(content: string, name?: string): boolean {
   }
   if (name === "cronjob" || name === "cron") return /^✗\s+\S+\s+failed\s*:/.test(text);
   if (name === "computer") {
-    return /^(?:Refused:|Screen control is off\.|No apps allowlisted\b|Grounding needs a vision model\b|'[^'\r\n]+' needs a higher tier\b|(?:activate|find|click\/move) needs\b|⛔ Stopping screen control\b)/.test(text)
-      || /^Screenshot saved\b[\s\S]*\bConfigure a vision model\b/.test(text);
+    return /^(?:Refused:|Screen control is off\.|No apps allowlisted\b|Grounding needs (?:native image input|a vision model that can see images)\b|'[^'\r\n]+' needs a higher tier\b|(?:activate|find|click\/move) needs\b|⛔ Stopping screen control\b)/.test(text)
+      || /^Screenshot saved\b[\s\S]*\b(?:switch to a model with native image input|configure a vision model so I can read it)\b/i.test(text);
   }
   return false;
 }

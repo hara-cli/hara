@@ -89,6 +89,16 @@ export interface TaskUserDependency {
   capability?: string;
 }
 
+/** Context compaction and bounded tool previews are Hara-owned continuation mechanics, not events that a
+ * human can resolve. Models sometimes misclassify them as external state and ask the user to rerun a script
+ * or paste output. Keep that invalid handoff out of durable task state regardless of provider behavior. */
+function describesEngineRecoverableOutputBoundary(parts: readonly string[]): boolean {
+  const text = parts.join("\n").toLowerCase();
+  const namesEngineOutput = /(?:hara|tool(?:_|\s*)output|historical tool|read_file|tool_result_read|bash|python|工具输出|历史工具|文件内容|脚本输出|命令输出|读取文件)/u.test(text);
+  const namesBoundedVisibility = /(?:truncat|chars? omitted|cut off|too long|cannot (?:read|see)|unable to (?:read|see)|incomplete output|截断|被截|省略|看不全|无法读取|不可见|不完整|过长)/u.test(text);
+  return namesEngineOutput && namesBoundedVisibility;
+}
+
 /** Engine-readable completion receipt. Free-form assistant prose is never treated as proof that the accepted
  * brief succeeded. A verified task names observable evidence; a task waiting on the user names the exact
  * missing input without falsely entering the completed state. */
@@ -424,6 +434,14 @@ function completionInput(
     }
     if (!dependencyEvidence.length) {
       return { ok: false, reason: "dependency requires at least one observed evidence item" };
+    }
+    if (describesEngineRecoverableOutputBoundary([detail, ...evidence, ...dependencyEvidence])) {
+      return {
+        ok: false,
+        reason:
+          "tool/history output truncation is engine-recoverable, not a human-only dependency; " +
+          "use a narrow grep/read_file offset+limit request or tool_result_read instead of asking the user to rerun or paste output",
+      };
     }
     let capability: string | undefined;
     if (raw.capability !== undefined) {
@@ -843,7 +861,12 @@ export function finishTaskExecution(
     ? "paused"
     : outcome?.status === "completed"
       ? (incomplete || !acceptedBriefVerified ? "paused" : "completed")
-      : outcome?.status === "halted" && (outcome.stopReason === "deadline" || outcome.stopReason === "task_round_budget")
+      : outcome?.status === "halted" && (
+          outcome.stopReason === "deadline"
+          || outcome.stopReason === "task_round_budget"
+          || outcome.stopReason === "max_rounds"
+          || outcome.stopReason === "strategy_stall"
+        )
         ? "paused"
       : outcome?.status === "error" || outcome?.status === "empty" || outcome?.status === "halted"
         ? "blocked"

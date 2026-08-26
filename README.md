@@ -123,6 +123,21 @@ command for existing users and is not shown as a new Token Plan connection.
 > Plan keys (Coding Plan / Token Plan) are licensed **only** for use inside AI coding agents /
 > OpenClaw-type tools like hara — not Dify/n8n, API-testing tools, or direct script/backend calls.
 
+**MiniMax Token Plan — Codex/Responses route**
+```bash
+hara profile add minimax --byok \
+  --provider minimax-token-plan \
+  --model MiniMax-M3
+# Enter the MiniMax Token Plan key at Hara's masked prompt, then:
+hara profile use minimax
+```
+
+Hara pins this preset to MiniMax's documented `https://api.minimaxi.com/v1` Responses endpoint, keeps the
+address visible in settings, and offers the live Key-scoped model catalog with `MiniMax-M3` as the bounded
+fallback. Adaptive Thinking is exposed as off/on, and the current MiniMax Codex model catalog declares native
+text and image input. A custom OpenAI- or Anthropic-compatible MiniMax endpoint remains available through the
+generic custom-provider path.
+
 **DeepSeek — native Responses for V4 Flash and V4 Pro**
 ```bash
 hara config set provider deepseek
@@ -135,7 +150,7 @@ Responses API. Hara resends the complete durable message/tool history on every r
 endpoint is stateless: it never depends on `previous_response_id`, `conversation`, or server-side storage.
 Explicit custom or legacy ids are not silently remapped; their availability remains provider-side.
 DeepSeek V4 Flash and Pro remain text-only, while `deepseek-v4-flash-vision-exp` accepts native image
-input. Hara keeps the existing image-describer fallback only for the text-only models.
+input. Text-only conversations ask for a model switch and never forward an image to a secondary provider.
 If live model discovery is unavailable, `/model` still offers the three documented V4 models as a
 host-scoped fallback; a successful live `/models` response remains authoritative.
 
@@ -182,18 +197,13 @@ manager's normal credential store. `HARA_PACKAGE_REGISTRY` is the environment eq
 Replies follow the latest user message's language by default. Use `hara --lang zh-CN` (or `en`) to pin one
 launch, and `hara --lang auto` to restore per-message matching.
 
-**Vision** — hara **auto-detects** whether your main model can see images. A vision model (Claude, gpt-4o,
-qwen-vl, glm-4v, `deepseek-v4-flash-vision-exp`…) gets pasted images **inline**. For a **text-only** model
-(including DeepSeek V4 Flash/Pro and text-only coding models), set a describer — the "eyes" — and hara
-OCRs/describes each pasted image into text first:
-```bash
-hara config set visionModel qwen-vl-max   # a vision model on the same plan/key
-# point it elsewhere if your endpoint doesn't serve vision:
-#   hara config set visionBaseURL https://dashscope.aliyuncs.com/compatible-mode/v1
-#   hara config set visionApiKey  sk-...
-```
-If a model's capability is unknown, hara **asks once and remembers**. In the TUI, `/vision <model>` sets the
-describer and `/vision main yes|no|auto` corrects a model's detected capability.
+**Vision** — hara **auto-detects** whether the selected conversation model can see images. A multimodal
+model (Claude, GPT-4o, MiniMax-M3, qwen-vl, glm-4v, `deepseek-v4-flash-vision-exp`…) receives pasted
+images **inline**. A text-only model asks you to switch models instead of silently sending the image and
+conversation context to a secondary provider. If a custom model's capability is unknown, hara **asks once
+and remembers**; `/vision main yes|no|auto` corrects that native capability record. Legacy
+`visionModel` / `visionBaseURL` / `visionApiKey` values remain readable for config compatibility but are
+ignored by image routing.
 
 **Reasoning effort** — dial how hard a thinking model reasons: `off` · `low` · `medium` · `high` · `max`.
 ```bash
@@ -275,8 +285,8 @@ turn is active. **shift+tab** cycles the approval mode, **Esc** interrupts a run
 turn, and tool approvals appear inline (y/N). **Ctrl+V** pastes an image from your clipboard (a screenshot,
 or a copied image) — or drag an image file into the terminal — and it appears as a highlighted `[Image #N]`
 token inline where your cursor is (backspace over it to remove it). hara auto-detects the model's capability —
-a vision model sees the image directly; a text-only model routes it through a `visionModel` describer (see
-Setup), shown in the header at startup. Set `HARA_TUI=0` for the classic readline REPL.
+a multimodal model sees the image directly; a text-only model asks you to switch models and never silently
+uses a second image provider. Set `HARA_TUI=0` for the classic readline REPL.
 
 Text pasted by a modern terminal is handled as one bracketed-paste event, including multiline Claude/Codex
 output and a paste immediately followed by Enter. It is inserted for review and never auto-submitted merely
@@ -356,8 +366,8 @@ external MCP/agent confirmations remain stricter and cannot be bypassed by a rem
 **Screen control** (opt-in): the `computer` tool drives desktop software (screenshot → click/type), native per OS
 (mac `screencapture`+`cliclick` · Windows PowerShell · Linux `scrot`+`xdotool`). Off by default — enable a tier with
 `hara config set computerUse read|click|full` and allowlist apps with `hara config set computerApps "App, …"`. Guarded
-by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and per-action approval. Screenshots are read via your
-vision model into **actionable** output — interactive elements + positions (pass `focus` to target what you're after) — so even a text-only main model can click.
+by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and per-action approval. Screenshots are read by the
+selected conversation model into **actionable** output — interactive elements + positions (pass `focus` to target what you're after). A text-only model must be switched before visual screen control.
 **Sessions and task execution**: conversations are saved automatically — `-c` / `--resume <id>` or
 `hara resume <id>` to continue, `hara sessions` to list, `hara export [id] [--out file]` to render one as a
 Markdown transcript. The current task is persisted separately with stable task/turn identity and recovers as

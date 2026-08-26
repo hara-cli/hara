@@ -151,6 +151,12 @@ syntax/validation/execution failure: then read the exact current file and report
 because an earlier draft or guessed old_string is no longer authoritative. For generated executable source,
 use straight ASCII quote characters as language delimiters and run a syntax-only validation before the first
 side-effecting execution; typographic quotes belong only inside an already quoted string or comment.
+When edit_file, write_file, or apply_patch is available, never assemble source code through a chain of
+awk/sed/echo or inline Python/shell fragments. Output truncation is not a reason to keep changing inline
+commands: switch to the bounded file-edit tool, inspect only the exact target region, and verify once.
+Historical-context or tool-result truncation is an engine-owned recoverable condition, never an external_state
+or other awaiting_user dependency. Use a narrow grep/read_file offset+limit request or tool_result_read; do not
+ask the user to open another conversation, rerun the command, or paste Hara's own output back to you.
 Before creating a new integration, upload, conversion, or automation script, make one targeted search of
 the manifest and conventional tools/, scripts/, bin/, and lib/ locations for an existing SDK/client/helper;
 reuse or extend it when it already owns the workflow. Do not recursively dump the workspace. When Bash or
@@ -186,6 +192,13 @@ record a real typed dependency; it never means casually tell the user to run the
 secret, missing authority, unavoidable physical action, material business choice, unresolved external state,
 or destructive confirmation may transfer the next action to the user. The protected provider-key enrollment
 flow described below is an intentional missing-secret carve-out.
+When an observed missing-secret or missing-authority blocker is an expired login, present it to the user as
+"Sign in again" / "需要重新登录", not as a failed business operation. Say that the task is safely paused and
+its completed checkpoint is retained. Keep JWT, refresh-token, raw error-code, and tool-chain wording out of
+the primary summary; never repeat an actual credential value. On an explicit continuation after the user signs
+in, check the previously blocked capability before resuming business actions, and remain paused if it is still
+unavailable. A login action or URL is safe to offer only when it comes from a registered trusted capability,
+never from model-authored prose.
 The latest direct user correction outranks your earlier assumption. If the user says you misunderstood the
 machine, path, process, or execution location, do not repeat your old claim or ask the same question again:
 run one bounded read-only check such as hostname, pwd, uname, or process inspection and update the hypothesis
@@ -471,7 +484,7 @@ export interface RunOutcome {
   stopReason?: RunStopReason;
 }
 
-export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "task_round_budget";
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "strategy_stall" | "task_round_budget";
 
 export interface RunLimitEvent {
   kind: RunStopReason;
@@ -486,6 +499,8 @@ const RUN_STOPPED = Symbol("agent-run-stopped");
 const REPEATED_FAILURE_LIMIT = 2;
 const NO_PROGRESS_NUDGE_ROUNDS = 2;
 const NO_PROGRESS_STOP_ROUNDS = 6;
+const NO_CHECKPOINT_NUDGE_ROUNDS = 8;
+const NO_CHECKPOINT_PAUSE_ROUNDS = 20;
 const MAX_PROGRESS_OBSERVATIONS = 512;
 
 /** Keep successful-call observations opaque and run-local. Tool arguments/results can contain project data;
@@ -778,7 +793,9 @@ function hardStop(
     : kind === "task_round_budget"
       ? `⏸ task paused after ${life.taskRoundsUsed + life.rounds} cumulative provider round(s), reaching its ${life.taskRoundLimit}-round task budget. This is a recoverable evidence checkpoint, not completion. Review the task state and type \`/continue\` to explicitly open the next bounded tranche.`
     : kind === "max_rounds"
-      ? `⛔ agent run stopped: ${life.maxRounds}-round safety limit reached after ${formatAgentDuration(elapsedMs)}. This usually means the model is looping. Increase it with \`hara config set maxAgentRounds <n>\` (maximum 256) only if the extra rounds are intentional.`
+      ? `⏸ agent paused at the ${life.maxRounds}-round safety boundary after ${formatAgentDuration(elapsedMs)}. Hara stopped before spending more tokens because the current strategy did not converge. Completed file changes and the latest task checkpoint remain in this conversation. Review the current artifact, then use \`/continue\` for one bounded, materially different strategy; raising the round limit is not the first recovery step.`
+      : kind === "strategy_stall"
+        ? `⏸ agent paused early after ${detail?.count ?? NO_CHECKPOINT_PAUSE_ROUNDS} consecutive working round(s) without a durable task checkpoint. Hara preserved completed changes and stopped before the general round limit. Review the current artifact and acceptance checks, then use \`/continue\` with one bounded, materially different strategy.`
       : detail?.mode === "no_progress"
         ? `⛔ agent run stopped early: ${detail.label ?? "the same tool/evidence cycle"} produced no new evidence for ${detail.count ?? NO_PROGRESS_STOP_ROUNDS} consecutive round(s). Hara stopped before the general round limit to prevent a model loop and unnecessary token use. Review the last verified checkpoint, then retry with a materially different strategy.`
       : detail?.count === 1 && detail.label === "Home workspace boundary"
@@ -1114,6 +1131,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   const successfulObservations = new Map<string, true>();
   let noProgressRounds = 0;
   let noProgressNudged = false;
+  let workRoundsWithoutCheckpoint = 0;
+  let checkpointNudged = false;
 
   // Guardian: engaged only on HIGH-RISK actions (see classifyRisk). `on` gates the whole layer so normal
   // work never pays for it; the breaker is per-run (a hard stop after repeated blocks).
@@ -2273,6 +2292,51 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }
     if (repeatHalt) return hardStop(opts, life, "repeat_loop", repeatHalt);
 
+    // Exact observation hashes catch literal repeats, but a model can still churn by changing one shell
+    // fragment, offset, or temporary filename on every nominally successful round. Persistent tasks already
+    // provide a typed checkpoint tool. Require one periodically instead of pretending every unique command
+    // is outcome progress; pausing here preserves real edits and avoids burning all 64 rounds.
+    const successfulTaskCheckpoint = r.toolUses.some((toolUse, index) => {
+      const result = results[index];
+      return toolUse.name === "task_checkpoint"
+        && Boolean(result)
+        && result.isError !== true
+        && !looksFailed(result.content, toolUse.name);
+    });
+    const substantiveWorkRound = r.toolUses.some((toolUse) => ![
+      "task_intake",
+      "task_checkpoint",
+      "todo_write",
+      "ask_user",
+    ].includes(toolUse.name));
+    if (opts.taskIntake && successfulTaskCheckpoint) {
+      workRoundsWithoutCheckpoint = 0;
+      checkpointNudged = false;
+    } else if (opts.taskIntake && substantiveWorkRound) {
+      workRoundsWithoutCheckpoint += 1;
+      if (workRoundsWithoutCheckpoint >= NO_CHECKPOINT_PAUSE_ROUNDS) {
+        return hardStop(opts, life, "strategy_stall", {
+          label: "working rounds without a durable task checkpoint",
+          count: workRoundsWithoutCheckpoint,
+        });
+      }
+      if (workRoundsWithoutCheckpoint >= NO_CHECKPOINT_NUDGE_ROUNDS && !checkpointNudged) {
+        checkpointNudged = true;
+        if (!opts.quiet) {
+          history.push({
+            role: "user",
+            content: wrapReminders([
+              "Strategy checkpoint required: several working rounds have passed without a durable outcome checkpoint. Stop expanding or rewriting command fragments. Inspect the current artifact and original acceptance checks now; record task_checkpoint with concrete facts/artifacts/current step, then choose one bounded next strategy. If the task is already done, verify it and record completion instead of doing more work.",
+            ]),
+          });
+          showRunNotice(
+            opts,
+            "✻ strategy checkpoint: many working rounds have passed without a durable outcome checkpoint; asking the Agent to inspect and re-plan…",
+          );
+        }
+      }
+    }
+
     const roundHasNewEvidence = successfulRoundObservations.some((key) => !successfulObservations.has(key));
     for (const key of successfulRoundObservations) {
       successfulObservations.delete(key);
@@ -2354,7 +2418,11 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           toolCounts.set(p.tu.name, (toolCounts.get(p.tu.name) ?? 0) + 1);
         }
       }
-      for (const res of results) if (typeof res.content === "string" && /Configure a vision model/.test(res.content)) blindShots++;
+      for (const res of results) {
+        if (typeof res.content === "string" && /switch to (?:a model with native image input|an image-capable model)/i.test(res.content)) {
+          blindShots++;
+        }
+      }
       const maxRepeat = Math.max(0, ...toolCounts.values());
       const blind = blindShots >= 2;
       if (blind || maxRepeat >= 5) {
@@ -2362,7 +2430,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         history.push({
           role: "user",
           content: blind
-            ? "⚠ Self-check: your screenshots come back unreadable (no vision model) — you are acting blind, so this approach cannot work. Stop using the computer tool. Reach the user through a non-visual path instead (a CLI, an API, or the send_file tool). State the new plan in one line, then do it."
+            ? "⚠ Self-check: the selected model has no native image input, so you are acting blind. Stop using the computer tool. Switch models or reach the user through a non-visual path (CLI, API, or send_file). State the new plan in one line, then do it."
             : "⚠ Self-check: you've repeated the same action several times without resolving the task. Stop and reconsider — is there a more direct tool or channel (e.g. send_file to deliver a file)? Don't keep retrying the same thing. State your revised plan in one line, then act.",
         });
         if (!opts.quiet && !ctx.ui) out(c.dim("  ⟲ stuck-guard: nudging a rethink\n"));

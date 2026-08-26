@@ -522,13 +522,14 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "models.capabilities.v1",
         "sessions.readonly-history.v1",
         "sessions.cross-profile-fork.v1",
+        "sessions.space-route.v1",
         "learning.review.v1",
         "agent.action-ownership.v1",
         "agent.public-profile-edit.v1",
         "agent.blueprint-provenance.v1",
         "spaces.tenant-boundary.v1",
       ],
-      "persistent clients can negotiate attachments, model descriptors, safe recovery, reviewed learning, action ownership, Agent profiles, verified blueprints, and tenant Spaces",
+      "persistent clients can negotiate attachments, model descriptors, safe recovery, explicit Space routing, reviewed learning, action ownership, Agent profiles, verified blueprints, and tenant Spaces",
     );
     for (const method of ["spaces.list", "spaces.use", "agents.create", "agents.update-profile", "agents.archive"]) {
       assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
@@ -1341,7 +1342,7 @@ test("serve e2e: structured attachments support image-only turns and expose path
   }
 });
 
-test("serve e2e: a vision sidecar persists its description instead of raw images", { timeout: 10000 }, async () => {
+test("serve e2e: a legacy vision-sidecar result is rejected instead of rerouting the attachment", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-sidecar-image-"));
   const store = memStore();
   mkdirSync(join(dir, ".git"));
@@ -1406,16 +1407,13 @@ test("serve e2e: a vision sidecar persists its description instead of raw images
       text: "/inspect-image",
       images: [{ path: imagePath, mediaType: "image/jpeg" }],
     });
-    assert.equal(sent.result.reply, "understood");
-    const user = providerHistory.findLast((message) => message.role === "user");
-    assert.equal(user.images, undefined);
-    assert.match(user.content, /Use all supplied visual evidence/);
-    assert.match(user.content, /read by vision-helper/);
-    assert.match(user.content, /three participants/);
-    const persistedUser = store.saved.get(sid).history.findLast((message) => message.role === "user");
-    assert.equal(persistedUser.images, undefined);
-    assert.equal(persistedUser.imageDescription, "A sequence diagram with three participants.");
-    assert.equal(persistedUser.attachments[0].strategy, "vision-sidecar");
+    assert.match(sent.error.message, /no native image route/);
+    assert.deepEqual(providerHistory, [], "the selected text model is never called with translated context");
+    assert.equal(
+      store.saved.get(sid).history.some((message) => message.imageDescription),
+      false,
+      "new histories never persist a sidecar description",
+    );
   } finally {
     c.close();
     await srv.close();
@@ -1764,8 +1762,8 @@ test("serve e2e: unavailable history stays readable, same-Space recovery is expl
   const deps = {
     ...baseDeps(personalProvider, store),
     buildSessionProvider: async () => personalProvider,
-    buildProviderFor: async (model, _effort, _cwd, profileId) => {
-      providerRequests.push({ model, profileId });
+    buildProviderFor: async (model, _effort, _cwd, profileId, spaceId) => {
+      providerRequests.push({ model, profileId, spaceId });
       if (profileId === "key") {
         throw new Error(`model '${model}' is not authorized for organization connection 'key'`);
       }
@@ -1774,7 +1772,7 @@ test("serve e2e: unavailable history stays readable, same-Space recovery is expl
       }
       return personalProvider;
     },
-    runtimeInfo: (_cwd, model, profileId) => {
+    runtimeInfo: (_cwd, model, profileId, spaceId) => {
       const selectedProfile = profileId ?? "personal";
       if (selectedProfile === "key") {
         return {
@@ -1789,7 +1787,7 @@ test("serve e2e: unavailable history stays readable, same-Space recovery is expl
       return {
         providerId: "qwen",
         profileId: "personal",
-        spaceId: "personal",
+        spaceId: spaceId ?? "personal",
         model: model ?? "qwen3.7-plus",
         effortLevels: [],
         availableModels: ["qwen3.7-plus"],
@@ -1840,6 +1838,24 @@ test("serve e2e: unavailable history stays readable, same-Space recovery is expl
     assert.equal(blockedExport.error.code, -32001);
     assert.match(blockedExport.error.message, /cross-Space conversation transfer is blocked/i);
     assert.equal(store.saved.size, 2, "a denied company export creates no copied session");
+
+    const companyContextWithPersonalFunding = await client.call("session.fork", {
+      sessionId,
+      targetProfileId: "personal",
+      targetModel: "qwen3.7-plus",
+      targetSpaceId: "org:tenant-key",
+      transferHistory: true,
+    });
+    assert.equal(companyContextWithPersonalFunding.error, undefined);
+    assert.equal(companyContextWithPersonalFunding.result.profileId, "personal");
+    assert.equal(companyContextWithPersonalFunding.result.spaceId, "org:tenant-key");
+    assert.equal(companyContextWithPersonalFunding.result.model, "qwen3.7-plus");
+    assert.equal(store.saved.get(companyContextWithPersonalFunding.result.sessionId).meta.profileId, "personal");
+    assert.equal(store.saved.get(companyContextWithPersonalFunding.result.sessionId).meta.spaceId, "org:tenant-key");
+    assert.ok(
+      providerRequests.some((request) => request.profileId === "personal" && request.spaceId === "org:tenant-key"),
+      "the provider is built with the company Space audience even though the personal connection pays",
+    );
 
     const forked = await client.call("session.fork", {
       sessionId: personalSourceId,

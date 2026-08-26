@@ -13,6 +13,7 @@ import {
   isDeepSeekResponsesModel,
   isOfficialDeepSeekEndpoint,
 } from "./deepseek.js";
+import { isOfficialMiniMaxEndpoint } from "./minimax.js";
 
 /** The wire protocol used to talk to a platform (which transport builds the request + reads the stream). */
 export type WireApi = "chat" | "responses" | "anthropic";
@@ -66,6 +67,7 @@ const BY_PROVIDER: Record<string, Partial<PlatformCaps>> = {
   // Exact model-level routing is resolved from the official Token Plan base URL above. This row keeps
   // the provider conservative if a future saved profile is missing its preset endpoint.
   "token-plan": { wireApi: "chat", reasoning: "none", cache: "auto" },
+  "minimax-token-plan": { wireApi: "responses", reasoning: "minimax_responses", cache: "auto" },
   qwen: { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" }, // DashScope
   "qwen-oauth": { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" },
   glm: { wireApi: "chat", reasoning: "none", cache: "auto" }, // Zhipu native /paas/v4 — different thinking param; leave alone (its /anthropic endpoint resolves via baseURL)
@@ -87,6 +89,8 @@ export function resolvePlatform(
   modelId?: string,
 ): PlatformCaps {
   const deepSeekResponses = isDeepSeekResponsesModel(providerId, baseURL, modelId);
+  const miniMaxEndpoint = isOfficialMiniMaxEndpoint(baseURL);
+  const miniMaxResponses = providerId === "minimax-token-plan" || miniMaxEndpoint;
   const tokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
   const tokenPlanResponses = tokenPlan && isTokenPlanQwenResponsesModel(modelId ?? "");
   // baseURL shape is the strongest signal for a custom profile; else the provider-id override; else chat.
@@ -94,6 +98,8 @@ export function resolvePlatform(
     ? tokenPlanResponses
       ? { wireApi: "responses" as const, reasoning: "qwen_responses" as const, cache: "auto" as const }
       : { wireApi: "chat" as const, reasoning: "none" as const, cache: "auto" as const }
+    : miniMaxEndpoint
+      ? { wireApi: "responses" as const, reasoning: "minimax_responses" as const, cache: "auto" as const }
     : baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
   const managedDeepSeekGateway =
     providerId === "hara-gateway"
@@ -110,9 +116,11 @@ export function resolvePlatform(
   if (wireApiOverride && wireApiOverride !== resolved.wireApi) {
     const reasoning = wireApiOverride === "responses" && deepSeekResponses
       ? "deepseek_responses"
-      : wireApiOverride === "chat" && isOfficialDeepSeekEndpoint(providerId, baseURL)
-        ? "deepseek"
-        : BY_WIRE[wireApiOverride].reasoning;
+      : wireApiOverride === "responses" && miniMaxResponses
+        ? "minimax_responses"
+        : wireApiOverride === "chat" && isOfficialDeepSeekEndpoint(providerId, baseURL)
+          ? "deepseek"
+          : BY_WIRE[wireApiOverride].reasoning;
     return { ...resolved, wireApi: wireApiOverride, reasoning };
   }
   return resolved;

@@ -13,6 +13,7 @@ import {
   isOfficialTokenPlanOpenAIEndpoint,
   isTokenPlanQwenResponsesModel,
 } from "../dist/providers/alibaba.js";
+import { isOfficialMiniMaxEndpoint } from "../dist/providers/minimax.js";
 
 const DS = "https://coding.dashscope.aliyuncs.com/v1"; // the reporter's custom endpoint
 
@@ -66,6 +67,17 @@ test("reasoningParams DeepSeek Responses uses only documented effort values", ()
   assert.deepEqual(reasoningParams("deepseek_responses", "off", "deepseek-v4-flash"), { reasoning: { effort: "none" } });
 });
 
+test("reasoningParams MiniMax M3 exposes an adaptive thinking on/off switch", () => {
+  assert.deepEqual(reasoningParams("minimax_responses", "off", "MiniMax-M3"), { reasoning: { effort: "none" } });
+  for (const effort of ["low", "medium", "high", "max"]) {
+    assert.deepEqual(
+      reasoningParams("minimax_responses", effort, "MiniMax-M3"),
+      { reasoning: { effort: "high" } },
+      effort,
+    );
+  }
+});
+
 test("reasoningParams DeepSeek Chat preserves its native low/high/max levels", () => {
   assert.deepEqual(reasoningParams("deepseek", "off", "deepseek-v4-pro"), { thinking: { type: "disabled" } });
   assert.deepEqual(reasoningParams("deepseek", "low", "deepseek-v4-pro"), {
@@ -108,6 +120,23 @@ test("resolvePlatform: ANY vendor's /anthropic endpoint → anthropic wire + thi
     assert.equal(caps.reasoning, "thinking_budget");
     assert.equal(caps.cache, "cache_control");
   }
+});
+
+test("resolvePlatform: MiniMax Token Plan and an older generic profile use the official Responses route", () => {
+  const baseURL = "https://api.minimaxi.com/v1";
+  assert.equal(isOfficialMiniMaxEndpoint(baseURL), true);
+  assert.equal(isOfficialMiniMaxEndpoint(`${baseURL}/`), true);
+  assert.equal(isOfficialMiniMaxEndpoint("http://api.minimaxi.com/v1"), false);
+  assert.equal(isOfficialMiniMaxEndpoint("https://api.minimaxi.com.example/v1"), false);
+  assert.equal(isOfficialMiniMaxEndpoint("https://api.minimaxi.com/anthropic"), false);
+  for (const provider of ["minimax-token-plan", "openai", "custom"]) {
+    const caps = resolvePlatform(provider, baseURL, undefined, "MiniMax-M3");
+    assert.equal(caps.wireApi, "responses", provider);
+    assert.equal(caps.reasoning, "minimax_responses", provider);
+  }
+  const anthropic = resolvePlatform("minimax-token-plan", "https://api.minimaxi.com/anthropic", undefined, "MiniMax-M3");
+  assert.equal(anthropic.wireApi, "anthropic");
+  assert.equal(anthropic.reasoning, "thinking_budget");
 });
 
 test("resolvePlatform: official DeepSeek V4 models use Responses; legacy ids keep Chat", () => {

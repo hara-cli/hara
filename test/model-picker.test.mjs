@@ -9,16 +9,19 @@ import {
   codingPlanFallbackModels,
   deepSeekFallbackModels,
   listModels,
+  miniMaxFallbackModels,
 } from "../dist/providers/models.js";
 import {
   TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
   TOKEN_PLAN_OPENAI_BASE_URL,
   tokenPlanModelReplacement,
 } from "../dist/providers/alibaba.js";
+import { MINIMAX_TOKEN_PLAN_MODELS } from "../dist/providers/minimax.js";
 
 test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSeek uses off plus native low/high/max; none → nothing", () => {
   assert.deepEqual(levelsFor("enable_thinking"), ["off", "high"]);
   assert.deepEqual(levelsFor("ollama_think"), ["off", "high"]);
+  assert.deepEqual(levelsFor("minimax_responses", "MiniMax-M3"), ["off", "high"]);
   assert.deepEqual(levelsFor("reasoning_effort"), ["off", "low", "medium", "high"]);
   assert.deepEqual(levelsFor("thinking_budget"), ["off", "low", "medium", "high"]);
   assert.deepEqual(levelsFor("deepseek"), ["off", "low", "high", "max"]);
@@ -34,6 +37,7 @@ test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSe
 test("levelLabel: binary reads as on/off, graded as the level name", () => {
   assert.equal(levelLabel("enable_thinking", "high"), "on");
   assert.equal(levelLabel("enable_thinking", "off"), "off");
+  assert.equal(levelLabel("minimax_responses", "high", "MiniMax-M3"), "on");
   assert.equal(levelLabel("reasoning_effort", "medium"), "medium");
   assert.equal(levelLabel("qwen_responses", "max", "qwen3.8-max"), "xhigh");
 });
@@ -176,5 +180,26 @@ test("DeepSeek model discovery falls back to the official V4 Responses catalog o
     await listModels("https://api.deepseek.com", "k", live),
     ["deepseek-v5"],
     "live discovery remains authoritative over the dated fallback",
+  );
+});
+
+test("MiniMax Token Plan discovery falls back to M3 only on the exact official endpoint", async () => {
+  assert.deepEqual([...MINIMAX_TOKEN_PLAN_MODELS], ["MiniMax-M3"]);
+  assert.deepEqual(miniMaxFallbackModels("https://api.minimaxi.com/v1"), ["MiniMax-M3"]);
+  assert.deepEqual(miniMaxFallbackModels("https://api.minimaxi.com/v1/"), ["MiniMax-M3"]);
+  assert.deepEqual(miniMaxFallbackModels("http://api.minimaxi.com/v1"), []);
+  assert.deepEqual(miniMaxFallbackModels("https://api.minimaxi.com.example/v1"), []);
+  assert.deepEqual(miniMaxFallbackModels("https://api.minimaxi.com/anthropic"), []);
+
+  const unavailable = async () => ({ ok: false, json: async () => ({}) });
+  assert.deepEqual(
+    await listModels("https://api.minimaxi.com/v1", "k", unavailable),
+    ["MiniMax-M3"],
+  );
+  const live = async () => ({ ok: true, json: async () => ({ data: [{ id: "MiniMax-M3.1" }] }) });
+  assert.deepEqual(
+    await listModels("https://api.minimaxi.com/v1", "k", live),
+    ["MiniMax-M3.1"],
+    "live key-scoped discovery remains authoritative",
   );
 });

@@ -66,8 +66,8 @@ export interface ToolContext {
    *  given they are offered as a numbered list; the user may also type a free-text answer. Returns the chosen
    *  option text or the free text. */
   ask?: (question: string, options?: string[], signal?: AbortSignal) => Promise<string>;
-  /** describe an image file via the vision sidecar (lets the computer tool return a screenshot as text);
-   *  `hint` focuses the description on a goal (e.g. "the Login button") for actionable RPA output */
+  /** Describe a screenshot with the selected conversation model's native image input. `hint` focuses the
+   * description on a goal (e.g. "the Login button") for actionable RPA output. */
   describeImage?: (path: string, hint?: string, signal?: AbortSignal) => Promise<string>;
   /** Inspect a verified, engine-owned image snapshot with the current session's authorized image route.
    * The inspect_image tool owns filesystem validation and passes only a private temporary snapshot here;

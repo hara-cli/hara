@@ -425,4 +425,5 @@ test("statusbar: Alibaba plan context windows use exact documented sizes", () =>
   assert.equal(contextWindow("glm-5"), 202_752);
   assert.equal(contextWindow("glm-4.7"), 202_752);
   assert.equal(contextWindow("MiniMax-M2.5"), 196_608);
+  assert.equal(contextWindow("MiniMax-M3"), 1_000_000);
 });

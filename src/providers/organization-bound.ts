@@ -62,11 +62,17 @@ export function bindOrganizationProvider(
   provider: Provider,
   enrollment: Profile,
   resolveCurrent: OrganizationProfileResolver = () => getProfile(enrollment.id),
+  options: { requirePersonalModelConnections?: boolean } = {},
 ): Provider {
   if (enrollment.kind !== "gateway") throw new Error("only gateway providers can be organization-bound");
   const expectedSpaceId = spaceIdForProfile(enrollment);
   const prepare = async (signal?: AbortSignal): Promise<OrganizationExecutionPolicy> => {
     const policy = await refreshOrganizationExecutionPolicy(enrollment, expectedSpaceId, resolveCurrent, signal);
+    if (options.requirePersonalModelConnections && policy.allowPersonalModelConnections !== true) {
+      throw new Error(
+        "company policy does not allow personal model connections for this Space; choose a managed company model or ask an administrator",
+      );
+    }
     assertOrganizationModelAllowed(policy, provider.model);
     return policy;
   };

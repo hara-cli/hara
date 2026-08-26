@@ -242,6 +242,25 @@ test("awaiting_user rejects free-form handoff and available capabilities", () =>
   assert.match(available.reason, /blocked or unavailable/);
 });
 
+test("awaiting_user rejects Hara output compaction as a human dependency", () => {
+  const interaction = newTurnInteraction();
+  const task = createTaskExecution("finish the local import", interaction.turnId);
+  const rejected = applyTaskCheckpoint(task, {
+    completion: {
+      state: "awaiting_user",
+      evidence: ["read_file results contain [hara: 512 chars omitted from historical tool output]"],
+      dependency: {
+        kind: "external_state",
+        detail: "请用户另开会话运行 .tmp/fc.mjs，并粘贴完整 bash/Python 输出",
+        evidence: ["工具输出被截断，当前会话无法读取完整文件内容"],
+      },
+    },
+  });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.reason, /engine-recoverable/);
+  assert.match(rejected.reason, /read_file offset\+limit/);
+});
+
 test("verified completion cannot coexist with a persisted blocker", () => {
   const interaction = newTurnInteraction();
   const created = createTaskExecution("verify the artifact", interaction.turnId, "2026-08-14T00:00:00.000Z");
@@ -257,7 +276,7 @@ test("verified completion cannot coexist with a persisted blocker", () => {
   assert.match(rejected.reason, /cannot retain a blocker/);
 });
 
-test("deadline and cumulative task-round limits are resumable pauses while loop breakers remain blocked", () => {
+test("lifecycle and strategy boundaries are resumable pauses while exact loop breakers remain blocked", () => {
   const interaction = newTurnInteraction();
   const task = createTaskExecution("finish the long task", interaction.turnId);
   const deadline = finishTaskExecution(task, { status: "halted", stopReason: "deadline", error: "deadline" });
@@ -267,6 +286,12 @@ test("deadline and cumulative task-round limits are resumable pauses while loop 
   const roundBudget = finishTaskExecution(task, { status: "halted", stopReason: "task_round_budget", error: "checkpoint" });
   assert.equal(roundBudget.status, "paused");
   assert.equal(roundBudget.lastOutcome, "halted");
+
+  const maxRounds = finishTaskExecution(task, { status: "halted", stopReason: "max_rounds", error: "bounded pause" });
+  assert.equal(maxRounds.status, "paused");
+
+  const strategyStall = finishTaskExecution(task, { status: "halted", stopReason: "strategy_stall", error: "re-plan" });
+  assert.equal(strategyStall.status, "paused");
 
   const loop = finishTaskExecution(task, { status: "halted", stopReason: "repeat_loop", error: "loop" });
   assert.equal(loop.status, "blocked");

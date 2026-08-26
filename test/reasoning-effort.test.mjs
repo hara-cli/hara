@@ -64,9 +64,15 @@ test("openai: models that don't accept the reasoning_effort param return false (
 // ── reasoningParams: the OpenAI-compat merge body per style (incl. the new DeepSeek style + max clamp) ──
 
 test("reasoning: unset dial → {} for every style (model default, zero impact)", () => {
-  for (const style of ["reasoning_effort", "reasoning_object", "qwen_responses", "deepseek_responses", "deepseek", "enable_thinking", "ollama_think", "none"]) {
+  for (const style of ["reasoning_effort", "reasoning_object", "qwen_responses", "minimax_responses", "deepseek_responses", "deepseek", "enable_thinking", "ollama_think", "none"]) {
     assert.deepEqual(reasoningParams(style, undefined, "deepseek-v4-pro"), {}, `${style} unset → {}`);
   }
+});
+
+test("minimax_responses style: Adaptive Thinking is a binary off/on wire value", () => {
+  assert.deepEqual(reasoningParams("minimax_responses", "off", "MiniMax-M3"), { reasoning: { effort: "none" } });
+  assert.deepEqual(reasoningParams("minimax_responses", "low", "MiniMax-M3"), { reasoning: { effort: "high" } });
+  assert.deepEqual(reasoningParams("minimax_responses", "max", "MiniMax-M3"), { reasoning: { effort: "high" } });
 });
 
 test("deepseek style: off → thinking DISABLED (reasoning_effort can't express off)", () => {

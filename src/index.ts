@@ -9,7 +9,6 @@ import {
   effectiveAttachmentCapabilities,
   locateImage,
   classifyVision,
-  visionSidecarAuthorized,
   SCREENSHOT_SYSTEM,
 } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
@@ -364,19 +363,33 @@ const displayConfigValue = (key: string, value: unknown): string => {
 };
 
 // One mutable HaraConfig object owns one foreground run. Once that run is attached to a persisted
-// session, every auxiliary provider built from the same config (role, guardian, routing, vision, or an
+// session, every auxiliary provider built from the same config (role, guardian, routing, fallback, or an
 // interactive /model switch) must stay on the session's identity route. A WeakMap keeps this runtime-only
 // binding out of config serialization and lets explicit callback bindings override it for hara serve.
 const runtimeProfileBindings = new WeakMap<HaraConfig, string>();
+
+/** Resolve the current authenticated organization enrollment that owns a durable Space. A personal
+ * provider route may pay for inference inside that Space, but it never becomes the source of company
+ * identity, Agent policy, or permissions. Prefer the active enrollment when several routes reach the
+ * same tenant; otherwise keep the selection deterministic in profile-file order. */
+function organizationEnrollmentForSpace(cfg: HaraConfig, expectedSpaceId: string): Profile | null {
+  if (expectedSpaceId === PERSONAL_ID) return null;
+  const candidates = listProfiles().filter(
+    (profile) => profile.kind === "gateway" && spaceIdForProfile(profile) === expectedSpaceId,
+  );
+  const activeProfileId = resolveActive(cfg.cwd).id;
+  return candidates.find((profile) => profile.id === activeProfileId) ?? candidates[0] ?? null;
+}
 
 async function buildProvider(
   cfg: HaraConfig,
   targetOverride?: ProviderTargetOverride,
   boundProfileId?: string,
+  boundSpaceId?: string,
 ): Promise<Provider | null> {
   // Identity-profile is the source of truth for routing. `cfg` is the *merged* HaraConfig (env +
   // project + global) and still drives non-routing concerns (model overrides, baseURL fallbacks
-  // for things like vision/route/fallback sidecars). The active profile decides "where to send
+  // for things like routing/fallback helpers). The active profile decides "where to send
   // requests" — gateway (deviceToken at the gateway) vs BYOK (user's key direct to the provider).
   const effectiveProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
   const ap = effectiveProfileId
@@ -388,6 +401,8 @@ async function buildProvider(
   if (!isValidProfileId(ap.id)) {
     throw new Error("the selected profile uses a legacy invalid id; re-add it with 1-64 letters, numbers, dots, underscores, or dashes");
   }
+  const expectedSpaceId = boundSpaceId ?? spaceIdForProfile(ap);
+  assertProfileAudience(cfg, ap.id, expectedSpaceId);
   if (ap.kind === "gateway") {
     if (!ap.gatewayUrl || !ap.deviceToken || deviceTokenExpired(ap.tokenExpiresAt)) return null;
     const baseURL = ap.baseURL || `${ap.gatewayUrl.replace(/\/$/, "")}/v1`;
@@ -417,9 +432,25 @@ async function buildProvider(
 
   const baseTarget = resolveByokProviderTarget(cfg, ap, false);
   const target = overrideProviderTarget(baseTarget, targetOverride);
-  const built = await createProviderForTarget(target, cfg.reasoningEffort);
+  const rawProvider = await createProviderForTarget(target, cfg.reasoningEffort);
+  let built = rawProvider;
+  if (rawProvider && expectedSpaceId !== PERSONAL_ID) {
+    const enrollment = organizationEnrollmentForSpace(cfg, expectedSpaceId);
+    if (!enrollment) {
+      throw new Error(`company Space '${expectedSpaceId}' is no longer enrolled; refusing personal-key inference`);
+    }
+    const policy = await ensureOrganizationExecutionPolicy(cfg, ap, expectedSpaceId);
+    if (!policy) throw new Error("organization execution policy is unavailable; refusing personal-key inference");
+    assertOrganizationModelAllowed(policy, target.model);
+    built = bindOrganizationProvider(
+      rawProvider,
+      { ...enrollment },
+      () => profileByIdForConfig(cfg, enrollment.id),
+      { requirePersonalModelConnections: true },
+    );
+  }
   // The rest of the active run (status, vision classification, role defaults, resume) must see the resolved
-  // identity route rather than the always-populated Personal/global fields. Explicit sidecars stay isolated.
+  // identity route rather than the always-populated Personal/global fields. Explicit overrides stay isolated.
   if (!targetOverride && built) {
     cfg.provider = target.provider;
     cfg.model = target.model;
@@ -432,24 +463,30 @@ async function buildProvider(
 /** Wrap the main provider with per-turn model routing when `routeModel` is configured: trivial/non-coding
  *  turns go to the alternate (cheap/general) model, real coding/action work stays on the primary. No-op when
  *  routeModel is unset or equals the primary model. routeBaseURL/routeApiKey default to the primary's. */
-async function withRouting(primary: Provider | null, cfg: HaraConfig, boundProfileId?: string): Promise<Provider | null> {
+async function withRouting(
+  primary: Provider | null,
+  cfg: HaraConfig,
+  boundProfileId?: string,
+  boundSpaceId?: string,
+): Promise<Provider | null> {
   if (!primary || !cfg.routeModel || cfg.routeModel === primary.model) return primary;
   const alt = await buildProvider(cfg, {
     model: cfg.routeModel,
     ...(cfg.routeBaseURL ? { baseURL: cfg.routeBaseURL } : {}),
     ...(cfg.routeApiKey ? { apiKey: cfg.routeApiKey } : {}),
-  }, boundProfileId);
+  }, boundProfileId, boundSpaceId);
   return alt ? routingProvider(primary, alt) : primary;
 }
 
 /** Build the main provider for a persisted conversation and synchronize the mutable runtime config with
- * that exact identity route. This is deliberately separate from sidecar overrides: a resumed session's
- * profile/model are primary runtime state, while vision/route/fallback providers must not overwrite it. */
+ * that exact identity route. This is deliberately separate from auxiliary overrides: a resumed session's
+ * profile/model are primary runtime state, while routing/fallback providers must not overwrite it. */
 async function buildSessionBoundRuntime(
   cfg: HaraConfig,
   profileId: string,
   model: string,
   effort?: string,
+  spaceId?: string,
 ): Promise<{ provider: Provider; profile: Profile } | null> {
   const profile = profileByIdForConfig(cfg, profileId);
   if (!profile) {
@@ -463,7 +500,9 @@ async function buildSessionBoundRuntime(
   }
   runtimeProfileBindings.set(cfg, profileId);
   if (effort) cfg.reasoningEffort = effort as HaraConfig["reasoningEffort"];
-  const primary = await buildProvider(cfg, { model }, profileId);
+  const expectedSpaceId = spaceId ?? spaceIdForProfile(profile);
+  assertProfileAudience(cfg, profileId, expectedSpaceId);
+  const primary = await buildProvider(cfg, { model }, profileId, expectedSpaceId);
   if (!primary) return null;
   cfg.provider = primary.id as ProviderId;
   cfg.model = primary.model;
@@ -475,7 +514,7 @@ async function buildSessionBoundRuntime(
     cfg.baseURL = target.baseURL;
     cfg.apiKey = target.apiKey;
   }
-  return { provider: (await withRouting(primary, cfg, profileId)) ?? primary, profile };
+  return { provider: (await withRouting(primary, cfg, profileId, expectedSpaceId)) ?? primary, profile };
 }
 
 /** Re-resolve a persisted session's mutable local connection and prove it still names the same durable
@@ -491,6 +530,15 @@ function assertProfileAudience(
     throw new Error(`session profile '${profileId}' is no longer available; start a new conversation`);
   }
   const currentSpaceId = spaceIdForProfile(profile);
+  if (profile.kind === "byok" && expectedSpaceId !== PERSONAL_ID) {
+    const enrollment = organizationEnrollmentForSpace(cfg, expectedSpaceId);
+    if (!enrollment) {
+      throw new Error(
+        `session belongs to company Space '${expectedSpaceId}', but no current organization enrollment proves that audience`,
+      );
+    }
+    return profile;
+  }
   if (currentSpaceId !== expectedSpaceId) {
     throw new Error(
       `session belongs to Space '${expectedSpaceId}', but connection '${profileId}' now resolves to '${currentSpaceId}'; old history will not be sent across companies`,
@@ -507,12 +555,24 @@ async function ensureOrganizationExecutionPolicy(
   profile: Profile,
   expectedSpaceId = spaceIdForProfile(profile),
 ): Promise<OrganizationExecutionPolicy | null> {
-  if (profile.kind !== "gateway") return null;
-  return refreshOrganizationExecutionPolicy(
-    profile,
+  if (expectedSpaceId === PERSONAL_ID) return null;
+  const enrollment = profile.kind === "gateway"
+    ? profile
+    : organizationEnrollmentForSpace(cfg, expectedSpaceId);
+  if (!enrollment) {
+    throw new Error(`company Space '${expectedSpaceId}' is no longer enrolled; refusing company inference`);
+  }
+  const policy = await refreshOrganizationExecutionPolicy(
+    enrollment,
     expectedSpaceId,
-    () => profileByIdForConfig(cfg, profile.id),
+    () => profileByIdForConfig(cfg, enrollment.id),
   );
+  if (profile.kind === "byok" && policy.allowPersonalModelConnections !== true) {
+    throw new Error(
+      "company policy does not allow personal model connections for this Space; choose a managed company model or ask an administrator",
+    );
+  }
+  return policy;
 }
 
 /** One company-aware authorization guard for every built-in Git staging/commit path. The returned closure
@@ -554,6 +614,7 @@ async function buildGuardian(
   cfg: HaraConfig,
   primary: Provider | null,
   boundProfileId?: string,
+  boundSpaceId?: string,
 ): Promise<{ provider: Provider | null; enabled: boolean } | undefined> {
   if (cfg.guardian === "off") return undefined;
   let gp: Provider | null = primary;
@@ -562,7 +623,7 @@ async function buildGuardian(
       model: cfg.routeModel,
       ...(cfg.routeBaseURL ? { baseURL: cfg.routeBaseURL } : {}),
       ...(cfg.routeApiKey ? { apiKey: cfg.routeApiKey } : {}),
-    }, boundProfileId)) ?? primary;
+    }, boundProfileId, boundSpaceId)) ?? primary;
   }
   return { provider: gp, enabled: true };
 }
@@ -899,6 +960,11 @@ function spaceDirectorySnapshot(targetCwd: string) {
       authoritative: Boolean(entry.profile.tenantId),
       // Until Control returns a membership role/capability, company Agent profiles fail closed as view-only.
       agentProfilePermission: "view" as const,
+      // A missing or stale bundle is intentionally shown as blocked. The inference path still performs a
+      // required fresh Control sync before every personal-key turn; this field is presentation only.
+      personalModelConnections: loadOrganizationExecutionPolicy(spaceId)?.allowPersonalModelConnections === true
+        ? "allowed" as const
+        : "blocked" as const,
     })),
   ];
   return {
@@ -1079,6 +1145,7 @@ async function testNamedProviderConnection(inputId: string, targetCwd: string) {
 const SETUP_DEFAULT_MODEL: Record<string, string> = {
   anthropic: "claude-opus-4-8",
   "token-plan": "qwen3.8-max",
+  "minimax-token-plan": "MiniMax-M3",
   qwen: "qwen-plus",
   openai: "gpt-4o-mini",
   glm: "glm-4.6",
@@ -1095,6 +1162,7 @@ const SETUP_MENU: { label: string; id: ProviderId | "custom" }[] = [
   { label: "Anthropic", id: "anthropic" },
   { label: "OpenAI", id: "openai" },
   { label: "Alibaba Cloud Model Studio Token Plan (API key, Beijing)", id: "token-plan" },
+  { label: "MiniMax Token Plan (API key, Responses)", id: "minimax-token-plan" },
   { label: "GLM (Zhipu)", id: "glm" },
   { label: "DeepSeek", id: "deepseek" },
   { label: "Ollama (local, no key)", id: "ollama" },
@@ -2206,11 +2274,9 @@ function runDoctor(cfg: HaraConfig): string {
   const vcap = classifyVision(live.provider, live.model, live.modelVision);
   const imageStatus = vcap === "vision"
     ? c.dim("native on the main model")
-    : live.visionModel
-      ? c.dim("advanced compatibility fallback · ") + c.bold(live.visionModel)
-      : vcap === "text"
-        ? c.dim("off for this text-only model")
-        : c.dim("checked on first image");
+    : vcap === "text"
+      ? c.dim("off for this text-only model")
+      : c.dim("checked on first image");
   const installation = activeInstallation();
   const lines = [
     c.bold("hara doctor"),
@@ -2889,7 +2955,7 @@ profileCmd
   .option("--code <code>", "(gateway) enrollment code from your admin")
   .option("--label <label>", "human-friendly label for the profile")
   .option("--byok", "(byok) BYOK profile — bring your own provider key")
-  .option("--provider <id>", "(byok/local) anthropic | token-plan | openai-compatible | openai | glm | deepseek | openrouter | ollama | lmstudio (legacy: qwen | qwen-oauth)")
+  .option("--provider <id>", "(byok/local) anthropic | token-plan | minimax-token-plan | openai-compatible | openai | glm | deepseek | openrouter | ollama | lmstudio (legacy: qwen | qwen-oauth)")
   .option("--key <key>", "(byok) API key for scripts; omit in a terminal for masked input")
   .option("--no-key-prompt", "(byok) do not prompt for a missing API key; resolve it from the provider environment at use-time")
   .option("--base-url <url>", "(byok) override the provider base URL (OpenAI-compatible endpoints)")
@@ -2990,7 +3056,7 @@ profileCmd
       out(c.dim(`Switch to it with \`hara profile use ${id}\`.\n`));
       return;
     }
-    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|token-plan|openai-compatible|openai|glm|deepseek|openrouter|ollama|lmstudio [--base-url … --model …]\n"));
+    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|token-plan|minimax-token-plan|openai-compatible|openai|glm|deepseek|openrouter|ollama|lmstudio [--base-url … --model …]\n"));
     process.exit(1);
   });
 
@@ -3266,17 +3332,25 @@ program
       profile: Profile,
       targetCwd: string,
       live: HaraConfig,
+      expectedSpaceId = spaceIdForProfile(profile),
     ): Promise<void> => {
-      const enrollment = enrollmentFromProfile(profile);
+      if (expectedSpaceId === PERSONAL_ID) return;
+      const organizationProfile = profile.kind === "gateway"
+        ? profile
+        : organizationEnrollmentForSpace(live, expectedSpaceId);
+      if (!organizationProfile) {
+        throw new Error(`company Space '${expectedSpaceId}' is no longer enrolled; refusing company inference`);
+      }
+      const enrollment = enrollmentFromProfile(organizationProfile);
       if (!enrollment) return;
-      await ensureOrganizationExecutionPolicy(live, profile);
+      await ensureOrganizationExecutionPolicy(live, profile, expectedSpaceId);
       const now = Date.now();
-      if (now - (controlPlaneRefreshAt.get(profile.id) ?? 0) < 60_000) return;
-      controlPlaneRefreshAt.set(profile.id, now);
-      void heartbeatEnrollment(enrollment, undefined, { profileId: profile.id });
-      void syncOrganizationLearningsFromControl(profile.id, {
+      if (now - (controlPlaneRefreshAt.get(organizationProfile.id) ?? 0) < 60_000) return;
+      controlPlaneRefreshAt.set(organizationProfile.id, now);
+      void heartbeatEnrollment(enrollment, undefined, { profileId: organizationProfile.id });
+      void syncOrganizationLearningsFromControl(organizationProfile.id, {
         cwd: targetCwd,
-        organizationScopeId: spaceIdForProfile(profile),
+        organizationScopeId: expectedSpaceId,
       }).catch(() => undefined);
     };
     const handle = await startServe(
@@ -3288,18 +3362,27 @@ program
         // `hara serve` is persistent, but config.json is user-editable at any time. Re-read it for every
         // new/resumed session and model operation so a repaired/rotated key takes effect without restarting
         // the desktop server (and, critically, never ask for a key that is already on disk).
-        buildSessionProvider: async (targetCwd, profileId) => {
+        buildSessionProvider: async (targetCwd, profileId, spaceId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
           if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
-          await refreshSessionControlPlane(profile, targetCwd ?? cwd, live);
-          return withRouting(await buildProvider(live, undefined, profileId), live, profileId);
+          const expectedSpaceId = spaceId ?? spaceIdForProfile(profile);
+          assertProfileAudience(live, profile.id, expectedSpaceId);
+          await refreshSessionControlPlane(profile, targetCwd ?? cwd, live, expectedSpaceId);
+          return withRouting(
+            await buildProvider(live, undefined, profileId, expectedSpaceId),
+            live,
+            profileId,
+            expectedSpaceId,
+          );
         },
-        buildProviderFor: async (model, effort, targetCwd, profileId) => {
+        buildProviderFor: async (model, effort, targetCwd, profileId, spaceId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
           if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
-          await refreshSessionControlPlane(profile, targetCwd ?? cwd, live);
+          const expectedSpaceId = spaceId ?? spaceIdForProfile(profile);
+          assertProfileAudience(live, profile.id, expectedSpaceId);
+          await refreshSessionControlPlane(profile, targetCwd ?? cwd, live, expectedSpaceId);
           if (
             profile.kind === "gateway"
             && profile.availableModels?.length
@@ -3315,17 +3398,21 @@ program
               },
               { model },
               profileId,
+              expectedSpaceId,
             ),
             live,
             profileId,
+            expectedSpaceId,
           );
         },
-        listModels: async (targetCwd, profileId) => {
+        listModels: async (targetCwd, profileId, spaceId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
           if (!profile) throw new Error(`session profile '${profileId}' is no longer available`);
+          const expectedSpaceId = spaceId ?? spaceIdForProfile(profile);
+          assertProfileAudience(live, profile.id, expectedSpaceId);
           if (profile.kind === "gateway") {
-            const policy = await ensureOrganizationExecutionPolicy(live, profile);
+            const policy = await ensureOrganizationExecutionPolicy(live, profile, expectedSpaceId);
             const allowed = (models: string[]): string[] => models.filter((model) => {
               try {
                 if (policy) assertOrganizationModelAllowed(policy, model);
@@ -3343,11 +3430,21 @@ program
             ));
           }
           const target = resolveByokProviderTarget(live, profile, false);
-          return listModels(
+          const models = await listModels(
             target.baseURL,
             target.apiKey ?? "",
             createModelFetch(live.proxy),
           );
+          if (expectedSpaceId === PERSONAL_ID) return models;
+          const policy = await ensureOrganizationExecutionPolicy(live, profile, expectedSpaceId);
+          return models.filter((model) => {
+            try {
+              if (policy) assertOrganizationModelAllowed(policy, model);
+              return true;
+            } catch {
+              return false;
+            }
+          });
         },
         prepareImages: async (images, opts) => {
           const live = loadConfig({ cwd: opts.cwd });
@@ -3358,46 +3455,14 @@ program
             : { ...resolveByokProviderTarget(live, profile, false), model: opts.model };
           const native = classifyVision(target.provider, opts.model, live.modelVision);
           if (native === "vision") return { images };
-          const visionAuthorized = visionSidecarAuthorized(
-            live.visionModel,
-            profile.kind === "gateway" ? profile.availableModels ?? [] : undefined,
+          throw new Error(
+            native === "text"
+              ? `model '${opts.model}' cannot read images; switch this conversation to an image-capable model`
+              : (
+                  `image capability for model '${opts.model}' is unknown; ` +
+                  "choose a model with advertised image support or set a modelVision override"
+                ),
           );
-          if (!visionAuthorized) {
-            throw new Error(
-              profile.kind === "gateway" && live.visionModel
-                ? (
-                    `the advanced image fallback '${live.visionModel}' is not authorized for organization ` +
-                    `connection '${profile.id}'; use an image-capable model or organization-managed image ` +
-                    "fallback from this connection"
-                  )
-                : native === "text"
-                ? `model '${opts.model}' cannot read images; switch to an image-capable main model or configure the advanced image fallback`
-                : (
-                    `image capability for model '${opts.model}' is unknown; ` +
-                    "choose a model with advertised image support or set an advanced modelVision override"
-                  ),
-            );
-          }
-          const visionProvider = await buildProvider(live, {
-            model: live.visionModel,
-            ...(live.visionBaseURL ? { baseURL: live.visionBaseURL } : {}),
-            ...(live.visionApiKey ? { apiKey: live.visionApiKey } : {}),
-          }, profileId);
-          assertProfileAudience(live, profileId, opts.spaceId);
-          if (!visionProvider) {
-            throw new Error(
-              `the advanced image fallback is not authenticated for profile '${profile.id}'`,
-            );
-          }
-          const description = await describeImages(visionProvider, images, {
-            signal: opts.signal,
-            hint: opts.hint,
-          });
-          assertProfileAudience(live, profileId, opts.spaceId);
-          return {
-            description,
-            viaModel: live.visionModel,
-          };
         },
         providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
         unpinProjectProfile: (targetCwd) => {
@@ -3549,10 +3614,17 @@ program
           ).reasoning,
           cfg.model,
         ).filter((e): e is NonNullable<typeof e> => !!e),
-        runtimeInfo: (targetCwd, selectedModel, profileId) => {
+        runtimeInfo: (targetCwd, selectedModel, profileId, spaceId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
           if (!profile) throw new Error(`session profile '${profileId}' is no longer available; re-enroll that connection or start a new session with an existing profile`);
+          const expectedSpaceId = spaceId ?? spaceIdForProfile(profile);
+          assertProfileAudience(live, profile.id, expectedSpaceId);
+          const organizationProfile = expectedSpaceId === PERSONAL_ID
+            ? null
+            : profile.kind === "gateway"
+              ? profile
+              : organizationEnrollmentForSpace(live, expectedSpaceId);
           const current = profileId
             ? profile.kind === "gateway"
               ? {
@@ -3575,14 +3647,13 @@ program
             model,
             profileId: profile.id,
             profileKind: profile.kind,
-            spaceId: spaceIdForProfile(profile),
+            spaceId: expectedSpaceId,
+            ...(organizationProfile ? { organizationProfileId: organizationProfile.id } : {}),
             effortLevels: advertisedEfforts ?? inferredEfforts,
             attachmentCapabilities: effectiveAttachmentCapabilities(
               current.provider,
               model,
               live.modelVision,
-              live.visionModel,
-              profile.kind === "gateway" ? profile.availableModels ?? [] : undefined,
             ),
             ...(profile.kind === "gateway" && profile.availableModels?.length
               ? { availableModels: [...profile.availableModels] }
@@ -3607,9 +3678,14 @@ program
           const boundProfileId = profileId ?? PERSONAL_ID;
           if (!spaceId) throw new Error("session has no durable Space binding");
           assertProfileAudience(live, boundProfileId, spaceId);
-          const base = await withRouting(await buildProvider(live, undefined, profileId), live, profileId);
+          const base = await withRouting(
+            await buildProvider(live, undefined, profileId, spaceId),
+            live,
+            profileId,
+            spaceId,
+          );
           assertProfileAudience(live, boundProfileId, spaceId);
-          const guardian = await buildGuardian(live, base, profileId);
+          const guardian = await buildGuardian(live, base, profileId, spaceId);
           assertProfileAudience(live, boundProfileId, spaceId);
           return guardian;
         },
@@ -4907,7 +4983,7 @@ program.action(async (opts) => {
       assertAudience();
     }
     // Fallback provider, built correctly for CROSS-PROVIDER failover. Passing profile.id is essential:
-    // every sidecar request of a persisted session stays inside the same identity boundary.
+    // every fallback request of a persisted session stays inside the same identity boundary.
     let fallbackProv: Provider | null = null;
     if (cfg.fallbackModel && cfg.fallbackModel !== primary.model) {
       const fp = cfg.fallbackProvider;
@@ -4940,9 +5016,9 @@ program.action(async (opts) => {
     fbOpt = fallbackProv ? { provider: fallbackProv } : undefined;
     guardianOpt = nextGuardian;
   };
-  /** The engine owns local-file validation; this selector owns provider identity. Prefer the current main
-   * model whenever it sees images natively. A compatibility helper is used only for a text-only main model
-   * and only when the same profile is authorized to call it. No credential ever enters model context. */
+  /** The engine owns local-file validation; this selector owns provider identity. Image inspection always
+   * stays on the current conversation model so a stale global helper cannot change vendor, billing, policy,
+   * or company data routing behind the user's back. No credential ever enters model context. */
   const inspectImageWithCurrentRoute = async (
     primary: Provider,
     profile: Profile,
@@ -4953,32 +5029,17 @@ program.action(async (opts) => {
   ): Promise<{ text: string; model: string }> => {
     if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
     const native = classifyVision(primary.id, primary.model, cfg.modelVision);
-    let imageProvider: Provider | null = native === "vision" ? primary : null;
-    if (!imageProvider && cfg.visionModel) {
-      const authorized = visionSidecarAuthorized(
-        cfg.visionModel,
-        profile.kind === "gateway" ? profile.availableModels ?? [] : undefined,
-      );
-      if (authorized) {
-        imageProvider = await buildProvider(cfg, {
-          model: cfg.visionModel,
-          ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
-          ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
-        }, profile.id);
-        if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
-      }
-    }
-    if (!imageProvider) {
+    if (native !== "vision") {
       throw new Error(
         `model '${primary.model}' cannot inspect images through profile '${profile.id}'; ` +
-        "switch this conversation to an image-capable model or configure an authorized compatibility helper",
+        "switch this conversation to an image-capable model",
       );
     }
-    const text = await describeImages(imageProvider, [image], { hint, signal });
+    const text = await describeImages(primary, [image], { hint, signal });
     if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
     return {
       text,
-      model: imageProvider.model,
+      model: primary.model,
     };
   };
   // Safety UX: first line of stdout = "where am I sending requests right now". Stable, scriptable,
@@ -5060,21 +5121,12 @@ program.action(async (opts) => {
       if (!profileId || !spaceId) throw new Error("headless session has no durable Space binding");
       return assertProfileAudience(cfg, profileId, spaceId);
     };
-    // Vision sidecar for headless runs (gateway/cron): without it the computer tool's screenshots come back
-    // "configure a vision model" even when one is set, leaving a headless agent blind. Mirrors the interactive
-    // describeScreenshot — a configured visionModel, else the main model if it's vision-capable.
+    // Headless image inspection uses the pinned conversation model. A background task must not silently
+    // send company screenshots to a second provider merely because legacy vision settings exist locally.
     const describeImage = async (path: string, hint?: string, signal?: AbortSignal): Promise<string> => {
       assertHeadlessAudience();
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      const vp = cfg.visionModel
-        ? ((await buildProvider(cfg, {
-            model: cfg.visionModel,
-            ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
-            ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
-          }, meta?.profileId ?? sessionRouteProfileId)) ?? null)
-        : cap === "vision"
-          ? provider
-          : null;
+      const vp = cap === "vision" ? provider : null;
       assertHeadlessAudience();
       if (!vp) return "";
       try {
@@ -5328,9 +5380,8 @@ program.action(async (opts) => {
         content: `${INTERJECT_PREFIX}\n\n${entry.content}`,
       })));
     }
-    // Inbound images (gateway): the platform downloaded the user's photo(s) and passed their paths via env.
-    // Let the agent actually SEE them — attached inline for a vision-capable main model, else described via the
-    // visionModel sidecar and folded into the message (text-only models can't take image blocks).
+    // Inbound images (gateway): attach them only to a natively multimodal pinned model. A text-only route
+    // receives an explicit marker instead of silently forwarding private chat media to a second model.
     const printText = String(opts.print);
     if (meta && requiresAudienceBindingSave) {
       // Automated recall must first be able to reload the exact durable audience identity. This is especially
@@ -5351,34 +5402,15 @@ program.action(async (opts) => {
       .map((p) => ({ path: p, mediaType: mediaTypeFor(p) ?? "image/jpeg" }));
     if (inboundImgs.length && classifyVision(cfg.provider, cfg.model, cfg.modelVision) === "vision") {
       history.push({ role: "user", content: userText, images: inboundImgs }); // native vision → inline
-    } else if (inboundImgs.length && cfg.visionModel) {
-      let desc = "";
-      let vp: Provider | null = null;
-      const visionProfileId = meta?.profileId ?? sessionRouteProfileId;
-      assertHeadlessAudience();
-      try {
-        vp = (await buildProvider(cfg, {
-          model: cfg.visionModel,
-          ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
-          ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
-        }, visionProfileId)) ?? null;
-      } catch {
-        /* provider setup is best-effort; the audience checks remain mandatory */
-      }
-      assertHeadlessAudience();
-      if (vp) {
-        assertHeadlessAudience();
-        try {
-          desc = await describeImages(vp, inboundImgs);
-        } catch {
-          /* describe is best-effort — fall back to the marker-only text */
-        }
-        assertHeadlessAudience();
-      }
+    } else if (inboundImgs.length) {
       const n = inboundImgs.length;
       history.push({
         role: "user",
-        content: desc ? `${userText}\n\n[${n} image${n > 1 ? "s" : ""} the user sent — described by ${cfg.visionModel}]\n${desc}` : userText,
+        content: (
+          `${userText}\n\n[${n} image${n > 1 ? "s were" : " was"} not sent to the model because ` +
+          `${cfg.model} has no verified native image input. Ask the user to switch this conversation to ` +
+          "an image-capable model and resend the image.]"
+        ),
       });
     } else {
       history.push({ role: "user", content: userText });
@@ -5891,15 +5923,15 @@ program.action(async (opts) => {
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
   if (resumed) out(c.dim(`(resumed ${shortId(meta.id)} · ${history.length} msgs · model = ${cfg.model})\n`));
 
-  // Advanced image fallback state — shared by the `/vision` command (both REPLs) and the TUI image pipeline.
-  let visionProvider: Provider | null | undefined;
+  // `/vision main …` is only a capability override for custom model ids. Image routing itself remains
+  // pinned to the current conversation model; legacy sidecar settings are deliberately ignored.
   let remindedVision = false;
-  /** `/vision <model>` sets the describer; `/vision main yes|no|auto` sets the current model's capability. */
+  /** `/vision main yes|no|auto` sets the current model's native image capability. */
   const applyVision = (arg: string): string => {
     const parts = arg.trim().split(/\s+/).filter(Boolean);
     if (parts.length === 0) {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      return `images — main ${cfg.model}: ${cap}${cap === "unknown" ? " (checked on first image)" : ""} · advanced fallback: ${cfg.visionModel || "off"}`;
+      return `images — current model ${cfg.model}: ${cap}${cap === "unknown" ? " (checked on first image)" : ""}`;
     }
     if (parts[0] === "main") {
       const v = parts[1];
@@ -5915,12 +5947,7 @@ program.action(async (opts) => {
       }
       return `(${cfg.model} vision = ${v})`;
     }
-    const model = parts.join(" ");
-    cfg.visionModel = model;
-    visionProvider = undefined; // rebuild the describer with the new model
-    writeConfigValue("visionModel", model);
-    const warn = classifyVision(cfg.provider, model, cfg.modelVision) !== "vision" ? `  ⚠ ${model} isn't a known vision model — if it can't read images, pick a *-vl / vision model.` : "";
-    return `(advanced image fallback → ${model}; used only when the selected main model cannot read images)${warn}`;
+    return "usage: /vision main yes|no|auto (secondary vision models were removed; switch /model instead)";
   };
 
   const commands: Slash[] = [
@@ -6031,7 +6058,6 @@ program.action(async (opts) => {
           provider = nextProvider;
           meta.model = nextProvider.model;
           setSessionForceModel(force);
-          visionProvider = undefined;
           remindedVision = false;
           if (bar.isActive()) bar.update({ model: nextProvider.model });
           persistSession(); // persist only after provider + Space checks both succeed
@@ -6043,7 +6069,7 @@ program.action(async (opts) => {
     },
     {
       name: "vision",
-      desc: "advanced image fallback: /vision <model> · /vision main yes|no|auto",
+      desc: "set native image capability for a custom model: /vision main yes|no|auto",
       run: (a) => void out(applyVision(a || "") + "\n"),
     },
     {
@@ -6380,26 +6406,14 @@ program.action(async (opts) => {
       }
     }
     setTheme(cfg.theme);
-    // Vision: a text-only main model routes pasted images through a describer (`visionModel`); a
-    // vision-capable main model gets them inline (describer auto-suspended). Unknown models are asked
-    // once and remembered per-model in cfg.modelVision. See classifyVision for the capability map.
-    const getVisionProvider = async (): Promise<Provider | null> => {
-      assertInteractiveAudience();
-      if (visionProvider !== undefined) return visionProvider;
-      visionProvider = await buildProvider(cfg, {
-        model: cfg.visionModel!,
-        ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
-        ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
-      }, authoritativeProfileId);
-      assertInteractiveAudience();
-      return visionProvider;
-    };
-    // lets the computer tool return a screenshot as text (describe via the vision sidecar / a vision main model).
+    // Images and computer screenshots stay on the current conversation model. Unknown custom model ids are
+    // asked once and remembered; text-only models must be switched instead of silently using another vendor.
+    // Lets the computer tool return a screenshot as text through the current multimodal model.
     // Uses the screenshot-tuned prompt (actionable UI elements + positions) + an optional focus hint, so a
-    // text-only main model gets something it can click on rather than a generic transcription.
+    // native multimodal model gets actionable UI context rather than a generic transcription.
     const describeScreenshot = async (path: string, hint?: string, signal?: AbortSignal): Promise<string> => {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
+      const vp = cap === "vision" ? provider : null;
       if (!vp) return "";
       try {
         const description = await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
@@ -6416,7 +6430,7 @@ program.action(async (opts) => {
     // tool can click it precisely instead of guessing pixels from a text description.
     const locateScreenshot = async (path: string, target: string, signal?: AbortSignal): Promise<{ x: number; y: number } | null> => {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      const vp = cfg.visionModel ? await getVisionProvider() : cap === "vision" ? provider : null;
+      const vp = cap === "vision" ? provider : null;
       if (!vp) return null;
       try {
         const location = await locateImage(vp, { path, mediaType: "image/png" }, target, { signal });
@@ -6432,8 +6446,7 @@ program.action(async (opts) => {
       remindedVision = true;
       sink.notice(
         `⚠ ${cfg.model} is text-only and can't see images, so your image was skipped.\n` +
-          `  Switch this conversation to a main model with native image support.\n` +
-          `  Advanced compatibility remains available with /vision <model> when a text-only route must be kept.`,
+          "  Switch this conversation to a model with native image support, then resend the image.",
       );
     };
     const resolveImages = async (
@@ -6455,24 +6468,8 @@ program.action(async (opts) => {
         h.sink.notice(`(remembered: ${cfg.model} ${ans === "yes" ? "supports images" : "is text-only"})`);
       }
       if (cap === "vision") return { attach: imgs }; // native vision — describer suspended
-      if (!cfg.visionModel) {
-        remindVision(h.sink);
-        return { skip: true };
-      }
-      const vp = await getVisionProvider();
-      if (!vp) {
-        h.sink.notice("(image compatibility helper unavailable — check the advanced image fallback settings)");
-        return { skip: true };
-      }
-      h.sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with the image compatibility helper…`);
-      try {
-        const desc = await describeImages(vp, imgs, { signal: h.signal });
-        return { extraText: `\n\n[Image description — compatibility helper]\n${desc}` };
-      } catch (e) {
-        const msg = h.signal?.aborted ? "image describe cancelled" : `image describe failed: ${e instanceof Error ? e.message : String(e)}`;
-        h.sink.notice(`(${msg})`);
-        return { skip: true };
-      }
+      remindVision(h.sink);
+      return { skip: true };
     };
     // ── Header (rebuilt per 顾雅 spec, 2026-06):
     //   • Single-line logo + tagline (no ASCII banner block).
@@ -6480,8 +6477,7 @@ program.action(async (opts) => {
     //     (route host only when baseURL is custom); org spreads to `org <label> · <id> → <host>`
     //     plus its own `model` line annotated with the source (org default / user override).
     //   • cwd line silently appends "· AGENTS.md" when loaded — we never show a negative noise line.
-    //   • Image compatibility is not model identity. It stays out of the header and appears only as a
-    //     one-shot inline notice when a text-only model actually receives an image.
+    //   • Image capability is part of the selected model route; text-only routes get a one-shot notice.
     const __mainCap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
     const __routeForHeader = routeHost(__activeP);
     // Model-source label (org only). `loadConfig` already merges env > project > overlay > globals,
@@ -6493,13 +6489,9 @@ program.action(async (opts) => {
           ? "org default"
           : "user override"
         : undefined;
-    // Lazy vision notice: only set it for the "describer in use" path (header used to always-on it).
-    // Native-vision models stay silent (the routing IS direct, nothing to say). "Unknown" stays silent
-    // too — the existing per-image picker (resolveImages) handles that on first paste.
-    const __visionNotice =
-      __mainCap === "text" && cfg.visionModel
-        ? `${cfg.model} is text-only — attached images use Hara's compatibility helper`
-        : undefined;
+    const __visionNotice = __mainCap === "text"
+      ? `${cfg.model} is text-only — switch models before attaching images`
+      : undefined;
     await runTui({
       initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,
@@ -6712,7 +6704,6 @@ program.action(async (opts) => {
                 if (!nextProvider) return void h.sink.notice("(could not rebuild provider)");
                 provider = nextProvider;
                 meta.model = nextProvider.model;
-                visionProvider = undefined;
                 remindedVision = false;
                 persistSession();
                 return void h.sink.notice(`(model → ${cfg.provider}:${nextProvider.model} · thinking ${chosen.effort ?? "default"})`);
@@ -6722,7 +6713,6 @@ program.action(async (opts) => {
               provider = nextProvider;
               meta.model = nextProvider.model;
               setSessionForceModel(force);
-              visionProvider = undefined; // new model may resolve a different describer / capability
               remindedVision = false;
               persistSession(); // persist only after provider + Space checks both succeed
               return void h.sink.notice(`(model → ${cfg.provider}:${nextProvider.model}${force ? " · forced (all roles)" : ""})`);

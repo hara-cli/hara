@@ -7,6 +7,10 @@ import {
   isOfficialTokenPlanOpenAIEndpoint,
   isTokenPlanInteractiveAgentModel,
 } from "./alibaba.js";
+import {
+  isOfficialMiniMaxEndpoint,
+  MINIMAX_TOKEN_PLAN_MODELS,
+} from "./minimax.js";
 
 // Alibaba Coding Plan's documented exact ids (verified 2026-07-18). Live `/models` remains authoritative;
 // this list is only a usability fallback because the coding endpoint/key combinations do not all enumerate.
@@ -46,6 +50,10 @@ export function deepSeekFallbackModels(baseURL: string | undefined): string[] {
     : [];
 }
 
+export function miniMaxFallbackModels(baseURL: string | undefined): string[] {
+  return isOfficialMiniMaxEndpoint(baseURL) ? [...MINIMAX_TOKEN_PLAN_MODELS] : [];
+}
+
 // Model discovery — "what can this key run?" A plan / OpenAI-compatible key usually exposes many
 // models (Qwen, GLM, Kimi, …) via `GET {baseURL}/models`; the /model picker lists them so you switch by
 // arrow keys, not by memorizing ids. Live results win. A bounded request falls back to Alibaba's documented
@@ -60,6 +68,7 @@ export async function listModels(
   const fallback = [
     ...codingPlanFallbackModels(baseURL),
     ...deepSeekFallbackModels(baseURL),
+    ...miniMaxFallbackModels(baseURL),
   ];
   try {
     const url = baseURL.replace(/\/+$/, "") + "/models";

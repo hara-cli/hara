@@ -63,6 +63,46 @@ test("context budget retains a bounded latest request even for structure-heavy h
   assert.ok(prepared.history.some((message) => message.role === "user" && message.content.includes("request-199")));
 });
 
+test("tight context preserves the latest narrow tool evidence instead of making re-read loop forever", () => {
+  const history = [];
+  for (let index = 0; index < 18; index++) {
+    history.push({ role: "user", content: `inspect old region ${index}` });
+    history.push({
+      role: "assistant",
+      text: "",
+      toolUses: [{ id: `old-call-${index}`, name: "read_file", input: { path: `/tmp/old-${index}.mjs` } }],
+    });
+    history.push({
+      role: "tool",
+      results: [{ id: `old-call-${index}`, name: "read_file", content: `OLD-${index}-START\n${"o".repeat(9_000)}\nOLD-${index}-END` }],
+    });
+  }
+  history.push({ role: "user", content: "continue from a narrow exact read" });
+  history.push({
+    role: "assistant",
+    text: "",
+    toolUses: [{ id: "latest-call", name: "read_file", input: { path: "/tmp/current.mjs", offset: 40, limit: 80 } }],
+  });
+  history.push({
+    role: "tool",
+    results: [{ id: "latest-call", name: "read_file", content: `LATEST-START\n${"n".repeat(8_000)}\nLATEST-END` }],
+  });
+
+  const prepared = prepareHistoryForModel(history, { model: "fake", maxChars: 18_000 });
+  const retainedTools = prepared.history.filter((message) => message.role === "tool");
+  const latest = retainedTools.at(-1).results[0].content;
+  const oldest = retainedTools[0].results[0].content;
+  const guard = prepared.history.find((message) => message.role === "user" && message.content.includes("Hara context guard"));
+
+  assert.ok(prepared.preparedChars <= prepared.budgetChars);
+  assert.match(latest, /LATEST-START/);
+  assert.match(latest, /LATEST-END/);
+  assert.ok(latest.length >= 4_000, `latest exact evidence retained ${latest.length} chars`);
+  assert.ok(oldest.length < latest.length, "older tool payloads yield budget to the newest read");
+  assert.match(guard.content, /not a tool outage or a human dependency/);
+  assert.match(guard.content, /do not ask the user to rerun a command or paste Hara's tool output/);
+});
+
 test("agent retries context overflow once on the same provider before considering fallback", async () => {
   let calls = 0;
   const seen = [];

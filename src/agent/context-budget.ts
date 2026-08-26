@@ -12,8 +12,10 @@ export const MAX_TOOL_INPUT_STRING_CHARS = 12_000;
 export const RECENT_IMAGE_TURNS = 2;
 
 const GUARD_NOTE =
-  "[Hara context guard: older/oversized context was bounded for this model request. The durable transcript is unchanged. " +
-  "Prefer current task state and recent messages; re-read files or ask the user before relying on an omitted exact value.]";
+  "[Hara context guard: older/oversized context was bounded for this model request. The durable transcript is unchanged, " +
+  "and the newest tool round is retained preferentially. A truncation marker is not a tool outage or a human dependency. " +
+  "Use a narrow grep/read_file offset+limit request or the tool_result_read id when an exact omitted value is still needed; " +
+  "do not ask the user to rerun a command or paste Hara's tool output.]";
 
 export interface PreparedHistory {
   history: NeutralMsg[];
@@ -124,6 +126,16 @@ export function prepareHistoryForModel(history: NeutralMsg[], options: PrepareOp
   const latestUser = userIndices.at(-1) ?? -1;
   const recentUsers = new Set(userIndices.slice(-3));
   const imageUsers = new Set(userIndices.slice(-RECENT_IMAGE_TURNS));
+  const toolIndices = history.flatMap((message, index) => message.role === "tool" ? [index] : []);
+  const latestTool = toolIndices.at(-1) ?? -1;
+  const latestToolResultCount = latestTool >= 0 && history[latestTool]?.role === "tool"
+    ? Math.max(1, history[latestTool].results.length)
+    : 1;
+  // A model that follows a context-guard hint by issuing a narrow re-read must actually see that new
+  // evidence on the next turn. Older tool payloads can collapse aggressively, but reserve a bounded
+  // portion of this request for the latest tool round so re-reading does not become a self-defeating loop.
+  const latestToolRoundBudget = Math.max(1_500, Math.min(24_000, Math.floor(budgetChars * 0.25)));
+  const latestToolResultCap = Math.max(128, Math.floor(latestToolRoundBudget / latestToolResultCount));
   let changed = false;
   let omittedImages = 0;
 
@@ -153,7 +165,8 @@ export function prepareHistoryForModel(history: NeutralMsg[], options: PrepareOp
       };
     }
     const results = message.results.map((result) => {
-      const content = clip(result.content, 24_000, `tool result ${result.name}`);
+      const label = index === latestTool ? `latest tool result ${result.name}` : `historical tool result ${result.name}`;
+      const content = clip(result.content, 24_000, label);
       if (content !== result.content) changed = true;
       return { ...result, content };
     });
@@ -163,7 +176,9 @@ export function prepareHistoryForModel(history: NeutralMsg[], options: PrepareOp
   const reduce = (toolCap: number, assistantCap: number, oldUserCap: number, recentUserCap: number, inputCap: number): void => {
     snapshot = snapshot.map((message, index): NeutralMsg => {
       if (message.role === "tool") {
-        return { role: "tool", results: message.results.map((result) => ({ ...result, content: clip(result.content, toolCap, `tool result ${result.name}`) })) };
+        const resultCap = index === latestTool ? Math.max(toolCap, latestToolResultCap) : toolCap;
+        const label = index === latestTool ? "latest tool output" : "historical tool output";
+        return { role: "tool", results: message.results.map((result) => ({ ...result, content: clip(result.content, resultCap, label) })) };
       }
       if (message.role === "assistant") {
         return {

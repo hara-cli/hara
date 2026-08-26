@@ -94,8 +94,8 @@ test("App header (personal): bordered card, ◆ glyph + title, profile grid, /mo
   // session is the first 8 chars, never the full uuid.
   assert.ok(frame.includes("7bf3ee14"), "session shows the short id");
   assert.ok(!frame.includes("7bf3ee14-aaaa"), "no full uuid leak");
-  // No visionModel configured → NO "vision <model>" clause on the model row (stay silent).
-  assert.ok(!/vision\s+\S/.test(frame), "no 'vision <model>' clause when visionModel is unset");
+  // Image capability never presents a secondary model as part of the active route.
+  assert.ok(!/vision\s+\S/.test(frame), "no secondary vision model appears in the route");
   // The actionable /model ↹ affordance is present (green in a real TTY).
   assert.ok(frame.includes("/model ↹"), "/model ↹ affordance on the model row");
   // Tip block keeps the user-visible execution transcript shortcut, but never advertises private reasoning.
@@ -120,7 +120,7 @@ test("App header keeps the optional image compatibility model out of primary ide
   const frame = strip(lastFrame());
   assert.ok(/profile\s+personal/.test(frame), "profile grid row shows 'personal'");
   assert.ok(/model\s+qwen:glm-5/.test(frame), "model row carries provider:model");
-  assert.ok(!frame.includes("vision qwen3.7-plus"), "the compatibility helper is not presented as a second primary model");
+  assert.ok(!frame.includes("vision qwen3.7-plus"), "legacy vision config is not presented as a second primary model");
   assert.ok(frame.includes("/model ↹"), "/model ↹ remains the primary model affordance");
   unmount();
 });
@@ -213,12 +213,12 @@ test("App image compatibility notice stays lazy until an image attachment is use
       cwd: process.cwd(),
       header,
       onSubmit,
-      visionNotice: "glm-5 is text-only — attached images use Hara's compatibility helper",
+      visionNotice: "glm-5 is text-only — switch models before attaching images",
     }),
   );
   await tick();
   // At init the notice is NOT in the frame — header doesn't carry it anymore.
-  assert.ok(!strip(lastFrame()).includes("compatibility helper"), "image compatibility notice is silent at init");
+  assert.ok(!strip(lastFrame()).includes("switch models before attaching images"), "image capability notice is silent at init");
   // Simulate a turn where the runner reports an image attachment by having the App see one in handleSubmit.
   // We can't paste a real image via stdin in ink-testing-library, so we feed a synthetic onClipboardImage and
   // press Ctrl+V — but the simplest path is to drive the notice via a direct image turn through onSubmit + the
@@ -228,7 +228,7 @@ test("App image compatibility notice stays lazy until an image attachment is use
   stdin.write("\r");
   await tick(150);
   // Still no notice — no image yet.
-  assert.ok(!strip(lastFrame()).includes("compatibility helper"), "still no image notice after a plain text turn");
+  assert.ok(!strip(lastFrame()).includes("switch models before attaching images"), "still no image notice after a plain text turn");
   unmount();
 });
 

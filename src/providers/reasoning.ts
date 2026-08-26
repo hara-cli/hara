@@ -16,6 +16,8 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `qwen_responses` — Alibaba Model Studio Responses API for Qwen: `reasoning: { effort }`, with
  *                         model-specific levels. qwen3.8-max accepts low|medium|xhigh; older supported
  *                         Qwen Responses models also accept `none` and the wider graded dial.
+ *  - `minimax_responses` — MiniMax M3 Responses API: `none` disables thinking; any enabled Hara level
+ *                         maps to `high`, which MiniMax documents as Adaptive Thinking rather than depth.
  *  - `deepseek_responses` — DeepSeek V4 Responses API: `reasoning: { effort }`, with DeepSeek's
  *                         documented none|low|high|max values (`none` disables thinking).
  *  - `deepseek`         — DeepSeek V4 OpenAI-compat chat: a `thinking: { type }` on/off object PLUS a
@@ -28,7 +30,7 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `ollama_think`     — Ollama's OpenAI-compat endpoint: a `think` boolean that stops a local reasoning
  *                         model's thinking phase (measured: deepseek-r1:14b 17s → 0.6s). Off models ignore it.
  *  - `none`             — the platform has no thinking control; leave the request untouched. */
-export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "qwen_responses" | "deepseek_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
+export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "qwen_responses" | "minimax_responses" | "deepseek_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
 
 /** OpenAI reasoning families that accept `reasoning_effort` / `reasoning.effort`. Others reject it, so the
  *  `reasoning_effort` / `reasoning_object` styles no-op on non-reasoning models. */
@@ -89,6 +91,8 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
         : effort === "off" ? "none" : effort;
       return { reasoning: { effort: mapped } };
     }
+    case "minimax_responses":
+      return { reasoning: { effort: effort === "off" ? "none" : "high" } };
     case "deepseek_responses":
       // DeepSeek Responses owns a provider-specific `none` value for disabling thinking. Keep the
       // transport stable instead of silently switching an `off` request to Chat Completions.
