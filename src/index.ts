@@ -245,6 +245,7 @@ import {
   saveSession,
   loadSession,
   acquireSessionLock,
+  reclaimOrphanedSessionLocks,
   releaseSessionLock,
   ensureSessionMetadataIndex,
   findSessionMetadataByPrefix,
@@ -3315,6 +3316,16 @@ program
   .option("--approval <mode>", "default approval mode for sessions: suggest | auto-edit | full-auto", "auto-edit")
   .action(async (o) => {
     const cwd = o.cwd ? (await import("node:path")).resolve(o.cwd) : process.cwd();
+    const sessionLockRecovery = reclaimOrphanedSessionLocks();
+    if (sessionLockRecovery.scanned > 0 || sessionLockRecovery.deferred > 0) {
+      out(c.dim(
+        `hara: session locks checked ${sessionLockRecovery.scanned}`
+        + ` · reclaimed ${sessionLockRecovery.reclaimed}`
+        + ` · live ${sessionLockRecovery.live}`
+        + ` · malformed ${sessionLockRecovery.malformed}`
+        + ` · deferred ${sessionLockRecovery.deferred}\n`,
+      ));
+    }
     const cfg = loadConfig({ cwd });
     const initialProfile = profileForConfig(cfg).profile;
     if (initialProfile.kind === "gateway") {

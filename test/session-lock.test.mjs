@@ -2,10 +2,14 @@
 // its append-only history by racing writes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, existsSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { acquireSessionLock, releaseSessionLock } from "../dist/session/store.js";
+import {
+  acquireSessionLock,
+  reclaimOrphanedSessionLocks,
+  releaseSessionLock,
+} from "../dist/session/store.js";
 
 const lockPath = (id) => join(homedir(), ".hara", "sessions", `${id}.lock`);
 
@@ -63,5 +67,35 @@ test("release only removes OUR lock, never steals another process's", () => {
     assert.ok(existsSync(lockPath(id)), "another process's lock left intact");
   } finally {
     rmSync(lockPath(id), { force: true });
+  }
+});
+
+test("startup recovery removes only proven-dead locks and ignores lock age", () => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const deadId = `t-lock-orphan-${suffix}`;
+  const liveId = `t-lock-aged-live-${suffix}`;
+  const malformedId = `t-lock-malformed-${suffix}`;
+  const deadPath = lockPath(deadId);
+  const livePath = lockPath(liveId);
+  const malformedPath = lockPath(malformedId);
+  const reclaimPath = `${deadPath}.reclaim`;
+  try {
+    writeFileSync(deadPath, JSON.stringify({ pid: 2_000_000_000, startedAt: 1, token: "dead-owner" }));
+    writeFileSync(reclaimPath, JSON.stringify({ pid: 2_000_000_000, startedAt: 1, token: "dead-reclaimer" }));
+    writeFileSync(livePath, JSON.stringify({ pid: process.pid, startedAt: 1, token: "live-owner" }));
+    utimesSync(livePath, new Date(0), new Date(0));
+    writeFileSync(malformedPath, "not-json");
+
+    const report = reclaimOrphanedSessionLocks();
+    assert.equal(report.reclaimed, 1);
+    assert.ok(report.scanned >= 3);
+    assert.ok(report.live >= 1);
+    assert.ok(report.malformed >= 1);
+    assert.equal(existsSync(deadPath), false, "proven-dead primary lock removed");
+    assert.equal(existsSync(reclaimPath), false, "proven-dead recovery guard removed");
+    assert.equal(existsSync(livePath), true, "live lock survives even with an ancient mtime");
+    assert.equal(readFileSync(malformedPath, "utf8"), "not-json", "malformed evidence remains untouched");
+  } finally {
+    for (const target of [deadPath, reclaimPath, livePath, malformedPath]) rmSync(target, { force: true });
   }
 });

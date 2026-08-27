@@ -880,6 +880,75 @@ export function acquireSessionLock(id: string): { ok: boolean; pid?: number } {
   }
 }
 
+export interface SessionLockRecoveryReport {
+  scanned: number;
+  reclaimed: number;
+  live: number;
+  malformed: number;
+  deferred: number;
+}
+
+/**
+ * Recover abandoned session locks before a persistent Serve process accepts work.
+ *
+ * Age is deliberately irrelevant: a paused but live owner keeps its lock forever. Only a complete lock
+ * whose PID is proven dead is eligible, and the normal O_EXCL takeover path performs the mutation so a
+ * concurrently starting Hara process can win safely. Malformed files remain untouched for inspection.
+ */
+export function reclaimOrphanedSessionLocks(): SessionLockRecoveryReport {
+  const report: SessionLockRecoveryReport = {
+    scanned: 0,
+    reclaimed: 0,
+    live: 0,
+    malformed: 0,
+    deferred: 0,
+  };
+  let directory: string;
+  let names: string[];
+  try {
+    directory = sessionsDir();
+    names = readdirSync(directory);
+  } catch {
+    report.deferred += 1;
+    return report;
+  }
+
+  for (const name of names) {
+    if (!name.endsWith(".lock")) continue;
+    report.scanned += 1;
+    const id = name.slice(0, -".lock".length);
+    const target = join(directory, name);
+    try {
+      if (!validSessionId(id) || !lstatSync(target).isFile()) {
+        report.malformed += 1;
+        continue;
+      }
+    } catch {
+      report.deferred += 1;
+      continue;
+    }
+
+    const held = readLockRecord(target);
+    if (!held || !Number.isFinite(held.startedAt) || held.startedAt <= 0) {
+      report.malformed += 1;
+      continue;
+    }
+    if (pidAlive(held.pid)) {
+      report.live += 1;
+      continue;
+    }
+
+    const recovered = acquireSessionLock(id);
+    if (!recovered.ok) {
+      report.deferred += 1;
+      continue;
+    }
+    releaseSessionLock(id);
+    report.reclaimed += 1;
+  }
+  return report;
+}
+
 /** Release a session lock we hold (only removes it if the pid matches ours — never steals another's). */
 export function releaseSessionLock(id: string): void {
   const token = ownedLocks.get(id);

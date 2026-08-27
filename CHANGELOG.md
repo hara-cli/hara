@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.154.1 — 2026-08-27 — safe orphaned session-lock recovery
+
+- Audit session locks when `hara serve` starts and reclaim only complete records whose owning PID is
+  proven dead. Recovery reuses the token-fenced O_EXCL takeover path, so a concurrently starting Hara
+  process cannot be unlinked or mistaken for an orphan.
+- Preserve every live, malformed, or contended lock regardless of age, and emit only redacted aggregate
+  counts for diagnosis. Upgrade with `npm i -g @nanhara/hara@0.154.1`.
+
 ## 0.154.0 — 2026-08-26 — first-class model plans and durable Agent recovery
 
 - Add MiniMax Token Plan as a first-class provider. Hara pins the documented Codex/Responses endpoint,
