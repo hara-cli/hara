@@ -23,6 +23,7 @@ import {
   latestForCwd,
   titleFrom,
   deriveTitle,
+  sanitizeSessionTitle,
   validSessionId,
   sessionFileExists,
   MAX_SESSION_FILE_BYTES,
@@ -53,6 +54,77 @@ test("deriveTitle: auto-summarizes the first message, keeps CJK, drops slash-com
   assert.equal(deriveTitle("  fix   the  null  check  "), "fix the null check"); // whitespace collapsed
   assert.equal(deriveTitle(""), ""); // blank → empty (caller falls back to short id)
   assert.ok(deriveTitle("x".repeat(80)).endsWith("…")); // long input capped
+  const fakeSecret = "sk-sessiontitle1234567890";
+  assert.equal(deriveTitle(`排查登录 ${fakeSecret}`), "排查登录 credential");
+  assert.equal(sanitizeSessionTitle(`API_KEY=${fakeSecret}`), "credential");
+});
+
+test("session persistence and the v3 compatibility pass remove legacy credentials from titles and sidecars", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-title-redaction-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const fakeSecret = "sk-legacytitle1234567890";
+  try {
+    const sessions = join(home, ".hara", "sessions");
+    const project = join(home, "project");
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    const generation = "11111111-1111-4111-8111-111111111111";
+    const id = "legacy-sensitive-title";
+    const emptyId = "legacy-empty-draft";
+    const meta = {
+      id,
+      cwd: project,
+      provider: "test",
+      model: "test",
+      title: `debug ${fakeSecret}`,
+      createdAt: "2026-08-28T00:00:00.000Z",
+      updatedAt: "2026-08-28T00:00:00.000Z",
+      source: "interactive",
+    };
+    writeFileSync(join(sessions, `${id}.json`), JSON.stringify({
+      storageGeneration: generation,
+      meta,
+      history: [{ role: "user", content: `please use ${fakeSecret}` }],
+    }));
+    writeFileSync(join(sessions, `${id}.metadata`), JSON.stringify({
+      v: 1,
+      generation,
+      routes: 2,
+      meta,
+    }));
+    writeFileSync(join(sessions, `${emptyId}.json`), JSON.stringify({
+      meta: {
+        ...meta,
+        id: emptyId,
+        title: "",
+        createdAt: "2026-08-27T00:00:00.000Z",
+        updatedAt: "2026-08-27T00:00:00.000Z",
+      },
+      history: [],
+    }));
+
+    assert.equal(listSessions()[0]?.title, "debug credential", "legacy sidecars are safe even before migration");
+    await ensureSessionMetadataIndex({ force: true });
+
+    const transcript = readFileSync(join(sessions, `${id}.json`), "utf8");
+    const sidecar = readFileSync(join(sessions, `${id}.metadata`), "utf8");
+    assert.equal(transcript.includes(fakeSecret), false);
+    assert.equal(sidecar.includes(fakeSecret), false);
+    assert.equal(JSON.parse(sidecar).routes, 3);
+    assert.equal(loadSession(id)?.meta.title, "debug credential");
+    const migratedEmpty = loadSession(emptyId);
+    assert.equal(migratedEmpty?.meta.archived, true, "legacy empty interactive drafts are reversibly archived");
+    assert.equal(migratedEmpty?.history.length, 0);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("automation metadata history is cursor-paged without returning every transcript", () => {
@@ -403,7 +475,7 @@ test("an unsupported extended-year transcript is isolated while healthy legacy s
         updatedAt,
         source: "interactive",
       },
-      history: [],
+      history: [{ role: "user", content: id }],
     }));
     writeLegacy("legacy-year-10000", "+010000-01-01T00:00:00.000Z");
     writeLegacy("legacy-healthy-year", "2026-07-24T00:00:00.000Z");
@@ -578,7 +650,7 @@ test("legacy metadata migration publishes same-hour sessions in updatedAt order"
         updatedAt,
         source: "interactive",
       },
-      history: [],
+      history: [{ role: "user", content: id }],
     }));
     writeLegacy("migration-order-a", "2026-07-24T03:10:00.000Z");
     writeLegacy("migration-order-b", "2026-07-24T03:20:00.000Z");
@@ -1596,6 +1668,7 @@ test("SessionHub releaseIdle keeps in-flight locks and releases only quiescent s
   const busy = hub.create({ cwd: "/tmp/busy", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
   const configuring = hub.create({ cwd: "/tmp/configuring", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
   const idle = hub.create({ cwd: "/tmp/idle", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
+  assert.equal(saved.size, 0, "opening new chats creates only live drafts, not empty transcript files");
   assert.equal(busy.meta.haraVersion, "0.148.0-test");
   assert.equal(configuring.meta.haraVersion, "0.148.0-test");
   assert.equal(idle.meta.haraVersion, "0.148.0-test");
@@ -1612,4 +1685,32 @@ test("SessionHub releaseIdle keeps in-flight locks and releases only quiescent s
   configuring.configuring = false;
   hub.releaseAll();
   assert.deepEqual(new Set(released), new Set([idle.meta.id, busy.meta.id, configuring.meta.id]));
+});
+
+test("SessionHub persists a draft on its first content and can delete an abandoned draft", () => {
+  const saved = new Map();
+  const released = [];
+  const store = {
+    acquire: () => ({ ok: true }),
+    release: (id) => released.push(id),
+    load: (id) => saved.get(id) ?? null,
+    save: (meta, history, task) => saved.set(meta.id, structuredClone({ meta, history, ...(task ? { task } : {}) })),
+    list: () => [],
+    delete: (id) => saved.delete(id),
+  };
+  const provider = { id: "fake", model: "fake-1", async turn() { throw new Error("unused"); } };
+  const hub = new SessionHub(store);
+  const draft = hub.create({ cwd: "/tmp/draft", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
+  assert.equal(saved.has(draft.meta.id), false);
+  assert.equal(hub.setApproval(draft.meta.id, "full-auto"), "updated");
+  assert.equal(hub.rename(draft.meta.id, "draft title"), true);
+  assert.equal(saved.has(draft.meta.id), false, "metadata-only edits do not turn an abandoned draft into history");
+  draft.history.push({ role: "user", content: "start work" });
+  hub.save(draft);
+  assert.equal(saved.get(draft.meta.id).history.length, 1);
+
+  const abandoned = hub.create({ cwd: "/tmp/draft", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
+  assert.equal(hub.delete(abandoned.meta.id), "gone");
+  assert.equal(hub.get(abandoned.meta.id), undefined);
+  assert.ok(released.includes(abandoned.meta.id));
 });

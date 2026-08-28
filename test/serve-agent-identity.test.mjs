@@ -317,6 +317,17 @@ test("serve persists Agent identity, lists offices, and runs the selected person
       cwd: workspace,
       agentRef: "beta:designer",
     });
+    const beforeDesignerTurn = await client.call("session.list", {});
+    assert.ok(
+      !beforeDesignerTurn.result.sessions.some((session) => session.id === designer.result.sessionId),
+      "an untouched Agent draft must not create an empty history row",
+    );
+    const designerSent = await client.call("session.send", {
+      sessionId: designer.result.sessionId,
+      text: "review the experience",
+    });
+    assert.equal(designerSent.result.reply, "done");
+    assert.match(observedSystems.at(-1), /YOU ARE THE DESIGNER PERSONA/);
     const afterDesigner = await client.call("session.list", {});
     assert.equal(
       afterDesigner.result.sessions.find((session) => session.id === designer.result.sessionId).cwd,

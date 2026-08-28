@@ -27,7 +27,7 @@ import {
   MAX_ASSISTANT_CONTINUATION_ITEMS,
   type NeutralMsg,
 } from "../providers/types.js";
-import { redactSensitiveValue } from "../security/secrets.js";
+import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
@@ -164,7 +164,9 @@ const MAX_RECENT_SESSION_METADATA_SIZE = 500;
 const MAX_RECENT_SESSION_INDEX_PAGES = 4;
 const MAX_SESSION_PREFIX_LOOKUP_PAGES = 8;
 const SESSION_INDEX_VERSION = 1;
-const SESSION_INDEX_ROUTE_SCHEMA = 2;
+// v3 performs one complete compatibility pass so transcripts/sidecars written before session-title
+// sanitization are atomically rewritten under their ordinary session lock.
+const SESSION_INDEX_ROUTE_SCHEMA = 3;
 const SESSION_GENERATION_PREFIX_BYTES = 512;
 const MAX_SESSION_AUTHORITY_CACHE_ENTRIES = 2_048;
 const SESSION_STORAGE_GENERATION = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
@@ -188,8 +190,9 @@ interface SessionIndexCursor {
 interface SessionMetadataSidecar {
   v: 1;
   generation: string;
-  /** Route schema 2 includes source/cwd, automation-audience, gateway-prefix, and short-id partitions. */
-  routes?: 2;
+  /** Schema 2 introduced every route partition; schema 3 additionally certifies the transcript/title
+   * redaction rewrite. Readers accept both shapes but only the current schema skips compatibility work. */
+  routes?: 2 | 3;
   meta: SessionMeta;
 }
 
@@ -1047,14 +1050,31 @@ export function cleanSessionName(raw: string): string {
  *  (callers fall back to the short id, never "new session"). */
 export function deriveTitle(text: string): string {
   if (typeof text !== "string") return ""; // a malformed/hand-edited session may have a non-string content
-  const t = text
+  const t = sanitizeSessionTitle(text, 40)
     .replace(/^\/\S+\s*/, "") // drop a leading slash-command
     .replace(/```[\s\S]*?```/g, " ") // drop fenced code blocks
     .replace(/\s+/g, " ")
     .trim();
   if (!t) return "";
-  const max = 40;
-  return t.length <= max ? t : t.slice(0, max).replace(/\s+\S*$/, "").trim() + "…";
+  return t;
+}
+
+/** One boundary for every user/model/legacy title. Credentials are replaced before a title can be
+ * returned to a renderer, retained in live state, or written to either transcript or metadata sidecar. */
+export function sanitizeSessionTitle(raw: string, max = 120): string {
+  if (typeof raw !== "string" || max <= 0) return "";
+  const redacted = redactSensitiveText(raw);
+  let safe = redacted.text
+    .replace(/\b(?:[A-Za-z][A-Za-z0-9_.-]*(?:api[_-]?key|apikey|secret|token|password|passwd)[A-Za-z0-9_.-]*|(?:api[_-]?key|apikey|secret|token|password|passwd)[A-Za-z0-9_.-]*)\b\s*[:=]\s*(?:["']?\*{3}["']?)/giu, "credential")
+    .replace(/<REDACTED:[^>]+>|\b(?:sk-\*{3}|gh\*_\*{3}|glpat-\*{3}|xox\*-\*{3}|npm_\*{3}|AIza\*{3}|stripe-live-\*{3}|AWS-KEY-\*{3}|JWT-\*{3})|\bBearer\s+\*{3}/giu, "credential")
+    .replace(/[\u0000-\u001f\u007f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (redacted.redactions.length && (!safe || /^\*{3}$/u.test(safe))) safe = "Sensitive input";
+  if (!safe) return "";
+  if (safe.length <= max) return safe;
+  const clipped = safe.slice(0, max).replace(/\s+\S*$/u, "").trim();
+  return `${clipped || safe.slice(0, max)}…`;
 }
 
 export function titleFrom(history: NeutralMsg[]): string {
@@ -1082,6 +1102,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   // Redact a deep COPY: the live turn may still need a credential the user supplied, but the durable
   // transcript never should. Tool inputs/results are included, not just user message content.
   const safe = redactSensitiveValue(data).value;
+  safe.meta.title = sanitizeSessionTitle(safe.meta.title);
   // Structural routing/identity fields must remain byte-for-byte stable even if a path happens to contain
   // credential-looking text. Free-form meta (title, workingSet, todos, sourceName) and ALL history remain
   // deeply redacted. The live objects are not modified by the redaction walk.
@@ -1172,6 +1193,9 @@ function persistSessionSnapshot(
   updatedAt: string,
 ): void {
   checkedSessionId(meta.id);
+  // Also clean the live object. Deep-copy redaction alone protected disk, but could leave a credential in
+  // the current renderer until the next reload and allowed the RPC rename response to echo it.
+  meta.title = sanitizeSessionTitle(meta.title);
   const owned = ownedLocks.has(meta.id);
   const knownDirectoryState = !owned && sessionDirectoryMatchesCurrentState();
   if (!isTimestamp(updatedAt)) throw new Error("invalid session update timestamp");
@@ -1477,8 +1501,9 @@ function readSessionMetadataSidecar(
       && isSessionMeta(wrapped.meta)
       && wrapped.meta.id === id
     ) {
+      const safeMeta = redactedSessionCopy({ meta: wrapped.meta, history: [] }).meta;
       return {
-        meta: wrapped.meta,
+        meta: safeMeta,
         generation: wrapped.generation,
         ...(wrapped.routes === SESSION_INDEX_ROUTE_SCHEMA ? { routed: true } : {}),
       };
@@ -1487,7 +1512,7 @@ function readSessionMetadataSidecar(
     // safe best-effort cache only under the old strict-newer rule; wrapped sidecars are instead verified
     // against the authoritative transcript generation below and therefore do not trust wall-clock mtimes.
     return info.mtimeMs > transcriptMtimeMs && isSessionMeta(parsed) && parsed.id === id
-      ? { meta: parsed }
+      ? { meta: redactedSessionCopy({ meta: parsed, history: [] }).meta }
       : null;
   } catch {
     return null;
@@ -2200,7 +2225,22 @@ function migrateLegacySession(id: string): boolean {
         : undefined;
     const needsGatewayOwner = !!gatewayOwner && data.meta.gatewayOwner !== gatewayOwner;
     if (needsGatewayOwner) data.meta.gatewayOwner = gatewayOwner;
-    if (data.storageGeneration && !needsGatewayOwner) {
+    // Older Desktop builds persisted a transcript as soon as the user clicked “new chat”. Archive only
+    // truly empty interactive shells while rewriting them through the v3 compatibility path. Keeping the
+    // file preserves reversibility; user-only turns, task checkpoints, gateway and automation sessions are
+    // never classified as abandoned drafts.
+    if (
+      data.history.length === 0
+      && !data.task
+      && (data.meta.source === undefined || data.meta.source === "interactive")
+      && data.meta.archived !== true
+    ) {
+      data.meta.archived = true;
+    }
+    if (data.storageGeneration && !needsGatewayOwner && readSessionMetadataSidecar(
+      data.meta.id,
+      lstatSync(sessionFile(data.meta.id)).mtimeMs,
+    )?.routed) {
       // The transcript is already generation-bound (for example, a candidate build that only had the
       // global timeline). Merge the existing intent into every route without rewriting conversation data.
       appendSessionIndexRecord({
@@ -2211,6 +2251,8 @@ function migrateLegacySession(id: string): boolean {
       }, data.meta, true);
       writeSessionMetadataSidecar(data.meta, data.storageGeneration);
     } else {
+      // A generation-bound v1/v2 transcript still needs a v3 rewrite: readSessionFile already produced a
+      // redacted copy, and normal persistence removes legacy plaintext from both transcript and sidecar.
       persistSessionSnapshot(data.meta, data.history, data.task, data.meta.updatedAt);
     }
     return true;

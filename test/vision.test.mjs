@@ -35,6 +35,7 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("qwen", "qwen3.6-flash");
   V("qwen", "qwen3.8-max");
   V("qwen", "qwen3.8-max-preview");
+  V("token-plan", "qwen3.8-flash");
   V("openai", "kimi-k2.5"); // Coding Plan: 视觉理解
   V("openai", "glm-4v");
   V("openai", "glm-4.5v");

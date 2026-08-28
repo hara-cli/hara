@@ -220,6 +220,30 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
   quietDiscovery: true,
 });
 
+test("serve e2e: revoked organization access returns a safe re-enrollment error", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-org-auth-"));
+  const store = memStore();
+  const deps = {
+    ...baseDeps(textProvider, store),
+    buildSessionProvider: async () => {
+      throw new Error("organization role sync failed with HTTP 401");
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const created = await client.call("session.create", { cwd: dir });
+    assert.equal(created.error.code, -32001);
+    assert.match(created.error.message, /re-enroll/i);
+    assert.doesNotMatch(created.error.message, /HTTP 401|role sync/i);
+  } finally {
+    client.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 const reservePort = () => new Promise((resolve, reject) => {
   const server = createServer();
   server.once("error", reject);
@@ -527,9 +551,11 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "agent.action-ownership.v1",
         "agent.public-profile-edit.v1",
         "agent.blueprint-provenance.v1",
+        "external.sessions.metadata.v1",
+        "external.sessions.interaction.v1",
         "spaces.tenant-boundary.v1",
       ],
-      "persistent clients can negotiate attachments, model descriptors, safe recovery, explicit Space routing, reviewed learning, action ownership, Agent profiles, verified blueprints, and tenant Spaces",
+      "persistent clients can negotiate attachments, model descriptors, safe recovery, explicit Space routing, reviewed learning, action ownership, Agent profiles, verified blueprints, external-session interaction, and tenant Spaces",
     );
     for (const method of ["spaces.list", "spaces.use", "agents.create", "agents.update-profile", "agents.archive"]) {
       assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
@@ -1673,13 +1699,18 @@ test("serve e2e: persisted sessions keep their organization profile across activ
     const created = await client.call("session.create", {});
     sessionId = created.result.sessionId;
     assert.equal(created.result.profileId, "flash-org");
-    assert.equal(store.saved.get(sessionId).meta.profileId, "flash-org", "new session persists its identity route");
+    assert.equal(store.saved.has(sessionId), false, "an untouched new chat remains an in-memory draft");
+    const firstTurn = await client.call("session.send", { sessionId, text: "pin this organization route" });
+    assert.equal(firstTurn.result.reply, "bound");
+    assert.equal(store.saved.get(sessionId).meta.profileId, "flash-org", "the first turn persists its identity route");
   } finally {
     client.close();
     await first.close();
   }
 
   activeProfile = "pro-org";
+  auxiliaryRound = 0;
+  auxiliaryRequests.length = 0;
   const second = await startServe({ host: "127.0.0.1", port: 0, token: "tok-2", cwd: dir }, deps);
   client = await connect(second.port);
   try {
@@ -3666,11 +3697,12 @@ test("serve e2e: a per-session full-auto choice persists across reconnects witho
       approval: "full-auto",
     });
     assert.equal(changed.result.approval, "full-auto");
-    assert.equal(store.saved.get(sessionId).meta.approval, "full-auto");
+    assert.equal(store.saved.has(sessionId), false, "draft-only settings do not create an empty transcript");
 
     const sent = await firstClient.call("session.send", { sessionId, text: "write without prompting" });
     assert.equal(sent.result.reply, "done");
     assert.equal(firstClient.events.filter((event) => event.method === "approval.request").length, 0);
+    assert.equal(store.saved.get(sessionId).meta.approval, "full-auto");
   } finally {
     firstClient.close();
     await firstServer.close();

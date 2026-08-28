@@ -12,6 +12,18 @@
 //                                                        page:{hasMore,limit,nextCursor?}}
 //                                                        Interactive sessions only; automation history has
 //                                                        its own cursor under automation.list.
+//   external.sources.list {}                         → {sources:[{id,label,state,version?,reason?,capabilities}]}
+//   external.sessions.list {sourceId?,cursor?,limit?,search?}
+//                                                   → {sources,sessions:[{opaque id,sourceId,title,
+//                                                        workspaceName,workspaceId,state,createdAt,updatedAt,
+//                                                        origin?,ephemeral}],page}
+//   external.sessions.read {sessionId}              → {session,messages:[{id,role,text}],readOnly:boolean}
+//   external.sessions.fork {sessionId}              → {sourceSessionId,session,messages,readOnly:false}
+//   external.sessions.submit {sessionId,text}       → {sessionId,turnId,status,reply,error?}
+//   external.sessions.interrupt {sessionId}         → {}
+//                                                        Personal Space only. Provider-native IDs, full paths,
+//                                                        provider cursors and credentials never cross Serve. A
+//                                                        source session is read-only until explicitly forked.
 //   session.create    {cwd?,approval?,agentRef?} → {sessionId,model,profileId,approval,agentRef?}
 //   agents.list       {cwd?,sessionId?}          → {agents,offices,currentOfficeId}
 //   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}]}

@@ -1018,6 +1018,26 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
                       type: "string",
                       description: "Required for missing_secret/missing_authority; must be checkpointed blocked or unavailable.",
                     },
+                    manual_action: {
+                      type: "object",
+                      description: "Optional structured user handoff shown as a safe copy-only card. Never include a real credential. For a terminal step, include the exact command, a non-destructive verify_command, the short resume_phrase the user sends after verification, and hints for non-obvious flags or observed error patterns. Hara displays and copies these commands but never executes them.",
+                      properties: {
+                        command: { type: "string", description: "Exact copy-only command. Use placeholders instead of secret values; Hara never executes it." },
+                        verify_command: { type: "string", description: "Exact non-destructive copy-only command that verifies the external action succeeded; Hara never executes it." },
+                        resume_phrase: { type: "string", description: "Short phrase the user can send after the external action succeeds." },
+                        hints: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            properties: {
+                              term: { type: "string", description: "Flag or term, for example -w." },
+                              detail: { type: "string", description: "Focused explanation shown as help text/tooltip." },
+                            },
+                            required: ["term", "detail"],
+                          },
+                        },
+                      },
+                    },
                   },
                   required: ["kind", "detail", "evidence"],
                 },

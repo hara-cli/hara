@@ -414,6 +414,7 @@ test("statusbar: ctxPctFor + nextMode cycle", () => {
 test("statusbar: Alibaba plan context windows use exact documented sizes", () => {
   assert.equal(contextWindow("qwen3.8-max"), 983_616);
   assert.equal(contextWindow("qwen/qwen3.8-max"), 983_616);
+  assert.equal(contextWindow("qwen3.8-flash"), 1_000_000);
   assert.equal(contextWindow("qwen3.7-max"), 1_000_000);
   assert.equal(contextWindow("qwen3.7-plus"), 1_000_000);
   assert.equal(contextWindow("qwen3.6-flash"), 1_000_000);

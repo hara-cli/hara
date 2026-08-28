@@ -17,6 +17,7 @@ import {
   releaseSessionLock,
   deleteSession,
   deriveTitle,
+  sanitizeSessionTitle,
 } from "../session/store.js";
 import { forkTaskExecution, recoverTaskExecution, type TaskExecution } from "../session/task.js";
 
@@ -55,6 +56,10 @@ export interface ServeSession {
   projectContext?: string;
   /** This live attachment came from persisted history (resume/fork), not a fresh empty session. */
   continuationSession: boolean;
+  /** False only for a freshly-created, still-empty draft. It exists in the live client but is not placed
+   * in durable history until the first user turn/task, so opening and abandoning “new chat” leaves no
+   * orphan transcript. Omitted by older embedders means already durable. */
+  durable?: boolean;
   busy: boolean; // one turn per session at a time
   configuring: boolean; // provider/model/resume handshakes are serialized against turns/deletes
   /** Provider Promises that are still physically in flight after the agent's hard cancellation boundary. */
@@ -118,10 +123,9 @@ export class SessionHub {
     };
     const lock = this.store.acquire(meta.id); // fresh UUID, but filesystem errors must still fail closed
     if (!lock.ok) throw new Error(`could not acquire session lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
-    const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
+    const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, durable: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
     try {
       this.sessions.set(meta.id, s);
-      this.store.save(meta, []); // an empty newly-created thread must survive restart and appear in lists
       return s;
     } catch (error) {
       this.sessions.delete(meta.id);
@@ -156,7 +160,7 @@ export class SessionHub {
       const task = recoverTaskExecution(prior.task);
       const approval = prior.meta.approval ?? o.legacyApproval ?? o.approval;
       prior.meta.approval = approval;
-      const s: ServeSession = { meta: prior.meta, history: [...prior.history], task, provider: o.provider, approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
+      const s: ServeSession = { meta: prior.meta, history: [...prior.history], task, provider: o.provider, approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: prior.history.length > 0, durable: true, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: prior.meta.effort };
       this.sessions.set(id, s);
       keepLock = true; // live session owns it until delete/releaseAll
       return { session: s };
@@ -244,7 +248,9 @@ export class SessionHub {
       if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
     }
     this.stampVersion(s.meta);
+    if (s.durable === false && s.history.length === 0 && !s.task) return;
     this.store.save(s.meta, s.history, s.task);
+    s.durable = true;
   }
 
   /** Persist a projected transcript/task transition without mutating the live arrays first. Steering uses
@@ -255,21 +261,24 @@ export class SessionHub {
       if (first && "content" in first && typeof first.content === "string") s.meta.title = deriveTitle(first.content);
     }
     this.stampVersion(s.meta);
+    if (s.durable === false && history.length === 0 && !task) return;
     this.store.save(s.meta, history, task);
+    s.durable = true;
   }
 
   /** Rename a session (live or on-disk). Returns false when the id is unknown. */
   rename(id: string, title: string): boolean {
+    const safeTitle = sanitizeSessionTitle(title);
     const live = this.sessions.get(id);
     if (live) {
       if (live.busy || live.configuring) return false;
-      live.meta.title = title;
+      live.meta.title = safeTitle;
       this.stampVersion(live.meta);
-      this.store.save(live.meta, live.history, live.task);
+      this.save(live);
       return true;
     }
     return this.mutateStored(id, (current) => {
-      current.meta.title = title;
+      current.meta.title = safeTitle;
     });
   }
 
@@ -280,7 +289,7 @@ export class SessionHub {
       if (live.busy || live.configuring) return false;
       live.meta.archived = on;
       this.stampVersion(live.meta);
-      this.store.save(live.meta, live.history, live.task);
+      this.save(live);
       return true;
     }
     return this.mutateStored(id, (current) => {
@@ -297,7 +306,7 @@ export class SessionHub {
       live.approval = approval;
       live.meta.approval = approval;
       this.stampVersion(live.meta);
-      this.store.save(live.meta, live.history, live.task);
+      this.save(live);
       return "updated";
     }
     const updated = this.mutateStored(id, (current) => {
@@ -374,6 +383,7 @@ export class SessionHub {
       stats: { input: 0, output: 0 },
       projectContext: o.projectContext,
       continuationSession: history.length > 0,
+      durable: true,
       busy: false,
       configuring: false,
       pendingProviderTurns: 0,
@@ -403,6 +413,11 @@ export class SessionHub {
       (live?.pendingProviderTurns ?? 0) > 0 ||
       (live?.pendingToolRuns ?? 0) > 0
     ) return "busy";
+    if (live?.durable === false) {
+      this.sessions.delete(id);
+      this.store.release(id);
+      return "gone";
+    }
     const ok = this.store.delete(id);
     if (!ok) return "missing";
     if (live) this.sessions.delete(id);

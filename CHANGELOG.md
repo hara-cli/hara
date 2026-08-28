@@ -5,6 +5,30 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.155.0 — 2026-08-29 — local Codex/Claude session bridge and Qwen 3.8 vision
+
+- Add a device-local external session bridge for Codex and Claude Code. Hara Serve can discover, read,
+  fork, continue, and interrupt sessions through the tools' supported runtime surfaces while keeping native
+  IDs and local paths behind opaque device-bound identifiers. Transcript previews, runtime events, approval
+  prompts, and errors are bounded and redacted before they reach Desktop; Hara-created forks remain
+  distinguishable from sessions owned by the original tool, and an uncertain App Server request timeout
+  terminates its owned process tree instead of leaving unobserved work running.
+- Make `qwen3.8-flash` a first-class Alibaba Token Plan conversation model with Responses transport,
+  native image input, the documented one-million-token context window, and the supported
+  `low`/`medium`/`xhigh` reasoning levels. Media-generation model IDs remain outside the chat picker.
+- Preserve actionable recovery instead of turning Agent work into generic advice: a verified external
+  dependency can carry redacted copy-only action, verification, and resume instructions; Desktop-visible
+  runtime logs remain bounded while recording paired successful/failed provider and tool lifecycles with
+  durations; expired company enrollment receives a focused re-enrollment path; and stale opted-in scheduler
+  entries repair their executable after an upgrade without installing a scheduler for a user who never
+  enabled one.
+- Sanitize model-authored, user-authored, and legacy session titles before display or persistence, migrate
+  older metadata through the normal locked writer, reversibly archive legacy empty interactive drafts and
+  restore one only after an explicit resume receives real content, keep new chats in memory until their first
+  content, prune expired continuation payloads on startup, and remove
+  obsolete config profile selectors now that `profiles.json.active` is the single identity authority. Upgrade
+  with `npm i -g @nanhara/hara@0.155.0`.
+
 ## 0.154.1 — 2026-08-27 — safe orphaned session-lock recovery
 
 - Audit session locks when `hara serve` starts and reclaim only complete records whose owning PID is

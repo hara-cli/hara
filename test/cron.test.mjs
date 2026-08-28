@@ -30,7 +30,7 @@ import {
   setEnabled,
   updateJob,
 } from "../dist/cron/store.js";
-import { renderLaunchdPlist } from "../dist/cron/install.js";
+import { renderLaunchdPlist, schedulerEntryStateFor } from "../dist/cron/install.js";
 import { defaultProcessIdentity } from "../dist/process-identity.js";
 
 test("durationToMs", () => {
@@ -51,6 +51,34 @@ test("macOS cron uses calendar-minute events instead of a coalescible StartInter
     assert.match(plist, new RegExp(`<key>Minute</key><integer>${minute}</integer>`));
   }
   assert.match(plist, /<string>\/Applications\/Hara &amp; Tools\/hara<\/string>/);
+});
+
+test("Desktop detects and repairs a scheduler entry that points at an old app executable", () => {
+  const currentCommand = ["/Applications/Hara.app/Contents/MacOS/hara"];
+  const current = renderLaunchdPlist([...currentCommand, "cron", "tick"]);
+  const stale = renderLaunchdPlist([
+    "/Applications/Hara.app/Contents/MacOS/Hara",
+    "cron",
+    "tick",
+  ]);
+  assert.equal(schedulerEntryStateFor("darwin", current, currentCommand), "current");
+  assert.equal(schedulerEntryStateFor("darwin", stale, currentCommand), "stale");
+  assert.equal(schedulerEntryStateFor("darwin", null, currentCommand), "absent");
+});
+
+test("Linux scheduler comparison rejects duplicate or stale tagged entries", () => {
+  const command = ["/opt/hara/bin/hara"];
+  const line = "* * * * * '/opt/hara/bin/hara' 'cron' 'tick' >/dev/null 2>&1  # hara-cron";
+  assert.equal(schedulerEntryStateFor("linux", `${line}\n`, command), "current");
+  assert.equal(schedulerEntryStateFor("linux", `${line}\n${line}\n`, command), "stale");
+  assert.equal(
+    schedulerEntryStateFor(
+      "linux",
+      "* * * * * '/old/hara' 'cron' 'tick' >/dev/null 2>&1  # hara-cron\n",
+      command,
+    ),
+    "stale",
+  );
 });
 
 test("parseSchedule: the three forms + errors", () => {

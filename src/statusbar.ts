@@ -37,6 +37,7 @@ export function contextWindow(model: string): number {
   const m = model.toLowerCase().split("/").at(-1) ?? model.toLowerCase();
   if (/haiku/.test(m)) return 200_000;
   if (/^qwen3\.8-max(?:-|$)/.test(m)) return 983_616;
+  if (/^qwen3\.8-flash(?:-|$)/.test(m)) return 1_000_000;
   if (/^qwen3\.7-max(?:-|$)/.test(m)) return 1_000_000;
   if (/^qwen3\.[567]-plus(?:-|$)/.test(m) || /^qwen3-coder-plus(?:-|$)/.test(m)) return 1_000_000;
   if (/^qwen3\.[67]-flash(?:-|$)/.test(m)) return 1_000_000;

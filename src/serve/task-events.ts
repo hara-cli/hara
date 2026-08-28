@@ -72,6 +72,12 @@ export interface TaskLifecycleEvent {
         detail: string;
         evidence: string[];
         capability?: string;
+        manualAction?: {
+          command?: string;
+          verifyCommand?: string;
+          resumePhrase?: string;
+          hints?: Array<{ term: string; detail: string }>;
+        };
       };
     };
   };
@@ -177,6 +183,9 @@ export function taskLifecycleEvent(
                       evidence: persisted.completion.dependency.evidence.map((item) => item.slice(0, 1_000)),
                       ...(persisted.completion.dependency.capability
                         ? { capability: persisted.completion.dependency.capability }
+                        : {}),
+                      ...(persisted.completion.dependency.manualAction
+                        ? { manualAction: structuredClone(persisted.completion.dependency.manualAction) }
                         : {}),
                     },
                   }

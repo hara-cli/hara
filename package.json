@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.154.1",
+  "version": "0.155.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -74,6 +74,7 @@
     "typescript": "^6.0.3"
   },
   "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.250",
     "@zvec/zvec": "^0.5.0",
     "qrcode-terminal": "^0.12.0"
   },

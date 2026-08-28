@@ -23,6 +23,8 @@ import {
 import { homedir, platform } from "node:os";
 import { basename, isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
+import { pruneStoredToolResults } from "../tools/result-limit.js";
+import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
 import { runAgent, type RunOpts } from "../agent/loop.js";
 import {
   COMPACT_SYSTEM,
@@ -93,14 +95,19 @@ import {
   type Schedule,
 } from "../cron/schedule.js";
 import { parseDeliver } from "../cron/deliver.js";
-import { installScheduler, isInstalled } from "../cron/install.js";
+import {
+  installScheduler,
+  isInstalled,
+  reconcileInstalledScheduler,
+  schedulerEntryState,
+} from "../cron/install.js";
 import { runJobTracked, selfArgv } from "../cron/runner.js";
 import { loadTasks } from "../tools/task.js";
 import { listPending, resolvePending } from "../gateway/flows-pending.js";
 import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from "../tools/todo.js";
 import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
-import { ensureSessionMetadataIndex, type SessionMeta } from "../session/store.js";
+import { ensureSessionMetadataIndex, sanitizeSessionTitle, type SessionMeta } from "../session/store.js";
 import {
   parseFrame,
   rpcResult,
@@ -148,6 +155,10 @@ import {
   type Role,
 } from "../org/roles.js";
 import { agentIdentityFromMetadata, type AgentPublicIdentity } from "../org/agent-identity.js";
+import {
+  isOrganizationAuthorizationRejection,
+  organizationAuthorizationRecoveryMessage,
+} from "../org-fleet/errors.js";
 import { effectiveRoleModel } from "../session/session-model.js";
 import {
   DeskClientError,
@@ -196,6 +207,12 @@ import {
   type SessionAttachmentIntent,
   type ValidatedSessionAttachments,
 } from "./attachments.js";
+import { createExternalSessionRegistry } from "../external-sessions/registry.js";
+import {
+  ExternalSessionInputError,
+  type ExternalSessionService,
+  type ExternalSessionSourceId,
+} from "../external-sessions/types.js";
 
 /** What the CLI entry injects (built in index.ts, where config/providers/guardian already live). */
 export interface ServeDeps {
@@ -318,6 +335,9 @@ export interface ServeDeps {
   discoveryHome?: string; // tests: isolate the discovery file from the real home directory
   artifactHome?: string; // tests/embedders: isolate ~/.hara/artifacts from the real home directory
   compactTimeoutMs?: number; // tests/embedders: bound a provider that ignores cancellation
+  /** Optional hermetic/session-provider override. Production uses official local adapters and never parses
+   * private transcript files in the renderer or protocol layer. */
+  externalSessions?: ExternalSessionService;
 }
 
 export interface ServeAutoCompactDecision {
@@ -689,6 +709,9 @@ export interface SpaceSummary {
   /** False only for pre-Space Control enrollments that did not return a tenant id. */
   authoritative: boolean;
   agentProfilePermission: "edit" | "view";
+  /** Organization credential health. Personal omits it. Expired/invalid Spaces remain visible for
+   * recovery but cannot become an execution route until re-enrolled. */
+  accessState?: OrganizationAccessState;
   /** Presentation hint only. Inference still refreshes Control and fails closed before every BYOK turn. */
   personalModelConnections?: "allowed" | "blocked";
 }
@@ -1022,6 +1045,8 @@ function automationDeliverySummary(job: CronJob): {
   return { kind: parsed.platform, label: labels[parsed.platform], mode };
 }
 
+let automaticSchedulerRepairAttemptedFor = "";
+
 function automationSchedulerInfo(): {
   installed: boolean;
   supported: boolean;
@@ -1039,14 +1064,37 @@ function automationSchedulerInfo(): {
     };
   }
   try {
-    const installed = isInstalled();
+    let installed = isInstalled();
+    let detail = installed
+      ? "The local scheduler is installed."
+      : "Install the local scheduler once so enabled tasks can run while Desktop is closed.";
+    if (process.env.HARA_DESKTOP_SIDECAR === "1") {
+      const command = selfArgv();
+      const signature = command.join("\0");
+      const state = schedulerEntryState(command);
+      if (state === "stale" && automaticSchedulerRepairAttemptedFor !== signature) {
+        automaticSchedulerRepairAttemptedFor = signature;
+        const reconciled = reconcileInstalledScheduler(command);
+        installed = reconciled.current;
+        detail = reconciled.detail;
+      } else if (state === "current") {
+        installed = true;
+        detail = "The local scheduler is installed.";
+      } else if (state === "absent") {
+        installed = false;
+        detail = "Install the local scheduler once so enabled tasks can run while Desktop is closed.";
+      } else {
+        installed = false;
+        detail = state === "unsafe"
+          ? "The existing scheduler entry could not be verified; remove it and install the scheduler again."
+          : "The scheduler still points to an older Hara executable; install it again to repair the path.";
+      }
+    }
     return {
       installed,
       supported: true,
       platform: currentPlatform,
-      detail: installed
-        ? "The local scheduler is installed."
-        : "Install the local scheduler once so enabled tasks can run while Desktop is closed.",
+      detail,
     };
   } catch {
     return {
@@ -1206,9 +1254,13 @@ function automationScheduleForRequest(
 }
 
 export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<ServeHandle> {
+  // Best-effort private-state hygiene; never delays or prevents the local server from starting.
+  pruneStoredToolResults();
+  const runtimeLog = createServeRuntimeLogger({ enabled: !deps.quietDiscovery });
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
   const hub = new SessionHub(deps.store ?? realStore, deps.version);
+  const externalSessions = deps.externalSessions ?? createExternalSessionRegistry({ haraVersion: deps.version });
   // Existing pre-index transcripts are imported in yielding batches. The server can accept health/init
   // traffic immediately; only metadata listing waits for the one-time compatibility view to be complete.
   const sessionIndexReady = (): Promise<void> =>
@@ -1252,6 +1304,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ? { attachmentCapabilities: live.attachmentCapabilities }
         : {}),
     };
+  };
+  const externalSessionSpaceId = (): string => {
+    const runtime = runtimeInfo(opts.cwd);
+    return runtime.spaceId ?? failClosedSpaceId(runtime.profileId);
   };
   type SessionSpaceBinding = {
     profileId: string;
@@ -1389,8 +1445,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   };
 
   const observeProviderTurn = (session: ServeSession, turn: Promise<unknown>): void => {
+    const startedAt = Date.now();
     session.pendingProviderTurns += 1;
     trackActiveOperation(turn);
+    runtimeLog("provider.started", { sessionId: session.meta.id });
     const settled = (): void => {
       session.pendingProviderTurns = Math.max(0, session.pendingProviderTurns - 1);
       // A logical timeout/interrupt may return before a non-cooperative provider physically settles.
@@ -1398,12 +1456,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       releaseSessionBusyIfIdle(session);
       if (closing) hub.releaseIdle();
     };
-    void turn.then(settled, settled);
+    void turn.then(() => {
+      runtimeLog("provider.completed", {
+        sessionId: session.meta.id,
+        durationMs: Date.now() - startedAt,
+      });
+      settled();
+    }, (error) => {
+      runtimeLog("provider.failed", {
+        sessionId: session.meta.id,
+        category: serveRuntimeFailureCategory(error),
+        durationMs: Date.now() - startedAt,
+      });
+      settled();
+    });
   };
 
-  const observeToolRun = (session: ServeSession, toolRun: Promise<unknown>): void => {
+  const observeToolRun = (
+    session: ServeSession,
+    toolRun: Promise<unknown>,
+    tool: { name: string },
+  ): void => {
+    const startedAt = Date.now();
     session.pendingToolRuns += 1;
     trackActiveOperation(toolRun);
+    runtimeLog("tool.started", { sessionId: session.meta.id, tool: tool.name });
     const settled = (): void => {
       session.pendingToolRuns = Math.max(0, session.pendingToolRuns - 1);
       // `abort === null` means the logical turn already returned. Keep the session busy/locked until
@@ -1411,7 +1488,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       releaseSessionBusyIfIdle(session);
       if (closing) hub.releaseIdle();
     };
-    void toolRun.then(settled, settled);
+    void toolRun.then(() => {
+      runtimeLog("tool.completed", {
+        sessionId: session.meta.id,
+        tool: tool.name,
+        durationMs: Date.now() - startedAt,
+      });
+      settled();
+    }, (error) => {
+      runtimeLog("tool.failed", {
+        sessionId: session.meta.id,
+        tool: tool.name,
+        category: serveRuntimeFailureCategory(error),
+        durationMs: Date.now() - startedAt,
+      });
+      settled();
+    });
   };
 
   /** An RPC-requested shutdown is a cooperative handoff (for example, before a Desktop update), not a
@@ -1435,6 +1527,33 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const frame = rpcNotify(method, params);
     for (const ws of authed) if (ws.readyState === ws.OPEN) ws.send(frame);
   };
+  const confirmExternalSessionAction = (
+    sessionId: string,
+    question: string,
+    signal: AbortSignal,
+    allowAlways = false,
+  ): Promise<boolean | "always"> => new Promise((resolve) => {
+    const approvalId = randomUUID();
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (value: boolean | "always"): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      pendingApprovals.delete(approvalId);
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = (): void => finish(false);
+    timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS);
+    timer.unref();
+    pendingApprovals.set(approvalId, { finish, allowAlways });
+    if (signal.aborted) finish(false);
+    else {
+      signal.addEventListener("abort", onAbort, { once: true });
+      broadcast("external.approval.request", { sessionId, approvalId, question, allowAlways });
+    }
+  });
   const nextTaskEventCursor = (): TaskLifecycleCursor => {
     const sequence = taskEventSequence + 1;
     if (!Number.isSafeInteger(sequence)) {
@@ -1490,6 +1609,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       throw error;
     }
   }
+  runtimeLog("serve.started", { version: deps.version, port });
 
   /** Move accepted steering from the task inbox into a write-ahead transcript snapshot. The caller either
    *  appends the returned messages to live history or returns them to runAgent for that append. A crash can
@@ -1524,6 +1644,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     stopReason?: "deadline" | "task_round_budget" | "max_rounds" | "strategy_stall";
   }> => {
     const sessionId = s.meta.id;
+    const runtimeStartedAt = Date.now();
     const spaceBinding = sessionSpaceBinding(s.meta);
     bindSafeLegacyPersonalSession(s, spaceBinding);
     // Serve sessions can stay attached to Desktop for days. Refresh project instructions at the
@@ -1586,6 +1707,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       publishTaskState(event);
     };
     broadcast("event.turn_start", { sessionId, taskId: s.task.id, turnId: s.task.turnId });
+    runtimeLog("turn.started", { sessionId });
     emitTaskState({ state: "running", phase: "starting" });
     const historyStart = s.history.length;
     const before = { input: s.stats.input, output: s.stats.output };
@@ -1765,7 +1887,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               signal,
               {
                 onProviderTurn: (turn) => observeProviderTurn(s, turn),
-                onToolRun: (toolRun) => observeToolRun(s, toolRun),
+                onToolRun: (toolRun, tool) => observeToolRun(s, toolRun, tool),
                 onSubagentLifecycle: (event) => {
                   if (!taskId || !turnId) return;
                   const snapshot = workforceLedger.recordSubagent(s.meta.id, taskId, turnId, event);
@@ -1850,7 +1972,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         stats: s.stats,
         signal: turnAbort.signal,
         onProviderTurn: (turn) => observeProviderTurn(s, turn),
-        onToolRun: (toolRun) => observeToolRun(s, toolRun),
+        onToolRun: (toolRun, tool) => observeToolRun(s, toolRun, tool),
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
         });
@@ -1892,6 +2014,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             stopReason: outcome.stopReason,
             usage,
             ctx,
+          });
+          runtimeLog("turn.paused", {
+            sessionId,
+            category: outcome.stopReason === "deadline" ? "timeout" : "conflict",
+            durationMs: Date.now() - runtimeStartedAt,
           });
           return {
             reply: failure,
@@ -1942,6 +2069,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
       const ctx = ctxOf(s);
       broadcast("event.turn_end", { sessionId, taskId: s.task!.id, turnId: s.task!.turnId, reply, usage, ctx });
+      runtimeLog("turn.completed", { sessionId, durationMs: Date.now() - runtimeStartedAt });
       return { reply, usage, ctx, taskId: s.task!.id, turnId: s.task!.turnId };
     } catch (error) {
       if (s.task?.status === "running") {
@@ -1954,6 +2082,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         hub.save(s);
         emitTaskState({ phase: "finished" }, s.meta.todos ?? []);
       }
+      runtimeLog(turnAbort.signal.aborted ? "turn.interrupted" : "turn.failed", {
+        sessionId,
+        category: turnAbort.signal.aborted ? "cancelled" : serveRuntimeFailureCategory(error),
+        durationMs: Date.now() - runtimeStartedAt,
+      });
       throw error;
     } finally {
       stopTodoEvents();
@@ -2229,8 +2362,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         const p = (req.params ?? {}) as Record<string, any>;
         try {
         if (req.method === "initialize") {
-          if (typeof p.token !== "string" || !sameToken(p.token, token)) return reply(rpcError(id, ERR.UNAUTHORIZED, "bad token"));
+          if (typeof p.token !== "string" || !sameToken(p.token, token)) {
+            runtimeLog("auth.denied", { method: "initialize", code: ERR.UNAUTHORIZED, category: "authentication" });
+            return reply(rpcError(id, ERR.UNAUTHORIZED, "bad token"));
+          }
           authed.add(ws);
+          runtimeLog("client.authenticated", { method: "initialize" });
           // capability negotiation (codex app-server pattern): the server ADVERTISES its method set so
           // clients feature-detect up front instead of probing for -32601 per call. `p.capabilities`
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
@@ -2239,6 +2376,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
+            "external.sources.list", "external.sessions.list", "external.sessions.read", "external.sessions.fork",
+            "external.sessions.submit", "external.sessions.interrupt",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
@@ -2275,6 +2414,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "agent.action-ownership.v1",
             "agent.public-profile-edit.v1",
             "agent.blueprint-provenance.v1",
+            "external.sessions.metadata.v1",
+            "external.sessions.interaction.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
@@ -2295,7 +2436,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             setupState,
             capabilities: {
               methods,
-              events: ["event.task_state", "event.workforce_state", "event.surface"],
+              events: [
+                "event.task_state", "event.workforce_state", "event.surface",
+                "external.event.turn_start", "external.event.text", "external.event.tool",
+                "external.event.notice", "external.event.turn_end", "external.approval.request",
+              ],
               features,
             },
           }));
@@ -2356,6 +2501,111 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
               },
             }));
+          }
+          case "external.sources.list": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            return reply(rpcResult(id!, await externalSessions.listSources()));
+          }
+          case "external.sessions.list": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (p.sourceId !== undefined && p.sourceId !== "codex" && p.sourceId !== "claude") {
+              return reply(rpcError(id, ERR.PARAMS, "sourceId must be codex or claude"));
+            }
+            if (p.cursor !== undefined && (typeof p.cursor !== "string" || !p.cursor || p.cursor.length > 160)) {
+              return reply(rpcError(id, ERR.PARAMS, "cursor must be a bounded non-empty opaque cursor"));
+            }
+            if (p.limit !== undefined && (!Number.isInteger(p.limit) || p.limit < 1 || p.limit > 100)) {
+              return reply(rpcError(id, ERR.PARAMS, "limit must be an integer from 1 to 100"));
+            }
+            if (p.search !== undefined && (typeof p.search !== "string" || p.search.length > 200)) {
+              return reply(rpcError(id, ERR.PARAMS, "search must be a string of at most 200 characters"));
+            }
+            return reply(rpcResult(id!, await externalSessions.listSessions({
+              ...(p.sourceId ? { sourceId: p.sourceId as ExternalSessionSourceId } : {}),
+              ...(p.cursor ? { cursor: p.cursor as string } : {}),
+              ...(p.limit ? { limit: p.limit as number } : {}),
+              ...(typeof p.search === "string" ? { search: p.search } : {}),
+            })));
+          }
+          case "external.sessions.read": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            return reply(rpcResult(id!, await externalSessions.readSession(p.sessionId)));
+          }
+          case "external.sessions.fork": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            return reply(rpcResult(id!, await externalSessions.forkSession(p.sessionId)));
+          }
+          case "external.sessions.submit": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
+            }
+            const externalSessionId = p.sessionId;
+            const externalTurnId = `extturn_${randomUUID()}`;
+            broadcast("external.event.turn_start", { sessionId: externalSessionId, turnId: externalTurnId });
+            try {
+              const result = await externalSessions.submit(externalSessionId, p.text, {
+                text: (delta) => broadcast("external.event.text", { sessionId: externalSessionId, turnId: externalTurnId, delta }),
+                tool: (name, preview) => broadcast("external.event.tool", {
+                  sessionId: externalSessionId,
+                  turnId: externalTurnId,
+                  name,
+                  preview,
+                }),
+                notice: (text) => broadcast("external.event.notice", { sessionId: externalSessionId, turnId: externalTurnId, text }),
+                confirm: (request, signal) => confirmExternalSessionAction(
+                  externalSessionId,
+                  request.question,
+                  signal,
+                  request.allowAlways === true,
+                ),
+              });
+              const wireResult = { ...result, turnId: externalTurnId };
+              broadcast("external.event.turn_end", {
+                sessionId: wireResult.sessionId,
+                requestedSessionId: externalSessionId,
+                turnId: wireResult.turnId,
+                reply: wireResult.reply,
+                status: wireResult.status,
+                ...(wireResult.error ? { error: wireResult.error } : {}),
+              });
+              return reply(rpcResult(id!, wireResult));
+            } catch (error) {
+              const message = redactSensitiveText(String(error instanceof Error ? error.message : error)).text.slice(0, 2_000);
+              runtimeLog("external.turn.failed", {
+                sessionId: externalSessionId,
+                category: serveRuntimeFailureCategory(error),
+              });
+              broadcast("external.event.turn_end", {
+                sessionId: externalSessionId,
+                requestedSessionId: externalSessionId,
+                turnId: externalTurnId,
+                reply: "",
+                status: "failed",
+                error: message,
+              });
+              throw error;
+            }
+          }
+          case "external.sessions.interrupt": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            await externalSessions.interrupt(p.sessionId);
+            return reply(rpcResult(id!, {}));
           }
           case "spaces.list": {
             if (!deps.spaces) return reply(rpcError(id, ERR.METHOD, "Spaces are not supported by this server"));
@@ -2865,7 +3115,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (s.abort && s.task?.status === "running") {
               broadcastTaskState(s, { state: "running", phase: "stopping", detail: "Stopping at a safe boundary" });
             }
-            s.abort?.abort();
+            if (s.abort) {
+              runtimeLog("turn.interrupted", { sessionId: s.meta.id, category: "cancelled" });
+              s.abort.abort();
+            }
             return reply(rpcResult(id!, {}));
           }
           case "approval.reply": {
@@ -2890,8 +3143,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string" || typeof p.title !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId + title required"));
             const live = hub.get(p.sessionId);
             if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — rename after it finishes"));
-            if (!hub.rename(p.sessionId, p.title.slice(0, 120))) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
-            return reply(rpcResult(id!, { sessionId: p.sessionId, title: p.title.slice(0, 120) }));
+            const safeTitle = sanitizeSessionTitle(p.title);
+            if (!hub.rename(p.sessionId, safeTitle)) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            return reply(rpcResult(id!, { sessionId: p.sessionId, title: safeTitle }));
           }
           case "session.archive": {
             if (typeof p.sessionId !== "string" || typeof p.archived !== "boolean") return reply(rpcError(id, ERR.PARAMS, "sessionId + archived required"));
@@ -4358,8 +4612,24 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcError(id, ERR.METHOD, `unknown method ${req.method}`));
         }
         } catch (e: any) {
-          const code = e instanceof SessionSpaceBoundaryError ? ERR.UNAUTHORIZED : ERR.INTERNAL;
-          return reply(rpcError(id, code, redactSensitiveText(String(e?.message ?? e)).text));
+          const organizationAuthorizationRejected = isOrganizationAuthorizationRejection(e);
+          const code = e instanceof SessionSpaceBoundaryError || organizationAuthorizationRejected
+            ? ERR.UNAUTHORIZED
+            : e instanceof ExternalSessionInputError ? ERR.PARAMS : ERR.INTERNAL;
+          runtimeLog("rpc.failed", {
+            method: req.method,
+            code,
+            category: code === ERR.UNAUTHORIZED
+              ? "authorization"
+              : code === ERR.PARAMS ? "invalid_request" : serveRuntimeFailureCategory(e),
+          });
+          return reply(rpcError(
+            id,
+            code,
+            organizationAuthorizationRejected
+              ? organizationAuthorizationRecoveryMessage()
+              : redactSensitiveText(String(e?.message ?? e)).text,
+          ));
         }
       })();
       inFlightRequests.add(task);
@@ -4387,6 +4657,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const close = (): Promise<void> => {
     if (closePromise) return closePromise;
     closing = true; // message handlers check this before parsing, so no new work enters the hub
+    runtimeLog("serve.stopping");
     if (sessionIndexRefreshTimer) clearInterval(sessionIndexRefreshTimer);
     closePromise = (async () => {
       const serverClosed = new Promise<void>((resolve) => {
@@ -4404,6 +4675,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         controller.abort(new Error("Hara Serve is shutting down"));
       }
       for (const session of hub.active()) session.abort?.abort();
+      await externalSessions.close?.().catch(() => {});
       await deps.closeGatewayLogins?.().catch(() => {});
 
       for (const client of wss.clients) {

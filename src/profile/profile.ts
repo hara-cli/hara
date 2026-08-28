@@ -202,6 +202,24 @@ interface ProfilesState {
   snapshot: PrivateStateFileSnapshot;
 }
 
+/** `profiles.json.active` is the sole identity selector. Candidate/legacy builds also wrote
+ * `config.currentProfile` or `config.profileId`; those fields are ignored at runtime but leave a misleading
+ * second source of truth for users and diagnostics. Remove only those deprecated selectors, preserving the
+ * personal provider/model/key fields for which config.json remains authoritative. Cleanup is best effort so
+ * an unavailable personal config cannot make an otherwise valid organization registry unreadable. */
+function scrubLegacyConfigProfileSelectors(): void {
+  try {
+    const config = readRawConfig();
+    if (!Object.hasOwn(config, "currentProfile") && !Object.hasOwn(config, "profileId")) return;
+    updateRawConfig((current) => {
+      delete current.currentProfile;
+      delete current.profileId;
+    });
+  } catch {
+    // The ordinary config boundary reports malformed/unsafe config when that personal route is actually used.
+  }
+}
+
 function withProfilesLock<T>(fn: () => T): T {
   return withPrivateStateLockSync(homedir(), [], "profiles", fn, {
     busyMessage: "profiles registry is busy; retry the operation",
@@ -289,6 +307,7 @@ function maybeMigrateUnlocked(): ProfilesState {
   }
   const f: ProfilesFile = { active, profiles };
   const snapshot = persistProfilesFile(f, undefined, true);
+  scrubLegacyConfigProfileSelectors();
 
   // Park the exact verified legacy bytes without ever following/replacing an alias. If archival races or
   // fails, leave org.json untouched; profiles.json already makes the migration idempotent.
@@ -317,6 +336,7 @@ function maybeMigrate(): ProfilesFile {
       if (!validProfilesFile(existing.value)) {
         throw new Error("profiles registry contains invalid data; refusing automatic migration or replacement");
       }
+      scrubLegacyConfigProfileSelectors();
       return existing.value;
     }
   } catch {

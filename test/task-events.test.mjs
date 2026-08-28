@@ -102,6 +102,12 @@ test("task lifecycle event exposes an awaiting-user completion receipt without c
         kind: "material_choice",
         detail: "release-owner approval",
         evidence: ["publishing changes the public release channel and no approval choice was supplied"],
+        manual_action: {
+          command: "hara release approve -w production",
+          verify_command: "hara release status -w production",
+          resume_phrase: "I approved the production release",
+          hints: [{ term: "-w", detail: "Targets the named workspace." }],
+        },
       },
     },
   }, "2026-08-14T00:01:00.000Z");
@@ -123,6 +129,12 @@ test("task lifecycle event exposes an awaiting-user completion receipt without c
       kind: "material_choice",
       detail: "release-owner approval",
       evidence: ["publishing changes the public release channel and no approval choice was supplied"],
+      manualAction: {
+        command: "hara release approve -w production",
+        verifyCommand: "hara release status -w production",
+        resumePhrase: "I approved the production release",
+        hints: [{ term: "-w", detail: "Targets the named workspace." }],
+      },
     },
   });
 });

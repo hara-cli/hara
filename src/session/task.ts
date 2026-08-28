@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { RunOutcome } from "../agent/loop.js";
 import type { Todo } from "../tools/todo.js";
+import { redactSensitiveText } from "../security/secrets.js";
 
 export const TASK_SCHEMA_VERSION = 1;
 export const MAX_TASK_OBJECTIVE_CHARS = 4096;
@@ -16,6 +17,12 @@ export const MAX_TASK_CHECKPOINT_FACTS = 64;
 export const MAX_TASK_CHECKPOINT_CAPABILITIES = 32;
 export const MAX_TASK_COMPLETION_EVIDENCE = 12;
 export const MAX_TASK_DEPENDENCY_EVIDENCE = 8;
+export const MAX_TASK_MANUAL_COMMAND_CHARS = 2_048;
+export const MAX_TASK_VERIFY_COMMAND_CHARS = 2_048;
+export const MAX_TASK_RESUME_PHRASE_CHARS = 500;
+export const MAX_TASK_MANUAL_HINTS = 8;
+export const MAX_TASK_MANUAL_HINT_TERM_CHARS = 80;
+export const MAX_TASK_MANUAL_HINT_DETAIL_CHARS = 500;
 export const MAX_TASK_STATE_KEY_CHARS = 120;
 export const MAX_TASK_FACT_STRING_CHARS = 2_000;
 export const MAX_TASK_EVIDENCE_CHARS = 1_000;
@@ -87,6 +94,15 @@ export interface TaskUserDependency {
   detail: string;
   evidence: string[];
   capability?: string;
+  manualAction?: {
+    /** Display/copy only. Desktop never executes this command. Recognizable credentials are redacted. */
+    command?: string;
+    /** Optional copy-only command that proves the external action took effect. */
+    verifyCommand?: string;
+    /** Exact safe phrase the user can send after completing the external action. */
+    resumePhrase?: string;
+    hints?: Array<{ term: string; detail: string }>;
+  };
 }
 
 /** Context compaction and bounded tool previews are Hara-owned continuation mechanics, not events that a
@@ -298,6 +314,70 @@ interface TaskUserDependencyInput {
   detail?: unknown;
   evidence?: unknown;
   capability?: unknown;
+  manual_action?: unknown;
+}
+
+interface TaskManualActionInput {
+  command?: unknown;
+  verify_command?: unknown;
+  resume_phrase?: unknown;
+  hints?: unknown;
+}
+
+function safeManualText(value: unknown, label: string, max: number): { ok: true; value?: string } | { ok: false; reason: string } {
+  if (value === undefined) return { ok: true };
+  if (typeof value !== "string") return { ok: false, reason: `${label} must be a string` };
+  const normalized = value.replace(/\r\n?/g, "\n").replace(/\0/g, "").trim();
+  if (!normalized) return { ok: true };
+  // The task event reaches a live renderer before durable session redaction. Apply the shared recognizer at
+  // intake so even a model-authored copy command can never echo an observed credential into Desktop.
+  return { ok: true, value: redactSensitiveText(normalized).text.slice(0, max) };
+}
+
+function manualActionInput(value: unknown):
+  | { ok: true; value?: TaskUserDependency["manualAction"] }
+  | { ok: false; reason: string } {
+  if (value === undefined) return { ok: true };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { ok: false, reason: "dependency manual_action must be an object" };
+  }
+  const input = value as TaskManualActionInput;
+  const command = safeManualText(input.command, "manual command", MAX_TASK_MANUAL_COMMAND_CHARS);
+  if (!command.ok) return command;
+  const verifyCommand = safeManualText(input.verify_command, "manual verification command", MAX_TASK_VERIFY_COMMAND_CHARS);
+  if (!verifyCommand.ok) return verifyCommand;
+  const resumePhrase = safeManualText(input.resume_phrase, "resume phrase", MAX_TASK_RESUME_PHRASE_CHARS);
+  if (!resumePhrase.ok) return resumePhrase;
+  if (input.hints !== undefined && !Array.isArray(input.hints)) {
+    return { ok: false, reason: "manual action hints must be an array" };
+  }
+  const hints: Array<{ term: string; detail: string }> = [];
+  for (const raw of input.hints ?? []) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return { ok: false, reason: "every manual action hint must be an object" };
+    }
+    const item = raw as { term?: unknown; detail?: unknown };
+    const term = safeManualText(item.term, "manual hint term", MAX_TASK_MANUAL_HINT_TERM_CHARS);
+    if (!term.ok || !term.value) return { ok: false, reason: term.ok ? "manual hint term is required" : term.reason };
+    const detail = safeManualText(item.detail, "manual hint detail", MAX_TASK_MANUAL_HINT_DETAIL_CHARS);
+    if (!detail.ok || !detail.value) return { ok: false, reason: detail.ok ? "manual hint detail is required" : detail.reason };
+    hints.push({ term: term.value, detail: detail.value });
+    if (hints.length > MAX_TASK_MANUAL_HINTS) {
+      return { ok: false, reason: `manual action hints cannot exceed ${MAX_TASK_MANUAL_HINTS} entries` };
+    }
+  }
+  if (!command.value && !verifyCommand.value && !resumePhrase.value && hints.length === 0) {
+    return { ok: false, reason: "manual_action must include a command, verify_command, resume_phrase, or hint" };
+  }
+  return {
+    ok: true,
+    value: {
+      ...(command.value ? { command: command.value } : {}),
+      ...(verifyCommand.value ? { verifyCommand: verifyCommand.value } : {}),
+      ...(resumePhrase.value ? { resumePhrase: resumePhrase.value } : {}),
+      ...(hints.length ? { hints } : {}),
+    },
+  };
 }
 
 function taskStateKey(value: unknown, label: string): { ok: true; value: string } | { ok: false; reason: string } {
@@ -459,11 +539,14 @@ function completionInput(
     if ((raw.kind === "missing_secret" || raw.kind === "missing_authority") && !capability) {
       return { ok: false, reason: `${raw.kind} dependency requires the blocked/unavailable capability name` };
     }
+    const manualAction = manualActionInput(raw.manual_action);
+    if (!manualAction.ok) return manualAction;
     dependency = {
       kind: raw.kind as TaskUserDependencyKind,
       detail,
       evidence: dependencyEvidence,
       ...(capability ? { capability } : {}),
+      ...(manualAction.value ? { manualAction: manualAction.value } : {}),
     };
   }
   return {
@@ -996,6 +1079,15 @@ export function taskCheckpointContext(checkpoint: TaskCheckpoint | undefined): s
             ...(checkpoint.completion.dependency.capability
               ? [`- blocked capability: ${checkpoint.completion.dependency.capability}`]
               : []),
+            ...(checkpoint.completion.dependency.manualAction?.command
+              ? [`- manual command (copy only): ${checkpoint.completion.dependency.manualAction.command}`]
+              : []),
+            ...(checkpoint.completion.dependency.manualAction?.verifyCommand
+              ? [`- verification command (copy only): ${checkpoint.completion.dependency.manualAction.verifyCommand}`]
+              : []),
+            ...(checkpoint.completion.dependency.manualAction?.resumePhrase
+              ? [`- resume phrase: ${checkpoint.completion.dependency.manualAction.resumePhrase}`]
+              : []),
             ...checkpoint.completion.dependency.evidence.map((item) => `- dependency evidence: ${item}`),
           ]
         : []),
@@ -1053,6 +1145,32 @@ export function formatTaskExecution(task: TaskExecution | undefined): string {
 
 function validCheckpointText(value: unknown, max = MAX_TASK_CHECKPOINT_STEP_CHARS): boolean {
   return value === undefined || (typeof value === "string" && value.length > 0 && value.length <= max);
+}
+
+function validTaskManualAction(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const action = value as Record<string, unknown>;
+  if (
+    !validCheckpointText(action.command, MAX_TASK_MANUAL_COMMAND_CHARS)
+    || !validCheckpointText(action.verifyCommand, MAX_TASK_VERIFY_COMMAND_CHARS)
+    || !validCheckpointText(action.resumePhrase, MAX_TASK_RESUME_PHRASE_CHARS)
+    || (action.hints !== undefined && !Array.isArray(action.hints))
+  ) return false;
+  const hints = (action.hints ?? []) as unknown[];
+  if (hints.length > MAX_TASK_MANUAL_HINTS) return false;
+  for (const raw of hints) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+    const hint = raw as Record<string, unknown>;
+    if (
+      !validCheckpointText(hint.term, MAX_TASK_MANUAL_HINT_TERM_CHARS)
+      || !validCheckpointText(hint.detail, MAX_TASK_MANUAL_HINT_DETAIL_CHARS)
+    ) return false;
+  }
+  return action.command !== undefined
+    || action.verifyCommand !== undefined
+    || action.resumePhrase !== undefined
+    || hints.length > 0;
 }
 
 function validTaskCheckpoint(value: unknown): value is TaskCheckpoint {
@@ -1120,6 +1238,7 @@ function validTaskCheckpoint(value: unknown): value is TaskCheckpoint {
           && (dependencyCapabilityState === "blocked" || dependencyCapabilityState === "unavailable")))
       && ((dependencyKind !== "missing_secret" && dependencyKind !== "missing_authority")
         || typeof dependencyCapability === "string")
+      && validTaskManualAction(dependencyObject.manualAction)
     );
     if (
       (completion.state !== "verified" && completion.state !== "awaiting_user")

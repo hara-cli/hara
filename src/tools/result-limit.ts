@@ -122,6 +122,18 @@ function pruneStore(
   );
 }
 
+/** Startup janitor for abandoned continuation payloads. Creation-time pruning enforces quotas, while this
+ * explicit pass also removes expired files on installations that have not produced another oversized tool
+ * result recently. Paths that fail the private-state identity checks remain untouched. */
+export function pruneStoredToolResults(now = Date.now()): boolean {
+  try {
+    const binding = resultBinding(`tr_${"0".repeat(32)}`);
+    return pruneStore(binding.directory, 0, now);
+  } catch {
+    return false;
+  }
+}
+
 /** Store only a redacted, bounded UTF-8 value. Failure degrades to an ordinary preview; the original tool
  * action must not fail merely because this optional continuation store is unavailable. */
 export function storeToolResult(value: unknown): StoredToolResult | null {

@@ -108,6 +108,28 @@ test("resolveActive: defaults to profiles.json `active` (source=default)", () =>
   });
 });
 
+test("profiles.json active is authoritative and stale config profile selectors are removed", () => {
+  withHome((home) => {
+    const configPath = join(home, ".hara", "config.json");
+    writeFileSync(configPath, JSON.stringify({
+      provider: "anthropic",
+      model: "claude-opus-4-8",
+      apiKey: "test-key",
+      currentProfile: "org-y",
+      profileId: "org-y",
+    }, null, 2) + "\n", { mode: 0o600 });
+
+    process.chdir(home);
+    assert.equal(resolveActive().id, "personal", "the stale config selector never overrides profiles.json");
+    const cleaned = JSON.parse(readFileSync(configPath, "utf8"));
+    assert.equal(Object.hasOwn(cleaned, "currentProfile"), false);
+    assert.equal(Object.hasOwn(cleaned, "profileId"), false);
+    assert.equal(cleaned.provider, "anthropic");
+    assert.equal(cleaned.model, "claude-opus-4-8");
+    assert.equal(cleaned.apiKey, "test-key");
+  });
+});
+
 test("resolveActive: HARA_PROFILE env overrides default (source=env)", () => {
   withHome((home) => {
     process.chdir(home);

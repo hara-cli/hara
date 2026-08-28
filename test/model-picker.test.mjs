@@ -27,6 +27,7 @@ test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSe
   assert.deepEqual(levelsFor("deepseek"), ["off", "low", "high", "max"]);
   assert.deepEqual(levelsFor("deepseek_responses"), ["off", "low", "high", "max"]);
   assert.deepEqual(levelsFor("qwen_responses", "qwen3.8-max"), ["low", "medium", "max"]);
+  assert.deepEqual(levelsFor("qwen_responses", "qwen3.8-flash"), ["low", "medium", "max"]);
   assert.deepEqual(levelsFor("qwen_responses", "qwen3.7-max"), ["off", "low", "medium", "high", "max"]);
   assert.deepEqual(levelsFor("qwen_responses", "deepseek-v4-pro"), []);
   assert.deepEqual(levelsFor("none"), []);
@@ -40,12 +41,14 @@ test("levelLabel: binary reads as on/off, graded as the level name", () => {
   assert.equal(levelLabel("minimax_responses", "high", "MiniMax-M3"), "on");
   assert.equal(levelLabel("reasoning_effort", "medium"), "medium");
   assert.equal(levelLabel("qwen_responses", "max", "qwen3.8-max"), "xhigh");
+  assert.equal(levelLabel("qwen_responses", "max", "qwen3.8-flash"), "xhigh");
 });
 
 test("normalizeEffort maps stale cross-provider values onto qwen3.8-max's real dial", () => {
   assert.equal(normalizeEffort("qwen_responses", "qwen3.8-max", "off"), "low");
   assert.equal(normalizeEffort("qwen_responses", "qwen3.8-max", "high"), "max");
   assert.equal(normalizeEffort("qwen_responses", "qwen3.8-max", "medium"), "medium");
+  assert.equal(normalizeEffort("qwen_responses", "qwen3.8-flash", "high"), "max");
   assert.equal(normalizeEffort("qwen_responses", "deepseek-v4-pro", "high"), undefined);
 });
 
@@ -149,6 +152,7 @@ test("Token Plan discovery follows the key-scoped live catalog but hides models 
 
 test("Token Plan setup suggestions stay separate from live entitlement and stale ids migrate only to authorized targets", () => {
   assert.ok(TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS.includes("qwen3.8-max"));
+  assert.ok(TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS.includes("qwen3.8-flash"));
   assert.ok(TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS.includes("glm-5.2"));
   assert.equal(TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS.some((id) => /audio|image|happyhorse|wan/i.test(id)), false);
   assert.equal(tokenPlanModelReplacement("glm-5", ["glm-5.2", "qwen3.8-max"]), "glm-5.2");

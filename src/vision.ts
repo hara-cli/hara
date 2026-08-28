@@ -31,10 +31,10 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   // OpenAI
   { rx: /gpt-4o|gpt-4\.1|gpt-4-turbo|chatgpt-4o|gpt-5|(?:^|[-_/])o[134](?:[-_/]|$)/i, cap: "vision" },
   { rx: /gpt-4(\b|-0|-1)|gpt-3\.5|davinci|babbage|text-(?:embedding|davinci)/i, cap: "text" },
-  // Qwen — Token Plan's qwen3.8-max and qwen3.6/3.7 plus/flash families accept images; 3.7-max and
+  // Qwen — Token Plan's qwen3.8 max/flash and qwen3.6/3.7 plus/flash families accept images; 3.7-max and
   // coder models are text-only. Keep the specific vision families before the broad text catch-all.
   { rx: /qwen.*vl|qwen.*omni|qvq/i, cap: "vision" },
-  { rx: /qwen3\.8-max(?:-preview)?|qwen3\.[567]-(?:plus|flash)/i, cap: "vision" },
+  { rx: /qwen3\.8-(?:max(?:-preview)?|flash)|qwen3\.[567]-(?:plus|flash)/i, cap: "vision" },
   { rx: /qwen.*(?:coder|plus|max|turbo|long|math)|qwq|qwen[\d.]*-?\d+b\b|qwen-?\d/i, cap: "text" },
   // GLM / Zhipu — 4v/4.5v see images; glm-5, glm-4.7, glm-4-flash are text-only.
   { rx: /glm-?\d(?:\.\d+)?v|cogvlm|glm.*vision/i, cap: "vision" },

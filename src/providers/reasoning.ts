@@ -14,7 +14,7 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `reasoning_effort` — OpenAI chat reasoning models (o-series / gpt-5): the `reasoning_effort` enum.
  *  - `reasoning_object` — OpenAI Responses API: `reasoning: { effort }` (for the responses transport).
  *  - `qwen_responses` — Alibaba Model Studio Responses API for Qwen: `reasoning: { effort }`, with
- *                         model-specific levels. qwen3.8-max accepts low|medium|xhigh; older supported
+ *                         model-specific levels. qwen3.8 max/flash accept low|medium|xhigh; older supported
  *                         Qwen Responses models also accept `none` and the wider graded dial.
  *  - `minimax_responses` — MiniMax M3 Responses API: `none` disables thinking; any enabled Hara level
  *                         maps to `high`, which MiniMax documents as Adaptive Thinking rather than depth.
@@ -82,11 +82,11 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
       return { reasoning: { effort: effort === "off" ? "minimal" : effort === "max" ? "high" : effort } };
     case "qwen_responses": {
       if (!supportsReasoningStyle(style, model)) return {};
-      // The qwen3.8-max catalog exposed to Codex documents low|medium|xhigh (default xhigh), not an
+      // The qwen3.8 max/flash catalog exposed to Codex documents low|medium|xhigh (default xhigh), not an
       // off value. A stale cross-provider `off` therefore degrades to low instead of sending an invalid
       // enum or unexpectedly restoring the expensive default. `max` is Hara's portable name for xhigh.
-      const qwen38Max = /^qwen3\.8-max(?:-|$)/i.test(bareModel(model));
-      const mapped = qwen38Max
+      const qwen38 = /^qwen3\.8-(?:max|flash)(?:-|$)/i.test(bareModel(model));
+      const mapped = qwen38
         ? effort === "off" || effort === "low" ? "low" : effort === "medium" ? "medium" : "xhigh"
         : effort === "off" ? "none" : effort;
       return { reasoning: { effort: mapped } };

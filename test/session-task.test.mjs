@@ -182,6 +182,12 @@ test("an accepted brief requires a fresh engine-readable completion receipt", ()
         detail: "approval to publish the public release",
         evidence: ["the release endpoint returned an authority-required decision"],
         capability: "release_authority",
+        manual_action: {
+          command: "release-auth login -w workspace-1 --token sk-taskcheckpoint1234567890",
+          verify_command: "release-auth status -w workspace-1 --token sk-taskcheckpoint1234567890",
+          resume_phrase: "I completed release authentication",
+          hints: [{ term: "-w", detail: "Selects the target workspace." }],
+        },
       },
     },
   }, "2026-08-14T00:02:30.000Z");
@@ -190,6 +196,14 @@ test("an accepted brief requires a fresh engine-readable completion receipt", ()
   assert.equal(paused.status, "paused");
   assert.equal(paused.checkpoint.completion.state, "awaiting_user");
   assert.equal(paused.checkpoint.completion.dependency.kind, "missing_authority");
+  assert.equal(paused.checkpoint.completion.dependency.manualAction.command.includes("sk-taskcheckpoint"), false);
+  assert.match(paused.checkpoint.completion.dependency.manualAction.command, /--token \*\*\*/);
+  assert.equal(paused.checkpoint.completion.dependency.manualAction.verifyCommand.includes("sk-taskcheckpoint"), false);
+  assert.match(paused.checkpoint.completion.dependency.manualAction.verifyCommand, /--token \*\*\*/);
+  assert.equal(paused.checkpoint.completion.dependency.manualAction.resumePhrase, "I completed release authentication");
+  assert.deepEqual(paused.checkpoint.completion.dependency.manualAction.hints, [
+    { term: "-w", detail: "Selects the target workspace." },
+  ]);
   assert.match(paused.checkpoint.blockReason, /approval to publish/);
 
   const verified = applyTaskCheckpoint(briefed.task, {

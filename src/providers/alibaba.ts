@@ -13,6 +13,7 @@ export const TOKEN_PLAN_OPENAI_BASE_URL =
  * this list because they use separate image/audio/video capability surfaces. */
 export const TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS = Object.freeze([
   "qwen3.8-max",
+  "qwen3.8-flash",
   "qwen3.7-plus",
   "qwen3.7-max",
   "qwen3.6-flash",
@@ -49,7 +50,7 @@ export function isOfficialTokenPlanOpenAIEndpoint(baseURL: string | undefined): 
  * families Alibaba currently documents for Responses/Codex, including dated aliases and the preview/
  * production qwen3.8-max transition observed in the key-scoped live catalog. */
 export function isTokenPlanQwenResponsesModel(model: string): boolean {
-  return /^qwen3\.(?:8-max(?:-preview)?|7-(?:max|plus)|6-(?:plus|flash))(?:-|$)/i.test(bareModel(model));
+  return /^qwen3\.(?:8-(?:max(?:-preview)?|flash)|7-(?:max|plus)|6-(?:plus|flash))(?:-|$)/i.test(bareModel(model));
 }
 
 /** `/models` is entitlement-authoritative but also lists media generators that require separate APIs or

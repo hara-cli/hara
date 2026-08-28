@@ -81,6 +81,10 @@ import {
   deviceTokenExpiryWarning,
 } from "./org-fleet/enroll.js";
 import {
+  isOrganizationAuthorizationRejection,
+  organizationAuthorizationRecoveryMessage,
+} from "./org-fleet/errors.js";
+import {
   loadActiveProfile,
   listProfiles,
   useProfile,
@@ -256,6 +260,7 @@ import {
   gatewayOwnerFromSessionId,
   automatedTitle,
   slugify,
+  sanitizeSessionTitle,
   type SessionMeta,
   type SessionData,
 } from "./session/store.js";
@@ -282,6 +287,7 @@ import {
   recentWorkspaceTransferCandidate,
 } from "./session/transfer.js";
 import { setSessionForceModel, isSessionForceModel, effectiveRoleModel } from "./session/session-model.js";
+import { pruneStoredToolResults } from "./tools/result-limit.js";
 import { createPhysicalOperationDrain } from "./session/operation-drain.js";
 import {
   assertOrganizationModelAllowed,
@@ -961,6 +967,7 @@ function spaceDirectorySnapshot(targetCwd: string) {
       authoritative: Boolean(entry.profile.tenantId),
       // Until Control returns a membership role/capability, company Agent profiles fail closed as view-only.
       agentProfilePermission: "view" as const,
+      accessState: organizationAccessState(entry.profile),
       // A missing or stale bundle is intentionally shown as blocked. The inference path still performs a
       // required fresh Control sync before every personal-key turn; this field is presentation only.
       personalModelConnections: loadOrganizationExecutionPolicy(spaceId)?.allowPersonalModelConnections === true
@@ -984,6 +991,9 @@ function useSpaceConnection(spaceId: string, targetCwd: string) {
   }
   const target = current.spaces.find((space) => space.id === spaceId);
   if (!target) throw new Error("Space was not found");
+  if (target.kind === "organization" && (target.accessState === "expired" || target.accessState === "invalid")) {
+    throw new Error("this company connection is unavailable; re-enroll it in AI & Models before switching");
+  }
   const profileId = target.kind === "personal" ? PERSONAL_ID : target.profileId;
   const switched = useProfile(profileId);
   if (!switched.ok) throw new Error(switched.reason);
@@ -1404,6 +1414,7 @@ async function acquireOrganizationSnapshot(o: OrgOpts): Promise<string | null> {
     o.organizationPolicyVersion = policy?.version;
     return null;
   } catch (error) {
+    if (isOrganizationAuthorizationRejection(error)) return organizationAuthorizationRecoveryMessage();
     return error instanceof Error ? error.message : String(error);
   }
 }
@@ -1930,7 +1941,7 @@ async function nameSession(provider: Provider, history: NeutralMsg[], signal?: A
       { timeoutMs: 10_000, label: "session naming", signal },
     );
     if (signal?.aborted || r.stop === "error") return fallback;
-    return slugify(r.text) || fallback;
+    return sanitizeSessionTitle(slugify(r.text) || fallback, 40);
   } catch {
     return fallback;
   }
@@ -2521,7 +2532,10 @@ program
       try {
         await ensureOrganizationExecutionPolicy(cfg, initialOrgProfile, spaceIdForProfile(initialOrgProfile));
       } catch (error) {
-        process.stderr.write(`hara: organization policy sync failed — ${error instanceof Error ? error.message : String(error)}\n`);
+        const message = isOrganizationAuthorizationRejection(error)
+          ? organizationAuthorizationRecoveryMessage()
+          : redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+        process.stderr.write(`hara: organization policy sync failed — ${message}\n`);
         process.exitCode = 2;
         return;
       }
@@ -3329,7 +3343,17 @@ program
     const cfg = loadConfig({ cwd });
     const initialProfile = profileForConfig(cfg).profile;
     if (initialProfile.kind === "gateway") {
-      await ensureOrganizationExecutionPolicy(cfg, initialProfile);
+      try {
+        await ensureOrganizationExecutionPolicy(cfg, initialProfile);
+      } catch (error) {
+        // Desktop must still open Settings and Personal recovery surfaces when a formerly active company
+        // enrollment expires or is revoked. Company inference remains fail-closed because every provider
+        // build/turn below performs the same required policy refresh before sending history.
+        const message = isOrganizationAuthorizationRejection(error)
+          ? organizationAuthorizationRecoveryMessage()
+          : redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+        process.stderr.write(`hara: company connection needs attention — ${message}\n`);
+      }
     }
     const provider0 = await withRouting(await buildProvider(cfg), cfg);
     const guardianOpt = await buildGuardian(cfg, provider0);
@@ -4717,6 +4741,7 @@ config
 
 // default action (interactive REPL / one-shot)
 program.action(async (opts) => {
+  pruneStoredToolResults();
   if (
     (!opts.print || opts.continue || opts.resume)
     && process.env.HARA_CRON !== "1"
@@ -4874,7 +4899,10 @@ program.action(async (opts) => {
       try {
         await syncOrgRolesForProfile(roleRouteProfile, undefined, { required: true });
       } catch (error) {
-        process.stderr.write(`hara: organization role sync failed — ${error instanceof Error ? error.message : String(error)}\n`);
+        const message = isOrganizationAuthorizationRejection(error)
+          ? organizationAuthorizationRecoveryMessage()
+          : redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+        process.stderr.write(`hara: organization role sync failed — ${message}\n`);
         process.exitCode = 2;
         return;
       }
@@ -5098,7 +5126,16 @@ program.action(async (opts) => {
     // after identity is authoritative so an early active-profile hint cannot leak another tenant's prompt
     // or accidentally grant MCP access to a role that is read-only in the saved session's organization.
     if (profile.kind === "gateway" && !existsSync(orgRolesDir(profile.id))) {
-      await syncOrgRolesForProfile(profile);
+      try {
+        await syncOrgRolesForProfile(profile, undefined, { required: true });
+      } catch (error) {
+        const message = isOrganizationAuthorizationRejection(error)
+          ? organizationAuthorizationRecoveryMessage()
+          : redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+        process.stderr.write(`hara: organization role sync failed — ${message}\n`);
+        process.exitCode = 2;
+        return false;
+      }
     }
     const requestedRole = String(opts.role).trim();
     requestedHeadlessRole = requestedHeadlessAgent?.project
@@ -5344,7 +5381,10 @@ program.action(async (opts) => {
         meta.provider = provider.id;
         meta.model = desiredModel;
       } catch (error) {
-        process.stderr.write(`hara: cannot resume session ${shortId(rid)} — ${error instanceof Error ? error.message : String(error)}.\n`);
+        const message = isOrganizationAuthorizationRejection(error)
+          ? organizationAuthorizationRecoveryMessage()
+          : redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+        process.stderr.write(`hara: cannot resume session ${shortId(rid)} — ${message}.\n`);
         process.exitCode = 2;
         return;
       }
@@ -5441,6 +5481,11 @@ program.action(async (opts) => {
       clearTodos();
       if (meta) meta.todos = [];
     }
+    // The compatibility migration hides abandoned zero-turn drafts instead of deleting them. An explicit
+    // resume is the user's reversible restore action: only revive the thread after a real user turn has
+    // been staged and every profile/Space/provider check above has succeeded. Failed resume attempts leave
+    // the archived draft hidden.
+    if (meta?.archived && opts.resume) delete meta.archived;
     if (meta) saveSession(meta, history, task);
     // --role: run this headless turn AS an org role/agent persona (the gateway's /agent switch lands here).
     // Local roles resolve at cwd; qualified project agents were resolved before config/provider startup and
@@ -5856,7 +5901,13 @@ program.action(async (opts) => {
   }
   registerRunMcp();
   const history: NeutralMsg[] = resumed?.history ? [...resumed.history] : [];
-  const persistSession = (): void => saveSession(meta, history, task);
+  const persistSession = (): void => {
+    // Opening an archived legacy draft is read-only until the user actually submits content. The first
+    // persisted turn revives it, preserving the reversible archive contract without letting zero-turn
+    // drafts silently reappear in the conversation list.
+    if (resumeId && meta.archived && history.length > 0) delete meta.archived;
+    saveSession(meta, history, task);
+  };
   const taskIntakeForRun = () => task
     ? {
         task,
@@ -6340,7 +6391,7 @@ program.action(async (opts) => {
       desc: "rename this session: /name <name>",
       run: (a) => {
         if (!a) return void out(c.dim(`session: ${meta.title || "(untitled)"} · ${meta.id}\n`));
-        meta.title = a.slice(0, 32);
+        meta.title = sanitizeSessionTitle(a, 32);
         if (bar.isActive()) bar.update({ sessionName: meta.title });
         persistSession();
         out(c.green(`(renamed → ${meta.title})\n`));
@@ -6740,7 +6791,7 @@ program.action(async (opts) => {
           }
           if (nm === "name") {
             if (!arg) return void h.sink.notice(`session: ${meta.title || "(untitled)"} · ${meta.id}`);
-            meta.title = arg.slice(0, 32);
+            meta.title = sanitizeSessionTitle(arg, 32);
             h.sink.session(meta.title);
             persistSession();
             return void h.sink.notice(`(renamed → ${meta.title})`);

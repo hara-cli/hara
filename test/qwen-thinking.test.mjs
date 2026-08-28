@@ -46,6 +46,7 @@ test("reasoningParams reasoning_object (Responses API): reasoning:{effort} on re
 
 test("Token Plan Qwen Responses uses documented model-specific reasoning levels", () => {
   assert.equal(isQwenResponsesReasoningModel("qwen3.8-max"), true);
+  assert.equal(isQwenResponsesReasoningModel("qwen3.8-flash"), true);
   assert.equal(isQwenResponsesReasoningModel("qwen/qwen3.7-max"), true);
   assert.equal(isQwenResponsesReasoningModel("qwen3.6-plus"), true);
   assert.equal(isQwenResponsesReasoningModel("qwen3.6-flash"), true);
@@ -55,6 +56,8 @@ test("Token Plan Qwen Responses uses documented model-specific reasoning levels"
   assert.deepEqual(reasoningParams("qwen_responses", "high", "qwen3.8-max"), { reasoning: { effort: "xhigh" } });
   assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.8-max"), { reasoning: { effort: "xhigh" } });
   assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.8-max"), { reasoning: { effort: "low" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.8-flash"), { reasoning: { effort: "xhigh" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.8-flash"), { reasoning: { effort: "low" } });
   assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.7-max"), { reasoning: { effort: "none" } });
   assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.6-flash"), { reasoning: { effort: "max" } });
   assert.deepEqual(reasoningParams("qwen_responses", "high", "deepseek-v4-pro"), {});
@@ -198,7 +201,7 @@ test("resolvePlatform: Token Plan selects Responses per model and keeps other ca
   assert.equal(isOfficialTokenPlanOpenAIEndpoint(`${tokenPlan}/`), true);
   assert.equal(isOfficialTokenPlanOpenAIEndpoint("https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic"), false);
   assert.equal(isOfficialTokenPlanOpenAIEndpoint("https://token-plan.cn-beijing.maas.aliyuncs.com.example/compatible-mode/v1"), false);
-  for (const model of ["qwen3.8-max", "qwen3.8-max-preview", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash"]) {
+  for (const model of ["qwen3.8-max", "qwen3.8-max-preview", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.6-flash"]) {
     assert.equal(isTokenPlanQwenResponsesModel(model), true, model);
     assert.equal(resolvePlatform("qwen", tokenPlan, undefined, model).wireApi, "responses", model);
     assert.equal(resolvePlatform("qwen", tokenPlan, undefined, model).reasoning, "qwen_responses", model);
