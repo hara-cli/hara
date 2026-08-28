@@ -30,6 +30,36 @@ completed with zero vulnerabilities.
 
 ---
 
+## [ERR-20260829-POSIX-TRUE-VERSION] Cross-platform CLI probes need a controlled executable fixture
+
+**Logged**: 2026-08-29T06:45:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: testing
+
+### Summary
+
+The release test used `/usr/bin/true` as an explicit CLI and expected `--version` to produce no output.
+BSD `true` on macOS satisfied that assumption, while GNU coreutils `true` on the Linux release runner
+printed a version string, so the package and binary workflows stopped before publishing.
+
+### Resolution
+
+Use a private executable fixture with deterministic `--version` behavior, while retaining the real spawn
+and PATH-prepending assertions. The targeted test and the complete host-boundary suite now pass. A failed
+public tag is never moved; the corrected release advances to the next patch version.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes, on GNU coreutils runners
+- Related Files: test/external-sessions.test.mjs
+- Tags: ci, linux, macos, fixture, release
+- Pattern-Key: tests.external_cli_probe_uses_controlled_cross_platform_fixture
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260829-CODEX-SESSION-BOUNDED-READ] Large Codex history and stale PATH broke real session intake
 
 **Logged**: 2026-08-29T00:00:00+08:00

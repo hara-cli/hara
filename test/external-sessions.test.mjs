@@ -57,19 +57,30 @@ test("Codex discovery accepts only the explicit macOS app-bundle locations", {
 test("an explicit CLI prepends its verified sibling runtime directory", {
   skip: process.platform === "win32" ? "POSIX executable fixture" : false,
 }, async () => {
-  let childPath = "";
-  const result = await probeExternalCommand({
-    command: "/usr/bin/true",
-    env: { PATH: "/bin:/usr/bin" },
-    timeoutMs: 2_000,
-    spawnProcess(command, args, options) {
-      childPath = String(options.env?.PATH ?? "");
-      return spawn(command, [...args], options);
-    },
-  });
-  assert.deepEqual(result, { installed: true });
-  assert.equal(childPath.split(":")[0], "/usr/bin");
-  assert.equal(childPath.split(":").filter((entry) => entry === "/usr/bin").length, 1);
+  const root = mkdtempSync(join(tmpdir(), "hara-external-runtime-"));
+  try {
+    const runtimeBin = join(root, "bin");
+    const executable = join(runtimeBin, "fixture-cli");
+    mkdirSync(runtimeBin, { recursive: true });
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    chmodSync(executable, 0o755);
+
+    let childPath = "";
+    const result = await probeExternalCommand({
+      command: executable,
+      env: { PATH: "/bin:/usr/bin" },
+      timeoutMs: 2_000,
+      spawnProcess(command, args, options) {
+        childPath = String(options.env?.PATH ?? "");
+        return spawn(command, [...args], options);
+      },
+    });
+    assert.deepEqual(result, { installed: true });
+    assert.equal(childPath.split(":")[0], runtimeBin);
+    assert.equal(childPath.split(":").filter((entry) => entry === runtimeBin).length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a timed-out App Server request closes the uncertain provider process", {

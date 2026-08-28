@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.155.0 — 2026-08-29 — local Codex/Claude session bridge and Qwen 3.8 vision
+## 0.155.1 — 2026-08-29 — local Codex/Claude session bridge and Qwen 3.8 vision
 
 - Add a device-local external session bridge for Codex and Claude Code. Hara Serve can discover, read,
   fork, continue, and interrupt sessions through the tools' supported runtime surfaces while keeping native
@@ -27,7 +27,7 @@ All notable changes to `@nanhara/hara`.
   restore one only after an explicit resume receives real content, keep new chats in memory until their first
   content, prune expired continuation payloads on startup, and remove
   obsolete config profile selectors now that `profiles.json.active` is the single identity authority. Upgrade
-  with `npm i -g @nanhara/hara@0.155.0`.
+  with `npm i -g @nanhara/hara@0.155.1`.
 
 ## 0.154.1 — 2026-08-27 — safe orphaned session-lock recovery
 
