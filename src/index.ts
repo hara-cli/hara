@@ -291,16 +291,24 @@ import { pruneStoredToolResults } from "./tools/result-limit.js";
 import { createPhysicalOperationDrain } from "./session/operation-drain.js";
 import {
   assertOrganizationModelAllowed,
-  loadGlobalRoles,
   loadOrganizationExecutionPolicy,
-  loadRoles,
   orgRolesDir,
   roleToolFilter,
   scaffoldRoles,
   type OrganizationExecutionPolicy,
   type Role,
 } from "./org/roles.js";
-import { buildAgentsIndex, canonicalProjectPath, resolveAgent, loadProjects, addProject, removeProject, type AgentIndexEntry } from "./org/projects.js";
+import {
+  buildAgentsIndex,
+  canonicalProjectPath,
+  loadActiveGlobalRoles,
+  loadActiveRoles,
+  resolveAgent,
+  loadProjects,
+  addProject,
+  removeProject,
+  type AgentIndexEntry,
+} from "./org/projects.js";
 import { loadSkillIndex, loadSkillBody, scaffoldSkills, globalSkillsDir } from "./skills/skills.js";
 import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPluginEnabled, pluginMcpServers, pluginHooks, haraBinDir } from "./plugins/plugins.js";
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
@@ -1541,7 +1549,7 @@ function runFailureDetail(outcome: RunOutcome): string | null {
 async function runOrg(task: string, o: OrgOpts): Promise<RunOutcome> {
   const snapshotError = await acquireOrganizationSnapshot(o);
   if (snapshotError) return { status: "error", error: `organization policy sync failed: ${snapshotError}` };
-  const roles = loadRoles(o.cwd, o.profileId);
+  const roles = loadActiveRoles(o.cwd, o.profileId);
   const roleSnapshotError = bindRolesToOrganizationSnapshot(roles, o);
   if (roleSnapshotError) return { status: "error", error: roleSnapshotError };
   if (!roles.length) {
@@ -1823,7 +1831,7 @@ async function executePlan(plan: Plan, roles: Role[], o: OrgOpts): Promise<RunOu
 async function runPlan(task: string, o: OrgOpts): Promise<RunOutcome> {
   const snapshotError = await acquireOrganizationSnapshot(o);
   if (snapshotError) return { status: "error", error: `organization policy sync failed: ${snapshotError}` };
-  const roles = loadRoles(o.cwd, o.profileId);
+  const roles = loadActiveRoles(o.cwd, o.profileId);
   const roleSnapshotError = bindRolesToOrganizationSnapshot(roles, o);
   if (roleSnapshotError) return { status: "error", error: roleSnapshotError };
   out(c.dim("Planning…\n"));
@@ -1858,7 +1866,7 @@ async function runPlan(task: string, o: OrgOpts): Promise<RunOutcome> {
 async function runResume(o: OrgOpts): Promise<RunOutcome> {
   const snapshotError = await acquireOrganizationSnapshot(o);
   if (snapshotError) return { status: "error", error: `organization policy sync failed: ${snapshotError}` };
-  const roles = loadRoles(o.cwd, o.profileId);
+  const roles = loadActiveRoles(o.cwd, o.profileId);
   const roleSnapshotError = bindRolesToOrganizationSnapshot(roles, o);
   if (roleSnapshotError) return { status: "error", error: roleSnapshotError };
   const plan = loadPlan(o.cwd);
@@ -2282,7 +2290,7 @@ function runDoctor(cfg: HaraConfig): string {
   const gatewayOk = profile.kind === "gateway" && !!profile.deviceToken && !deviceTokenExpired(profile.tokenExpiresAt);
   const authed = hasKey || oauthOk || gatewayOk || providerIsLocal(live.provider);
   const ad = assetsDir();
-  const roles = loadRoles(live.cwd, profile.id);
+  const roles = loadActiveRoles(live.cwd, profile.id);
   const vcap = classifyVision(live.provider, live.model, live.modelVision);
   const imageStatus = vcap === "vision"
     ? c.dim("native on the main model")
@@ -2545,7 +2553,7 @@ program
     // that project (its AGENTS.md/data context), instead of failing or running context-blind here.
     let orgCwd = cfg.cwd;
     let forceRole = opts2.role;
-    if (opts2.role && (opts2.role.includes(":") || !loadRoles(cfg.cwd, orgProfileId).some((r) => r.id === opts2.role))) {
+    if (opts2.role && (opts2.role.includes(":") || !loadActiveRoles(cfg.cwd, orgProfileId).some((r) => r.id === opts2.role))) {
       const hit = resolveAgent(opts2.role, cfg.cwd, orgProfileId);
       if (hit && "ambiguous" in hit) {
         out(c.yellow(`'${opts2.role}' exists in several projects — qualify it:\n`) + hit.ambiguous.map((e) => `  ${e.project}:${e.name}`).join("\n") + "\n");
@@ -4329,7 +4337,7 @@ rolesCmd
     );
   });
 rolesCmd.action(() => {
-  const roles = loadRoles(process.cwd());
+  const roles = loadActiveRoles(process.cwd());
   if (!roles.length) {
     out(c.dim("No roles. Run `hara roles init`.\n"));
     return;
@@ -4908,7 +4916,7 @@ program.action(async (opts) => {
       }
     }
     const isLocalRole = !ref.includes(":")
-      && loadRoles(process.cwd(), roleRouteProfileId).some((role) => role.id === ref);
+      && loadActiveRoles(process.cwd(), roleRouteProfileId).some((role) => role.id === ref);
     if (!isLocalRole) {
       const hit = resolveAgent(ref, process.cwd(), roleRouteProfileId);
       if (hit && "ambiguous" in hit) {
@@ -4945,10 +4953,10 @@ program.action(async (opts) => {
   if (opts.print && opts.role) {
     const requestedRole = String(opts.role).trim();
     requestedHeadlessRole = requestedHeadlessAgent?.project
-      ? loadRoles(requestedHeadlessAgent.home, sessionRouteProfileId).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+      ? loadActiveRoles(requestedHeadlessAgent.home, sessionRouteProfileId).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
       : requestedHeadlessAgent
-        ? loadGlobalRoles(sessionRouteProfileId).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
-        : loadRoles(cwd, sessionRouteProfileId).find((candidate) => candidate.id === requestedRole);
+        ? loadActiveGlobalRoles(sessionRouteProfileId).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+        : loadActiveRoles(cwd, sessionRouteProfileId).find((candidate) => candidate.id === requestedRole);
     if (!requestedHeadlessRole) {
       process.stderr.write(`hara: role '${opts.role}' disappeared from its declared home (${cwd}); refusing to start providers or MCP servers under the wrong persona.\n`);
       process.exitCode = 2;
@@ -5139,10 +5147,10 @@ program.action(async (opts) => {
     }
     const requestedRole = String(opts.role).trim();
     requestedHeadlessRole = requestedHeadlessAgent?.project
-      ? loadRoles(requestedHeadlessAgent.home, profile.id).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+      ? loadActiveRoles(requestedHeadlessAgent.home, profile.id).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
       : requestedHeadlessAgent
-        ? loadGlobalRoles(profile.id).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
-        : loadRoles(cwd, profile.id).find((candidate) => candidate.id === requestedRole);
+        ? loadActiveGlobalRoles(profile.id).find((candidate) => candidate.id === requestedHeadlessAgent!.name)
+        : loadActiveRoles(cwd, profile.id).find((candidate) => candidate.id === requestedRole);
     if (requestedHeadlessRole) return true;
     process.stderr.write(`hara: role '${opts.role}' is not available for session profile '${profile.id}'; refusing to reuse a persona from another connection.\n`);
     process.exitCode = 2;
@@ -6124,7 +6132,7 @@ program.action(async (opts) => {
           } else {
             __lines.push(c.dim(`session pinned: ${meta.model || "(none)"}${__force ? c.yellow(" · forced (all roles use session model)") : ""}`));
           }
-          const __roles = loadRoles(cwd, authoritativeProfileId);
+          const __roles = loadActiveRoles(cwd, authoritativeProfileId);
           if (__roles.length) {
             __lines.push(c.dim("roles:"));
             for (const r of __roles) {
@@ -6181,7 +6189,7 @@ program.action(async (opts) => {
       name: "roles",
       desc: "list org roles",
       run: () => {
-        const rs = loadRoles(cwd, authoritativeProfileId);
+        const rs = loadActiveRoles(cwd, authoritativeProfileId);
         if (!rs.length) return void out(c.dim("No roles. Run `hara roles init`.\n"));
         for (const r of rs) out(`  ${r.id}  ${c.dim(`[${roleMeta(r)}] owns: ${r.owns.join(", ")}`)}\n`);
       },
@@ -6907,7 +6915,7 @@ program.action(async (opts) => {
           if (nm === "doctor") return void h.sink.notice(runDoctor(cfg).replace(/\[[0-9;]*m/g, ""));
           if (nm === "vision") return void h.sink.notice(applyVision(arg));
           if (nm === "roles") {
-            const rs = loadRoles(cwd, authoritativeProfileId);
+            const rs = loadActiveRoles(cwd, authoritativeProfileId);
             return void h.sink.notice(rs.length ? rs.map((r) => `  ${r.id} [${roleMeta(r)}] — owns: ${r.owns.join(", ")}`).join("\n") : "No roles. Run `hara roles init`.");
           }
           if (nm === "skills") {

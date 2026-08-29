@@ -5,11 +5,9 @@ import { disposeReminderScope } from "../agent/reminders.js";
 import { resetRepeatGuard } from "../agent/repeat-guard.js";
 import { clearTouched } from "../agent/touched.js";
 import { memoryDigest } from "../memory/store.js";
-import { resolveAgent } from "../org/projects.js";
+import { loadActiveGlobalRoles, loadActiveRoles, resolveAgent } from "../org/projects.js";
 import {
-  loadGlobalRoles,
   loadOrganizationExecutionPolicy,
-  loadRoles,
   subagentToolFilter,
   type Role,
 } from "../org/roles.js";
@@ -71,7 +69,7 @@ function aggregateUsage(
 
 async function executeNative(request: NativeSubagentRequest): Promise<SubagentSettlement> {
   request.assertAudience?.();
-  const roles = loadRoles(request.cwd, request.profileId);
+  const roles = loadActiveRoles(request.cwd, request.profileId);
   const roleRef = request.role?.trim();
   if (request.role !== undefined && !roleRef) return roleError("role cannot be blank");
   let role: Role | undefined;
@@ -86,7 +84,7 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
     if (hit && !("ambiguous" in hit)) {
       role = hit.project
         ? roles.find((candidate) => candidate.id === hit.name)
-        : loadGlobalRoles(request.profileId).find((candidate) => candidate.id === hit.name);
+        : loadActiveGlobalRoles(request.profileId).find((candidate) => candidate.id === hit.name);
     }
   } else if (roleRef) {
     role = roles.find((candidate) => candidate.id === roleRef);

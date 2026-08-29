@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HARA_RUNTIME_VERSION } from "../dist/version.js";
@@ -122,6 +122,25 @@ test("a fresh cron occurrence binds the active profile, Space, provider, and mod
     assert.equal(saved.meta.model, "cron-route-model");
     assert.equal(saved.meta.pendingRouteBinding, undefined);
 
+    // A command-mode job can invoke `hara -p` from its own script. The nested child receives HARA_CRON=1
+    // but no pre-created occurrence or HARA_CRON_ID, so it must create and bind an ordinary fresh session
+    // instead of being mistaken for an unverifiable legacy organization transcript.
+    const beforeNested = new Set(readdirSync(sessions));
+    const nested = await runCli(
+      ["-p", "nested command-mode agent work", "--approval", "full-auto"],
+      project,
+      home,
+      { HARA_CRON: "1" },
+    );
+    assert.equal(nested.code, 0, nested.stderr || nested.stdout);
+    assert.equal(requests.length, 2);
+    const nestedFiles = readdirSync(sessions).filter((file) => file.endsWith(".json") && !beforeNested.has(file));
+    assert.deepEqual(
+      nestedFiles,
+      [],
+      "plain nested -p stays stateless and cannot leave an unbound legacy-looking occurrence behind",
+    );
+
     writeFileSync(join(sessions, `${refusedId}.json`), JSON.stringify(pendingOccurrence(refusedId, project, jobId)));
     const refused = await runCli(
       ["-p", "must not run", "--approval", "full-auto", "--resume", refusedId],
@@ -131,7 +150,7 @@ test("a fresh cron occurrence binds the active profile, Space, provider, and mod
     );
     assert.equal(refused.code, 2, refused.stderr || refused.stdout);
     assert.match(refused.stderr + refused.stdout, /legacy organization session|no verifiable Space binding/i);
-    assert.equal(requests.length, 1, "a mismatched cron identity cannot send a model request");
+    assert.equal(requests.length, 2, "a mismatched cron identity cannot send a model request");
     const stillPending = JSON.parse(readFileSync(join(sessions, `${refusedId}.json`), "utf8"));
     assert.equal(stillPending.meta.pendingRouteBinding, "cron");
     assert.equal(stillPending.meta.profileId, undefined);

@@ -173,6 +173,19 @@ export class SessionHub {
     return this.sessions.get(id);
   }
 
+  /** Dismissal is an Agent-wide lifecycle operation, not just a property of the currently selected chat. */
+  hasActiveWorkForAgent(agentRef: string): boolean {
+    return [...this.sessions.values()].some((session) =>
+      session.meta.agentRef === agentRef
+      && (
+        session.busy
+        || session.configuring
+        || session.abort !== null
+        || session.pendingProviderTurns > 0
+        || session.pendingToolRuns > 0
+      ));
+  }
+
   /** Drop an attached but idle session and release its lock without deleting persistence. This is used
    * when resume attached successfully but live provider validation failed before the client got a handle. */
   detach(id: string): boolean {

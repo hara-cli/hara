@@ -198,7 +198,7 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     });
     assert.equal(staleUpdate.error.code, -32005);
 
-    const hired = await client.call("agents.create", {
+    const hireInput = {
       id: "product-designer",
       cwd: workspace,
       description: "Owns product experience",
@@ -220,7 +220,8 @@ test("serve persists Agent identity, lists offices, and runs the selected person
         accent: "#4f9c8f",
         character: "designer",
       },
-    });
+    };
+    const hired = await client.call("agents.create", hireInput);
     assert.ok(hired.result, `Agent hire failed: ${JSON.stringify(hired.error)}`);
     assert.ok(hired.result.agent, `newly hired Agent missing from catalog: ${JSON.stringify(hired.result.catalog)}`);
     assert.equal(hired.result.agent.ref, "global:product-designer");
@@ -275,6 +276,22 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     });
     assert.equal(rejectedQueryBlueprint.error.code, -32602);
     assert.ok(!existsSync(join(roles, "query-secret-blueprint.md")));
+    // A lower-priority Claude Code role with the same username must not spring back into Hara after the
+    // native employee leaves. Hara's roster tombstone hides the qualified identity without changing
+    // either source prompt, and an explicit market hire restores the same employee recoverably.
+    const claudeRoles = join(home, ".claude", "agents");
+    mkdirSync(claudeRoles, { recursive: true });
+    const shadowFile = join(claudeRoles, "product-designer.md");
+    const shadowText = [
+      "---",
+      "name: product-designer",
+      "description: Claude-owned product designer",
+      "---",
+      "CLAUDE SOURCE MUST REMAIN UNCHANGED",
+      "",
+    ].join("\n");
+    writeFileSync(shadowFile, shadowText, { mode: 0o600 });
+    const hiredTextBeforeDismissal = readFileSync(hiredFile, "utf8");
     const dismissed = await client.call("agents.archive", {
       ref: "global:product-designer",
       expectedRevision: hired.result.agent.revision,
@@ -282,7 +299,54 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     });
     assert.equal(dismissed.result.archived, true);
     assert.ok(!dismissed.result.catalog.agents.some((agent) => agent.ref === "global:product-designer"));
-    assert.match(readFileSync(hiredFile, "utf8"), /^archived: true$/m);
+    assert.ok(dismissed.result.catalog.dismissedAgentRefs.includes("global:product-designer"));
+    assert.equal(readFileSync(hiredFile, "utf8"), hiredTextBeforeDismissal);
+    assert.equal(readFileSync(shadowFile, "utf8"), shadowText);
+
+    const externalFile = join(claudeRoles, "external-auditor.md");
+    const externalText = [
+      "---",
+      "name: external-auditor",
+      "description: Claude-owned audit role",
+      "---",
+      "EXTERNAL PRIVATE PROMPT",
+      "",
+    ].join("\n");
+    writeFileSync(externalFile, externalText, { mode: 0o600 });
+    const externalCatalog = await client.call("agents.list", { cwd: workspace });
+    const external = externalCatalog.result.agents.find((agent) => agent.ref === "global:external-auditor");
+    assert.equal(external.owner, "external");
+    assert.deepEqual(external.allowedActions, ["chat", "archive"]);
+    assert.match(external.revision, /^[a-f0-9]{32}$/);
+    const externalSession = await client.call("session.create", {
+      cwd: workspace,
+      agentRef: external.ref,
+    });
+    await client.call("session.send", { sessionId: externalSession.result.sessionId, text: "audit this" });
+    const externalDismissed = await client.call("agents.archive", {
+      ref: external.ref,
+      expectedRevision: external.revision,
+      cwd: workspace,
+    });
+    assert.ok(!externalDismissed.result.catalog.agents.some((agent) => agent.ref === external.ref));
+    assert.ok(externalDismissed.result.catalog.dismissedAgentRefs.includes(external.ref));
+    assert.equal(readFileSync(externalFile, "utf8"), externalText);
+    const preservedExternalHistory = await client.call("session.history", { sessionId: externalSession.result.sessionId });
+    assert.equal(preservedExternalHistory.result.agentRef, external.ref);
+    assert.ok(preservedExternalHistory.result.history.length >= 2);
+    const blockedExternalTurn = await client.call("session.submit", {
+      sessionId: externalSession.result.sessionId,
+      text: "more work",
+    });
+    assert.equal(blockedExternalTurn.error.code, -32602);
+    assert.match(blockedExternalTurn.error.message, /left the active staff directory/);
+
+    const rehired = await client.call("agents.create", hireInput);
+    assert.equal(rehired.result.restored, true);
+    assert.equal(rehired.result.agent.ref, "global:product-designer");
+    assert.ok(!rehired.result.catalog.dismissedAgentRefs.includes("global:product-designer"));
+    assert.equal(readFileSync(hiredFile, "utf8"), hiredTextBeforeDismissal);
+    assert.equal(readFileSync(shadowFile, "utf8"), shadowText);
     assert.deepEqual(
       catalog.result.offices.find((office) => office.id === "project:beta").agentRefs,
       ["main", "beta:designer", "global:architect"],
@@ -292,7 +356,7 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     assert.equal(looseCatalog.result.currentOfficeId, "workspace");
     assert.deepEqual(
       looseCatalog.result.offices.find((office) => office.id === "workspace").agentRefs,
-      ["main", "global:architect"],
+      ["main", "global:architect", "global:product-designer"],
     );
 
     const created = await client.call("session.create", {
@@ -305,7 +369,8 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     const sessionId = created.result.sessionId;
     const sent = await client.call("session.send", { sessionId, text: "hello" });
     assert.equal(sent.result.reply, "done");
-    assert.match(observedSystems[0], /YOU ARE THE ARCHITECT PERSONA/);
+    assert.ok(observedSystems.some((system) => /YOU ARE THE ARCHITECT PERSONA/.test(system)));
+    assert.ok(observedSystems.some((system) => /EXTERNAL PRIVATE PROMPT/.test(system)));
 
     const listed = await client.call("session.list", {});
     assert.equal(listed.result.sessions.find((session) => session.id === sessionId).agentRef, "global:architect");

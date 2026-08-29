@@ -1665,8 +1665,8 @@ test("SessionHub releaseIdle keeps in-flight locks and releases only quiescent s
   };
   const provider = { id: "fake", model: "fake-1", async turn() { throw new Error("unused"); } };
   const hub = new SessionHub(store, "0.148.0-test");
-  const busy = hub.create({ cwd: "/tmp/busy", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
-  const configuring = hub.create({ cwd: "/tmp/configuring", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
+  const busy = hub.create({ cwd: "/tmp/busy", provider, providerId: provider.id, model: provider.model, approval: "suggest", agentRef: "global:architect" });
+  const configuring = hub.create({ cwd: "/tmp/configuring", provider, providerId: provider.id, model: provider.model, approval: "suggest", agentRef: "global:reviewer" });
   const idle = hub.create({ cwd: "/tmp/idle", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
   assert.equal(saved.size, 0, "opening new chats creates only live drafts, not empty transcript files");
   assert.equal(busy.meta.haraVersion, "0.148.0-test");
@@ -1674,6 +1674,9 @@ test("SessionHub releaseIdle keeps in-flight locks and releases only quiescent s
   assert.equal(idle.meta.haraVersion, "0.148.0-test");
   busy.busy = true;
   configuring.configuring = true;
+  assert.equal(hub.hasActiveWorkForAgent("global:architect"), true);
+  assert.equal(hub.hasActiveWorkForAgent("global:reviewer"), true);
+  assert.equal(hub.hasActiveWorkForAgent("global:unrelated"), false);
 
   hub.releaseIdle();
   assert.equal(hub.get(idle.meta.id), undefined);
@@ -1683,6 +1686,8 @@ test("SessionHub releaseIdle keeps in-flight locks and releases only quiescent s
 
   busy.busy = false;
   configuring.configuring = false;
+  assert.equal(hub.hasActiveWorkForAgent("global:architect"), false);
+  assert.equal(hub.hasActiveWorkForAgent("global:reviewer"), false);
   hub.releaseAll();
   assert.deepEqual(new Set(released), new Set([idle.meta.id, busy.meta.id, configuring.meta.id]));
 });

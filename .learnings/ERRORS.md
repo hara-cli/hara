@@ -127,6 +127,39 @@ action, but leave failed or zero-turn opens archived. Focused and full-session c
 
 ---
 
+## [ERR-20260829-MODEL-CAPABILITY-VERSION-SKEW] New model capability was hidden by an older running engine
+
+**Logged**: 2026-08-29T23:35:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: model-routing
+
+### Summary
+
+The current source and Desktop catalog correctly described `qwen3.8-flash` as multimodal, but the installed
+Desktop was still connected to Hara engine 0.154.0. That engine predated the Qwen 3.8 capability map, so the
+composer presented the model as unable to read images even though Alibaba Token Plan supports them.
+
+### Resolution
+
+Treat model onboarding as one versioned end-to-end contract: static provider catalog, Serve capability
+response, Desktop copy, provider transport, native image payload, bundled sidecar version, and running-engine
+upgrade must all be verified together. Keep the Desktop capability badge authoritative to the running engine,
+but surface and repair engine skew during release instead of interpreting an old engine's answer as a current
+provider limitation. Regression coverage now verifies both Qwen 3.8 Flash classification and its Responses
+`input_image` payload.
+
+### Metadata
+
+- Source: user_feedback
+- Reproducible: yes with Hara engine 0.154.0
+- Related Files: src/vision.ts, src/providers/responses.ts, test/vision.test.mjs, test/responses-provider.test.mjs
+- Tags: qwen, token-plan, vision, desktop, sidecar, version-skew
+- Pattern-Key: model.capabilities_require_runtime_and_transport_release_verification
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260828-EXTERNAL-SESSION-SMOKE-SANDBOX] Local session and loopback smoke tests need the host boundary
 
 **Logged**: 2026-08-28T00:00:00+08:00

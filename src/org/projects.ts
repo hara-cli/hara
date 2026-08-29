@@ -14,12 +14,13 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { loadRoles, loadGlobalRoles, type Role } from "./roles.js";
 import type { AgentPublicIdentity } from "./agent-identity.js";
 import { sleepSync } from "../sync-sleep.js";
+import { dismissedAgentRefs } from "./agent-roster.js";
 
 export interface RegisteredProject {
   name: string;
@@ -306,7 +307,10 @@ function sameRoleDefinition(a: Role, b: Role): boolean {
 }
 
 /** Build the global index: inherited globals are listed once; any project override gets its qualified home. */
-export function buildAgentsIndex(profileId?: string): AgentIndexEntry[] {
+export function buildAgentsIndex(
+  profileId?: string,
+  options: { includeDismissed?: boolean } = {},
+): AgentIndexEntry[] {
   const globals = loadGlobalRoles(profileId);
   const globalById = new Map(globals.map((role) => [role.id, role]));
   const out: AgentIndexEntry[] = globals.map((role) => ({
@@ -334,7 +338,53 @@ export function buildAgentsIndex(profileId?: string): AgentIndexEntry[] {
       });
     }
   }
-  return out;
+  // Company catalogs are Control-authoritative and have their own administrator lifecycle. The local
+  // roster applies only to Personal Space discoveries and never hides a similarly named company Agent.
+  if (options.includeDismissed || globals.some((role) => role.source === "org")) return out;
+  const dismissed = dismissedAgentRefs();
+  return out.filter((entry) => !dismissed.has(entry.project
+    ? `${entry.project}:${entry.name}`
+    : `global:${entry.name}`));
+}
+
+function registeredProjectForCwd(cwd: string): RegisteredProject | undefined {
+  const canonical = canonicalProjectPath(cwd);
+  if (!canonical) return undefined;
+  return loadProjects()
+    .filter((project) => {
+      const remainder = relative(project.path, canonical);
+      return remainder === "" || (remainder !== ".." && !remainder.startsWith(`..${sep}`) && !isAbsolute(remainder));
+    })
+    .sort((left, right) => right.path.length - left.path.length)[0];
+}
+
+/**
+ * Load only Agents currently employed in Personal Space. Discovery remains source-owned, so this
+ * filter runs after all precedence layers have merged: dismissing a native role cannot reveal a
+ * lower-priority Claude/OpenClaw/plugin role with the same username. Company roles are always left
+ * to Control's administrator-owned lifecycle.
+ */
+export function loadActiveRoles(cwd: string, profileId?: string): Role[] {
+  const roles = loadRoles(cwd, profileId);
+  if (!roles.length || roles.some((role) => role.source === "org")) return roles;
+  const dismissed = dismissedAgentRefs();
+  if (!dismissed.size) return roles;
+  const project = registeredProjectForCwd(cwd);
+  return roles.filter((role) => {
+    if (role.source === "project" || role.source === "claude-project") {
+      // An unregistered project has no durable qualified address in the Hara roster yet.
+      return !project || !dismissed.has(`${project.name}:${role.id}`);
+    }
+    return !dismissed.has(`global:${role.id}`);
+  });
+}
+
+/** Global-only counterpart used when an explicit `global:name` is delegated. */
+export function loadActiveGlobalRoles(profileId?: string): Role[] {
+  const roles = loadGlobalRoles(profileId);
+  if (!roles.length || roles.some((role) => role.source === "org")) return roles;
+  const dismissed = dismissedAgentRefs();
+  return dismissed.size ? roles.filter((role) => !dismissed.has(`global:${role.id}`)) : roles;
 }
 
 /** Resolve `global:agent`, `project:agent`, or a bare name.
@@ -347,10 +397,11 @@ export function resolveAgent(
   refInput: string,
   preferredHome?: string,
   profileId?: string,
+  options: { includeDismissed?: boolean } = {},
 ): AgentIndexEntry | { ambiguous: AgentIndexEntry[] } | null {
   if (typeof refInput !== "string") return null;
   const ref = refInput.trim();
-  const index = buildAgentsIndex(profileId);
+  const index = buildAgentsIndex(profileId, options);
   const separator = ref.indexOf(":");
   if (separator > 0) {
     const namespace = ref.slice(0, separator).trim().toLowerCase();

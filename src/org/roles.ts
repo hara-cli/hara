@@ -484,6 +484,29 @@ export function nativeRoleIdentityRevision(role: Role): string | undefined {
   try { return identityRevision(readModelContextFileSync(role.file, MAX_ROLE_BYTES)); } catch { return undefined; }
 }
 
+/** Optimistic-concurrency token for every discoverable personal Agent, including read-in-place roles.
+ * Only the digest crosses Serve; private prompt text and external filesystem metadata never do. */
+export function agentRoleRevision(role: Role): string {
+  const native = nativeRoleIdentityRevision(role);
+  if (native) return native;
+  return identityRevision(JSON.stringify({
+    id: role.id,
+    source: role.source,
+    file: role.file,
+    home: role.home,
+    description: role.description,
+    model: role.model,
+    owns: role.owns,
+    rejects: role.rejects,
+    allowTools: role.allowTools,
+    denyTools: role.denyTools,
+    readOnly: role.readOnly,
+    identity: role.identity,
+    blueprint: role.blueprint,
+    system: role.system,
+  }));
+}
+
 function identityFrontmatterLines(identity: AgentPublicIdentity): string[] {
   const lines = [`display-name: ${JSON.stringify(identity.displayName)}`];
   if (identity.title) lines.push(`title: ${JSON.stringify(identity.title)}`);

@@ -141,13 +141,12 @@ import {
 } from "../org/projects.js";
 import {
   loadGlobalRoles,
-  archiveNativeRoleAgent,
+  agentRoleRevision,
   createNativeGlobalAgent,
   loadMainAgentIdentity,
   loadOrganizationExecutionPolicy,
   loadRoles,
   mainAgentIdentityRevision,
-  nativeRoleIdentityRevision,
   roleToolFilter,
   updateMainAgentIdentity,
   updateNativeRoleIdentity,
@@ -155,6 +154,12 @@ import {
   type Role,
 } from "../org/roles.js";
 import { agentIdentityFromMetadata, type AgentPublicIdentity } from "../org/agent-identity.js";
+import {
+  dismissAgentRef,
+  dismissedAgentRefs,
+  isAgentRefDismissed,
+  restoreAgentRef,
+} from "../org/agent-roster.js";
 import {
   isOrganizationAuthorizationRejection,
   organizationAuthorizationRecoveryMessage,
@@ -379,6 +384,8 @@ export interface ServeAgentCatalog {
   agents: ServeAgentInfo[];
   offices: ServeAgentOffice[];
   currentOfficeId: string;
+  /** Qualified Personal refs hidden from the active directory; source prompts and history remain intact. */
+  dismissedAgentRefs: string[];
 }
 
 interface ResolvedServeAgent {
@@ -427,8 +434,13 @@ function projectHomeHint(ref: string, fallback: string): string {
   return loadProjects().find((project) => project.name === namespace)?.path ?? fallback;
 }
 
-function resolveServeAgent(ref: string, cwd: string, profileId?: string): ResolvedServeAgent | { ambiguous: string[] } | null {
-  const hit = resolveAgent(ref, cwd, profileId);
+function resolveServeAgent(
+  ref: string,
+  cwd: string,
+  profileId?: string,
+  options: { includeDismissed?: boolean } = {},
+): ResolvedServeAgent | { ambiguous: string[] } | null {
+  const hit = resolveAgent(ref, cwd, profileId, options);
   if (!hit) return null;
   if ("ambiguous" in hit) {
     return { ambiguous: hit.ambiguous.map(canonicalAgentRef).sort() };
@@ -514,8 +526,10 @@ function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: 
           : "external",
       allowedActions: spaceId === "personal" && (role?.source === "global" || role?.source === "project")
         ? ["chat", "edit_profile", "archive"]
-        : ["chat"],
-      ...(spaceId === "personal" && role ? { revision: nativeRoleIdentityRevision(role) } : {}),
+        : spaceId === "personal"
+          ? ["chat", "archive"]
+          : ["chat"],
+      ...(spaceId === "personal" && role ? { revision: agentRoleRevision(role) } : {}),
     });
   }
 
@@ -554,7 +568,12 @@ function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: 
     ...(currentOffice.id === lobby.id ? [] : [lobby]),
     ...projectOffices.filter((office) => office.id !== currentOffice.id),
   ];
-  return { agents, offices, currentOfficeId: currentOffice.id };
+  return {
+    agents,
+    offices,
+    currentOfficeId: currentOffice.id,
+    dismissedAgentRefs: spaceId === "personal" ? [...dismissedAgentRefs()].sort() : [],
+  };
 }
 
 /** Shared, deterministic trigger for Desktop/Serve auto-compaction. Keep it separate from the provider
@@ -1371,7 +1390,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     if (!session.meta.agentRef) return undefined;
     const runtime = runtimeInfo(session.meta.cwd, session.meta.model, session.meta.profileId, session.meta.spaceId);
     const identityProfileId = runtime.organizationProfileId ?? session.meta.profileId;
-    const resolved = resolveServeAgent(session.meta.agentRef, session.meta.cwd, identityProfileId);
+    const resolved = resolveServeAgent(
+      session.meta.agentRef,
+      session.meta.cwd,
+      identityProfileId,
+      { includeDismissed: true },
+    );
     if (!resolved) throw new Error(`agent '${session.meta.agentRef}' is no longer available for this session connection`);
     if ("ambiguous" in resolved) {
       throw new Error(`agent '${session.meta.agentRef}' became ambiguous; expected its persisted qualified identity`);
@@ -2122,6 +2146,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     },
     deferStartedResult = false,
   ): Promise<SubmitDecision> => {
+    if (
+      s.meta.agentRef
+      && (s.meta.spaceId ?? failClosedSpaceId(s.meta.profileId)) === "personal"
+      && isAgentRefDismissed(s.meta.agentRef)
+    ) {
+      throw new SessionSubmitParamsError(
+        `agent '${s.meta.agentRef}' has left the active staff directory; re-hire it before sending more work`,
+      );
+    }
     const intents: SessionAttachmentIntent[] = [
       ...((input.attachments ?? []) as SessionAttachmentIntent[]),
       ...((input.images ?? []).map((image: any) => ({
@@ -2723,11 +2756,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.UNAUTHORIZED, "company Agents must be created by an organization administrator"));
             }
             const username = p.id.trim().toLowerCase();
+            if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(username) || username === "main" || username === "readme") {
+              return reply(rpcError(id, ERR.PARAMS, "Agent username must use 1-64 lowercase letters, numbers, dots, underscores, or dashes and cannot be reserved"));
+            }
+            const ref = `global:${username}`;
             const before = serveAgentCatalog(cwd, profileId, spaceId);
-            if (before.agents.some((agent) => agent.name.toLowerCase() === username || agent.ref.toLowerCase() === `global:${username}`)) {
+            if (before.agents.some((agent) => agent.name.toLowerCase() === username || agent.ref.toLowerCase() === ref)) {
               return reply(rpcError(id, ERR.CONFLICT, "Agent username is already in use"));
             }
             try {
+              // Hiring a dismissed username restores that exact employee and its private prompt/history.
+              // This is especially important for Claude/OpenClaw roles that Hara reads in place: a market
+              // action must never overwrite another tool's source file merely to put it back on the roster.
+              const dismissed = before.dismissedAgentRefs.includes(ref);
+              const existing = dismissed
+                ? resolveServeAgent(ref, cwd, profileId, { includeDismissed: true })
+                : null;
+              if (existing && !("ambiguous" in existing)) {
+                restoreAgentRef(ref);
+                const catalog = serveAgentCatalog(cwd, profileId, spaceId);
+                return reply(rpcResult(id!, {
+                  agent: catalog.agents.find((agent) => agent.ref === ref),
+                  catalog,
+                  restored: true,
+                }));
+              }
               await createNativeGlobalAgent({
                 id: username,
                 description: p.description,
@@ -2735,9 +2788,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 profile: p.profile,
                 blueprint: p.blueprint,
               });
+              // A stale roster tombstone may outlive an uninstalled source role. Explicit hiring owns the
+              // new prompt creation, so make that new employee visible only after creation succeeds.
+              if (dismissed) restoreAgentRef(ref);
               const catalog = serveAgentCatalog(cwd, profileId, spaceId);
               return reply(rpcResult(id!, {
-                agent: catalog.agents.find((agent) => agent.ref === `global:${username}`),
+                agent: catalog.agents.find((agent) => agent.ref === ref),
                 catalog,
               }));
             } catch (error) {
@@ -2780,8 +2836,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const resolved = resolveServeAgent(ref, cwd, profileId);
             if (!resolved || "ambiguous" in resolved) return reply(rpcError(id, ERR.PARAMS, `Agent '${ref}' could not be resolved`));
+            if (hub.hasActiveWorkForAgent(ref)) {
+              return reply(rpcError(id, ERR.BUSY, "finish or stop every active task for this Agent before dismissing it"));
+            }
             try {
-              await archiveNativeRoleAgent(resolved.role, p.expectedRevision);
+              if (agentRoleRevision(resolved.role) !== p.expectedRevision) {
+                return reply(rpcError(id, ERR.CONFLICT, "Agent changed before dismissal; refresh and retry"));
+              }
+              dismissAgentRef(ref);
               const catalog = serveAgentCatalog(cwd, profileId, spaceId);
               return reply(rpcResult(id!, { ref, archived: true, catalog }));
             } catch (error) {

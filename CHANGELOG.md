@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.155.3 — 2026-08-29 — recoverable Personal Agent roster
+
+- Make every Personal Agent discoverable from Hara, Claude Code, OpenClaw, Hermes, plugins, and registered
+  projects dismissible from Hara without modifying or deleting its source prompt. A private, atomic local
+  roster now hides the qualified identity after discovery and precedence merging, so a lower-priority role
+  with the same username cannot unexpectedly reappear.
+- Keep dismissed Agent conversations readable but block new work until the same qualified identity is
+  re-hired. Talent Market hiring restores an existing source-owned Agent and its history instead of
+  overwriting external files; automatic organization routing, plans, CLI role selection, and native
+  subagents all exclude dismissed Personal Agents. Company Agent lifecycle remains administrator-owned by
+  Hara Control.
+- Refuse dismissal while any live task for that Agent is still running or configuring, and expose stable
+  optimistic-concurrency revisions for read-in-place external roles. Upgrade with
+  `npm i -g @nanhara/hara@0.155.3`.
+
 ## 0.155.2 — 2026-08-29 — reliable scheduled Agent routing
 
 - Bind every `mode: print` cron occurrence to its authoritative personal or company Space, provider, and

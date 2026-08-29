@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createResponsesProvider, toResponsesInput } from "../dist/providers/responses.js";
 
 function listen(events) {
@@ -95,6 +98,31 @@ test("toResponsesInput preserves a structured image description for text-only re
     role: "user",
     content: "inspect this\n\n[Attached image description]\na red warning banner",
   }]);
+});
+
+test("toResponsesInput sends native image parts for multimodal Qwen Responses models", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-qwen-responses-image-"));
+  const imagePath = join(dir, "sample.png");
+  try {
+    writeFileSync(imagePath, Buffer.from("synthetic-qwen-image"));
+    assert.deepEqual(toResponsesInput([{
+      role: "user",
+      content: "read the screenshot",
+      images: [{ path: imagePath, mediaType: "image/png" }],
+    }], true), [{
+      role: "user",
+      content: [
+        { type: "input_text", text: "read the screenshot" },
+        {
+          type: "input_image",
+          image_url: `data:image/png;base64,${Buffer.from("synthetic-qwen-image").toString("base64")}`,
+          detail: "auto",
+        },
+      ],
+    }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 for (const deepSeekModel of ["deepseek-v4-flash", "deepseek-v4-pro"]) {
