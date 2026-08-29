@@ -5258,6 +5258,25 @@ program.action(async (opts) => {
       // Stamp who created this session (cron runner sets HARA_CRON, gateway sets HARA_GATEWAY) and give
       // automated sessions a "name · time" title UP FRONT — the raw prompt must never become the title.
       const src = sessionSourceFromEnv();
+      // A cron parent deliberately creates the occurrence before spawning this process so even launch
+      // failures appear in Desktop. That record has no audience yet. Treat it as a new session only when
+      // every unforgeable-by-accident invariant still matches this exact generated cron run and it contains
+      // no user/model/task data. Ordinary legacy sessions remain fail-closed below.
+      const bindablePendingCronOccurrence = Boolean(
+        prior
+        && exactGeneratedCronSession
+        && prior.meta.pendingRouteBinding === "cron"
+        && prior.meta.source === "cron"
+        && src.source === "cron"
+        && !!src.jobId
+        && prior.meta.jobId === src.jobId
+        && !prior.meta.profileId
+        && !prior.meta.spaceId
+        && prior.meta.provider === ""
+        && prior.meta.model === ""
+        && prior.history.length === 0
+        && !prior.task
+      );
       if (prior?.meta.profileId && prior.meta.profileId !== sessionRouteProfileId) {
         process.stderr.write(`hara: session ${shortId(rid)} changed identity while it was being opened; retry the resume.\n`);
         process.exitCode = 2;
@@ -5269,6 +5288,7 @@ program.action(async (opts) => {
       if (
         prior
         && !prior.meta.spaceId
+        && !bindablePendingCronOccurrence
         && !(
           prior.meta.profileId === PERSONAL_ID
           && prior.meta.provider !== "hara-gateway"
@@ -5307,7 +5327,8 @@ program.action(async (opts) => {
             }
           : { source: "interactive" as const }),
       };
-      requiresAudienceBindingSave = !prior;
+      requiresAudienceBindingSave = !prior || bindablePendingCronOccurrence;
+      if (bindablePendingCronOccurrence) delete meta.pendingRouteBinding;
       if (meta.haraVersion !== pkg.version) {
         meta.haraVersion = pkg.version;
         requiresAudienceBindingSave = true;

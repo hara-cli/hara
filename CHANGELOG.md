@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.155.2 — 2026-08-29 — reliable scheduled Agent routing
+
+- Bind every `mode: print` cron occurrence to its authoritative personal or company Space, provider, and
+  model before the first model request. The parent now marks a zero-history occurrence as explicitly pending;
+  only the matching generated cron child may complete that route under the session lock. Ordinary legacy,
+  mismatched, or data-bearing sessions remain fail-closed, while pre-launch failures stay visible in Desktop.
+- Restore successful scheduled prompts that previously exited with “legacy organization session has no
+  verifiable Space binding” or fell through to an empty/wrong model route. Upgrade with
+  `npm i -g @nanhara/hara@0.155.2`.
+
 ## 0.155.1 — 2026-08-29 — local Codex/Claude session bridge and Qwen 3.8 vision
 
 - Add a device-local external session bridge for Codex and Claude Code. Hara Serve can discover, read,

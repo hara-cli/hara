@@ -110,6 +110,7 @@ test("print mode persists an occurrence before a missing cwd can make spawn fail
   );
   assert.ok(occurrence, "the failed launch remains visible as a distinct automation-history occurrence");
   assert.equal(occurrence.sourceName, job.name);
+  assert.equal(occurrence.pendingRouteBinding, "cron", "an unstarted occurrence remains explicitly unrouted");
 });
 
 test("command mode turns protected-file preflight exceptions into a recorded task failure", async () => {

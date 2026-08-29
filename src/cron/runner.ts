@@ -70,9 +70,10 @@ export function cronAgentArgs(
     : ["-p", job.task, "--approval", "full-auto", "--resume", sessionId];
 }
 
-/** Persist the automation identity before cwd/provider/profile/spawn work can fail. The empty model/provider
- * deliberately tell the child to resolve the current bound profile defaults; a successful child replaces
- * them under the session lock, while an early failure still remains visible in Desktop run history. */
+/** Persist the automation identity before cwd/provider/profile/spawn work can fail. The explicit pending
+ * marker lets only this fresh, zero-history cron occurrence acquire the child's authoritative route under
+ * the session lock. An early launch failure still remains visible in Desktop without pretending it was
+ * already bound to a provider, profile, or organization Space. */
 export function persistPrintAutomationOccurrence(
   job: Pick<CronJob, "id" | "name" | "cwd">,
   sessionId = randomUUID(),
@@ -90,6 +91,7 @@ export function persistPrintAutomationOccurrence(
     source: "cron",
     sourceName: job.name,
     jobId: job.id,
+    pendingRouteBinding: "cron",
   };
   saveSession(meta, []);
   return sessionId;

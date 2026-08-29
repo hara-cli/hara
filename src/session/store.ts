@@ -105,6 +105,10 @@ export interface SessionMeta {
   sourceName?: string;
   /** Stable cron job identity for automation history association; absent for gateways and legacy runs. */
   jobId?: string;
+  /** A cron parent may persist an empty occurrence before its child can resolve credentials. Only the
+   * matching generated cron child may replace this marker with an authoritative profile/Space route,
+   * and only while the occurrence still has no history or task data. */
+  pendingRouteBinding?: "cron";
   /** Per-session reasoning effort pin used by persistent Serve clients. */
   effort?: string;
   /** Per-session approval policy. New persistent clients write this explicitly so reconnecting never
@@ -1116,6 +1120,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   safe.meta.updatedAt = data.meta.updatedAt;
   if (data.meta.source !== undefined) safe.meta.source = data.meta.source;
   if (data.meta.jobId !== undefined) safe.meta.jobId = data.meta.jobId;
+  if (data.meta.pendingRouteBinding !== undefined) safe.meta.pendingRouteBinding = data.meta.pendingRouteBinding;
   if (data.meta.effort !== undefined) safe.meta.effort = data.meta.effort;
   if (data.meta.approval !== undefined) safe.meta.approval = data.meta.approval;
   if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
@@ -1408,6 +1413,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
     (meta.source === undefined || meta.source === "interactive" || meta.source === "gateway" || meta.source === "cron") &&
     (meta.sourceName === undefined || typeof meta.sourceName === "string") &&
     (meta.jobId === undefined || (typeof meta.jobId === "string" && AUTOMATION_JOB_ID.test(meta.jobId))) &&
+    (meta.pendingRouteBinding === undefined || meta.pendingRouteBinding === "cron") &&
     (meta.effort === undefined || typeof meta.effort === "string") &&
     (meta.approval === undefined
       || meta.approval === "suggest"
