@@ -64,7 +64,7 @@ test("openai: models that don't accept the reasoning_effort param return false (
 // ── reasoningParams: the OpenAI-compat merge body per style (incl. the new DeepSeek style + max clamp) ──
 
 test("reasoning: unset dial → {} for every style (model default, zero impact)", () => {
-  for (const style of ["reasoning_effort", "reasoning_object", "qwen_responses", "minimax_responses", "deepseek_responses", "deepseek", "enable_thinking", "ollama_think", "none"]) {
+  for (const style of ["reasoning_effort", "reasoning_object", "qwen_responses", "alibaba_responses", "minimax_responses", "deepseek_responses", "deepseek", "enable_thinking", "ollama_think", "none"]) {
     assert.deepEqual(reasoningParams(style, undefined, "deepseek-v4-pro"), {}, `${style} unset → {}`);
   }
 });

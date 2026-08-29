@@ -16,11 +16,8 @@ export function levelsFor(style: ReasoningStyle, model = ""): Effort[] {
   if (style === "deepseek" || style === "deepseek_responses") {
     return ["off", "low", "high", "max"];
   }
-  if (style === "qwen_responses") {
-    const bare = model.split("/").at(-1) ?? model;
-    return /^qwen3\.8-(?:max|flash)(?:-|$)/i.test(bare)
-      ? ["low", "medium", "max"]
-      : ["off", "low", "medium", "high", "max"];
+  if (style === "qwen_responses" || style === "alibaba_responses") {
+    return ["off", "low", "medium", "high", "max"];
   }
   return ["off", "low", "medium", "high"];
 }
@@ -30,8 +27,6 @@ export function levelLabel(style: ReasoningStyle, e: Effort, model = ""): string
   if (style === "enable_thinking" || style === "minimax_responses" || style === "ollama_think") {
     return e === "off" ? "off" : "on";
   }
-  const bare = model.split("/").at(-1) ?? model;
-  if (style === "qwen_responses" && e === "max" && /^qwen3\.8-(?:max|flash)(?:-|$)/i.test(bare)) return "xhigh";
   return String(e);
 }
 
@@ -40,10 +35,6 @@ export function normalizeEffort(style: ReasoningStyle, model: string, effort: Ef
   const levels = levelsFor(style, model);
   if (!levels.length) return undefined;
   if (levels.includes(effort)) return effort;
-  const bare = model.split("/").at(-1) ?? model;
-  if (style === "qwen_responses" && /^qwen3\.8-(?:max|flash)(?:-|$)/i.test(bare)) {
-    return effort === "high" || effort === "max" ? "max" : "low";
-  }
   return levels[0];
 }
 

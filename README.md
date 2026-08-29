@@ -110,8 +110,15 @@ hara profile use tokenplan
 
 `/model` reads the Key's live Token Plan catalog and hides image/audio/video generators that need their
 own API or Skill. Hara chooses the wire protocol per model on the shared endpoint: the documented Qwen
-3.8/3.7/3.6 families use Responses; GLM, DeepSeek, Kimi, and other catalog entries conservatively use
-Chat unless Alibaba documents Responses support. Existing Coding Plan endpoints remain available for
+3.8/3.7/3.6, DeepSeek V4, and GLM 5.2 Token Plan models use Responses; unknown future/other entries
+conservatively use Chat until Alibaba documents Responses support. Normal chats expose Auto plus the
+model-supported thinking levels. Selecting Off sends Alibaba's explicit `enable_thinking:false` extension
+without a competing `reasoning` object, so the server actually stops generating reasoning tokens.
+Responses calls keep Hara's durable history local (`store:false`) and opt into Alibaba's Session cache header;
+Hara still replays its own verified history instead of depending on a response id that expires after seven
+days. Alibaba's provider-executed Harness tools are not silently added to a turn: Hara exposes its own audited
+tool surface so local approval, company policy, and execution logs remain authoritative.
+Existing Coding Plan endpoints remain available for
 legacy saved profiles, but new Token Plan Keys and Base URLs are isolated and cannot be mixed with them.
 For non-interactive setup, omit the stored key with `--no-key-prompt` and provide `OPENAI_API_KEY` only in
 the trusted launcher environment. Do not place a Token Plan key in Hara Control or another shared application
@@ -198,7 +205,8 @@ Replies follow the latest user message's language by default. Use `hara --lang z
 launch, and `hara --lang auto` to restore per-message matching.
 
 **Vision** — hara **auto-detects** whether the selected conversation model can see images. A multimodal
-model (Claude, GPT-4o, MiniMax-M3, qwen-vl, glm-4v, `deepseek-v4-flash-vision-exp`…) receives pasted
+model (Claude, GPT-4o, MiniMax-M3, qwen3.8-max/flash, qwen3.7-plus, qwen-vl, glm-4v,
+`deepseek-v4-flash-vision-exp`…) receives pasted
 images **inline**. A text-only model asks you to switch models instead of silently sending the image and
 conversation context to a secondary provider. If a custom model's capability is unknown, hara **asks once
 and remembers**; `/vision main yes|no|auto` corrects that native capability record. Legacy
@@ -211,9 +219,11 @@ hara config set reasoningEffort high     # or off / low / medium / max
 ```
 hara expresses it the way each endpoint wants (OpenAI `reasoning_effort`, Anthropic thinking budget,
 DashScope `enable_thinking`, **DeepSeek** Chat `thinking` + `reasoning_effort`, or DeepSeek V4 Responses
-`reasoning.effort`). DeepSeek V4 Flash, Pro, and Vision-Exp expose three thinking grades—`low`, `high`,
+`reasoning.effort`). Alibaba Token Plan Responses uses `enable_thinking:false` for Off and
+`reasoning.effort` only for enabled levels; an endpoint rejection is surfaced instead of silently retrying
+with the provider's expensive default. DeepSeek V4 Flash, Pro, and Vision-Exp expose three thinking grades—`low`, `high`,
 `max`—plus `off`; Vision-Exp also accepts native image attachments through Responses `input_image`.
-On Responses, Hara maps `off` to the documented `none` value without changing transport. The shared
+On DeepSeek Responses, Hara maps `off` to the documented `none` value without changing transport. The shared
 cross-provider `medium` value normalizes to DeepSeek `high`. In the TUI, bare `/model` opens a picker —
 ↑↓ pick a model, **←→ set the thinking level**.
 

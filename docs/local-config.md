@@ -10,7 +10,7 @@ provider is required; everything else has a sane default.
 ## Required — the LLM provider
 | key | what | example |
 |---|---|---|
-| `provider` | `anthropic` \| `qwen` \| `qwen-oauth` \| `openai` \| `glm` \| `deepseek` \| `openrouter` \| `ollama` \| `lmstudio` \| `hara-gateway` | `qwen` |
+| `provider` | `anthropic` \| `token-plan` \| `minimax-token-plan` \| `qwen` \| `qwen-oauth` \| `openai` \| `glm` \| `deepseek` \| `openrouter` \| `ollama` \| `lmstudio` \| `hara-gateway` | `token-plan` |
 | `apiKey` | provider key (env fallback per provider, e.g. `ANTHROPIC_API_KEY`) | `sk-…` |
 | `model` | default model | `glm-5` |
 | `baseURL` | OpenAI-compatible base (for qwen/openai) | `https://…/v1` |
@@ -24,6 +24,14 @@ by the stateless protocol; it is never rendered as assistant text. Flash and Pro
 native `low` / `high` / `max` grades (`off` is sent as Responses `none`).
 The model picker uses live discovery first and falls back to the two documented V4 ids only for the exact
 official DeepSeek host.
+
+The built-in Alibaba Token Plan profile uses the fixed Beijing endpoint. Its documented Qwen 3.8/3.7/3.6,
+DeepSeek V4, and GLM 5.2 Agent models use Responses; the Key-scoped live `/models` result controls what the
+picker marks usable. Qwen 3.8 Max/Flash, Qwen 3.7 Plus, and Qwen 3.6 Flash accept native images; Qwen 3.7 Max,
+Token Plan DeepSeek, and GLM 5.2 remain text-only. Off is sent only as `enable_thinking:false`; enabled levels
+use `reasoning.effort`. Token Plan Responses uses `store:false` plus Alibaba's Session cache header while
+Hara retains the durable transcript locally. Provider-side Harness tools are not automatically enabled,
+because doing so would bypass Hara's local approval and organization-policy tool boundary.
 
 ## Optional
 - **Native image capability override**: `modelVision.<model>` records `yes` / `no` for a custom model id

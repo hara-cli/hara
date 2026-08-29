@@ -4,6 +4,7 @@ import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
 import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
+import { applyReasoningParams, reasoningRouteKey, sendWithReasoningFallback } from "./reasoning-fallback.js";
 import { resolvePlatform } from "./registry.js";
 
 /** Assemble streamed tool-call fragments into tool uses. CRITICAL: non-empty arguments that don't parse
@@ -122,13 +123,11 @@ export function createOpenAIProvider(opts: {
         type: "function" as const,
         function: { name: t.name, description: t.description, parameters: t.input_schema },
       }));
+      const caps = resolvePlatform(opts.label, opts.baseURL, undefined, opts.model);
+      const style = opts.reasoningStyle ?? caps.reasoning;
       const params: any = {
         model: opts.model,
-        messages: toOpenAI(
-          system,
-          history,
-          opts.reasoningStyle ?? resolvePlatform(opts.label, opts.baseURL, undefined, opts.model).reasoning,
-        ),
+        messages: toOpenAI(system, history, style),
         max_tokens: 32000, // was 8192 — too small: a big write_file's args got truncated → unparseable → loop
         stream: true,
         stream_options: { include_usage: true },
@@ -137,9 +136,15 @@ export function createOpenAIProvider(opts: {
       // Reasoning: the registry says HOW this platform expresses the thinking dial (DashScope →
       // enable_thinking, OpenAI reasoning models → reasoning_effort, …); the applier turns hara's dial
       // into the params to merge. UNSET → {} (model default, zero impact). One data-driven line replaces
-      // the old per-platform if/else — a new platform is a registry row, not code here.
-      const caps = resolvePlatform(opts.label, opts.baseURL, undefined, opts.model);
-      Object.assign(params, reasoningParams(opts.reasoningStyle ?? caps.reasoning, opts.reasoningEffort, opts.model));
+      // the old per-platform if/else — a new platform is a registry row, not code here. A strict endpoint
+      // that rejects an explicit selection fails visibly; silently removing the field could re-enable an
+      // expensive provider default and would violate the user's latency/cost choice.
+      const reasoningRoute = reasoningRouteKey(opts.label, opts.baseURL, opts.model, style);
+      const reasoningKeys = applyReasoningParams(
+        params,
+        reasoningParams(style, opts.reasoningEffort, opts.model),
+        reasoningRoute,
+      );
 
       // Stream: emit text deltas live; accumulate tool-call args by index; grab usage from the tail chunk.
       let text = "";
@@ -148,7 +153,9 @@ export function createOpenAIProvider(opts: {
       let finish: string | undefined;
       let usage = { input: 0, output: 0 };
       try {
-        const stream = await client.chat.completions.create(params, { signal });
+        const stream = await sendWithReasoningFallback(reasoningRoute, params, reasoningKeys, (body) =>
+          client.chat.completions.create(body as typeof params, { signal }),
+        );
         for await (const chunk of stream as any) {
           onActivity?.(); // ANY chunk (reasoning, tool-args, content, even a keep-alive) → the model is alive
           const choice = chunk.choices?.[0];
@@ -189,7 +196,6 @@ export function createOpenAIProvider(opts: {
       const { toolUses, error: argsError } = assembleToolCalls([...acc.values()], finish);
       if (argsError) return { text, toolUses: [], stop: "error", errorMsg: argsError, usage };
       const stop = finish === "tool_calls" || toolUses.length ? "tool_use" : "end";
-      const style = opts.reasoningStyle ?? resolvePlatform(opts.label, opts.baseURL, undefined, opts.model).reasoning;
       return {
         text,
         toolUses,

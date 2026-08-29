@@ -130,6 +130,42 @@ test("profiles.json active is authoritative and stale config profile selectors a
   });
 });
 
+test("profiles registry safely restores a missing reserved personal row without changing a named connection", () => {
+  withHome((home) => {
+    const haraHome = join(home, ".hara");
+    const profilesPath = join(haraHome, "profiles.json");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "openai",
+      apiKey: "personal-config-key",
+      model: "personal-model",
+    }, null, 2) + "\n", { mode: 0o600 });
+    writeFileSync(profilesPath, JSON.stringify({
+      active: "aliyun-token-plan",
+      profiles: [{
+        id: "aliyun-token-plan",
+        kind: "byok",
+        label: "Alibaba Token Plan",
+        provider: "token-plan",
+        apiKey: "named-token-plan-key",
+        baseURL: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        defaultModel: "qwen3.8-flash",
+      }],
+    }, null, 2) + "\n", { mode: 0o600 });
+
+    process.chdir(home);
+    const profiles = listProfiles();
+    assert.deepEqual(profiles.map((profile) => profile.id), ["personal", "aliyun-token-plan"]);
+    assert.equal(resolveActive().id, "aliyun-token-plan", "the named active route is preserved");
+
+    const stored = JSON.parse(readFileSync(profilesPath, "utf8"));
+    assert.equal(stored.active, "aliyun-token-plan");
+    assert.equal(stored.profiles[1].apiKey, "named-token-plan-key", "the existing credential is byte-for-byte preserved");
+    assert.equal(stored.profiles[1].defaultModel, "qwen3.8-flash");
+    assert.equal(stored.profiles[0].id, "personal");
+    assert.equal(stored.profiles[0].apiKey, "personal-config-key", "Personal remains backed by config.json");
+  });
+});
+
 test("resolveActive: HARA_PROFILE env overrides default (source=env)", () => {
   withHome((home) => {
     process.chdir(home);

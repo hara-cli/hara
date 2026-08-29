@@ -4,6 +4,7 @@ import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
 import { assembleToolCalls } from "./openai.js";
 import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
+import { applyReasoningParams, reasoningRouteKey, sendWithReasoningFallback } from "./reasoning-fallback.js";
 import type {
   NeutralMsg,
   Provider,
@@ -165,14 +166,23 @@ export function createResponsesProvider(opts: {
   reasoningEffort?: "off" | "low" | "medium" | "high" | "max";
   reasoningStyle?: ReasoningStyle;
   supportsImages?: boolean;
+  /** Explicit persistence policy for compatible Responses endpoints. Alibaba defaults to storing a
+   * response for seven days; Hara owns durable history locally and therefore disables it there. */
+  store?: boolean;
+  /** Alibaba's opt-in server-side Session cache. It lowers repeat-prefix latency/usage without making
+   * Hara depend on an expiring previous_response_id. Never send this vendor header to other endpoints. */
+  dashscopeSessionCache?: boolean;
   omitAuthorization?: boolean;
   fetch?: typeof fetch;
 }): Provider {
+  const defaultHeaders: Record<string, string | null> = {};
+  if (opts.omitAuthorization) defaultHeaders.Authorization = null;
+  if (opts.dashscopeSessionCache) defaultHeaders["x-dashscope-session-cache"] = "enable";
   const client = new OpenAI({
     apiKey: opts.apiKey,
     maxRetries: 4,
     ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
-    ...(opts.omitAuthorization ? { defaultHeaders: { Authorization: null } } : {}),
+    ...(Object.keys(defaultHeaders).length ? { defaultHeaders } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
   });
 
@@ -193,10 +203,16 @@ export function createResponsesProvider(opts: {
         max_output_tokens: 32000,
         stream: true,
       };
+      if (opts.store !== undefined) params.store = opts.store;
       if (responseTools.length) params.tools = responseTools;
-      Object.assign(
+      // An explicit thinking choice is a latency/cost contract. If an endpoint rejects the field, surface
+      // the error instead of retrying without it and silently turning the provider default back on.
+      const reasoningStyle = opts.reasoningStyle ?? "reasoning_object";
+      const reasoningRoute = reasoningRouteKey(opts.label, opts.baseURL, opts.model, reasoningStyle);
+      const reasoningKeys = applyReasoningParams(
         params,
-        reasoningParams(opts.reasoningStyle ?? "reasoning_object", opts.reasoningEffort, opts.model),
+        reasoningParams(reasoningStyle, opts.reasoningEffort, opts.model),
+        reasoningRoute,
       );
 
       let text = "";
@@ -270,7 +286,9 @@ export function createResponsesProvider(opts: {
       };
 
       try {
-        const stream = await client.responses.create(params, { signal });
+        const stream = await sendWithReasoningFallback(reasoningRoute, params, reasoningKeys, (body) =>
+          client.responses.create(body as typeof params, { signal }),
+        );
         for await (const event of stream as any) {
           onActivity?.();
           if (Number.isInteger(event?.sequence_number)) {

@@ -176,7 +176,7 @@ function persistProfilesFile(f: ProfilesFile, expectedText?: string, expectedMis
   return snapshot;
 }
 
-function validProfilesFile(value: unknown): value is ProfilesFile {
+function validProfilesFileStructure(value: unknown): value is ProfilesFile {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const file = value as Partial<ProfilesFile>;
   // Legacy releases accepted a wider id alphabet. Keep those records readable so the command layer can
@@ -194,7 +194,22 @@ function validProfilesFile(value: unknown): value is ProfilesFile {
     ) return false;
     ids.add(entry.id);
   }
-  return ids.has(file.active) && ids.has(PERSONAL_ID);
+  return ids.has(file.active);
+}
+
+function validProfilesFile(value: unknown): boolean {
+  return validProfilesFileStructure(value)
+    && value.profiles.some((profile) => profile.id === PERSONAL_ID);
+}
+
+/** A short-lived Desktop/provider-connections build persisted only named personal connections and omitted
+ * the reserved `personal` row. The named route and credential are valid, but older CLI readers reject the
+ * whole registry because fallback/removal semantics require Personal to exist. This compatibility shape is
+ * deliberately narrow: every stored row and the active pointer must otherwise validate, and we only add the
+ * synthesized config-backed Personal view. Existing profile values/credentials are never changed. */
+function missingPersonalCompatibilityFile(value: unknown): boolean {
+  return validProfilesFileStructure(value)
+    && !value.profiles.some((profile) => profile.id === PERSONAL_ID);
 }
 
 interface ProfilesState {
@@ -290,10 +305,18 @@ function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | nul
 function maybeMigrateUnlocked(): ProfilesState {
   const existing = readPrivateJSON<ProfilesFile>("profiles.json");
   if (existing) {
-    if (!validProfilesFile(existing.value)) {
-      throw new Error("profiles registry contains invalid data; refusing automatic migration or replacement");
+    if (validProfilesFile(existing.value)) {
+      return { value: existing.value, snapshot: existing.snapshot };
     }
-    return { value: existing.value, snapshot: existing.snapshot };
+    if (missingPersonalCompatibilityFile(existing.value)) {
+      const healed: ProfilesFile = {
+        active: existing.value.active,
+        profiles: [readPersonalFromConfig(), ...existing.value.profiles],
+      };
+      const snapshot = persistProfilesFile(healed, existing.snapshot.text);
+      return { value: healed, snapshot };
+    }
+    throw new Error("profiles registry contains invalid data; refusing automatic migration or replacement");
   }
 
   const personal = readPersonalFromConfig();

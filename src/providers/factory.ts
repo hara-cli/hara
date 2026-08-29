@@ -7,6 +7,7 @@ import { createAnthropicProvider } from "./anthropic.js";
 import { createOpenAIProvider } from "./openai.js";
 import { createResponsesProvider } from "./responses.js";
 import { deepSeekResponsesSupportsImages } from "./deepseek.js";
+import { isOfficialTokenPlanOpenAIEndpoint } from "./alibaba.js";
 import { resolvePlatform } from "./registry.js";
 import type { Provider } from "./types.js";
 import type { ProviderTarget } from "./target.js";
@@ -41,6 +42,7 @@ export async function createProviderForTarget(
     return createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort, fetch });
   }
   if (wire === "responses") {
+    const alibabaTokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
     return createResponsesProvider({
       apiKey: transportKey,
       model,
@@ -48,7 +50,8 @@ export async function createProviderForTarget(
       label: provider,
       reasoningEffort,
       reasoningStyle: caps.reasoning,
-      supportsImages: caps.reasoning !== "deepseek_responses" || deepSeekResponsesSupportsImages(model),
+      supportsImages: !/^deepseek-/i.test(model) || deepSeekResponsesSupportsImages(model),
+      ...(alibabaTokenPlan ? { store: false, dashscopeSessionCache: true } : {}),
       omitAuthorization: providerIsLocal(provider),
       fetch,
     });

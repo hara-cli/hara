@@ -6,7 +6,7 @@
 import type { ReasoningStyle } from "./reasoning.js";
 import {
   isOfficialTokenPlanOpenAIEndpoint,
-  isTokenPlanQwenResponsesModel,
+  isTokenPlanResponsesModel,
 } from "./alibaba.js";
 import {
   DEEPSEEK_RESPONSES_MODELS,
@@ -92,11 +92,11 @@ export function resolvePlatform(
   const miniMaxEndpoint = isOfficialMiniMaxEndpoint(baseURL);
   const miniMaxResponses = providerId === "minimax-token-plan" || miniMaxEndpoint;
   const tokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
-  const tokenPlanResponses = tokenPlan && isTokenPlanQwenResponsesModel(modelId ?? "");
+  const tokenPlanResponses = tokenPlan && isTokenPlanResponsesModel(modelId ?? "");
   // baseURL shape is the strongest signal for a custom profile; else the provider-id override; else chat.
   const byUrl = tokenPlan
     ? tokenPlanResponses
-      ? { wireApi: "responses" as const, reasoning: "qwen_responses" as const, cache: "auto" as const }
+      ? { wireApi: "responses" as const, reasoning: "alibaba_responses" as const, cache: "auto" as const }
       : { wireApi: "chat" as const, reasoning: "none" as const, cache: "auto" as const }
     : miniMaxEndpoint
       ? { wireApi: "responses" as const, reasoning: "minimax_responses" as const, cache: "auto" as const }

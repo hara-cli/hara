@@ -4,7 +4,7 @@
 // platform that reuses a style is pure data in the registry — no new code here. New code only when a
 // genuinely new style appears (a new provider param shape).
 
-import { isTokenPlanQwenResponsesModel } from "./alibaba.js";
+import { isTokenPlanQwenResponsesModel, isTokenPlanResponsesModel } from "./alibaba.js";
 
 export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
 
@@ -13,9 +13,11 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *                         thinking phase server-side (off → the big latency vanishes, measured 14s→1.6s).
  *  - `reasoning_effort` — OpenAI chat reasoning models (o-series / gpt-5): the `reasoning_effort` enum.
  *  - `reasoning_object` — OpenAI Responses API: `reasoning: { effort }` (for the responses transport).
- *  - `qwen_responses` — Alibaba Model Studio Responses API for Qwen: `reasoning: { effort }`, with
- *                         model-specific levels. qwen3.8 max/flash accept low|medium|xhigh; older supported
- *                         Qwen Responses models also accept `none` and the wider graded dial.
+ *  - `qwen_responses` — legacy/internal alias for Alibaba Qwen Responses reasoning.
+ *  - `alibaba_responses` — Alibaba Model Studio Responses API: explicit off uses the provider extension
+ *                         `enable_thinking:false`; enabled levels use `reasoning: { effort }`. The explicit
+ *                         boolean is intentional: live Token Plan measurements found `effort:none` could
+ *                         still emit reasoning tokens, while the boolean reliably disabled thinking.
  *  - `minimax_responses` — MiniMax M3 Responses API: `none` disables thinking; any enabled Hara level
  *                         maps to `high`, which MiniMax documents as Adaptive Thinking rather than depth.
  *  - `deepseek_responses` — DeepSeek V4 Responses API: `reasoning: { effort }`, with DeepSeek's
@@ -30,7 +32,7 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `ollama_think`     — Ollama's OpenAI-compat endpoint: a `think` boolean that stops a local reasoning
  *                         model's thinking phase (measured: deepseek-r1:14b 17s → 0.6s). Off models ignore it.
  *  - `none`             — the platform has no thinking control; leave the request untouched. */
-export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "qwen_responses" | "minimax_responses" | "deepseek_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
+export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "qwen_responses" | "alibaba_responses" | "minimax_responses" | "deepseek_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
 
 /** OpenAI reasoning families that accept `reasoning_effort` / `reasoning.effort`. Others reject it, so the
  *  `reasoning_effort` / `reasoning_object` styles no-op on non-reasoning models. */
@@ -55,6 +57,7 @@ export function supportsReasoningStyle(style: ReasoningStyle, model = ""): boole
     return false;
   }
   if (style === "qwen_responses") return isQwenResponsesReasoningModel(model);
+  if (style === "alibaba_responses") return isTokenPlanResponsesModel(model);
   return true;
 }
 
@@ -80,16 +83,14 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
     case "reasoning_object":
       if (!isReasoningModel(model)) return {};
       return { reasoning: { effort: effort === "off" ? "minimal" : effort === "max" ? "high" : effort } };
-    case "qwen_responses": {
+    case "qwen_responses":
+    case "alibaba_responses": {
       if (!supportsReasoningStyle(style, model)) return {};
-      // The qwen3.8 max/flash catalog exposed to Codex documents low|medium|xhigh (default xhigh), not an
-      // off value. A stale cross-provider `off` therefore degrades to low instead of sending an invalid
-      // enum or unexpectedly restoring the expensive default. `max` is Hara's portable name for xhigh.
-      const qwen38 = /^qwen3\.8-(?:max|flash)(?:-|$)/i.test(bareModel(model));
-      const mapped = qwen38
-        ? effort === "off" || effort === "low" ? "low" : effort === "medium" ? "medium" : "xhigh"
-        : effort === "off" ? "none" : effort;
-      return { reasoning: { effort: mapped } };
+      // Do not send `reasoning` together with the explicit off switch: Alibaba documents that the object
+      // has priority. More importantly, current Token Plan behavior can keep thinking on for `none`, while
+      // the top-level provider extension reliably returns zero reasoning tokens.
+      if (effort === "off") return { enable_thinking: false };
+      return { reasoning: { effort } };
     }
     case "minimax_responses":
       return { reasoning: { effort: effort === "off" ? "none" : "high" } };

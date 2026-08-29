@@ -16,6 +16,7 @@ function listen(events) {
       requests.push({
         url: request.url,
         authorization: request.headers.authorization,
+        sessionCache: request.headers["x-dashscope-session-cache"],
         body: raw ? JSON.parse(raw) : null,
       });
       response.writeHead(200, { "content-type": "text/event-stream" });
@@ -242,7 +243,7 @@ test(`Responses transport consumes semantic SSE and function calls for ${deepSee
 });
 }
 
-test("Token Plan Qwen request carries xhigh reasoning without OpenAI-only state fields", async () => {
+test("Token Plan request carries the selected reasoning level without OpenAI-only state fields", async () => {
   const mock = await listen([completed([], { input_tokens: 2, output_tokens: 1 }, 0)]);
   try {
     await createResponsesProvider({
@@ -251,14 +252,44 @@ test("Token Plan Qwen request carries xhigh reasoning without OpenAI-only state 
       model: "qwen3.8-max",
       reasoningEffort: "max",
       reasoningStyle: "qwen_responses",
+      store: false,
+      dashscopeSessionCache: true,
     }).turn({ system: "test", history: [{ role: "user", content: "ping" }], tools: [], onText() {} });
 
     assert.equal(mock.requests.length, 1);
-    assert.deepEqual(mock.requests[0].body.reasoning, { effort: "xhigh" });
+    assert.deepEqual(mock.requests[0].body.reasoning, { effort: "max" });
     assert.equal(mock.requests[0].body.previous_response_id, undefined);
     assert.equal(mock.requests[0].body.conversation, undefined);
-    assert.equal(mock.requests[0].body.store, undefined);
+    assert.equal(mock.requests[0].body.store, false);
+    assert.equal(mock.requests[0].sessionCache, "enable");
     assert.equal(mock.requests[0].body.parallel_tool_calls, undefined);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+  }
+});
+
+test("Token Plan off sends only enable_thinking=false so reasoning cannot override it", async () => {
+  const mock = await listen([completed([], {
+    input_tokens: 2,
+    output_tokens: 1,
+    output_tokens_details: { reasoning_tokens: 0 },
+  }, 0)]);
+  try {
+    await createResponsesProvider({
+      apiKey: "test-key",
+      baseURL: mock.baseURL,
+      model: "qwen3.7-plus",
+      reasoningEffort: "off",
+      reasoningStyle: "alibaba_responses",
+      store: false,
+      dashscopeSessionCache: true,
+    }).turn({ system: "test", history: [{ role: "user", content: "classify" }], tools: [], onText() {} });
+
+    assert.equal(mock.requests.length, 1);
+    assert.equal(mock.requests[0].body.enable_thinking, false);
+    assert.equal(mock.requests[0].body.reasoning, undefined, "reasoning would take precedence and must be omitted");
+    assert.equal(mock.requests[0].body.store, false, "Hara owns durable history locally");
+    assert.equal(mock.requests[0].sessionCache, "enable");
   } finally {
     await new Promise((resolve) => mock.server.close(resolve));
   }

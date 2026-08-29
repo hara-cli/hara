@@ -26,7 +26,7 @@ import { randomUUID } from "node:crypto";
 import { deliverResult } from "../cron/deliver.js";
 import { selfArgv } from "../cron/runner.js";
 import { resolveAgent } from "../org/projects.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, type HaraConfig } from "../config.js";
 import { createProviderForTarget } from "../providers/factory.js";
 import {
   profileByIdForConfig,
@@ -638,8 +638,40 @@ export function captureNoToolAudience(): NoToolAudience {
   return { profileId: profile.id, spaceId: spaceIdForProfile(profile) };
 }
 
-async function buildNoToolProvider(audience?: NoToolAudience): Promise<Provider | null> {
+function validNoToolModelOverride(value: string | undefined): value is string {
+  return typeof value === "string"
+    && !value.includes("://")
+    && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(value);
+}
+
+/** Resolve the thinking dial for ONE isolated no-tool judgment.
+ *
+ * A no-tool turn that also forces a JSON schema is a fill-in-the-blank classification BY CONSTRUCTION:
+ * the model cannot act, and the answer shape is fixed, so a reasoning chain adds latency and output
+ * tokens without changing the verdict. That property belongs to the call SHAPE, not to any one caller —
+ * putting the default here fixes the whole class once, instead of leaving each new caller to rediscover
+ * it. Free-form no-tool prompts are ordinary generation and keep the profile's normal setting.
+ *
+ * This stays provider-neutral on purpose: `off` is an intent, and providers/reasoning.ts decides whether
+ * it becomes a wire parameter at all (for an unknown platform it becomes nothing). Callers that genuinely
+ * want the chain back pass an explicit level, or "inherit" for the profile's normal-chat choice. */
+export function noToolReasoningEffort(
+  requested: NoToolReasoningEffort | undefined,
+  configured: HaraConfig["reasoningEffort"],
+  schemaForced: boolean,
+): HaraConfig["reasoningEffort"] {
+  if (requested === "inherit") return configured;
+  if (requested !== undefined) return requested;
+  return schemaForced ? "off" : configured;
+}
+
+async function buildNoToolProvider(
+  audience?: NoToolAudience,
+  options: Pick<NoToolTurnOptions, "model" | "reasoningEffort" | "schema"> = {},
+): Promise<Provider | null> {
   const cfg = loadConfig();
+  if (options.model !== undefined && !validNoToolModelOverride(options.model)) return null;
+  const reasoningEffort = noToolReasoningEffort(options.reasoningEffort, cfg.reasoningEffort, !!options.schema);
   const profile = audience
     ? profileByIdForConfig(cfg, audience.profileId)
     : profileForConfig(cfg).profile;
@@ -647,18 +679,21 @@ async function buildNoToolProvider(audience?: NoToolAudience): Promise<Provider 
   if (audience && spaceIdForProfile(profile) !== audience.spaceId) return null;
   if (profile.kind === "gateway") {
     if (!profile.gatewayUrl || !profile.deviceToken) return null;
+    const model = resolveGatewayModel(cfg, profile, process.env, options.model);
+    if (profile.availableModels?.length && !profile.availableModels.includes(model)) return null;
     const provider = await createProviderForTarget({
       provider: "hara-gateway",
       apiKey: profile.deviceToken,
       baseURL: profile.baseURL || `${profile.gatewayUrl.replace(/\/$/, "")}/v1`,
-      model: resolveGatewayModel(cfg, profile),
+      model,
       ...(cfg.proxy ? { proxy: cfg.proxy } : {}),
-    }, cfg.reasoningEffort);
+    }, reasoningEffort);
     return provider ? bindOrganizationProvider(provider, { ...profile }) : null;
   }
+  const target = resolveByokProviderTarget(cfg, profile, false);
   return createProviderForTarget(
-    resolveByokProviderTarget(cfg, profile, false),
-    cfg.reasoningEffort,
+    options.model ? { ...target, model: options.model } : target,
+    reasoningEffort,
   );
 }
 
@@ -680,9 +715,18 @@ function extractJson(raw: string): unknown {
   return undefined;
 }
 
+/** One call's thinking selection. Omitted accepts the schema-forced default resolved by
+ *  `noToolReasoningEffort`; "inherit" follows the profile's normal-chat setting. */
+export type NoToolReasoningEffort = NonNullable<HaraConfig["reasoningEffort"]> | "inherit";
+
 export interface NoToolTurnOptions {
   schema?: object;
   timeoutMs?: number;
+  /** Same profile credential and endpoint, with only a bounded model-id override. */
+  model?: string;
+  /** One-call thinking override; ordinary chat/global config remains untouched. Schema-forced calls
+   *  default to `off` — see `noToolReasoningEffort`. */
+  reasoningEffort?: NoToolReasoningEffort;
   /** Gateway lifecycle signal. Shutdown is authoritative even if the provider returns a late response. */
   signal?: AbortSignal;
   /** Frozen route for pending/flow data. Ordinary one-shot callers may omit it and use the active route. */
@@ -753,7 +797,7 @@ export async function runNoToolTurn(provider: Provider, prompt: string, opts: No
  * callers then fail closed (no pending action is executed and no unsafe subprocess fallback is attempted). */
 export async function runNoToolModel(prompt: string, opts: NoToolTurnOptions = {}): Promise<string> {
   try {
-    const provider = await buildNoToolProvider(opts.audience);
+    const provider = await buildNoToolProvider(opts.audience, opts);
     return provider ? await runNoToolTurn(provider, prompt, opts) : "";
   } catch {
     return "";

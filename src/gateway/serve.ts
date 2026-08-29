@@ -5,7 +5,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
-import { dispatchFlows, flowSourceKey } from "./flows.js";
+import { dispatchFlows, flowSourceKey, type FlowRunOptions } from "./flows.js";
 import { captureNoToolAudience, handleOwnerReply, runNoToolModel, type NoToolAudience } from "./flows-pending.js";
 import { chatContext, chatCd, chatSessionIdPrefix, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, toggleVoice } from "./sessions.js";
 import { plainChat } from "../cron/deliver.js";
@@ -568,8 +568,15 @@ export function runHara(
 /** Run a one-off FLOW text task directly against the provider with `tools: []`. The old subprocess path
  * launched the full coding agent with `--approval full-auto`, allowing a prompt-injected group message to
  * reach bash/edit/MCP tools. `cwd` is intentionally ignored: isolated flow judgments cannot read a project. */
-function runFlowAgent(prompt: string, _cwd: string, schema?: object, signal?: AbortSignal, audience?: NoToolAudience): Promise<string> {
-  return runNoToolModel(prompt, { schema, timeoutMs: 60_000, signal, audience });
+function runFlowAgent(
+  prompt: string,
+  _cwd: string,
+  schema?: object,
+  signal?: AbortSignal,
+  audience?: NoToolAudience,
+  options: FlowRunOptions = {},
+): Promise<string> {
+  return runNoToolModel(prompt, { schema, timeoutMs: 60_000, signal, audience, ...options });
 }
 
 /** Re-exported so `hara gateway --platform weixin --login` can run the QR flow. */

@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.156.0 — 2026-08-30 — Alibaba Responses and efficient message Flows
+
+- Fully align Alibaba Token Plan Agent models with the current Responses API. Qwen 3.8/3.7/3.6,
+  DeepSeek V4, and GLM 5.2 now select the documented transport on the fixed Beijing endpoint; the Key's
+  live `/models` catalog remains authoritative, and media generators stay out of the conversation picker.
+  Qwen 3.8 Max/Flash, Qwen 3.7 Plus, and Qwen 3.6 Flash accept native images.
+- Make thinking control honest and measurable. Normal chat keeps Auto and every supported level, while Off
+  sends only Alibaba's `enable_thinking:false`; a rejected explicit level fails visibly instead of silently
+  falling back to an expensive provider default. Token Plan Responses disables seven-day response storage,
+  enables Alibaba Session caching, and retains Hara's complete durable history locally.
+- Make message Flows default to reasoning Off, allow a same-connection model override, and add schema-checked
+  `staticResult` rules that perform deterministic routing with zero model calls. `inherit` restores the normal
+  chat setting; company model policy is refreshed and enforced before every managed request.
+- Recover a narrowly identified legacy provider-connections registry that omitted the reserved Personal row.
+  Hara atomically restores only the config-backed Personal entry while preserving the selected named route and
+  all existing credentials. Upgrade with `npm i -g @nanhara/hara@0.156.0`.
+
 ## 0.155.3 — 2026-08-29 — recoverable Personal Agent roster
 
 - Make every Personal Agent discoverable from Hara, Claude Code, OpenClaw, Hermes, plugins, and registered

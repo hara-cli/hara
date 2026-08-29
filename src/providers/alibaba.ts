@@ -53,6 +53,17 @@ export function isTokenPlanQwenResponsesModel(model: string): boolean {
   return /^qwen3\.(?:8-(?:max(?:-preview)?|flash)|7-(?:max|plus)|6-(?:plus|flash))(?:-|$)/i.test(bareModel(model));
 }
 
+/** Models in the current Token Plan interactive catalog that Alibaba documents on its OpenAI-compatible
+ * Responses API. Keep this separate from the Qwen family check: the same subscription endpoint also serves
+ * DeepSeek and GLM, and those models should not silently fall back to Chat with no thinking control. Unknown
+ * future ids continue to fail closed to Chat until their Responses behavior is documented or observed live. */
+export function isTokenPlanResponsesModel(model: string): boolean {
+  const id = bareModel(model);
+  return isTokenPlanQwenResponsesModel(id)
+    || /^deepseek-v4-(?:pro(?:-0813)?|flash(?:-0731)?)(?:-|$)/i.test(id)
+    || /^glm-5\.2(?:-|$)/i.test(id);
+}
+
 /** `/models` is entitlement-authoritative but also lists media generators that require separate APIs or
  * Skills. Keep those out of Hara's interactive Agent model picker without guessing an allow-list for
  * future text models. */

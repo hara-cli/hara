@@ -259,9 +259,17 @@ test("flow config rejects malformed rules and logs are private, bounded, and sec
     writeFileSync(join(hara, "flows.json"), JSON.stringify({ flows: [
       { name: "bad-platform", do: "x", on: { platform: 7 } },
       { name: "bad-cwd", do: "x", cwd: 9 },
+      { name: "bad-both-modes", do: "x", staticResult: { disposition: "ignore" } },
+      { name: "bad-model", do: "x", model: "https://endpoint.example/model" },
+      {
+        name: "bad-static-schema",
+        staticResult: { disposition: 7 },
+        schema: { type: "object", properties: { disposition: { type: "string" } }, required: ["disposition"] },
+      },
       { name: "valid", do: "triage", on: { platform: "feishu", keyword: ["help"] } },
+      { name: "valid-static", staticResult: { disposition: "ignore", briefing: "fixed" } },
     ] }));
-    assert.deepEqual(loadFlows().map((flow) => flow.name), ["valid"]);
+    assert.deepEqual(loadFlows().map((flow) => flow.name), ["valid", "valid-static"]);
 
     const file = join(hara, "flows-log.jsonl");
     writeFileSync(file, "x".repeat(1_000_000), { mode: 0o644 });
@@ -272,6 +280,102 @@ test("flow config rejects malformed rules and logs are private, bounded, and sec
     const line = readFileSync(file, "utf8");
     assert.ok(!line.includes("flow-secret-value-123456"));
     assert.ok(!line.includes("opaque-value-123456"));
+  });
+});
+
+test("flows pass their thinking choice through, allow a same-route model override, and support zero-token static results", async () => {
+  await withTempHome(async (home) => {
+    const hara = join(home, ".hara");
+    mkdirSync(hara, { recursive: true });
+    const message = { chatId: "oc_group", userId: "member", chatType: "group", text: "help" };
+    const modelResult = JSON.stringify({ disposition: "ignore", briefing: "model" });
+    const calls = [];
+    writeFileSync(join(hara, "flows.json"), JSON.stringify([{
+      name: "fast-classifier",
+      on: { keyword: "help" },
+      do: "classify",
+      model: "qwen3.8-flash",
+      log: false,
+    }]));
+    assert.equal(await dispatchFlows(message, "feishu", async (...args) => {
+      calls.push(args);
+      return modelResult;
+    }), true);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(
+      calls[0][5],
+      { model: "qwen3.8-flash", reasoningEffort: "off" },
+      "every Flow defaults off, including a rule whose author later removes its schema",
+    );
+
+    writeFileSync(join(hara, "flows.json"), JSON.stringify([{
+      name: "inherit-chat-setting",
+      on: { keyword: "help" },
+      do: "classify",
+      reasoningEffort: "inherit",
+      log: false,
+    }]));
+    calls.length = 0;
+    assert.equal(await dispatchFlows(message, "feishu", async (...args) => {
+      calls.push(args);
+      return modelResult;
+    }), true);
+    assert.deepEqual(
+      calls[0][5],
+      { reasoningEffort: "inherit" },
+      "inherit is forwarded verbatim so the isolated call restores the normal-chat profile setting",
+    );
+
+    writeFileSync(join(hara, "flows.json"), JSON.stringify([{
+      name: "explicit-level",
+      on: { keyword: "help" },
+      do: "classify",
+      reasoningEffort: "high",
+      log: false,
+    }]));
+    calls.length = 0;
+    assert.equal(await dispatchFlows(message, "feishu", async (...args) => {
+      calls.push(args);
+      return modelResult;
+    }), true);
+    assert.deepEqual(calls[0][5], { reasoningEffort: "high" }, "an explicit level overrides the default");
+
+    const fixed = {
+      disposition: "informational",
+      briefing: "fixed route",
+      draft: "fixed answer",
+      route: { replyInChat: true },
+    };
+    writeFileSync(join(hara, "flows.json"), JSON.stringify([{
+      name: "static-keyword-route",
+      on: { keyword: "help" },
+      staticResult: fixed,
+      replyOn: ["informational"],
+      schema: {
+        type: "object",
+        properties: {
+          disposition: { type: "string" },
+          briefing: { type: "string" },
+          draft: { type: "string" },
+          route: { type: "object" },
+        },
+        required: ["disposition", "briefing", "draft", "route"],
+      },
+      log: false,
+    }]));
+    let modelCalls = 0;
+    const replies = [];
+    assert.equal(await dispatchFlows(
+      message,
+      "feishu",
+      async () => {
+        modelCalls += 1;
+        return modelResult;
+      },
+      async (text) => replies.push(text),
+    ), true);
+    assert.equal(modelCalls, 0, "static routing does not invoke a provider");
+    assert.deepEqual(replies, ["fixed answer"]);
   });
 });
 

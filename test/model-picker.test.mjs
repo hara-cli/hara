@@ -26,9 +26,10 @@ test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSe
   assert.deepEqual(levelsFor("thinking_budget"), ["off", "low", "medium", "high"]);
   assert.deepEqual(levelsFor("deepseek"), ["off", "low", "high", "max"]);
   assert.deepEqual(levelsFor("deepseek_responses"), ["off", "low", "high", "max"]);
-  assert.deepEqual(levelsFor("qwen_responses", "qwen3.8-max"), ["low", "medium", "max"]);
-  assert.deepEqual(levelsFor("qwen_responses", "qwen3.8-flash"), ["low", "medium", "max"]);
+  assert.deepEqual(levelsFor("qwen_responses", "qwen3.8-max"), ["off", "low", "medium", "high", "max"]);
+  assert.deepEqual(levelsFor("qwen_responses", "qwen3.8-flash"), ["off", "low", "medium", "high", "max"]);
   assert.deepEqual(levelsFor("qwen_responses", "qwen3.7-max"), ["off", "low", "medium", "high", "max"]);
+  assert.deepEqual(levelsFor("alibaba_responses", "deepseek-v4-pro"), ["off", "low", "medium", "high", "max"]);
   assert.deepEqual(levelsFor("qwen_responses", "deepseek-v4-pro"), []);
   assert.deepEqual(levelsFor("none"), []);
   assert.deepEqual(levelsFor("enable_thinking", "qwen3-coder-next"), [], "model-level capability overrides the shared endpoint");
@@ -40,15 +41,15 @@ test("levelLabel: binary reads as on/off, graded as the level name", () => {
   assert.equal(levelLabel("enable_thinking", "off"), "off");
   assert.equal(levelLabel("minimax_responses", "high", "MiniMax-M3"), "on");
   assert.equal(levelLabel("reasoning_effort", "medium"), "medium");
-  assert.equal(levelLabel("qwen_responses", "max", "qwen3.8-max"), "xhigh");
-  assert.equal(levelLabel("qwen_responses", "max", "qwen3.8-flash"), "xhigh");
+  assert.equal(levelLabel("qwen_responses", "max", "qwen3.8-max"), "max");
+  assert.equal(levelLabel("qwen_responses", "max", "qwen3.8-flash"), "max");
 });
 
-test("normalizeEffort maps stale cross-provider values onto qwen3.8-max's real dial", () => {
-  assert.equal(normalizeEffort("qwen_responses", "qwen3.8-max", "off"), "low");
-  assert.equal(normalizeEffort("qwen_responses", "qwen3.8-max", "high"), "max");
+test("normalizeEffort keeps every documented Token Plan Responses level selectable", () => {
+  assert.equal(normalizeEffort("qwen_responses", "qwen3.8-max", "off"), "off");
+  assert.equal(normalizeEffort("qwen_responses", "qwen3.8-max", "high"), "high");
   assert.equal(normalizeEffort("qwen_responses", "qwen3.8-max", "medium"), "medium");
-  assert.equal(normalizeEffort("qwen_responses", "qwen3.8-flash", "high"), "max");
+  assert.equal(normalizeEffort("qwen_responses", "qwen3.8-flash", "high"), "high");
   assert.equal(normalizeEffort("qwen_responses", "deepseek-v4-pro", "high"), undefined);
 });
 
@@ -71,7 +72,7 @@ test("movePicker: ←→ cycles the thinking level for the endpoint's style", ()
   assert.equal(movePicker({ modelIdx: 0, effort: "high" }, "right", 3, "deepseek").effort, "max");
   assert.equal(movePicker({ modelIdx: 0, effort: "max" }, "right", 3, "deepseek").effort, "off", "max wraps to off");
   assert.equal(movePicker({ modelIdx: 0, effort: "off" }, "left", 3, "deepseek").effort, "max", "left from off wraps to max");
-  assert.equal(movePicker({ modelIdx: 0, effort: "off" }, "right", 3, "qwen_responses", "qwen3.8-max").effort, "medium");
+  assert.equal(movePicker({ modelIdx: 0, effort: "off" }, "right", 3, "qwen_responses", "qwen3.8-max").effort, "low");
   // none: ←→ is a no-op
   assert.equal(movePicker({ modelIdx: 0, effort: "off" }, "right", 3, "none").effort, "off");
 });
