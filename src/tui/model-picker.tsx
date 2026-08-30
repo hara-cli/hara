@@ -70,6 +70,7 @@ export function ModelPicker({
   style,
   current,
   effort,
+  hint,
   onSelect,
   onCancel,
 }: {
@@ -80,6 +81,9 @@ export function ModelPicker({
   current?: string;
   /** the current session reasoning dial, to open the ←→ on it */
   effort: Effort;
+  /** Optional one-line buying advice per model, supplied by the endpoint's catalog. Provider-neutral on
+   *  purpose: the picker renders whatever it is given and shows nothing when a model has no hint. */
+  hint?: (model: string) => string | undefined;
   onSelect: (model: string, effort: Effort) => void;
   onCancel: () => void;
 }) {
@@ -107,9 +111,11 @@ export function ModelPicker({
       ) : (
         models.map((m, i) => {
           const on = i === s.modelIdx;
+          const advice = hint?.(m);
           return (
             <Box key={m}>
               <Text color={on ? "cyan" : undefined} bold={on}>{(on ? " ❯ " : "   ") + m}</Text>
+              {advice ? <Text dimColor>{"  — " + advice}</Text> : null}
               {on && hasLevels ? <Text dimColor>{"   " + dial}</Text> : null}
             </Box>
           );

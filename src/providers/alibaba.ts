@@ -64,6 +64,37 @@ export function isTokenPlanResponsesModel(model: string): boolean {
     || /^glm-5\.2(?:-|$)/i.test(id);
 }
 
+/** Entries the live catalog still returns but nobody should newly choose: a retired alias that the server
+ * silently reroutes, or a model another catalog entry beats on every axis. Hiding them keeps the picker a
+ * list of real decisions instead of a changelog. This never restricts what a key may call — an explicit
+ * `/model <id>` or `hara config set model` still accepts any entitled id, and the model already configured
+ * is always kept in the list so nobody is stranded on one of these. */
+export function isTokenPlanSupersededModel(model: string): boolean {
+  const id = bareModel(model).toLowerCase();
+  // Alibaba retired the preview and reroutes it to qwen3.8-max, billing and reporting it as qwen3.8-max.
+  if (/^qwen3\.8-max-preview(?:-|$)/.test(id)) return true;
+  // qwen3.6-flash loses to qwen3.8-flash on every axis: dearer per token (1.2/7.2 vs 0.8/2.7), tiered above
+  // 256K (4.8/28.8) where qwen3.8-flash stays flat to 1M, and an older generation with the same vision.
+  if (/^qwen3\.6-flash(?:-|$)/.test(id)) return true;
+  return false;
+}
+
+/** One line of buying advice per catalog entry: what this model is FOR, and the one fact that decides it
+ * (price shape, a standing discount, or a missing capability). Undefined for anything not in the curated
+ * table, so an unknown future id shows up unannotated rather than mislabelled. */
+export function tokenPlanModelHint(model: string): string | undefined {
+  const id = bareModel(model).toLowerCase();
+  if (/^qwen3\.8-flash(?:-|$)/.test(id)) return "daily driver · cheapest · flat rate to 1M · images";
+  if (/^qwen3\.8-max(?:-|$)/.test(id)) return "heavy work · half price 22:00–08:00 · images";
+  if (/^qwen3\.7-plus(?:-|$)/.test(id)) return "writing and tone · images";
+  if (/^qwen3\.7-max(?:-|$)/.test(id)) return "text only · qwen3.8-max is the current generation";
+  if (/^deepseek-v4-pro-0813(?:-|$)/.test(id)) return "text only · deep reasoning · half price 22:00–08:00";
+  if (/^deepseek-v4-pro(?:-|$)/.test(id)) return "text only · deep reasoning · flat rate";
+  if (/^deepseek-v4-flash(?:-0731)?(?:-|$)/.test(id)) return "text only · light work · peak/off-peak pricing";
+  if (/^glm-5\.2(?:-|$)/.test(id)) return "text only · flat rate";
+  return undefined;
+}
+
 /** `/models` is entitlement-authoritative but also lists media generators that require separate APIs or
  * Skills. Keep those out of Hara's interactive Agent model picker without guessing an allow-list for
  * future text models. */

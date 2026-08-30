@@ -199,6 +199,7 @@ import { createProviderForTarget } from "./providers/factory.js";
 import { resolvePlatform } from "./providers/registry.js";
 import { boundedProviderTurn } from "./providers/bounded-turn.js";
 import { levelsFor } from "./tui/model-picker.js";
+import { isOfficialTokenPlanOpenAIEndpoint, tokenPlanModelHint } from "./providers/alibaba.js";
 import { listModels } from "./providers/models.js";
 import { createModelFetch } from "./network/model-fetch.js";
 import { listJobs, tailJob, killJob } from "./exec/jobs.js";
@@ -6856,10 +6857,13 @@ program.action(async (opts) => {
                   bURL,
                   cfg.apiKey ?? "",
                   createModelFetch(cfg.proxy),
+                  cfg.model,
                 );
                 assertInteractiveAudience();
                 const style = resolvePlatform(cfg.provider, bURL, undefined, cfg.model).reasoning;
-                const chosen = await h.pickModel({ models, style, current: cfg.model, effort: cfg.reasoningEffort });
+                // Buying advice is endpoint-specific; other providers show a plain list until they have one.
+                const hint = isOfficialTokenPlanOpenAIEndpoint(bURL) ? tokenPlanModelHint : undefined;
+                const chosen = await h.pickModel({ models, style, current: cfg.model, effort: cfg.reasoningEffort, hint });
                 if (!chosen) return; // esc — no change
                 const nextModel = chosen.model || cfg.model;
                 const nextProvider = await rebuildInteractiveProvider(nextModel, chosen.effort);

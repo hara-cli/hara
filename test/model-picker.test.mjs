@@ -14,6 +14,8 @@ import {
 import {
   TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
   TOKEN_PLAN_OPENAI_BASE_URL,
+  isTokenPlanSupersededModel,
+  tokenPlanModelHint,
   tokenPlanModelReplacement,
 } from "../dist/providers/alibaba.js";
 import { MINIMAX_TOKEN_PLAN_MODELS } from "../dist/providers/minimax.js";
@@ -207,4 +209,35 @@ test("MiniMax Token Plan discovery falls back to M3 only on the exact official e
     ["MiniMax-M3.1"],
     "live key-scoped discovery remains authoritative",
   );
+});
+
+test("the picker hides only entries nobody should newly choose", () => {
+  // A retired alias the server reroutes, and a model beaten on price, tiering, and generation.
+  assert.equal(isTokenPlanSupersededModel("qwen3.8-max-preview"), true);
+  assert.equal(isTokenPlanSupersededModel("qwen3.6-flash"), true);
+  // Everything that still represents a real decision stays listed.
+  for (const keep of ["qwen3.8-flash", "qwen3.8-max", "qwen3.7-plus", "qwen3.7-max", "glm-5.2",
+                      "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731"]) {
+    assert.equal(isTokenPlanSupersededModel(keep), false, keep);
+  }
+});
+
+test("a superseded model stays listed while it is the configured one", async () => {
+  const catalog = ["qwen3.8-flash", "qwen3.6-flash", "qwen3.8-max-preview", "qwen-image-3.0-pro"];
+  const ok = async () => new Response(JSON.stringify({ data: catalog.map((id) => ({ id })) }), { status: 200 });
+
+  const listed = await listModels(TOKEN_PLAN_OPENAI_BASE_URL, "k", ok);
+  assert.deepEqual(listed, ["qwen3.8-flash"], "superseded entries and media generators are both hidden");
+
+  const stranded = await listModels(TOKEN_PLAN_OPENAI_BASE_URL, "k", ok, "qwen3.6-flash");
+  assert.deepEqual(stranded, ["qwen3.6-flash", "qwen3.8-flash"], "the model in use is never filtered away");
+});
+
+test("model hints say what a model is for, and stay silent on unknown ids", () => {
+  assert.match(tokenPlanModelHint("qwen3.8-flash"), /daily driver/);
+  assert.match(tokenPlanModelHint("qwen3.8-max"), /22:00/, "the standing night discount is the deciding fact");
+  assert.match(tokenPlanModelHint("glm-5.2"), /text only/, "no vision is a capability the picker must surface");
+  assert.match(tokenPlanModelHint("deepseek-v4-pro-0813"), /half price/);
+  // An id the table has never seen renders unannotated rather than mislabelled.
+  assert.equal(tokenPlanModelHint("qwen4.0-superflash"), undefined);
 });

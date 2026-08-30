@@ -81,7 +81,7 @@ export interface Helpers {
    *  option or free text). Routes through the same prompt/input channel as confirm/select. */
   ask: (question: string, options?: string[], signal?: AbortSignal) => Promise<string>;
   /** /model picker: ↑↓ a model + ←→ its thinking level; resolves to the chosen {model, effort}, or null on esc. */
-  pickModel: (o: { models: string[]; style: ReasoningStyle; current?: string; effort: Effort }) => Promise<{ model: string; effort: Effort } | null>;
+  pickModel: (o: { models: string[]; style: ReasoningStyle; current?: string; effort: Effort; hint?: (model: string) => string | undefined }) => Promise<{ model: string; effort: Effort } | null>;
   setApproval: (m: Approval) => void;
   signal: AbortSignal;
   exit: () => void;
@@ -591,7 +591,7 @@ export function App({
   // line, then resolves the awaiting tool with that text. Separate from `prompt` (the select-only path).
   const [askText, setAskText] = useState<{ token: symbol; title: string; resolve: (v: string) => void } | null>(null);
   const [showTranscript, setShowTranscript] = useState(false); // Ctrl+T full-transcript overlay
-  const [picker, setPicker] = useState<{ models: string[]; style: ReasoningStyle; current?: string; effort: Effort; resolve: (v: { model: string; effort: Effort } | null) => void } | null>(null); // /model picker overlay
+  const [picker, setPicker] = useState<{ models: string[]; style: ReasoningStyle; current?: string; effort: Effort; hint?: (model: string) => string | undefined; resolve: (v: { model: string; effort: Effort } | null) => void } | null>(null); // /model picker overlay
   const [modeSelector, setModeSelector] = useState(false); // transient approval selector: shift+tab pops it, auto-hides
   const modeSelectorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Live checklist mirror: TodoPanel reads this, and `Working` derives its spinner verb from the
@@ -891,7 +891,7 @@ export function App({
         return askTextFn(question, signal);
       };
       const setApprovalFn = (m: Approval): void => setStatus((s) => ({ ...s, approval: m }));
-      const pickModelFn = (o: { models: string[]; style: ReasoningStyle; current?: string; effort: Effort }): Promise<{ model: string; effort: Effort } | null> =>
+      const pickModelFn = (o: { models: string[]; style: ReasoningStyle; current?: string; effort: Effort; hint?: (model: string) => string | undefined }): Promise<{ model: string; effort: Effort } | null> =>
         new Promise((resolve) => setPicker({ ...o, resolve }));
       // Enter the conversation flow INSTANTLY: yield one macrotask so ink paints the committed message +
       // cleared input + spinner BEFORE the turn's synchronous prep runs (reading @-files, base64-encoding
@@ -1027,6 +1027,7 @@ export function App({
           style={picker.style}
           current={picker.current}
           effort={picker.effort}
+          hint={picker.hint}
           onSelect={(model, effort) => {
             const r = picker.resolve;
             setPicker(null);

@@ -6,6 +6,7 @@ import {
 import {
   isOfficialTokenPlanOpenAIEndpoint,
   isTokenPlanInteractiveAgentModel,
+  isTokenPlanSupersededModel,
 } from "./alibaba.js";
 import {
   isOfficialMiniMaxEndpoint,
@@ -63,6 +64,9 @@ export async function listModels(
   baseURL: string | undefined,
   apiKey: string,
   fetchImpl: typeof fetch = userModelFetch,
+  /** The model already in use. It is never filtered out of the list, so a user sitting on a superseded
+   * entry can still see and re-pick it instead of silently losing their current route. */
+  keep?: string,
 ): Promise<string[]> {
   if (!baseURL) return []; // SDK-default hosts (anthropic/openai) — no custom endpoint to enumerate
   const fallback = [
@@ -81,7 +85,9 @@ export async function listModels(
     // Stable order + de-dup so the picker list doesn't jump around between opens.
     const discovered = [...new Set(ids)].sort((a, b) => a.localeCompare(b));
     const selectable = isOfficialTokenPlanOpenAIEndpoint(baseURL)
-      ? discovered.filter(isTokenPlanInteractiveAgentModel)
+      ? discovered.filter((id) =>
+          isTokenPlanInteractiveAgentModel(id)
+          && (!isTokenPlanSupersededModel(id) || id === keep))
       : discovered;
     return selectable.length ? selectable : fallback;
   } catch {
