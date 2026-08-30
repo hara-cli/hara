@@ -33,6 +33,31 @@ use `reasoning.effort`. Token Plan Responses uses `store:false` plus Alibaba's S
 Hara retains the durable transcript locally. Provider-side Harness tools are not automatically enabled,
 because doing so would bypass Hara's local approval and organization-policy tool boundary.
 
+## Subscription plans (Alibaba and MiniMax Token Plan)
+
+Both Token Plans bill on a shape that surprises anyone expecting per-token pay-as-you-go. Three facts
+explain most "Hara got slow" and "Hara stopped answering" reports, and none of them are visible from a
+model list:
+
+- **Output pricing includes the thinking chain.** A reasoning level is not a free quality knob — every
+  thinking token is billed at the output rate. Hara therefore sends thinking `off` for its own isolated
+  schema-forced judgments (message Flow triage, the owner approval classifier), and `/model` exposes the
+  level so a normal chat can choose deliberately.
+- **Quota runs on a fixed window and does not carry over.** Alibaba's personal plans use a 7-day window;
+  MiniMax uses a 5-hour window plus a weekly one. Unused quota is lost at the boundary, and hitting the
+  cap **pauses the service** rather than billing an overage. Saving quota is therefore not about spending
+  less money — it is about not being cut off, and leaving room for the expensive work.
+- **Throughput is a plan-tier property, not a client property.** MiniMax documents dynamic throttling at
+  peak (weekdays 15:00–17:30) and a per-tier ceiling on concurrent agents. A slow turn under load is
+  usually the tier. Before suspecting Hara, check whether the same prompt is slow in another tool on the
+  same key.
+
+Model choice on Alibaba Token Plan is a real decision, so `/model` annotates each entry with what it is
+for and the one fact that decides it — which models are text-only, which are tiered by context length,
+and which carry a standing discount. Entries nobody should newly choose (a retired alias the server
+reroutes, or a model another entry beats on every axis) are hidden from the picker; the model already
+configured always stays listed, and `/model <id>` still accepts any id the key is entitled to.
+
 ## Optional
 - **Native image capability override**: `modelVision.<model>` records `yes` / `no` for a custom model id
   whose image support Hara cannot identify. Legacy `visionModel` / `visionBaseURL` / `visionApiKey` fields

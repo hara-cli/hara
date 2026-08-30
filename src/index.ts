@@ -200,6 +200,7 @@ import { resolvePlatform } from "./providers/registry.js";
 import { boundedProviderTurn } from "./providers/bounded-turn.js";
 import { levelsFor } from "./tui/model-picker.js";
 import { isOfficialTokenPlanOpenAIEndpoint, tokenPlanModelHint } from "./providers/alibaba.js";
+import { planNoteLines } from "./providers/plan-notes.js";
 import { listModels } from "./providers/models.js";
 import { createModelFetch } from "./network/model-fetch.js";
 import { listJobs, tailJob, killJob } from "./exec/jobs.js";
@@ -1415,6 +1416,12 @@ async function runSetup(): Promise<void> {
       out(ok ? c.green("✓ connected\n") : c.yellow(`⚠ couldn't reach ${provider} (saved anyway)\n`));
     }
 
+    // A subscription plan's cost shape is invisible from the model list and explains most "Hara is slow"
+    // / "Hara stopped" reports. Say it once, here, where a first-run user is still reading.
+    const planLines = planNoteLines(provider);
+    if (planLines.length) {
+      out(c.dim(`\nAbout this plan:\n`) + planLines.map((line) => c.dim(`  · ${line}\n`)).join(""));
+    }
     out(c.green(`\n✓ saved to ${configPath()}\n`) + c.dim(`Check it with ${c.bold("hara doctor")}, then just run ${c.bold("hara")}.\n`));
   } catch (e: any) {
     if (e?.message === "cancelled") out(c.dim("\n(cancelled)\n"));
