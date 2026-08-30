@@ -172,6 +172,9 @@ export function createResponsesProvider(opts: {
   /** Alibaba's opt-in server-side Session cache. It lowers repeat-prefix latency/usage without making
    * Hara depend on an expiring previous_response_id. Never send this vendor header to other endpoints. */
   dashscopeSessionCache?: boolean;
+  /** The thinking level was chosen by the engine, not by a user or rule, so an endpoint that rejects the
+   * field may be retried without it. Absent (the default) keeps an explicit choice failing visibly. */
+  reasoningAdvisory?: boolean;
   omitAuthorization?: boolean;
   fetch?: typeof fetch;
 }): Provider {
@@ -206,7 +209,9 @@ export function createResponsesProvider(opts: {
       if (opts.store !== undefined) params.store = opts.store;
       if (responseTools.length) params.tools = responseTools;
       // An explicit thinking choice is a latency/cost contract. If an endpoint rejects the field, surface
-      // the error instead of retrying without it and silently turning the provider default back on.
+      // the error instead of retrying without it and silently turning the provider default back on. Only an
+      // engine-chosen level is advisory enough to drop — nobody asked for it, so a plain request beats a
+      // failed one.
       const reasoningStyle = opts.reasoningStyle ?? "reasoning_object";
       const reasoningRoute = reasoningRouteKey(opts.label, opts.baseURL, opts.model, reasoningStyle);
       const reasoningKeys = applyReasoningParams(
@@ -286,8 +291,12 @@ export function createResponsesProvider(opts: {
       };
 
       try {
-        const stream = await sendWithReasoningFallback(reasoningRoute, params, reasoningKeys, (body) =>
-          client.responses.create(body as typeof params, { signal }),
+        const stream = await sendWithReasoningFallback(
+          reasoningRoute,
+          params,
+          reasoningKeys,
+          (body) => client.responses.create(body as typeof params, { signal }),
+          { allowRemoval: opts.reasoningAdvisory === true },
         );
         for await (const event of stream as any) {
           onActivity?.();

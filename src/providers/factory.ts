@@ -15,6 +15,10 @@ import type { ProviderTarget } from "./target.js";
 export async function createProviderForTarget(
   target: ProviderTarget,
   reasoningEffort?: HaraConfig["reasoningEffort"],
+  /** True when the engine picked `reasoningEffort` itself rather than a user or rule choosing it. Such a
+   * value is advisory: an endpoint that rejects the field may be retried without it instead of failing the
+   * whole call. An explicit selection is a latency/cost contract and always fails visibly. */
+  options: { reasoningAdvisory?: boolean } = {},
 ): Promise<Provider | null> {
   const { provider, apiKey, model, baseURL, proxy } = target;
   const fetch = proxy === undefined ? userModelFetch : createModelFetch(proxy);
@@ -51,6 +55,7 @@ export async function createProviderForTarget(
       reasoningEffort,
       reasoningStyle: caps.reasoning,
       supportsImages: !/^deepseek-/i.test(model) || deepSeekResponsesSupportsImages(model),
+      ...(options.reasoningAdvisory ? { reasoningAdvisory: true } : {}),
       ...(alibabaTokenPlan ? { store: false, dashscopeSessionCache: true } : {}),
       omitAuthorization: providerIsLocal(provider),
       fetch,
@@ -61,6 +66,7 @@ export async function createProviderForTarget(
     model,
     baseURL,
     label: provider,
+    ...(options.reasoningAdvisory ? { reasoningAdvisory: true } : {}),
     reasoningEffort,
     omitAuthorization: providerIsLocal(provider),
     fetch,

@@ -665,13 +665,28 @@ export function noToolReasoningEffort(
   return schemaForced ? "off" : configured;
 }
 
+/** True when NOBODY asked for this thinking level — the engine defaulted it. Only such a value may be
+ *  dropped when a strict endpoint rejects the field: no user or rule contract is broken by sending a plain
+ *  request instead. An explicit level, and `inherit` (which names the profile's own setting), are choices
+ *  and must fail visibly rather than silently restore an expensive provider default. */
+export function noToolReasoningAdvisory(
+  requested: NoToolReasoningEffort | undefined,
+  callerAdvisory: boolean | undefined,
+  schemaForced: boolean,
+): boolean {
+  if (requested === undefined) return schemaForced;
+  if (requested === "inherit") return false;
+  return callerAdvisory === true;
+}
+
 async function buildNoToolProvider(
   audience?: NoToolAudience,
-  options: Pick<NoToolTurnOptions, "model" | "reasoningEffort" | "schema"> = {},
+  options: Pick<NoToolTurnOptions, "model" | "reasoningEffort" | "reasoningAdvisory" | "schema"> = {},
 ): Promise<Provider | null> {
   const cfg = loadConfig();
   if (options.model !== undefined && !validNoToolModelOverride(options.model)) return null;
   const reasoningEffort = noToolReasoningEffort(options.reasoningEffort, cfg.reasoningEffort, !!options.schema);
+  const reasoningAdvisory = noToolReasoningAdvisory(options.reasoningEffort, options.reasoningAdvisory, !!options.schema);
   const profile = audience
     ? profileByIdForConfig(cfg, audience.profileId)
     : profileForConfig(cfg).profile;
@@ -687,13 +702,14 @@ async function buildNoToolProvider(
       baseURL: profile.baseURL || `${profile.gatewayUrl.replace(/\/$/, "")}/v1`,
       model,
       ...(cfg.proxy ? { proxy: cfg.proxy } : {}),
-    }, reasoningEffort);
+    }, reasoningEffort, { reasoningAdvisory });
     return provider ? bindOrganizationProvider(provider, { ...profile }) : null;
   }
   const target = resolveByokProviderTarget(cfg, profile, false);
   return createProviderForTarget(
     options.model ? { ...target, model: options.model } : target,
     reasoningEffort,
+    { reasoningAdvisory },
   );
 }
 
@@ -727,6 +743,9 @@ export interface NoToolTurnOptions {
   /** One-call thinking override; ordinary chat/global config remains untouched. Schema-forced calls
    *  default to `off` — see `noToolReasoningEffort`. */
   reasoningEffort?: NoToolReasoningEffort;
+  /** Set when the caller supplied `reasoningEffort` as its OWN default rather than passing on a user or
+   *  rule choice. It only relaxes rejection handling; it never changes which level is sent. */
+  reasoningAdvisory?: boolean;
   /** Gateway lifecycle signal. Shutdown is authoritative even if the provider returns a late response. */
   signal?: AbortSignal;
   /** Frozen route for pending/flow data. Ordinary one-shot callers may omit it and use the active route. */

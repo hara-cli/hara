@@ -304,8 +304,9 @@ test("flows pass their thinking choice through, allow a same-route model overrid
     assert.equal(calls.length, 1);
     assert.deepEqual(
       calls[0][5],
-      { model: "qwen3.8-flash", reasoningEffort: "off" },
-      "every Flow defaults off, including a rule whose author later removes its schema",
+      { model: "qwen3.8-flash", reasoningEffort: "off", reasoningAdvisory: true },
+      "every Flow defaults off, including a rule whose author later removes its schema; the level is"
+        + " marked advisory because the author never asked for it",
     );
 
     writeFileSync(join(hara, "flows.json"), JSON.stringify([{
@@ -323,7 +324,7 @@ test("flows pass their thinking choice through, allow a same-route model overrid
     assert.deepEqual(
       calls[0][5],
       { reasoningEffort: "inherit" },
-      "inherit is forwarded verbatim so the isolated call restores the normal-chat profile setting",
+      "inherit is forwarded verbatim, and is a choice — never advisory",
     );
 
     writeFileSync(join(hara, "flows.json"), JSON.stringify([{
@@ -338,7 +339,11 @@ test("flows pass their thinking choice through, allow a same-route model overrid
       calls.push(args);
       return modelResult;
     }), true);
-    assert.deepEqual(calls[0][5], { reasoningEffort: "high" }, "an explicit level overrides the default");
+    assert.deepEqual(
+      calls[0][5],
+      { reasoningEffort: "high" },
+      "an explicit level overrides the default and is never dropped behind the author's back",
+    );
 
     const fixed = {
       disposition: "informational",

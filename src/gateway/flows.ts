@@ -26,6 +26,8 @@ export interface FlowRunOptions {
   /** Flow-local reasoning selection. Dispatch always supplies `off` by default;
    *  "inherit" restores the active profile's normal-chat choice. */
   reasoningEffort?: FlowReasoningEffort;
+  /** The level above is the dispatcher's own default, not the rule author's choice. */
+  reasoningAdvisory?: boolean;
 }
 
 export interface FlowRule {
@@ -672,6 +674,9 @@ export async function dispatchFlows(
           // Keep the product default explicit here; the lower no-tool layer separately applies the same
           // default to every schema-forced classifier (owner approval judge included).
           const reasoningEffort = r.reasoningEffort ?? "off";
+          // When the author named no level, `off` is ours, not theirs: a strict endpoint that rejects the
+          // field may be retried without it rather than failing the automation.
+          const reasoningAdvisory = r.reasoningEffort === undefined;
           output = r.staticResult
             ? JSON.stringify(r.staticResult)
             : (await runAgent(
@@ -683,6 +688,7 @@ export async function dispatchFlows(
                 {
                   ...(r.model ? { model: r.model } : {}),
                   reasoningEffort,
+                  ...(reasoningAdvisory ? { reasoningAdvisory: true } : {}),
                 },
               )).trim();
           if (!signal?.aborted) await durableClaim?.saveOutput(output);

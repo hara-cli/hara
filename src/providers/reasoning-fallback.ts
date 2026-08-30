@@ -1,10 +1,10 @@
 // Optional safety net for the thinking dial on UNKNOWN endpoints.
 //
-// Most
-// OpenAI-compatible servers ignore a field they do not implement, but a strict one answers HTTP 400
+// Most OpenAI-compatible servers ignore a field they do not implement, but a strict one answers HTTP 400
 // "unknown parameter". Removing an explicitly selected thinking level can materially change latency and
 // cost, so production callers fail visibly by default. A caller may opt into best-effort removal only when
-// the field is genuinely advisory and changing it cannot violate a user or automation contract.
+// the field is genuinely advisory and changing it cannot violate a user or automation contract — today
+// that is the engine-chosen `off` on isolated no-tool judgments, which no user or rule asked for.
 //
 // Deliberately narrow: an error we cannot positively attribute to our own parameters is rethrown
 // untouched. A real 400 (bad model id, oversized input, missing credential) must still surface as

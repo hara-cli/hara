@@ -103,6 +103,9 @@ export function createOpenAIProvider(opts: {
   /** Internal transport override for a capability-preserving fallback (currently DeepSeek Responses
    * `off` → Chat with thinking.disabled). Normal callers should let the registry choose. */
   reasoningStyle?: ReasoningStyle;
+  /** The thinking level was chosen by the engine, not by a user or rule, so an endpoint that rejects the
+   * field may be retried without it. Absent (the default) keeps an explicit choice failing visibly. */
+  reasoningAdvisory?: boolean;
   /** Local OpenAI-compatible endpoints may intentionally use auth:none. The SDK still requires a
    * constructor value, so explicitly remove its generated Authorization header at the final header layer. */
   omitAuthorization?: boolean;
@@ -153,8 +156,12 @@ export function createOpenAIProvider(opts: {
       let finish: string | undefined;
       let usage = { input: 0, output: 0 };
       try {
-        const stream = await sendWithReasoningFallback(reasoningRoute, params, reasoningKeys, (body) =>
-          client.chat.completions.create(body as typeof params, { signal }),
+        const stream = await sendWithReasoningFallback(
+          reasoningRoute,
+          params,
+          reasoningKeys,
+          (body) => client.chat.completions.create(body as typeof params, { signal }),
+          { allowRemoval: opts.reasoningAdvisory === true },
         );
         for await (const chunk of stream as any) {
           onActivity?.(); // ANY chunk (reasoning, tool-args, content, even a keep-alive) → the model is alive
