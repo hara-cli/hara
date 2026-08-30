@@ -44,6 +44,8 @@ export interface Role {
   owns: string[];
   rejects: string[];
   model?: string;
+  /** Optional Agent-level reasoning override. Absence inherits the selected Space/connection default. */
+  reasoningEffort?: string;
   allowTools?: string[];
   denyTools?: string[];
   /** Enforce a genuinely read-only tool surface. Reviewer roles default to true unless explicitly disabled. */
@@ -72,6 +74,14 @@ export interface CreateNativeAgentInput {
   instructions?: string;
   profile: AgentPublicIdentityInput;
   blueprint?: AgentBlueprintInstallInput;
+  execution?: AgentExecutionPreferencesInput;
+}
+
+export interface AgentExecutionPreferencesInput {
+  /** Empty/null clears the override and follows the Space default. */
+  model?: string | null;
+  /** Empty/null clears the override and follows the Space default. */
+  reasoningEffort?: string | null;
 }
 
 export interface AgentBlueprintInstallInput {
@@ -138,6 +148,7 @@ export interface OrganizationBundleRole {
   owns?: string[];
   rejects?: string[];
   model?: string;
+  reasoning_effort?: string;
   allow_tools?: string[];
   deny_tools?: string[];
   system: string;
@@ -225,8 +236,17 @@ const SAFE_ORG_ROLE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const WINDOWS_RESERVED_ROLE_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 const ORG_BUNDLE_KEYS = new Set(["version", "org_policy", "roles"]);
 const ORG_ROLE_KEYS = new Set([
-  "name", "description", "owns", "rejects", "model", "allow_tools", "deny_tools", "system",
+  "name", "description", "owns", "rejects", "model", "reasoning_effort", "allow_tools", "deny_tools", "system",
 ]);
+const AGENT_REASONING_EFFORTS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function organizationRoleReasoningEffort(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || !AGENT_REASONING_EFFORTS.has(value)) {
+    throw new Error("managed organization role 'reasoning_effort' is invalid");
+  }
+  return value;
+}
 
 function organizationRoleString(value: unknown, field: string, required = false): string | undefined {
   if (value === undefined && !required) return undefined;
@@ -272,6 +292,9 @@ function parseOrganizationBundleRole(value: unknown): OrganizationBundleRole {
     ...(input.owns !== undefined ? { owns: organizationRoleList(input.owns, "owns") } : {}),
     ...(input.rejects !== undefined ? { rejects: organizationRoleList(input.rejects, "rejects") } : {}),
     ...(input.model !== undefined ? { model: organizationRoleString(input.model, "model") } : {}),
+    ...(input.reasoning_effort !== undefined
+      ? { reasoning_effort: organizationRoleReasoningEffort(input.reasoning_effort) }
+      : {}),
     ...(input.allow_tools !== undefined ? { allow_tools: organizationRoleList(input.allow_tools, "allow_tools") } : {}),
     ...(input.deny_tools !== undefined ? { deny_tools: organizationRoleList(input.deny_tools, "deny_tools") } : {}),
     system: organizationRoleString(input.system, "system", true)!,
@@ -314,6 +337,7 @@ export function parseOrganizationRoleBundleEnvelope(raw: unknown): OrganizationR
       owns: role.owns ?? [],
       rejects: role.rejects ?? [],
       ...(role.model ? { model: role.model } : {}),
+      ...(role.reasoning_effort ? { reasoningEffort: role.reasoning_effort } : {}),
       ...(role.allow_tools ? { allowTools: role.allow_tools } : {}),
       ...(role.deny_tools ? { denyTools: role.deny_tools } : {}),
     };
@@ -323,6 +347,7 @@ export function parseOrganizationRoleBundleEnvelope(raw: unknown): OrganizationR
       owns: role.owns ?? [],
       rejects: role.rejects ?? [],
       ...(role.model ? { model: role.model } : {}),
+      ...(role.reasoning_effort ? { reasoningEffort: role.reasoning_effort } : {}),
       ...(role.allow_tools ? { allowTools: role.allow_tools } : {}),
       ...(role.deny_tools ? { denyTools: role.deny_tools } : {}),
       source: "org",
@@ -496,6 +521,7 @@ export function agentRoleRevision(role: Role): string {
     home: role.home,
     description: role.description,
     model: role.model,
+    reasoningEffort: role.reasoningEffort,
     owns: role.owns,
     rejects: role.rejects,
     allowTools: role.allowTools,
@@ -626,6 +652,41 @@ function setTopLevelFrontmatterField(text: string, key: string, value: string): 
   return `---${newline}${[...retained, `${key}: ${value}`].join(newline)}${match[3]}---${match[4]}${match[5]}`;
 }
 
+function setOptionalTopLevelFrontmatterField(
+  text: string,
+  key: string,
+  value: string | undefined,
+): string {
+  const match = /^---(\r?\n)([\s\S]*?)(\r?\n)---(\r?\n?)([\s\S]*)$/.exec(text);
+  if (!match) throw new Error("native Agent file has no editable top-level frontmatter");
+  const newline = match[1];
+  const retained = match[2].split(/\r?\n/).filter((line) => {
+    if (/^\s/.test(line)) return true;
+    return /^([A-Za-z0-9_-]+)\s*:/.exec(line)?.[1] !== key;
+  });
+  const fields = value === undefined ? retained : [...retained, `${key}: ${value}`];
+  return `---${newline}${fields.join(newline)}${match[3]}---${match[4]}${match[5]}`;
+}
+
+function normalizeAgentExecutionPreferences(
+  input: AgentExecutionPreferencesInput,
+): { model?: string; reasoningEffort?: string } {
+  const model = typeof input.model === "string" ? input.model.trim() : "";
+  if (model && (model.length > 512 || /[\u0000-\u001f\u007f]/.test(model))) {
+    throw new Error("Agent model must be at most 512 printable characters");
+  }
+  const reasoningEffort = typeof input.reasoningEffort === "string"
+    ? input.reasoningEffort.trim()
+    : "";
+  if (reasoningEffort && !AGENT_REASONING_EFFORTS.has(reasoningEffort)) {
+    throw new Error(`Agent reasoning effort '${reasoningEffort}' is invalid`);
+  }
+  return {
+    ...(model ? { model } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  };
+}
+
 export async function createNativeGlobalAgent(
   input: CreateNativeAgentInput,
 ): Promise<{ id: string; identity: AgentPublicIdentity; revision: string }> {
@@ -653,11 +714,14 @@ export async function createNativeGlobalAgent(
   const blueprint = blueprintInput
     ? { ...blueprintInput, digest: blueprintInstallDigest(blueprintInput, instructions) }
     : undefined;
+  const execution = normalizeAgentExecutionPreferences(input.execution ?? {});
   const file = join(globalRolesDir(), `${id}.md`);
   const content = [
     "---",
     `name: ${id}`,
     `description: ${JSON.stringify(description || `${identity.displayName} Agent`)}`,
+    ...(execution.model ? [`model: ${JSON.stringify(execution.model)}`] : []),
+    ...(execution.reasoningEffort ? [`reasoning-effort: ${JSON.stringify(execution.reasoningEffort)}`] : []),
     ...identityFrontmatterLines(identity),
     ...(blueprint ? blueprintFrontmatterLines(blueprint) : []),
     "---",
@@ -724,6 +788,7 @@ export async function updateNativeRoleIdentity(
   role: Role,
   input: AgentPublicIdentityInput,
   expectedRevision: string,
+  execution?: AgentExecutionPreferencesInput,
 ): Promise<{ identity: AgentPublicIdentity; revision: string }> {
   if ((role.source !== "global" && role.source !== "project") || !role.file) {
     throw new Error("this Agent is managed by an organization or external tool and is read-only here");
@@ -732,7 +797,24 @@ export async function updateNativeRoleIdentity(
   const snapshot = await readRegularFileSnapshotNoFollow(target, MAX_ROLE_BYTES);
   if (identityRevision(snapshot.text) !== expectedRevision) throw new Error("agent profile changed; refresh and retry");
   const identity = normalizeAgentPublicIdentityInput(input, role.id, role.source);
-  const content = replacePublicIdentityFrontmatter(snapshot.text, identity);
+  let content = replacePublicIdentityFrontmatter(snapshot.text, identity);
+  if (execution !== undefined) {
+    const normalized = normalizeAgentExecutionPreferences(execution);
+    if (Object.prototype.hasOwnProperty.call(execution, "model")) {
+      content = setOptionalTopLevelFrontmatterField(
+        content,
+        "model",
+        normalized.model ? JSON.stringify(normalized.model) : undefined,
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(execution, "reasoningEffort")) {
+      content = setOptionalTopLevelFrontmatterField(
+        content,
+        "reasoning-effort",
+        normalized.reasoningEffort ? JSON.stringify(normalized.reasoningEffort) : undefined,
+      );
+    }
+  }
   await atomicWriteText(target, content, {
     expected: snapshot.text,
     expectedIdentity: snapshot,
@@ -883,6 +965,7 @@ function rolesFromDirs(dirs: RoleDir[]): Map<string, Role> {
           ? claudeCompatibilityWarnings(String(fm.description ?? ""), body)
           : [];
         const rawModel = fm.model ? String(fm.model) : "";
+        const rawReasoningEffort = fm["reasoning-effort"] ? String(fm["reasoning-effort"]).trim() : "";
         const foreignClaudeModel = claudeSource && /^claude(?:[-_.]|$)/i.test(rawModel);
         byId.set(id, {
           id,
@@ -893,6 +976,9 @@ function rolesFromDirs(dirs: RoleDir[]): Map<string, Role> {
           // the session model instead of passing a foreign id to (for example) a Qwen/OpenAI endpoint.
           model: rawModel && !/^(sonnet|opus|haiku|inherit)$/i.test(rawModel) && !foreignClaudeModel
             ? rawModel
+            : undefined,
+          reasoningEffort: AGENT_REASONING_EFFORTS.has(rawReasoningEffort)
+            ? rawReasoningEffort
             : undefined,
           allowTools: Array.isArray(fm.allowTools) ? fm.allowTools : claudeTools(fm.tools),
           denyTools: Array.isArray(fm.denyTools) ? fm.denyTools : undefined,

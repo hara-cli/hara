@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { getTool } from "../dist/tools/registry.js";
-import { actionAllowed, keyIsBlocked } from "../dist/tools/computer.js";
+import { actionAllowed, keyIsBlocked, windowsClipboardInvocation } from "../dist/tools/computer.js";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,16 @@ test("actionAllowed: the tier gates each action", () => {
   assert.equal(actionAllowed("click", "type"), false); // typing needs full
   assert.equal(actionAllowed("full", "type"), true);
   assert.equal(actionAllowed("full", "key"), true);
+});
+
+test("Windows clipboard invocation preserves CJK and emoji without putting user text on the command line", () => {
+  const text = "Hara 窗口重命名 🦀";
+  const invocation = windowsClipboardInvocation(text);
+  assert.equal(invocation.command, "powershell");
+  assert.ok(invocation.args.includes("-STA"));
+  assert.equal(Buffer.from(invocation.input, "base64").toString("utf8"), text);
+  assert.equal(invocation.args.join(" ").includes(text), false);
+  assert.match(invocation.args.at(-1), /FromBase64String/);
 });
 
 test("keyIsBlocked: dangerous combos refused, safe ones allowed", () => {

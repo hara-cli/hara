@@ -109,8 +109,10 @@ export interface SessionMeta {
    * matching generated cron child may replace this marker with an authoritative profile/Space route,
    * and only while the occurrence still has no history or task data. */
   pendingRouteBinding?: "cron";
-  /** Per-session reasoning effort pin used by persistent Serve clients. */
-  effort?: string;
+  /** Per-session reasoning effort pin used by persistent Serve clients. `null` is an explicit
+   * provider/model automatic setting; `undefined` is reserved for legacy sessions that still inherit
+   * the connection default when they are next resumed. */
+  effort?: string | null;
   /** Per-session approval policy. New persistent clients write this explicitly so reconnecting never
    * silently falls back from full-auto (or another user choice) to the Serve process default. */
   approval?: ApprovalMode;
@@ -1414,7 +1416,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
     (meta.sourceName === undefined || typeof meta.sourceName === "string") &&
     (meta.jobId === undefined || (typeof meta.jobId === "string" && AUTOMATION_JOB_ID.test(meta.jobId))) &&
     (meta.pendingRouteBinding === undefined || meta.pendingRouteBinding === "cron") &&
-    (meta.effort === undefined || typeof meta.effort === "string") &&
+    (meta.effort === undefined || meta.effort === null || typeof meta.effort === "string") &&
     (meta.approval === undefined
       || meta.approval === "suggest"
       || meta.approval === "auto-edit"

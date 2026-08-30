@@ -6,7 +6,7 @@
 
 import { isTokenPlanQwenResponsesModel, isTokenPlanResponsesModel } from "./alibaba.js";
 
-export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
+export type Effort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | undefined;
 
 /** How a platform expresses the thinking dial on the wire:
  *  - `enable_thinking`  — DashScope chat (Qwen/GLM via Alibaba): a boolean that actually starts/stops the
@@ -14,10 +14,9 @@ export type Effort = "off" | "low" | "medium" | "high" | "max" | undefined;
  *  - `reasoning_effort` — OpenAI chat reasoning models (o-series / gpt-5): the `reasoning_effort` enum.
  *  - `reasoning_object` — OpenAI Responses API: `reasoning: { effort }` (for the responses transport).
  *  - `qwen_responses` — legacy/internal alias for Alibaba Qwen Responses reasoning.
- *  - `alibaba_responses` — Alibaba Model Studio Responses API: explicit off uses the provider extension
- *                         `enable_thinking:false`; enabled levels use `reasoning: { effort }`. The explicit
- *                         boolean is intentional: live Token Plan measurements found `effort:none` could
- *                         still emit reasoning tokens, while the boolean reliably disabled thinking.
+ *  - `alibaba_responses` — Alibaba Model Studio Responses API: `reasoning: { effort }`. Beijing Token
+ *                         Plan documents the complete none|minimal|low|medium|high|xhigh|max vocabulary;
+ *                         Hara calls the provider-native `none` value `off`.
  *  - `minimax_responses` — MiniMax M3 Responses API: `none` disables thinking; any enabled Hara level
  *                         maps to `high`, which MiniMax documents as Adaptive Thinking rather than depth.
  *  - `deepseek_responses` — DeepSeek V4 Responses API: `reasoning: { effort }`, with DeepSeek's
@@ -40,7 +39,76 @@ export function isReasoningModel(model: string): boolean {
   return /^(o1|o3|o4|gpt-5)/i.test(model);
 }
 
+/** OpenAI's effort enum is model-specific. This returns only values that the selected model is documented
+ * to accept; a persisted value from another model is still normalized defensively by `reasoningParams`.
+ * Hara calls the provider-native `none` value `off` so all providers share one honest UI label. */
+export function openAIReasoningEffortLevels(model: string): Exclude<Effort, undefined>[] {
+  const id = bareModel(model).toLowerCase();
+  if (/^gpt-5\.6(?:-|$)/.test(id)) return ["off", "low", "medium", "high", "xhigh", "max"];
+  if (/^gpt-5\.(?:2|4|5)(?:-|$)/.test(id)) return ["off", "low", "medium", "high", "xhigh"];
+  if (/^gpt-5(?:\.1)?(?:-|$)/.test(id)) return ["minimal", "low", "medium", "high"];
+  if (/^(?:o1|o3|o4)(?:-|$)/.test(id)) return ["low", "medium", "high"];
+  return [];
+}
+
+function openAIReasoningEffort(model: string, effort: Exclude<Effort, undefined>): string {
+  const levels = openAIReasoningEffortLevels(model);
+  if (levels.includes(effort)) return effort === "off" ? "none" : effort;
+  if (effort === "off" || effort === "minimal") {
+    if (levels.includes("off")) return "none";
+    if (levels.includes("minimal")) return "minimal";
+    return levels[0] ?? "minimal";
+  }
+  if (effort === "max") return levels.includes("max") ? "max" : levels.includes("xhigh") ? "xhigh" : "high";
+  if (effort === "xhigh") return levels.includes("xhigh") ? "xhigh" : "high";
+  return effort;
+}
+
 const bareModel = (model: string): string => model.split("/").at(-1) ?? model;
+
+/** Effective Alibaba Responses levels for the selected model. Token Plan Personal is Beijing-only, where
+ * the current Responses contract documents all seven levels for Qwen3.8. Third-party families keep their
+ * provider-native narrower contracts even though they share Alibaba's transport. */
+export function alibabaReasoningEffortLevels(model: string): Exclude<Effort, undefined>[] {
+  const id = bareModel(model).toLowerCase();
+  if (/^qwen3\.8-(?:max(?:-preview)?|flash)(?:-|$)/.test(id)) {
+    return ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+  }
+  if (/^deepseek-v4-(?:pro-0813|flash-0731)(?:-|$)/.test(id)) {
+    return ["off", "low", "high", "max"];
+  }
+  if (/^deepseek-v4-(?:pro|flash)(?:-|$)/.test(id)) {
+    return ["off", "high", "max"];
+  }
+  if (/^glm-5\.2(?:-|$)/.test(id)) {
+    return ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+  }
+  if (isTokenPlanQwenResponsesModel(id)) {
+    return ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+  }
+  return [];
+}
+
+/** Normalize a cross-provider or older saved value to the selected Alibaba model's native/effective level.
+ * This also defines migration behavior when a user changes model without first clearing the old default. */
+export function normalizeAlibabaReasoningEffort(
+  model: string,
+  effort: Exclude<Effort, undefined>,
+): Exclude<Effort, undefined> {
+  const id = bareModel(model).toLowerCase();
+  if (/^qwen3\.8-(?:max(?:-preview)?|flash)(?:-|$)/.test(id)) {
+    return effort;
+  }
+  if (/^deepseek-v4-(?:pro-0813|flash-0731)(?:-|$)/.test(id)) {
+    if (effort === "off" || effort === "low" || effort === "high" || effort === "max") return effort;
+    return effort === "minimal" ? "low" : "high";
+  }
+  if (/^deepseek-v4-(?:pro|flash)(?:-|$)/.test(id)) {
+    if (effort === "off" || effort === "high" || effort === "max") return effort;
+    return effort === "xhigh" ? "max" : "high";
+  }
+  return effort;
+}
 
 /** Qwen models whose public Model Studio metadata documents Responses reasoning controls. Keep this
  * allow-list family-shaped: the Token Plan endpoint also serves GLM/DeepSeek models, which must not
@@ -78,33 +146,39 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
       return { think: effort !== "off" };
     case "reasoning_effort":
       if (!isReasoningModel(model)) return {};
-      // OpenAI's ceiling is "high"; there's no "max" — clamp so the global `max` dial never 400s here.
-      return { reasoning_effort: effort === "off" ? "minimal" : effort === "max" ? "high" : effort };
+      return { reasoning_effort: openAIReasoningEffort(model, effort) };
     case "reasoning_object":
       if (!isReasoningModel(model)) return {};
-      return { reasoning: { effort: effort === "off" ? "minimal" : effort === "max" ? "high" : effort } };
+      return { reasoning: { effort: openAIReasoningEffort(model, effort) } };
     case "qwen_responses":
     case "alibaba_responses": {
       if (!supportsReasoningStyle(style, model)) return {};
-      // Do not send `reasoning` together with the explicit off switch: Alibaba documents that the object
-      // has priority. More importantly, current Token Plan behavior can keep thinking on for `none`, while
-      // the top-level provider extension reliably returns zero reasoning tokens.
-      if (effort === "off") return { enable_thinking: false };
-      return { reasoning: { effort } };
+      // Use the reasoning object because it has priority and `enable_thinking` is deprecated on Responses.
+      // Normalize aliases first so the stored setting and the wire both describe a real model-native level.
+      const normalized = normalizeAlibabaReasoningEffort(model, effort);
+      return { reasoning: { effort: normalized === "off" ? "none" : normalized } };
     }
     case "minimax_responses":
       return { reasoning: { effort: effort === "off" ? "none" : "high" } };
     case "deepseek_responses":
       // DeepSeek Responses owns a provider-specific `none` value for disabling thinking. Keep the
       // transport stable instead of silently switching an `off` request to Chat Completions.
-      return { reasoning: { effort: effort === "off" ? "none" : effort === "medium" ? "high" : effort } };
+      return {
+        reasoning: {
+          effort: effort === "off"
+            ? "none"
+            : effort === "low" || effort === "max"
+              ? effort
+              : "high",
+        },
+      };
     case "deepseek":
       // off → turn thinking OFF via the object (reasoning_effort can't say "off"). Any level → thinking ON
       // + the effort enum. Normalize the cross-provider `medium` value to DeepSeek's documented `high`.
       if (effort === "off") return { thinking: { type: "disabled" } };
       return {
         thinking: { type: "enabled" },
-        reasoning_effort: effort === "low" ? "low" : effort === "max" ? "max" : "high",
+        reasoning_effort: effort === "low" || effort === "max" ? effort : "high",
       };
     case "thinking_budget": // Anthropic — applied by anthropic.ts, not on a chat/responses merge body
     case "none":

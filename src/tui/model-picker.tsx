@@ -4,7 +4,14 @@
 // thin ink shell over it (like the Transcript overlay).
 import { Box, Text, useInput } from "ink";
 import { useState } from "react";
-import { supportsReasoningStyle, type ReasoningStyle, type Effort } from "../providers/reasoning.js";
+import {
+  alibabaReasoningEffortLevels,
+  normalizeAlibabaReasoningEffort,
+  openAIReasoningEffortLevels,
+  supportsReasoningStyle,
+  type ReasoningStyle,
+  type Effort,
+} from "../providers/reasoning.js";
 
 /** The levels ←→ cycles for a style. Binary thinking toggles (DashScope, MiniMax adaptive, Ollama)
  *  show off/on; graded styles (OpenAI/Anthropic effort/budget) show the full dial; `none` → no control. */
@@ -17,8 +24,12 @@ export function levelsFor(style: ReasoningStyle, model = ""): Effort[] {
     return ["off", "low", "high", "max"];
   }
   if (style === "qwen_responses" || style === "alibaba_responses") {
-    return ["off", "low", "medium", "high", "max"];
+    return alibabaReasoningEffortLevels(model);
   }
+  if (style === "reasoning_effort" || style === "reasoning_object") {
+    return openAIReasoningEffortLevels(model);
+  }
+  if (style === "thinking_budget") return ["off", "low", "medium", "high", "max"];
   return ["off", "low", "medium", "high"];
 }
 
@@ -35,6 +46,10 @@ export function normalizeEffort(style: ReasoningStyle, model: string, effort: Ef
   const levels = levelsFor(style, model);
   if (!levels.length) return undefined;
   if (levels.includes(effort)) return effort;
+  if (effort && (style === "qwen_responses" || style === "alibaba_responses")) {
+    const normalized = normalizeAlibabaReasoningEffort(model, effort);
+    if (levels.includes(normalized)) return normalized;
+  }
   return levels[0];
 }
 

@@ -69,7 +69,9 @@ test("an explicit CLI prepends its verified sibling runtime directory", {
     const result = await probeExternalCommand({
       command: executable,
       env: { PATH: "/bin:/usr/bin" },
-      timeoutMs: 2_000,
+      // The full release suite starts many real child-process fixtures in parallel. Keep this
+      // PATH-order assertion bounded without turning transient process-launch pressure into a flake.
+      timeoutMs: 10_000,
       spawnProcess(command, args, options) {
         childPath = String(options.env?.PATH ?? "");
         return spawn(command, [...args], options);

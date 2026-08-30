@@ -33,6 +33,7 @@ import {
   sensitiveStructuredInputReason,
 } from "../dist/security/sensitive-files.js";
 import {
+  createBoundedToolNoticeEmitter,
   createToolOutputLineRedactor,
   isSecretEnvironmentName,
   redactToolSubprocessOutput,
@@ -745,6 +746,21 @@ test("streaming subprocess redaction drops an overlong no-newline record with bo
   redactor.flush();
   assert.deepEqual(emitted, ["[output line omitted — exceeded 1024 characters]\n", "next\n"]);
   assert.ok(!emitted.join("").includes("still-dropped"));
+});
+
+test("renderer live output folds once after a fixed line budget", () => {
+  const emitted = [];
+  const bounded = createBoundedToolNoticeEmitter((line) => emitted.push(line), {
+    maxLines: 2,
+    maxCharacters: 1024,
+  });
+  bounded("one");
+  bounded("two");
+  bounded("three");
+  bounded("four");
+  assert.deepEqual(emitted.slice(0, 2), ["one", "two"]);
+  assert.equal(emitted.length, 3);
+  assert.match(emitted[2], /live output folded after 2 lines/);
 });
 
 test("macOS Seatbelt retains deny-read even when ordinary shell sandbox mode is off", { skip: process.platform !== "darwin" }, async (t) => {

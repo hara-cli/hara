@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { createResponsesProvider } from "../dist/providers/responses.js";
 import { resetReasoningSupport } from "../dist/providers/reasoning-fallback.js";
 
-/** A strict endpoint: it rejects the thinking field by name, and only answers once it is gone. */
+/** A strict Responses endpoint: it rejects the reasoning field by name, and only answers once it is gone. */
 function strictEndpoint() {
   const requests = [];
   const server = createServer((request, response) => {
@@ -14,9 +14,9 @@ function strictEndpoint() {
     request.on("end", () => {
       const body = raw ? JSON.parse(raw) : null;
       requests.push(body);
-      if (body && "enable_thinking" in body) {
+      if (body && "reasoning" in body) {
         response.writeHead(400, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { message: "Unknown parameter: 'enable_thinking'." } }));
+        response.end(JSON.stringify({ error: { message: "Unknown parameter: 'reasoning'." } }));
         return;
       }
       const event = {
@@ -61,14 +61,14 @@ test("an engine-chosen level is dropped and retried when the endpoint rejects it
     assert.equal(result.stop, "end", "the automation completes instead of failing on a rejected optimization");
     assert.equal(result.text, "ok");
     assert.equal(mock.requests.length, 2);
-    assert.equal(mock.requests[0].enable_thinking, false);
-    assert.equal("enable_thinking" in mock.requests[1], false);
+    assert.deepEqual(mock.requests[0].reasoning, { effort: "none" });
+    assert.equal("reasoning" in mock.requests[1], false);
 
     // The route is remembered, so the next turn skips the rejected field entirely — one round trip.
     const again = await turn(provider(mock, { reasoningAdvisory: true }));
     assert.equal(again.stop, "end");
     assert.equal(mock.requests.length, 3);
-    assert.equal("enable_thinking" in mock.requests[2], false);
+    assert.equal("reasoning" in mock.requests[2], false);
   } finally {
     resetReasoningSupport();
     await new Promise((resolve) => mock.server.close(resolve));
@@ -82,7 +82,7 @@ test("an explicit level fails visibly rather than silently restoring the provide
     const result = await turn(provider(mock, {})); // no reasoningAdvisory → a user/rule contract
     assert.equal(result.stop, "error");
     assert.equal(mock.requests.length, 1, "no speculative retry behind the user's back");
-    assert.equal(mock.requests[0].enable_thinking, false);
+    assert.deepEqual(mock.requests[0].reasoning, { effort: "none" });
   } finally {
     resetReasoningSupport();
     await new Promise((resolve) => mock.server.close(resolve));

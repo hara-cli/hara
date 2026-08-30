@@ -213,16 +213,20 @@ and remembers**; `/vision main yes|no|auto` corrects that native capability reco
 `visionModel` / `visionBaseURL` / `visionApiKey` values remain readable for config compatibility but are
 ignored by image routing.
 
-**Reasoning effort** — dial how hard a thinking model reasons: `off` · `low` · `medium` · `high` · `max`.
+**Reasoning effort** — choose from the levels the current model actually supports. Hara's internal vocabulary
+is `off` · `minimal` · `low` · `medium` · `high` · `xhigh` · `max`; binary and narrower providers expose only
+their valid subset, and an unset value keeps the provider/model default.
 ```bash
-hara config set reasoningEffort high     # or off / low / medium / max
+hara config set reasoningEffort high     # also off / minimal / low / medium / xhigh / max
 ```
 hara expresses it the way each endpoint wants (OpenAI `reasoning_effort`, Anthropic thinking budget,
 DashScope `enable_thinking`, **DeepSeek** Chat `thinking` + `reasoning_effort`, or DeepSeek V4 Responses
-`reasoning.effort`). Alibaba Token Plan Responses uses `enable_thinking:false` for Off and
-`reasoning.effort` only for enabled levels; an endpoint rejection is surfaced instead of silently retrying
-with the provider's expensive default. DeepSeek V4 Flash, Pro, and Vision-Exp expose three thinking grades—`low`, `high`,
-`max`—plus `off`; Vision-Exp also accepts native image attachments through Responses `input_image`.
+`reasoning.effort`). Alibaba Token Plan Responses uses `reasoning.effort:none` for Off because that object
+takes priority and `enable_thinking` is deprecated there. Its picker is model-specific: Qwen3.8 and GLM 5.2
+expose all seven levels on the Beijing Token Plan endpoint, and each DeepSeek V4 variant exposes only its
+effective native subset. An endpoint rejection is surfaced instead of silently retrying with the provider's
+expensive default. DeepSeek V4 Flash, Pro, and Vision-Exp expose model-specific thinking grades; Vision-Exp
+also accepts native image attachments through Responses `input_image`.
 On DeepSeek Responses, Hara maps `off` to the documented `none` value without changing transport. The shared
 cross-provider `medium` value normalizes to DeepSeek `high`. In the TUI, bare `/model` opens a picker —
 ↑↓ pick a model, **←→ set the thinking level**.

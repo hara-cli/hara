@@ -162,11 +162,34 @@ const has = async (cmd: string, signal?: AbortSignal): Promise<boolean> =>
   (await (process.platform === "win32" ? run("where", [cmd], signal) : run("which", [cmd], signal))).ok;
 const ps = (script: string, signal?: AbortSignal) => run("powershell", ["-NoProfile", "-Command", script], signal);
 
+const WINDOWS_CLIPBOARD_SCRIPT = [
+  "$ErrorActionPreference='Stop'",
+  "Add-Type -AssemblyName System.Windows.Forms",
+  "$encoded=[Console]::In.ReadToEnd().Trim()",
+  "$bytes=[Convert]::FromBase64String($encoded)",
+  "$value=[Text.Encoding]::UTF8.GetString($bytes)",
+  "[System.Windows.Forms.Clipboard]::SetText($value)",
+].join("; ");
+
+/** A fixed-script, stdin-only Windows clipboard invocation. `clip.exe` decodes redirected bytes through
+ * the active legacy code page and can turn CJK/emoji into `?`. Base64 keeps user text out of both the
+ * PowerShell command line and that code-page boundary; PowerShell decodes the original UTF-8 in STA mode. */
+export function windowsClipboardInvocation(text: string): { command: string; args: string[]; input: string } {
+  return {
+    command: "powershell",
+    args: ["-NoProfile", "-NonInteractive", "-STA", "-Command", WINDOWS_CLIPBOARD_SCRIPT],
+    input: Buffer.from(text, "utf8").toString("base64"),
+  };
+}
+
 /** Put text on the OS clipboard (so `type` can paste it — IME-safe + Unicode-safe, unlike keystroke injection). */
 async function setClipboard(text: string, signal?: AbortSignal): Promise<boolean> {
   try {
     if (process.platform === "darwin") return (await run("pbcopy", [], signal, text, 5_000)).ok;
-    if (process.platform === "win32") return (await run("clip", [], signal, text, 5_000)).ok;
+    if (process.platform === "win32") {
+      const invocation = windowsClipboardInvocation(text);
+      return (await run(invocation.command, invocation.args, signal, invocation.input, 5_000)).ok;
+    }
     if (await has("wl-copy", signal)) return (await run("wl-copy", [], signal, text, 5_000)).ok;
     if (await has("xclip", signal)) return (await run("xclip", ["-selection", "clipboard"], signal, text, 5_000)).ok;
   } catch {

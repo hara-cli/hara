@@ -205,6 +205,38 @@ export function createToolOutputLineRedactor(
   };
 }
 
+/** Bound renderer-facing live output without reducing the final tool result's independently bounded
+ * head/tail evidence. A command can legitimately produce megabytes, but one WebSocket/React item per line
+ * would turn a healthy long task into a Desktop memory-pressure failure. */
+export function createBoundedToolNoticeEmitter(
+  emit: (safeLine: string) => void,
+  options: { maxLines?: number; maxCharacters?: number } = {},
+): (safeLine: string) => void {
+  const maxLines = options.maxLines ?? 160;
+  const maxCharacters = options.maxCharacters ?? 48 * 1024;
+  if (!Number.isSafeInteger(maxLines) || maxLines < 1) {
+    throw new Error("live output maxLines must be a positive integer");
+  }
+  if (!Number.isSafeInteger(maxCharacters) || maxCharacters < 1024) {
+    throw new Error("live output maxCharacters must be an integer >= 1024");
+  }
+  let lines = 0;
+  let characters = 0;
+  let folded = false;
+  return (safeLine: string): void => {
+    if (folded) return;
+    const nextCharacters = characters + safeLine.length;
+    if (lines >= maxLines || nextCharacters > maxCharacters) {
+      folded = true;
+      emit(`[live output folded after ${lines} lines / ${characters} characters; the final result keeps a bounded head/tail summary]`);
+      return;
+    }
+    lines += 1;
+    characters = nextCharacters;
+    emit(safeLine);
+  };
+}
+
 /** Terminate a spawned tool and, when it owns a POSIX process group, all descendants. On Windows,
  * taskkill /T is the supported process-tree primitive. Callers should spawn with `detached: true` on POSIX
  * and pass `processGroup: true`; the explicit flag avoids ever signaling Hara's own process group. */

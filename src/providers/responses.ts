@@ -3,7 +3,7 @@ import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
 import { assembleToolCalls } from "./openai.js";
-import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
+import { reasoningParams, type Effort, type ReasoningStyle } from "./reasoning.js";
 import { applyReasoningParams, reasoningRouteKey, sendWithReasoningFallback } from "./reasoning-fallback.js";
 import type {
   NeutralMsg,
@@ -163,7 +163,7 @@ export function createResponsesProvider(opts: {
   model: string;
   baseURL?: string;
   label?: string;
-  reasoningEffort?: "off" | "low" | "medium" | "high" | "max";
+  reasoningEffort?: Effort;
   reasoningStyle?: ReasoningStyle;
   supportsImages?: boolean;
   /** Explicit persistence policy for compatible Responses endpoints. Alibaba defaults to storing a

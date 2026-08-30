@@ -151,6 +151,7 @@ import {
   updateMainAgentIdentity,
   updateNativeRoleIdentity,
   type AgentBlueprintProvenance,
+  type AgentExecutionPreferencesInput,
   type Role,
 } from "../org/roles.js";
 import { agentIdentityFromMetadata, type AgentPublicIdentity } from "../org/agent-identity.js";
@@ -226,7 +227,8 @@ export interface ServeDeps {
   model: string;
   buildSessionProvider: (cwd?: string, profileId?: string, spaceId?: string) => Promise<Provider | null>; // fresh live config/credential route
   /** provider for a specific model/effort — powers per-session model switching (composer picker) */
-  buildProviderFor?: (model: string, effort?: string, cwd?: string, profileId?: string, spaceId?: string) => Promise<Provider | null>;
+  /** `null` means provider/model automatic; `undefined` means inherit the current connection default. */
+  buildProviderFor?: (model: string, effort?: string | null, cwd?: string, profileId?: string, spaceId?: string) => Promise<Provider | null>;
   /** live model list from the endpoint (may be empty — not every endpoint enumerates) */
   listModels?: (cwd?: string, profileId?: string, spaceId?: string) => Promise<string[]>;
   /** Live per-project context policy. Production re-reads config for every completed turn; embedders that
@@ -310,6 +312,8 @@ export interface ServeDeps {
     /** Organization enrollment that supplies company Agents and policy when the inference route is BYOK. */
     organizationProfileId?: string;
     effortLevels?: string[];
+    /** Connection/Space default for new work. Missing means provider/model automatic. */
+    defaultReasoningEffort?: string;
     /** Finite server-authorized set for a scoped gateway token. Missing means unconstrained discovery. */
     availableModels?: string[];
     /** Effective Hara input capabilities for the selected conversation model. */
@@ -360,6 +364,8 @@ export interface ServeAgentInfo {
   scope: "main" | "global" | "project";
   project?: string;
   model?: string;
+  /** Agent override; absence follows the selected Space/connection default. */
+  reasoningEffort?: string;
   readOnly?: boolean;
   /** Verified install provenance only; private blueprint prompt text is never serialized. */
   blueprint?: AgentBlueprintProvenance;
@@ -516,6 +522,7 @@ function serveAgentCatalog(cwd: string, profileId: string | undefined, spaceId: 
       scope: entry.project ? "project" : "global",
       ...(entry.project ? { project: entry.project } : {}),
       ...(role?.model ? { model: role.model } : {}),
+      ...(role?.reasoningEffort ? { reasoningEffort: role.reasoningEffort } : {}),
       ...(role?.readOnly ? { readOnly: true } : {}),
       ...(role?.blueprint ? { blueprint: role.blueprint } : {}),
       spaceId,
@@ -605,6 +612,9 @@ export interface ProviderSettingsCatalogEntry {
   defaultModel: string;
   defaultBaseURL?: string;
   customBaseURL: boolean;
+  knownModels?: readonly string[];
+  knownModelEntries?: Array<{ id: string; effortLevels: string[] }>;
+  legacy?: boolean;
 }
 
 export interface ProviderSettingsState {
@@ -621,6 +631,10 @@ export interface ProviderSettingsState {
     profileSource: "flag" | "env" | "pin" | "default" | "fallback";
     editable: boolean;
     environmentOverride?: boolean;
+    reasoningEffort?: string;
+    effortLevels?: string[];
+    tokenExpiresAt?: string;
+    tokenExpired?: boolean;
   };
   providers: ProviderSettingsCatalogEntry[];
   connections?: ProviderConnectionSummary[];
@@ -642,6 +656,8 @@ export interface ProviderConnectionSummary {
   removable: boolean;
   keyHint?: string;
   createdAt?: string;
+  reasoningEffort?: string;
+  effortLevels?: string[];
 }
 
 export interface ProviderSettingsInput {
@@ -651,6 +667,8 @@ export interface ProviderSettingsInput {
   apiKey?: string;
   clearApiKey?: boolean;
   activatePersonal?: boolean;
+  reasoningEffort?: string;
+  clearReasoningEffort?: boolean;
 }
 
 export interface ProviderConnectionCreateInput extends ProviderSettingsInput {
@@ -662,6 +680,7 @@ export interface ProviderConnectionCreateInput extends ProviderSettingsInput {
 export interface ProviderSettingsTestResult {
   ok: boolean;
   models: string[];
+  entries?: Array<{ id: string; providerId: string; effortLevels: string[] }>;
   error?: string;
 }
 
@@ -679,6 +698,8 @@ export interface OrganizationConnectionSummary {
   gatewayHost: string;
   model: string;
   availableModels?: string[];
+  reasoningEffort?: string;
+  effortLevels?: string[];
   enrolledAt?: string;
   expiresAt?: string;
   tokenNeverExpires?: boolean;
@@ -1306,6 +1327,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     spaceId?: string;
     organizationProfileId?: string;
     effortLevels: string[];
+    defaultReasoningEffort?: string;
     availableModels?: string[];
     attachmentCapabilities?: EffectiveAttachmentCapabilities;
   } => {
@@ -1318,6 +1340,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       ...(live?.spaceId ? { spaceId: live.spaceId } : {}),
       ...(live?.organizationProfileId ? { organizationProfileId: live.organizationProfileId } : {}),
       effortLevels: live?.effortLevels ?? deps.effortLevels ?? [],
+      ...(live?.defaultReasoningEffort ? { defaultReasoningEffort: live.defaultReasoningEffort } : {}),
       ...(live?.availableModels ? { availableModels: live.availableModels } : {}),
       ...(live?.attachmentCapabilities
         ? { attachmentCapabilities: live.attachmentCapabilities }
@@ -2685,6 +2708,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!p.profile || typeof p.profile !== "object" || Array.isArray(p.profile)) {
               return reply(rpcError(id, ERR.PARAMS, "profile must be an object"));
             }
+            if (p.execution !== undefined && (!p.execution || typeof p.execution !== "object" || Array.isArray(p.execution))) {
+              return reply(rpcError(id, ERR.PARAMS, "execution must be an object"));
+            }
+            const executionInput = p.execution as Record<string, unknown> | undefined;
+            if (executionInput) {
+              const unknownExecutionFields = Object.keys(executionInput).filter(
+                (key) => key !== "model" && key !== "reasoningEffort",
+              );
+              if (
+                unknownExecutionFields.length
+                || (executionInput.model !== undefined && executionInput.model !== null && typeof executionInput.model !== "string")
+                || (executionInput.reasoningEffort !== undefined && executionInput.reasoningEffort !== null && typeof executionInput.reasoningEffort !== "string")
+              ) {
+                return reply(rpcError(id, ERR.PARAMS, "execution supports only string model and reasoningEffort fields"));
+              }
+            }
             if (p.sessionId !== undefined && (typeof p.sessionId !== "string" || !p.sessionId)) {
               return reply(rpcError(id, ERR.PARAMS, "sessionId must be a non-empty string"));
             }
@@ -2717,13 +2756,45 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             try {
               if (ref === "main") {
+                if (executionInput && Object.values(executionInput).some((value) => typeof value === "string" && value.trim())) {
+                  return reply(rpcError(id, ERR.PARAMS, "the main Hara Agent follows the active Space defaults"));
+                }
                 await updateMainAgentIdentity(p.profile, p.expectedRevision);
               } else {
                 const resolved = resolveServeAgent(ref, cwd, profileId);
                 if (!resolved || "ambiguous" in resolved) {
                   return reply(rpcError(id, ERR.PARAMS, `Agent '${ref}' could not be resolved`));
                 }
-                await updateNativeRoleIdentity(resolved.role, p.profile, p.expectedRevision);
+                if (executionInput) {
+                  const nextModel = Object.prototype.hasOwnProperty.call(executionInput, "model")
+                    ? typeof executionInput.model === "string" && executionInput.model.trim()
+                      ? executionInput.model.trim()
+                      : undefined
+                    : resolved.role.model;
+                  const nextEffort = Object.prototype.hasOwnProperty.call(executionInput, "reasoningEffort")
+                    ? typeof executionInput.reasoningEffort === "string" && executionInput.reasoningEffort.trim()
+                      ? executionInput.reasoningEffort.trim()
+                      : undefined
+                    : resolved.role.reasoningEffort;
+                  const executionModel = nextModel ?? runtime.model;
+                  const executionRuntime = runtimeInfo(cwd, executionModel, profileId, spaceId);
+                  if (nextModel && executionRuntime.availableModels?.length && !executionRuntime.availableModels.includes(nextModel)) {
+                    return reply(rpcError(id, ERR.PARAMS, `model '${nextModel}' is not authorized for the active connection`));
+                  }
+                  if (nextEffort && !executionRuntime.effortLevels.includes(nextEffort)) {
+                    return reply(rpcError(
+                      id,
+                      ERR.PARAMS,
+                      `thinking effort '${nextEffort}' is not supported by model '${executionModel}'`,
+                    ));
+                  }
+                }
+                await updateNativeRoleIdentity(
+                  resolved.role,
+                  p.profile,
+                  p.expectedRevision,
+                  executionInput as AgentExecutionPreferencesInput | undefined,
+                );
               }
               const catalog = serveAgentCatalog(cwd, profileId, spaceId);
               return reply(rpcResult(id!, {
@@ -2919,13 +2990,32 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               }
             }
             const roleModel = resolvedAgent ? effectiveRoleModel(resolvedAgent.role.model, provider.model) : undefined;
-            if (roleModel) {
+            const selectedModel = roleModel ?? provider.model;
+            const selectedRuntime = runtimeInfo(cwd, selectedModel, profileId, spaceId);
+            const roleReasoningEffort = resolvedAgent?.role.reasoningEffort;
+            if (
+              roleReasoningEffort
+              && !selectedRuntime.effortLevels.includes(roleReasoningEffort)
+            ) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                `agent '${resolvedAgent!.ref}' requires unsupported reasoning effort '${roleReasoningEffort}' for model '${selectedModel}'`,
+              ));
+            }
+            // Freeze the inherited connection default into this new conversation. `null` records an
+            // intentional provider/model automatic setting; later edits to Space defaults affect only new
+            // work, never this session when it resumes.
+            const sessionEffort = roleReasoningEffort
+              ?? selectedRuntime.defaultReasoningEffort
+              ?? null;
+            if (roleModel || roleReasoningEffort) {
               const roleProvider = deps.buildProviderFor
-                ? await deps.buildProviderFor(roleModel, undefined, cwd, profileId, spaceId)
+                ? await deps.buildProviderFor(selectedModel, sessionEffort, cwd, profileId, spaceId)
                 : null;
               if (closing) return;
               if (!roleProvider) {
-                return reply(rpcError(id, ERR.INTERNAL, `agent '${resolvedAgent!.ref}' requires unavailable model '${roleModel}'`));
+                return reply(rpcError(id, ERR.INTERNAL, `agent '${resolvedAgent!.ref}' requires unavailable model '${selectedModel}'`));
               }
               provider = roleProvider;
             }
@@ -2940,6 +3030,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               provider,
               providerId: provider.id,
               model: provider.model,
+              effort: sessionEffort,
               approval,
               projectContext: loadAgentContext(cwd) || undefined,
               ...(resolvedAgent ? { agentRef: resolvedAgent.ref } : {}),
@@ -2975,7 +3066,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const resumeModel = priorMeta?.model || runtimeInfo(priorMeta?.cwd, undefined, boundProfileId, boundSpaceId).model;
             const provider = priorMeta && deps.buildProviderFor
-              ? await deps.buildProviderFor(resumeModel, undefined, priorMeta.cwd, boundProfileId, boundSpaceId)
+              ? await deps.buildProviderFor(resumeModel, priorMeta.effort, priorMeta.cwd, boundProfileId, boundSpaceId)
               : await deps.buildSessionProvider(priorMeta?.cwd, boundProfileId, boundSpaceId);
             if (closing) return;
             if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated — check the active profile and ~/.hara/config.json"));
@@ -3332,10 +3423,29 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const provider = targetRequested
               ? deps.buildProviderFor
-                ? await deps.buildProviderFor(targetModel, undefined, source.meta.cwd, targetProfileId, targetSpaceId)
+                ? await deps.buildProviderFor(
+                    targetModel,
+                    targetRuntime?.defaultReasoningEffort ?? null,
+                    source.meta.cwd,
+                    targetProfileId,
+                    targetSpaceId,
+                  )
                 : null
               : deps.buildProviderFor
-                ? await deps.buildProviderFor(sourceModel, undefined, source.meta.cwd, sourceProfileId, sourceSpaceId)
+                ? await deps.buildProviderFor(
+                    sourceModel,
+                    source.meta.effort !== undefined
+                      ? source.meta.effort
+                      : runtimeInfo(
+                          source.meta.cwd,
+                          sourceModel,
+                          sourceProfileId,
+                          sourceSpaceId,
+                        ).defaultReasoningEffort ?? null,
+                    source.meta.cwd,
+                    sourceProfileId,
+                    sourceSpaceId,
+                  )
                 : await deps.buildSessionProvider(source.meta.cwd, sourceProfileId, sourceSpaceId);
             if (closing) return;
             if (!provider) {
@@ -3383,6 +3493,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               profileId: targetProfileId,
               spaceId: targetSpaceId,
               model: targetModel,
+              effort: targetRequested
+                ? targetRuntime?.defaultReasoningEffort ?? null
+                : source.meta.effort !== undefined
+                  ? source.meta.effort
+                  : runtimeInfo(
+                      source.meta.cwd,
+                      sourceModel,
+                      sourceProfileId,
+                      sourceSpaceId,
+                    ).defaultReasoningEffort ?? null,
               provider,
               providerId: provider.id,
               approval: deps.approval,
@@ -3468,7 +3588,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               ...(currentAvailable !== undefined ? { currentAvailable } : {}),
               ...(recommendedModel ? { recommendedModel } : {}),
               profileId: savedMeta?.profileId ?? defaultRuntime.profileId,
-              effort: session?.effort ?? savedMeta?.effort ?? null,
+              defaultModel: defaultRuntime.model,
+              defaultReasoningEffort: defaultRuntime.defaultReasoningEffort ?? null,
+              effort: session?.effort !== undefined
+                ? session.effort
+                : savedMeta?.effort ?? null,
               effortLevels: currentRuntime.effortLevels,
               attachmentCapabilities: currentRuntime.attachmentCapabilities,
             }));
@@ -3488,9 +3612,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               (p.baseURL !== undefined && typeof p.baseURL !== "string") ||
               (p.apiKey !== undefined && typeof p.apiKey !== "string") ||
               (p.clearApiKey !== undefined && typeof p.clearApiKey !== "boolean") ||
+              (p.reasoningEffort !== undefined && typeof p.reasoningEffort !== "string") ||
+              (p.clearReasoningEffort !== undefined && typeof p.clearReasoningEffort !== "boolean") ||
               (p.activate !== undefined && typeof p.activate !== "boolean")
             ) {
-              return reply(rpcError(id, ERR.PARAMS, "id + label + provider + model required; optional baseURL/apiKey/clearApiKey/activate have invalid types"));
+              return reply(rpcError(id, ERR.PARAMS, "id + label + provider + model required; optional baseURL/apiKey/clearApiKey/reasoningEffort/clearReasoningEffort/activate have invalid types"));
             }
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const input: ProviderConnectionCreateInput = {
@@ -3501,6 +3627,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               ...(p.baseURL !== undefined ? { baseURL: p.baseURL } : {}),
               ...(p.apiKey !== undefined ? { apiKey: p.apiKey } : {}),
               ...(p.clearApiKey !== undefined ? { clearApiKey: p.clearApiKey } : {}),
+              ...(p.reasoningEffort !== undefined ? { reasoningEffort: p.reasoningEffort } : {}),
+              ...(p.clearReasoningEffort !== undefined ? { clearReasoningEffort: p.clearReasoningEffort } : {}),
               ...(p.activate !== undefined ? { activate: p.activate } : {}),
             };
             const result = await deps.createProviderConnection(input, targetCwd);
@@ -3673,9 +3801,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               (p.baseURL !== undefined && typeof p.baseURL !== "string") ||
               (p.apiKey !== undefined && typeof p.apiKey !== "string") ||
               (p.clearApiKey !== undefined && typeof p.clearApiKey !== "boolean") ||
+              (p.reasoningEffort !== undefined && typeof p.reasoningEffort !== "string") ||
+              (p.clearReasoningEffort !== undefined && typeof p.clearReasoningEffort !== "boolean") ||
               (p.activatePersonal !== undefined && typeof p.activatePersonal !== "boolean")
             ) {
-              return reply(rpcError(id, ERR.PARAMS, "provider + model required; optional baseURL/apiKey/clearApiKey/activatePersonal have invalid types"));
+              return reply(rpcError(id, ERR.PARAMS, "provider + model required; optional baseURL/apiKey/clearApiKey/reasoningEffort/clearReasoningEffort/activatePersonal have invalid types"));
             }
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const input: ProviderSettingsInput = {
@@ -3684,6 +3814,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               ...(p.baseURL !== undefined ? { baseURL: p.baseURL } : {}),
               ...(p.apiKey !== undefined ? { apiKey: p.apiKey } : {}),
               ...(p.clearApiKey !== undefined ? { clearApiKey: p.clearApiKey } : {}),
+              ...(p.reasoningEffort !== undefined ? { reasoningEffort: p.reasoningEffort } : {}),
+              ...(p.clearReasoningEffort !== undefined ? { clearReasoningEffort: p.clearReasoningEffort } : {}),
               ...(p.activatePersonal !== undefined ? { activatePersonal: p.activatePersonal } : {}),
             };
             const result = await callback(input, targetCwd);
@@ -3703,7 +3835,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
             }
             const model = typeof p.model === "string" && p.model ? p.model : s.meta.model;
-            const effort = typeof p.effort === "string" && p.effort ? p.effort : undefined;
+            if (p.effort !== undefined && typeof p.effort !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "effort must be a string when provided"));
+            }
+            const effort = typeof p.effort === "string" && p.effort ? p.effort : null;
             if (!deps.buildProviderFor) return reply(rpcError(id, ERR.METHOD, "model switching not supported by this server"));
             const requestedRuntime = runtimeInfo(s.meta.cwd, model, s.meta.profileId, s.meta.spaceId);
             const requestedSpaceId = requestedRuntime.spaceId
@@ -3714,7 +3849,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (requestedRuntime.availableModels?.length && !requestedRuntime.availableModels.includes(model)) {
               return reply(rpcError(id, ERR.PARAMS, `model '${model}' is not authorized for the active organization connection`));
             }
-            if (effort && !requestedRuntime.effortLevels.includes(effort)) {
+            if (effort !== null && !requestedRuntime.effortLevels.includes(effort)) {
               return reply(rpcError(id, ERR.PARAMS, `thinking effort '${effort}' is not supported by model '${model}'`));
             }
             const hasRawImageHistory = s.history.some(
@@ -3752,7 +3887,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               s.meta.effort = effort;
               s.effort = effort;
               hub.save(s); // persist the picker immediately, even if no next turn is sent
-              return reply(rpcResult(id!, { sessionId: s.meta.id, model, effort: effort ?? null }));
+              return reply(rpcResult(id!, { sessionId: s.meta.id, model, effort }));
             } finally {
               s.configuring = false;
             }

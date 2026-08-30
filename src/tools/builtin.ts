@@ -22,7 +22,11 @@ import {
   sensitiveFileError,
   sensitiveShellCommandReason,
 } from "../security/sensitive-files.js";
-import { createToolOutputLineRedactor, redactToolSubprocessOutput } from "../security/subprocess-env.js";
+import {
+  createBoundedToolNoticeEmitter,
+  createToolOutputLineRedactor,
+  redactToolSubprocessOutput,
+} from "../security/subprocess-env.js";
 import { isReadOnlyCommand, splitCompound } from "../security/permissions.js";
 import { loadConfig } from "../config.js";
 import { commandHasPackageRegistry, normalizePackageRegistry, packageRegistryEnv } from "../package-registry.js";
@@ -495,7 +499,7 @@ registerTool({
       }
     }
     const liveEmit = ctx.ui
-      ? (line: string) => ctx.ui!.notice(line.replace(/\r?\n$/, ""))
+      ? createBoundedToolNoticeEmitter((line: string) => ctx.ui!.notice(line.replace(/\r?\n$/, "")))
       : procOut.isTTY
         ? (line: string) => procOut.write(line)
         : null;

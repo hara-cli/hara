@@ -198,7 +198,7 @@ import {
 import { createProviderForTarget } from "./providers/factory.js";
 import { resolvePlatform } from "./providers/registry.js";
 import { boundedProviderTurn } from "./providers/bounded-turn.js";
-import { levelsFor } from "./tui/model-picker.js";
+import { levelsFor, normalizeEffort } from "./tui/model-picker.js";
 import { isOfficialTokenPlanOpenAIEndpoint, tokenPlanModelHint } from "./providers/alibaba.js";
 import { planNoteLines } from "./providers/plan-notes.js";
 import { listModels } from "./providers/models.js";
@@ -407,6 +407,7 @@ async function buildProvider(
   targetOverride?: ProviderTargetOverride,
   boundProfileId?: string,
   boundSpaceId?: string,
+  reasoningEffortOverride?: HaraConfig["reasoningEffort"] | null,
 ): Promise<Provider | null> {
   // Identity-profile is the source of truth for routing. `cfg` is the *merged* HaraConfig (env +
   // project + global) and still drives non-routing concerns (model overrides, baseURL fallbacks
@@ -438,7 +439,12 @@ async function buildProvider(
       model,
       ...(cfg.proxy ? { proxy: cfg.proxy } : {}),
     };
-    const rawProvider = await createProviderForTarget(target, cfg.reasoningEffort);
+    const reasoningEffort = reasoningEffortOverride === null
+      ? undefined
+      : reasoningEffortOverride
+        ?? (runtimeProfileBindings.get(cfg) === ap.id ? cfg.reasoningEffort : undefined)
+        ?? gatewayDefaultReasoningEffort(ap, model);
+    const rawProvider = await createProviderForTarget(target, reasoningEffort);
     const built = rawProvider
       ? bindOrganizationProvider(rawProvider, { ...ap }, () => profileByIdForConfig(cfg, ap.id))
       : null;
@@ -447,13 +453,18 @@ async function buildProvider(
       cfg.model = target.model;
       cfg.baseURL = target.baseURL;
       cfg.apiKey = undefined;
+      cfg.reasoningEffort = reasoningEffort;
+      runtimeProfileBindings.set(cfg, ap.id);
     }
     return built;
   }
 
   const baseTarget = resolveByokProviderTarget(cfg, ap, false);
   const target = overrideProviderTarget(baseTarget, targetOverride);
-  const rawProvider = await createProviderForTarget(target, cfg.reasoningEffort);
+  const reasoningEffort = reasoningEffortOverride === null
+    ? undefined
+    : reasoningEffortOverride ?? cfg.reasoningEffort;
+  const rawProvider = await createProviderForTarget(target, reasoningEffort);
   let built = rawProvider;
   if (rawProvider && expectedSpaceId !== PERSONAL_ID) {
     const enrollment = organizationEnrollmentForSpace(cfg, expectedSpaceId);
@@ -477,6 +488,8 @@ async function buildProvider(
     cfg.model = target.model;
     cfg.baseURL = target.baseURL;
     cfg.apiKey = target.apiKey;
+    cfg.reasoningEffort = reasoningEffort;
+    runtimeProfileBindings.set(cfg, ap.id);
   }
   return built;
 }
@@ -506,7 +519,7 @@ async function buildSessionBoundRuntime(
   cfg: HaraConfig,
   profileId: string,
   model: string,
-  effort?: string,
+  effort?: string | null,
   spaceId?: string,
 ): Promise<{ provider: Provider; profile: Profile } | null> {
   const profile = profileByIdForConfig(cfg, profileId);
@@ -519,11 +532,22 @@ async function buildSessionBoundRuntime(
   if (profile.kind === "gateway" && profile.availableModels?.length && !profile.availableModels.includes(model)) {
     throw new Error(`model '${model}' is not authorized for organization connection '${profile.id}'`);
   }
+  if (profile.kind === "gateway" || effort !== undefined) {
+    // `cfg` originates from current connection defaults. A persisted session value (including
+    // explicit provider-automatic `null`) must replace it; a company-bound legacy session with no
+    // saved value must also clear any Personal default so only Control's default can win.
+    cfg.reasoningEffort = (effort ?? undefined) as HaraConfig["reasoningEffort"];
+  }
   runtimeProfileBindings.set(cfg, profileId);
-  if (effort) cfg.reasoningEffort = effort as HaraConfig["reasoningEffort"];
   const expectedSpaceId = spaceId ?? spaceIdForProfile(profile);
   assertProfileAudience(cfg, profileId, expectedSpaceId);
-  const primary = await buildProvider(cfg, { model }, profileId, expectedSpaceId);
+  const primary = await buildProvider(
+    cfg,
+    { model },
+    profileId,
+    expectedSpaceId,
+    effort === null ? null : undefined,
+  );
   if (!primary) return null;
   cfg.provider = primary.id as ProviderId;
   cfg.model = primary.model;
@@ -666,6 +690,68 @@ function authHint(cfg: HaraConfig, boundProfile?: Profile | null): string {
   return `Set ${c.bold(providerEnvKey(provider))} (or ${c.bold("HARA_API_KEY")}), or run ${c.bold("hara setup")}.`;
 }
 
+function personalReasoningEffortLevels(
+  provider: ProviderId,
+  baseURL: string | undefined,
+  model: string,
+): NonNullable<HaraConfig["reasoningEffort"]>[] {
+  return levelsFor(
+    resolvePlatform(provider, baseURL ?? providerDefaultBaseURL(provider), undefined, model).reasoning,
+    model,
+  ).filter((effort): effort is NonNullable<HaraConfig["reasoningEffort"]> => !!effort);
+}
+
+function providerSettingsCatalog() {
+  return providerCatalog().map((provider) => ({
+    ...provider,
+    ...(provider.knownModels?.length
+      ? {
+          knownModelEntries: provider.knownModels.map((model) => ({
+            id: model,
+            effortLevels: personalReasoningEffortLevels(
+              provider.id,
+              provider.defaultBaseURL,
+              model,
+            ),
+          })),
+        }
+      : {}),
+  }));
+}
+
+function gatewayReasoningEffortLevels(profile: Profile, model: string): NonNullable<HaraConfig["reasoningEffort"]>[] {
+  const perModel = profile.modelCapabilities?.find((capability) => capability.model === model)?.thinkingEfforts;
+  const advertised = perModel ?? profile.thinkingEfforts ?? [];
+  return advertised.filter((effort): effort is NonNullable<HaraConfig["reasoningEffort"]> => (
+    REASONING_EFFORTS.includes(effort as NonNullable<HaraConfig["reasoningEffort"]>)
+  ));
+}
+
+function gatewayDefaultReasoningEffort(
+  profile: Profile,
+  model: string,
+): HaraConfig["reasoningEffort"] {
+  const effort = profile.defaultReasoningEffort;
+  return effort && gatewayReasoningEffortLevels(profile, model).includes(
+    effort as NonNullable<HaraConfig["reasoningEffort"]>,
+  )
+    ? effort as NonNullable<HaraConfig["reasoningEffort"]>
+    : undefined;
+}
+
+function assertPersonalReasoningEffort(
+  provider: ProviderId,
+  baseURL: string | undefined,
+  model: string,
+  effort: HaraConfig["reasoningEffort"],
+): void {
+  if (effort === undefined) return;
+  const levels = personalReasoningEffortLevels(provider, baseURL, model);
+  if (!levels.includes(effort)) {
+    throw new Error(`model '${model}' does not support reasoning effort '${effort}' on this connection`);
+  }
+}
+
 function providerEnvironmentOverride(): boolean {
   return !!(
     process.env.HARA_PROVIDER ||
@@ -687,6 +773,17 @@ function personalProviderConnectionsSnapshot(
   const raw = readRawConfig();
   const configured = personal.id !== PERSONAL_ID
     || ["provider", "model", "baseURL", "apiKey"].some((key) => Object.hasOwn(raw, key));
+  const reasoningStyle = resolvePlatform(
+    target.provider,
+    target.baseURL ?? providerDefaultBaseURL(target.provider),
+    undefined,
+    target.model,
+  ).reasoning;
+  const effortLevels = levelsFor(reasoningStyle, target.model)
+    .filter((effort): effort is NonNullable<typeof effort> => !!effort);
+  const reasoningEffort = live.reasoningEffort
+    ? normalizeEffort(reasoningStyle, target.model, live.reasoningEffort)
+    : undefined;
   return [{
     id: PERSONAL_ID,
     label: entry.label,
@@ -700,6 +797,8 @@ function personalProviderConnectionsSnapshot(
     active: listProfiles().find((profile) => profile.id === resolution.id)?.kind === "byok",
     legacyPersonal: true,
     removable: configured,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    effortLevels,
     ...(target.apiKey ? { keyHint: maskKey(target.apiKey) } : {}),
   }];
 }
@@ -727,17 +826,20 @@ function personalProfileForSettings(live: HaraConfig, resolution: ActiveResoluti
 function providerSettingsSnapshot(targetCwd: string) {
   const live = loadConfig({ cwd: targetCwd });
   const { profile, resolution } = profileForConfig(live);
-  const catalog = providerCatalog();
+  const catalog = providerSettingsCatalog();
   const connections = personalProviderConnectionsSnapshot(live, resolution, catalog);
   const switchLocked = resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin";
 
   if (profile.kind === "gateway") {
     const entry = catalog.find((candidate) => candidate.id === "hara-gateway")!;
     const tokenExpired = deviceTokenExpired(profile.tokenExpiresAt);
+    const model = process.env.HARA_MODEL || effectiveModel(profile) || live.model;
+    const effortLevels = gatewayReasoningEffortLevels(profile, model);
+    const reasoningEffort = gatewayDefaultReasoningEffort(profile, model);
     return {
       current: {
         provider: "hara-gateway",
-        model: process.env.HARA_MODEL || effectiveModel(profile) || live.model,
+        model,
         baseURL: profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined),
         location: entry.location,
         auth: entry.auth,
@@ -747,6 +849,8 @@ function providerSettingsSnapshot(targetCwd: string) {
         profileKind: profile.kind,
         profileSource: resolution.source,
         editable: false,
+        effortLevels,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
         ...(profile.tokenExpiresAt ? { tokenExpiresAt: profile.tokenExpiresAt, tokenExpired } : {}),
       },
       providers: catalog,
@@ -765,6 +869,17 @@ function providerSettingsSnapshot(targetCwd: string) {
   const keyConfigured =
     providerIsLocal(provider) ||
     (provider === "qwen-oauth" ? loadQwenToken() !== null : !!apiKey);
+  const reasoningStyle = resolvePlatform(
+    provider,
+    baseURL ?? providerDefaultBaseURL(provider),
+    undefined,
+    model,
+  ).reasoning;
+  const effortLevels = levelsFor(reasoningStyle, model)
+    .filter((effort): effort is NonNullable<typeof effort> => !!effort);
+  const reasoningEffort = live.reasoningEffort
+    ? normalizeEffort(reasoningStyle, model, live.reasoningEffort)
+    : undefined;
 
   return {
     current: {
@@ -779,6 +894,8 @@ function providerSettingsSnapshot(targetCwd: string) {
       profileKind: profile.kind,
       profileSource: resolution.source,
       editable: !environmentOverride,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      effortLevels,
       ...(environmentOverride ? { environmentOverride: true } : {}),
     },
     providers: catalog,
@@ -812,6 +929,8 @@ async function createNamedProviderConnection(
     baseURL?: string;
     apiKey?: string;
     clearApiKey?: boolean;
+    reasoningEffort?: string;
+    clearReasoningEffort?: boolean;
     activate?: boolean;
   },
   targetCwd: string,
@@ -839,7 +958,15 @@ async function createNamedProviderConnection(
     baseURL: input.baseURL,
     apiKey: input.apiKey,
     clearApiKey: input.clearApiKey,
+    reasoningEffort: input.reasoningEffort as HaraConfig["reasoningEffort"],
+    clearReasoningEffort: input.clearReasoningEffort,
   });
+  assertPersonalReasoningEffort(
+    normalized.provider,
+    normalized.baseURL,
+    normalized.model,
+    normalized.reasoningEffort,
+  );
   const currentPersonal = personalProfileForSettings(liveBefore, resolution);
   const currentTarget = resolveByokProviderTarget(liveBefore, currentPersonal, false, {});
   const reusableRaw = {
@@ -855,6 +982,10 @@ async function createNamedProviderConnection(
     ?? reusablePersonalProviderApiKey(normalized, reusableRaw, {});
   updatePersonalProviderConfig({
     ...normalized,
+    ...(input.reasoningEffort !== undefined
+      ? { reasoningEffort: input.reasoningEffort as HaraConfig["reasoningEffort"] }
+      : {}),
+    ...(input.clearReasoningEffort === true ? { clearReasoningEffort: true } : {}),
     ...(storedKey ? { apiKey: storedKey } : {}),
   });
   archiveHistoricalPersonalRoutes({
@@ -947,6 +1078,8 @@ function organizationConnectionsSnapshot(targetCwd: string) {
     .filter((profile) => profile.kind === "gateway")
     .map((profile) => {
       const endpoint = publicGatewayIdentity(profile.gatewayUrl);
+      const model = effectiveModel(profile) || "";
+      const reasoningEffort = gatewayDefaultReasoningEffort(profile, model);
       return {
         id: profile.id,
         spaceId: spaceIdForProfile(profile),
@@ -955,7 +1088,9 @@ function organizationConnectionsSnapshot(targetCwd: string) {
         ...(profile.tenantName ? { tenantName: profile.tenantName } : {}),
         active: profile.id === resolution.id,
         ...endpoint,
-        model: effectiveModel(profile) || "",
+        model,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        effortLevels: gatewayReasoningEffortLevels(profile, model),
         ...(profile.availableModels?.length ? { availableModels: [...profile.availableModels] } : {}),
         ...(profile.enrolledAt ? { enrolledAt: profile.enrolledAt } : {}),
         ...(profile.tokenExpiresAt ? { expiresAt: profile.tokenExpiresAt } : {}),
@@ -1126,7 +1261,14 @@ async function testProviderSettingsCandidate(input: {
   baseURL?: string;
   apiKey?: string;
   clearApiKey?: boolean;
-}, options: { reusePersonalApiKey?: boolean } = {}): Promise<{ ok: boolean; models: string[]; error?: string }> {
+  reasoningEffort?: string;
+  clearReasoningEffort?: boolean;
+}, options: { reusePersonalApiKey?: boolean } = {}): Promise<{
+  ok: boolean;
+  models: string[];
+  entries: Array<{ id: string; providerId: string; effortLevels: string[] }>;
+  error?: string;
+}> {
   if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
     throw new Error("provider is not a configurable personal provider");
   }
@@ -1136,7 +1278,15 @@ async function testProviderSettingsCandidate(input: {
     baseURL: input.baseURL,
     apiKey: input.apiKey,
     clearApiKey: input.clearApiKey,
+    reasoningEffort: input.reasoningEffort as HaraConfig["reasoningEffort"],
+    clearReasoningEffort: input.clearReasoningEffort,
   });
+  assertPersonalReasoningEffort(
+    candidate.provider,
+    candidate.baseURL,
+    candidate.model,
+    candidate.reasoningEffort,
+  );
   const raw = readRawConfig();
   const apiKey = options.reusePersonalApiKey === false
     ? candidate.apiKey
@@ -1145,6 +1295,7 @@ async function testProviderSettingsCandidate(input: {
     return {
       ok: false,
       models: [],
+      entries: [],
       error: "A new API key is required when the provider or endpoint changes",
     };
   }
@@ -1155,6 +1306,19 @@ async function testProviderSettingsCandidate(input: {
     apiKey ?? "",
     createModelFetch(configuredProxy),
   );
+  const entries = [...new Set([candidate.model, ...models])].map((model) => ({
+    id: model,
+    providerId: candidate.provider,
+    effortLevels: levelsFor(
+      resolvePlatform(
+        candidate.provider,
+        candidate.baseURL ?? providerDefaultBaseURL(candidate.provider),
+        undefined,
+        model,
+      ).reasoning,
+      model,
+    ).filter((effort): effort is NonNullable<typeof effort> => !!effort),
+  }));
   const probeModel =
     providerIsLocal(candidate.provider) &&
     models.length > 0 &&
@@ -1162,18 +1326,21 @@ async function testProviderSettingsCandidate(input: {
     (candidate.model === "local-model" || candidate.model === "qwen3")
       ? models[0]
       : candidate.model;
-  const provider = await createProviderForTarget({
-    provider: candidate.provider,
-    apiKey,
-    model: probeModel,
-    baseURL: candidate.baseURL,
-    ...(configuredProxy ? { proxy: configuredProxy } : {}),
-  });
+  const provider = await createProviderForTarget(
+    {
+      provider: candidate.provider,
+      apiKey,
+      model: probeModel,
+      baseURL: candidate.baseURL,
+      ...(configuredProxy ? { proxy: configuredProxy } : {}),
+    },
+    candidate.reasoningEffort,
+  );
   if (!provider) {
     const error = candidate.provider === "qwen-oauth"
       ? "Qwen browser sign-in is not complete; run `hara login qwen` first"
       : "provider is not authenticated";
-    return { ok: false, models, error };
+    return { ok: false, models, entries, error };
   }
   const result = await boundedProviderTurn(
     provider,
@@ -1189,13 +1356,14 @@ async function testProviderSettingsCandidate(input: {
     return {
       ok: false,
       models,
+      entries,
       error: redactKnownSecrets(
         result.errorMsg || "provider connection test failed",
         [apiKey],
       ).text.slice(0, 500),
     };
   }
-  return { ok: true, models };
+  return { ok: true, models, entries };
 }
 
 async function testNamedProviderConnection(inputId: string, targetCwd: string) {
@@ -3496,17 +3664,23 @@ program
           ) {
             throw new Error(`model '${model}' is not authorized for organization connection '${profile.id}'`);
           }
+          const resolvedEffort = effort === null
+            ? undefined
+            : effort !== undefined
+            ? effort as HaraConfig["reasoningEffort"]
+            : profile.kind === "gateway"
+              ? gatewayDefaultReasoningEffort(profile, model)
+              : live.reasoningEffort;
+          const runtimeCfg = { ...live, reasoningEffort: resolvedEffort };
           return withRouting(
             await buildProvider(
-              {
-                ...live,
-                reasoningEffort: (effort as HaraConfig["reasoningEffort"]) ?? live.reasoningEffort,
-              },
+              runtimeCfg,
               { model },
               profileId,
               expectedSpaceId,
+              effort === null ? null : resolvedEffort,
             ),
-            live,
+            runtimeCfg,
             profileId,
             expectedSpaceId,
           );
@@ -3703,7 +3877,15 @@ program
             baseURL: input.baseURL,
             apiKey: input.apiKey,
             clearApiKey: input.clearApiKey,
+            reasoningEffort: input.reasoningEffort as HaraConfig["reasoningEffort"],
+            clearReasoningEffort: input.clearReasoningEffort,
           });
+          assertPersonalReasoningEffort(
+            normalized.provider,
+            normalized.baseURL,
+            normalized.model,
+            normalized.reasoningEffort,
+          );
           const currentPersonal = personalProfileForSettings(liveBefore, resolution);
           const currentTarget = resolveByokProviderTarget(liveBefore, currentPersonal, false, {});
           const reusableRaw = {
@@ -3719,6 +3901,10 @@ program
             ?? reusablePersonalProviderApiKey(normalized, reusableRaw, {});
           updatePersonalProviderConfig({
             ...normalized,
+            ...(input.reasoningEffort !== undefined
+              ? { reasoningEffort: input.reasoningEffort as HaraConfig["reasoningEffort"] }
+              : {}),
+            ...(input.clearReasoningEffort === true ? { clearReasoningEffort: true } : {}),
             ...(storedKey ? { apiKey: storedKey } : {}),
           });
           archiveHistoricalPersonalRoutes({
@@ -3761,9 +3947,20 @@ program
             resolvePlatform(current.provider, current.baseURL, undefined, model).reasoning,
             model,
           ).filter((e): e is NonNullable<typeof e> => !!e);
-          const advertisedEfforts = profile.kind === "gateway" && Array.isArray(profile.thinkingEfforts)
-            ? profile.thinkingEfforts.filter((effort) => ["off", "low", "medium", "high", "max"].includes(effort))
+          const advertisedEfforts = profile.kind === "gateway"
+            ? gatewayReasoningEffortLevels(profile, model)
             : undefined;
+          const reasoningStyle = resolvePlatform(
+            current.provider,
+            current.baseURL,
+            undefined,
+            model,
+          ).reasoning;
+          const defaultReasoningEffort = profile.kind === "gateway"
+            ? gatewayDefaultReasoningEffort(profile, model)
+            : live.reasoningEffort
+              ? normalizeEffort(reasoningStyle, model, live.reasoningEffort)
+              : undefined;
           return {
             providerId: current.provider,
             model,
@@ -3772,6 +3969,7 @@ program
             spaceId: expectedSpaceId,
             ...(organizationProfile ? { organizationProfileId: organizationProfile.id } : {}),
             effortLevels: advertisedEfforts ?? inferredEfforts,
+            ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
             attachmentCapabilities: effectiveAttachmentCapabilities(
               current.provider,
               model,

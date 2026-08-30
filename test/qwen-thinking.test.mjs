@@ -34,9 +34,9 @@ test("Coding Plan coder models suppress the unsupported thinking parameter", () 
   assert.equal(supportsReasoningStyle("enable_thinking", "qwen3.7-plus"), true);
 });
 
-test("reasoningParams reasoning_effort: only OpenAI reasoning models; off → minimal", () => {
+test("reasoningParams reasoning_effort: only OpenAI reasoning models; legacy off clamps to the model minimum", () => {
   assert.deepEqual(reasoningParams("reasoning_effort", "high", "gpt-5"), { reasoning_effort: "high" });
-  assert.deepEqual(reasoningParams("reasoning_effort", "off", "o3"), { reasoning_effort: "minimal" });
+  assert.deepEqual(reasoningParams("reasoning_effort", "off", "o3"), { reasoning_effort: "low" });
   assert.deepEqual(reasoningParams("reasoning_effort", "high", "qwen3.7-plus"), {}, "non-reasoning model → untouched");
 });
 
@@ -45,7 +45,7 @@ test("reasoningParams reasoning_object (Responses API): reasoning:{effort} on re
   assert.deepEqual(reasoningParams("reasoning_object", "medium", "qwen3.7-plus"), {});
 });
 
-test("Token Plan Responses uses an explicit verified off switch and graded reasoning levels", () => {
+test("Token Plan Responses sends each model's effective reasoning level", () => {
   assert.equal(isQwenResponsesReasoningModel("qwen3.8-max"), true);
   assert.equal(isQwenResponsesReasoningModel("qwen3.8-flash"), true);
   assert.equal(isQwenResponsesReasoningModel("qwen/qwen3.7-max"), true);
@@ -55,18 +55,23 @@ test("Token Plan Responses uses an explicit verified off switch and graded reaso
   assert.deepEqual(reasoningParams("qwen_responses", "low", "qwen3.8-max"), { reasoning: { effort: "low" } });
   assert.deepEqual(reasoningParams("qwen_responses", "medium", "qwen3.8-max"), { reasoning: { effort: "medium" } });
   assert.deepEqual(reasoningParams("qwen_responses", "high", "qwen3.8-max"), { reasoning: { effort: "high" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "minimal", "qwen3.8-max"), { reasoning: { effort: "minimal" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "xhigh", "qwen3.8-max"), { reasoning: { effort: "xhigh" } });
   assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.8-max"), { reasoning: { effort: "max" } });
-  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.8-max"), { enable_thinking: false });
+  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.8-max"), { reasoning: { effort: "none" } });
   assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.8-flash"), { reasoning: { effort: "max" } });
-  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.8-flash"), { enable_thinking: false });
-  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.7-max"), { enable_thinking: false });
+  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.8-flash"), { reasoning: { effort: "none" } });
+  assert.deepEqual(reasoningParams("qwen_responses", "off", "qwen3.7-max"), { reasoning: { effort: "none" } });
   assert.deepEqual(reasoningParams("qwen_responses", "max", "qwen3.6-flash"), { reasoning: { effort: "max" } });
   assert.deepEqual(reasoningParams("qwen_responses", "high", "deepseek-v4-pro"), {});
   for (const model of ["qwen3.7-plus", "deepseek-v4-pro", "deepseek-v4-flash-0731", "glm-5.2"]) {
     assert.equal(isTokenPlanResponsesModel(model), true, model);
-    assert.deepEqual(reasoningParams("alibaba_responses", "off", model), { enable_thinking: false }, model);
+    assert.deepEqual(reasoningParams("alibaba_responses", "off", model), { reasoning: { effort: "none" } }, model);
     assert.deepEqual(reasoningParams("alibaba_responses", "high", model), { reasoning: { effort: "high" } }, model);
   }
+  assert.deepEqual(reasoningParams("alibaba_responses", "low", "deepseek-v4-pro"), { reasoning: { effort: "high" } });
+  assert.deepEqual(reasoningParams("alibaba_responses", "xhigh", "deepseek-v4-pro"), { reasoning: { effort: "max" } });
+  assert.deepEqual(reasoningParams("alibaba_responses", "medium", "deepseek-v4-pro-0813"), { reasoning: { effort: "high" } });
   assert.equal(isTokenPlanResponsesModel("kimi-k2.7-code"), false);
 });
 

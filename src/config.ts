@@ -113,12 +113,15 @@ export interface HaraConfig {
   /** Thinking/reasoning effort dial (provider-mapped):
    *   - unset    → each provider's default (anthropic = adaptive, openai = unset, etc.)
    *   - "off"    → no extended thinking; on adaptive-only Anthropic models we just omit `thinking`
+   *   - "minimal"→ the provider's smallest non-zero reasoning level when it exposes one
    *   - "low"    → small budget (anthropic budget_tokens, openai reasoning_effort:"low")
    *   - "medium" → balanced (anthropic adaptive, openai reasoning_effort:"medium")
    *   - "high"   → large budget (anthropic budget_tokens up, openai reasoning_effort:"high")
-   *  Provider adapters map this to the closest supported control. Official DeepSeek V4 models use
-   *  Responses for the complete native none/low/high/max set (`off` maps to `none`). */
-  reasoningEffort: "off" | "low" | "medium" | "high" | "max" | undefined;
+   *   - "xhigh"  → provider-native extra-high reasoning where available
+   *   - "max"    → provider-native maximum reasoning where available
+   *  Provider/model capability metadata decides which values are offered; adapters retain compatibility
+   *  mappings only for previously persisted values. */
+  reasoningEffort: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | undefined;
   /** lifecycle hooks (PreToolUse/PostToolUse) — shell commands run around tool calls */
   hooks: HooksConfig;
   /** Guardian safety layer: an internal HIGH-RISK classifier + a conservative cheap-model veto + a hard
@@ -263,7 +266,15 @@ export function providerCatalog(): ProviderCatalogEntry[] {
 }
 
 export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
-export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = ["off", "low", "medium", "high", "max"];
+export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
 export const APPROVAL_MODES: ApprovalMode[] = ["suggest", "auto-edit", "full-auto"];
 export const SANDBOX_MODES: SandboxMode[] = ["off", "workspace-write", "read-only"];
 export const COMPUTER_USE_MODES: HaraConfig["computerUse"][] = ["off", "read", "click", "full"];
@@ -516,6 +527,10 @@ export interface PersonalProviderConfigUpdate {
    * undefined; use clearApiKey for an explicit removal. */
   apiKey?: string;
   clearApiKey?: boolean;
+  /** Default reasoning dial for new work using this Personal connection. Undefined preserves the
+   * existing value; clearReasoningEffort restores the provider/model default. */
+  reasoningEffort?: HaraConfig["reasoningEffort"];
+  clearReasoningEffort?: boolean;
 }
 
 export interface NormalizedPersonalProviderConfigUpdate extends PersonalProviderConfigUpdate {
@@ -608,12 +623,20 @@ export function normalizePersonalProviderConfig(input: PersonalProviderConfigUpd
   if (apiKey && !providerRequiresApiKey(input.provider)) {
     throw new Error(`${input.provider} does not accept an API key`);
   }
+  if (
+    input.reasoningEffort !== undefined
+    && !REASONING_EFFORTS.includes(input.reasoningEffort)
+  ) {
+    throw new Error(`reasoning effort must be one of: ${REASONING_EFFORTS.join(", ")}`);
+  }
   return {
     provider: input.provider,
     model,
     ...(baseURL ? { baseURL } : {}),
     ...(apiKey ? { apiKey } : {}),
     ...(input.clearApiKey === true ? { clearApiKey: true } : {}),
+    ...(input.reasoningEffort !== undefined ? { reasoningEffort: input.reasoningEffort } : {}),
+    ...(input.clearReasoningEffort === true ? { clearReasoningEffort: true } : {}),
   };
 }
 
@@ -646,7 +669,7 @@ export function reusablePersonalProviderApiKey(
 /** Atomically update the legacy/personal provider slot without returning or logging its credential. */
 export function updatePersonalProviderConfig(input: PersonalProviderConfigUpdate): void {
   const normalized = normalizePersonalProviderConfig(input);
-  const { model, baseURL, apiKey } = normalized;
+  const { model, baseURL, apiKey, reasoningEffort } = normalized;
 
   updateRawConfig((config) => {
     const previousProvider = isProviderId(config.provider) ? config.provider : "anthropic";
@@ -670,6 +693,9 @@ export function updatePersonalProviderConfig(input: PersonalProviderConfigUpdate
       // A flat legacy key belongs to one exact endpoint, not merely a provider label.
       delete config.apiKey;
     }
+
+    if (normalized.clearReasoningEffort === true) delete config.reasoningEffort;
+    else if (reasoningEffort !== undefined) config.reasoningEffort = reasoningEffort;
   });
 }
 
@@ -681,6 +707,7 @@ export function clearPersonalProviderConfig(): void {
     delete config.model;
     delete config.baseURL;
     delete config.apiKey;
+    delete config.reasoningEffort;
   });
 }
 
@@ -780,8 +807,10 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   const fallbackBaseURL = nonBlankEnv(process.env.HARA_FALLBACK_BASE_URL) ?? merged.fallbackBaseURL;
   const fallbackApiKey = nonBlankEnv(process.env.HARA_FALLBACK_API_KEY) ?? merged.fallbackApiKey;
   const reasoningRaw = process.env.HARA_REASONING_EFFORT ?? merged.reasoningEffort;
-  const reasoningEffort = reasoningRaw && (["off", "low", "medium", "high", "max"] as const).includes(reasoningRaw as never)
-    ? (reasoningRaw as "off" | "low" | "medium" | "high" | "max")
+  const reasoningEffort = reasoningRaw && REASONING_EFFORTS.includes(
+    reasoningRaw as NonNullable<HaraConfig["reasoningEffort"]>,
+  )
+    ? (reasoningRaw as NonNullable<HaraConfig["reasoningEffort"]>)
     : undefined;
 
   return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };

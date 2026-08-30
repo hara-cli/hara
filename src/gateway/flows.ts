@@ -204,7 +204,7 @@ function validFlow(value: unknown): value is FlowRule {
   if (f.cwd !== undefined && typeof f.cwd !== "string") return false;
   if (f.schema !== undefined && (!f.schema || typeof f.schema !== "object" || Array.isArray(f.schema))) return false;
   if (f.model !== undefined && !isFlowModelId(f.model)) return false;
-  if (f.reasoningEffort !== undefined && !["inherit", "off", "low", "medium", "high", "max"].includes(String(f.reasoningEffort))) return false;
+  if (f.reasoningEffort !== undefined && !["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(f.reasoningEffort))) return false;
   if (hasStatic && (f.guard !== undefined || f.cwd !== undefined || f.model !== undefined || f.reasoningEffort !== undefined)) return false;
   if (hasStatic && f.schema !== undefined && validateAgainstSchema(f.staticResult, f.schema)) return false;
   if (f.deliver !== undefined && !isStrings(f.deliver)) return false;

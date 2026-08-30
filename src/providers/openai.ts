@@ -3,7 +3,7 @@ import type { Provider, NeutralMsg, ToolUse, TurnArgs, TurnResult } from "./type
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
-import { reasoningParams, type ReasoningStyle } from "./reasoning.js";
+import { reasoningParams, type Effort, type ReasoningStyle } from "./reasoning.js";
 import { applyReasoningParams, reasoningRouteKey, sendWithReasoningFallback } from "./reasoning-fallback.js";
 import { resolvePlatform } from "./registry.js";
 
@@ -99,7 +99,7 @@ export function createOpenAIProvider(opts: {
   model: string;
   baseURL?: string;
   label?: string;
-  reasoningEffort?: "off" | "low" | "medium" | "high" | "max";
+  reasoningEffort?: Effort;
   /** Internal transport override for a capability-preserving fallback (currently DeepSeek Responses
    * `off` → Chat with thinking.disabled). Normal callers should let the registry choose. */
   reasoningStyle?: ReasoningStyle;

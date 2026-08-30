@@ -911,6 +911,43 @@ test("personal provider switch never replays a flat key to another vendor and lo
   }
 });
 
+test("personal provider settings persist, preserve, and clear the default reasoning effort", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-provider-reasoning-default-"));
+  const home = join(root, "home");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  const previousHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    updatePersonalProviderConfig({
+      provider: "token-plan",
+      model: "qwen3.8-flash",
+      apiKey: "opaque-token-plan-key",
+      reasoningEffort: "medium",
+    });
+    let raw = readRawConfig();
+    assert.equal(raw.reasoningEffort, "medium");
+
+    updatePersonalProviderConfig({
+      provider: "token-plan",
+      model: "qwen3.8-max",
+    });
+    raw = readRawConfig();
+    assert.equal(raw.reasoningEffort, "medium", "omitting the field preserves the connection default");
+
+    updatePersonalProviderConfig({
+      provider: "token-plan",
+      model: "qwen3.8-max",
+      clearReasoningEffort: true,
+    });
+    raw = readRawConfig();
+    assert.equal("reasoningEffort" in raw, false, "automatic removes the explicit connection default");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("config get masks every API key and authenticated proxy URL", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-config-redaction-"));
   const home = join(root, "home");

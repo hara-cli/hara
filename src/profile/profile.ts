@@ -59,6 +59,11 @@ import {
 
 export type ProfileKind = "byok" | "gateway";
 
+export interface GatewayModelCapability {
+  model: string;
+  thinkingEfforts: string[];
+}
+
 export interface Profile {
   id: string;
   kind: ProfileKind;
@@ -89,6 +94,11 @@ export interface Profile {
   availableModels?: string[];
   /** Server-advertised thinking dial for the scoped gateway model. */
   thinkingEfforts?: string[];
+  /** Modern Controls advertise reasoning levels per model. The shared `thinkingEfforts` field above
+   * remains a backward-compatible intersection for older clients. */
+  modelCapabilities?: GatewayModelCapability[];
+  /** Company-admin default for new work. Missing means use the provider/model default. */
+  defaultReasoningEffort?: string;
   enrolledAt?: string;
   /** Control/data-plane shared expiry for the gateway device token. */
   tokenExpiresAt?: string;
@@ -295,6 +305,10 @@ function readDefaultOrgFromOrgJson(e: Record<string, any> | null): Profile | nul
       ? e.availableModels
       : (defaultModel ? [defaultModel] : []),
     thinkingEfforts: Array.isArray(e.thinkingEfforts) ? e.thinkingEfforts : undefined,
+    modelCapabilities: Array.isArray(e.modelCapabilities) ? e.modelCapabilities : undefined,
+    defaultReasoningEffort: typeof e.defaultReasoningEffort === "string"
+      ? e.defaultReasoningEffort
+      : undefined,
     enrolledAt: e.enrolledAt || new Date().toISOString(),
     tokenExpiresAt: typeof e.expiresAt === "string" ? e.expiresAt : undefined,
     tokenNeverExpires: e.tokenNeverExpires === true ? true : undefined,

@@ -5,6 +5,24 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.157.0 — 2026-08-30 — model defaults and Agent execution profiles
+
+- Make model configuration describe a default execution profile rather than only a Key. Personal Space keeps
+  exactly one editable connection with a default model and optional default reasoning effort; Alibaba Token
+  Plan Qwen 3.8 and GLM 5.2 expose the documented seven-level dial, while each other model advertises only
+  levels its wire protocol accepts. Provider automatic remains an explicit choice.
+- Freeze the effective model and reasoning setting when new conversations, tasks, or Agent sessions start.
+  Later edits affect only new work; resume and conversation-copy paths preserve both explicit effort and
+  provider automatic instead of silently inheriting a newer default. Message Flows continue to default to
+  reasoning Off unless the rule explicitly inherits or overrides it.
+- Let Personal Agents optionally override model and reasoning effort, while the Main Agent always follows the
+  active Space. Company Agent execution preferences arrive only through the current Control bundle and are
+  validated against that company's model capability catalog; Personal defaults never become company policy.
+- Use Alibaba's current Responses reasoning object (`off` maps to provider-native `none`), retain native image
+  input for Qwen 3.8 Max/Flash, keep media-generation IDs outside the conversation picker, improve rate-limit
+  diagnosis, and add purpose/cost hints for the current Token Plan catalog. Upgrade with
+  `npm i -g @nanhara/hara@0.157.0`.
+
 ## 0.156.1 — 2026-08-30 — one Personal model connection
 
 - Present exactly one current model connection for Personal Space. Registries created by the short-lived

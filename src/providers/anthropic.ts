@@ -3,6 +3,7 @@ import type { Provider, NeutralMsg, SystemPromptPart, TurnArgs, TurnResult } fro
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
+import type { Effort } from "./reasoning.js";
 
 export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
   const msgs: Anthropic.MessageParam[] = [];
@@ -115,7 +116,7 @@ function isAdaptiveOnly(model: string): boolean {
 
 /** Map hara's reasoningEffort dial to Anthropic's `thinking` parameter (or omit it).
  *  Exported for unit testing. */
-export function buildThinkingParam(model: string, effort?: "off" | "low" | "medium" | "high" | "max"):
+export function buildThinkingParam(model: string, effort?: Effort):
   | { type: "enabled"; budget_tokens: number }
   | { type: "adaptive" }
   | undefined {
@@ -124,14 +125,15 @@ export function buildThinkingParam(model: string, effort?: "off" | "low" | "medi
   if (effort === "off") return undefined; // omit thinking entirely (works on every model, incl. adaptive-only)
   const adaptiveOnly = isAdaptiveOnly(model);
   if (adaptiveOnly) return { type: "adaptive" }; // can't honor budget on these — fall back to adaptive instead of 400'ing
+  if (effort === "minimal") return { type: "enabled", budget_tokens: 2048 };
   if (effort === "low") return { type: "enabled", budget_tokens: 4096 };
   if (effort === "medium") return { type: "adaptive" };
-  if (effort === "max") return { type: "enabled", budget_tokens: 32000 }; // top of the dial — biggest budget
+  if (effort === "xhigh" || effort === "max") return { type: "enabled", budget_tokens: 32000 }; // top of the dial — biggest budget
   // high
   return { type: "enabled", budget_tokens: 24000 };
 }
 
-export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: "off" | "low" | "medium" | "high" | "max"; fetch?: typeof fetch }): Provider {
+export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: Effort; fetch?: typeof fetch }): Provider {
   const client = new Anthropic({
     apiKey: opts.apiKey,
     maxRetries: 4,

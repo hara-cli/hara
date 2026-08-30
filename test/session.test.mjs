@@ -1719,3 +1719,47 @@ test("SessionHub persists a draft on its first content and can delete an abandon
   assert.equal(hub.get(abandoned.meta.id), undefined);
   assert.ok(released.includes(abandoned.meta.id));
 });
+
+test("SessionHub preserves an explicit provider-automatic reasoning default across save, resume, and fork", () => {
+  const saved = new Map();
+  const store = {
+    acquire: () => ({ ok: true }),
+    release: () => {},
+    load: (id) => saved.get(id) ?? null,
+    save: (meta, history, task) => saved.set(meta.id, structuredClone({ meta, history, ...(task ? { task } : {}) })),
+    list: () => [],
+    delete: (id) => saved.delete(id),
+  };
+  const provider = { id: "fake", model: "fake-1", async turn() { throw new Error("unused"); } };
+  const firstHub = new SessionHub(store);
+  const original = firstHub.create({
+    cwd: "/tmp/automatic",
+    provider,
+    providerId: provider.id,
+    model: provider.model,
+    effort: null,
+    approval: "suggest",
+  });
+  assert.equal(original.meta.effort, null);
+  original.history.push({ role: "user", content: "persist automatic" });
+  firstHub.save(original);
+  firstHub.releaseAll();
+
+  const secondHub = new SessionHub(store);
+  const resumed = secondHub.resume(original.meta.id, { provider, approval: "suggest" });
+  assert.ok("session" in resumed);
+  assert.equal(resumed.session.effort, null);
+  assert.equal(resumed.session.meta.effort, null);
+
+  const forked = secondHub.fork(original.meta.id, {
+    provider,
+    providerId: provider.id,
+    approval: "suggest",
+    effort: null,
+  });
+  assert.ok("session" in forked);
+  assert.equal(forked.session.effort, null);
+  assert.equal(forked.session.meta.effort, null);
+  assert.equal(saved.get(forked.session.meta.id).meta.effort, null);
+  secondHub.releaseAll();
+});

@@ -67,8 +67,8 @@ export interface ServeSession {
   /** Tool Promises still physically in flight after a logical deadline/cancel boundary. */
   pendingToolRuns: number;
   abort: AbortController | null; // in-flight turn/compaction interrupt handle
-  /** per-session thinking dial override (set via session.set-model) — informational; the provider carries it */
-  effort?: string;
+  /** Per-session thinking dial. `null` freezes provider/model automatic; `undefined` is legacy inherit. */
+  effort?: string | null;
 }
 
 /** Embedders predating Space metadata may still pass only a profile id. Treat every non-default route
@@ -104,7 +104,7 @@ export class SessionHub {
     }
   }
 
-  create(o: { cwd: string; profileId?: string; spaceId?: string; provider: Provider; providerId: string; model: string; approval: ApprovalMode; projectContext?: string; agentRef?: string }): ServeSession {
+  create(o: { cwd: string; profileId?: string; spaceId?: string; provider: Provider; providerId: string; model: string; effort?: string | null; approval: ApprovalMode; projectContext?: string; agentRef?: string }): ServeSession {
     const profileId = o.profileId ?? "personal";
     const meta: SessionMeta = {
       id: newSessionId(),
@@ -119,11 +119,12 @@ export class SessionHub {
       createdAt: new Date().toISOString(),
       updatedAt: "",
       source: "interactive", // serve sessions are user-driven (desktop/IDE clients)
+      ...(o.effort !== undefined ? { effort: o.effort } : {}),
       ...(o.agentRef ? { agentRef: o.agentRef } : {}),
     };
     const lock = this.store.acquire(meta.id); // fresh UUID, but filesystem errors must still fail closed
     if (!lock.ok) throw new Error(`could not acquire session lock for ${meta.id}${lock.pid ? ` (held by pid ${lock.pid})` : ""}`);
-    const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, durable: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null };
+    const s: ServeSession = { meta, history: [], provider: o.provider, approval: o.approval, autoApprove: new Set(), stats: { input: 0, output: 0 }, projectContext: o.projectContext, continuationSession: false, durable: false, busy: false, configuring: false, pendingProviderTurns: 0, pendingToolRuns: 0, abort: null, effort: o.effort };
     try {
       this.sessions.set(meta.id, s);
       return s;
@@ -336,6 +337,8 @@ export class SessionHub {
       profileId?: string;
       spaceId?: string;
       model?: string;
+      /** Frozen default for the new fork. `null` means provider/model automatic. */
+      effort?: string | null;
       provider: Provider;
       providerId: string;
       approval: ApprovalMode;
@@ -373,7 +376,11 @@ export class SessionHub {
       source: "interactive",
       ...(src.meta.workingSet ? { workingSet: [...src.meta.workingSet] } : {}),
       ...(src.meta.todos ? { todos: src.meta.todos.map((todo) => ({ ...todo, ...(todo.blockedBy ? { blockedBy: [...todo.blockedBy] } : {}) })) } : {}),
-      ...(preservesRoute && src.meta.effort ? { effort: src.meta.effort } : {}),
+      ...(o.effort !== undefined
+        ? { effort: o.effort }
+        : preservesRoute && src.meta.effort !== undefined
+          ? { effort: src.meta.effort }
+          : {}),
       ...(targetProfileId === sourceProfileId && targetSpaceId === sourceSpaceId && src.meta.agentRef
         ? { agentRef: src.meta.agentRef }
         : {}),
@@ -402,7 +409,7 @@ export class SessionHub {
       pendingProviderTurns: 0,
       pendingToolRuns: 0,
       abort: null,
-      effort: preservesRoute ? src.meta.effort : undefined,
+      effort: o.effort !== undefined ? o.effort : preservesRoute ? src.meta.effort : undefined,
     };
     try {
       this.sessions.set(meta.id, s);

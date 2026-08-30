@@ -46,6 +46,11 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
       model: "deepseek-v4-pro",
       available_models: ["deepseek-v4-pro"],
       thinking_efforts: ["off", "low", "high", "max"],
+      model_capabilities: [{
+        model: "deepseek-v4-pro",
+        thinking_efforts: ["off", "low", "high", "max"],
+      }],
+      default_reasoning_effort: "high",
       expires_at: "2026-01-08T00:00:00Z",
       service_bindings: [{
         tenant_id: "tenant-1",
@@ -68,6 +73,11 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
   assert.equal(e.deviceId, "d1");
   assert.deepEqual(e.availableModels, ["deepseek-v4-pro"]);
   assert.deepEqual(e.thinkingEfforts, ["off", "low", "high", "max"]);
+  assert.deepEqual(e.modelCapabilities, [{
+    model: "deepseek-v4-pro",
+    thinkingEfforts: ["off", "low", "high", "max"],
+  }]);
+  assert.equal(e.defaultReasoningEffort, "high");
   assert.equal(e.expiresAt, "2026-01-08T00:00:00.000Z");
   assert.equal(e.tokenNeverExpires, false);
   assert.deepEqual(e.serviceBindings, [{
@@ -111,9 +121,27 @@ test("parseEnrollResponse: snake_case + camelCase, trims slash, validates expiry
     () => parseEnrollResponse("https://gw", {
       device_token: "t1",
       model: "deepseek-v4-pro",
-      thinking_efforts: ["xhigh"],
+      thinking_efforts: ["ultra"],
     }, "t"),
     /invalid thinking_efforts/,
+  );
+  assert.throws(
+    () => parseEnrollResponse("https://gw", {
+      device_token: "t1",
+      model: "deepseek-v4-pro",
+      available_models: ["deepseek-v4-pro"],
+      model_capabilities: [{ model: "other", thinking_efforts: ["high"] }],
+    }, "t"),
+    /invalid model_capabilities/,
+  );
+  assert.throws(
+    () => parseEnrollResponse("https://gw", {
+      device_token: "t1",
+      model: "deepseek-v4-pro",
+      thinking_efforts: ["off", "low", "high", "max"],
+      default_reasoning_effort: "medium",
+    }, "t"),
+    /not supported/,
   );
   assert.throws(
     () => parseEnrollResponse("https://gw", {
@@ -301,6 +329,11 @@ test("profile-native enrollment stores only the scoped token in private profiles
         model: "deepseek-v4-pro",
         available_models: ["deepseek-v4-pro"],
         thinking_efforts: ["off", "low", "high", "max"],
+        model_capabilities: [{
+          model: "deepseek-v4-pro",
+          thinking_efforts: ["off", "low", "high", "max"],
+        }],
+        default_reasoning_effort: "high",
         expires_at: "2099-01-01T00:00:00Z",
         desk: {
           url: "https://desk.example.test",
@@ -326,6 +359,11 @@ test("profile-native enrollment stores only the scoped token in private profiles
         model: "deepseek-v4-pro",
         available_models: ["deepseek-v4-flash", "deepseek-v4-pro"],
         thinking_efforts: ["off", "low", "high", "max"],
+        model_capabilities: [
+          { model: "deepseek-v4-flash", thinking_efforts: ["off", "low", "high", "max"] },
+          { model: "deepseek-v4-pro", thinking_efforts: ["off", "low", "high", "max"] },
+        ],
+        default_reasoning_effort: "low",
         expires_at: null,
       }));
     } else {
@@ -349,6 +387,11 @@ test("profile-native enrollment stores only the scoped token in private profiles
     assert.equal(storedProfile?.deviceToken, "scoped-device-token");
     assert.deepEqual(storedProfile?.availableModels, ["deepseek-v4-flash", "deepseek-v4-pro"]);
     assert.deepEqual(storedProfile?.thinkingEfforts, ["off", "low", "high", "max"]);
+    assert.deepEqual(storedProfile?.modelCapabilities, [
+      { model: "deepseek-v4-flash", thinkingEfforts: ["off", "low", "high", "max"] },
+      { model: "deepseek-v4-pro", thinkingEfforts: ["off", "low", "high", "max"] },
+    ]);
+    assert.equal(storedProfile?.defaultReasoningEffort, "low");
     assert.equal(storedProfile?.tokenExpiresAt, undefined, "a heartbeat can replace a finite expiry with explicit permanent access");
     assert.equal(storedProfile?.tokenNeverExpires, true);
     assert.deepEqual(storedProfile?.serviceBindings, [{
@@ -461,7 +504,7 @@ test("syncOrgRoles: pulls /v1/roles → ~/.hara/org-roles/*.md, maps snake→cam
   const prev = process.env.HOME;
   process.env.HOME = home;
   let rolesAuth = null;
-  let bundle = { version: 7, org_policy: { requireApprovalForWrites: true }, roles: [{ name: "auditor", description: "reviews PRs", owns: ["review", "audit"], rejects: ["implement"], model: "glm-5", allow_tools: ["read_file", "bash"], system: "You are the auditor." }] };
+  let bundle = { version: 7, org_policy: { requireApprovalForWrites: true }, roles: [{ name: "auditor", description: "reviews PRs", owns: ["review", "audit"], rejects: ["implement"], model: "glm-5", reasoning_effort: "high", allow_tools: ["read_file", "bash"], system: "You are the auditor." }] };
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (d) => (body += d));
@@ -492,6 +535,7 @@ test("syncOrgRoles: pulls /v1/roles → ~/.hara/org-roles/*.md, maps snake→cam
     const md = readFileSync(join(dir, "auditor.md"), "utf8");
     assert.match(md, /allowTools: \[read_file, bash\]/, "allow_tools → allowTools");
     assert.match(md, /owns: \[review, audit\]/);
+    assert.match(md, /reasoning-effort: high/);
     assert.match(md, /You are the auditor\./);
     const policy = JSON.parse(readFileSync(join(dir, "_policy.json"), "utf8"));
     assert.equal(policy.version, 7);
@@ -502,6 +546,7 @@ test("syncOrgRoles: pulls /v1/roles → ~/.hara/org-roles/*.md, maps snake→cam
     assert.deepEqual(role.allowTools, ["read_file", "bash"]);
     assert.deepEqual(role.owns, ["review", "audit"]);
     assert.equal(role.model, "glm-5");
+    assert.equal(role.reasoningEffort, "high");
     // authoritative replace: server drops the role → next sync removes it locally (the _policy sidecar isn't a role)
     bundle = { version: 8, org_policy: {}, roles: [] };
     assert.equal(await syncOrgRoles(), 0, "empty bundle → 0 roles");

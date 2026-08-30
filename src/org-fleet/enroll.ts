@@ -39,6 +39,7 @@ import {
   DEFAULT_ORG_ID,
   isValidProfileId,
   spaceIdForProfile,
+  type GatewayModelCapability,
   type Profile,
 } from "../profile/profile.js";
 import {
@@ -73,6 +74,10 @@ export interface Enrollment {
   availableModels?: string[];
   /** Thinking controls accepted by the selected managed model. Legacy servers omit this field. */
   thinkingEfforts?: string[];
+  /** Per-model reasoning controls from modern Controls. */
+  modelCapabilities?: GatewayModelCapability[];
+  /** Company-admin default for new chats/tasks/Agents; absent means model automatic. */
+  defaultReasoningEffort?: string;
   baseURL?: string; // explicit OpenAI-compatible base; defaults to <gatewayUrl>/v1
   enrolledAt: string;
   /** Device-token expiry shared by Hara Control and the model gateway. Missing on legacy servers. */
@@ -101,7 +106,7 @@ const ROLE_BUNDLE_REQUEST_TIMEOUT_MS = 20_000;
 const MAX_LEARNING_RESPONSE_BYTES = 2 * 1024 * 1024;
 const LEARNING_REQUEST_TIMEOUT_MS = 20_000;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
-const THINKING_EFFORTS = new Set(["off", "low", "medium", "high", "max"]);
+const THINKING_EFFORTS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const loopbackHostname = (hostname: string): boolean => hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 
 const deviceInfo = (): { name: string; os: string; hara_version: string } => ({ name: hostname(), os: platform(), hara_version: process.env.HARA_BUILD_VERSION ?? "dev" });
@@ -187,6 +192,8 @@ export function loadEnrollment(): Enrollment | null {
         model: ap.defaultModel || "",
         availableModels: ap.availableModels,
         thinkingEfforts: ap.thinkingEfforts,
+        modelCapabilities: ap.modelCapabilities,
+        defaultReasoningEffort: ap.defaultReasoningEffort,
         baseURL: ap.baseURL,
         enrolledAt: ap.enrolledAt || new Date().toISOString(),
         expiresAt: ap.tokenExpiresAt,
@@ -229,6 +236,56 @@ function inferredGatewayThinkingEfforts(model: string): string[] {
   return /^(?:deepseek-v4-(?:flash|pro|flash-vision-exp)|deepseek-(?:chat|reasoner|pro))$/i.test(model)
     ? ["off", "low", "high", "max"]
     : [];
+}
+
+function parseModelCapabilities(
+  value: unknown,
+  availableModels: readonly string[],
+): GatewayModelCapability[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.length > 64) {
+    throw new Error("enroll response contains invalid model_capabilities");
+  }
+  const seen = new Set<string>();
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error("enroll response contains invalid model_capabilities");
+    }
+    const record = entry as Record<string, unknown>;
+    const model = record.model ?? record.id;
+    if (
+      typeof model !== "string"
+      || !availableModels.includes(model)
+      || seen.has(model)
+    ) {
+      throw new Error("enroll response contains invalid model_capabilities");
+    }
+    seen.add(model);
+    const thinkingEfforts = parseAdvertisedStringList(
+      record.thinking_efforts ?? record.thinkingEfforts,
+      "model_capabilities.thinking_efforts",
+      { maxItems: THINKING_EFFORTS.size, maxLength: 16, allowed: THINKING_EFFORTS },
+    ) ?? [];
+    return { model, thinkingEfforts };
+  });
+}
+
+function parseDefaultReasoningEffort(
+  value: unknown,
+  model: string,
+  modelCapabilities: readonly GatewayModelCapability[] | undefined,
+  sharedEfforts: readonly string[],
+): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || !THINKING_EFFORTS.has(value)) {
+    throw new Error("enroll response contains an invalid default_reasoning_effort");
+  }
+  const supported = modelCapabilities?.find((capability) => capability.model === model)?.thinkingEfforts
+    ?? sharedEfforts;
+  if (!supported.includes(value)) {
+    throw new Error("enroll response default_reasoning_effort is not supported by its default model");
+  }
+  return value;
 }
 
 function parseDeskBinding(value: unknown): DeskCreds | undefined {
@@ -326,6 +383,16 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     "thinking_efforts",
     { maxItems: THINKING_EFFORTS.size, maxLength: 16, allowed: THINKING_EFFORTS },
   ) ?? inferredGatewayThinkingEfforts(rawModel);
+  const modelCapabilities = parseModelCapabilities(
+    j.model_capabilities ?? j.modelCapabilities,
+    availableModels,
+  );
+  const defaultReasoningEffort = parseDefaultReasoningEffort(
+    j.default_reasoning_effort ?? j.defaultReasoningEffort,
+    rawModel,
+    modelCapabilities,
+    thinkingEfforts,
+  );
   const hasExpiry = Object.hasOwn(j, "expires_at") || Object.hasOwn(j, "expiresAt");
   const rawExpiresAt = Object.hasOwn(j, "expires_at") ? j.expires_at : j.expiresAt;
   let expiresAt: string | undefined;
@@ -348,6 +415,8 @@ export function parseEnrollResponse(gatewayUrl: string, j: Record<string, unknow
     model: rawModel,
     availableModels,
     thinkingEfforts,
+    modelCapabilities,
+    defaultReasoningEffort,
     baseURL: normalizeGatewayBaseUrl(j.base_url ?? j.baseURL),
     enrolledAt: now,
     expiresAt,
@@ -440,6 +509,8 @@ export function gatewayProfileFromEnrollment(id: string, label: string | undefin
     defaultModel: e.model || "",
     availableModels: e.availableModels ?? (e.model ? [e.model] : []),
     thinkingEfforts: e.thinkingEfforts,
+    modelCapabilities: e.modelCapabilities,
+    defaultReasoningEffort: e.defaultReasoningEffort,
     enrolledAt: e.enrolledAt,
     tokenExpiresAt: e.expiresAt,
     tokenNeverExpires: e.tokenNeverExpires,
@@ -510,6 +581,8 @@ export function enrollmentFromProfile(profile: Profile): Enrollment | null {
     model: profile.defaultModel || "",
     availableModels: profile.availableModels,
     thinkingEfforts: profile.thinkingEfforts,
+    modelCapabilities: profile.modelCapabilities,
+    defaultReasoningEffort: profile.defaultReasoningEffort,
     baseURL: profile.baseURL,
     enrolledAt: profile.enrolledAt || new Date(0).toISOString(),
     expiresAt: profile.tokenExpiresAt,
@@ -540,6 +613,26 @@ function updatedEnrollmentFromHeartbeat(e: Enrollment, body: Record<string, unkn
     "thinking_efforts",
     { maxItems: THINKING_EFFORTS.size, maxLength: 16, allowed: THINKING_EFFORTS },
   );
+  const advertisedCapabilities = parseModelCapabilities(
+    body.model_capabilities ?? body.modelCapabilities,
+    availableModels,
+  );
+  const modelCapabilities = advertisedCapabilities
+    ?? e.modelCapabilities?.filter((capability) => availableModels.includes(capability.model));
+  const thinkingEfforts = advertisedEfforts ?? e.thinkingEfforts ?? inferredGatewayThinkingEfforts(model);
+  const hasDefaultReasoningEffort = Object.hasOwn(body, "default_reasoning_effort")
+    || Object.hasOwn(body, "defaultReasoningEffort");
+  const rawDefaultReasoningEffort = Object.hasOwn(body, "default_reasoning_effort")
+    ? body.default_reasoning_effort
+    : body.defaultReasoningEffort;
+  const defaultReasoningEffort = hasDefaultReasoningEffort
+    ? parseDefaultReasoningEffort(
+        rawDefaultReasoningEffort,
+        model,
+        modelCapabilities,
+        thinkingEfforts,
+      )
+    : e.defaultReasoningEffort;
   const hasExpiry = Object.hasOwn(body, "expires_at") || Object.hasOwn(body, "expiresAt");
   const rawExpiresAt = Object.hasOwn(body, "expires_at") ? body.expires_at : body.expiresAt;
   let expiresAt = e.expiresAt;
@@ -558,7 +651,9 @@ function updatedEnrollmentFromHeartbeat(e: Enrollment, body: Record<string, unkn
     ...e,
     model,
     availableModels,
-    thinkingEfforts: advertisedEfforts ?? e.thinkingEfforts ?? inferredGatewayThinkingEfforts(model),
+    thinkingEfforts,
+    modelCapabilities,
+    defaultReasoningEffort,
     expiresAt,
     tokenNeverExpires,
   };
@@ -585,6 +680,8 @@ function persistHeartbeatCatalog(e: Enrollment, persistence: HeartbeatPersistenc
     ...(selected ? { model: selected } : { model: undefined }),
     availableModels: e.availableModels,
     thinkingEfforts: e.thinkingEfforts,
+    modelCapabilities: e.modelCapabilities,
+    defaultReasoningEffort: e.defaultReasoningEffort,
     tokenExpiresAt: e.expiresAt,
     tokenNeverExpires: e.tokenNeverExpires,
   });
@@ -650,13 +747,14 @@ export async function heartbeat(signal?: AbortSignal): Promise<boolean> {
 // convention); we map them to the camelCase frontmatter keys the CLI role loader expects.
 
 /** Render one bundle role into the markdown frontmatter the CLI role loader expects
- *  (src/org/roles.ts parseFrontmatter): name/description/owns/rejects/model/allowTools/denyTools, body=system. */
+ *  (src/org/roles.ts parseFrontmatter): identity, execution defaults, tool policy, body=system. */
 function renderRoleMd(r: OrganizationBundleRole): string {
   const fm: string[] = ["---", `name: ${r.name}`];
   if (r.description) fm.push(`description: ${r.description}`);
   if (r.owns?.length) fm.push(`owns: [${r.owns.join(", ")}]`);
   if (r.rejects?.length) fm.push(`rejects: [${r.rejects.join(", ")}]`);
   if (r.model) fm.push(`model: ${r.model}`);
+  if (r.reasoning_effort) fm.push(`reasoning-effort: ${r.reasoning_effort}`);
   if (r.allow_tools?.length) fm.push(`allowTools: [${r.allow_tools.join(", ")}]`); // snake_case wire → camelCase fm
   if (r.deny_tools?.length) fm.push(`denyTools: [${r.deny_tools.join(", ")}]`);
   fm.push("---", "", (r.system || "").trim(), "");

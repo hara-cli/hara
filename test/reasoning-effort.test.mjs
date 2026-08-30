@@ -22,6 +22,10 @@ test("anthropic: low → enabled with small budget (4096)", () => {
   assert.deepEqual(buildThinkingParam("claude-sonnet-4-6", "low"), { type: "enabled", budget_tokens: 4096 });
 });
 
+test("anthropic: minimal → enabled with the smallest Hara budget (2048)", () => {
+  assert.deepEqual(buildThinkingParam("claude-sonnet-4-6", "minimal"), { type: "enabled", budget_tokens: 2048 });
+});
+
 test("anthropic: medium → adaptive (balanced default)", () => {
   assert.deepEqual(buildThinkingParam("claude-sonnet-4-6", "medium"), { type: "adaptive" });
 });
@@ -93,9 +97,12 @@ test("deepseek style: NOT gated on isReasoningModel — applies even to a bare m
   assert.deepEqual(reasoningParams("deepseek", "high", "deepseek-chat"), { thinking: { type: "enabled" }, reasoning_effort: "high" });
 });
 
-test("reasoning_effort style: max clamps to OpenAI's ceiling 'high' (OpenAI has no max)", () => {
+test("reasoning_effort style follows each OpenAI model's documented levels", () => {
   assert.deepEqual(reasoningParams("reasoning_effort", "max", "gpt-5"), { reasoning_effort: "high" });
   assert.deepEqual(reasoningParams("reasoning_effort", "off", "gpt-5"), { reasoning_effort: "minimal" });
+  assert.deepEqual(reasoningParams("reasoning_effort", "off", "gpt-5.4"), { reasoning_effort: "none" });
+  assert.deepEqual(reasoningParams("reasoning_effort", "xhigh", "gpt-5.4"), { reasoning_effort: "xhigh" });
+  assert.deepEqual(reasoningParams("reasoning_effort", "max", "gpt-5.6"), { reasoning_effort: "max" });
   assert.deepEqual(reasoningParams("reasoning_effort", "high", "gpt-4o"), {}, "non-reasoning model → no field");
 });
 

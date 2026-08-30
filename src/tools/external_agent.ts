@@ -14,6 +14,7 @@ import { capHeadTail } from "./builtin.js";
 import { loadConfig } from "../config.js";
 import type { SandboxMode } from "../sandbox.js";
 import {
+  createBoundedToolNoticeEmitter,
   createToolOutputLineRedactor,
   redactToolSubprocessOutput,
   terminateSubprocessTree,
@@ -198,8 +199,11 @@ registerTool({
       let forceIssued = false;
       let closeBeforeForce = false;
       let cancelTermination: ((cancelForce?: boolean) => void) | undefined;
-      const liveOut = ctx.ui ? createToolOutputLineRedactor((line) => ctx.ui!.notice(line.replace(/\r?\n$/, ""))) : null;
-      const liveErr = ctx.ui ? createToolOutputLineRedactor((line) => ctx.ui!.notice(line.replace(/\r?\n$/, ""))) : null;
+      const liveNotice = ctx.ui
+        ? createBoundedToolNoticeEmitter((line) => ctx.ui!.notice(line.replace(/\r?\n$/, "")))
+        : null;
+      const liveOut = liveNotice ? createToolOutputLineRedactor(liveNotice) : null;
+      const liveErr = liveNotice ? createToolOutputLineRedactor(liveNotice) : null;
       const finish = (s: string): void => {
         if (done) return;
         done = true;

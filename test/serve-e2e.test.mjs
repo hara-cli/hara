@@ -1556,6 +1556,92 @@ test("serve e2e: models.list honors a persisted session profile before that sess
   }
 });
 
+test("serve e2e: new sessions freeze the connection reasoning default and automatic across restarts", { timeout: 15000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-reasoning-default-freeze-"));
+  const store = memStore();
+  const providerBuilds = [];
+  let defaultReasoningEffort = "high";
+  const providerFor = (model) => ({ ...textProvider, model });
+  const deps = {
+    ...baseDeps(providerFor("qwen3.8-flash"), store),
+    buildSessionProvider: async () => providerFor("qwen3.8-flash"),
+    buildProviderFor: async (model, effort) => {
+      providerBuilds.push({ model, effort });
+      return providerFor(model);
+    },
+    listModels: async () => ["qwen3.8-flash"],
+    runtimeInfo: (_cwd, model) => ({
+      providerId: "token-plan",
+      model: model ?? "qwen3.8-flash",
+      profileId: "personal",
+      profileKind: "byok",
+      spaceId: "personal",
+      defaultReasoningEffort,
+      effortLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+      availableModels: ["qwen3.8-flash"],
+    }),
+  };
+
+  let firstServer;
+  let firstClient;
+  let secondServer;
+  let secondClient;
+  try {
+    firstServer = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+    firstClient = await connect(firstServer.port);
+    await firstClient.call("initialize", { token: "tok" });
+    const explicit = await firstClient.call("session.create", {});
+    await firstClient.call("session.send", { sessionId: explicit.result.sessionId, text: "freeze high" });
+    const listed = await firstClient.call("models.list", { sessionId: explicit.result.sessionId });
+    assert.equal(listed.result.defaultModel, "qwen3.8-flash");
+    assert.equal(listed.result.defaultReasoningEffort, "high");
+    assert.equal(listed.result.effort, "high");
+
+    defaultReasoningEffort = undefined;
+    const automatic = await firstClient.call("session.create", {});
+    await firstClient.call("session.send", { sessionId: automatic.result.sessionId, text: "freeze automatic" });
+    assert.equal(store.saved.get(automatic.result.sessionId).meta.effort, null);
+
+    firstClient.close();
+    firstClient = undefined;
+    await firstServer.close();
+    firstServer = undefined;
+    defaultReasoningEffort = "low";
+
+    secondServer = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+    secondClient = await connect(secondServer.port);
+    await secondClient.call("initialize", { token: "tok" });
+    await secondClient.call("session.resume", { sessionId: explicit.result.sessionId });
+    await secondClient.call("session.resume", { sessionId: automatic.result.sessionId });
+    assert.ok(
+      providerBuilds.some((build) => build.model === "qwen3.8-flash" && build.effort === "high"),
+      "the old explicit inherited default remains frozen",
+    );
+    assert.ok(
+      providerBuilds.some((build) => build.model === "qwen3.8-flash" && build.effort === null),
+      "provider automatic remains explicit instead of inheriting the later low default",
+    );
+    const forkBuildStart = providerBuilds.length;
+    const forkedAutomatic = await secondClient.call("session.fork", {
+      sessionId: automatic.result.sessionId,
+    });
+    assert.equal(forkedAutomatic.error, undefined);
+    assert.equal(store.saved.get(forkedAutomatic.result.sessionId).meta.effort, null);
+    const forkBuilds = providerBuilds.slice(forkBuildStart);
+    assert.ok(forkBuilds.length > 0);
+    assert.ok(
+      forkBuilds.every((build) => build.effort === null),
+      "forking a provider-automatic session must not inherit a newer connection default",
+    );
+  } finally {
+    firstClient?.close();
+    secondClient?.close();
+    if (firstServer) await firstServer.close();
+    if (secondServer) await secondServer.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: managed gateway enforces its model scope and advertised DeepSeek thinking levels", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-managed-model-scope-"));
   const store = memStore();

@@ -257,7 +257,11 @@ test("Token Plan request carries the selected reasoning level without OpenAI-onl
     }).turn({ system: "test", history: [{ role: "user", content: "ping" }], tools: [], onText() {} });
 
     assert.equal(mock.requests.length, 1);
-    assert.deepEqual(mock.requests[0].body.reasoning, { effort: "max" });
+    assert.deepEqual(
+      mock.requests[0].body.reasoning,
+      { effort: "max" },
+      "qwen3.8-max preserves the documented maximum reasoning level",
+    );
     assert.equal(mock.requests[0].body.previous_response_id, undefined);
     assert.equal(mock.requests[0].body.conversation, undefined);
     assert.equal(mock.requests[0].body.store, false);
@@ -268,7 +272,7 @@ test("Token Plan request carries the selected reasoning level without OpenAI-onl
   }
 });
 
-test("Token Plan off sends only enable_thinking=false so reasoning cannot override it", async () => {
+test("Token Plan off uses the Responses-native none level", async () => {
   const mock = await listen([completed([], {
     input_tokens: 2,
     output_tokens: 1,
@@ -286,8 +290,8 @@ test("Token Plan off sends only enable_thinking=false so reasoning cannot overri
     }).turn({ system: "test", history: [{ role: "user", content: "classify" }], tools: [], onText() {} });
 
     assert.equal(mock.requests.length, 1);
-    assert.equal(mock.requests[0].body.enable_thinking, false);
-    assert.equal(mock.requests[0].body.reasoning, undefined, "reasoning would take precedence and must be omitted");
+    assert.equal(mock.requests[0].body.enable_thinking, undefined);
+    assert.deepEqual(mock.requests[0].body.reasoning, { effort: "none" });
     assert.equal(mock.requests[0].body.store, false, "Hara owns durable history locally");
     assert.equal(mock.requests[0].sessionCache, "enable");
   } finally {

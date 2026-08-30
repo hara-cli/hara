@@ -58,6 +58,7 @@ test("serve persists Agent identity, lists offices, and runs the selected person
   const roles = join(home, ".hara", "roles");
   const previousHome = process.env.HOME;
   const observedSystems = [];
+  const observedProviderBuilds = [];
   let handle;
   let client;
   try {
@@ -125,13 +126,17 @@ test("serve persists Agent identity, lists offices, and runs the selected person
         providerId: "fake",
         model: "fake-main",
         buildSessionProvider: async () => providerFor("fake-main"),
-        buildProviderFor: async (model) => providerFor(model),
+        buildProviderFor: async (model, effort) => {
+          observedProviderBuilds.push({ model, effort });
+          return providerFor(model);
+        },
         runtimeInfo: (_cwd, model) => ({
           providerId: "fake",
           model: model ?? "fake-main",
           profileId: "personal",
           spaceId: "personal",
-          effortLevels: [],
+          effortLevels: ["low", "high"],
+          defaultReasoningEffort: "low",
         }),
         spawnSubagent: async () => "disabled",
         sandbox: "off",
@@ -184,11 +189,19 @@ test("serve persists Agent identity, lists offices, and runs the selected person
         accent: "#4f9c8f",
         character: "architect",
       },
+      execution: {
+        model: "fake-role",
+        reasoningEffort: "high",
+      },
     });
     assert.equal(updatedProfile.result.agent.identity.displayName, "Ada Lin");
+    assert.equal(updatedProfile.result.agent.model, "fake-role");
+    assert.equal(updatedProfile.result.agent.reasoningEffort, "high");
     assert.notEqual(updatedProfile.result.agent.revision, architect.revision);
     const updatedRoleText = readFileSync(join(roles, "architect.md"), "utf8");
     assert.match(updatedRoleText, /display-name: "Ada Lin"/);
+    assert.match(updatedRoleText, /^model: "fake-role"$/m);
+    assert.match(updatedRoleText, /^reasoning-effort: "high"$/m);
     assert.match(updatedRoleText, /YOU ARE THE ARCHITECT PERSONA/);
     const staleUpdate = await client.call("agents.update-profile", {
       ref: "global:architect",
@@ -197,6 +210,17 @@ test("serve persists Agent identity, lists offices, and runs the selected person
       profile: { displayName: "Stale overwrite" },
     });
     assert.equal(staleUpdate.error.code, -32005);
+
+    const mainAgent = catalog.result.agents.find((agent) => agent.ref === "main");
+    const rejectedMainExecution = await client.call("agents.update-profile", {
+      ref: "main",
+      expectedRevision: mainAgent.revision,
+      cwd: workspace,
+      profile: { displayName: mainAgent.identity.displayName },
+      execution: { reasoningEffort: "high" },
+    });
+    assert.equal(rejectedMainExecution.error.code, -32602);
+    assert.match(rejectedMainExecution.error.message, /follows the active Space defaults/);
 
     const hireInput = {
       id: "product-designer",
@@ -366,6 +390,10 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     assert.equal(created.result.agentRef, "global:architect");
     assert.equal(created.result.spaceId, "personal");
     assert.equal(created.result.model, "fake-role");
+    assert.ok(
+      observedProviderBuilds.some((build) => build.model === "fake-role" && build.effort === "high"),
+      "the selected Agent must build its provider with the Agent reasoning override",
+    );
     const sessionId = created.result.sessionId;
     const sent = await client.call("session.send", { sessionId, text: "hello" });
     assert.equal(sent.result.reply, "done");
