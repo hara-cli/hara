@@ -27,8 +27,11 @@ const {
   removePin,
   unpinResolvedProjectProfile,
   removeProfile,
+  removeHistoricalPersonalRoutes,
+  syncStoredPersonalProfile,
   useProfile,
 } = await import("../dist/profile/profile.js");
+const { clearPersonalProviderConfig } = await import("../dist/config.js");
 after(() => {
   if (originalTrustProjectConfig === undefined) delete process.env.HARA_TRUST_PROJECT_CONFIG;
   else process.env.HARA_TRUST_PROJECT_CONFIG = originalTrustProjectConfig;
@@ -130,7 +133,7 @@ test("profiles.json active is authoritative and stale config profile selectors a
   });
 });
 
-test("profiles registry safely restores a missing reserved personal row without changing a named connection", () => {
+test("profiles registry restores Personal without rewriting an existing named CLI route", () => {
   withHome((home) => {
     const haraHome = join(home, ".hara");
     const profilesPath = join(haraHome, "profiles.json");
@@ -155,14 +158,76 @@ test("profiles registry safely restores a missing reserved personal row without 
     process.chdir(home);
     const profiles = listProfiles();
     assert.deepEqual(profiles.map((profile) => profile.id), ["personal", "aliyun-token-plan"]);
-    assert.equal(resolveActive().id, "aliyun-token-plan", "the named active route is preserved");
+    assert.equal(resolveActive().id, "aliyun-token-plan", "the existing CLI route remains selectable for compatibility");
 
     const stored = JSON.parse(readFileSync(profilesPath, "utf8"));
     assert.equal(stored.active, "aliyun-token-plan");
     assert.equal(stored.profiles[1].apiKey, "named-token-plan-key", "the existing credential is byte-for-byte preserved");
     assert.equal(stored.profiles[1].defaultModel, "qwen3.8-flash");
     assert.equal(stored.profiles[0].id, "personal");
-    assert.equal(stored.profiles[0].apiKey, "personal-config-key", "Personal remains backed by config.json");
+    assert.equal(stored.profiles[0].apiKey, "personal-config-key", "the config-backed route is not silently overwritten");
+    const config = JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8"));
+    assert.equal(config.provider, "openai");
+    assert.equal(config.model, "personal-model");
+    assert.equal(config.apiKey, "personal-config-key");
+  });
+});
+
+test("clearing the duplicated 0.156.0 Personal shape removes every compatibility credential", () => {
+  withHome((home) => {
+    const haraHome = join(home, ".hara");
+    const profilesPath = join(haraHome, "profiles.json");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "qwen",
+      apiKey: "stale-personal-key",
+      model: "glm-5.2",
+    }, null, 2) + "\n", { mode: 0o600 });
+    writeFileSync(profilesPath, JSON.stringify({
+      active: "aliyun-token-plan",
+      profiles: [
+        {
+          id: "personal",
+          kind: "byok",
+          label: "Personal",
+          provider: "qwen",
+          apiKey: "stale-personal-key",
+          defaultModel: "glm-5.2",
+        },
+        {
+          id: "aliyun-token-plan",
+          kind: "byok",
+          label: "Alibaba Token Plan",
+          provider: "token-plan",
+          apiKey: "current-token-plan-key",
+          baseURL: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+          defaultModel: "deepseek-v4-pro",
+        },
+      ],
+    }, null, 2) + "\n", { mode: 0o600 });
+
+    process.chdir(home);
+    assert.equal(resolveActive().id, "aliyun-token-plan");
+    const config = JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8"));
+    assert.equal(config.provider, "qwen");
+    assert.equal(config.model, "glm-5.2");
+    assert.equal(config.apiKey, "stale-personal-key");
+    const stored = JSON.parse(readFileSync(profilesPath, "utf8"));
+    assert.equal(stored.active, "aliyun-token-plan");
+    assert.equal(stored.profiles.find((profile) => profile.id === "aliyun-token-plan").apiKey, "current-token-plan-key");
+
+    assert.equal(removeHistoricalPersonalRoutes(), 1);
+    clearPersonalProviderConfig();
+    syncStoredPersonalProfile();
+
+    const clearedConfig = JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8"));
+    assert.equal(Object.hasOwn(clearedConfig, "provider"), false);
+    assert.equal(Object.hasOwn(clearedConfig, "model"), false);
+    assert.equal(Object.hasOwn(clearedConfig, "apiKey"), false);
+    const clearedProfilesText = readFileSync(profilesPath, "utf8");
+    const clearedProfiles = JSON.parse(clearedProfilesText);
+    assert.deepEqual(clearedProfiles.profiles.map((profile) => profile.id), ["personal"]);
+    assert.equal(Object.hasOwn(clearedProfiles.profiles[0], "apiKey"), false);
+    assert.doesNotMatch(clearedProfilesText, /stale-personal-key|current-token-plan-key/);
   });
 });
 

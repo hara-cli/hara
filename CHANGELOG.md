@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.156.1 — 2026-08-30 — one Personal model connection
+
+- Present exactly one current model connection for Personal Space. Registries created by the short-lived
+  named-connection Desktop flow keep their exact internal route only for old-session compatibility; they no
+  longer appear as a second Personal identity or overwrite advanced CLI routes during ordinary reads.
+- Replace the Personal provider, endpoint, Key, or model in place. Saving while a company Space is active can
+  keep that company selected, while choosing Personal switches only future sessions; company Control
+  enrollments and their credentials remain independent.
+- Add an explicit clear action that keeps Personal Space and chat history but removes its current connection,
+  every retired compatibility credential, and the saved Key. Provider-specific environment credentials fail
+  closed with focused guidance instead of pretending they were deleted. Upgrade with
+  `npm i -g @nanhara/hara@0.156.1`.
+
 ## 0.156.0 — 2026-08-30 — Alibaba Responses and efficient message Flows
 
 - Fully align Alibaba Token Plan Agent models with the current Responses API. Qwen 3.8/3.7/3.6,

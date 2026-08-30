@@ -1,5 +1,33 @@
 # Errors
 
+## [ERR-20260830-NPM-PACK-CACHE-OWNERSHIP] Release pack checks must not depend on the shared npm cache
+
+**Logged**: 2026-08-30T10:20:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release verification
+
+### Summary
+
+`npm pack --dry-run` completed its build but failed when npm tried to open a root-owned temporary entry in
+the workstation's shared cache. The package was valid; cache ownership was unrelated user-machine state.
+
+### Resolution
+
+Do not use `sudo chown` as part of a release. Run packaging and registry verification with a task-private
+cache under the system temporary directory. The same 0.156.1 package dry-run then completed successfully.
+
+### Metadata
+
+- Source: command_failure
+- Reproducible: yes, with the affected shared cache
+- Related Files: package.json, package-lock.json
+- Tags: npm, cache, permissions, release
+- Pattern-Key: release.npm_pack_uses_task_private_cache
+- Recurrence-Count: 1
+
+---
+
 ## [ERR-20260829-NPM-AUDIT-MIRROR] Default npm mirror does not implement the audit endpoint
 
 **Logged**: 2026-08-29T04:14:00+08:00

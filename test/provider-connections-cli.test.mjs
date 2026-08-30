@@ -142,7 +142,7 @@ function waitForExit(child, timeoutMs = 5_000) {
   });
 }
 
-test("real serve keeps same-provider named personal connections independent and redacted", { timeout: 30_000 }, async () => {
+test("real serve exposes one replaceable Personal connection and keeps credentials redacted", { timeout: 30_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-provider-connections-cli-"));
   const home = join(root, "home");
   const project = join(root, "project");
@@ -163,6 +163,22 @@ test("real serve keeps same-provider named personal connections independent and 
     guardian: "off",
     updateCheck: false,
   }), { mode: 0o600 });
+  writeFileSync(profilesPath, `${JSON.stringify({
+    active: "legacy-openai",
+    profiles: [
+      { id: "personal", kind: "byok", label: "Personal", provider: "ollama", defaultModel: "qwen3" },
+      {
+        id: "legacy-openai",
+        kind: "byok",
+        label: "Legacy OpenAI",
+        provider: "openai",
+        model: "gpt-a",
+        defaultModel: "gpt-a",
+        baseURL: provider.baseURL,
+        apiKey: keyA,
+      },
+    ],
+  }, null, 2)}\n`, { mode: 0o600 });
 
   const childEnv = { ...process.env };
   for (const name of [
@@ -218,20 +234,26 @@ test("real serve keeps same-provider named personal connections independent and 
     assert.ok(initialized.result.capabilities.methods.includes("settings.providers.connections.create"));
 
     const initial = await client.call("settings.providers.list", {});
-    assert.equal(initial.result.current.profileId, "personal");
+    assert.equal(initial.result.current.profileId, "legacy-openai");
     assert.deepEqual(initial.result.connections.map((connection) => connection.id), ["personal"]);
+    assert.equal(initial.result.connections[0].model, "gpt-a");
+    assert.equal(initial.result.connections[0].active, true);
+    assert.equal(JSON.stringify(initial).includes(keyA), false, "the legacy current key is never echoed over RPC");
 
     const createdA = await client.call("settings.providers.connections.create", {
       id: "team-openai-a",
       label: "Team OpenAI A",
       provider: "openai",
-      model: "gpt-a",
+      model: "gpt-b",
       baseURL: provider.baseURL,
-      apiKey: keyA,
       activate: false,
     });
-    assert.equal(createdA.result.connections.find((connection) => connection.id === "team-openai-a").active, false);
+    assert.equal(createdA.result.current.profileId, "personal", "replacing the active legacy route canonicalizes the Personal slot");
+    assert.deepEqual(createdA.result.connections.map((connection) => connection.id), ["personal"]);
+    assert.equal(createdA.result.connections[0].model, "gpt-b");
+    assert.equal(createdA.result.connections[0].active, true);
     assert.equal(JSON.stringify(createdA).includes(keyA), false, "the first key is never echoed over RPC");
+    assert.equal(JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8")).apiKey, keyA, "same-endpoint replacement safely adopts the legacy saved key");
 
     const createdB = await client.call("settings.providers.connections.create", {
       id: "team-openai-b",
@@ -242,51 +264,56 @@ test("real serve keeps same-provider named personal connections independent and 
       apiKey: keyB,
       activate: true,
     });
-    assert.equal(createdB.result.current.profileId, "team-openai-b");
-    assert.equal(createdB.result.connections.filter((connection) => connection.provider === "openai").length, 2);
+    assert.equal(createdB.result.current.profileId, "personal");
+    assert.deepEqual(createdB.result.connections.map((connection) => connection.id), ["personal"]);
+    assert.equal(createdB.result.connections[0].model, "gpt-b");
     assert.equal(JSON.stringify(createdB).includes(keyB), false, "the second key is never echoed over RPC");
 
     const stored = JSON.parse(readFileSync(profilesPath, "utf8"));
-    assert.equal(stored.active, "team-openai-b");
-    assert.equal(stored.profiles.find((profile) => profile.id === "team-openai-a").apiKey, keyA);
-    assert.equal(stored.profiles.find((profile) => profile.id === "team-openai-b").apiKey, keyB);
+    assert.equal(stored.active, "personal");
+    assert.deepEqual(stored.profiles.map((profile) => profile.id), ["personal", "legacy-openai"]);
+    assert.equal(stored.profiles[1].archivedPersonalRoute, true, "old sessions retain a hidden compatibility route");
+    const personalConfig = JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8"));
+    assert.equal(personalConfig.provider, "openai");
+    assert.equal(personalConfig.model, "gpt-b");
+    assert.equal(personalConfig.apiKey, keyB);
     if (process.platform !== "win32") {
-      assert.equal(statSync(profilesPath).mode & 0o777, 0o600, "named credentials stay in the private profile store");
+      assert.equal(statSync(join(haraHome, "config.json")).mode & 0o777, 0o600, "the Personal credential stays private");
     }
 
-    const testedA = await client.call("settings.providers.connections.test", { id: "team-openai-a" });
-    assert.equal(testedA.result.ok, true);
-    assert.deepEqual(testedA.result.models, ["gpt-a", "gpt-b"]);
+    const testedPersonal = await client.call("settings.providers.connections.test", { id: "personal" });
+    assert.equal(testedPersonal.result.ok, true);
+    assert.deepEqual(testedPersonal.result.models, ["gpt-a", "gpt-b"]);
     assert.ok(provider.requests.length >= 2, "saved-connection testing probes models and a completion");
     assert.ok(
-      provider.requests.every((request) => request.authorization === `Bearer ${keyA}`),
-      "testing A uses A's saved credential even while B is active",
+      provider.requests.every((request) => request.authorization === `Bearer ${keyB}`),
+      "testing the Personal connection uses only its current saved credential",
     );
-    assert.equal(JSON.stringify(testedA).includes(keyA), false, "saved-connection testing never echoes its key");
+    assert.equal(JSON.stringify(testedPersonal).includes(keyB), false, "saved-connection testing never echoes its key");
 
-    const duplicate = await client.call("settings.providers.connections.create", {
+    const replacementWithoutKey = await client.call("settings.providers.connections.create", {
       id: "team-openai-a",
-      label: "Must Not Overwrite",
+      label: "Personal replacement",
       provider: "openai",
-      model: "gpt-overwrite",
-      apiKey: keyB,
+      model: "gpt-a",
+      baseURL: provider.baseURL,
       activate: true,
     });
-    assert.match(duplicate.error.message, /already exists/);
-    assert.equal(JSON.parse(readFileSync(profilesPath, "utf8")).profiles.find((profile) => profile.id === "team-openai-a").apiKey, keyA);
+    assert.equal(replacementWithoutKey.result.connections[0].model, "gpt-a");
+    assert.equal(JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8")).apiKey, keyB, "same-endpoint replacement reuses the current key");
 
-    const usedA = await client.call("settings.providers.connections.use", { id: "team-openai-a" });
-    assert.equal(usedA.result.current.profileId, "team-openai-a");
-    assert.equal(usedA.result.connections.find((connection) => connection.id === "team-openai-a").active, true);
+    const usedPersonal = await client.call("settings.providers.connections.use", { id: "personal" });
+    assert.equal(usedPersonal.result.current.profileId, "personal");
+    assert.equal(usedPersonal.result.connections[0].active, true);
 
-    const removedB = await client.call("settings.providers.connections.remove", { id: "team-openai-b" });
-    assert.equal(removedB.result.connections.some((connection) => connection.id === "team-openai-b"), false);
-    assert.equal(removedB.result.current.profileId, "team-openai-a");
-
-    const removedActive = await client.call("settings.providers.connections.remove", { id: "team-openai-a" });
-    assert.equal(removedActive.result.current.profileId, "personal");
-    assert.deepEqual(removedActive.result.connections.map((connection) => connection.id), ["personal"]);
-    assert.equal(readFileSync(profilesPath, "utf8").includes("sk-named-connection"), false);
+    const cleared = await client.call("settings.providers.connections.remove", { id: "personal" });
+    assert.equal(cleared.result.current.profileId, "personal");
+    assert.deepEqual(cleared.result.connections.map((connection) => connection.id), ["personal"]);
+    assert.equal(cleared.result.connections[0].keyConfigured, false);
+    assert.equal(readFileSync(join(haraHome, "config.json"), "utf8").includes("sk-named-connection"), false);
+    const clearedProfiles = readFileSync(profilesPath, "utf8");
+    assert.deepEqual(JSON.parse(clearedProfiles).profiles.map((profile) => profile.id), ["personal"]);
+    assert.equal(clearedProfiles.includes("sk-named-connection"), false, "clear removes compatibility credentials too");
 
     const socketClosed = new Promise((resolve) => client.ws.once("close", resolve));
     assert.deepEqual((await client.call("server.shutdown", {})).result, { accepted: true });

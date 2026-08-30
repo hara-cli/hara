@@ -101,6 +101,9 @@ export interface Profile {
    * without these fields. */
   createdAt?: string;
   updatedAt?: string;
+  /** Compatibility-only route retained so sessions created before the single-Personal-connection
+   * migration can still resume. It is never offered as another user-selectable Personal connection. */
+  archivedPersonalRoute?: boolean;
 }
 
 export interface ProfilesFile {
@@ -698,6 +701,66 @@ export function removeProfile(id: string): { ok: true; activeChanged: boolean; r
     }
     persistProfilesFile(state.value, state.snapshot.text);
     return { ok: true, activeChanged, removedKind: removed.kind, removed };
+  });
+}
+
+/** Remove every non-canonical BYOK route after the user explicitly clears their Personal model
+ * connection. Those rows exist only to let pre-migration sessions resume; clearing the connection is the
+ * explicit point at which retaining their credentials would violate the user's intent. */
+export function removeHistoricalPersonalRoutes(): number {
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const retained = state.value.profiles.filter((profile) => (
+      profile.kind !== "byok" || profile.id === PERSONAL_ID
+    ));
+    const removed = state.value.profiles.length - retained.length;
+    if (removed === 0) return 0;
+    state.value.profiles = retained;
+    if (!retained.some((profile) => profile.id === state.value.active)) {
+      state.value.active = PERSONAL_ID;
+    }
+    persistProfilesFile(state.value, state.snapshot.text);
+    return removed;
+  });
+}
+
+/** Retire legacy named BYOK rows from new selection after Personal is explicitly replaced, while keeping
+ * their exact routes available to already-bound sessions. Company profiles are never touched. */
+export function archiveHistoricalPersonalRoutes(options: { activatePersonal?: boolean } = {}): number {
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    let changed = 0;
+    state.value.profiles = state.value.profiles.map((profile) => {
+      if (profile.kind !== "byok" || profile.id === PERSONAL_ID || profile.archivedPersonalRoute) return profile;
+      changed += 1;
+      return { ...profile, archivedPersonalRoute: true };
+    });
+    if (options.activatePersonal) {
+      if (state.value.active !== PERSONAL_ID) {
+        state.value.active = PERSONAL_ID;
+        changed += 1;
+      }
+    }
+    if (changed > 0) persistProfilesFile(state.value, state.snapshot.text);
+    return changed;
+  });
+}
+
+/** Refresh the non-authoritative Personal presentation row after its config-backed credential changes.
+ * This prevents a cleared key from surviving in the compatibility registry even though runtime routing no
+ * longer reads it there. */
+export function syncStoredPersonalProfile(): void {
+  withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const stored = state.value.profiles.find((profile) => profile.id === PERSONAL_ID);
+    const refreshed = {
+      ...readPersonalFromConfig(),
+      ...(stored?.label ? { label: stored.label } : {}),
+    };
+    state.value.profiles = state.value.profiles.map((profile) => (
+      profile.id === PERSONAL_ID ? refreshed : profile
+    ));
+    persistProfilesFile(state.value, state.snapshot.text);
   });
 }
 

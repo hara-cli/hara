@@ -44,6 +44,45 @@ optional signed capability rather than adding its approximately 206 MB native bi
 
 ---
 
+## [LRN-20260830-PERSONAL-SPACE-OWNS-ONE-CONNECTION] correction
+
+**Logged**: 2026-08-30T09:00:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: profiles
+
+### Summary
+
+Personal is a durable user Space, not a container for an arbitrary list of visible BYOK identities. It
+owns one replaceable model connection. Company Control connections are a separate, repeatable collection.
+
+### Details
+
+A compatibility repair restored the reserved `personal` profile beside an active named BYOK profile. The
+data remained technically routable, but Desktop exposed both rows as peer “personal connections”, made the
+reserved row impossible to delete, and hid recovery actions behind different detail modes. The result made
+one person appear to have two Personal identities even though both routes belonged to the same Space.
+
+Historical route IDs can still be needed to resume sessions. Preserve those only as hidden compatibility
+records, promote the selected route into canonical Personal, and expose exactly one replace/clear workflow.
+An explicit clear must also remove compatibility credentials; merely hiding a row is not deletion.
+
+### Suggested Action
+
+Model identity and connection cardinality separately: one Personal Space → one current personal model
+connection; zero or more company Spaces → one or more administrator-enrolled Control connections. Migration
+tests must cover both the missing-Personal shape and the already-duplicated shape.
+
+### Metadata
+
+- Source: correction
+- Related Files: src/profile/profile.ts, src/index.ts, ../hara-desktop/src/ProviderSettings.tsx
+- Tags: profiles, personal-space, migration, desktop, credentials
+- Pattern-Key: profiles.personal_space_owns_one_connection
+- Recurrence-Count: 1
+
+---
+
 ## [LRN-20260822-AGENT-OWNS-AUTHORIZED-ACTIONS] correction
 
 **Logged**: 2026-08-22T00:00:00+08:00

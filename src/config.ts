@@ -673,6 +673,17 @@ export function updatePersonalProviderConfig(input: PersonalProviderConfigUpdate
   });
 }
 
+/** Clear the single user-owned model connection without deleting the Personal Space itself.
+ * Organization profiles and every unrelated personal setting remain untouched. */
+export function clearPersonalProviderConfig(): void {
+  updateRawConfig((config) => {
+    delete config.provider;
+    delete config.model;
+    delete config.baseURL;
+    delete config.apiKey;
+  });
+}
+
 /** Record (or clear, with cap=null) a confirmed per-model vision capability in `modelVision`. */
 export function setModelVisionOverride(model: string, cap: "yes" | "no" | null): void {
   updateRawConfig((config) => {

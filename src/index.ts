@@ -38,6 +38,7 @@ import {
   providerIsLocal,
   providerRequiresApiKey,
   normalizePersonalProviderConfig,
+  clearPersonalProviderConfig,
   reusablePersonalProviderApiKey,
   updatePersonalProviderConfig,
   isProviderId,
@@ -90,6 +91,9 @@ import {
   useProfile,
   addProfile,
   removeProfile,
+  archiveHistoricalPersonalRoutes,
+  removeHistoricalPersonalRoutes,
+  syncStoredPersonalProfile,
   setModel as setProfileModel,
   resetModel as resetProfileModel,
   getProfile,
@@ -673,35 +677,49 @@ function personalProviderConnectionsSnapshot(
   resolution: ActiveResolution,
   catalog: ReturnType<typeof providerCatalog>,
 ) {
-  const personal = profileByIdForConfig(live, PERSONAL_ID)!;
-  return listProfiles()
-    .filter((candidate) => candidate.kind === "byok")
-    .map((candidate) => candidate.id === PERSONAL_ID ? personal : candidate)
-    .filter((candidate) => !!candidate.provider && candidate.provider !== "hara-gateway")
-    .map((candidate) => {
-      // A connection card describes the persisted route. One-shot HARA_* overrides remain visible on
-      // `current`, but must not make every saved card appear to share the same provider or credential.
-      const target = resolveByokProviderTarget(live, candidate, false, {});
-      const entry = catalog.find((item) => item.id === target.provider)!;
-      const keyConfigured = providerIsLocal(target.provider)
-        || (target.provider === "qwen-oauth" ? loadQwenToken() !== null : !!target.apiKey);
-      return {
-        id: candidate.id,
-        label: candidate.label || (candidate.id === PERSONAL_ID ? "Personal" : candidate.id),
-        provider: target.provider,
-        model: target.model,
-        ...(target.baseURL ? { baseURL: target.baseURL } : {}),
-        location: entry.location as "cloud" | "local",
-        auth: entry.auth as "api-key" | "oauth" | "none",
-        keyConfigured,
-        authenticated: keyConfigured,
-        active: resolution.id === candidate.id,
-        legacyPersonal: candidate.id === PERSONAL_ID,
-        removable: candidate.id !== PERSONAL_ID,
-        ...(candidate.apiKey ? { keyHint: maskKey(candidate.apiKey) } : {}),
-        ...(candidate.createdAt ? { createdAt: candidate.createdAt } : {}),
-      };
-    });
+  const personal = personalProfileForSettings(live, resolution);
+  const target = resolveByokProviderTarget(live, personal, false, {});
+  const entry = catalog.find((item) => item.id === target.provider)!;
+  const keyConfigured = providerIsLocal(target.provider)
+    || (target.provider === "qwen-oauth" ? loadQwenToken() !== null : !!target.apiKey);
+  const raw = readRawConfig();
+  const configured = personal.id !== PERSONAL_ID
+    || ["provider", "model", "baseURL", "apiKey"].some((key) => Object.hasOwn(raw, key));
+  return [{
+    id: PERSONAL_ID,
+    label: entry.label,
+    provider: target.provider,
+    model: target.model,
+    ...(target.baseURL ? { baseURL: target.baseURL } : {}),
+    location: entry.location as "cloud" | "local",
+    auth: entry.auth as "api-key" | "oauth" | "none",
+    keyConfigured,
+    authenticated: keyConfigured,
+    active: listProfiles().find((profile) => profile.id === resolution.id)?.kind === "byok",
+    legacyPersonal: true,
+    removable: configured,
+    ...(target.apiKey ? { keyHint: maskKey(target.apiKey) } : {}),
+  }];
+}
+
+/** Desktop presents one Personal connection even when an older CLI/Desktop build left named BYOK routes.
+ * Prefer the active compatible route, or the only unarchived legacy route while a company is active. The
+ * route keeps its internal id so existing sessions remain bound, but it is exposed as the one Personal slot. */
+function personalProfileForSettings(live: HaraConfig, resolution: ActiveResolution): Profile {
+  const profiles = listProfiles();
+  const active = profiles.find((profile) => profile.id === resolution.id);
+  if (active?.kind === "byok" && !active.archivedPersonalRoute) {
+    return profileByIdForConfig(live, active.id) ?? active;
+  }
+  const compatible = profiles.filter((profile) => (
+    profile.kind === "byok"
+    && profile.id !== PERSONAL_ID
+    && !profile.archivedPersonalRoute
+  ));
+  if (compatible.length === 1) {
+    return profileByIdForConfig(live, compatible[0].id) ?? compatible[0];
+  }
+  return profileByIdForConfig(live, PERSONAL_ID)!;
 }
 
 function providerSettingsSnapshot(targetCwd: string) {
@@ -758,7 +776,7 @@ function providerSettingsSnapshot(targetCwd: string) {
       profileId: profile.id,
       profileKind: profile.kind,
       profileSource: resolution.source,
-      editable: profile.id === PERSONAL_ID && !environmentOverride,
+      editable: !environmentOverride,
       ...(environmentOverride ? { environmentOverride: true } : {}),
     },
     providers: catalog,
@@ -796,16 +814,22 @@ async function createNamedProviderConnection(
   },
   targetCwd: string,
 ) {
-  const id = cleanNamedProviderConnectionId(input.id);
-  const label = cleanNamedProviderConnectionLabel(input.label);
-  if (getProfile(id)) throw new Error(`connection '${id}' already exists; choose a new name instead of overwriting it`);
+  // Older Desktop builds call this named-connection method. Hara now has one Personal model connection,
+  // so keep the RPC compatible while treating it as an explicit replacement of that canonical slot.
+  cleanNamedProviderConnectionId(input.id);
+  cleanNamedProviderConnectionLabel(input.label);
   if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
     throw new Error("provider is not a configurable personal provider");
   }
   const resolution = resolveActive(targetCwd);
   const switchLocked = resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin";
+  const liveBefore = loadConfig({ cwd: targetCwd });
+  const activeBefore = profileByIdForConfig(liveBefore, resolution.id);
   if (input.activate && (switchLocked || providerEnvironmentOverride())) {
     throw new Error("the active connection is locked by a flag, environment variable, or project pin; save without switching or remove that override first");
+  }
+  if (activeBefore?.kind === "byok" && activeBefore.id !== PERSONAL_ID && switchLocked) {
+    throw new Error("the legacy personal route is selected by a flag, environment variable, or project pin; remove that override before replacing Personal");
   }
   const normalized = normalizePersonalProviderConfig({
     provider: input.provider,
@@ -814,31 +838,39 @@ async function createNamedProviderConnection(
     apiKey: input.apiKey,
     clearApiKey: input.clearApiKey,
   });
-  if (providerRequiresApiKey(normalized.provider) && !normalized.apiKey) {
-    throw new Error("a new API key is required for a named cloud connection");
+  const currentPersonal = personalProfileForSettings(liveBefore, resolution);
+  const currentTarget = resolveByokProviderTarget(liveBefore, currentPersonal, false, {});
+  const reusableRaw = {
+    provider: currentTarget.provider,
+    baseURL: currentTarget.baseURL,
+    apiKey: currentTarget.apiKey,
+  };
+  const availableKey = reusablePersonalProviderApiKey(normalized, reusableRaw);
+  if (providerRequiresApiKey(normalized.provider) && !availableKey) {
+    throw new Error("a new API key is required when the provider or endpoint changes");
   }
-  const now = new Date().toISOString();
-  const added = addProfile({
-    id,
-    kind: "byok",
-    label,
-    provider: normalized.provider,
-    apiKey: normalized.apiKey,
-    baseURL: normalized.baseURL,
-    defaultModel: normalized.model,
-    createdAt: now,
-    updatedAt: now,
-  }, { activate: input.activate === true });
-  if (!added.ok) throw new Error(added.reason);
+  const storedKey = normalized.apiKey
+    ?? reusablePersonalProviderApiKey(normalized, reusableRaw, {});
+  updatePersonalProviderConfig({
+    ...normalized,
+    ...(storedKey ? { apiKey: storedKey } : {}),
+  });
+  archiveHistoricalPersonalRoutes({
+    activatePersonal: input.activate === true || activeBefore?.kind === "byok",
+  });
+  syncStoredPersonalProfile();
   return providerSettingsSnapshot(targetCwd);
 }
 
 function useNamedProviderConnection(inputId: string, targetCwd: string) {
   const id = inputId.trim();
   if (!isValidProfileId(id)) throw new Error("invalid personal connection id");
-  const target = getProfile(id);
-  if (!target || target.kind !== "byok") throw new Error("personal connection was not found");
+  const live = loadConfig({ cwd: targetCwd });
   const resolution = resolveActive(targetCwd);
+  const target = id === PERSONAL_ID
+    ? personalProfileForSettings(live, resolution)
+    : getProfile(id);
+  if (!target || target.kind !== "byok") throw new Error("personal connection was not found");
   if (
     resolution.source === "flag"
     || resolution.source === "env"
@@ -847,12 +879,32 @@ function useNamedProviderConnection(inputId: string, targetCwd: string) {
   ) {
     throw new Error("the active connection is locked by a flag, environment variable, or project pin; remove that override before switching");
   }
-  const switched = useProfile(id);
+  const switched = useProfile(target.id);
   if (!switched.ok) throw new Error(switched.reason);
   return providerSettingsSnapshot(targetCwd);
 }
 
 function removeNamedProviderConnection(inputId: string, targetCwd: string) {
+  if (inputId.trim() === PERSONAL_ID) {
+    if (providerEnvironmentOverride()) {
+      throw new Error("provider/model/base URL is overridden by HARA_* environment variables; remove the override before clearing Personal");
+    }
+    const live = loadConfig({ cwd: targetCwd });
+    const resolution = resolveActive(targetCwd);
+    const personal = personalProfileForSettings(live, resolution);
+    const target = resolveByokProviderTarget(live, personal, false, {});
+    const credentialEnvKey = providerEnvKey(target.provider);
+    if (
+      process.env.HARA_API_KEY?.trim()
+      || (credentialEnvKey && process.env[credentialEnvKey]?.trim())
+    ) {
+      throw new Error(`the Personal credential is supplied by ${process.env.HARA_API_KEY?.trim() ? "HARA_API_KEY" : credentialEnvKey}; remove that environment variable before clearing the connection`);
+    }
+    removeHistoricalPersonalRoutes();
+    clearPersonalProviderConfig();
+    syncStoredPersonalProfile();
+    return providerSettingsSnapshot(targetCwd);
+  }
   const id = cleanNamedProviderConnectionId(inputId);
   const target = getProfile(id);
   if (!target || target.kind !== "byok") throw new Error("personal connection was not found");
@@ -1147,12 +1199,15 @@ async function testProviderSettingsCandidate(input: {
 async function testNamedProviderConnection(inputId: string, targetCwd: string) {
   const id = inputId.trim();
   if (!isValidProfileId(id)) throw new Error("invalid personal connection id");
-  const profile = getProfile(id);
-  if (!profile || profile.kind !== "byok") throw new Error("personal connection was not found");
   const live = loadConfig({ cwd: targetCwd });
+  const resolution = resolveActive(targetCwd);
+  const profile = id === PERSONAL_ID
+    ? personalProfileForSettings(live, resolution)
+    : getProfile(id);
+  if (!profile || profile.kind !== "byok") throw new Error("personal connection was not found");
   // Test the persisted identity itself. Ambient one-shot HARA_* routing must not silently test another
   // endpoint or key, especially when two saved connections use the same provider.
-  const target = resolveByokProviderTarget(live, profileByIdForConfig(live, id) ?? profile, false, {});
+  const target = resolveByokProviderTarget(live, profileByIdForConfig(live, profile.id) ?? profile, false, {});
   return testProviderSettingsCandidate({
     provider: target.provider,
     model: target.model,
@@ -3621,13 +3676,18 @@ program
             throw new Error("provider/model/base URL is overridden by HARA_* environment variables; remove the override before editing System Settings");
           }
           const resolution = resolveActive(settingsCwd);
-          if (resolution.id !== PERSONAL_ID) {
-            if (resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin") {
-              throw new Error(`profile '${resolution.id}' is selected by ${resolution.source}; switch or unpin it before editing Personal provider settings`);
-            }
-            if (input.activatePersonal !== true) {
-              throw new Error(`profile '${resolution.id}' is active; confirm activatePersonal to save and switch to Personal`);
-            }
+          const liveBefore = loadConfig({ cwd: settingsCwd });
+          const activeBefore = profileByIdForConfig(liveBefore, resolution.id);
+          const switchLocked = resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin";
+          if (
+            resolution.id !== PERSONAL_ID
+            && input.activatePersonal === true
+            && switchLocked
+          ) {
+            throw new Error(`profile '${resolution.id}' is selected by ${resolution.source}; switch or unpin it before activating Personal`);
+          }
+          if (activeBefore?.kind === "byok" && activeBefore.id !== PERSONAL_ID && switchLocked) {
+            throw new Error(`legacy personal route '${resolution.id}' is selected by ${resolution.source}; switch or unpin it before replacing Personal`);
           }
           const normalized = normalizePersonalProviderConfig({
             provider: input.provider,
@@ -3636,16 +3696,27 @@ program
             apiKey: input.apiKey,
             clearApiKey: input.clearApiKey,
           });
-          const raw = readRawConfig();
-          const availableKey = reusablePersonalProviderApiKey(normalized, raw);
+          const currentPersonal = personalProfileForSettings(liveBefore, resolution);
+          const currentTarget = resolveByokProviderTarget(liveBefore, currentPersonal, false, {});
+          const reusableRaw = {
+            provider: currentTarget.provider,
+            baseURL: currentTarget.baseURL,
+            apiKey: currentTarget.apiKey,
+          };
+          const availableKey = reusablePersonalProviderApiKey(normalized, reusableRaw);
           if (providerRequiresApiKey(normalized.provider) && !availableKey) {
             throw new Error("a new API key is required when the provider or endpoint changes");
           }
-          updatePersonalProviderConfig(normalized);
-          if (resolution.id !== PERSONAL_ID) {
-            const switched = useProfile(PERSONAL_ID);
-            if (!switched.ok) throw new Error(switched.reason);
-          }
+          const storedKey = normalized.apiKey
+            ?? reusablePersonalProviderApiKey(normalized, reusableRaw, {});
+          updatePersonalProviderConfig({
+            ...normalized,
+            ...(storedKey ? { apiKey: storedKey } : {}),
+          });
+          archiveHistoricalPersonalRoutes({
+            activatePersonal: input.activatePersonal === true || activeBefore?.kind === "byok",
+          });
+          syncStoredPersonalProfile();
           return providerSettingsSnapshot(settingsCwd);
         },
         effortLevels: levelsFor(
