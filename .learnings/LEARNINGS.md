@@ -437,3 +437,56 @@ and status cannot be confused. Never report a failed visual route solely from co
 - Recurrence-Count: 1
 
 ---
+
+## [LRN-20260830-REASONING-DEFAULT-BELONGS-TO-CALL-SHAPE] best_practice
+
+**Logged**: 2026-08-30T00:00:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: providers
+
+### Summary
+
+A thinking-mode default belongs to the SHAPE of a call, not to one caller. A no-tool turn that also forces
+a JSON schema is fill-in-the-blank classification by construction, so it defaults to `off` inside
+`runNoToolModel`. Separately, an explicitly selected reasoning level is a latency/cost contract: a strict
+endpoint that rejects it must fail visibly, never silently retry with the provider default.
+
+### Details
+
+Measured on the Alibaba Token Plan endpoint (qwen3.7-plus, same triage prompt, median of 3): the default
+call spent 8.8s and 464 output tokens of which 423 were reasoning; `enable_thinking:false` spent 2.2s and
+41 tokens with zero reasoning. Every provider measured (qwen family, DeepSeek, GLM) thinks by default, so
+the waste was universal, silent, and invisible in error logs — only slower and more expensive.
+
+The first fix put the `off` default in `dispatchFlows`. That turned a universal property of the call shape
+into one dispatcher's local policy, and it immediately leaked: the owner-reply intent classifier in
+`flows-pending.ts`, an identical no-tool + schema judgment, kept paying full reasoning cost. Sinking the
+default into `runNoToolModel` fixes the whole class once and makes every future caller of that shape
+inherit it; `"inherit"` remains the explicit opt-out.
+
+Two provider-level cautions. Alibaba documents that `reasoning.effort` supersedes `enable_thinking`, but
+live Token Plan calls with `effort:"none"` still emitted 227 reasoning tokens while the boolean reliably
+returned zero — the observation lives in the `alibaba_responses` adapter comment, never in core logic. And
+a dial is only safe to send everywhere if rejection semantics are explicit — and survivable is not the same
+as silent. The wire helper strips its own keys and retries only when the caller marks the field advisory,
+which is exactly the engine-chosen `off`: nobody asked for it, so a plain request beats a failed automation.
+A level a user or rule selected is a latency/cost contract and surfaces the rejection instead of silently
+restoring an expensive provider default. An unrelated 400 is always rethrown untouched.
+
+### Suggested Action
+
+When adding a provider parameter, decide three things explicitly: which call SHAPE owns its default, whether
+it is user intent or merely advisory, and what happens when an unknown endpoint rejects it.
+Vendor documentation is a hypothesis; measure before encoding it, and keep the measured exception in the
+adapter.
+
+### Metadata
+
+- Source: architecture_review
+- Related Files: src/gateway/flows-pending.ts, src/gateway/flows.ts, src/providers/reasoning.ts, src/providers/reasoning-fallback.ts
+- Tags: reasoning, providers, flows, cost, latency, resilience
+- Pattern-Key: providers.reasoning_default_by_call_shape_and_survivable_rejection
+- Recurrence-Count: 1
+
+---
