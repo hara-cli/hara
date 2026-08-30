@@ -632,3 +632,55 @@ an ellipsis.
 - Recurrence-Count: 1
 
 ---
+
+## [LRN-20260830-MODEL-BATTERY-HAS-NO-CAPABILITY-SPREAD] measurement
+
+**Logged**: 2026-08-30T16:30:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: providers
+
+### Summary
+
+qwen3.8-flash, qwen3.7-plus, MiniMax-M3 and deepseek-v4-pro scored 100% on every business task that could
+be designed for them, including executed code and real dense UI screenshots. Model choice for Hara is
+therefore not a capability decision; it is decided by cost, by latency in the specific modality, and by
+whether the model has vision at all.
+
+### Details
+
+Code was graded by execution, not keyword matching: each model wrote a function and the harness ran it
+against fixed assertions. Four tasks - interval merging, Chinese currency parsing, an off-by-one pagination
+fix, and a concurrency-limited `mapLimit` requiring input order, a concurrency ceiling, first-error
+propagation and no further workers after a failure. All four models passed all 23 assertions.
+
+Vision was graded against ground truth baked into generated images (invoice fields with a decoy invoice
+code, a bar chart requiring a sum, an order table requiring a filtered total) and then against two real
+Hara Desktop screenshots - dense Chinese UI at small sizes. All three vision-capable models read every
+value correctly, including 110/3/0, engine 0.155.1, and the first agent name.
+
+The differences are latency by modality and capability coverage, not correctness. Total code latency
+(best of two rounds): MiniMax-M3 11.0s, qwen3.8-flash 12.4s, deepseek-v4-pro 16.2s, qwen3.7-plus 19.7s.
+Vision latency inverts it: on the real screenshots qwen3.8-flash took 2.6s against MiniMax-M3's 9.5s, a
+3.6x gap, and MiniMax was slowest on every vision task despite being fastest on text. Long-context first
+token still favors MiniMax by 4.3x at 142k input. deepseek-v4-pro has no vision on this endpoint at all,
+which disqualifies it as a Hara default because pasted images, inspect_image and computer use are core.
+
+### Suggested Action
+
+Default to qwen3.8-flash: cheapest, fastest vision, no capability gap. Reach for MiniMax-M3 on
+long-context or multi-round agent work, where its first-token advantage compounds. Do not default to
+deepseek-v4-pro (no vision) and do not default to qwen3.7-plus (best at nothing measured, and its price
+triples above 256K). Note the limitation honestly: a battery where everything scores 100% cannot rank
+capability ceilings - separating these models on capability needs multi-file, long-horizon agent tasks
+that this harness does not model.
+
+### Metadata
+
+- Source: measurement
+- Related Files: src/providers/registry.ts, src/providers/alibaba.ts, src/providers/minimax.ts
+- Tags: models, benchmark, vision, code, latency, model-selection
+- Pattern-Key: providers.choose_on_cost_latency_and_coverage_when_capability_ties
+- Recurrence-Count: 1
+
+---
