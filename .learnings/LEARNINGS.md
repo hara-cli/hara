@@ -529,3 +529,106 @@ adapter.
 - Recurrence-Count: 1
 
 ---
+
+## [LRN-20260830-MINIMAX-LATENCY-IS-NOT-THE-TRANSPORT] measurement
+
+**Logged**: 2026-08-30T15:00:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: providers
+
+### Summary
+
+A "MiniMax feels slow" report did not reproduce. Measured on the Max tier, MiniMax-M3 is the fastest
+route on this machine and beats qwen3.8-flash by 4-5x once the prompt reaches agent scale. The one defect
+that produces the reported symptom is not speed but attribution: a provider rate limit and a slow model
+looked identical in the spinner.
+
+### Details
+
+Sunday 2026-08-30 14:47, single-threaded, outside MiniMax's documented weekday 15:00-17:30 peak window.
+
+Transport parity, MiniMax-M3, five tasks x two rounds: `/v1` Responses (Hara's route) reached first token
+in 0.5-1.0s and finished in 0.9-3.2s; `/anthropic` (the protocol MiniMax's own quick-start uses) reached
+0.5-1.2s and 0.9-2.9s. There is no latency argument for switching transports, and correctness matched.
+
+Thinking control is not a latency lever here. Default (no parameter) had a 939ms median first token and
+1663ms median turn; explicit `off` had 863ms and 1522ms. Unlike the Alibaba endpoint, M3 does not spend a
+large default reasoning budget on short prompts, so the Alibaba playbook does not transfer.
+
+Time to first token against input size is where the real difference is, and it inverts the earlier
+recommendation. At ~7k input MiniMax-M3 answered in 676ms vs qwen3.8-flash 1227ms; at ~49k, 1153ms vs
+5745ms; at ~142k, 2613ms vs 11307ms. qwen3.8-flash being flat-rate to 1M context is a PRICE property and
+was measured as one; its latency at long context is not flat, and an agent session is long by
+construction. Short work still favors flash on cost; long-context work favors M3 on latency.
+
+The reproducible defect: the OpenAI SDK is constructed with `maxRetries: 4`, so a 429 is retried with
+backoff and no stream event. MiniMax documents per-tier agent concurrency (Max is roughly 4-5), RPM/TPM
+limits recovering in about a minute, and dynamic peak throttling. Hara trips this more easily than most
+clients because parallel sub-agents, Flows, and cron share one key, and the spinner said only "waiting for
+the model". Being throttled and being slow to think were indistinguishable.
+
+### Suggested Action
+
+Record the HTTP status at Hara's own model fetch and name the cause in the spinner. Untested and still
+open: the weekday 15:00-17:30 peak window, and concurrent multi-agent load against the tier ceiling.
+Measure a provider before believing a latency report about it, and measure at agent-scale input rather
+than a toy prompt - the toy prompt hid the only difference that mattered.
+
+### Metadata
+
+- Source: measurement
+- Related Files: src/network/throttle-signal.ts, src/network/model-fetch.ts, src/providers/minimax.ts, src/tui/App.tsx
+- Tags: minimax, latency, throttling, rate-limit, context-length, providers
+- Pattern-Key: providers.latency_is_measured_at_agent_scale_not_toy_prompt
+- Recurrence-Count: 1
+
+---
+
+## [LRN-20260830-CLAUDE-AGENT-ROSTER-SCOPE] reference
+
+**Logged**: 2026-08-30T15:00:00+08:00
+**Priority**: medium
+**Status**: in_progress
+**Area**: org-roles
+
+### Summary
+
+Hara's specialist roster on a developer machine is dominated by imported Claude Code agents. The import is
+correctly scoped - no other project's agents leak in - but the roster is unconditional, costs about 2.5k
+tokens of every system prompt, and its truncation order sacrifices Hara's own roles before imported ones.
+
+### Details
+
+Accounting on this machine: `loadRoles` returned 75 roles - 50 from `~/.claude/agents` (61 files, minus
+those with no description or `modelInvocable: false`), 12 from `~/.openclaw`, 10 from `~/.hara/agents`,
+2 plugin, 1 hermes. The digest is 62 lines and 10,258 characters, injected as a `session`-stability prompt
+part on every non-override run.
+
+Scope is correct and was verified, not assumed. Hara reads only `~/.claude/agents` and
+`<projectRoot>/.claude/agents`. The nanhara checkout has 21 project agents of its own; they are not loaded
+while the working directory is hara-cli. Claude Code's plugin agents under `~/.claude/plugins` are not a
+`RoleSource` and are never read, which is why Claude Code lists roughly 100 agents while Hara loads 75.
+
+Two open problems. There is no way to exclude imported agents - no `roleSources` or equivalent config
+exists. And `roleCatalog` truncates by slicing the tail at 16,000 characters with `sourceRank` ordering
+`project < claude-project < global < claude-global < org < openclaw < hermes < plugin`, so company-pushed
+`org` roles and Hara's own bundled `plugin` roles are dropped BEFORE a user's personal imported Claude
+agents. At 10,258 of 16,000 characters this is roughly 40 more agents away, and it truncates silently with
+a single trailing ellipsis.
+
+### Suggested Action
+
+Truncate by per-source quota rather than slicing the tail, or at minimum rank `org` and `plugin` above
+`claude-global`; add a config to exclude imported sources; and log what was dropped instead of appending
+an ellipsis.
+
+### Metadata
+
+- Source: architecture_review
+- Related Files: src/org/roles.ts, src/agent/loop.ts, src/context/agents-md.ts
+- Tags: roles, agents, claude-interop, context-budget, truncation
+- Pattern-Key: roles.truncation_must_not_sacrifice_governed_sources_first
+- Recurrence-Count: 1
+
+---

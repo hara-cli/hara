@@ -28,6 +28,7 @@ import { clearTodos, currentTodos, onTodosChange, type Todo } from "../tools/tod
 import { onTurnPhase, turnPhase, type TurnPhase } from "../agent/phase.js";
 import { listJobs, onJobsChange } from "../exec/jobs.js";
 import { ModelPicker } from "./model-picker.js";
+import { throttleNotice, throttleSignal } from "../network/throttle-signal.js";
 import type { ReasoningStyle, Effort } from "../providers/reasoning.js";
 import { newSteerInteraction, newTurnInteraction, requestsTaskContinuation, type TaskInteraction } from "../session/task.js";
 
@@ -462,12 +463,17 @@ function StatusRow({ working, steerable, todos, queued }: { working: boolean; st
   const elapsedSec = Math.floor((Date.now() - startRef.current) / 1000);
   // Pre-first-token honesty (codex-parity): "waiting for the model" reads very differently from a
   // generic "working" when the network is slow — the user knows the request is out, not dead.
+  // Naming a throttle beats counting seconds: a plan-tier rate limit and a slow model are the same
+  // spinner otherwise, and the user can only conclude "Hara is slow".
+  const throttled = throttleNotice(throttleSignal.current);
   const verb = (
     phase === "awaiting_user"
       ? "waiting for your answer · task timer paused · esc to cancel"
-      : phase === "waiting"
-        ? `waiting for the model… ${elapsedSec}s · esc to interrupt`
-        : spinnerVerb(todos, elapsedSec)
+      : throttled
+        ? `${throttled} · ${elapsedSec}s · esc to interrupt`
+        : phase === "waiting"
+          ? `waiting for the model… ${elapsedSec}s · esc to interrupt`
+          : spinnerVerb(todos, elapsedSec)
   ) + bgTag;
   return (
     <Box marginTop={1}>

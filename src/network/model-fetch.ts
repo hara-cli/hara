@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { isIP } from "node:net";
 import { readRawConfig } from "../config.js";
+import { throttleSignal } from "./throttle-signal.js";
 
 export type ModelProxySource = "hara-env" | "environment" | "config" | "windows-system";
 
@@ -334,6 +335,14 @@ export function createModelFetch(
           ...(init as Parameters<UndiciModule["fetch"]>[1]),
           dispatcher: agent,
         }) as unknown as Response;
+      }
+      // Record the one fact the spinner cannot otherwise know: the provider said "come back later", and
+      // the SDK is about to retry in silence. A successful response clears it.
+      const status = (response as unknown as Response).status;
+      if (status === 429 || status === 503 || status === 529) {
+        throttleSignal.hit(status, (response as unknown as Response).headers?.get?.("retry-after"));
+      } else if (status < 400) {
+        throttleSignal.clear();
       }
       return response as unknown as Response;
     } catch (error) {
