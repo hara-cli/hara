@@ -94,6 +94,14 @@ test("workspace transfer persists a new project-bound fork and leaves the source
         updatedAt: "2026-07-21T08:01:00.000Z",
         source: "gateway",
         sourceName: "telegram",
+        jobId: "source-automation",
+        automationRun: {
+          status: "error",
+          startedAt: "2026-07-21T08:00:00.000Z",
+          finishedAt: "2026-07-21T08:01:00.000Z",
+          durationMs: 60_000,
+          error: "source occurrence failed",
+        },
         archived: true,
         gatewayOwner: "telegram:42",
         workingSet: ["remember this"],
@@ -112,6 +120,8 @@ test("workspace transfer persists a new project-bound fork and leaves the source
     assert.equal(fork.meta.createdAt, "2026-07-21T08:02:00.000Z");
     assert.equal(fork.meta.source, "interactive");
     assert.equal(fork.meta.sourceName, undefined);
+    assert.equal(fork.meta.jobId, undefined);
+    assert.equal(fork.meta.automationRun, undefined, "interactive forks never inherit an automation outcome");
     assert.equal(fork.meta.archived, undefined);
     assert.equal(fork.meta.gatewayOwner, undefined);
     assert.deepEqual(fork.history, source.history);

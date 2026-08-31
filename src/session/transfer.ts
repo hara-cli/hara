@@ -52,6 +52,7 @@ export function workspaceSessionFork(
   meta.source = "interactive";
   delete meta.sourceName;
   delete meta.jobId;
+  delete meta.automationRun;
   delete meta.archived;
   delete meta.gatewayOwner;
 

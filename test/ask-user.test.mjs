@@ -12,12 +12,25 @@ test("ask_user is registered as a read-kind tool the model can see", () => {
   assert.equal(t.kind, "read", "ask_user never triggers the approval gate");
   assert.ok(getTools().some((x) => x.name === "ask_user"), "ask_user is in the tool set");
   assert.ok(t.input_schema.required.includes("question"), "question is required");
+  assert.equal(t.input_schema.properties.default.type, "string", "headless callers can supply an explicit default");
 });
 
-test("ask_user: headless / non-TTY (no ctx.ask) returns a safe note and does NOT hang", async () => {
+test("ask_user: headless / non-TTY skips without inventing an answer", async () => {
   const t = ask_user();
   const res = await t.run({ question: "Which database?" }, { cwd: process.cwd() }); // ctx.ask absent
   assert.equal(res, NO_INTERACTIVE_USER);
+  assert.match(res, /question skipped/i);
+  assert.doesNotMatch(res, /best judgment/i);
+});
+
+test("ask_user: headless uses only an explicit caller-supplied default", async () => {
+  const t = ask_user();
+  const res = await t.run(
+    { question: "Which database?", default: "Use the already configured database" },
+    { cwd: process.cwd() },
+  );
+  assert.match(res, /used the explicit default/i);
+  assert.match(res, /already configured database/i);
 });
 
 test("ask_user: routes the question (with options) through ctx.ask and returns the chosen option", async () => {
@@ -60,7 +73,7 @@ test("ask_user: empty question is rejected without touching ctx.ask", async () =
   assert.equal(called, false, "ctx.ask not called on a bad question");
 });
 
-test("ask_user: a failing ctx.ask degrades gracefully (no throw)", async () => {
+test("ask_user: a failing ctx.ask preserves the default-or-skip contract", async () => {
   const t = ask_user();
   const ctx = {
     cwd: process.cwd(),
@@ -69,8 +82,12 @@ test("ask_user: a failing ctx.ask degrades gracefully (no throw)", async () => {
     },
   };
   const res = await t.run({ question: "anything?" }, ctx);
-  assert.match(res, /best judgment/);
+  assert.match(res, /question skipped/);
+  assert.doesNotMatch(res, /best judgment/);
   assert.match(res, /boom/);
+  const withDefault = await t.run({ question: "anything?", default: "keep the saved value" }, ctx);
+  assert.match(withDefault, /used the explicit default/);
+  assert.match(withDefault, /keep the saved value/);
 });
 
 test("ask_user: cancellation is rethrown so the agent loop can stop instead of continuing", async () => {

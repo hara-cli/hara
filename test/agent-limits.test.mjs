@@ -14,6 +14,7 @@ import {
 } from "../dist/agent/limits.js";
 import { runShell } from "../dist/sandbox.js";
 import { getTool } from "../dist/tools/registry.js";
+import { HEADLESS_USER_INPUT_REQUIRED } from "../dist/tools/ask_user.js";
 import { onTurnPhase, setTurnPhase } from "../dist/agent/phase.js";
 import { applyTaskBrief, createTaskExecution } from "../dist/session/task.js";
 import { loadOrganizationExecutionPolicy, orgRolesDir } from "../dist/org/roles.js";
@@ -1244,6 +1245,72 @@ test("ask_user wait does not consume active budget and resumes the same tool rou
   assert.ok(Date.now() - started > 1_050);
   const toolRound = history.find((message) => message.role === "tool");
   assert.equal(toolRound.results[0].content, "use the gallery");
+});
+
+test("headless ask_user without an explicit default stops before any same-round side effect", async () => {
+  let turns = 0;
+  let sideEffects = 0;
+  const provider = {
+    id: "headless-question",
+    model: "headless-question",
+    async turn() {
+      turns += 1;
+      return {
+        text: "",
+        toolUses: [
+          { id: "ask-headless", name: "ask_user", input: { question: "which target?" } },
+          { id: "effect-after-ask", name: "headless_effect", input: {} },
+        ],
+        stop: "tool_use",
+      };
+    },
+  };
+  const history = [{ role: "user", content: "run without a terminal" }];
+  const outcome = await runAgent(history, base(provider, {
+    quiet: true,
+    extraTools: [{
+      name: "headless_effect",
+      description: "must not run without the requested answer",
+      input_schema: { type: "object", properties: {} },
+      kind: "edit",
+      async run() { sideEffects += 1; return "ran"; },
+    }],
+  }));
+
+  assert.deepEqual(outcome, { status: "error", error: HEADLESS_USER_INPUT_REQUIRED });
+  assert.equal(turns, 1, "the model never gets a chance to invent an answer");
+  assert.equal(sideEffects, 0);
+  assert.equal(history.at(-1).role, "tool");
+  assert.equal(history.at(-1).results.length, 2, "the rejected tool round remains protocol-complete");
+  assert.ok(history.at(-1).results.every((result) => result.isError === true));
+});
+
+test("headless ask_user continues only with its explicit caller-supplied default", async () => {
+  let round = 0;
+  const provider = {
+    id: "headless-default",
+    model: "headless-default",
+    async turn() {
+      round += 1;
+      return round === 1
+        ? {
+            text: "",
+            toolUses: [{
+              id: "ask-default",
+              name: "ask_user",
+              input: { question: "which target?", default: "use the configured target" },
+            }],
+            stop: "tool_use",
+          }
+        : { text: "continued deterministically", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "run without a terminal" }];
+  const outcome = await runAgent(history, base(provider, { quiet: true }));
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(round, 2);
+  assert.match(history.find((message) => message.role === "tool").results[0].content, /used the explicit default/i);
 });
 
 test("external cancellation still aborts and cleans a paused ask_user", async () => {

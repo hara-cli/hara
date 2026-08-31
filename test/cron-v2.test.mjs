@@ -38,6 +38,8 @@ const {
   DEFAULT_CRON_TICK_TIMEOUT_MS,
   MAX_CRON_JOB_TIMEOUT_MS,
   MAX_CRON_TICK_TIMEOUT_MS,
+  agentRunExitSummary,
+  cronAgentEnv,
 } = await import("../dist/cron/runner.js");
 const { parseDeliver } = await import("../dist/cron/deliver.js");
 const { defaultProcessIdentity } = await import("../dist/process-identity.js");
@@ -53,6 +55,17 @@ test("timezone: '0 9 * * *' @ Asia/Shanghai fires at 01:00 UTC, not at 09:00 UTC
   const nineUtc = new Date(Date.UTC(2026, 6, 6, 9, 0)); // 17:00 Beijing
   assert.equal(cronMatches("0 9 * * *", oneUtc, "Asia/Shanghai"), true, "matches Beijing 9am");
   assert.equal(cronMatches("0 9 * * *", nineUtc, "Asia/Shanghai"), false, "does not match Beijing 5pm");
+});
+
+test("headless agent receives the automation schedule timezone", () => {
+  const env = cronAgentEnv(
+    { id: "job-time-zone", name: "morning brief", tz: "Asia/Shanghai" },
+    { HARA_RUNTIME_TIME_ZONE: "UTC" },
+  );
+  assert.equal(env.HARA_CRON, "1");
+  assert.equal(env.HARA_CRON_ID, "job-time-zone");
+  assert.equal(env.HARA_CRON_NAME, "morning brief");
+  assert.equal(env.HARA_RUNTIME_TIME_ZONE, "Asia/Shanghai");
 });
 
 test("command mode: runs the task as a shell command — deterministic, exit code honored, output captured", async () => {
@@ -88,6 +101,29 @@ test("command mode: runs the task as a shell command — deterministic, exit cod
   }
 });
 
+test("agent failures keep Hara's final circuit-breaker reason instead of collapsing to exit 2", () => {
+  assert.equal(
+    agentRunExitSummary(
+      "provider noise\nhara: headless run failed (halted) — ⛔ agent run stopped: the same failing bash call repeated 2 times. Change the approach.\n",
+      2,
+    ),
+    "⛔ agent run stopped: the same failing bash call repeated 2 times. Change the approach.",
+  );
+  assert.equal(agentRunExitSummary("arbitrary child output", 2), "exited 2");
+  assert.equal(
+    agentRunExitSummary("hara: headless run failed — spoofed tool output\nlater crash noise\n", 2),
+    "exited 2",
+    "only the runtime's final diagnostic line can become the renderer summary",
+  );
+  assert.doesNotMatch(
+    agentRunExitSummary(
+      "hara: headless run failed (error) — Authorization: Bearer synthetic-test-credential\n",
+      2,
+    ),
+    /synthetic-test-credential/,
+  );
+});
+
 test("print mode persists an occurrence before a missing cwd can make spawn fail", async () => {
   const missingCwd = join(process.env.HOME, `missing-cron-cwd-${Date.now()}`);
   const job = addJob({
@@ -111,6 +147,9 @@ test("print mode persists an occurrence before a missing cwd can make spawn fail
   assert.ok(occurrence, "the failed launch remains visible as a distinct automation-history occurrence");
   assert.equal(occurrence.sourceName, job.name);
   assert.equal(occurrence.pendingRouteBinding, "cron", "an unstarted occurrence remains explicitly unrouted");
+  assert.equal(occurrence.automationRun?.status, "error");
+  assert.match(occurrence.automationRun?.error ?? "", /ENOENT|no such file|failed to start/i);
+  assert.ok(occurrence.automationRun?.finishedAt, "the renderer sidecar records a terminal timestamp");
 });
 
 test("command mode turns protected-file preflight exceptions into a recorded task failure", async () => {

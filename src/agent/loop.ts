@@ -65,8 +65,13 @@ import {
   type TaskExecution,
 } from "../session/task.js";
 import { captureLearning } from "../learning/store.js";
-import { askUserTool } from "../tools/ask_user.js";
+import {
+  askUserTool,
+  HEADLESS_USER_INPUT_REQUIRED,
+  NO_INTERACTIVE_USER,
+} from "../tools/ask_user.js";
 import { PromptAssembler, type AssembledSystemPrompt } from "./prompt.js";
+import { runtimeTimePrompt, type RuntimeTimePromptOptions } from "../runtime-time.js";
 import {
   assertOrganizationModelAllowed,
   loadOrganizationExecutionPolicy,
@@ -323,6 +328,7 @@ export function composeSystem(
   executionContext?: string,
   intake?: { enabled: boolean; brief?: TaskBrief; checkpoint?: TaskExecution["checkpoint"] },
   profileId?: string,
+  runtimeTime?: RuntimeTimePromptOptions,
 ): AssembledSystemPrompt {
   const assembler = new PromptAssembler();
   assembler.add("core", "static", "core", override || HARA_SYSTEM());
@@ -382,7 +388,10 @@ export function composeSystem(
     .add("roles", "session", "role", roles ? `# Specialist roles (metadata only — use \`agent\` with a role id for bounded read-only expertise)\n${roles}` : "")
     .add("skills", "session", "skill", skills ? `# Skills (capabilities you can load — call the \`skill\` tool with the id for full instructions before using one)\n${skills}` : "")
     .add("task-intake", "turn", "task", intakeContext)
-    .add("task-checkpoint", "turn", "task", checkpointContext);
+    .add("task-checkpoint", "turn", "task", checkpointContext)
+    // Keep the changing clock at the very end: stable core/session prefixes remain cacheable, while every
+    // provider request (including later tool rounds and a long-lived session's next turn) gets a fresh value.
+    .add("runtime-clock", "turn", "runtime", runtimeTimePrompt(runtimeTime));
   return assembler.build();
 }
 
@@ -1641,6 +1650,28 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // while planning, approving, or executing, so finalize the round with real results for work that already
     // completed and explicit interruption errors for everything else before persisting the session.
     const results: ToolResult[] = new Array(r.toolUses.length);
+    const headlessQuestionWithoutDefault = !ctx.ask && r.toolUses.some((toolUse) => {
+      if (toolUse.name !== "ask_user") return false;
+      const question = (toolUse.input as { question?: unknown } | null)?.question;
+      const explicitDefault = (toolUse.input as { default?: unknown } | null)?.default;
+      return typeof question === "string"
+        && question.trim().length > 0
+        && !(typeof explicitDefault === "string" && explicitDefault.trim().length > 0);
+    });
+    if (headlessQuestionWithoutDefault) {
+      history.push({
+        role: "tool",
+        results: r.toolUses.map((toolUse) => ({
+          id: toolUse.id,
+          name: toolUse.name,
+          content: toolUse.name === "ask_user"
+            ? `Error: ${HEADLESS_USER_INPUT_REQUIRED}`
+            : "Error: not executed because an unanswered ask_user call stopped this headless run.",
+          isError: true,
+        })),
+      });
+      return { status: "error", error: HEADLESS_USER_INPUT_REQUIRED };
+    }
     const finalizeStoppedToolRound = (): RunOutcome => {
       const pendingMessage = life.timedOut
         ? `Error: agent active-execution deadline ${formatAgentDuration(life.timeoutMs)} reached before this tool call completed.`
@@ -1672,6 +1703,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     };
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
     let repeatHalt: { label: string; count: number } | null = null;
+    let unansweredUserQuestion = false;
     const noteCall = (name: string, input: unknown, content: string, isError = false): string => {
       let note = recordCall(name, input, content, isError, ctx.todoScope);
       const identities = failureIdentities(name, input, content, isError);
@@ -2119,6 +2151,15 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     const successfulRoundObservations: string[] = [];
     const runOne = async (idx: number, p: Plan): Promise<void> => {
       if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
+      if (unansweredUserQuestion) {
+        results[idx] = {
+          id: p.tu.id,
+          name: p.tu.name,
+          content: "Error: not executed because an unanswered ask_user call stopped this run.",
+          isError: true,
+        };
+        return;
+      }
       if (recallExhausted && RECALL_TOOLS.has(p.tu.name)) {
         results[idx] = {
           id: p.tu.id,
@@ -2226,6 +2267,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           if (!settled.ok) throw settled.error;
         }
         const res = toolResult === RUN_STOPPED ? (settled as { ok: true; value: string }).value : toolResult;
+        if (p.tool === askUserTool && res.startsWith(NO_INTERACTIVE_USER)) {
+          unansweredUserQuestion = true;
+          results[idx] = {
+            id: p.tu.id,
+            name: p.tu.name,
+            content: `Error: ${HEADLESS_USER_INPUT_REQUIRED}`,
+            isError: true,
+          };
+          return;
+        }
         const resultLooksFailed = looksFailed(res, p.tu.name);
         if (
           !resultLooksFailed
@@ -2309,6 +2360,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       } catch (error) {
         return interactionFailure("task-state checkpoint", error);
       }
+    }
+    if (unansweredUserQuestion) {
+      return { status: "error", error: HEADLESS_USER_INPUT_REQUIRED };
     }
     if (repeatHalt) return hardStop(opts, life, "repeat_loop", repeatHalt);
 

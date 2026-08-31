@@ -13,12 +13,16 @@ import { homedir } from "node:os";
 
 export interface TmuxRoute {
   pane: string; // tmux pane id, e.g. "%3" or "sess:0.1"
-  peer?: string; // the chat peer that should answer (informational; matching is owner-gated upstream)
+  peer?: string; // exact chat peer allowed to answer; absent only on legacy routes, which inbound chat ignores
   cwd?: string;
   ts: number;
   /** "once" (default) = consumed after one injected reply; "bind" = persistent, every reply injects until unbound. */
   mode?: "once" | "bind";
 }
+
+export const TMUX_ONCE_ROUTE_TTL_MS = 30 * 60 * 1000;
+export const TMUX_BIND_ROUTE_TTL_MS = 12 * 60 * 60 * 1000;
+const MAX_ROUTE_CLOCK_SKEW_MS = 60 * 1000;
 
 function dir(): string {
   return join(homedir(), ".hara", "gateway");
@@ -63,19 +67,36 @@ export function listRoutes(): TmuxRoute[] {
   return load();
 }
 
-/** Remove all persistent "bind" routes (the chat `/detach` command). Returns how many were removed. */
-export function unbindBinds(): number {
+/** Remove persistent routes for one chat. An explicit peer also clears legacy unscoped routes so an
+ * upgrade cannot leave an old global bind hijacking normal messages. Omit peer for the local all-route tool. */
+export function unbindBinds(peer?: string): number {
   const before = load();
-  const after = before.filter((r) => r.mode === "bind" ? false : true);
+  const after = before.filter((route) => (
+    route.mode !== "bind"
+    || (peer !== undefined && route.peer !== peer && Boolean(route.peer))
+  ));
   save(after);
   return before.length - after.length;
 }
 
 /** Pure: pick the OLDEST live registered pane (FIFO — the longest-waiting ask answers first); return it plus the
- *  routes to keep. A "once" route is consumed after use; a "bind" route persists. Dead panes are always pruned. */
-export function pickRoute(routes: TmuxRoute[], isAlive: (pane: string) => boolean): { chosen: TmuxRoute | null; remaining: TmuxRoute[] } {
-  const live = routes.filter((r) => isAlive(r.pane)).sort((a, b) => a.ts - b.ts);
-  const chosen = live[0] ?? null;
+ *  routes to keep. Inbound gateway calls MUST pass the exact chat peer: legacy/unscoped and other-chat routes
+ *  are never eligible. One-shot routes expire after 30 minutes and binds after 12 hours so a forgotten live
+ *  tmux pane cannot silently capture ordinary chat forever. */
+export function pickRoute(
+  routes: TmuxRoute[],
+  isAlive: (pane: string) => boolean,
+  peer?: string,
+  now = Date.now(),
+): { chosen: TmuxRoute | null; remaining: TmuxRoute[] } {
+  const live = routes.filter((route) => {
+    const ttl = route.mode === "bind" ? TMUX_BIND_ROUTE_TTL_MS : TMUX_ONCE_ROUTE_TTL_MS;
+    return route.ts <= now + MAX_ROUTE_CLOCK_SKEW_MS
+      && now - route.ts <= ttl
+      && isAlive(route.pane);
+  }).sort((a, b) => a.ts - b.ts);
+  const eligible = peer === undefined ? live : live.filter((route) => route.peer === peer);
+  const chosen = eligible[0] ?? null;
   const remaining = chosen && chosen.mode !== "bind" ? live.filter((r) => r.pane !== chosen.pane) : live;
   return { chosen, remaining };
 }
@@ -129,8 +150,8 @@ export function outputDelta(lastSent: string, current: string): string {
 
 /** Pick (and consume per mode) the oldest live registered pane WITHOUT injecting — so the caller can capture the
  *  pane before/after injecting and relay just the new output. Returns the pane id, or null if none pending. */
-export function pickPaneForReply(): string | null {
-  const { chosen, remaining } = pickRoute(load(), paneAlive);
+export function pickPaneForReply(peer: string): string | null {
+  const { chosen, remaining } = pickRoute(load(), paneAlive, peer);
   save(remaining);
   return chosen?.pane ?? null;
 }
@@ -138,8 +159,8 @@ export function pickPaneForReply(): string | null {
 /** Daemon entrypoint: deliver an inbound reply to the oldest live registered pane. Returns the pane id injected
  *  into, or null if there was no pending route (→ caller treats the message as a normal task). One-shot: the
  *  chosen route is consumed and dead panes are pruned. */
-export function deliverToTmux(text: string): string | null {
-  const { chosen, remaining } = pickRoute(load(), paneAlive);
+export function deliverToTmux(text: string, peer: string): string | null {
+  const { chosen, remaining } = pickRoute(load(), paneAlive, peer);
   save(remaining);
   if (!chosen) return null;
   try {

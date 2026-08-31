@@ -3,14 +3,23 @@
 // on a decision only the user can make (an ambiguous requirement, a real fork in approach) — never for
 // anything you can derive from the code/context. The question (and optional numbered choices) is shown
 // through the SAME input channel as the approval prompt (ctx.ask), so it works in both the classic REPL and
-// the TUI. In headless / non-TTY / `-p` / gateway runs there is no interactive user (ctx.ask is absent) — the
-// tool returns a clear "proceed with your best judgment" string instead of hanging. kind:"read" so it never
-// itself triggers the approval gate (the interaction IS the prompt).
+// the TUI. In headless / non-TTY / `-p` / gateway runs there is no interactive user (ctx.ask is absent): an
+// explicit default is used when supplied, otherwise the agent loop closes the tool round and stops instead
+// of allowing later calls to act on an invented answer.
+// kind:"read" so it never itself triggers the approval gate (the interaction IS the prompt).
 import { getTool, registerTool, type Tool, type ToolContext } from "./registry.js";
 
-/** Returned when nobody can answer (headless / non-TTY / -p / gateway / sub-agent). Phrased so the model
- *  keeps going on its own judgment rather than re-asking or stalling. */
-export const NO_INTERACTIVE_USER = "(no interactive user available — proceed with your best judgment)";
+/** Returned when nobody can answer and the caller supplied no deterministic fallback. */
+export const NO_INTERACTIVE_USER = "(no interactive user available — question skipped; no answer was inferred)";
+export const HEADLESS_USER_INPUT_REQUIRED =
+  "Headless run stopped: ask_user required an answer, but no interactive user or explicit default was available.";
+
+function unavailableResult(explicitDefault: string, reason = ""): string {
+  const result = explicitDefault
+    ? `(no interactive user available — used the explicit default: ${explicitDefault})`
+    : NO_INTERACTIVE_USER;
+  return reason ? `${result} (${reason})` : result;
+}
 
 const definition: Tool = {
   name: "ask_user",
@@ -23,8 +32,9 @@ const definition: Tool = {
     "Provide `options` (a short list of likely answers) when the choice is constrained — they are shown as a " +
     "numbered menu — but the user may always type a free-text answer instead. The tool returns the user's " +
     "answer (chosen option or free text) as its result. " +
-    "In a non-interactive run (no terminal) it returns a 'proceed with your best judgment' note instead of " +
-    "blocking, so prefer making a reasonable call over asking when context already answers the question.",
+    "For non-interactive runs, provide `default` only when the task itself defines a safe deterministic " +
+    "fallback. Without one, the engine stops the headless run with a clear blocker and no later tool in that " +
+    "round executes; do not call ask_user for uncertainty that is not genuinely blocking.",
   kind: "read", // the prompt itself is the interaction; never route it through the approval gate
   classify: () => ({ effect: "interactive", concurrencySafe: false }),
   input_schema: {
@@ -38,15 +48,20 @@ const definition: Tool = {
       },
       header: { type: "string", description: "optional short label/topic for the question (e.g. 'Database choice')" },
       context: { type: "string", description: "optional one-line context shown before the question (keep it short)" },
+      default: {
+        type: "string",
+        description: "optional explicit fallback used only when no interactive user can answer; omit to skip rather than guess",
+      },
     },
     required: ["question"],
   },
   async run(input: any, ctx: ToolContext): Promise<string> {
     const question = typeof input.question === "string" ? input.question.trim() : "";
     if (!question) return "ask_user needs a non-empty `question`.";
+    const explicitDefault = typeof input.default === "string" ? input.default.trim() : "";
 
-    // No interactive user (headless / non-TTY / -p / gateway / sub-agent): do NOT block — let the model proceed.
-    if (typeof ctx.ask !== "function") return NO_INTERACTIVE_USER;
+    // No interactive user: do not block and, critically, do not manufacture a preference on the user's behalf.
+    if (typeof ctx.ask !== "function") return unavailableResult(explicitDefault);
 
     const options = Array.isArray(input.options)
       ? input.options.map((o: unknown) => String(o ?? "").trim()).filter((o: string) => o.length > 0)
@@ -65,8 +80,8 @@ const definition: Tool = {
       // Cancellation is authoritative. Let the agent loop close the open tool round as interrupted/deadline;
       // converting it into an ordinary "no user" result would let the model continue after Esc.
       if (ctx.signal?.aborted) throw e;
-      // If the interactive prompt fails for any reason, degrade gracefully rather than crash the turn.
-      return `${NO_INTERACTIVE_USER} (ask failed: ${e?.message ?? e})`;
+      // If the interactive prompt fails, preserve the same deterministic default-or-skip contract.
+      return unavailableResult(explicitDefault, `ask failed: ${e?.message ?? e}`);
     }
   },
 };

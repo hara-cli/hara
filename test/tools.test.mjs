@@ -218,12 +218,19 @@ test("write_file creates nested parent directories", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-test-"));
   try {
     const ctx = { cwd: dir };
-    await getTool("write_file").run({ path: "deep/nested/b.txt", content: "x" }, ctx);
+    const receipt = await getTool("write_file").run({ path: "deep/nested/b.txt", content: "x" }, ctx);
+    assert.match(receipt, /reference this file as deep\/nested\/b\.txt/);
     const r = await getTool("read_file").run({ path: "deep/nested/b.txt" }, ctx);
     assert.equal(r, "     1\tx"); // cat -n numbered
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("write_file and bash advertise one shared cwd path contract", () => {
+  assert.match(getTool("write_file").description, /same cwd as bash/i);
+  assert.match(getTool("bash").description, /same working directory used by read_file\/write_file/i);
+  assert.match(getTool("bash").description, /subdir\/name remains subdir\/name/i);
 });
 
 test("read_file streams a file larger than the in-memory threshold", async () => {

@@ -4037,7 +4037,7 @@ program
     };
     if (action === "status") {
       const rs = listRoutes();
-      out(rs.length ? rs.map((r) => `${r.pane}  [${r.mode ?? "once"}]  ${r.cwd ?? ""}`).join("\n") + "\n" : "(no panes registered)\n");
+      out(rs.length ? rs.map((r) => `${r.pane}  [${r.mode ?? "once"} · ${r.peer ? "chat-bound" : "legacy-unscoped"}]  ${r.cwd ?? ""}`).join("\n") + "\n" : "(no panes registered)\n");
       return;
     }
     if (action === "unbind" || action === "back") {
@@ -4045,29 +4045,43 @@ program
       out(unbindPane(pane!) ? `✓ ${action === "back" ? "back from remote — unbound" : "unbound"} ${pane}\n` : `${pane} was not registered\n`);
       return;
     }
+    const resolveWeixinPeer = async () => {
+      const wx = await import("./gateway/weixin.js");
+      const creds = wx.loadWeixinCreds() ?? undefined;
+      const configured = process.env.HARA_WX_PEER?.trim();
+      if (configured) return { peer: configured, wx, creds };
+      if (!creds) return { wx };
+      const peers = wx.weixinKnownPeers(creds.account_id);
+      return { peer: peers.find((candidate) => candidate.endsWith("@im.wechat")) || peers[0], wx, creds };
+    };
     if (action === "bind") {
       needPane();
-      registerTmuxRoute(pane!, undefined, process.cwd(), "bind");
-      out(c.green(`🔗 bound ${pane}`) + ` — every WeChat reply now injects here until \`hara remote unbind\` (or send /detach in chat). Daemon must be running.\n`);
+      const { peer } = await resolveWeixinPeer();
+      if (!peer) {
+        out(c.red("No known WeChat chat to bind. Log in/start the WeChat gateway or set HARA_WX_PEER, then retry. No route was created.\n"));
+        process.exitCode = 2;
+        return;
+      }
+      registerTmuxRoute(pane!, peer, process.cwd(), "bind");
+      out(c.green(`🔗 bound ${pane}`) + ` to one WeChat chat for 12 hours — renew with \`hara remote bind\`, unbind locally, or send /detach in that chat.\n`);
       return;
     }
     if (action === "ask") {
       needPane();
       if (!text) return void out(c.red('usage: hara remote ask "<question>"\n'));
-      registerTmuxRoute(pane!, undefined, process.cwd(), "once"); // register first — inbound inject works even if the push is throttled
       try {
-        const wx = await import("./gateway/weixin.js");
-        const creds = wx.loadWeixinCreds();
-        if (!creds) return void out(c.yellow(`↩ ${pane} registered, but no WeChat login (run \`hara gateway --platform weixin --login\`). Your next reply to the bot still injects here.\n`));
-        let peer = process.env.HARA_WX_PEER;
-        if (!peer) {
-          const peers = wx.weixinKnownPeers(creds.account_id);
-          peer = peers.find((candidate) => candidate.endsWith("@im.wechat")) || peers[0];
+        const { peer, wx, creds } = await resolveWeixinPeer();
+        if (!wx || !creds || !peer) {
+          out(c.red("No known WeChat chat. Log in/start the WeChat gateway or set HARA_WX_PEER. No route was created.\n"));
+          process.exitCode = 2;
+          return;
         }
-        if (peer) await wx.weixinAdapter(creds).send(peer, text);
-        out(c.green(`↩ asked on WeChat + registered ${pane}`) + ` — reply on WeChat and it'll be injected here. Daemon must be running.\n`);
+        registerTmuxRoute(pane!, peer, process.cwd(), "once");
+        await wx.weixinAdapter(creds).send(peer, text);
+        out(c.green(`↩ asked on WeChat + registered ${pane}`) + ` for that chat for 30 minutes — its reply will be injected here.\n`);
       } catch (e: any) {
-        out(c.yellow(`↩ ${pane} registered; WeChat push failed (${e.message}) — your next reply to the bot still injects here.\n`));
+        unbindPane(pane!);
+        out(c.yellow(`WeChat push failed (${e.message}); the temporary route was removed. Retry when the gateway is available.\n`));
       }
       return;
     }

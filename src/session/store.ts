@@ -51,6 +51,16 @@ export const MAX_SESSION_METADATA_FILE_BYTES = 4 * 1024 * 1024;
  *  (automated sessions get "name · time", NEVER the raw prompt). */
 export type SessionSource = "interactive" | "gateway" | "cron";
 
+/** Small renderer-safe outcome attached to one automated occurrence. The full transcript remains local;
+ *  automation.list reads this bounded metadata sidecar instead of reopening up to 100 large sessions. */
+export interface AutomationSessionRun {
+  status: "ok" | "error" | "running" | "timed_out";
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  error?: string;
+}
+
 const AUTOMATION_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** Derive the session source from the spawn environment — the gateway subprocess runs with
@@ -109,6 +119,8 @@ export interface SessionMeta {
    * matching generated cron child may replace this marker with an authoritative profile/Space route,
    * and only while the occurrence still has no history or task data. */
   pendingRouteBinding?: "cron";
+  /** Bounded outcome for Desktop's automation timeline. This never contains the task prompt or reply. */
+  automationRun?: AutomationSessionRun;
   /** Per-session reasoning effort pin used by persistent Serve clients. `null` is an explicit
    * provider/model automatic setting; `undefined` is reserved for legacy sessions that still inherit
    * the connection default when they are next resumed. */
@@ -1296,6 +1308,21 @@ function isPersistedTodo(value: unknown): boolean {
   );
 }
 
+function isAutomationSessionRun(value: unknown): value is AutomationSessionRun {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const run = value as Partial<Record<keyof AutomationSessionRun, unknown>>;
+  return (
+    (run.status === "ok" || run.status === "error" || run.status === "running" || run.status === "timed_out")
+    && isTimestamp(run.startedAt)
+    && (run.finishedAt === undefined || isTimestamp(run.finishedAt))
+    && (
+      run.durationMs === undefined
+      || (Number.isSafeInteger(run.durationMs) && Number(run.durationMs) >= 0)
+    )
+    && (run.error === undefined || (typeof run.error === "string" && run.error.length <= 4_096))
+  );
+}
+
 function isAssistantContinuation(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const continuation = value as Record<string, unknown>;
@@ -1416,6 +1443,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
     (meta.sourceName === undefined || typeof meta.sourceName === "string") &&
     (meta.jobId === undefined || (typeof meta.jobId === "string" && AUTOMATION_JOB_ID.test(meta.jobId))) &&
     (meta.pendingRouteBinding === undefined || meta.pendingRouteBinding === "cron") &&
+    (meta.automationRun === undefined || isAutomationSessionRun(meta.automationRun)) &&
     (meta.effort === undefined || meta.effort === null || typeof meta.effort === "string") &&
     (meta.approval === undefined
       || meta.approval === "suggest"

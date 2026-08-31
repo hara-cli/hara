@@ -15,7 +15,12 @@ import { matrixChatType, matrixDirectRoomsFromSync, parseMatrixEvent, parseMxc }
 import { parseDingtalkMessage } from "../dist/gateway/dingtalk.js";
 import { parseSignalMessage, signalAdapter } from "../dist/gateway/signal.js";
 import { parseWecomMessage } from "../dist/gateway/wecom.js";
-import { pickRoute, outputDelta } from "../dist/gateway/tmux-routes.js";
+import {
+  pickRoute,
+  outputDelta,
+  TMUX_BIND_ROUTE_TTL_MS,
+  TMUX_ONCE_ROUTE_TTL_MS,
+} from "../dist/gateway/tmux-routes.js";
 import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, gatewayAdmissionKey, gatewayStatus, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
 import { GatewayLoginManager } from "../dist/gateway/login.js";
 import { chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
@@ -633,23 +638,48 @@ test("parseWecomMessage: needs body, skips self, parses text", () => {
 
 test("pickRoute: oldest live pane chosen (FIFO), dead pruned, chosen consumed", () => {
   const alive = (p) => p !== "dead";
-  const r = pickRoute([{ pane: "a", ts: 3 }, { pane: "dead", ts: 1 }, { pane: "b", ts: 2 }], alive);
+  const r = pickRoute([{ pane: "a", ts: 3 }, { pane: "dead", ts: 1 }, { pane: "b", ts: 2 }], alive, undefined, 4);
   assert.equal(r.chosen.pane, "b"); // oldest LIVE (dead ts:1 skipped, b ts:2 < a ts:3)
   assert.deepEqual(r.remaining.map((x) => x.pane), ["a"]); // b consumed, dead pruned, a kept
   assert.equal(pickRoute([], alive).chosen, null);
-  const allDead = pickRoute([{ pane: "dead", ts: 1 }], alive);
+  const allDead = pickRoute([{ pane: "dead", ts: 1 }], alive, undefined, 2);
   assert.equal(allDead.chosen, null);
   assert.deepEqual(allDead.remaining, []); // dead pruned even when nothing chosen
 });
 
 test("pickRoute: a persistent 'bind' route is chosen but NOT consumed", () => {
   const alive = () => true;
-  const r = pickRoute([{ pane: "%1", ts: 1, mode: "bind" }, { pane: "%2", ts: 2, mode: "once" }], alive);
+  const r = pickRoute([{ pane: "%1", ts: 1, mode: "bind" }, { pane: "%2", ts: 2, mode: "once" }], alive, undefined, 3);
   assert.equal(r.chosen.pane, "%1"); // oldest
   assert.deepEqual(r.remaining.map((x) => x.pane).sort(), ["%1", "%2"]); // bind kept (not consumed)
-  const r2 = pickRoute([{ pane: "%2", ts: 2, mode: "once" }], alive);
+  const r2 = pickRoute([{ pane: "%2", ts: 2, mode: "once" }], alive, undefined, 3);
   assert.equal(r2.chosen.pane, "%2");
   assert.deepEqual(r2.remaining, []); // once consumed
+});
+
+test("pickRoute: inbound chat only selects its own fresh route and rejects legacy global binds", () => {
+  const now = 1_000_000;
+  const routes = [
+    { pane: "%legacy", ts: now - 1, mode: "bind" },
+    { pane: "%other", peer: "wx-other", ts: now - 3, mode: "bind" },
+    { pane: "%mine", peer: "wx-mine", ts: now - 2, mode: "bind" },
+  ];
+  const selected = pickRoute(routes, () => true, "wx-mine", now);
+  assert.equal(selected.chosen.pane, "%mine");
+  assert.deepEqual(selected.remaining.map((route) => route.pane).sort(), ["%legacy", "%mine", "%other"]);
+  assert.equal(pickRoute(routes, () => true, "wx-unknown", now).chosen, null);
+});
+
+test("pickRoute: stale one-shot and bind routes are pruned even while their tmux pane is alive", () => {
+  const now = 100_000_000;
+  const routes = [
+    { pane: "%old-once", peer: "wx", ts: now - TMUX_ONCE_ROUTE_TTL_MS - 1, mode: "once" },
+    { pane: "%old-bind", peer: "wx", ts: now - TMUX_BIND_ROUTE_TTL_MS - 1, mode: "bind" },
+    { pane: "%fresh", peer: "wx", ts: now - 1, mode: "once" },
+  ];
+  const selected = pickRoute(routes, () => true, "wx", now);
+  assert.equal(selected.chosen.pane, "%fresh");
+  assert.deepEqual(selected.remaining, []);
 });
 
 test("outputDelta: append/unchanged/scroll-anchor/tail", () => {

@@ -782,23 +782,42 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     // sessions created through serve are stamped interactive → never leak into the automation timeline
     assert.equal(auto.result.sessions.some((s) => s.id === sid), false, "serve session not in automation list");
     for (let index = 0; index < 55; index++) {
+      const occurrenceAt = new Date(Date.UTC(2026, 6, 24, 0, 0, index)).toISOString();
       store.save({
         id: `automation-history-${String(index).padStart(2, "0")}`,
         cwd: dir,
         provider: "fake",
         model: "fake-1",
         title: `automation run ${index}`,
-        createdAt: new Date(Date.UTC(2026, 6, 24, 0, 0, index)).toISOString(),
-        updatedAt: new Date(Date.UTC(2026, 6, 24, 0, 0, index)).toISOString(),
+        createdAt: occurrenceAt,
+        updatedAt: occurrenceAt,
         source: "cron",
         sourceName: "paged automation",
         jobId: "paged-automation",
+        ...(index === 54
+          ? {
+              automationRun: {
+                status: "error",
+                startedAt: occurrenceAt,
+                finishedAt: new Date(Date.UTC(2026, 6, 24, 0, 1, index)).toISOString(),
+                durationMs: 60_000,
+                error: "agent repeated the same failing call",
+              },
+            }
+          : {}),
       }, []);
     }
     const firstHistoryPage = await c.call("automation.list", { sessionLimit: 20 });
     assert.equal(firstHistoryPage.result.sessions.length, 20);
     assert.equal(firstHistoryPage.result.sessionPage.hasMore, true);
     assert.ok(firstHistoryPage.result.sessionPage.nextCursor);
+    const failedOccurrence = firstHistoryPage.result.sessions.find(
+      (session) => session.id === "automation-history-54",
+    );
+    assert.equal(failedOccurrence.status, "error");
+    assert.equal(failedOccurrence.error, "agent repeated the same failing call");
+    assert.equal(failedOccurrence.durationMs, 60_000);
+    assert.equal(failedOccurrence.needsAttention, true);
     const secondHistoryPage = await c.call("automation.list", {
       sessionLimit: 20,
       sessionCursor: firstHistoryPage.result.sessionPage.nextCursor,

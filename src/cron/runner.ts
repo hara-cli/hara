@@ -28,11 +28,15 @@ import { sensitiveShellCommandReason } from "../security/sensitive-files.js";
 import { createToolOutputLineRedactor, redactToolSubprocessOutput, terminateSubprocessTree, toolSubprocessEnv } from "../security/subprocess-env.js";
 import { compareProcessIdentity, defaultProcessIdentity } from "../process-identity.js";
 import {
+  acquireSessionLock,
   automatedTitle,
+  loadSession,
+  releaseSessionLock,
   saveSession,
   type SessionMeta,
 } from "../session/store.js";
 import { HARA_RUNTIME_VERSION } from "../version.js";
+import { RUNTIME_TIME_ZONE_ENV } from "../runtime-time.js";
 
 /** Jobs that are enabled AND due at `nowMs` (pure — for the tick and for testing). */
 export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
@@ -70,6 +74,20 @@ export function cronAgentArgs(
     : ["-p", job.task, "--approval", "full-auto", "--resume", sessionId];
 }
 
+/** Bind a headless occurrence to the same IANA zone used to decide when that job is due. */
+export function cronAgentEnv(
+  job: Pick<CronJob, "id" | "name" | "tz">,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...baseEnv,
+    HARA_CRON: "1",
+    HARA_CRON_ID: job.id,
+    HARA_CRON_NAME: job.name,
+    ...(job.tz ? { [RUNTIME_TIME_ZONE_ENV]: job.tz } : {}),
+  };
+}
+
 /** Persist the automation identity before cwd/provider/profile/spawn work can fail. The explicit pending
  * marker lets only this fresh, zero-history cron occurrence acquire the child's authoritative route under
  * the session lock. An early launch failure still remains visible in Desktop without pretending it was
@@ -92,6 +110,10 @@ export function persistPrintAutomationOccurrence(
     sourceName: job.name,
     jobId: job.id,
     pendingRouteBinding: "cron",
+    automationRun: {
+      status: "running",
+      startedAt: at.toISOString(),
+    },
   };
   saveSession(meta, []);
   return sessionId;
@@ -398,6 +420,66 @@ export interface CronTickResult {
   stopped?: string;
 }
 
+const MAX_AGENT_FAILURE_SUMMARY_CHARS = 600;
+
+/** Pull only Hara's own final headless diagnostic out of a captured agent run. Arbitrary command-mode
+ * stderr is never promoted into a renderer error, because a command can spoof runtime-looking output. */
+export function agentRunExitSummary(output: string, code: number | null): string {
+  const lines = redactToolSubprocessOutput(output)
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const runtimeFailure = lines.at(-1);
+  if (!runtimeFailure || !/^hara:\s+(?:headless|structured) run failed\b/iu.test(runtimeFailure)) {
+    return code === null ? "agent process exited without a status code" : `exited ${code}`;
+  }
+  const separator = runtimeFailure.indexOf(" — ");
+  const detail = (separator >= 0
+    ? runtimeFailure.slice(separator + 3)
+    : runtimeFailure.replace(/^hara:\s+(?:headless|structured) run failed(?:\s*\([^)]*\))?\s*[-—:]?\s*/iu, ""))
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (!detail) return code === null ? "agent process exited without a status code" : `exited ${code}`;
+  return detail.length <= MAX_AGENT_FAILURE_SUMMARY_CHARS
+    ? detail
+    : `${detail.slice(0, MAX_AGENT_FAILURE_SUMMARY_CHARS - 1).trimEnd()}…`;
+}
+
+/** Finalize the small occurrence sidecar only after the owned child has closed. Failure to refresh this
+ * acceleration data never replaces the cron job store's authoritative terminal state. */
+function finalizePrintAutomationOccurrence(
+  sessionId: string | undefined,
+  job: Pick<CronJob, "id">,
+  startedAt: number,
+  result: CronRunResult,
+): void {
+  if (!sessionId) return;
+  const lock = acquireSessionLock(sessionId);
+  if (!lock.ok) return;
+  try {
+    const session = loadSession(sessionId);
+    if (
+      !session
+      || session.meta.source !== "cron"
+      || session.meta.jobId !== job.id
+    ) return;
+    const finishedAt = Date.now();
+    session.meta.automationRun = {
+      status: terminalStatus(result),
+      startedAt: session.meta.automationRun?.startedAt ?? new Date(startedAt).toISOString(),
+      finishedAt: new Date(finishedAt).toISOString(),
+      durationMs: Math.max(0, finishedAt - startedAt),
+      ...(result.error ? { error: result.error.slice(0, 4_096) } : {}),
+    };
+    saveSession(session.meta, session.history, session.task);
+  } catch {
+    /* the cron job record remains authoritative; automation.list can still use its latest fallback */
+  } finally {
+    releaseSessionLock(sessionId);
+  }
+}
+
 /** Keep a per-job log from growing forever: once over ~1MB, retain only the last ~256KB. */
 function capLog(log: string): void {
   try {
@@ -412,10 +494,11 @@ function capLog(log: string): void {
 /** Run one job's task in a fresh hara process (full-auto, no prompts), appending output to its log.
  *  Exported so `hara cron run <id>` can fire a job on demand, ignoring its schedule. */
 export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<CronRunResult> {
+  const occurrenceStartedAt = Date.now();
   let occurrenceSessionId: string | undefined;
   if (job.mode === "print") {
     try {
-      occurrenceSessionId = persistPrintAutomationOccurrence(job);
+      occurrenceSessionId = persistPrintAutomationOccurrence(job, randomUUID(), new Date(occurrenceStartedAt));
     } catch (error) {
       return Promise.resolve({
         ok: false,
@@ -425,7 +508,9 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
     }
   }
   if (options.signal?.aborted) {
-    return Promise.resolve({ ok: false, error: "interrupted before cron job start by agent run deadline or cancellation", output: "", interrupted: true });
+    const result = { ok: false, error: "interrupted before cron job start by agent run deadline or cancellation", output: "", interrupted: true } as const;
+    finalizePrintAutomationOccurrence(occurrenceSessionId, job, occurrenceStartedAt, result);
+    return Promise.resolve(result);
   }
   return new Promise((resolve) => {
     const timeoutMs = cronJobTimeoutMs(options.timeoutMs);
@@ -478,22 +563,21 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
     // rename without guessing from free-form names, while the raw prompt never becomes a title.
     const env = job.mode === "command"
       ? toolSubprocessEnv(process.env, { HARA_CRON: "1" })
-      : {
-          ...process.env,
-          HARA_CRON: "1",
-          HARA_CRON_ID: job.id,
-          HARA_CRON_NAME: job.name,
-        };
+      : cronAgentEnv(job);
     const processGroup = platform() !== "win32";
     if (options.signal?.aborted) {
-      resolve({ ok: false, error: "interrupted before cron job start by agent run deadline or cancellation", output: "", interrupted: true });
+      const result = { ok: false, error: "interrupted before cron job start by agent run deadline or cancellation", output: "", interrupted: true } as const;
+      finalizePrintAutomationOccurrence(occurrenceSessionId, job, occurrenceStartedAt, result);
+      resolve(result);
       return;
     }
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(cmd, argv as string[], { cwd: job.cwd, env, detached: processGroup });
     } catch (error) {
-      resolve({ ok: false, error: `failed to start: ${error instanceof Error ? error.message : String(error)}`, output: "" });
+      const result = { ok: false, error: `failed to start: ${error instanceof Error ? error.message : String(error)}`, output: "" };
+      finalizePrintAutomationOccurrence(occurrenceSessionId, job, occurrenceStartedAt, result);
+      resolve(result);
       return;
     }
     let tail = ""; // combined stdout/stderr tail for diagnostics and ordinary delivery
@@ -544,12 +628,14 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
       cancelTermination?.();
       flush();
       capLog(log);
-      resolve({
+      const finalized = {
         ...result,
         error: result.error ? redactToolSubprocessOutput(result.error) : undefined,
         stdout: stdoutTail,
         output: tail,
-      });
+      };
+      finalizePrintAutomationOccurrence(occurrenceSessionId, job, occurrenceStartedAt, finalized);
+      resolve(finalized);
     };
     const abortRun = (): void => {
       if (done || timedOut || aborted) return;
@@ -608,7 +694,17 @@ export function runJobOnce(job: CronJob, options: CronRunOptions = {}): Promise<
         return;
       }
       if (timedOut) settle({ ok: false, error: `timed out after ${timeoutMs}ms`, output: tail, timedOut: true });
-      else settle(code === 0 ? { ok: true, output: tail } : { ok: false, error: `exited ${code}`, output: tail });
+      else if (code === 0) settle({ ok: true, output: tail });
+      else {
+        // The final runtime diagnostic may be buffered without a trailing newline. Flush before deriving
+        // the bounded renderer summary; settle's second flush is intentionally idempotent.
+        flush();
+        settle({
+          ok: false,
+          error: job.mode === "command" ? `exited ${code}` : agentRunExitSummary(tail, code),
+          output: tail,
+        });
+      }
     });
   });
 }

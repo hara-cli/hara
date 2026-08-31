@@ -1180,7 +1180,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
             return recovered;
           }
           if (ac.signal.aborted) throw ac.signal.reason instanceof Error ? ac.signal.reason : new Error("gateway effect cancelled");
-          const pane = pickPaneForReply();
+          const pane = pickPaneForReply(String(m.chatId));
           if (!pane) {
             // No irreversible route existed. Remove this preflight marker before falling through to coding.
             await runOutcomes.remove(m.messageId);
@@ -1204,7 +1204,9 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
             }
           }
           const delta = outputDelta(before, after).trim();
-          const body = delta ? (delta.length > 1500 ? "…\n" + delta.slice(-1500) : delta) : "(已注入,暂无新输出 — 发 ? 再看)";
+          const body = delta
+            ? (delta.length > 1500 ? "…\n" + delta.slice(-1500) : delta)
+            : "✓ 已发送到这个远程会话，10 秒内暂无新输出。发 ? 可再看，发 /detach 退出远程控制。";
           const completed = { reply: `🖥 ${pane}\n${body}`, files: [] } satisfies HaraRun;
           if (ac.signal.aborted) throw ac.signal.reason instanceof Error ? ac.signal.reason : new Error("gateway effect cancelled");
           await finishRunOutcome(runOutcomes, m.messageId, completed);
@@ -1257,7 +1259,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       }
       if (cmd.cmd === "detach") {
         const { unbindBinds } = await import("./tmux-routes.js");
-        const n = unbindBinds();
+        const n = unbindBinds(String(m.chatId));
         return sendMessage(m.chatId, n ? `🔓 detached ${n} bound tmux pane(s) — replies go to hara again.` : "(no tmux panes were bound)");
       }
       if (cmd.cmd === "pwd") return sendMessage(m.chatId, `📂 ${ctx.cwd}\n🧵 ${ctx.sessionId.slice(-18)}`);

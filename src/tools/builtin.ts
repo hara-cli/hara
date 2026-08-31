@@ -290,11 +290,12 @@ registerTool({
   description:
     "Create or overwrite a UTF-8 text file (creates parent directories). This is text-only: do not use " +
     "it for binary Office files or merely to save a one-shot Python helper before executing it; send " +
-    "one-shot Python source directly to the python tool instead.",
+    "one-shot Python source directly to the python tool instead. Relative paths use the same cwd as bash; " +
+    "preserve every subdirectory prefix when a later command references the written file.",
   input_schema: {
     type: "object",
     properties: {
-      path: { type: "string" },
+      path: { type: "string", description: "path relative to the shared tool cwd or an absolute path; keep this exact path in later shell commands" },
       content: { type: "string" },
     },
     required: ["path", "content"],
@@ -331,7 +332,9 @@ registerTool({
     emitDiff(input.path, prev ?? "", input.content, ctx.ui);
     recordEdit([{ path: input.path, absPath: boundary.target, before: prev, beforeMode: prevSnapshot?.mode, committed, after: input.content }]);
     invalidateFileCandidates(ctx.cwd);
-    return `Wrote ${String(input.content).length} chars to ${p}` + (committed.warnings?.length ? ` Warning: ${committed.warnings.join("; ")}` : "");
+    const shellPath = isAbsolute(String(input.path)) ? p : String(input.path);
+    return `Wrote ${String(input.content).length} chars to ${p}. Shell commands use cwd ${ctx.cwd}; reference this file as ${shellPath}.`
+      + (committed.warnings?.length ? ` Warning: ${committed.warnings.join("; ")}` : "");
   },
 });
 
@@ -389,7 +392,8 @@ registerTool({
 registerTool({
   name: "bash",
   description:
-    "Run a shell command in the working directory; returns combined stdout/stderr. " +
+    "Run a shell command in the same working directory used by read_file/write_file; returns combined stdout/stderr. " +
+    "A file written as subdir/name remains subdir/name here unless the command explicitly changes directory. " +
     "On Windows Hara verifies Bash first and otherwise uses native cmd.exe; follow the startup notice's syntax guidance. " +
     "Do not use this to show a folder in Finder/File Explorer; call open_directory instead.",
   input_schema: {

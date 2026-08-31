@@ -62,7 +62,8 @@
 //                                                    records only; organization records require Control review.
 //   automation.list   {sessionCursor?,sessionLimit?} → {jobs:[{id,name,mode,enabled,task,scheduleSpec,
 //                                                    delivery:{kind,label,mode?},nextRunAt?,nextRunDeferred?,…}],
-//                                                    sessions:[{id,title,source,sourceName,jobId?,updatedAt,…}],
+//                                                    sessions:[{id,title,source,sourceName,jobId?,updatedAt,
+//                                                               status?,startedAt?,finishedAt?,durationMs?,error?}],
 //                                                    sessionPage:{hasMore,limit,nextCursor?},
 //                                                    scheduler:{installed,supported,platform,detail}}
 //                                                    Raw delivery targets are write-only and never returned.

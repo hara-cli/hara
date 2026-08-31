@@ -130,6 +130,7 @@ import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
+import { automationSessionForClient } from "./automation-session.js";
 import { projectApprovalPolicy } from "../security/project-approvals.js";
 import { tokenPlanModelReplacement } from "../providers/alibaba.js";
 import {
@@ -3951,15 +3952,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 error instanceof Error ? error.message : "invalid automation history page",
               ));
             }
-            const automated = automatedPage.sessions.map((m) => ({
-              id: m.id,
-              title: m.title,
-              cwd: m.cwd,
-              source: m.source,
-              sourceName: m.sourceName,
-              jobId: m.jobId,
-              updatedAt: m.updatedAt,
-            }));
+            const automated = automatedPage.sessions.map(automationSessionForClient);
             return reply(rpcResult(id!, {
               jobs,
               sessions: automated,

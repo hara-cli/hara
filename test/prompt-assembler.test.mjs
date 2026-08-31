@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PromptAssembler } from "../dist/agent/prompt.js";
 import { composeSystem, replyLanguageInstruction } from "../dist/agent/loop.js";
+import { runtimeTimePrompt } from "../dist/runtime-time.js";
 
 test("PromptAssembler renders deterministic text and refuses a stable suffix after turn context", () => {
   const prompt = new PromptAssembler()
@@ -39,7 +40,11 @@ test("Hara prompt keeps core/session identities stable when the accepted task br
       true,
       "# Task execution\nTask ID: t1\nObjective: repair the parser",
     ];
-    const before = composeSystem(...common, { enabled: true });
+    const runtimeTime = {
+      now: new Date("2026-08-31T03:04:05.000Z"),
+      timeZone: "Asia/Shanghai",
+    };
+    const before = composeSystem(...common, { enabled: true }, undefined, runtimeTime);
     const after = composeSystem(...common, {
       enabled: true,
       brief: {
@@ -50,7 +55,7 @@ test("Hara prompt keeps core/session identities stable when the accepted task br
         steps: ["inspect", "edit", "test"],
         createdAt: "2026-07-19T00:00:00.000Z",
       },
-    });
+    }, undefined, runtimeTime);
 
     const reusable = (prompt) => prompt.parts
       .filter((part) => part.stability !== "turn")
@@ -70,11 +75,45 @@ test("Hara prompt keeps core/session identities stable when the accepted task br
     assert.match(after.text, /After one ineffective edit to the same function, stop editing it/);
     assert.match(after.text, /# Project context \(AGENTS\.md\)/);
     assert.match(after.text, /The task brief below is the accepted interpretation/);
+    const clock = after.parts.find((part) => part.id === "runtime-clock");
+    assert.deepEqual(
+      { stability: clock?.stability, source: clock?.source },
+      { stability: "turn", source: "runtime" },
+    );
+    assert.equal(after.parts.at(-1)?.id, "runtime-clock", "the changing clock stays after cacheable context");
+    assert.match(clock?.content ?? "", /Current date and time: 2026-08-31 11:04:05 \(Monday\)/);
+    assert.match(clock?.content ?? "", /Time zone: Asia\/Shanghai \(UTC\+08:00\)/);
+
+    const nextDay = composeSystem(...common, { enabled: true }, undefined, {
+      now: new Date("2026-09-01T03:04:05.000Z"),
+      timeZone: "Asia/Shanghai",
+    });
+    assert.notEqual(
+      nextDay.parts.find((part) => part.id === "runtime-clock")?.digest,
+      clock?.digest,
+      "a later provider request receives a refreshed clock",
+    );
+    assert.deepEqual(
+      nextDay.parts.filter((part) => part.id !== "runtime-clock"),
+      before.parts.filter((part) => part.id !== "runtime-clock"),
+      "refreshing the clock does not invalidate any other prompt part",
+    );
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("runtime clock uses the requested zone across a UTC date boundary", () => {
+  const prompt = runtimeTimePrompt({
+    now: new Date("2026-09-01T01:02:03.000Z"),
+    timeZone: "America/Los_Angeles",
+  });
+  assert.match(prompt, /Current date and time: 2026-08-31 18:02:03 \(Monday\)/);
+  assert.match(prompt, /Time zone: America\/Los_Angeles \(UTC-07:00\)/);
+  assert.match(prompt, /refreshed before every model request/);
+  assert.match(prompt, /knowledge cutoff/);
 });
 
 test("reply language follows the latest message by default and accepts an explicit language tag", () => {

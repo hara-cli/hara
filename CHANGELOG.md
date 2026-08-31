@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.158.0 — 2026-08-31 — reliable automations and chat-scoped remote control
+
+- Scope every WeChat remote-terminal route to the exact chat that created it. Legacy global routes can no
+  longer intercept ordinary messages, one-shot routes expire after 30 minutes, persistent binds expire after
+  12 hours, and a failed push removes its temporary route instead of leaving a hidden capture point. The
+  internal “injected, no new output” diagnostic is replaced with an explicit remote-session receipt.
+- Give each scheduled Agent occurrence a bounded, renderer-safe lifecycle outcome (`running`, `ok`, `error`,
+  or `timed_out`) with duration and redacted failure context. Desktop can now distinguish a completed run from
+  a merely created session without reopening large transcripts, while the cron store remains authoritative.
+- Refresh the current date, time, and effective IANA time zone on every provider request and carry a scheduled
+  job's own time zone into its Agent process. Long-lived sessions and automations no longer reason from a stale
+  startup clock.
+- Stop non-interactive work cleanly when `ask_user` genuinely requires an answer and has no explicit default;
+  later same-round side effects are closed instead of running on an invented preference. Also make file-write
+  receipts state the exact shared shell path so Agents retain nested directories. Upgrade with
+  `npm i -g @nanhara/hara@0.158.0`.
+
 ## 0.157.0 — 2026-08-30 — model defaults and Agent execution profiles
 
 - Make model configuration describe a default execution profile rather than only a Key. Personal Space keeps
