@@ -24,7 +24,8 @@ cache under the system temporary directory. The same 0.156.1 package dry-run the
 - Related Files: package.json, package-lock.json
 - Tags: npm, cache, permissions, release
 - Pattern-Key: release.npm_pack_uses_task_private_cache
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- Last-Seen: 2026-08-31T01:15:00+08:00
 
 ---
 
@@ -2708,8 +2709,8 @@ fixture could not launch. Rerun the unchanged suite through the approved host bo
 - Related Files: test/web.test.mjs, test/wecom-gateway.test.mjs, test/serve-e2e.test.mjs
 - Tags: tests, sandbox, loopback
 - Pattern-Key: tests.full_suite_requires_loopback_permission
-- Recurrence-Count: 10
-- Last-Seen: 2026-08-29
+- Recurrence-Count: 11
+- Last-Seen: 2026-09-01
 
 ---
 
@@ -4087,9 +4088,15 @@ Transient TLS/auth timeouts prevented the first npm audit and `node:22-slim` ima
 ### Suggested Fix
 Treat registry availability as a distinct release dependency, retry boundedly, and require a real successful registry audit and container build before tagging.
 
+### Metadata
+- Reproducible: transient
+- Recurrence-Count: 2
+- Last-Seen: 2026-08-31T01:10:00+08:00
+- See Also: ERR-20260716-NPM-AUDIT-QUICK-410
+
 ### Resolution
 - **Resolved**: 2026-07-15T19:02:00+08:00
-- **Notes**: Both networks recovered; npm reported zero vulnerabilities and the real Docker image built and returned version 0.123.0.
+- **Notes**: Both networks recovered; npm reported zero vulnerabilities and the real Docker image built and returned version 0.123.0. The same official audit endpoint reset one Hara CLI 0.157.0 release-gate connection on 2026-08-31; the release remained blocked until a bounded retry returned an authoritative result.
 
 ---
 
@@ -7363,7 +7370,8 @@ exit 71.
 - Related Files: src/sandbox.ts, test/agent-limits.test.mjs
 - Tags: tests, macos, sandbox, seatbelt
 - Pattern-Key: tests.nested_seatbelt_requires_unsandboxed_runner
-- Recurrence-Count: 1
+- Recurrence-Count: 3
+- Last-Seen: 2026-09-01
 
 ---
 

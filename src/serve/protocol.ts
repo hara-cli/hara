@@ -20,6 +20,7 @@
 //   external.sessions.read {sessionId}              → {session,messages:[{id,role,text}],readOnly:boolean}
 //   external.sessions.fork {sessionId}              → {sourceSessionId,session,messages,readOnly:false}
 //   external.sessions.submit {sessionId,text}       → {sessionId,turnId,status,reply,error?}
+//   external.sessions.steer {sessionId,text}        → {sessionId,turnId,accepted:true}
 //   external.sessions.interrupt {sessionId}         → {}
 //                                                        Personal Space only. Provider-native IDs, full paths,
 //                                                        provider cursors and credentials never cross Serve. A

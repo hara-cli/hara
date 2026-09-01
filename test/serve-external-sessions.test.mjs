@@ -90,6 +90,7 @@ const sourceResult = {
       resume: true,
       observeLive: false,
       submit: true,
+      steer: true,
       interrupt: true,
     },
   }],
@@ -145,6 +146,7 @@ test("Serve advertises a Personal-only external session interaction surface", as
         session: { ...(await this.listSessions()).sessions[0] },
         messages: [{ id: "msg_0123456789abcdef01234567", role: "assistant", text: "existing reply" }],
         readOnly: true,
+        controlMode: "history",
       };
     },
     async forkSession(requestedSessionId) {
@@ -154,7 +156,8 @@ test("Serve advertises a Personal-only external session interaction surface", as
         sourceSessionId: sessionId,
         session: { ...source, id: forkedSessionId, title: "Session · Hara fork" },
         messages: [{ id: "msg_0123456789abcdef01234567", role: "assistant", text: "existing reply" }],
-        readOnly: true,
+        readOnly: false,
+        controlMode: "managed",
       };
     },
     async submit(requestedSessionId, text, sink) {
@@ -165,12 +168,23 @@ test("Serve advertises a Personal-only external session interaction surface", as
       const verdict = await sink.confirm({ question: "Allow test command?", allowAlways: true }, new AbortController().signal);
       assert.equal(verdict, true);
       sink.text("hello ");
+      await new Promise((resolve) => { finishAfterSteer = resolve; });
       sink.text("world");
       return {
         sessionId: forkedSessionId,
         turnId: "provider-turn-is-not-exposed",
         status: "completed",
         reply: "hello world",
+      };
+    },
+    async steer(requestedSessionId, text) {
+      assert.equal(requestedSessionId, forkedSessionId);
+      assert.equal(text, "add one focused check");
+      finishAfterSteer?.();
+      return {
+        sessionId: forkedSessionId,
+        turnId: "adapter-private-turn-is-not-exposed",
+        accepted: true,
       };
     },
     async interrupt(requestedSessionId) {
@@ -181,6 +195,7 @@ test("Serve advertises a Personal-only external session interaction surface", as
   };
   let personal;
   let company;
+  let finishAfterSteer;
   try {
     personal = await startServe(
       { host: "127.0.0.1", port: 0, token: "personal-token", cwd: root },
@@ -191,6 +206,7 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.methods.includes("external.sources.list"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.metadata.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.interaction.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.live-control.v1"));
     const listed = await client.call("external.sessions.list", { sourceId: "codex" });
     assert.equal(listed.result.sessions[0].id, sessionId);
     const read = await client.call("external.sessions.read", { sessionId });
@@ -201,11 +217,20 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.equal(forked.result.session.id, forkedSessionId);
 
     const submitted = client.call("external.sessions.submit", { sessionId: forkedSessionId, text: "continue safely" });
+    const started = await client.waitFor("external.event.turn_start");
     const approval = await client.waitFor("external.approval.request");
     assert.equal(approval.params.sessionId, forkedSessionId);
     assert.equal(approval.params.question, "Allow test command?");
     const approvalReply = await client.call("approval.reply", { approvalId: approval.params.approvalId, allow: true });
     assert.deepEqual(approvalReply.result, {});
+    await client.waitFor("external.event.text");
+    const steered = await client.call("external.sessions.steer", {
+      sessionId: forkedSessionId,
+      text: "add one focused check",
+    });
+    assert.equal(steered.result.accepted, true);
+    assert.equal(steered.result.turnId, started.params.turnId);
+    assert.notEqual(steered.result.turnId, "adapter-private-turn-is-not-exposed");
     const completed = await submitted;
     assert.equal(completed.result.sessionId, forkedSessionId);
     assert.equal(completed.result.reply, "hello world");

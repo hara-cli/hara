@@ -1575,6 +1575,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const frame = rpcNotify(method, params);
     for (const ws of authed) if (ws.readyState === ws.OPEN) ws.send(frame);
   };
+  // Adapter turn identifiers never cross Serve. Keep the one active wire id per opaque session so a
+  // follow-up (`steer`) is correlated with the same stream that Desktop is already rendering.
+  const externalWireTurns = new Map<string, string>();
   const confirmExternalSessionAction = (
     sessionId: string,
     question: string,
@@ -2434,7 +2437,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.read", "external.sessions.fork",
-            "external.sessions.submit", "external.sessions.interrupt",
+            "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
@@ -2473,6 +2476,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "agent.blueprint-provenance.v1",
             "external.sessions.metadata.v1",
             "external.sessions.interaction.v1",
+            "external.sessions.live-control.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
@@ -2611,6 +2615,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const externalSessionId = p.sessionId;
             const externalTurnId = `extturn_${randomUUID()}`;
+            if (externalWireTurns.has(externalSessionId)) {
+              return reply(rpcError(id, ERR.BUSY, "this external coding-agent session is already running"));
+            }
+            externalWireTurns.set(externalSessionId, externalTurnId);
             broadcast("external.event.turn_start", { sessionId: externalSessionId, turnId: externalTurnId });
             try {
               const result = await externalSessions.submit(externalSessionId, p.text, {
@@ -2654,7 +2662,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 error: message,
               });
               throw error;
+            } finally {
+              if (externalWireTurns.get(externalSessionId) === externalTurnId) {
+                externalWireTurns.delete(externalSessionId);
+              }
             }
+          }
+          case "external.sessions.steer": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
+            }
+            const externalTurnId = externalWireTurns.get(p.sessionId);
+            if (!externalTurnId) {
+              return reply(rpcError(id, ERR.BUSY, "this external coding-agent session has no active turn"));
+            }
+            const result = await externalSessions.steer(p.sessionId, p.text);
+            const wireResult = { ...result, turnId: externalTurnId };
+            broadcast("external.event.notice", {
+              sessionId: wireResult.sessionId,
+              turnId: wireResult.turnId,
+              text: "Follow-up delivered to the active coding-agent turn.",
+            });
+            return reply(rpcResult(id!, wireResult));
           }
           case "external.sessions.interrupt": {
             if (externalSessionSpaceId() !== "personal") {

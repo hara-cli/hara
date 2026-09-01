@@ -162,6 +162,7 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
         resume: ready,
         observeLive: false,
         submit: ready,
+        steer: false,
         interrupt: ready,
       },
     };
@@ -217,6 +218,7 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
         return mapped ? [mapped] : [];
       }),
       readOnly: !ref.owned,
+      controlMode: ref.owned ? "managed" : "history",
     };
   }
 

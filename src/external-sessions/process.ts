@@ -30,6 +30,50 @@ export interface ExternalCommandOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+/**
+ * Run one bounded provider-management command without retaining or returning its output. This is used for
+ * lifecycle operations such as starting Codex's official local App Server daemon. Provider stderr can
+ * contain paths or account details, so callers receive only the exit status.
+ */
+export async function runExternalCommandStatus(
+  options: ExternalCommandOptions,
+  args: readonly string[],
+): Promise<boolean> {
+  const timeoutMs = Math.max(500, Math.min(options.timeoutMs ?? 10_000, 30_000));
+  const spawnProcess = options.spawnProcess ?? defaultSpawn;
+  const processGroup = platform() !== "win32";
+  const launch = resolveExternalCommandLaunch(options.command, options.env ?? process.env);
+  if (!launch) return false;
+  return await new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawnProcess(launch.command, [...(options.argsPrefix ?? []), ...args], {
+        stdio: ["ignore", "ignore", "ignore"],
+        env: externalLaunchEnv(options.env ?? process.env, launch.runtimeBin),
+        detached: processGroup,
+        windowsHide: true,
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    let done = false;
+    const finish = (result: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      terminateSubprocessTree(child, { force: true, processGroup });
+      finish(false);
+    }, timeoutMs);
+    timer.unref();
+    child.once("error", () => finish(false));
+    child.once("close", (code) => finish(code === 0));
+  });
+}
+
 const existingExecutable = (candidate: string): string | null => {
   if (!isAbsolute(candidate) || !existsSync(candidate)) return null;
   try {
@@ -223,6 +267,8 @@ export interface JsonlRpcSequenceOptions extends ExternalCommandOptions {
   requests: Array<{ id?: number; method: string; params?: Record<string, unknown> }>;
   resultId: number;
   maxOutputBytes?: number;
+  /** Defaults to a private stdio App Server; Codex daemon clients use `app-server proxy`. */
+  appServerArgs?: readonly string[];
 }
 
 export interface JsonlRpcRequest {
@@ -241,6 +287,8 @@ export class ExternalJsonlRpcRequestError extends Error {
 
 export interface JsonlRpcClientOptions extends ExternalCommandOptions {
   maxOutputBytes?: number;
+  /** Defaults to a private stdio App Server; Codex daemon clients use `app-server proxy`. */
+  appServerArgs?: readonly string[];
   onNotification?: (method: string, params: Record<string, unknown>) => void;
   onClose?: (error: Error) => void;
   onServerRequest?: (
@@ -297,7 +345,10 @@ export class JsonlRpcClient {
     if (!launch) throw new Error("external session adapter command was not found");
     let child: ChildProcess;
     try {
-      child = spawnProcess(launch.command, [...(options.argsPrefix ?? []), "app-server", "--stdio"], {
+      child = spawnProcess(launch.command, [
+        ...(options.argsPrefix ?? []),
+        ...(options.appServerArgs ?? ["app-server", "--stdio"]),
+      ], {
         stdio: ["pipe", "pipe", "pipe"],
         env: externalLaunchEnv(options.env ?? process.env, launch.runtimeBin),
         detached: processGroup,
@@ -469,7 +520,10 @@ export async function runJsonlRpcSequence<T>(options: JsonlRpcSequenceOptions): 
   return await new Promise<T>((resolve, reject) => {
     let child: ChildProcess;
     try {
-      child = spawnProcess(launch.command, [...(options.argsPrefix ?? []), "app-server", "--stdio"], {
+      child = spawnProcess(launch.command, [
+        ...(options.argsPrefix ?? []),
+        ...(options.appServerArgs ?? ["app-server", "--stdio"]),
+      ], {
         stdio: ["pipe", "pipe", "pipe"],
         env: externalLaunchEnv(options.env ?? process.env, launch.runtimeBin),
         detached: processGroup,

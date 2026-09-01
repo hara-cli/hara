@@ -28,6 +28,7 @@ export interface ExternalSessionSourceCapabilities {
   resume: boolean;
   observeLive: boolean;
   submit: boolean;
+  steer: boolean;
   interrupt: boolean;
 }
 
@@ -70,6 +71,11 @@ export interface ExternalSessionReadResult {
   messages: ExternalSessionMessage[];
   /** True for provider-owned history. A Hara-created fork is writable on this device. */
   readOnly: boolean;
+  /**
+   * `live` is the provider's currently loaded session, `managed` is a Hara-owned continuation, and
+   * `history` is a protected provider session that must be forked before Hara writes to it.
+   */
+  controlMode: "history" | "managed" | "live";
 }
 
 export interface ExternalSessionForkResult extends ExternalSessionReadResult {
@@ -86,6 +92,13 @@ export interface ExternalTurnResult {
   status: ExternalTurnStatus;
   reply: string;
   error?: string;
+}
+
+export interface ExternalSteerResult {
+  sessionId: string;
+  /** Hara-owned turn id for correlating the accepted follow-up with the active stream. */
+  turnId: string;
+  accepted: true;
 }
 
 export interface ExternalApprovalRequest {
@@ -130,6 +143,7 @@ export interface ExternalSessionAdapter {
   read?(sessionId: string): Promise<ExternalSessionReadResult>;
   fork?(sessionId: string): Promise<ExternalSessionForkResult>;
   submit?(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
+  steer?(sessionId: string, text: string): Promise<ExternalSteerResult>;
   interrupt?(sessionId: string): Promise<void>;
   close?(): Promise<void>;
 }
@@ -140,6 +154,7 @@ export interface ExternalSessionService {
   readSession(sessionId: string): Promise<ExternalSessionReadResult>;
   forkSession(sessionId: string): Promise<ExternalSessionForkResult>;
   submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
+  steer(sessionId: string, text: string): Promise<ExternalSteerResult>;
   interrupt(sessionId: string): Promise<void>;
   close(): Promise<void>;
 }

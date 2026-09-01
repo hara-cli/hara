@@ -553,9 +553,10 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "agent.blueprint-provenance.v1",
         "external.sessions.metadata.v1",
         "external.sessions.interaction.v1",
+        "external.sessions.live-control.v1",
         "spaces.tenant-boundary.v1",
       ],
-      "persistent clients can negotiate attachments, model descriptors, safe recovery, explicit Space routing, reviewed learning, action ownership, Agent profiles, verified blueprints, external-session interaction, and tenant Spaces",
+      "persistent clients can negotiate attachments, model descriptors, safe recovery, explicit Space routing, reviewed learning, action ownership, Agent profiles, verified blueprints, external-session live control, and tenant Spaces",
     );
     for (const method of ["spaces.list", "spaces.use", "agents.create", "agents.update-profile", "agents.archive"]) {
       assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);

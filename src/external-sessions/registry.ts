@@ -13,6 +13,7 @@ import {
   type ExternalSessionService,
   type ExternalSessionSourceInfo,
   type ExternalSessionSourceId,
+  type ExternalSteerResult,
   type ExternalTurnResult,
   type ExternalTurnSink,
 } from "./types.js";
@@ -34,7 +35,7 @@ export interface ExternalSessionRegistryOptions {
   adapters?: ExternalSessionAdapter[];
   identityKey?: Buffer;
   identityHome?: string;
-  codex?: Partial<ExternalCommandOptions>;
+  codex?: Partial<ExternalCommandOptions> & { managedDaemon?: boolean };
   claude?: Partial<ExternalCommandOptions>;
 }
 
@@ -56,6 +57,7 @@ export class ExternalSessionRegistry implements ExternalSessionService {
           haraVersion: options.haraVersion,
           identityKey,
           ownership,
+          managedDaemon: options.codex?.managedDaemon,
         }),
         new ClaudeAgentSdkAdapter({
           command: options.claude?.command ?? "claude",
@@ -174,6 +176,16 @@ export class ExternalSessionRegistry implements ExternalSessionService {
       throw new ExternalSessionInputError("external session input exceeds 256 KiB");
     }
     return await adapter.submit(sessionId, text, sink);
+  }
+
+  async steer(sessionId: string, text: string): Promise<ExternalSteerResult> {
+    const adapter = this.adapterForSession(sessionId);
+    if (!adapter.steer) throw new ExternalSessionInputError("external session source does not support steering");
+    if (typeof text !== "string" || !text.trim()) throw new ExternalSessionInputError("text is required");
+    if (Buffer.byteLength(text, "utf8") > 256 * 1024) {
+      throw new ExternalSessionInputError("external session input exceeds 256 KiB");
+    }
+    return await adapter.steer(sessionId, text);
   }
 
   async interrupt(sessionId: string): Promise<void> {

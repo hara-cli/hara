@@ -240,9 +240,13 @@ test("Codex official runtime supports bounded read, safety fork, approval, strea
       } else {
         const lines = createInterface({ input: process.stdin });
         const reply = (id, result) => process.stdout.write(JSON.stringify({ id, result }) + "\\n");
+        let experimentalApi = false;
         lines.on("line", (line) => {
           const request = JSON.parse(line);
-          if (request.method === "initialize") reply(request.id, { userAgent: "fixture" });
+          if (request.method === "initialize") {
+            experimentalApi = request.params?.capabilities?.experimentalApi === true;
+            reply(request.id, { userAgent: "fixture" });
+          }
           if (request.method === "thread/list") reply(request.id, { data: [{
             id: "native-source", name: "Source", cwd: "/workspace/private-project",
             createdAt: 1780000000, updatedAt: 1780000010, status: { type: "idle" },
@@ -262,11 +266,15 @@ test("Codex official runtime supports bounded read, safety fork, approval, strea
             nextCursor: "provider-private-turn-cursor",
             backwardsCursor: "provider-private-backwards-cursor"
           });
-          if (request.method === "thread/fork") reply(request.id, { thread: {
-            id: "native-fork", cwd: "/workspace/private-project", name: "Source fork",
-            createdAt: 1780000000, updatedAt: 1780000020, status: { type: "idle" }, source: "appServer",
-            turns: []
-          } });
+          if (request.method === "thread/fork") {
+            if (!experimentalApi) {
+              process.stdout.write(JSON.stringify({ id: request.id, error: { code: -32600, message: "experimental client capability required" } }) + "\\n");
+            } else reply(request.id, { thread: {
+              id: "native-fork", cwd: "/workspace/private-project", name: "Source fork",
+              createdAt: 1780000000, updatedAt: 1780000020, status: { type: "idle" }, source: "appServer",
+              turns: []
+            } });
+          }
           if (request.method === "thread/resume") reply(request.id, { thread: { id: request.params.threadId } });
           if (request.method === "turn/start") {
             reply(request.id, { turn: { id: "native-turn" } });
@@ -371,6 +379,98 @@ test("Codex read degrades safely when an older App Server lacks bounded turn pag
       "Update Codex to read this transcript safely in Hara. The original session remains unchanged.",
     ]]);
     assert.doesNotMatch(JSON.stringify(read), /legacy-native|\/workspace\/legacy-private|provider-secret/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex shared App Server daemon exposes a loaded thread and steers one active turn without forking", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-external-codex-live-"));
+  try {
+    const fixture = join(root, "fake-codex-live.mjs");
+    writeFileSync(fixture, `
+      import { createInterface } from "node:readline";
+      if (process.argv.includes("--version")) {
+        process.stdout.write("codex-cli 9.9.9\\n");
+      } else if (process.argv.includes("daemon") && process.argv.includes("start")) {
+        process.exit(0);
+      } else {
+        const lines = createInterface({ input: process.stdin });
+        const reply = (id, result) => process.stdout.write(JSON.stringify({ id, result }) + "\\n");
+        let steerCount = 0;
+        lines.on("line", (line) => {
+          const request = JSON.parse(line);
+          if (request.method === "initialize") reply(request.id, { userAgent: "fixture-live" });
+          if (request.method === "thread/list") reply(request.id, { data: [{
+            id: "native-live-thread", name: "Live release", cwd: "/workspace/live-project",
+            createdAt: 1780000000, updatedAt: 1780000030,
+            status: { type: "active", activeFlags: [] }, source: "appServer", ephemeral: false
+          }], nextCursor: null });
+          if (request.method === "thread/resume") reply(request.id, { thread: {
+            id: request.params.threadId, status: { type: "active", activeFlags: [] }
+          } });
+          if (request.method === "thread/turns/list") {
+            if (request.params?.itemsView === "notLoaded") {
+              reply(request.id, { data: [{ id: "native-active-turn", status: "inProgress", items: [] }], nextCursor: null });
+            } else {
+              reply(request.id, { data: [{ id: "native-active-turn", items: [
+                { id: "native-live-user", type: "userMessage", content: [{ type: "text", text: "ship it" }] },
+                { id: "native-live-agent", type: "agentMessage", text: "working" }
+              ] }], nextCursor: null });
+            }
+          }
+          if (request.method === "thread/fork") {
+            process.stdout.write(JSON.stringify({ id: request.id, error: { code: -32000, message: "live thread must not fork" } }) + "\\n");
+          }
+          if (request.method === "turn/steer") {
+            steerCount += 1;
+            reply(request.id, {});
+            if (steerCount === 2) {
+              process.stdout.write(JSON.stringify({ method: "item/agentMessage/delta", params: { delta: "follow-up accepted" } }) + "\\n");
+              process.stdout.write(JSON.stringify({ method: "turn/completed", params: { turn: { id: "native-active-turn", status: "completed" } } }) + "\\n");
+            }
+          }
+        });
+      }
+    `);
+
+    const adapter = new CodexAppServerAdapter({
+      command: process.execPath,
+      argsPrefix: [fixture],
+      managedDaemon: true,
+      timeoutMs: 3_000,
+      haraVersion: "0.0.0-test",
+      identityKey: Buffer.alloc(32, 17),
+    });
+    const source = await adapter.inspect();
+    assert.equal(source.capabilities.observeLive, true);
+    assert.equal(source.capabilities.steer, true);
+    const listed = await adapter.list({ limit: 10 });
+    const sessionId = listed.sessions[0].id;
+    const read = await adapter.read(sessionId);
+    assert.equal(read.readOnly, false);
+    assert.equal(read.controlMode, "live");
+
+    let initialSteerReady;
+    const initialSteer = new Promise((resolve) => { initialSteerReady = resolve; });
+    const deltas = [];
+    const turnPromise = adapter.submit(sessionId, "prioritize the UI", {
+      text: (delta) => deltas.push(delta),
+      tool: () => {},
+      notice: (message) => {
+        if (message.includes("active Codex turn")) initialSteerReady();
+      },
+      confirm: async () => true,
+    });
+    await initialSteer;
+    const steered = await adapter.steer(sessionId, "also run the responsive test");
+    assert.equal(steered.accepted, true);
+    const turn = await turnPromise;
+    assert.equal(turn.status, "completed");
+    assert.equal(turn.reply, "follow-up accepted");
+    assert.deepEqual(deltas, ["follow-up accepted"]);
+    assert.doesNotMatch(JSON.stringify({ source, listed, read, steered, turn }), /native-live|native-active|\/workspace\/live-project/);
+    await adapter.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

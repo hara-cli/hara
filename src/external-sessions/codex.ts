@@ -6,6 +6,7 @@ import {
   ExternalJsonlRpcRequestError,
   JsonlRpcClient,
   probeExternalCommand,
+  runExternalCommandStatus,
   runJsonlRpcSequence,
   type ExternalCommandOptions,
   type JsonlRpcRequest,
@@ -18,6 +19,7 @@ import type {
   ExternalSessionMessage,
   ExternalSessionReadResult,
   ExternalSessionSourceInfo,
+  ExternalSteerResult,
   ExternalTurnResult,
   ExternalTurnSink,
 } from "./types.js";
@@ -60,6 +62,8 @@ interface CodexNativeRef {
   nativeId: string;
   cwd: string;
   owned: boolean;
+  /** True only when the thread is loaded in the official daemon Hara is connected to. */
+  live: boolean;
   info: ExternalSessionInfo;
 }
 
@@ -70,6 +74,9 @@ interface CodexRuntime {
   nativeTurnId?: string;
   haraSessionId: string;
   haraTurnId: string;
+  state: "working" | "waiting";
+  nativeTurnReady: Promise<string>;
+  resolveNativeTurn(turnId: string): void;
 }
 
 const MAX_MESSAGE_TEXT = 128 * 1024;
@@ -133,7 +140,7 @@ const externalThread = (value: unknown, identityKey: Buffer): CodexNativeRef | n
     origin: originFromSource(thread.source),
     ephemeral: thread.ephemeral === true,
   };
-  return { nativeId: thread.id, cwd: thread.cwd, owned: false, info };
+  return { nativeId: thread.id, cwd: thread.cwd, owned: false, live: false, info };
 };
 
 const safeText = (value: unknown, max = MAX_MESSAGE_TEXT): string => redactSensitiveText(
@@ -205,17 +212,35 @@ export interface CodexAppServerAdapterOptions extends ExternalCommandOptions {
   /** Per-Serve secret: prevents a renderer from testing guessed native IDs or local paths against digests. */
   identityKey: Buffer;
   ownership?: ExternalSessionOwnershipStore;
+  /** Prefer the official shared App Server daemon. Disabled automatically for hermetic fixture prefixes. */
+  managedDaemon?: boolean;
 }
 
 export class CodexAppServerAdapter implements ExternalSessionAdapter {
   readonly id = "codex" as const;
   private readonly refs = new Map<string, CodexNativeRef>();
   private readonly running = new Map<string, CodexRuntime>();
+  private daemonTransport?: Promise<boolean>;
 
   constructor(private readonly options: CodexAppServerAdapterOptions) {}
 
+  private usesManagedDaemon(): Promise<boolean> {
+    const eligible = this.options.managedDaemon ?? !(this.options.argsPrefix?.length);
+    if (!eligible) return Promise.resolve(false);
+    this.daemonTransport ??= runExternalCommandStatus(this.options, ["app-server", "daemon", "start"]);
+    return this.daemonTransport;
+  }
+
+  private async appServerArgs(): Promise<readonly string[]> {
+    return await this.usesManagedDaemon()
+      ? ["app-server", "proxy"]
+      : ["app-server", "--stdio"];
+  }
+
   async inspect(): Promise<ExternalSessionSourceInfo> {
     const probe = await probeExternalCommand(this.options);
+    const ready = probe.installed && !probe.failed;
+    const observeLive = ready && await this.usesManagedDaemon();
     return {
       id: this.id,
       label: "Codex",
@@ -225,20 +250,25 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
         ? { reason: "command_not_found" as const }
         : probe.failed ? { reason: "probe_failed" as const } : {}),
       capabilities: {
-        listMetadata: probe.installed && !probe.failed,
-        read: probe.installed && !probe.failed,
-        fork: probe.installed && !probe.failed,
-        resume: probe.installed && !probe.failed,
-        observeLive: false,
-        submit: probe.installed && !probe.failed,
-        interrupt: probe.installed && !probe.failed,
+        listMetadata: ready,
+        read: ready,
+        fork: ready,
+        resume: ready,
+        observeLive,
+        submit: ready,
+        // A Hara-started turn can always accept follow-ups through the same App Server client. The
+        // shared daemon additionally permits steering a provider turn that was already active.
+        steer: ready,
+        interrupt: ready,
       },
     };
   }
 
   async list(input: { cursor?: string; limit: number; search?: string }): Promise<ExternalSessionAdapterPage> {
+    const daemon = await this.usesManagedDaemon();
     const result = await runJsonlRpcSequence<CodexThreadListResponse>({
       ...this.options,
+      appServerArgs: await this.appServerArgs(),
       requests: [
         {
           id: 1,
@@ -273,6 +303,12 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       if (!mapped) return [];
       const prior = this.refs.get(mapped.info.id);
       if (prior?.owned || this.options.ownership?.has(mapped.info.id)) mapped.owned = true;
+      mapped.live = daemon && ["idle", "working", "waiting"].includes(mapped.info.state);
+      const runtime = this.running.get(mapped.info.id);
+      if (runtime) {
+        mapped.live = true;
+        mapped.info = { ...mapped.info, state: runtime.state };
+      }
       this.refs.set(mapped.info.id, mapped);
       return [mapped.info];
     });
@@ -326,6 +362,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     try {
       result = await runJsonlRpcSequence<CodexTurnsListResponse>({
         ...this.options,
+        appServerArgs: await this.appServerArgs(),
         timeoutMs: this.options.timeoutMs ?? 30_000,
         requests: this.initializeRequests({
           id: 2,
@@ -377,7 +414,8 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     return {
       session: ref.info,
       messages: await this.recentMessages(ref),
-      readOnly: !ref.owned,
+      readOnly: !ref.owned && !ref.live,
+      controlMode: ref.owned ? "managed" : ref.live ? "live" : "history",
     };
   }
 
@@ -385,6 +423,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     const source = this.ref(sessionId);
     const result = await runJsonlRpcSequence<CodexThreadResponse>({
       ...this.options,
+      appServerArgs: await this.appServerArgs(),
       timeoutMs: this.options.timeoutMs ?? 30_000,
       requests: this.initializeRequests({
         id: 2,
@@ -395,13 +434,14 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
           excludeTurns: true,
           ephemeral: false,
         },
-      }),
+      }, { experimentalApi: true }),
       resultId: 2,
       maxOutputBytes: 16 * 1024 * 1024,
     });
     const mapped = externalThread(result.thread, this.options.identityKey);
     if (!mapped) throw new Error("Codex returned an invalid fork");
     mapped.owned = true;
+    mapped.live = await this.usesManagedDaemon();
     this.options.ownership?.add("codex", mapped.info.id);
     this.refs.set(mapped.info.id, mapped);
     return {
@@ -409,6 +449,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       session: mapped.info,
       messages: await this.recentMessages(mapped),
       readOnly: false,
+      controlMode: "managed",
     };
   }
 
@@ -491,15 +532,34 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     }
   }
 
+  private setState(ref: CodexNativeRef, state: ExternalSessionInfo["state"]): void {
+    ref.info = { ...ref.info, state, updatedAt: new Date().toISOString() };
+  }
+
+  private async activeTurnId(client: JsonlRpcClient, nativeThreadId: string): Promise<string> {
+    const result = await client.call<CodexTurnsListResponse>("thread/turns/list", {
+      threadId: nativeThreadId,
+      limit: 1,
+      sortDirection: "desc",
+      itemsView: "notLoaded",
+    });
+    const first = Array.isArray(result.data) ? result.data[0] : undefined;
+    if (!first || typeof first !== "object" || Array.isArray(first)) return "";
+    const turnId = (first as Record<string, unknown>).id;
+    return typeof turnId === "string" ? turnId : "";
+  }
+
   async submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult> {
     let ref = this.ref(sessionId);
     if (this.running.has(sessionId)) throw new Error("this external Codex session already has a Hara-controlled turn");
-    if (!ref.owned) {
+    if (!ref.owned && !ref.live) {
       const forked = await this.fork(sessionId);
       ref = this.ref(forked.session.id);
       sessionId = ref.info.id;
       sink.notice("Hara forked the Codex session before continuing, so the original remains unchanged.");
     }
+    const priorState = ref.info.state;
+    const appServerArgs = await this.appServerArgs();
     const haraTurnId = `extturn_${randomUUID()}`;
     const abort = new AbortController();
     let complete: ((result: ExternalTurnResult) => void) | undefined;
@@ -513,9 +573,20 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       terminalSettled = true;
       complete?.(result);
     };
+    let resolveNativeTurn = (_turnId: string): void => {};
+    const nativeTurnReady = new Promise<string>((resolve) => {
+      resolveNativeTurn = resolve;
+    });
+    let nativeTurnResolved = false;
+    const settleNativeTurn = (turnId: string): void => {
+      if (nativeTurnResolved) return;
+      nativeTurnResolved = true;
+      resolveNativeTurn(turnId);
+    };
     let runtime: CodexRuntime;
     const client = JsonlRpcClient.start({
       ...this.options,
+      appServerArgs,
       maxOutputBytes: 64 * 1024 * 1024,
       onNotification: (method, params) => {
         if (method === "item/agentMessage/delta" && typeof params.delta === "string") {
@@ -532,6 +603,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
             : {};
           const providerStatus = turn.status;
           const status = providerStatus === "interrupted" ? "interrupted" : providerStatus === "failed" ? "failed" : "completed";
+          this.setState(ref, status === "failed" ? "error" : "idle");
           finish({
             sessionId,
             turnId: haraTurnId,
@@ -549,8 +621,14 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
         ...(!abort.signal.aborted ? { error: safeText(error.message, 2_000) || "Codex session adapter closed" } : {}),
       }),
       onServerRequest: (request, respond, reject) => {
+        runtime.state = "waiting";
+        this.setState(ref, "waiting");
         void this.answerServerRequest(request, sink, abort.signal)
-          .then(respond)
+          .then((result) => {
+            runtime.state = "working";
+            this.setState(ref, "working");
+            respond(result);
+          })
           .catch(() => reject(-32601, "request is not supported by Hara"));
       },
     });
@@ -560,40 +638,83 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       nativeThreadId: ref.nativeId,
       haraSessionId: sessionId,
       haraTurnId,
+      state: "working",
+      nativeTurnReady,
+      resolveNativeTurn: settleNativeTurn,
     };
     this.running.set(sessionId, runtime);
+    this.setState(ref, "working");
     try {
       await client.call("initialize", {
         clientInfo: { name: "hara", title: "Hara", version: this.options.haraVersion },
         capabilities: {
-          experimentalApi: false,
+          experimentalApi: true,
           requestAttestation: false,
           optOutNotificationMethods: [],
         },
       });
       client.notify("initialized");
-      await client.call("thread/resume", {
+      const resumed = await client.call<CodexThreadResponse>("thread/resume", {
         threadId: ref.nativeId,
         approvalsReviewer: "user",
         excludeTurns: true,
       });
-      const started = await client.call<CodexTurnStartResponse>("turn/start", {
-        threadId: ref.nativeId,
-        input: [{ type: "text", text, text_elements: [] }],
-        approvalsReviewer: "user",
-      });
-      if (started.turn && typeof started.turn === "object" && !Array.isArray(started.turn)) {
-        const nativeTurnId = (started.turn as Record<string, unknown>).id;
-        if (typeof nativeTurnId === "string") runtime.nativeTurnId = nativeTurnId;
+      const resumedThread = resumed.thread && typeof resumed.thread === "object" && !Array.isArray(resumed.thread)
+        ? resumed.thread as Record<string, unknown>
+        : {};
+      const resumedState = stateFromStatus(resumedThread.status);
+      const active = ref.live && (
+        resumedState === "working"
+        || resumedState === "waiting"
+        || (resumedState === "unknown" && (priorState === "working" || priorState === "waiting"))
+      );
+      if (active) {
+        const nativeTurnId = await this.activeTurnId(client, ref.nativeId);
+        if (!nativeTurnId) throw new Error("Codex reports an active session but did not expose a steerable turn; refresh and retry");
+        runtime.nativeTurnId = nativeTurnId;
+        runtime.resolveNativeTurn(nativeTurnId);
+        await client.call("turn/steer", {
+          threadId: ref.nativeId,
+          input: [{ type: "text", text, text_elements: [] }],
+          expectedTurnId: nativeTurnId,
+        });
+        sink.notice("Hara added your message to the active Codex turn.");
+      } else {
+        const started = await client.call<CodexTurnStartResponse>("turn/start", {
+          threadId: ref.nativeId,
+          input: [{ type: "text", text, text_elements: [] }],
+          approvalsReviewer: "user",
+        });
+        if (started.turn && typeof started.turn === "object" && !Array.isArray(started.turn)) {
+          const nativeTurnId = (started.turn as Record<string, unknown>).id;
+          if (typeof nativeTurnId === "string") {
+            runtime.nativeTurnId = nativeTurnId;
+            runtime.resolveNativeTurn(nativeTurnId);
+          }
+        }
       }
       return await terminal;
     } catch (error) {
       throw error;
     } finally {
+      settleNativeTurn("");
       this.running.delete(sessionId);
       abort.abort();
       client.close();
     }
+  }
+
+  async steer(sessionId: string, text: string): Promise<ExternalSteerResult> {
+    const runtime = this.running.get(sessionId);
+    if (!runtime) throw new Error("this Codex session has no active Hara-visible turn");
+    const nativeTurnId = runtime.nativeTurnId || await runtime.nativeTurnReady;
+    if (!nativeTurnId) throw new Error("the active Codex turn ended before the follow-up could be delivered");
+    await runtime.client.call("turn/steer", {
+      threadId: runtime.nativeThreadId,
+      input: [{ type: "text", text, text_elements: [] }],
+      expectedTurnId: nativeTurnId,
+    });
+    return { sessionId, turnId: runtime.haraTurnId, accepted: true };
   }
 
   async interrupt(sessionId: string): Promise<void> {

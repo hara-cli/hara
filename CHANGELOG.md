@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.159.0 — 2026-09-01 — live Codex session control from Hara
+
+- Turn the local External Session bridge into a controllable Codex work channel. Hara can attach to a
+  compatible live App Server thread, send a follow-up into its active turn, or start the next turn without
+  exposing provider-native thread or turn IDs to Desktop. A Hara-created protected fork remains the default
+  before changing a stored session; Claude Code history stays read-only until its official runtime offers an
+  equivalent safe control surface.
+- Negotiate Codex's current experimental fork capability before using the official App Server protocol, keep
+  one opaque Hara turn ID across every correlated runtime event, reject overlapping submits, and terminate
+  Hara-owned process trees on timeout or interruption. npm-installed Codex builds that cannot start the
+  standalone managed daemon fall back to a bounded stdio session instead of claiming live attachment.
+- Advertise `external.sessions.steer` and `external.sessions.live-control.v1` through Hara Serve so Desktop and
+  future authenticated messaging routes can distinguish protected history, Hara-managed work, and genuinely
+  live sessions. Upgrade with `npm i -g @nanhara/hara@0.159.0`.
+
 ## 0.158.0 — 2026-08-31 — reliable automations and chat-scoped remote control
 
 - Scope every WeChat remote-terminal route to the exact chat that created it. Legacy global routes can no
