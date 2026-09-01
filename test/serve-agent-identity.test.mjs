@@ -412,9 +412,11 @@ test("serve persists Agent identity, lists offices, and runs the selected person
     });
     const beforeDesignerTurn = await client.call("session.list", {});
     assert.ok(
-      !beforeDesignerTurn.result.sessions.some((session) => session.id === designer.result.sessionId),
-      "an untouched Agent draft must not create an empty history row",
+      beforeDesignerTurn.result.sessions.some((session) => session.id === designer.result.sessionId),
+      "an untouched Agent draft must remain visible to the running client",
     );
+    assert.equal(store.saved.has(designer.result.sessionId), false,
+      "visibility must not turn an untouched Agent draft into an empty history row");
     const designerSent = await client.call("session.send", {
       sessionId: designer.result.sessionId,
       text: "review the experience",

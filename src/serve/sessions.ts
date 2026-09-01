@@ -18,6 +18,7 @@ import {
   deleteSession,
   deriveTitle,
   sanitizeSessionTitle,
+  sessionMetadataMatchesOptions,
 } from "../session/store.js";
 import { forkTaskExecution, recoverTaskExecution, type TaskExecution } from "../session/task.js";
 
@@ -78,6 +79,36 @@ function failClosedSpaceId(profileId?: string): string {
   return profileId && profileId !== "personal" ? `org-profile:${profileId}` : "personal";
 }
 
+const HUB_SESSION_CURSOR_PREFIX = "hara-live-v1:";
+
+type HubSessionCursor =
+  | { phase: "drafts"; offset: number }
+  | { phase: "stored"; cursor?: string };
+
+function encodeHubSessionCursor(cursor: HubSessionCursor): string {
+  return `${HUB_SESSION_CURSOR_PREFIX}${Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url")}`;
+}
+
+function decodeHubSessionCursor(value: string): HubSessionCursor | null {
+  if (!value.startsWith(HUB_SESSION_CURSOR_PREFIX) || value.length > 8_192) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value.slice(HUB_SESSION_CURSOR_PREFIX.length), "base64url").toString("utf8")) as Partial<HubSessionCursor>;
+    if (parsed.phase === "drafts") {
+      return Number.isSafeInteger(parsed.offset) && (parsed.offset ?? -1) >= 0
+        ? { phase: "drafts", offset: parsed.offset! }
+        : null;
+    }
+    if (parsed.phase === "stored") {
+      return parsed.cursor === undefined || (typeof parsed.cursor === "string" && parsed.cursor.length > 0)
+        ? { phase: "stored", ...(parsed.cursor ? { cursor: parsed.cursor } : {}) }
+        : null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export class SessionHub {
   private sessions = new Map<string, ServeSession>();
   constructor(private store: SessionStore = realStore, private haraVersion?: string) {}
@@ -106,6 +137,7 @@ export class SessionHub {
 
   create(o: { cwd: string; profileId?: string; spaceId?: string; provider: Provider; providerId: string; model: string; effort?: string | null; approval: ApprovalMode; projectContext?: string; agentRef?: string }): ServeSession {
     const profileId = o.profileId ?? "personal";
+    const createdAt = new Date().toISOString();
     const meta: SessionMeta = {
       id: newSessionId(),
       cwd: o.cwd,
@@ -116,8 +148,10 @@ export class SessionHub {
       model: o.model,
       approval: o.approval,
       title: "",
-      createdAt: new Date().toISOString(),
-      updatedAt: "",
+      createdAt,
+      // A live draft needs a stable timeline position before its first durable save. saveSession replaces
+      // this timestamp when the first user turn is written.
+      updatedAt: createdAt,
       source: "interactive", // serve sessions are user-driven (desktop/IDE clients)
       ...(o.effort !== undefined ? { effort: o.effort } : {}),
       ...(o.agentRef ? { agentRef: o.agentRef } : {}),
@@ -226,10 +260,94 @@ export class SessionHub {
   }
 
   list(cwd?: string): SessionMeta[] {
-    return this.store.list(cwd);
+    const options = cwd ? { cwd } : {};
+    const drafts = this.liveDrafts(options);
+    const draftIds = new Set(drafts.map((meta) => meta.id));
+    return [...drafts, ...this.store.list(cwd).filter((meta) => !draftIds.has(meta.id))]
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
   }
 
   listPage(options: SessionMetadataPageOptions = {}): SessionMetadataPage {
+    const limit = Math.min(100, Math.max(1, Math.trunc(options.limit ?? 50)));
+    const suppliedCursor = options.cursor;
+    const hubCursor = suppliedCursor?.startsWith(HUB_SESSION_CURSOR_PREFIX)
+      ? decodeHubSessionCursor(suppliedCursor)
+      : undefined;
+    if (suppliedCursor?.startsWith(HUB_SESSION_CURSOR_PREFIX) && !hubCursor) {
+      throw new Error("invalid session metadata cursor");
+    }
+
+    // A continuation in the durable phase must never prepend live drafts again. Raw cursors are accepted
+    // for compatibility with clients that cached a pre-0.160 page cursor.
+    if (hubCursor?.phase === "stored" || (suppliedCursor !== undefined && hubCursor === undefined)) {
+      const stored = this.listStoredPage({
+        ...options,
+        ...(hubCursor?.phase === "stored"
+          ? (hubCursor.cursor ? { cursor: hubCursor.cursor } : { cursor: undefined })
+          : {}),
+        limit,
+      });
+      return {
+        ...stored,
+        ...(stored.nextCursor
+          ? { nextCursor: encodeHubSessionCursor({ phase: "stored", cursor: stored.nextCursor }) }
+          : {}),
+      };
+    }
+
+    const { cursor: _cursor, limit: _limit, ...filters } = options;
+    const drafts = this.liveDrafts(filters);
+    const draftOffset = hubCursor?.phase === "drafts" ? hubCursor.offset : 0;
+    const sessions = drafts.slice(draftOffset, draftOffset + limit);
+    const nextDraftOffset = draftOffset + sessions.length;
+    if (nextDraftOffset < drafts.length) {
+      return {
+        sessions,
+        hasMore: true,
+        nextCursor: encodeHubSessionCursor({ phase: "drafts", offset: nextDraftOffset }),
+        limit,
+      };
+    }
+
+    const remaining = limit - sessions.length;
+    if (remaining > 0) {
+      const stored = this.listStoredPage({ ...filters, limit: remaining });
+      sessions.push(...stored.sessions);
+      return {
+        sessions,
+        hasMore: stored.hasMore,
+        ...(stored.nextCursor
+          ? { nextCursor: encodeHubSessionCursor({ phase: "stored", cursor: stored.nextCursor }) }
+          : {}),
+        limit,
+      };
+    }
+
+    // The page ended exactly at the live/durable boundary. Probe one bounded stored result so hasMore is
+    // truthful without persisting the drafts or enumerating the transcript directory.
+    const storedProbe = this.listStoredPage({ ...filters, limit: 1 });
+    const hasMore = storedProbe.sessions.length > 0 || storedProbe.hasMore;
+    return {
+      sessions,
+      hasMore,
+      ...(storedProbe.sessions.length > 0
+        ? { nextCursor: encodeHubSessionCursor({ phase: "stored" }) }
+        : storedProbe.nextCursor
+          ? { nextCursor: encodeHubSessionCursor({ phase: "stored", cursor: storedProbe.nextCursor }) }
+          : {}),
+      limit,
+    };
+  }
+
+  private liveDrafts(options: Omit<SessionMetadataPageOptions, "cursor" | "limit">): SessionMeta[] {
+    return [...this.sessions.values()]
+      .filter((session) => session.durable === false)
+      .map((session) => session.meta)
+      .filter((meta) => sessionMetadataMatchesOptions(meta, options))
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+  }
+
+  private listStoredPage(options: SessionMetadataPageOptions): SessionMetadataPage {
     if (this.store.listPage) return this.store.listPage(options);
     const limit = Math.min(100, Math.max(1, Math.trunc(options.limit ?? 50)));
     const offsetMatch = options.cursor === undefined
@@ -239,10 +357,9 @@ export class SessionHub {
       throw new Error("invalid session metadata cursor");
     }
     const offset = offsetMatch ? Number(offsetMatch[1]) : 0;
-    const sources = options.sources?.length ? new Set(options.sources) : undefined;
+    const { cursor: _cursor, limit: _limit, ...filters } = options;
     const filtered = this.store.list(options.cwd)
-      .filter((meta) => !sources || sources.has(meta.source ?? "interactive"))
-      .filter((meta) => options.includeArchived || !meta.archived)
+      .filter((meta) => sessionMetadataMatchesOptions(meta, filters))
       .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
     const sessions = filtered.slice(offset, offset + limit);
     const nextOffset = offset + sessions.length;

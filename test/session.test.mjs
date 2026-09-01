@@ -1707,6 +1707,9 @@ test("SessionHub persists a draft on its first content and can delete an abandon
   const hub = new SessionHub(store);
   const draft = hub.create({ cwd: "/tmp/draft", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
   assert.equal(saved.has(draft.meta.id), false);
+  assert.equal(hub.listPage({ cwd: "/tmp/draft" }).sessions[0].id, draft.meta.id,
+    "the running client can discover its empty live draft without a transcript file");
+  assert.equal(draft.meta.updatedAt, draft.meta.createdAt, "a live draft has a stable timeline position before first save");
   assert.equal(hub.setApproval(draft.meta.id, "full-auto"), "updated");
   assert.equal(hub.rename(draft.meta.id, "draft title"), true);
   assert.equal(saved.has(draft.meta.id), false, "metadata-only edits do not turn an abandoned draft into history");
@@ -1717,7 +1720,55 @@ test("SessionHub persists a draft on its first content and can delete an abandon
   const abandoned = hub.create({ cwd: "/tmp/draft", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
   assert.equal(hub.delete(abandoned.meta.id), "gone");
   assert.equal(hub.get(abandoned.meta.id), undefined);
+  assert.ok(!hub.listPage({ cwd: "/tmp/draft" }).sessions.some((meta) => meta.id === abandoned.meta.id));
   assert.ok(released.includes(abandoned.meta.id));
+});
+
+test("SessionHub pages live drafts before durable history without persisting the drafts", () => {
+  const saved = new Map();
+  const storedMeta = {
+    id: "stored-session",
+    cwd: "/tmp/paged-drafts",
+    provider: "fake",
+    model: "fake-1",
+    title: "stored",
+    createdAt: "2026-08-31T00:00:00.000Z",
+    updatedAt: "2026-08-31T00:00:01.000Z",
+    source: "interactive",
+  };
+  const store = {
+    acquire: () => ({ ok: true }),
+    release: () => {},
+    load: (id) => saved.get(id) ?? null,
+    save: (meta, history, task) => saved.set(meta.id, structuredClone({ meta, history, ...(task ? { task } : {}) })),
+    list: () => [storedMeta],
+    listPage: ({ cursor, limit = 50 }) => {
+      const offset = cursor === undefined ? 0 : Number(cursor.slice("stored:".length));
+      const sessions = [storedMeta].slice(offset, offset + limit);
+      const nextOffset = offset + sessions.length;
+      return {
+        sessions,
+        hasMore: nextOffset < 1,
+        ...(nextOffset < 1 ? { nextCursor: `stored:${nextOffset}` } : {}),
+        limit,
+      };
+    },
+    delete: (id) => saved.delete(id),
+  };
+  const provider = { id: "fake", model: "fake-1", async turn() { throw new Error("unused"); } };
+  const hub = new SessionHub(store);
+  const firstDraft = hub.create({ cwd: "/tmp/paged-drafts", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
+  const secondDraft = hub.create({ cwd: "/tmp/paged-drafts", provider, providerId: provider.id, model: provider.model, approval: "suggest" });
+
+  const first = hub.listPage({ cwd: "/tmp/paged-drafts", sources: ["interactive"], limit: 1 });
+  const second = hub.listPage({ cwd: "/tmp/paged-drafts", sources: ["interactive"], limit: 1, cursor: first.nextCursor });
+  const third = hub.listPage({ cwd: "/tmp/paged-drafts", sources: ["interactive"], limit: 1, cursor: second.nextCursor });
+  assert.deepEqual(new Set([first.sessions[0].id, second.sessions[0].id]), new Set([firstDraft.meta.id, secondDraft.meta.id]));
+  assert.equal(first.hasMore, true);
+  assert.equal(second.hasMore, true);
+  assert.equal(third.sessions[0].id, storedMeta.id);
+  assert.equal(third.hasMore, false);
+  assert.equal(saved.size, 0, "listing live drafts never creates durable history rows");
 });
 
 test("SessionHub preserves an explicit provider-automatic reasoning default across save, resume, and fork", () => {

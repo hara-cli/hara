@@ -1805,7 +1805,13 @@ test("serve e2e: persisted sessions keep their organization profile across activ
     const created = await client.call("session.create", {});
     sessionId = created.result.sessionId;
     assert.equal(created.result.profileId, "flash-org");
+    assert.equal(created.result.cwd, dir);
+    assert.equal(created.result.source, "interactive");
+    assert.equal(created.result.updatedAt.length > 0, true);
     assert.equal(store.saved.has(sessionId), false, "an untouched new chat remains an in-memory draft");
+    const visibleDraft = await client.call("session.list", {});
+    assert.ok(visibleDraft.result.sessions.some((session) => session.id === sessionId),
+      "create → list exposes the live draft before the first turn is persisted");
     const firstTurn = await client.call("session.send", { sessionId, text: "pin this organization route" });
     assert.equal(firstTurn.result.reply, "bound");
     assert.equal(store.saved.get(sessionId).meta.profileId, "flash-org", "the first turn persists its identity route");

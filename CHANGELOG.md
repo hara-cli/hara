@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.159.1 — 2026-09-01 — reliable blank conversation creation
+
+- Keep a newly created, still-empty conversation visible to the running Desktop client without writing an
+  orphan transcript. The live draft now participates in the same bounded, filtered session timeline as
+  durable history and disappears normally when abandoned or when the engine exits.
+- Return the new conversation's authoritative workspace, route, timestamp, and source from `session.create`,
+  allowing Desktop to activate it immediately and recover visibly if an older engine omits it from the next
+  list refresh. This fixes the Windows report where “New conversation” and “New session in this folder”
+  appeared to do nothing. Upgrade with `npm i -g @nanhara/hara@0.159.1`.
+
 ## 0.159.0 — 2026-09-01 — live Codex session control from Hara
 
 - Turn the local External Session bridge into a controllable Codex work channel. Hara can attach to a

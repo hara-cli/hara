@@ -25,7 +25,8 @@
 //                                                        Personal Space only. Provider-native IDs, full paths,
 //                                                        provider cursors and credentials never cross Serve. A
 //                                                        source session is read-only until explicitly forked.
-//   session.create    {cwd?,approval?,agentRef?} → {sessionId,model,profileId,approval,agentRef?}
+//   session.create    {cwd?,approval?,agentRef?} → {sessionId,title,cwd,model,profileId,spaceId,
+//                                                   approval,updatedAt,source,agentRef?}
 //   agents.list       {cwd?,sessionId?}          → {agents,offices,currentOfficeId}
 //   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    approval only migrates legacy sessions with no saved choice.

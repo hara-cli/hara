@@ -1709,7 +1709,10 @@ export function listSessions(cwd?: string): SessionMeta[] {
   return metas.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
 }
 
-function sessionMetadataMatchesOptions(
+/** Shared metadata predicate for persisted index pages and Serve's live, not-yet-durable drafts. Keeping
+ * both paths on one matcher prevents an empty conversation from crossing cwd/source/audience filters just
+ * because it has not written its first transcript yet. */
+export function sessionMetadataMatchesOptions(
   meta: SessionMeta,
   options: Omit<SessionMetadataPageOptions, "cursor" | "limit">,
 ): boolean {

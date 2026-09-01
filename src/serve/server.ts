@@ -3070,10 +3070,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             });
             return reply(rpcResult(id!, {
               sessionId: s.meta.id,
+              title: s.meta.title,
+              cwd: s.meta.cwd,
               model: s.meta.model,
               profileId: s.meta.profileId,
               spaceId: s.meta.spaceId,
               approval: s.approval,
+              updatedAt: s.meta.updatedAt,
+              source: s.meta.source ?? "interactive",
               agentRef: s.meta.agentRef,
             }));
           }
