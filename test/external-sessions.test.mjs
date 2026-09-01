@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 
 import { ClaudeAgentSdkAdapter } from "../dist/external-sessions/claude.js";
 import { CodexAppServerAdapter } from "../dist/external-sessions/codex.js";
+import { HaraRuntimeAdapter } from "../dist/external-sessions/runtime.js";
 import { ExternalSessionRegistry } from "../dist/external-sessions/registry.js";
 import {
   JsonlRpcClient,
@@ -123,6 +124,146 @@ test("a timed-out App Server request closes the uncertain provider process", {
   }
 });
 
+test("Hara Live starts an isolated runtime, creates a coding-agent relay, and keeps native ids behind Core", {
+  skip: process.platform === "win32" ? "POSIX detached runtime fixture" : false,
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-live-runtime-"));
+  const statePath = join(root, "runtime-state.json");
+  try {
+    const fixture = join(root, "fake-herdr.mjs");
+    writeFileSync(fixture, `
+      import { existsSync, readFileSync, writeFileSync } from "node:fs";
+      const statePath = ${JSON.stringify(statePath)};
+      const readState = () => existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : {};
+      const writeState = (patch) => writeFileSync(statePath, JSON.stringify({ ...readState(), ...patch }));
+      const raw = process.argv.slice(2);
+      if (raw.includes("--version")) {
+        process.stdout.write("herdr 0.8.2\\n");
+        process.exit(0);
+      }
+      const args = raw[0] === "--session" ? raw.slice(2) : raw;
+      const json = (result) => process.stdout.write(JSON.stringify({ id: "fixture", result }) + "\\n");
+      if (args[0] === "server") {
+        writeState({ server: true, serverPid: process.pid });
+        setInterval(() => {}, 60_000);
+      } else {
+        const state = readState();
+        if (!state.server) {
+          process.stderr.write(JSON.stringify({ id: "fixture", error: { code: "server_not_running", message: "not running" } }) + "\\n");
+          process.exit(1);
+        }
+        if (args[0] === "agent" && args[1] === "list") {
+          json({ type: "agent_list", agents: state.agent ? [state.agent] : [] });
+        } else if (args[0] === "workspace" && args[1] === "create") {
+          const cwd = args[args.indexOf("--cwd") + 1];
+          json({
+            type: "workspace_created",
+            workspace: { workspace_id: "native-workspace" },
+            root_pane: { pane_id: "native-pane" },
+          });
+          writeState({ cwd });
+        } else if (args[0] === "agent" && args[1] === "start") {
+          const kind = args[args.indexOf("--kind") + 1];
+          const agent = {
+            agent: kind,
+            agent_status: "idle",
+            cwd: state.cwd,
+            foreground_cwd: state.cwd,
+            interactive_ready: true,
+            name: args[2],
+            pane_id: "native-pane",
+            revision: 1,
+            state_change_seq: 1,
+            terminal_id: "native-terminal-secret",
+            workspace_id: "native-workspace",
+          };
+          writeState({ agent, text: kind + " ready" });
+          json({ type: "agent_started", agent, argv: [kind] });
+        } else if (args[0] === "agent" && args[1] === "read") {
+          process.stdout.write(state.text || "");
+        } else if (args[0] === "agent" && args[1] === "get") {
+          json({ type: "agent_info", agent: state.agent });
+        } else if (args[0] === "agent" && args[1] === "prompt") {
+          const text = args[3];
+          writeState({ text: (state.text || "") + "\\n> " + text });
+          process.stderr.write(JSON.stringify({ id: "fixture", error: { code: "agent_prompt_stalled", message: "accepted but state transition was delayed" } }) + "\\n");
+          process.exit(1);
+        } else if (args[0] === "agent" && args[1] === "wait") {
+          const wantsWorking = args.includes("working");
+          const agent = {
+            ...state.agent,
+            agent_status: wantsWorking ? "working" : "done",
+            revision: Number(state.agent.revision || 1) + 1,
+            state_change_seq: Number(state.agent.state_change_seq || 1) + 1,
+          };
+          writeState({
+            agent,
+            ...(wantsWorking ? {} : { text: (state.text || "") + "\\nruntime completed" }),
+          });
+          json({ type: "agent_info", agent });
+        } else if (args[0] === "agent" && args[1] === "send-keys") {
+          writeState({ text: (state.text || "") + "\\ninterrupted" });
+          json({ type: "agent_info", agent: state.agent });
+        } else if (args[0] === "workspace" && args[1] === "close") {
+          json({ type: "ok" });
+        } else {
+          process.stderr.write(JSON.stringify({ id: "fixture", error: { code: "unsupported", message: "unsupported" } }) + "\\n");
+          process.exit(1);
+        }
+      }
+    `);
+
+    const adapter = new HaraRuntimeAdapter({
+      command: process.execPath,
+      argsPrefix: [fixture],
+      timeoutMs: 3_000,
+      identityKey: Buffer.alloc(32, 23),
+      identityHome: root,
+      runtimeRoot: join(root, "runtime"),
+    });
+    const source = await adapter.inspect();
+    assert.equal(source.state, "ready");
+    assert.equal(source.capabilities.create, true);
+    assert.deepEqual((await adapter.list({ limit: 10 })).sessions, []);
+
+    const created = await adapter.create({ cwd: root, agentKind: "codex", title: "Release worker" });
+    assert.equal(created.readOnly, false);
+    assert.equal(created.controlMode, "live");
+    assert.equal(created.session.sourceId, "runtime");
+    assert.equal(created.session.agentKind, "codex");
+    assert.match(created.session.id, /^ext_runtime_[a-f0-9]{24}$/);
+    assert.equal(created.session.workspaceName, basename(root));
+    assert.deepEqual(created.messages.map(({ role, text }) => [role, text]), [["assistant", "codex ready"]]);
+
+    const listed = await adapter.list({ limit: 10 });
+    const metadata = JSON.stringify({ source, listed });
+    const escapedRoot = root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    assert.doesNotMatch(metadata, new RegExp(`native-(?:terminal|workspace|pane)|${escapedRoot}`));
+
+    const text = [];
+    const notices = [];
+    const turn = await adapter.submit(created.session.id, "verify the release", {
+      text: (delta) => text.push(delta),
+      notice: (message) => notices.push(message),
+      tool: () => {},
+      confirm: async () => true,
+    });
+    assert.equal(turn.status, "completed");
+    assert.match(turn.reply, /runtime completed/);
+    assert.deepEqual(text, [turn.reply]);
+    assert.match(notices[0], /original terminal session/i);
+    await adapter.interrupt(created.session.id);
+  } finally {
+    if (existsSync(statePath)) {
+      const state = JSON.parse(readFileSync(statePath, "utf8"));
+      if (Number.isSafeInteger(state.serverPid) && state.serverPid > 1) {
+        try { process.kill(state.serverPid, "SIGTERM"); } catch {}
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex App Server metadata is normalized and provider cursors remain server-owned", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-external-codex-"));
   try {
@@ -179,7 +320,7 @@ test("Codex App Server metadata is normalized and provider cursors remain server
       claude: { command: "definitely-missing-claude-test-command", timeoutMs: 500 },
     });
     const first = await registry.listSessions({ sourceId: "codex", limit: 1 });
-    assert.deepEqual(first.sources.map((source) => source.id), ["codex", "claude"]);
+    assert.deepEqual(first.sources.map((source) => source.id), ["runtime", "codex", "claude"]);
     assert.equal(first.sessions.length, 1);
     assert.equal(first.sessions[0].title, "Release audit");
     assert.equal(first.sessions[0].workspaceName, "secret-project");

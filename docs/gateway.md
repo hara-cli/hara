@@ -52,11 +52,19 @@ model or consume tokens.
   `~/.hara/workspace`, so a full-auto chat bot never lands on a real repo by accident.
 - Each `(chat × directory)` is a stable, resumable session. In-chat slash commands:
   `/help` · `/pwd` · `/cd <dir>` · `/new` · `/sessions` · `/resume <id>` ·
-  `/agent <name|project:name|main>` · `/voice` · `/say <text>` · `/send <path>` · `/detach`.
+  `/agent <name|project:name|main>` · `/coding help` · `/remote send <text>` · `/voice` · `/say <text>` ·
+  `/send <path>` · `/detach`.
   `/agent` uses the host's `hara agents` index. A bare name prefers an override in the current project;
   `project:name` pins the thread to that registered home and `/agent main` returns to the previous project/thread.
   A native `global:name` is portable, stays in the current project, and may continue to roam with `/cd`;
   an installed OpenClaw Agent keeps its configured workspace. Anything else runs hara on that session.
+- **Hara Live** is the explicit owner-only relay to Codex and Claude Code. `/coding new codex|claude` starts
+  the original tool in the current `/cd` directory; `/coding list`, `/coding use <8-char id>`, `/coding send
+  <message>`, `/coding read`, `/coding stop`, and `/coding off` manage it. The gateway stores only Hara's opaque
+  session id. Ordinary messages always remain in the Hara conversation and are never injected into a coding
+  terminal. A multi-user allowlist must set `HARA_GATEWAY_OWNER` before terminal control is enabled.
+- Existing tmux sessions registered with `hara remote ask` or `hara remote bind` remain available through the
+  explicitly namespaced `/remote send <message>` command. Legacy binds never capture an ordinary chat message.
 - **Two-way images**: send the bot a photo and the selected multimodal conversation model sees it inline;
   text-only routes ask for a model switch rather than forwarding media to a second provider. Ask it to send
   a file/image back and it uses the `send_file` tool — both work in
@@ -94,10 +102,10 @@ model or consume tokens.
   --recover-outcome <id> --confirm-recovery terminalize:<id>` converts an ambiguous running record into a
   compact no-rerun marker; only `--confirm-recovery delete-terminal:<id>` can delete an already-terminal marker
   after platform redelivery is known to be impossible. Completed-but-unacknowledged outcomes are never deleted.
-- The same boundary covers tmux reply injection and the stateful `/new`, `/voice`, `/say`, and `/send`
+- The same boundary covers explicit `/coding` and `/remote send` relays and the stateful `/new`, `/voice`, `/say`, and `/send`
   commands. `/voice` records one target state instead of toggling again; speech and files are snapshotted once.
   A durably completed reply/upload receipt is skipped on redelivery, while the cached outcome prevents another
-  thread, tmux injection, synthesis, or source-file read. Remote acceptance and local receipt commit are not one
+  thread, terminal injection, synthesis, or source-file read. Remote acceptance and local receipt commit are not one
   atomic operation: after a crash in that gap, a transport without server-side idempotency can deliver the same
   cached payload again, but Hara still does not rerun the local coding or file/TTS side effect.
 - One inbound event is attempted at most three times. Exhaustion emits one credential-free alert and is

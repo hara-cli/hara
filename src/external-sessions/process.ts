@@ -30,6 +30,152 @@ export interface ExternalCommandOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+export interface ExternalCommandCaptureResult {
+  ok: boolean;
+  stdout: string;
+  code: number | null;
+  timedOut: boolean;
+  /** A bounded machine-readable code only. Provider stderr is never returned. */
+  errorCode?: string;
+}
+
+export interface ExternalCommandRunOptions {
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+  cwd?: string;
+}
+
+const safeExternalErrorCode = (stderr: string): string | undefined => {
+  const line = stderr.trim().split(/\r?\n/u).at(-1);
+  if (!line || line.length > 64 * 1024) return undefined;
+  try {
+    const parsed = JSON.parse(line) as { error?: { code?: unknown } };
+    const code = parsed?.error?.code;
+    return typeof code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(code) ? code : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * Execute one short-lived local runtime command with bounded output. Raw stderr is deliberately discarded:
+ * coding-agent errors can contain prompts, native session identifiers, paths, or account details.
+ */
+export async function runExternalCommandCapture(
+  options: ExternalCommandOptions,
+  args: readonly string[],
+  run: ExternalCommandRunOptions = {},
+): Promise<ExternalCommandCaptureResult> {
+  const timeoutMs = Math.max(250, Math.min(run.timeoutMs ?? options.timeoutMs ?? 10_000, 10 * 60_000));
+  const maxOutputBytes = Math.max(4 * 1024, Math.min(run.maxOutputBytes ?? 4 * 1024 * 1024, 16 * 1024 * 1024));
+  const spawnProcess = options.spawnProcess ?? defaultSpawn;
+  const processGroup = platform() !== "win32";
+  const launch = resolveExternalCommandLaunch(options.command, options.env ?? process.env);
+  if (!launch) return { ok: false, stdout: "", code: null, timedOut: false, errorCode: "command_not_found" };
+  const cwd = run.cwd && isAbsolute(run.cwd) ? run.cwd : undefined;
+
+  return await new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawnProcess(launch.command, [...(options.argsPrefix ?? []), ...args], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: externalLaunchEnv(options.env ?? process.env, launch.runtimeBin),
+        detached: processGroup,
+        windowsHide: true,
+        ...(cwd ? { cwd } : {}),
+      });
+    } catch {
+      resolve({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "spawn_failed" });
+      return;
+    }
+
+    let done = false;
+    let stdout = "";
+    let stderr = "";
+    let outputBytes = 0;
+    const finish = (result: ExternalCommandCaptureResult): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      terminateSubprocessTree(child, { force: true, processGroup });
+      finish({ ok: false, stdout: "", code: null, timedOut: true, errorCode: "timeout" });
+    }, timeoutMs);
+    timer.unref();
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (done) return;
+      outputBytes += chunk.length;
+      if (outputBytes > maxOutputBytes) {
+        terminateSubprocessTree(child, { force: true, processGroup });
+        finish({ ok: false, stdout: "", code: null, timedOut: false, errorCode: "output_limit" });
+        return;
+      }
+      stdout = boundedAppend(stdout, chunk.toString(), maxOutputBytes);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr = boundedAppend(stderr, chunk.toString(), 64 * 1024);
+    });
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      finish({
+        ok: false,
+        stdout: "",
+        code: null,
+        timedOut: false,
+        errorCode: error.code === "ENOENT" ? "command_not_found" : "spawn_failed",
+      });
+    });
+    child.once("close", (code) => {
+      finish({
+        ok: code === 0,
+        stdout: code === 0 ? stdout : "",
+        code,
+        timedOut: false,
+        ...(code === 0 ? {} : { errorCode: safeExternalErrorCode(stderr) ?? "command_failed" }),
+      });
+    });
+  });
+}
+
+/** Start a persistent, non-interactive local runtime without retaining its stdio or a parent handle. */
+export async function spawnExternalCommandDetached(
+  options: ExternalCommandOptions,
+  args: readonly string[],
+  run: Pick<ExternalCommandRunOptions, "cwd"> = {},
+): Promise<boolean> {
+  const spawnProcess = options.spawnProcess ?? defaultSpawn;
+  const launch = resolveExternalCommandLaunch(options.command, options.env ?? process.env);
+  if (!launch) return false;
+  const cwd = run.cwd && isAbsolute(run.cwd) ? run.cwd : undefined;
+  return await new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawnProcess(launch.command, [...(options.argsPrefix ?? []), ...args], {
+        stdio: "ignore",
+        env: externalLaunchEnv(options.env ?? process.env, launch.runtimeBin),
+        detached: true,
+        windowsHide: true,
+        ...(cwd ? { cwd } : {}),
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    const finish = (started: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolve(started);
+    };
+    child.once("error", () => finish(false));
+    child.once("spawn", () => {
+      child.unref();
+      finish(true);
+    });
+  });
+}
+
 /**
  * Run one bounded provider-management command without retaining or returning its output. This is used for
  * lifecycle operations such as starting Codex's official local App Server daemon. Provider stderr can

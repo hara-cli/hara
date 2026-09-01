@@ -17,6 +17,8 @@
 //                                                   → {sources,sessions:[{opaque id,sourceId,title,
 //                                                        workspaceName,workspaceId,state,createdAt,updatedAt,
 //                                                        origin?,ephemeral}],page}
+//   external.sessions.create {sourceId:"runtime",cwd,agentKind:"codex"|"claude",title?}
+//                                                   → {session,messages,readOnly:false,controlMode:"live"}
 //   external.sessions.read {sessionId}              → {session,messages:[{id,role,text}],readOnly:boolean}
 //   external.sessions.fork {sessionId}              → {sourceSessionId,session,messages,readOnly:false}
 //   external.sessions.submit {sessionId,text}       → {sessionId,turnId,status,reply,error?}

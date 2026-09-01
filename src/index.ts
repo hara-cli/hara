@@ -4025,7 +4025,7 @@ program
 
 program
   .command("remote [action] [text]")
-  .description("drive THIS tmux session from chat: register the pane so WeChat replies inject back into it. actions: ask \"<q>\" | bind | back | status")
+  .description("register THIS tmux pane for explicit /remote send relays from chat. actions: ask \"<q>\" | bind | back | status")
   .action(async (action = "status", text?: string) => {
     const { registerTmuxRoute, unbindPane, listRoutes } = await import("./gateway/tmux-routes.js");
     const pane = process.env.TMUX_PANE; // set by tmux inside every pane
@@ -4063,7 +4063,7 @@ program
         return;
       }
       registerTmuxRoute(pane!, peer, process.cwd(), "bind");
-      out(c.green(`🔗 bound ${pane}`) + ` to one WeChat chat for 12 hours — renew with \`hara remote bind\`, unbind locally, or send /detach in that chat.\n`);
+      out(c.green(`🔗 bound ${pane}`) + ` to one WeChat chat for 12 hours — ordinary chat stays in Hara; use \`/remote send <message>\` explicitly, renew with \`hara remote bind\`, or unbind locally.\n`);
       return;
     }
     if (action === "ask") {
@@ -4077,8 +4077,8 @@ program
           return;
         }
         registerTmuxRoute(pane!, peer, process.cwd(), "once");
-        await wx.weixinAdapter(creds).send(peer, text);
-        out(c.green(`↩ asked on WeChat + registered ${pane}`) + ` for that chat for 30 minutes — its reply will be injected here.\n`);
+        await wx.weixinAdapter(creds).send(peer, `${text}\n\n回复本地终端请使用：/remote send <回复内容>`);
+        out(c.green(`↩ asked on WeChat + registered ${pane}`) + ` for that chat for 30 minutes — answer explicitly with \`/remote send <reply>\`; ordinary chat is never injected.\n`);
       } catch (e: any) {
         unbindPane(pane!);
         out(c.yellow(`WeChat push failed (${e.message}); the temporary route was removed. Retry when the gateway is available.\n`));

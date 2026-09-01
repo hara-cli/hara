@@ -86,6 +86,7 @@ const sourceResult = {
     capabilities: {
       listMetadata: true,
       read: true,
+      create: false,
       fork: true,
       resume: true,
       observeLive: false,
@@ -149,6 +150,27 @@ test("Serve advertises a Personal-only external session interaction surface", as
         controlMode: "history",
       };
     },
+    async createSession(input) {
+      assert.deepEqual(input, { sourceId: "runtime", cwd: root, agentKind: "codex", title: "Release relay" });
+      return {
+        session: {
+          id: "ext_runtime_0123456789abcdef01234567",
+          sourceId: "runtime",
+          title: "Release relay",
+          workspaceName: "hara",
+          workspaceId: "ws_runtime_opaque",
+          state: "idle",
+          createdAt: "2026-08-28T00:00:00.000Z",
+          updatedAt: "2026-08-28T00:01:00.000Z",
+          origin: "haraRuntime",
+          agentKind: "codex",
+          ephemeral: false,
+        },
+        messages: [],
+        readOnly: false,
+        controlMode: "live",
+      };
+    },
     async forkSession(requestedSessionId) {
       assert.equal(requestedSessionId, sessionId);
       const source = (await this.listSessions()).sessions[0];
@@ -207,11 +229,21 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.metadata.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.interaction.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.live-control.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime.v1"));
+    assert.ok(initialized.result.capabilities.methods.includes("external.sessions.create"));
     const listed = await client.call("external.sessions.list", { sourceId: "codex" });
     assert.equal(listed.result.sessions[0].id, sessionId);
     const read = await client.call("external.sessions.read", { sessionId });
     assert.equal(read.result.messages[0].text, "existing reply");
     assert.equal(read.result.readOnly, true);
+    const created = await client.call("external.sessions.create", {
+      sourceId: "runtime",
+      cwd: root,
+      agentKind: "codex",
+      title: "Release relay",
+    });
+    assert.equal(created.result.session.sourceId, "runtime");
+    assert.equal(created.result.controlMode, "live");
     const forked = await client.call("external.sessions.fork", { sessionId });
     assert.equal(forked.result.sourceSessionId, sessionId);
     assert.equal(forked.result.session.id, forkedSessionId);

@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.160.0 — 2026-09-02 — Hara Live coding-agent relay
+
+- Add Hara Live, an explicit device-local terminal relay for Codex and Claude Code. Hara starts an isolated
+  provider-native session in a user-selected workspace, keeps the provider process and history in their
+  original runtime, and exposes only device-bound opaque identifiers, bounded redacted output, interruption,
+  and message submission through Hara Serve. Existing provider history adapters remain unchanged and are
+  never commandeered.
+- Add the owner-only `/coding` gateway namespace for listing, creating, selecting, reading, messaging, and
+  stopping Hara Live sessions from Feishu, WeChat, and the other supported chat transports. Ordinary chat can
+  no longer fall into a registered terminal route; legacy tmux relays require the explicit `/remote send`
+  command, removing the confusing injected-terminal diagnostics from normal Hara conversations.
+- Recover safely when Claude Code accepts a prompt but takes longer than Herdr's initial state-transition
+  gate, and pin remote-friendly safety defaults: Claude Code starts in `acceptEdits`, while Codex stays in a
+  workspace-write sandbox with non-interactive approvals. A blocked native prompt is reported as waiting
+  instead of a successful completed turn. Upgrade with `npm i -g @nanhara/hara@0.160.0`.
+
 ## 0.159.1 — 2026-09-01 — reliable blank conversation creation
 
 - Keep a newly created, still-empty conversation visible to the running Desktop client without writing an

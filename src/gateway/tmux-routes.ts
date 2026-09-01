@@ -1,8 +1,7 @@
-// tmux reply routing — lets a chat reply (WeChat) be injected back into an already-running tmux session
-// (e.g. a Claude Code / codex / hara you started yourself), so "ping me on WeChat → I reply from outside →
-// that session continues" works WITHOUT the daemon owning the process. The asking session registers its tmux
-// pane (via the wechat-send `--ask` flow); the gateway daemon (sole WeChat receiver) injects the owner's reply
-// into the oldest live registered pane with `tmux send-keys`. Borrows the ccgram keystroke-injection pattern.
+// Explicit tmux reply routing — lets `/remote send <message>` inject into an already-running tmux session
+// (e.g. Claude Code / Codex / Hara started by the user) without the gateway owning that process. The asking
+// session registers its pane, and only the namespaced gateway command may consume it. Ordinary chat messages
+// are never routed here. Borrows the ccgram keystroke-injection pattern.
 //
 // Safety: the daemon only reaches this AFTER its allow-list gate (so only the owner can trigger it), and it
 // ONLY injects into panes that opted in by registering — never an arbitrary pane.
@@ -156,9 +155,8 @@ export function pickPaneForReply(peer: string): string | null {
   return chosen?.pane ?? null;
 }
 
-/** Daemon entrypoint: deliver an inbound reply to the oldest live registered pane. Returns the pane id injected
- *  into, or null if there was no pending route (→ caller treats the message as a normal task). One-shot: the
- *  chosen route is consumed and dead panes are pruned. */
+/** Explicit relay helper retained for embedders. Callers must already have parsed an opt-in `/remote send`
+ * command; the Hara gateway never passes ordinary inbound messages here. One-shot routes are consumed. */
 export function deliverToTmux(text: string, peer: string): string | null {
   const { chosen, remaining } = pickRoute(load(), paneAlive, peer);
   save(remaining);

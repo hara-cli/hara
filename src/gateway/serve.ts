@@ -7,9 +7,20 @@ import { createHash } from "node:crypto";
 import { telegramAdapter, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import { dispatchFlows, flowSourceKey, type FlowRunOptions } from "./flows.js";
 import { captureNoToolAudience, handleOwnerReply, runNoToolModel, type NoToolAudience } from "./flows-pending.js";
-import { chatContext, chatCd, chatSessionIdPrefix, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, toggleVoice } from "./sessions.js";
+import {
+  chatCodingSession,
+  chatContext,
+  chatCd,
+  chatSessionIdPrefix,
+  newChatSession,
+  ownsChatSession,
+  resolveOwnedSessionId,
+  setChatCodingSession,
+  setChatSession,
+  setChatAgent,
+  toggleVoice,
+} from "./sessions.js";
 import { plainChat } from "../cron/deliver.js";
-import { pickPaneForReply, capturePane, injectTmux, outputDelta } from "./tmux-routes.js";
 import { synthesize } from "./tts.js";
 import { cleanupTransientMedia, pruneStaleMedia } from "./media.js";
 import { selfArgv } from "../cron/runner.js";
@@ -42,11 +53,59 @@ import {
   type GatewayRunOutcomeRecovery,
   type GatewayRunOutcomeState,
 } from "./runtime-state.js";
+import { createExternalSessionRegistry } from "../external-sessions/registry.js";
+import type { ExternalSessionInfo, ExternalSessionSourceInfo } from "../external-sessions/types.js";
+import { HARA_RUNTIME_VERSION } from "../version.js";
 
 /** Parse a leading slash-command from a chat message (pure). null if it isn't one. */
 export function parseCommand(text: string): { cmd: string; arg: string } | null {
   const m = /^\/([a-z]+)\b\s*([\s\S]*)$/i.exec(text.trim());
   return m ? { cmd: m[1].toLowerCase(), arg: m[2].trim() } : null;
+}
+
+export type GatewayCodingAction = "status" | "list" | "new" | "use" | "send" | "read" | "stop" | "off" | "help" | "unknown";
+
+/** Parse only the argument to `/coding`. Keeping this namespace explicit prevents ordinary chat text from
+ * ever being injected into Codex or Claude Code. */
+export function parseGatewayCodingCommand(argument: string): { action: GatewayCodingAction; arg: string } {
+  const value = argument.trim();
+  if (!value) return { action: "status", arg: "" };
+  const match = /^(\S+)(?:\s+([\s\S]*))?$/u.exec(value);
+  const verb = match?.[1]?.toLowerCase() ?? "";
+  const arg = match?.[2]?.trim() ?? "";
+  if (verb === "create" || verb === "start") return { action: "new", arg };
+  if (verb === "interrupt") return { action: "stop", arg };
+  if (["status", "list", "new", "use", "send", "read", "stop", "off", "help"].includes(verb)) {
+    return { action: verb as Exclude<GatewayCodingAction, "unknown">, arg };
+  }
+  return { action: "unknown", arg: value };
+}
+
+export function gatewayCodingDisplayId(sessionId: string): string {
+  return sessionId.slice(-8).toUpperCase();
+}
+
+/** Resolve the compact suffix shown in chat. Full opaque IDs remain accepted for copy/paste, but native
+ * provider/terminal IDs never enter this layer. */
+export function resolveGatewayCodingSession(
+  reference: string,
+  sessions: readonly ExternalSessionInfo[],
+): ExternalSessionInfo | { ambiguous: true } | null {
+  const needle = reference.trim().toLowerCase();
+  if (!needle) return null;
+  const exact = sessions.find((session) => session.id.toLowerCase() === needle);
+  if (exact) return exact;
+  const matches = sessions.filter((session) => session.id.toLowerCase().endsWith(needle));
+  if (matches.length === 1) return matches[0];
+  return matches.length > 1 ? { ambiguous: true } : null;
+}
+
+/** Chat transports have much smaller useful payloads than the local terminal. Keep the newest output and
+ * make truncation visible; the complete bounded capture remains available in Desktop. */
+export function compactGatewayCodingOutput(text: string, limit = 3_500): string {
+  const clean = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ").trim();
+  if (clean.length <= limit) return clean;
+  return `…（仅显示最新输出；完整内容请在 Hara Desktop 查看）\n${clean.slice(-limit)}`;
 }
 
 /** Resolve a chat-thread agent through the same profile identity as its persisted Hara session. */
@@ -986,6 +1045,9 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   // Adapter names are the source of truth (e.g. requested `lark` builds the `feishu` adapter). Keep the
   // requested spelling only for startup/config hints; all persisted/routable identities are canonical.
   const platform = adapter.name || canonicalGatewayPlatform(requestedPlatform);
+  // Lazy adapters: constructing this registry does not start Herdr, Codex, or Claude. `/coding` is the only
+  // gateway route that touches it, and Hara Live starts only when the owner explicitly creates a session.
+  const externalSessions = createExternalSessionRegistry({ haraVersion: HARA_RUNTIME_VERSION });
   const releaseInstance = acquireGatewayInstance(runtimeScope, { displayPlatform: platform });
   let runtimeReporter: GatewayRuntimeReporter | undefined;
   try {
@@ -1010,6 +1072,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     runtimeReporter?.error("transport-exited");
     runtimeReporter?.stopped(true);
     await runtimeReporter?.flush();
+    await externalSessions.close().catch(() => {});
     releaseInstance();
     throw error;
   }
@@ -1037,6 +1100,16 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   // their own hard transfer deadlines, so an SDK that ignores this signal still cannot pin shutdown forever.
   const sendMessage = (chatId: number | string, text: string, idempotencyKey?: string): Promise<void> =>
     adapter.send(chatId, text, ac.signal, idempotencyKey);
+  const listLiveSessions = async (): Promise<{
+    source?: ExternalSessionSourceInfo;
+    sessions: ExternalSessionInfo[];
+  }> => {
+    const snapshot = await externalSessions.listSessions({ sourceId: "runtime", limit: 50 });
+    return {
+      source: snapshot.sources.find((candidate) => candidate.id === "runtime"),
+      sessions: snapshot.sessions,
+    };
+  };
   const sessionRuns = new KeyedSerialQueue(8, 4, 64, 32);
   const inboundHandlers = new GatewayInboundTracker();
   const stop = (): void => ac.abort(new GatewayQueueClosedError());
@@ -1146,9 +1219,9 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       await sendMessage(m.chatId, "⛔ not authorized.");
       return;
     }
-    // One credential/chat/user admission covers context lookup, routing, stateful commands, coding, and
-    // delivery. Context is therefore read only after earlier messages settle; /new or /voice cannot slip
-    // between a tmux preflight and a second coding enqueue because there is no second enqueue.
+    // One credential/chat/user admission covers context lookup, explicit terminal relays, stateful commands,
+    // coding, and delivery. Context is therefore read only after earlier messages settle; /new or /voice
+    // cannot slip between a durable relay marker and execution because there is no second enqueue.
     const admissionKey = gatewayAdmissionKey(runtimeScope, m);
     try {
       await sessionRuns.run(admissionKey, async () => {
@@ -1166,53 +1239,8 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     const ctx = chatContext(adapter.name, m.chatId, cwd, who);
     const runSerializedSideEffect = (effect: () => Promise<HaraRun>): Promise<HaraRun> =>
       executeDurableGatewayEffect(runOutcomes, m.messageId, effect, ac.signal);
-    // If a tmux session opted in (via `hara remote ask/bind`), this reply is its input → inject it into that
-    // pane, let it react, and reply with the session's NEW output (on-inbound relay — quiet + iLink-friendly:
-    // one reply per message, no continuous push). Owner-gated by the allowlist check above.
-    if (!existingRunOutcome && !parseCommand(m.text)) {
-        preparedResult = await (async () => {
-          // pickPaneForReply consumes a one-shot route, so even that lookup must happen after the durable
-          // marker. If a process dies after route consumption, redelivery warns instead of injecting elsewhere.
-          const prior = await runOutcomes.start(m.messageId);
-          if (prior) {
-            const recovered = resultFromRunOutcome(prior);
-            if (prior.status !== "complete") await finishRunOutcome(runOutcomes, m.messageId, recovered);
-            return recovered;
-          }
-          if (ac.signal.aborted) throw ac.signal.reason instanceof Error ? ac.signal.reason : new Error("gateway effect cancelled");
-          const pane = pickPaneForReply(String(m.chatId));
-          if (!pane) {
-            // No irreversible route existed. Remove this preflight marker before falling through to coding.
-            await runOutcomes.remove(m.messageId);
-            return undefined;
-          }
-          console.error(`hara gateway: routed reply → tmux pane ${pane}`);
-          const before = capturePane(pane) ?? "";
-          injectTmux(pane, m.text);
-          // wait for the session's output to SETTLE (poll every 800ms; stable for ~1.6s → done; cap ~10s) so a
-          // slow response isn't missed and we don't capture mid-stream.
-          let after = "";
-          let stable = 0;
-          for (let i = 0; i < 12; i++) {
-            await new Promise((r) => setTimeout(r, 800));
-            const cur = capturePane(pane) ?? "";
-            if (cur === after) {
-              if (++stable >= 2) break;
-            } else {
-              stable = 0;
-              after = cur;
-            }
-          }
-          const delta = outputDelta(before, after).trim();
-          const body = delta
-            ? (delta.length > 1500 ? "…\n" + delta.slice(-1500) : delta)
-            : "✓ 已发送到这个远程会话，10 秒内暂无新输出。发 ? 可再看，发 /detach 退出远程控制。";
-          const completed = { reply: `🖥 ${pane}\n${body}`, files: [] } satisfies HaraRun;
-          if (ac.signal.aborted) throw ac.signal.reason instanceof Error ? ac.signal.reason : new Error("gateway effect cancelled");
-          await finishRunOutcome(runOutcomes, m.messageId, completed);
-          return completed;
-        })();
-    }
+    // Ordinary chat always remains a Hara conversation. Terminal control is intentionally namespaced under
+    // `/coding`; legacy tmux binds can still be cleared with `/detach`, but can no longer capture messages.
     // Thread identity is (platform, chat) for DMs and (platform, chat, USER) for groups — auto-derived, so
     // group members each get their own session thread instead of interleaving into one polluted context.
     if (!existingRunOutcome && !preparedResult && ctx.rotatedFrom) {
@@ -1221,10 +1249,156 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     }
     const cmd = existingRunOutcome || preparedResult ? null : parseCommand(m.text);
     if (cmd) {
+      if (cmd.cmd === "remote") {
+        if (!approvalUserId || String(m.userId) !== approvalUserId) {
+          return sendMessage(m.chatId, "⛔ 本地终端转发仅允许已配置的网关所有者控制。");
+        }
+        const match = /^send\s+([\s\S]+)$/iu.exec(cmd.arg);
+        if (!match) {
+          return sendMessage(m.chatId, "旧 tmux 会话也必须显式转发：\n/remote send <消息>\n普通聊天不会再自动注入任何终端；新会话请优先使用 /coding help。");
+        }
+        preparedResult = await runSerializedSideEffect(async () => {
+          const { capturePane, injectTmux, outputDelta, pickPaneForReply } = await import("./tmux-routes.js");
+          const pane = pickPaneForReply(String(m.chatId));
+          if (!pane) return { reply: "✗ 没有为这个聊天显式登记的 tmux 会话。请在对应终端运行 hara remote ask 或 hara remote bind。", files: [] };
+          try {
+            const before = capturePane(pane) ?? "";
+            injectTmux(pane, match[1]);
+            let after = "";
+            let stable = 0;
+            for (let index = 0; index < 12; index += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 800));
+              const current = capturePane(pane) ?? "";
+              if (current === after) {
+                if (++stable >= 2) break;
+              } else {
+                stable = 0;
+                after = current;
+              }
+            }
+            const delta = compactGatewayCodingOutput(outputDelta(before, after), 1_500);
+            return {
+              reply: `🖥 tmux ${pane}\n${delta || "消息已发送；10 秒内暂无新输出。需要时再次使用 /remote send <消息>。"}`,
+              files: [],
+            };
+          } catch {
+            return { reply: "⚠️ tmux 转发未能完成；为避免重复执行，Hara 没有自动重发。", files: [] };
+          }
+        });
+      }
+      if (cmd.cmd === "coding" || cmd.cmd === "live") {
+        if (!approvalUserId || String(m.userId) !== approvalUserId) {
+          return sendMessage(m.chatId, "⛔ Hara Live 仅允许已配置的网关所有者控制。请设置 HARA_GATEWAY_OWNER。\nHara Live control is owner-only.");
+        }
+        const coding = parseGatewayCodingCommand(cmd.arg);
+        const help = [
+          "Hara Live（显式控制，不接管普通聊天）",
+          "/coding list — 查看本机活动会话",
+          "/coding new codex|claude — 在当前 /cd 目录启动",
+          "/coding use <8位编号> — 选择会话",
+          "/coding send <消息> — 发送并等待结果",
+          "/coding read — 查看最新终端输出",
+          "/coding stop — 中断当前任务",
+          "/coding off — 取消选择",
+        ].join("\n");
+        if (coding.action === "help" || coding.action === "unknown") {
+          return sendMessage(m.chatId, `${coding.action === "unknown" ? `✗ 未知 Hara Live 指令：${coding.arg}\n\n` : ""}${help}`);
+        }
+        if (coding.action === "new") {
+          const agentKind = coding.arg.toLowerCase();
+          if (agentKind !== "codex" && agentKind !== "claude") {
+            return sendMessage(m.chatId, "用法：/coding new codex 或 /coding new claude\n先用 /cd <目录> 选择工作区。");
+          }
+          preparedResult = await runSerializedSideEffect(async () => {
+            try {
+              const created = await externalSessions.createSession({
+                sourceId: "runtime",
+                cwd: ctx.cwd,
+                agentKind,
+                title: `Hara ${agentKind === "codex" ? "Codex" : "Claude"}`,
+              });
+              setChatCodingSession(adapter.name, m.chatId, created.session.id, who);
+              return {
+                reply: `✓ 已启动并选中 ${agentKind === "codex" ? "Codex" : "Claude Code"} · ${gatewayCodingDisplayId(created.session.id)}\n📂 ${created.session.workspaceName}\n使用 /coding send <消息> 开始工作。`,
+                files: [],
+              };
+            } catch {
+              return { reply: `✗ 无法启动 ${agentKind === "codex" ? "Codex" : "Claude Code"}。请先在 Hara Desktop 的“编程会话”确认 Hara Live 可用。`, files: [] };
+            }
+          });
+        } else if (coding.action === "use") {
+          const snapshot = await listLiveSessions().catch(() => ({ source: undefined, sessions: [] }));
+          const selected = resolveGatewayCodingSession(coding.arg, snapshot.sessions);
+          if (!selected) return sendMessage(m.chatId, `✗ 找不到会话“${coding.arg || "(空)"}”。发送 /coding list 查看当前编号。`);
+          if ("ambiguous" in selected) return sendMessage(m.chatId, "✗ 编号不唯一，请输入列表中完整的 8 位编号。");
+          setChatCodingSession(adapter.name, m.chatId, selected.id, who);
+          return sendMessage(m.chatId, `✓ 已选中 ${selected.agentKind === "claude" ? "Claude Code" : "Codex"} · ${gatewayCodingDisplayId(selected.id)}\n📂 ${selected.workspaceName}`);
+        } else if (coding.action === "off") {
+          setChatCodingSession(adapter.name, m.chatId, undefined, who);
+          return sendMessage(m.chatId, "✓ 已退出 Hara Live 选择；普通消息仍由 Hara 处理。");
+        } else if (coding.action === "send") {
+          if (!coding.arg) return sendMessage(m.chatId, "用法：/coding send <要交给 Codex 或 Claude Code 的消息>");
+          const selectedId = chatCodingSession(adapter.name, m.chatId, who);
+          if (!selectedId) return sendMessage(m.chatId, "尚未选择 Hara Live 会话。先发送 /coding list 或 /coding new codex。");
+          preparedResult = await runSerializedSideEffect(async () => {
+            try {
+              const turn = await externalSessions.submit(selectedId, coding.arg, {
+                text() {},
+                tool() {},
+                notice() {},
+                confirm: async () => false,
+              });
+              const output = compactGatewayCodingOutput(turn.reply) || "会话已接受消息，但暂未捕获到新的终端输出。";
+              return {
+                reply: `${turn.status === "completed" ? "🖥" : turn.status === "interrupted" ? "⏹" : "⚠️"} Hara Live · ${gatewayCodingDisplayId(selectedId)}\n${output}`,
+                files: [],
+              };
+            } catch {
+              return { reply: "⚠️ 无法完成这次 Hara Live 转发；为避免重复执行，Hara 没有自动重发。请用 /coding read 检查终端状态。", files: [] };
+            }
+          });
+        } else if (coding.action === "read") {
+          const selectedId = chatCodingSession(adapter.name, m.chatId, who);
+          if (!selectedId) return sendMessage(m.chatId, "尚未选择 Hara Live 会话。先发送 /coding list。");
+          try {
+            const read = await externalSessions.readSession(selectedId);
+            const output = compactGatewayCodingOutput(read.messages.map((message) => message.text).join("\n"));
+            return sendMessage(m.chatId, `🖥 Hara Live · ${gatewayCodingDisplayId(selectedId)}\n${output || "（终端暂无输出）"}`);
+          } catch {
+            return sendMessage(m.chatId, "✗ 当前 Hara Live 会话已不可用。发送 /coding list 重新选择。");
+          }
+        } else if (coding.action === "stop") {
+          const selectedId = chatCodingSession(adapter.name, m.chatId, who);
+          if (!selectedId) return sendMessage(m.chatId, "尚未选择 Hara Live 会话。");
+          preparedResult = await runSerializedSideEffect(async () => {
+            try {
+              await externalSessions.interrupt(selectedId);
+              return { reply: `⏹ 已向 Hara Live · ${gatewayCodingDisplayId(selectedId)} 发送中断。`, files: [] };
+            } catch {
+              return { reply: "✗ 无法中断当前 Hara Live 会话；它可能已经结束。", files: [] };
+            }
+          });
+        } else {
+          const snapshot = await listLiveSessions().catch(() => ({ source: undefined, sessions: [] }));
+          if (snapshot.source?.state !== "ready") {
+            return sendMessage(m.chatId, `Hara Live 当前不可用（${snapshot.source?.state ?? "unknown"}）。请先启动最新版 Hara Desktop。\n\n${help}`);
+          }
+          const selectedId = chatCodingSession(adapter.name, m.chatId, who);
+          const rows = snapshot.sessions.map((session) => {
+            const selected = session.id === selectedId ? "●" : "○";
+            const provider = session.agentKind === "claude" ? "Claude Code" : session.agentKind === "codex" ? "Codex" : "Agent";
+            return `${selected} ${gatewayCodingDisplayId(session.id)} · ${provider} · ${session.workspaceName} · ${session.state}`;
+          });
+          const title = coding.action === "status" && selectedId
+            ? `当前选择：${gatewayCodingDisplayId(selectedId)}`
+            : `Hara Live 会话：${snapshot.sessions.length}`;
+          return sendMessage(m.chatId, `${title}\n${rows.join("\n") || "（暂无活动会话）"}\n\n${help}`);
+        }
+      }
       if (cmd.cmd === "help")
         return sendMessage(
           m.chatId,
-          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/agents [search] — available agents\n/agent <name|project:name|main> — switch to that agent's independent thread\n/voice · /say <text> — speech · /send <path> — send a file\n/detach — stop injecting replies into bound tmux panes\n/help\nanything else = run hara here",
+          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/agents [search] — available agents\n/agent <name|project:name|main> — switch to that agent's independent thread\n/coding help — explicit Codex / Claude Code relay\n/remote send <text> — explicit legacy tmux relay\n/voice · /say <text> — speech · /send <path> — send a file\n/detach — clear legacy tmux binds\n/help\nanything else = run hara here",
         );
       if (cmd.cmd === "agents") {
         const agents = await listGatewayAgents(cmd.arg, ctx.cwd, ctx.sessionId);
@@ -1508,6 +1682,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     closeQueue();
     await sessionRuns.waitForIdle();
     const handlersDrained = await inboundHandlers.drain();
+    await externalSessions.close().catch(() => {});
     ac.signal.removeEventListener("abort", closeQueue);
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);

@@ -2436,7 +2436,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
-            "external.sources.list", "external.sessions.list", "external.sessions.read", "external.sessions.fork",
+            "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
@@ -2477,6 +2477,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.metadata.v1",
             "external.sessions.interaction.v1",
             "external.sessions.live-control.v1",
+            "external.sessions.runtime.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
@@ -2573,8 +2574,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (externalSessionSpaceId() !== "personal") {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
             }
-            if (p.sourceId !== undefined && p.sourceId !== "codex" && p.sourceId !== "claude") {
-              return reply(rpcError(id, ERR.PARAMS, "sourceId must be codex or claude"));
+            if (p.sourceId !== undefined && p.sourceId !== "codex" && p.sourceId !== "claude" && p.sourceId !== "runtime") {
+              return reply(rpcError(id, ERR.PARAMS, "sourceId must be codex, claude, or runtime"));
             }
             if (p.cursor !== undefined && (typeof p.cursor !== "string" || !p.cursor || p.cursor.length > 160)) {
               return reply(rpcError(id, ERR.PARAMS, "cursor must be a bounded non-empty opaque cursor"));
@@ -2590,6 +2591,27 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               ...(p.cursor ? { cursor: p.cursor as string } : {}),
               ...(p.limit ? { limit: p.limit as number } : {}),
               ...(typeof p.search === "string" ? { search: p.search } : {}),
+            })));
+          }
+          case "external.sessions.create": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (p.sourceId !== "runtime") return reply(rpcError(id, ERR.PARAMS, "sourceId must be runtime"));
+            if (typeof p.cwd !== "string" || !p.cwd || p.cwd.length > 4_096) {
+              return reply(rpcError(id, ERR.PARAMS, "cwd must be a bounded non-empty local path"));
+            }
+            if (p.agentKind !== "codex" && p.agentKind !== "claude") {
+              return reply(rpcError(id, ERR.PARAMS, "agentKind must be codex or claude"));
+            }
+            if (p.title !== undefined && (typeof p.title !== "string" || p.title.length > 120)) {
+              return reply(rpcError(id, ERR.PARAMS, "title must be a string of at most 120 characters"));
+            }
+            return reply(rpcResult(id!, await externalSessions.createSession({
+              sourceId: "runtime",
+              cwd: p.cwd,
+              agentKind: p.agentKind,
+              ...(typeof p.title === "string" ? { title: p.title } : {}),
             })));
           }
           case "external.sessions.read": {

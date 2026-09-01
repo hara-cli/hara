@@ -252,6 +252,7 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
       capabilities: {
         listMetadata: ready,
         read: ready,
+        create: false,
         fork: ready,
         resume: ready,
         observeLive,

@@ -1,11 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { CodexAppServerAdapter } from "./codex.js";
 import { ClaudeAgentSdkAdapter } from "./claude.js";
+import { HaraRuntimeAdapter } from "./runtime.js";
 import { ExternalSessionOwnershipStore, externalSessionIdentityKey } from "./identity.js";
 import type { ExternalCommandOptions } from "./process.js";
 import {
   ExternalSessionInputError,
   type ExternalSessionAdapter,
+  type ExternalSessionCreateInput,
   type ExternalSessionForkResult,
   type ExternalSessionListInput,
   type ExternalSessionListResult,
@@ -21,7 +23,7 @@ import {
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 const CURSOR_TTL_MS = 10 * 60 * 1_000;
-const SOURCE_ORDER: ExternalSessionSourceId[] = ["codex", "claude"];
+const SOURCE_ORDER: ExternalSessionSourceId[] = ["runtime", "codex", "claude"];
 
 interface CursorRecord {
   sourceId: ExternalSessionSourceId;
@@ -37,6 +39,7 @@ export interface ExternalSessionRegistryOptions {
   identityHome?: string;
   codex?: Partial<ExternalCommandOptions> & { managedDaemon?: boolean };
   claude?: Partial<ExternalCommandOptions>;
+  runtime?: Partial<ExternalCommandOptions> & { sessionName?: string; runtimeRoot?: string };
 }
 
 export class ExternalSessionRegistry implements ExternalSessionService {
@@ -48,6 +51,17 @@ export class ExternalSessionRegistry implements ExternalSessionService {
       const identityKey = options.identityKey ?? externalSessionIdentityKey(options.identityHome);
       const ownership = new ExternalSessionOwnershipStore(options.identityHome);
       return [
+        new HaraRuntimeAdapter({
+          command: options.runtime?.command ?? process.env.HARA_HERDR_PATH ?? "herdr",
+          argsPrefix: options.runtime?.argsPrefix,
+          spawnProcess: options.runtime?.spawnProcess,
+          timeoutMs: options.runtime?.timeoutMs,
+          env: options.runtime?.env,
+          sessionName: options.runtime?.sessionName,
+          runtimeRoot: options.runtime?.runtimeRoot,
+          identityHome: options.identityHome,
+          identityKey,
+        }),
         new CodexAppServerAdapter({
           command: options.codex?.command ?? "codex",
           argsPrefix: options.codex?.argsPrefix,
@@ -146,11 +160,26 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     };
   }
 
+  async createSession(input: ExternalSessionCreateInput): Promise<ExternalSessionReadResult> {
+    if (!input || input.sourceId !== "runtime") {
+      throw new ExternalSessionInputError("only Hara Live can create a terminal relay session");
+    }
+    const adapter = this.adapters.get(input.sourceId);
+    if (!adapter?.create) throw new ExternalSessionInputError("Hara Live runtime is unavailable");
+    return await adapter.create({
+      cwd: input.cwd,
+      agentKind: input.agentKind,
+      ...(input.title !== undefined ? { title: input.title } : {}),
+    });
+  }
+
   private adapterForSession(sessionId: string): ExternalSessionAdapter {
-    if (typeof sessionId !== "string" || !/^ext_(?:codex|claude)_[a-f0-9]{24}$/.test(sessionId)) {
+    if (typeof sessionId !== "string" || !/^ext_(?:codex|claude|runtime)_[a-f0-9]{24}$/.test(sessionId)) {
       throw new ExternalSessionInputError("external session id is invalid");
     }
-    const sourceId: ExternalSessionSourceId = sessionId.startsWith("ext_codex_") ? "codex" : "claude";
+    const sourceId: ExternalSessionSourceId = sessionId.startsWith("ext_codex_")
+      ? "codex"
+      : sessionId.startsWith("ext_claude_") ? "claude" : "runtime";
     const adapter = this.adapters.get(sourceId);
     if (!adapter) throw new ExternalSessionInputError("external session source is unavailable");
     return adapter;

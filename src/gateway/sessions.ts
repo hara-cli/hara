@@ -34,6 +34,8 @@ interface ChatEntry extends ChatThread {
   lastUsed?: number; // last inbound message ts — drives idle auto-rotation (session hygiene)
   agent?: string; // /agent — pin an org role / indexed agent for this chat
   agentReturnCwd?: string; // cwd to restore when `/agent main` clears a role with its own home
+  /** Explicit `/coding use` selection. Ordinary chat never routes here implicitly. */
+  codingSessionId?: string;
 }
 
 export interface ChatWho {
@@ -240,6 +242,9 @@ function normalizeEntry(value: unknown, key: string): ChatEntry {
   if (typeof value.lastUsed === "number" && Number.isFinite(value.lastUsed)) entry.lastUsed = value.lastUsed;
   if (typeof value.agent === "string" && value.agent) entry.agent = value.agent;
   if (typeof value.agentReturnCwd === "string" && value.agentReturnCwd) entry.agentReturnCwd = value.agentReturnCwd;
+  if (typeof value.codingSessionId === "string" && /^ext_runtime_[a-f0-9]{24}$/u.test(value.codingSessionId)) {
+    entry.codingSessionId = value.codingSessionId;
+  }
   return entry;
 }
 
@@ -534,6 +539,46 @@ export function setChatAgent(
       switchAgentContext(entry, platform, chatId, restore || entry.cwd, undefined, uid);
     }
     return entry.agent;
+  });
+}
+
+/** The Hara Live terminal explicitly selected by this chat actor. This is only a pointer: command handling
+ * must still rediscover the runtime session before reading, sending, or interrupting it. */
+export function chatCodingSession(
+  platform: string,
+  chatId: number | string,
+  who?: ChatWho,
+): string | undefined {
+  const uid = scopedUser(who);
+  const key = mapKey(platform, chatId, uid);
+  const release = acquireLock();
+  try {
+    return load()[key]?.codingSessionId;
+  } finally {
+    release();
+  }
+}
+
+/** Select or clear the Hara Live terminal controlled by `/coding`. The owning ChatEntry is initialized by
+ * `chatContext` before gateway commands are handled; refusing to manufacture one here preserves its cwd and
+ * Hara-thread invariants. */
+export function setChatCodingSession(
+  platform: string,
+  chatId: number | string,
+  sessionId: string | undefined,
+  who?: ChatWho,
+): string | undefined {
+  if (sessionId !== undefined && !/^ext_runtime_[a-f0-9]{24}$/u.test(sessionId)) {
+    throw new Error("Invalid Hara Live session id");
+  }
+  const uid = scopedUser(who);
+  const key = mapKey(platform, chatId, uid);
+  return mutate((map) => {
+    const entry = map[key];
+    if (!entry) return undefined;
+    if (sessionId) entry.codingSessionId = sessionId;
+    else delete entry.codingSessionId;
+    return entry.codingSessionId;
   });
 }
 

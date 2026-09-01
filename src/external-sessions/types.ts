@@ -5,7 +5,9 @@
  * objects must stay behind the Serve boundary. Desktop and future mobile clients receive only this
  * deliberately small projection.
  */
-export type ExternalSessionSourceId = "codex" | "claude";
+export type ExternalSessionSourceId = "codex" | "claude" | "runtime";
+
+export type ExternalRuntimeAgentKind = "codex" | "claude";
 
 export type ExternalSessionSourceState =
   | "ready"
@@ -24,6 +26,7 @@ export type ExternalSessionState =
 export interface ExternalSessionSourceCapabilities {
   listMetadata: boolean;
   read: boolean;
+  create: boolean;
   fork: boolean;
   resume: boolean;
   observeLive: boolean;
@@ -53,7 +56,9 @@ export interface ExternalSessionInfo {
   state: ExternalSessionState;
   createdAt: string;
   updatedAt: string;
-  origin?: "cli" | "vscode" | "exec" | "appServer" | "subAgent" | "unknown";
+  origin?: "cli" | "vscode" | "exec" | "appServer" | "subAgent" | "haraRuntime" | "unknown";
+  /** Present for Hara Live relay sessions; never inferred from transcript text. */
+  agentKind?: ExternalRuntimeAgentKind | "other";
   ephemeral: boolean;
 }
 
@@ -120,6 +125,13 @@ export interface ExternalSessionListInput {
   search?: string;
 }
 
+export interface ExternalSessionCreateInput {
+  sourceId: "runtime";
+  cwd: string;
+  agentKind: ExternalRuntimeAgentKind;
+  title?: string;
+}
+
 export interface ExternalSessionListResult {
   sources: ExternalSessionSourceInfo[];
   sessions: ExternalSessionInfo[];
@@ -140,6 +152,7 @@ export interface ExternalSessionAdapter {
   readonly id: ExternalSessionSourceId;
   inspect(): Promise<ExternalSessionSourceInfo>;
   list(input: { cursor?: string; limit: number; search?: string }): Promise<ExternalSessionAdapterPage>;
+  create?(input: Omit<ExternalSessionCreateInput, "sourceId">): Promise<ExternalSessionReadResult>;
   read?(sessionId: string): Promise<ExternalSessionReadResult>;
   fork?(sessionId: string): Promise<ExternalSessionForkResult>;
   submit?(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
@@ -151,6 +164,7 @@ export interface ExternalSessionAdapter {
 export interface ExternalSessionService {
   listSources(): Promise<{ sources: ExternalSessionSourceInfo[] }>;
   listSessions(input?: ExternalSessionListInput): Promise<ExternalSessionListResult>;
+  createSession(input: ExternalSessionCreateInput): Promise<ExternalSessionReadResult>;
   readSession(sessionId: string): Promise<ExternalSessionReadResult>;
   forkSession(sessionId: string): Promise<ExternalSessionForkResult>;
   submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;

@@ -21,9 +21,9 @@ import {
   TMUX_BIND_ROUTE_TTL_MS,
   TMUX_ONCE_ROUTE_TTL_MS,
 } from "../dist/gateway/tmux-routes.js";
-import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, gatewayAdmissionKey, gatewayStatus, parseCommand, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
+import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, compactGatewayCodingOutput, gatewayAdmissionKey, gatewayCodingDisplayId, gatewayStatus, parseCommand, parseGatewayCodingCommand, resolveGatewayCodingSession, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
 import { GatewayLoginManager } from "../dist/gateway/login.js";
-import { chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
+import { chatCodingSession, chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatCodingSession, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
 import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs, startWeixinLoginSession } from "../dist/gateway/weixin.js";
 import { synthesize, ttsConfigFromEnv, ttsCleanText, ttsTimeoutMs } from "../dist/gateway/tts.js";
 import { deliverResult } from "../dist/cron/deliver.js";
@@ -745,6 +745,29 @@ test("parseCommand: leading /word → {cmd,arg}; else null", () => {
   // an unknown slash-word still parses (e.g. "/foo"); the gateway routes unknown commands to a normal task run
 });
 
+test("/coding grammar is explicit and resolves only Hara opaque runtime ids", () => {
+  assert.deepEqual(parseGatewayCodingCommand(""), { action: "status", arg: "" });
+  assert.deepEqual(parseGatewayCodingCommand("start codex"), { action: "new", arg: "codex" });
+  assert.deepEqual(parseGatewayCodingCommand("send fix the tests"), { action: "send", arg: "fix the tests" });
+  assert.deepEqual(parseGatewayCodingCommand("interrupt"), { action: "stop", arg: "" });
+  assert.deepEqual(parseGatewayCodingCommand("hello world"), { action: "unknown", arg: "hello world" });
+
+  const sessions = [
+    { id: "ext_runtime_1111111111111111aabbccdd" },
+    { id: "ext_runtime_2222222222222222aabbccdd" },
+  ];
+  assert.equal(gatewayCodingDisplayId(sessions[0].id), "AABBCCDD");
+  assert.equal(resolveGatewayCodingSession(sessions[0].id, sessions)?.id, sessions[0].id);
+  assert.deepEqual(resolveGatewayCodingSession("aabbccdd", sessions), { ambiguous: true });
+  assert.equal(resolveGatewayCodingSession("1111aabbccdd", sessions)?.id, sessions[0].id);
+  assert.equal(resolveGatewayCodingSession("native-provider-id", sessions), null);
+
+  const long = "x".repeat(4_000);
+  const compact = compactGatewayCodingOutput(long, 120);
+  assert.match(compact, /完整内容请在 Hara Desktop 查看/);
+  assert.equal(compact.endsWith("x".repeat(120)), true);
+});
+
 test("isAllowed: empty allowlist = nobody (safe); else membership", () => {
   assert.equal(isAllowed(7, new Set()), false); // never wide-open
   assert.equal(isAllowed(7, new Set(["7"])), true);
@@ -951,6 +974,9 @@ test("chat ctx: /cd round trips restore each cwd thread and mutations preserve c
 
     assert.equal(toggleVoice("telegram", 42), true);
     assert.equal(setChatAgent("telegram", 42, "reviewer"), "reviewer");
+    const liveId = "ext_runtime_0123456789abcdef01234567";
+    assert.equal(setChatCodingSession("telegram", 42, liveId), liveId);
+    assert.equal(chatCodingSession("telegram", 42), liveId);
     const reviewerDefault = chatContext("telegram", 42, def);
     assert.notEqual(reviewerDefault.sessionId, a.sessionId, "selecting an agent leaves main history untouched");
     const beforeSwitch = JSON.parse(readFileSync(join(home, ".hara", "gateway", "chats.json"), "utf8"))["telegram:42"].lastUsed;
@@ -983,6 +1009,10 @@ test("chat ctx: /cd round trips restore each cwd thread and mutations preserve c
     assert.equal(chatContext("telegram", 42, def).voice, true);
     assert.equal(toggleVoice("telegram", 42), false); // and back off without replacing the entry
     assert.equal(chatContext("telegram", 42, def).agent, "reviewer");
+    assert.equal(chatCodingSession("telegram", 42), liveId, "project, Agent, and thread switches preserve the explicit Hara Live selection");
+    assert.equal(setChatCodingSession("telegram", 42, undefined), undefined);
+    assert.equal(chatCodingSession("telegram", 42), undefined);
+    assert.throws(() => setChatCodingSession("telegram", 42, "native-provider-id"), /Invalid Hara Live session id/);
 
     const stored = JSON.parse(readFileSync(join(home, ".hara", "gateway", "chats.json"), "utf8"))["telegram:42"];
     assert.ok(stored.lastUsed >= beforeSwitch, "lastUsed survives entry mutations");
