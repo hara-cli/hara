@@ -323,17 +323,23 @@ test("App Esc aborts the turn and actively removes a pending confirmation", asyn
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  stdin.write("go");
-  await tick();
-  stdin.write("\r");
-  await tick();
-  assert.ok(strip(lastFrame()).includes("approval must disappear on Esc"));
-  stdin.write("\x1b");
-  await tick(100);
-  assert.equal(interrupted, true, "Esc aborts the owning turn signal");
-  assert.ok(!strip(lastFrame()).includes("approval must disappear on Esc"), "the stale confirmation is removed");
-  unmount();
+  try {
+    stdin.write("go");
+    await waitUntil(() => strip(lastFrame()).includes("go"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(
+      () => strip(lastFrame()).includes("approval must disappear on Esc"),
+      "confirmation did not mount before Esc",
+    );
+    stdin.write("\x1b");
+    await waitUntil(() => interrupted, "Esc did not abort the owning turn signal");
+    await waitUntil(
+      () => !strip(lastFrame()).includes("approval must disappear on Esc"),
+      "the stale confirmation was not removed",
+    );
+  } finally {
+    unmount();
+  }
 });
 
 test("App select (plan-proceed): ↓↓ + Enter picks the third option", async () => {
