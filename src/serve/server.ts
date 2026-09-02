@@ -1159,9 +1159,11 @@ function automationSchedulerInfo(): {
         const reconciled = reconcileInstalledScheduler(command);
         installed = reconciled.current;
         detail = reconciled.detail;
-      } else if (state === "current") {
-        installed = true;
+      } else if (state === "current" && installed) {
         detail = "The local scheduler is installed.";
+      } else if (state === "current") {
+        installed = false;
+        detail = "The Hara scheduler file exists but launchd is not registered; install it again.";
       } else if (state === "absent") {
         installed = false;
         detail = "Install the local scheduler once so enabled tasks can run while Desktop is closed.";

@@ -12,6 +12,71 @@ const shQuote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`; // safe 
 const plistFile = (): string => join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 const MAX_SCHEDULER_ENTRY_BYTES = 256 * 1024;
 
+export type LaunchdRunner = (args: readonly string[]) => void;
+
+export interface LaunchdCommandPlan {
+  bootout: readonly string[];
+  bootstrap: readonly string[];
+  verify: readonly string[];
+}
+
+/** Modern launchctl commands are scoped to the logged-in GUI user. Keeping this plan pure makes the exact
+ * registration contract testable on every CI platform without touching the host scheduler. */
+export function launchdCommandPlan(uid: number, path: string): LaunchdCommandPlan {
+  if (!Number.isSafeInteger(uid) || uid < 0) throw new Error("could not determine the current macOS user id");
+  const domain = `gui/${uid}`;
+  return {
+    bootout: ["bootout", domain, path],
+    bootstrap: ["bootstrap", domain, path],
+    verify: ["print", `${domain}/${LABEL}`],
+  };
+}
+
+function currentUid(): number | null {
+  if (typeof process.getuid !== "function") return null;
+  const uid = process.getuid();
+  return Number.isSafeInteger(uid) && uid >= 0 ? uid : null;
+}
+
+const runLaunchctl: LaunchdRunner = (args) => {
+  execFileSync("launchctl", [...args], { stdio: "ignore" });
+};
+
+/** Replace any registration for this label, then prove launchd actually owns the service. A plist merely
+ * existing on disk is not evidence that scheduled work will run. */
+export function activateLaunchdService(
+  path: string,
+  uid: number,
+  run: LaunchdRunner = runLaunchctl,
+): string | null {
+  const plan = launchdCommandPlan(uid, path);
+  try {
+    run(plan.bootout);
+  } catch {
+    /* absent or already unloaded */
+  }
+  try {
+    run(plan.bootstrap);
+    run(plan.verify);
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+function launchdServiceLoaded(path: string, uid: number, run: LaunchdRunner = runLaunchctl): boolean {
+  if (!existsSync(path)) return false;
+  try {
+    const entry = lstatSync(path);
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.size > MAX_SCHEDULER_ENTRY_BYTES) return false;
+    if (!readFileSync(path, "utf8").includes(`<key>Label</key><string>${LABEL}</string>`)) return false;
+    run(launchdCommandPlan(uid, path).verify);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export type SchedulerEntryState = "absent" | "current" | "stale" | "unsafe";
 
 /** launchd's StartInterval may drop or heavily coalesce background timer firings. Calendar events retain
@@ -66,7 +131,10 @@ function currentCrontab(): string {
 
 export function isInstalled(): boolean {
   const os = platform();
-  if (os === "darwin") return existsSync(plistFile());
+  if (os === "darwin") {
+    const uid = currentUid();
+    return uid !== null && launchdServiceLoaded(plistFile(), uid);
+  }
   if (os === "linux") return currentCrontab().includes(CRON_TAG);
   return false;
 }
@@ -105,7 +173,15 @@ export function reconcileInstalledScheduler(cmd: readonly string[]): SchedulerRe
     return { installed: false, current: false, repaired: false, detail: "The local scheduler is not installed." };
   }
   if (state === "current") {
-    return { installed: true, current: true, repaired: false, detail: "The local scheduler is installed." };
+    const registered = isInstalled();
+    return registered
+      ? { installed: true, current: true, repaired: false, detail: "The local scheduler is installed." }
+      : {
+          installed: false,
+          current: false,
+          repaired: false,
+          detail: "The Hara scheduler file exists but launchd is not registered; install it again.",
+        };
   }
   if (state === "unsafe") {
     return {
@@ -130,29 +206,41 @@ export function installScheduler(cmd: string[]): { ok: boolean; msg: string } {
   if (os === "darwin") {
     const p = plistFile();
     const plist = renderLaunchdPlist(argv);
+    const uid = currentUid();
+    if (uid === null) return { ok: false, msg: "could not determine the current macOS user id" };
     mkdirSync(dirname(p), { recursive: true });
+    let previous: string | null = null;
     if (existsSync(p)) {
       try {
         const existing = lstatSync(p);
-        if (!existing.isFile() || existing.isSymbolicLink()) {
+        if (!existing.isFile() || existing.isSymbolicLink() || existing.size > MAX_SCHEDULER_ENTRY_BYTES) {
           return { ok: false, msg: `refusing to replace unsafe scheduler entry ${p}` };
         }
+        previous = readFileSync(p, "utf8");
       } catch (e) {
         return { ok: false, msg: `could not inspect existing scheduler entry (${e instanceof Error ? e.message : e})` };
       }
     }
     writeFileSync(p, plist, "utf8");
-    try {
-      execFileSync("launchctl", ["unload", p], { stdio: "ignore" });
-    } catch {
-      /* not loaded yet */
+    const activationError = activateLaunchdService(p, uid);
+    if (activationError) {
+      try {
+        runLaunchctl(launchdCommandPlan(uid, p).bootout);
+      } catch {
+        /* bootstrap may have failed before registration */
+      }
+      if (previous === null) {
+        rmSync(p, { force: true });
+      } else {
+        writeFileSync(p, previous, "utf8");
+        void activateLaunchdService(p, uid);
+      }
+      return {
+        ok: false,
+        msg: `launchd registration failed and the scheduler file was rolled back (${activationError})`,
+      };
     }
-    try {
-      execFileSync("launchctl", ["load", p], { stdio: "ignore" });
-    } catch (e) {
-      return { ok: false, msg: `wrote ${p} but launchctl load failed (${e instanceof Error ? e.message : e})` };
-    }
-    return { ok: true, msg: `launchd agent installed (${p}) — runs every calendar minute` };
+    return { ok: true, msg: `launchd agent registered and verified (${p}) — runs every calendar minute` };
   }
   if (os === "linux") {
     const kept = currentCrontab()
@@ -177,10 +265,13 @@ export function uninstallScheduler(): { ok: boolean; msg: string } {
   if (os === "darwin") {
     const p = plistFile();
     if (!existsSync(p)) return { ok: true, msg: "not installed" };
-    try {
-      execFileSync("launchctl", ["unload", p], { stdio: "ignore" });
-    } catch {
-      /* ignore */
+    const uid = currentUid();
+    if (uid !== null) {
+      try {
+        runLaunchctl(launchdCommandPlan(uid, p).bootout);
+      } catch {
+        /* already unloaded */
+      }
     }
     rmSync(p, { force: true });
     return { ok: true, msg: "launchd agent removed" };

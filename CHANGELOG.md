@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.164.1 — 2026-09-03 — verified macOS scheduler registration
+
+- Register the per-user macOS scheduler with modern `launchctl bootstrap`, verify the live service in its GUI
+  domain, and use `bootout` for replacement and removal. Hara no longer treats a plist that exists but failed
+  to load as an installed scheduler.
+- Roll back the scheduler file when registration or verification fails, preserving a prior safe entry when one
+  existed. Desktop and CLI now report the failure instead of leaving an orphaned file that implies tasks will
+  run.
+- Pin the compatible patched `fast-uri` 3.x release after the npm advisory disclosed URL canonicalization and
+  SSRF weaknesses in the prior transitive version; the production dependency audit is clean at release time.
+- Carry forward explicit vision-first image routing, DeepSeek `deepseek-v4-flash-vision-exp`, Volcengine Ark
+  Agent Plan, and deterministic Cron previews from `0.164.0`.
+
 ## 0.164.0 — 2026-09-03 — explicit vision-first image routing
 
 - Restore an explicit `visionModel` route for CLI, TUI, Desktop Serve, attached images, image inspection,

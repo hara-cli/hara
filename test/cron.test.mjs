@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   cronExpressionsEqual,
   durationToMs,
@@ -30,8 +31,15 @@ import {
   setEnabled,
   updateJob,
 } from "../dist/cron/store.js";
-import { renderLaunchdPlist, schedulerEntryStateFor } from "../dist/cron/install.js";
+import {
+  activateLaunchdService,
+  launchdCommandPlan,
+  renderLaunchdPlist,
+  schedulerEntryStateFor,
+} from "../dist/cron/install.js";
 import { defaultProcessIdentity } from "../dist/process-identity.js";
+
+const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
 
 test("durationToMs", () => {
   assert.equal(durationToMs("45s"), 45_000);
@@ -51,6 +59,35 @@ test("macOS cron uses calendar-minute events instead of a coalescible StartInter
     assert.match(plist, new RegExp(`<key>Minute</key><integer>${minute}</integer>`));
   }
   assert.match(plist, /<string>\/Applications\/Hara &amp; Tools\/hara<\/string>/);
+});
+
+test("macOS scheduler registration uses the GUI domain and verifies the live service", () => {
+  const path = "/Users/test/Library/LaunchAgents/net.nanhara.hara.cron.plist";
+  assert.deepEqual(launchdCommandPlan(501, path), {
+    bootout: ["bootout", "gui/501", path],
+    bootstrap: ["bootstrap", "gui/501", path],
+    verify: ["print", "gui/501/net.nanhara.hara.cron"],
+  });
+
+  const calls = [];
+  assert.equal(activateLaunchdService(path, 501, (args) => calls.push([...args])), null);
+  assert.deepEqual(calls, [
+    ["bootout", "gui/501", path],
+    ["bootstrap", "gui/501", path],
+    ["print", "gui/501/net.nanhara.hara.cron"],
+  ]);
+
+  const failed = activateLaunchdService(path, 501, (args) => {
+    if (args[0] === "bootstrap") throw new Error("bootstrap rejected");
+  });
+  assert.equal(failed, "bootstrap rejected");
+
+  const serverSource = readFileSync(`${repositoryRoot}/src/serve/server.ts`, "utf8");
+  assert.match(
+    serverSource,
+    /state === "current" && installed/,
+    "Desktop must not promote a matching plist to healthy without a live launchd registration",
+  );
 });
 
 test("Desktop detects and repairs a scheduler entry that points at an old app executable", () => {
