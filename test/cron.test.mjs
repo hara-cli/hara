@@ -388,6 +388,23 @@ test("nextRun honors a renderer-facing shared scan deadline", () => {
   assert.ok(Date.now() - started < 100, "an exhausted UI budget cannot scan a full year");
 });
 
+test("nextRun returns an immediate cron candidate even when the renderer budget just expired", () => {
+  const from = new Date(2026, 0, 5, 10, 0, 37).getTime();
+  assert.equal(
+    nextRun(
+      {
+        schedule: { kind: "cron", expr: "* * * * *" },
+        createdAt: from - 60_000,
+        lastRunAt: from,
+      },
+      from,
+      { deadlineMs: 0 },
+    ),
+    Math.floor(from / 60_000) * 60_000 + 60_000,
+    "an expired UI budget still permits the first constant-time candidate check",
+  );
+});
+
 test("nextRun: a matching current cron minute stays due now instead of jumping to tomorrow", () => {
   const from = new Date(2026, 0, 5, 9, 0, 37).getTime();
   const job = { schedule: { kind: "cron", expr: "0 9 * * *" }, createdAt: from, pendingDueAt: from };

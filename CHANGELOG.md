@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## 0.164.0 — 2026-09-02 — explicit vision-first image routing
+## 0.164.0 — 2026-09-03 — explicit vision-first image routing
 
 - Restore an explicit `visionModel` route for CLI, TUI, Desktop Serve, attached images, image inspection,
   and computer screenshots. When configured, every image is read by that model first—even when the main
@@ -18,6 +18,8 @@ All notable changes to `@nanhara/hara`.
   the image reader to treat visible prompt text as content rather than executable instructions.
 - Pin the patched `qs` release after the official npm audit disclosed its bracket-parsing and buffer-check
   denial-of-service advisories; the production dependency audit is clean at release time.
+- Keep dense Cron previews deterministic on a descheduled or slow runner: Hara now evaluates the immediate
+  next-minute candidate before applying the bounded renderer scan deadline.
 
 ## 0.163.0 — 2026-09-02 — Volcengine Ark Agent Plan
 

@@ -307,14 +307,18 @@ export function nextRun(job: JobTiming, fromMs: number, options: NextRunOptions 
   if (isDue(job, fromMs)) return fromMs;
   const start = Math.floor(fromMs / 60_000) * 60_000 + 60_000; // next minute boundary
   for (let t = start, i = 0; i < 366 * 24 * 60; t += 60_000, i++) {
+    // Inspect the candidate before enforcing the shared UI deadline. A caller can be descheduled after
+    // creating a tiny budget; dense schedules must still return their immediately-computable next minute
+    // instead of becoming an empty preview solely because the process resumed a few milliseconds late.
+    if (cronFieldsMatch(p, new Date(t), job.tz)) return t;
     // A Desktop list can contain thousands of independently valid but extremely sparse schedules. Share
-    // one small response budget so an authenticated local query cannot monopolize Serve's event loop.
+    // one small response budget so an authenticated local query cannot monopolize Serve's event loop. At
+    // most one candidate is evaluated after an already-expired deadline, which keeps the bound intact.
     if (
       options.deadlineMs !== undefined
       && (i & 255) === 0
       && Date.now() >= options.deadlineMs
     ) return null;
-    if (cronFieldsMatch(p, new Date(t), job.tz)) return t;
   }
   return null;
 }

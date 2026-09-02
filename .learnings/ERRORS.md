@@ -24,8 +24,8 @@ cache under the system temporary directory. The same 0.156.1 package dry-run the
 - Related Files: package.json, package-lock.json
 - Tags: npm, cache, permissions, release
 - Pattern-Key: release.npm_pack_uses_task_private_cache
-- Recurrence-Count: 2
-- Last-Seen: 2026-08-31T01:15:00+08:00
+- Recurrence-Count: 3
+- Last-Seen: 2026-09-03
 
 ---
 
@@ -55,7 +55,8 @@ completed with zero vulnerabilities.
 - Related Files: package-lock.json
 - Tags: npm, audit, registry, release
 - Pattern-Key: release.npm_audit_requires_authoritative_registry
-- Recurrence-Count: 1
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-03
 
 ---
 
