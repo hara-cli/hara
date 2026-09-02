@@ -41,7 +41,12 @@ const {
   agentRunExitSummary,
   cronAgentEnv,
 } = await import("../dist/cron/runner.js");
-const { parseDeliver } = await import("../dist/cron/deliver.js");
+const {
+  deliveryConfigurationError,
+  deliveryInstructionConflict,
+  parseDeliver,
+  MAX_CRON_DELIVERY_ATTEMPTS,
+} = await import("../dist/cron/deliver.js");
 const { defaultProcessIdentity } = await import("../dist/process-identity.js");
 const { listSessions } = await import("../dist/session/store.js");
 const { getTool } = await import("../dist/tools/registry.js");
@@ -1173,6 +1178,153 @@ test("parseDeliver: platforms validated, Weixin requires an explicit peer", () =
   assert.ok("error" in parseDeliver("nonsense"), "missing colon rejected");
 });
 
+test("delivery validation rejects missing credentials and duplicate prompt routing before save", () => {
+  assert.match(
+    deliveryConfigurationError("feishu:oc_test", {}),
+    /HARA_FEISHU_APP_ID.*HARA_FEISHU_APP_SECRET/,
+  );
+  assert.equal(
+    deliveryConfigurationError("feishu:oc_test", {
+      HARA_FEISHU_APP_ID: "configured",
+      HARA_FEISHU_APP_SECRET: "configured",
+    }),
+    null,
+  );
+  assert.match(
+    deliveryInstructionConflict("整理日报并发送到飞书群 oc_old", "feishu:oc_current"),
+    /structured deliver is the sole destination/,
+  );
+  assert.equal(deliveryInstructionConflict("整理每日 AI 科技早报", "feishu:oc_current"), null);
+});
+
+test("deterministic missing credentials block once and resume only after configuration appears", async () => {
+  const savedHome = process.env.HOME;
+  const savedProfile = process.env.USERPROFILE;
+  const savedAppId = process.env.HARA_FEISHU_APP_ID;
+  const savedAppSecret = process.env.HARA_FEISHU_APP_SECRET;
+  const home = mkdtempSync(join(tmpdir(), "hara-cron-blocked-delivery-"));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  delete process.env.HARA_FEISHU_APP_ID;
+  delete process.env.HARA_FEISHU_APP_SECRET;
+  try {
+    const now = Date.now();
+    const job = addJob({
+      name: "blocked delivery",
+      schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+      task: "prepare report",
+      mode: "print",
+      cwd: home,
+      deliver: "feishu:oc_test",
+      createdAt: now,
+    });
+    enqueueOutcomeNotifications(job.id, { ok: true, stdout: "done" }, now, "blocked-attempt");
+    let calls = 0;
+    const missing = async () => {
+      calls += 1;
+      return "Feishu delivery is not configured — set HARA_FEISHU_APP_ID and HARA_FEISHU_APP_SECRET before saving this job";
+    };
+    await deliverPendingNotifications(missing, now, undefined, { jobId: job.id });
+    assert.equal(calls, 1);
+    assert.equal(findJob(job.id).pendingNotifications[0].state, "blocked");
+    assert.equal(findJob(job.id).pendingNotifications[0].failureCode, "configuration_required");
+    await deliverPendingNotifications(missing, now + 86_400_000, undefined, { jobId: job.id });
+    assert.equal(calls, 1, "a deterministic configuration failure is not retried on every tick");
+
+    process.env.HARA_FEISHU_APP_ID = "configured";
+    process.env.HARA_FEISHU_APP_SECRET = "configured";
+    await deliverPendingNotifications(async () => { calls += 1; return null; }, now + 86_400_001, undefined, { jobId: job.id });
+    assert.equal(calls, 2);
+    assert.equal(findJob(job.id).pendingNotifications, undefined);
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedProfile;
+    if (savedAppId === undefined) delete process.env.HARA_FEISHU_APP_ID;
+    else process.env.HARA_FEISHU_APP_ID = savedAppId;
+    if (savedAppSecret === undefined) delete process.env.HARA_FEISHU_APP_SECRET;
+    else process.env.HARA_FEISHU_APP_SECRET = savedAppSecret;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a legacy job with missing delivery configuration is blocked before its task executes", async () => {
+  const savedHome = process.env.HOME;
+  const savedProfile = process.env.USERPROFILE;
+  const savedAppId = process.env.HARA_FEISHU_APP_ID;
+  const savedAppSecret = process.env.HARA_FEISHU_APP_SECRET;
+  const home = mkdtempSync(join(tmpdir(), "hara-cron-pre-run-block-"));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  delete process.env.HARA_FEISHU_APP_ID;
+  delete process.env.HARA_FEISHU_APP_SECRET;
+  try {
+    const now = Date.now();
+    const job = addJob({
+      name: "legacy missing config",
+      schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+      task: "must not execute",
+      mode: "print",
+      cwd: home,
+      deliver: "feishu:oc_test",
+      createdAt: now - 120_000,
+    });
+    let runs = 0;
+    const result = await runTick(now, async () => { runs += 1; return { ok: true }; });
+    assert.deepEqual(result.ran, []);
+    assert.equal(runs, 0);
+    assert.equal(findJob(job.id).lastRunAt, undefined);
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedProfile;
+    if (savedAppId === undefined) delete process.env.HARA_FEISHU_APP_ID;
+    else process.env.HARA_FEISHU_APP_ID = savedAppId;
+    if (savedAppSecret === undefined) delete process.env.HARA_FEISHU_APP_SECRET;
+    else process.env.HARA_FEISHU_APP_SECRET = savedAppSecret;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("transient delivery failures stop in dead-letter after the finite retry budget", async () => {
+  const savedHome = process.env.HOME;
+  const savedProfile = process.env.USERPROFILE;
+  const home = mkdtempSync(join(tmpdir(), "hara-cron-dead-letter-"));
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const now = Date.now();
+    const job = addJob({
+      name: "finite retry",
+      schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+      task: "prepare report",
+      mode: "print",
+      cwd: home,
+      deliver: "webhook:https://example.invalid/hook",
+      createdAt: now,
+    });
+    enqueueOutcomeNotifications(job.id, { ok: true, stdout: "done" }, now, "retry-attempt");
+    let calls = 0;
+    for (let attempt = 0; attempt < MAX_CRON_DELIVERY_ATTEMPTS; attempt += 1) {
+      await deliverPendingNotifications(async () => { calls += 1; return "delivery failed: transport request failed"; }, now + attempt * 86_400_000, undefined, { jobId: job.id });
+    }
+    const notification = findJob(job.id).pendingNotifications[0];
+    assert.equal(calls, MAX_CRON_DELIVERY_ATTEMPTS);
+    assert.equal(notification.state, "dead_letter");
+    assert.equal(notification.failureCode, "retry_exhausted");
+    await deliverPendingNotifications(async () => { calls += 1; return null; }, now + 365 * 86_400_000, undefined, { jobId: job.id });
+    assert.equal(calls, MAX_CRON_DELIVERY_ATTEMPTS, "dead-letter effects stay visible without retrying");
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("cronjob tool: add/list/remove work; cron-run sessions are refused (recursion guard)", async () => {
   const tool = getTool("cronjob");
   assert.ok(tool && tool.kind === "exec", "registered, approval-gated");
@@ -1196,27 +1348,45 @@ test("cronjob tool: add/list/remove work; cron-run sessions are refused (recursi
   assert.match(badTz, /invalid timezone/);
   const badAlert = await tool.run({ action: "add", schedule: "0 9 * * *", task: "x", alertAfter: 0 }, { cwd: process.cwd() });
   assert.match(badAlert, /alertAfter.*1 to 1000/);
-  const quiet = await tool.run({
+  const missingConfiguration = await tool.run({
     action: "add",
     schedule: "every 5m",
     task: "check price",
     deliver: "feishu:oc_test",
-    deliverMode: "on-output",
   }, { cwd: process.cwd() });
-  assert.match(quiet, /on-output/);
-  const quietId = /✓ scheduled (\S+)/.exec(quiet)[1];
-  assert.equal(findJob(quietId).deliverMode, "on-output");
-  const quietList = await tool.run({ action: "list" }, { cwd: process.cwd() });
-  assert.match(quietList, /feishu:oc_test \(on-output\)/);
-  assert.match(
-    await tool.run({ action: "add", schedule: "every 5m", task: "x", deliverMode: "on-error" }, { cwd: process.cwd() }),
-    /requires `deliver`/,
-  );
-  assert.match(
-    await tool.run({ action: "add", schedule: "every 5m", task: "x", deliver: "feishu:oc_test", deliverMode: "sometimes" }, { cwd: process.cwd() }),
-    /always, on-output, or on-error/,
-  );
-  assert.match(await tool.run({ action: "remove", id: quietId }, { cwd: process.cwd() }), /✓ removed/);
+  assert.match(missingConfiguration, /Feishu delivery is not configured/);
+  const savedAppId = process.env.HARA_FEISHU_APP_ID;
+  const savedAppSecret = process.env.HARA_FEISHU_APP_SECRET;
+  process.env.HARA_FEISHU_APP_ID = "configured";
+  process.env.HARA_FEISHU_APP_SECRET = "configured";
+  try {
+    const quiet = await tool.run({
+      action: "add",
+      schedule: "every 5m",
+      task: "check price",
+      deliver: "feishu:oc_test",
+      deliverMode: "on-output",
+    }, { cwd: process.cwd() });
+    assert.match(quiet, /on-output/);
+    const quietId = /✓ scheduled (\S+)/.exec(quiet)[1];
+    assert.equal(findJob(quietId).deliverMode, "on-output");
+    const quietList = await tool.run({ action: "list" }, { cwd: process.cwd() });
+    assert.match(quietList, /feishu:oc_test \(on-output\)/);
+    assert.match(
+      await tool.run({ action: "add", schedule: "every 5m", task: "x", deliverMode: "on-error" }, { cwd: process.cwd() }),
+      /requires `deliver`/,
+    );
+    assert.match(
+      await tool.run({ action: "add", schedule: "every 5m", task: "x", deliver: "feishu:oc_test", deliverMode: "sometimes" }, { cwd: process.cwd() }),
+      /always, on-output, or on-error/,
+    );
+    assert.match(await tool.run({ action: "remove", id: quietId }, { cwd: process.cwd() }), /✓ removed/);
+  } finally {
+    if (savedAppId === undefined) delete process.env.HARA_FEISHU_APP_ID;
+    else process.env.HARA_FEISHU_APP_ID = savedAppId;
+    if (savedAppSecret === undefined) delete process.env.HARA_FEISHU_APP_SECRET;
+    else process.env.HARA_FEISHU_APP_SECRET = savedAppSecret;
+  }
 });
 
 test("cronjob removal recovers a dead owner and requires one deliberate retry", async () => {

@@ -164,7 +164,8 @@ test("different directory tools share the same protected-Home root cause", () =>
   const grep = "Error: grep will not recursively scan the home directory. Run Hara from a project.";
   const glob = "Error: glob will not enumerate or recursively scan directories while Hara is rooted at the home directory.";
   assert.equal(failureIdentity("grep", { pattern: "x" }, grep).semantic, true);
-  assert.match(recordCall("grep", { pattern: "x" }, grep), /first project tool.*\/cd <project>.*current conversation will continue/is);
+  assert.equal(failureIdentity("grep", { pattern: "x" }, grep).hardStopAfter, 2);
+  assert.match(recordCall("grep", { pattern: "x" }, grep), /first project tool.*run can continue.*\/cd <project>/is);
   assert.match(recordCall("glob", { pattern: "**/*" }, glob), /same Home workspace boundary.*2 calls without intervening progress/is);
 });
 

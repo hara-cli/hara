@@ -160,7 +160,11 @@ import {
   type CapturedChanges,
 } from "./org/review-chain.js";
 import { parseSchedule, describeSchedule, nextRun, validTz } from "./cron/schedule.js";
-import { parseDeliver } from "./cron/deliver.js";
+import {
+  deliveryConfigurationError,
+  deliveryInstructionConflict,
+  parseDeliver,
+} from "./cron/deliver.js";
 import {
   addJob,
   recoverJobRunningState,
@@ -4312,6 +4316,10 @@ cronCmd
     if (opts.deliver) {
       const d = parseDeliver(opts.deliver);
       if ("error" in d) return void out(c.red(d.error + "\n"));
+      const configurationError = deliveryConfigurationError(opts.deliver);
+      if (configurationError) return void out(c.red(configurationError + "\n"));
+      const conflict = deliveryInstructionConflict(task, opts.deliver);
+      if (conflict) return void out(c.red(conflict + "\n"));
     }
     if (opts.deliverMode && !opts.deliver) return void out(c.red("--deliver-mode requires --deliver\n"));
     if (opts.deliverMode && !["always", "on-output", "on-error"].includes(opts.deliverMode)) {

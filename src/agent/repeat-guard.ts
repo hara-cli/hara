@@ -216,7 +216,9 @@ export function failureIdentities(
       key: HOME_WORKSPACE_BOUNDARY_KEY,
       label: "Home workspace boundary",
       semantic: true,
-      hardStopAfter: 1,
+      // One rejected read is recoverable: the model can switch to an explicit project workspace or
+      // ask the user for it. Stop only when it ignores that feedback and hits the same boundary again.
+      hardStopAfter: 2,
       kind: "home_boundary",
     }];
   }
@@ -304,8 +306,8 @@ export function recordCall(name: string, input: unknown, content: string, isErro
     if (s.fails === 1) {
       return (
         "\n\n⟳ hara: the first project tool was blocked by the Home workspace boundary — " +
-        "stop this run now and ask the user to switch with `/cd <project>` (the current conversation will continue); do not try another " +
-        "filesystem/search tool from Home."
+        "this call was rejected, but the run can continue. Switch to an explicit project workspace already supplied by the user, " +
+        "or ask them to use `/cd <project>` (the current conversation will continue); do not try another filesystem/search tool from Home."
       );
     }
     return (

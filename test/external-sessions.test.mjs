@@ -289,6 +289,45 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
   }
 });
 
+test("one incompatible external adapter degrades locally instead of failing the Session Center", async () => {
+  const capabilities = {
+    listMetadata: true,
+    read: true,
+    create: false,
+    fork: true,
+    resume: true,
+    observeLive: false,
+    submit: true,
+    steer: true,
+    interrupt: true,
+  };
+  const failing = {
+    id: "codex",
+    async inspect() { return { id: "codex", label: "Codex", state: "ready", capabilities }; },
+    async list() { throw new Error("external session adapter exited before replying (code 2)"); },
+  };
+  const healthy = {
+    id: "runtime",
+    async inspect() { return { id: "runtime", label: "Hara Live", state: "ready", capabilities }; },
+    async list() { return { sessions: [], hasMore: false }; },
+  };
+  const registry = new ExternalSessionRegistry({
+    haraVersion: "0.0.0-test",
+    identityKey: Buffer.alloc(32, 23),
+    adapters: [failing, healthy],
+  });
+
+  const result = await registry.listSessions({ sourceId: "codex", limit: 10 });
+  assert.deepEqual(result.sessions, []);
+  assert.equal(result.page.hasMore, false);
+  assert.equal(result.sources.find((source) => source.id === "runtime")?.state, "ready");
+  const codex = result.sources.find((source) => source.id === "codex");
+  assert.equal(codex?.state, "error");
+  assert.equal(codex?.reason, "probe_failed");
+  assert.equal(codex?.capabilities.listMetadata, false);
+  assert.doesNotMatch(JSON.stringify(result), /code 2|exited before replying/i);
+});
+
 test("Codex App Server metadata is normalized and provider cursors remain server-owned", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-external-codex-"));
   try {

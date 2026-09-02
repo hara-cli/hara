@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.162.1 — 2026-09-02 — reliable automation intake and resilient session discovery
+
+- Validate scheduled-delivery credentials and reject duplicate prompt-embedded routing before a job is
+  saved. Delivery effects now distinguish pending, retrying, blocked, and dead-letter states, pause work
+  while a destination is unusable, resume after repaired configuration, and stop transient retries after a
+  finite budget instead of accumulating unbounded failures.
+- Let an Agent recover from one Home-workspace boundary rejection, and keep a successful
+  `task_checkpoint` out of the unchanged-evidence loop detector. This prevents a bookkeeping checkpoint from
+  requesting itself repeatedly while preserving the hard stop for a second ignored boundary.
+- Degrade an incompatible Codex or Claude Code history adapter independently, keeping the other Session
+  Center sources available and replacing raw child-process diagnostics with a bounded `probe_failed` state.
+  Upgrade with `npm i -g @nanhara/hara@0.162.1`.
+
 ## 0.162.0 — 2026-09-02 — native Hara Live terminal view
 
 - Let Hara Live sessions start with provider-native model, reasoning-effort, and bounded work-mode

@@ -14,6 +14,15 @@ export interface DeliverTarget {
   to: string;
 }
 
+export type CronNotificationFailureState = "retrying" | "blocked" | "dead_letter";
+
+export interface CronNotificationFailureDisposition {
+  state: CronNotificationFailureState;
+  code: "configuration_required" | "invalid_target" | "authorization_failed" | "transport_failed" | "retry_exhausted";
+}
+
+export const MAX_CRON_DELIVERY_ATTEMPTS = 8;
+
 /** Parse a `--deliver` spec; error string on anything unsupported (listing what IS supported). */
 export function parseDeliver(spec: string): DeliverTarget | { error: string } {
   const i = spec.indexOf(":");
@@ -26,6 +35,68 @@ export function parseDeliver(spec: string): DeliverTarget | { error: string } {
   }
   if (platform === "telegram" || platform === "feishu" || platform === "webhook" || platform === "weixin") return { platform, to };
   return { error: "unsupported deliver platform — supported: telegram, feishu, weixin, webhook" };
+}
+
+/** Validate static delivery requirements before a job is persisted. This deliberately checks only
+ * presence, never reads or returns credential values. Weixin login remains a dynamic local-session
+ * capability and is checked by its adapter at delivery time. */
+export function deliveryConfigurationError(
+  spec: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const target = parseDeliver(spec);
+  if ("error" in target) return target.error;
+  if (target.platform === "feishu" && (!env.HARA_FEISHU_APP_ID || !env.HARA_FEISHU_APP_SECRET)) {
+    return "Feishu delivery is not configured — set HARA_FEISHU_APP_ID and HARA_FEISHU_APP_SECRET before saving this job";
+  }
+  if (target.platform === "telegram" && !env.HARA_TELEGRAM_TOKEN) {
+    return "Telegram delivery is not configured — set HARA_TELEGRAM_TOKEN before saving this job";
+  }
+  if (target.platform === "webhook") {
+    try {
+      const url = new URL(target.to);
+      if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("unsupported protocol");
+    } catch {
+      return "Webhook delivery target must be an absolute HTTP(S) URL";
+    }
+  }
+  return null;
+}
+
+/** A scheduled prompt describes the work; `deliver` is the sole routing source. Rejecting duplicate
+ * routing instructions prevents an agent from sending twice or choosing a prompt-embedded stale chat. */
+export function deliveryInstructionConflict(task: string, deliver?: string): string | null {
+  if (!deliver) return null;
+  const explicitTarget = /\b(?:feishu|lark|telegram|weixin|wechat|webhook):\S+/iu.test(task);
+  const englishRoute = /\b(?:send|deliver|post|push)\b[^\r\n]{0,100}\b(?:feishu|lark|telegram|weixin|wechat|webhook|chat[ _-]?id)\b/iu.test(task);
+  const chineseRoute = /(?:发送|投递|推送|发到|发至)[^\r\n]{0,100}(?:飞书|群聊|群组|会话|微信|电报|Webhook|chat[ _-]?id)/iu.test(task);
+  return explicitTarget || englishRoute || chineseRoute
+    ? "task must describe the work only; remove its delivery instruction because structured deliver is the sole destination"
+    : null;
+}
+
+/** Convert a sanitized transport error into a durable terminal/retry state. Deterministic failures do
+ * not wake on every scheduler tick; transient failures have a finite retry budget. */
+export function classifyDeliveryFailure(
+  error: string,
+  attempts: number,
+): CronNotificationFailureDisposition {
+  if (/not configured|not set|creds\.json missing|not logged in/iu.test(error)) {
+    return { state: "blocked", code: "configuration_required" };
+  }
+  if (/bad deliver spec|missing a target|unsupported deliver platform|ambiguous|absolute HTTP\(S\) URL/iu.test(error)) {
+    return { state: "dead_letter", code: "invalid_target" };
+  }
+  if (/\b(?:401|403)\b|auth(?:orization)? failed/iu.test(error)) {
+    return { state: "dead_letter", code: "authorization_failed" };
+  }
+  if (/\bwebhook (?:400|404|405|410|422)\b/iu.test(error)) {
+    return { state: "dead_letter", code: "invalid_target" };
+  }
+  if (attempts >= MAX_CRON_DELIVERY_ATTEMPTS) {
+    return { state: "dead_letter", code: "retry_exhausted" };
+  }
+  return { state: "retrying", code: "transport_failed" };
 }
 
 function safeDeliveryError(error: unknown): string {
@@ -64,6 +135,8 @@ export async function deliverResult(
 ): Promise<string | null> {
   const t = parseDeliver(spec);
   if ("error" in t) return t.error;
+  const configurationError = deliveryConfigurationError(spec);
+  if (configurationError) return configurationError;
   if (t.platform !== "webhook") text = plainChat(text); // chat surfaces are plain text; webhooks get raw payload
   try {
     return await withOutboundDeadline(
@@ -86,8 +159,7 @@ export async function deliverResult(
           });
         }
         if (t.platform === "telegram") {
-          const token = process.env.HARA_TELEGRAM_TOKEN;
-          if (!token) return "HARA_TELEGRAM_TOKEN not set";
+          const token = process.env.HARA_TELEGRAM_TOKEN!;
           const { telegramAdapter } = await import("../gateway/telegram.js");
           await telegramAdapter(token).send(t.to, text, deliverySignal, idempotencyKey);
           return null;
@@ -100,9 +172,8 @@ export async function deliverResult(
           return null;
         }
         // feishu
-        const appId = process.env.HARA_FEISHU_APP_ID;
-        const appSecret = process.env.HARA_FEISHU_APP_SECRET;
-        if (!appId || !appSecret) return "HARA_FEISHU_APP_ID / HARA_FEISHU_APP_SECRET not set";
+        const appId = process.env.HARA_FEISHU_APP_ID!;
+        const appSecret = process.env.HARA_FEISHU_APP_SECRET!;
         const { feishuAdapter } = await import("../gateway/feishu.js");
         await feishuAdapter(appId, appSecret).send(t.to, text, deliverySignal, idempotencyKey);
         return null;

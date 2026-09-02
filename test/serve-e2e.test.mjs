@@ -1008,6 +1008,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       kind: "webhook",
       label: "Webhook · configured",
       mode: "on-output",
+      state: "ready",
     });
     assert.equal(quietJob.deliverMode, "on-output");
     assert.equal(quietJob.alertAfter, 2);
@@ -1035,6 +1036,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       kind: "webhook",
       label: "Webhook · configured",
       mode: "on-error",
+      state: "ready",
     });
     assert.doesNotMatch(JSON.stringify(autoWithUpdate.result), /SECRET_PATH|PRIVATE_QUERY|example\.invalid/);
 

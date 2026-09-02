@@ -114,7 +114,7 @@ function runCli(args, cwd, home) {
   });
 }
 
-test("Home-root resume reuses history and halts after the first model-initiated workspace inventory", async () => {
+test("Home-root resume reuses history and lets the model recover after one rejected workspace inventory", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-resume-home-"));
   const home = join(root, "home");
   const hiddenProjectName = "HOME_PROJECT_NAME_MUST_NOT_REACH_MODEL";
@@ -151,10 +151,9 @@ test("Home-root resume reuses history and halts after the first model-initiated 
     );
 
     const result = await runCli(["-p", "continue the existing task", "--resume", sessionId], home, home);
-    assert.equal(result.code, 2, result.stderr);
-    assert.match(result.stderr, /first Home workspace boundary rejection.*\/cd <project>/i);
-    assert.doesNotMatch(result.stdout, /RESUME_BOUNDARY_OK/);
-    assert.equal(api.requests.length, 1, "the first Home boundary rejection halts before another model round");
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /RESUME_BOUNDARY_OK/);
+    assert.equal(api.requests.length, 2, "the first Home boundary rejection is returned to the model for recovery");
 
     const firstRequest = JSON.stringify(api.requests[0]);
     assert.match(firstRequest, /Existing-session continuity/);

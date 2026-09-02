@@ -15,7 +15,11 @@ import {
 } from "../cron/store.js";
 import { parseSchedule, describeSchedule, nextRun, validTz } from "../cron/schedule.js";
 import { runJobTracked } from "../cron/runner.js";
-import { parseDeliver } from "../cron/deliver.js";
+import {
+  deliveryConfigurationError,
+  deliveryInstructionConflict,
+  parseDeliver,
+} from "../cron/deliver.js";
 import { isInstalled } from "../cron/install.js";
 import { sensitiveShellCommandReason } from "../security/sensitive-files.js";
 import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
@@ -110,6 +114,10 @@ registerTool({
       if (deliver) {
         const d = parseDeliver(deliver);
         if ("error" in d) return `Error: ${d.error}`;
+        const configurationError = deliveryConfigurationError(deliver);
+        if (configurationError) return `Error: ${configurationError}`;
+        const conflict = deliveryInstructionConflict(task, deliver);
+        if (conflict) return `Error: ${conflict}`;
       }
       const deliverMode = input.deliverMode === undefined ? undefined : String(input.deliverMode);
       if (deliverMode && !deliver) return "Error: `deliverMode` requires `deliver`.";

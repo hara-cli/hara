@@ -38,6 +38,13 @@ import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 
 export type CronNotificationKind = "outcome" | "alert";
+export type CronNotificationState = "pending" | "retrying" | "blocked" | "dead_letter";
+export type CronNotificationFailureCode =
+  | "configuration_required"
+  | "invalid_target"
+  | "authorization_failed"
+  | "transport_failed"
+  | "retry_exhausted";
 
 /** A delivery effect is durable before transport. Its id is reused across retries so transports with
  * idempotency support cannot duplicate a message after an ambiguous response/process crash. */
@@ -49,6 +56,9 @@ export interface CronPendingNotification {
   createdAt: number;
   attempts: number;
   nextAttemptAt: number;
+  /** Missing means `pending` for stores written before notification states were introduced. */
+  state?: CronNotificationState;
+  failureCode?: CronNotificationFailureCode;
   lastError?: string;
 }
 
@@ -523,6 +533,14 @@ function validPendingNotification(value: unknown): value is CronPendingNotificat
     && typeof notification.attempts === "number" && Number.isInteger(notification.attempts)
     && notification.attempts >= 0 && notification.attempts <= Number.MAX_SAFE_INTEGER
     && validFinite(notification.nextAttemptAt)
+    && (notification.state === undefined || ["pending", "retrying", "blocked", "dead_letter"].includes(notification.state))
+    && (notification.failureCode === undefined || [
+      "configuration_required",
+      "invalid_target",
+      "authorization_failed",
+      "transport_failed",
+      "retry_exhausted",
+    ].includes(notification.failureCode))
     && (notification.lastError === undefined || (typeof notification.lastError === "string" && notification.lastError.length <= 4_096));
 }
 
@@ -968,6 +986,7 @@ function enqueueNotification(
     createdAt: nowMs,
     attempts: 0,
     nextAttemptAt: nowMs,
+    state: "pending",
   });
   return id;
 }
@@ -1072,6 +1091,7 @@ export function listPendingNotifications(nowMs = Date.now(), limit = 8, jobId?: 
   return loadJobs()
     .filter((job) => !jobId || job.id === jobId)
     .flatMap((job) => (job.pendingNotifications ?? []).map((notification) => ({ ...notification, jobId: job.id })))
+    .filter((notification) => notification.state === undefined || notification.state === "pending" || notification.state === "retrying")
     .filter((notification) => notification.nextAttemptAt <= nowMs)
     .sort((left, right) => {
       if (left.kind !== right.kind) return left.kind === "alert" ? -1 : 1;
@@ -1102,6 +1122,10 @@ export function deferPendingNotification(
   notificationId: string,
   error: string,
   at = Date.now(),
+  disposition: { state: Exclude<CronNotificationState, "pending">; code: CronNotificationFailureCode } = {
+    state: "retrying",
+    code: "transport_failed",
+  },
 ): boolean {
   return mutateJobs((jobs) => {
     const notification = jobs
@@ -1109,10 +1133,39 @@ export function deferPendingNotification(
       ?.pendingNotifications?.find((candidate) => candidate.id === notificationId);
     if (!notification) return false;
     notification.attempts = Math.min(Number.MAX_SAFE_INTEGER, notification.attempts + 1);
-    const exponent = Math.min(10, Math.max(0, notification.attempts - 1));
-    const delay = Math.min(6 * 3_600_000, 30_000 * (2 ** exponent));
-    notification.nextAttemptAt = at + delay;
+    notification.state = disposition.state;
+    notification.failureCode = disposition.code;
+    if (disposition.state === "retrying") {
+      const exponent = Math.min(10, Math.max(0, notification.attempts - 1));
+      const delay = Math.min(6 * 3_600_000, 30_000 * (2 ** exponent));
+      notification.nextAttemptAt = at + delay;
+    } else {
+      notification.nextAttemptAt = at;
+    }
     notification.lastError = notificationText(error || "transport request failed", 4_096);
+    return true;
+  });
+}
+
+/** Blocked effects remain visible but are not retried. Configuration-only blocks can be re-armed once
+ * the required environment variables appear; permanent/auth failures require an explicit job edit. */
+export function listBlockedNotifications(jobId?: string): PendingCronNotification[] {
+  return loadJobs()
+    .filter((job) => !jobId || job.id === jobId)
+    .flatMap((job) => (job.pendingNotifications ?? []).map((notification) => ({ ...notification, jobId: job.id })))
+    .filter((notification) => notification.state === "blocked");
+}
+
+export function resumeBlockedNotification(jobId: string, notificationId: string, at = Date.now()): boolean {
+  return mutateJobs((jobs) => {
+    const notification = jobs
+      .find((candidate) => candidate.id === jobId)
+      ?.pendingNotifications?.find((candidate) => candidate.id === notificationId);
+    if (!notification || notification.state !== "blocked") return false;
+    notification.state = "pending";
+    notification.nextAttemptAt = at;
+    delete notification.failureCode;
+    delete notification.lastError;
     return true;
   });
 }

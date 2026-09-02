@@ -807,9 +807,7 @@ function hardStop(
         ? `⏸ agent paused early after ${detail?.count ?? NO_CHECKPOINT_PAUSE_ROUNDS} consecutive working round(s) without a durable task checkpoint. Hara preserved completed changes and stopped before the general round limit. Review the current artifact and acceptance checks, then use \`/continue\` with one bounded, materially different strategy.`
       : detail?.mode === "no_progress"
         ? `⛔ agent run stopped early: ${detail.label ?? "the same tool/evidence cycle"} produced no new evidence for ${detail.count ?? NO_PROGRESS_STOP_ROUNDS} consecutive round(s). Hara stopped before the general round limit to prevent a model loop and unnecessary token use. Review the last verified checkpoint, then retry with a materially different strategy.`
-      : detail?.count === 1 && detail.label === "Home workspace boundary"
-        ? "⛔ agent run stopped after the first Home workspace boundary rejection. Switch with `/cd <project>` before retrying; the current conversation will continue in that project, and no other filesystem/search tool will be tried from Home in this turn."
-        : `⛔ agent run stopped: the same failing ${detail?.label ?? "tool call"} repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
+      : `⛔ agent run stopped: the same failing ${detail?.label ?? "tool call"} repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
   const event: RunLimitEvent = { kind, message, elapsedMs, rounds: life.rounds, timeoutMs: life.timeoutMs, maxRounds: life.maxRounds };
   if (!life.limitAnnounced) {
     life.limitAnnounced = true;
@@ -2411,43 +2409,51 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
     }
 
-    const roundHasNewEvidence = successfulRoundObservations.some((key) => !successfulObservations.has(key));
-    for (const key of successfulRoundObservations) {
-      successfulObservations.delete(key);
-      successfulObservations.set(key, true);
-    }
-    while (successfulObservations.size > MAX_PROGRESS_OBSERVATIONS) {
-      const oldest = successfulObservations.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      successfulObservations.delete(oldest);
-    }
-    if (roundHasNewEvidence) {
+    // Engine-owned bookkeeping is deliberately outside the evidence-cycle guard. In particular, a
+    // strategy nudge followed by the requested task_checkpoint must not itself count as another stale
+    // evidence round and trigger a second nudge that asks for yet another checkpoint.
+    if (successfulTaskCheckpoint) {
       noProgressRounds = 0;
       noProgressNudged = false;
-    } else {
-      noProgressRounds += 1;
-      if (noProgressRounds >= NO_PROGRESS_STOP_ROUNDS) {
-        return hardStop(opts, life, "repeat_loop", {
-          label: "the repeated successful tool/evidence cycle",
-          count: noProgressRounds,
-          mode: "no_progress",
-        });
+    } else if (substantiveWorkRound) {
+      const roundHasNewEvidence = successfulRoundObservations.some((key) => !successfulObservations.has(key));
+      for (const key of successfulRoundObservations) {
+        successfulObservations.delete(key);
+        successfulObservations.set(key, true);
       }
-      if (noProgressRounds >= NO_PROGRESS_NUDGE_ROUNDS && !noProgressNudged) {
-        noProgressNudged = true;
-        // Quiet sub-agents deliberately receive no injected reminders and never drain the main loop's
-        // reminder channel. Their hard stop still applies below if unchanged evidence continues.
-        if (!opts.quiet) {
-          history.push({
-            role: "user",
-            content: wrapReminders([
-              "No-progress correction: recent tool rounds completed but reproduced observations already seen in this run. Stop repeating the same OCR, file, command, MCP, or UI cycle. Re-check the original acceptance criteria and take a materially different bounded step, record a typed blocker with evidence, or finish with a verified checkpoint.",
-            ]),
+      while (successfulObservations.size > MAX_PROGRESS_OBSERVATIONS) {
+        const oldest = successfulObservations.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        successfulObservations.delete(oldest);
+      }
+      if (roundHasNewEvidence) {
+        noProgressRounds = 0;
+        noProgressNudged = false;
+      } else {
+        noProgressRounds += 1;
+        if (noProgressRounds >= NO_PROGRESS_STOP_ROUNDS) {
+          return hardStop(opts, life, "repeat_loop", {
+            label: "the repeated successful tool/evidence cycle",
+            count: noProgressRounds,
+            mode: "no_progress",
           });
-          showRunNotice(
-            opts,
-            "✻ no-progress guard: unchanged successful tool evidence repeated; asking the Agent to change strategy…",
-          );
+        }
+        if (noProgressRounds >= NO_PROGRESS_NUDGE_ROUNDS && !noProgressNudged) {
+          noProgressNudged = true;
+          // Quiet sub-agents deliberately receive no injected reminders and never drain the main loop's
+          // reminder channel. Their hard stop still applies below if unchanged evidence continues.
+          if (!opts.quiet) {
+            history.push({
+              role: "user",
+              content: wrapReminders([
+                "No-progress correction: recent tool rounds completed but reproduced observations already seen in this run. Stop repeating the same OCR, file, command, MCP, or UI cycle. Re-check the original acceptance criteria and take a materially different bounded step, record a typed blocker with evidence, or finish with a verified checkpoint.",
+              ]),
+            });
+            showRunNotice(
+              opts,
+              "✻ no-progress guard: unchanged successful tool evidence repeated; asking the Agent to change strategy…",
+            );
+          }
         }
       }
     }

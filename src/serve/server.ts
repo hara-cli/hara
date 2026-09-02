@@ -94,7 +94,11 @@ import {
   validTz,
   type Schedule,
 } from "../cron/schedule.js";
-import { parseDeliver } from "../cron/deliver.js";
+import {
+  deliveryConfigurationError,
+  deliveryInstructionConflict,
+  parseDeliver,
+} from "../cron/deliver.js";
 import {
   installScheduler,
   isInstalled,
@@ -1073,18 +1077,33 @@ function automationDeliverySummary(job: CronJob): {
   kind: "none" | "feishu" | "weixin" | "telegram" | "webhook" | "other";
   label: string;
   mode?: CronDeliverMode;
+  state?: "ready" | "pending" | "retrying" | "blocked" | "dead_letter";
+  pendingCount?: number;
 } {
   if (!job.deliver) return { kind: "none", label: "Saved only in Hara" };
   const parsed = parseDeliver(job.deliver);
   const mode = job.deliverMode ?? "always";
-  if ("error" in parsed) return { kind: "other", label: "External delivery · configured", mode };
+  const pending = job.pendingNotifications ?? [];
+  const state = deliveryConfigurationError(job.deliver)
+    ? "blocked" as const
+    : pending.some((notification) => notification.state === "dead_letter")
+    ? "dead_letter" as const
+    : pending.some((notification) => notification.state === "blocked")
+      ? "blocked" as const
+      : pending.some((notification) => notification.state === "retrying")
+        ? "retrying" as const
+        : pending.length
+          ? "pending" as const
+          : "ready" as const;
+  const queue = pending.length ? { pendingCount: pending.length } : {};
+  if ("error" in parsed) return { kind: "other", label: "External delivery · configured", mode, state, ...queue };
   const labels = {
     feishu: "Feishu · configured",
     weixin: "WeChat · configured",
     telegram: "Telegram · configured",
     webhook: "Webhook · configured",
   } as const;
-  return { kind: parsed.platform, label: labels[parsed.platform], mode };
+  return { kind: parsed.platform, label: labels[parsed.platform], mode, state, ...queue };
 }
 
 let automaticSchedulerRepairAttemptedFor = "";
@@ -4297,6 +4316,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (deliver) {
               const parsed = parseDeliver(deliver);
               if ("error" in parsed) return reply(rpcError(id, ERR.PARAMS, parsed.error));
+              const configurationError = deliveryConfigurationError(deliver);
+              if (configurationError) return reply(rpcError(id, ERR.PARAMS, configurationError));
+              const conflict = deliveryInstructionConflict(p.task, deliver);
+              if (conflict) return reply(rpcError(id, ERR.PARAMS, conflict));
             }
             if (p.deliverMode !== undefined && !isAutomationDeliveryMode(p.deliverMode)) {
               return reply(rpcError(id, ERR.PARAMS, "deliverMode must be always, on-output, or on-error"));
@@ -4406,6 +4429,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (deliver) {
               const parsed = parseDeliver(deliver);
               if ("error" in parsed) return reply(rpcError(id, ERR.PARAMS, parsed.error));
+              const configurationError = deliveryConfigurationError(deliver);
+              if (configurationError) return reply(rpcError(id, ERR.PARAMS, configurationError));
             }
             if (p.deliverMode !== undefined && !isAutomationDeliveryMode(p.deliverMode)) {
               return reply(rpcError(id, ERR.PARAMS, "deliverMode must be always, on-output, or on-error"));
@@ -4418,6 +4443,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               : deliver
                 ? { kind: "replace", deliver, ...(deliverMode ? { mode: deliverMode } : {}) }
                 : { kind: "preserve", ...(deliverMode ? { mode: deliverMode } : {}) };
+            const effectiveDeliver = p.clearDeliver === true ? undefined : deliver ?? existing.deliver;
+            if (effectiveDeliver) {
+              const configurationError = deliveryConfigurationError(effectiveDeliver);
+              if (configurationError) return reply(rpcError(id, ERR.PARAMS, configurationError));
+            }
+            const conflict = deliveryInstructionConflict(p.task, effectiveDeliver);
+            if (conflict) return reply(rpcError(id, ERR.PARAMS, conflict));
             const alertAfter = p.alertAfter === undefined ? undefined : Number(p.alertAfter);
             if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
               return reply(rpcError(id, ERR.PARAMS, "alertAfter must be an integer from 1 to 1000"));

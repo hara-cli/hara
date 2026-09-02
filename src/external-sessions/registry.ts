@@ -145,11 +145,34 @@ export class ExternalSessionRegistry implements ExternalSessionService {
       };
     }
     const providerCursor = input.cursor ? this.unwrapCursor(input.cursor, sourceId, search) : undefined;
-    const page = await adapter.list({
-      limit,
-      ...(providerCursor ? { cursor: providerCursor } : {}),
-      ...(search ? { search } : {}),
-    });
+    let page;
+    try {
+      page = await adapter.list({
+        limit,
+        ...(providerCursor ? { cursor: providerCursor } : {}),
+        ...(search ? { search } : {}),
+      });
+    } catch {
+      // Provider CLIs are independently installed and can be older than the adapter protocol (on
+      // Windows this commonly presents as App Server exiting with code 2). One broken provider must
+      // not fail the whole Session Center or hide Hara Live / the other provider. Return a sanitized,
+      // capability-disabled source snapshot; raw stderr, native ids, and local paths stay server-side.
+      const failedSources = sourceSnapshot.sources.map((candidate) => candidate.id === sourceId
+        ? {
+            ...candidate,
+            state: "error" as const,
+            reason: "probe_failed" as const,
+            capabilities: Object.fromEntries(
+              Object.keys(candidate.capabilities).map((capability) => [capability, false]),
+            ) as unknown as ExternalSessionSourceInfo["capabilities"],
+          }
+        : candidate);
+      return {
+        sources: failedSources,
+        sessions: [],
+        page: { limit, hasMore: false },
+      };
+    }
     const nextCursor = page.nextCursor ? this.wrapCursor(sourceId, page.nextCursor, search) : undefined;
     return {
       sources: sourceSnapshot.sources,

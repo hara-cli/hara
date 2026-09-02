@@ -2,7 +2,12 @@
 // session IS the agent — same model as openclaw/hermes). Meant to be invoked every minute by the OS
 // scheduler (see install.ts). A lock file prevents overlapping ticks from double-firing a slow job.
 import { spawn } from "node:child_process";
-import { deliverResult } from "./deliver.js";
+import {
+  classifyDeliveryFailure,
+  deliverResult,
+  deliveryConfigurationError,
+  parseDeliver,
+} from "./deliver.js";
 import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { platform } from "node:os";
@@ -14,8 +19,10 @@ import {
   recoverInterruptedRuns,
   enqueueOutcomeNotifications,
   listPendingNotifications,
+  listBlockedNotifications,
   acknowledgePendingNotification,
   deferPendingNotification,
+  resumeBlockedNotification,
   findJob,
   cronDir,
   logPath,
@@ -850,6 +857,18 @@ export async function deliverPendingNotifications(
   signal?: AbortSignal,
   options: PendingDeliveryOptions = {},
 ): Promise<number> {
+  // Missing environment credentials are a durable block, not a transport retry. Re-arm only the
+  // statically checkable adapters after their configuration becomes available.
+  for (const notification of listBlockedNotifications(options.jobId)) {
+    if (notification.failureCode !== "configuration_required") continue;
+    const target = parseDeliver(notification.target);
+    if (
+      "error" in target
+      || (target.platform !== "feishu" && target.platform !== "telegram")
+      || deliveryConfigurationError(notification.target)
+    ) continue;
+    resumeBlockedNotification(notification.jobId, notification.id, nowMs);
+  }
   const pending = listPendingNotifications(nowMs, options.limit ?? 8, options.jobId)
     .filter((notification) => !options.ids || options.ids.has(notification.id));
   let acknowledged = 0;
@@ -866,7 +885,8 @@ export async function deliverPendingNotifications(
       acknowledged++;
       continue;
     }
-    deferPendingNotification(notification.jobId, notification.id, error, Date.now());
+    const disposition = classifyDeliveryFailure(error, notification.attempts + 1);
+    deferPendingNotification(notification.jobId, notification.id, error, Date.now(), disposition);
     try {
       appendFileSync(logPath(notification.jobId), `\n[${notification.kind === "alert" ? "alert" : "deliver"}] ${error}\n`);
     } catch {
@@ -1094,6 +1114,16 @@ export async function runTick(
           : "tick cancelled by caller";
         break;
       }
+      // Delivery is part of the saved job contract. A legacy job created before configuration
+      // preflight must not keep executing and accumulating undeliverable outcomes. Static config
+      // blocks auto-clear when the environment is repaired; durable blocked/dead-letter effects
+      // clear only after successful retry or an explicit delivery edit.
+      const current = findJob(job.id);
+      if (!current) continue;
+      if (deliver === deliverResult && current.deliver && deliveryConfigurationError(current.deliver)) continue;
+      if (current.pendingNotifications?.some((notification) => (
+        notification.state === "blocked" || notification.state === "dead_letter"
+      ))) continue;
       const startedAt = Date.now();
       let runningToken: string | null;
       try {

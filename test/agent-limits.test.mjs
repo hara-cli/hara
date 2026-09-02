@@ -314,6 +314,58 @@ test("changing successful observations are progress and do not trip the no-progr
   assert.equal(tools, 6);
 });
 
+test("a requested task checkpoint resets stale-evidence accounting instead of feeding its own loop", async () => {
+  const created = createTaskExecution("inspect one stable artifact", "checkpoint-no-progress");
+  const accepted = applyTaskBrief(created, {
+    intent: "investigate",
+    goal: "inspect one stable artifact",
+    acceptance: ["the artifact is verified"],
+    steps: ["inspect", "checkpoint", "finish"],
+  });
+  assert.equal(accepted.ok, true);
+  let task = accepted.task;
+  let turns = 0;
+  const checkpoint = {
+    current_step: "re-check the stable artifact",
+    next_step: "finish the bounded verification",
+    facts: [{ key: "artifact_seen", value: true, evidence: "stable probe completed" }],
+  };
+  const provider = {
+    id: "checkpoint-no-progress",
+    model: "checkpoint-no-progress",
+    async turn() {
+      turns += 1;
+      if (turns === 1 || turns === 5) {
+        return { text: "", toolUses: [{ id: `checkpoint-${turns}`, name: "task_checkpoint", input: checkpoint }], stop: "tool_use" };
+      }
+      if (turns <= 8) {
+        return { text: "", toolUses: [{ id: `probe-${turns}`, name: "stable_probe", input: { target: "artifact" } }], stop: "tool_use" };
+      }
+      return { text: "verified", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "inspect one stable artifact" }], base(provider, {
+    maxRounds: 12,
+    timeoutMs: "10s",
+    quiet: true,
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate: (next) => { task = next; },
+      onRoundUsage: (next) => { task = next; },
+    },
+    extraTools: [{
+      name: "stable_probe",
+      description: "returns one stable observation",
+      input_schema: { type: "object", properties: { target: { type: "string" } }, required: ["target"] },
+      kind: "read",
+      async run() { return "artifact unchanged"; },
+    }],
+  }));
+  assert.equal(outcome.status, "completed", outcome.error);
+  assert.equal(turns, 9);
+});
+
 test("changing command fragments pause at a strategy checkpoint instead of consuming all 64 rounds", async () => {
   let turns = 0;
   let tools = 0;
@@ -572,39 +624,35 @@ test("three changed command variants with one stable API failure trip the strate
   assert.match(outcome.error, /curl\+open\.feishu\.cn.*API error 1061002.*repeated 3 times/is);
 });
 
-test("the first tool blocked by the Home boundary stops before another model round", async () => {
+test("the first tool blocked by the Home boundary returns feedback and allows the model to adjust", async () => {
   let turns = 0;
-  const names = ["home_grep", "home_glob", "home_ls"];
-  const diagnostics = [
-    "Error: grep will not recursively scan the home directory. Run Hara from a project.",
-    "Error: glob will not enumerate or recursively scan directories while Hara is rooted at the home directory.",
-    "Error: ls will not enumerate or recursively scan directories while Hara is rooted at the home directory.",
-  ];
+  const name = "home_grep";
+  const diagnostic = "Error: grep will not recursively scan the home directory. Run Hara from a project.";
   const provider = {
     id: "home-boundary",
     model: "home-boundary",
     async turn() {
-      const index = Math.min(turns, names.length - 1);
       turns += 1;
-      return { text: "", toolUses: [{ id: `home-${turns}`, name: names[index], input: { different: index } }], stop: "tool_use" };
+      return turns === 1
+        ? { text: "", toolUses: [{ id: "home-1", name, input: { different: 0 } }], stop: "tool_use" }
+        : { text: "Please switch to an explicit project with /cd <project>.", toolUses: [], stop: "end" };
     },
   };
   const outcome = await runAgent([{ role: "user", content: "scan Home" }], base(provider, {
     maxRounds: 20,
     timeoutMs: "10s",
     quiet: true,
-    extraTools: names.map((name, index) => ({
+    extraTools: [{
       name,
       description: "test Home boundary",
       input_schema: { type: "object", properties: { different: { type: "number" } } },
       kind: "read",
-      async run() { return diagnostics[index]; },
-    })),
+      async run() { return diagnostic; },
+    }],
   }));
-  assert.equal(turns, 1);
-  assert.equal(outcome.stopReason, "repeat_loop");
-  assert.match(outcome.error, /first Home workspace boundary rejection.*\/cd <project>/i);
-  assert.match(outcome.error, /current conversation will continue/i);
+  assert.equal(turns, 2);
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.stopReason, undefined);
 });
 
 test("three empty recall attempts disable recall and let the model answer naturally", async () => {
