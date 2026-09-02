@@ -73,9 +73,11 @@ reroutes, or a model another entry beats on every axis) are hidden from the pick
 configured always stays listed, and `/model <id>` still accepts any id the key is entitled to.
 
 ## Optional
-- **Native image capability override**: `modelVision.<model>` records `yes` / `no` for a custom model id
-  whose image support Hara cannot identify. Legacy `visionModel` / `visionBaseURL` / `visionApiKey` fields
-  remain loadable but are ignored; switch the conversation to a natively multimodal model instead.
+- **Image routing**: `visionModel` enables an explicit vision-first route for every image; the conversation
+  model receives description text only. `visionBaseURL` / `visionApiKey` optionally select a separate
+  Personal/BYOK endpoint and credential. Company routes ignore those overrides and require the exact
+  `visionModel` in their server-advertised allow-list. `modelVision.<model>` records `yes` / `no` only for
+  native capability detection when no vision-first model is enabled.
 - **Semantic search / vectors** — see below: `embedProvider` (`off` \| `ollama` \| `qwen` \| `openai`) + `embedModel` / `embedBaseURL` / `embedApiKey`.
 - **B-end fleet**: `hara enroll <gateway> --code <code>` → device token in `~/.hara/org.json` (0600); sets `provider=hara-gateway`.
 - **Behavior**: `approval` · `sandbox` · `theme` · `evolve` · `assetCapture` · `computerUse`/`computerApps` · `hooks` · `notify` · `vimMode` · `mcpServers` · `HARA_MAX_CONCURRENCY` (parallel sub-agent/read cap, default 8).

@@ -72,12 +72,12 @@ export interface HaraConfig {
   computerUse: "off" | "read" | "click" | "full";
   /** apps the agent may click/type into (frontmost-window allowlist; empty = no interaction allowed). */
   computerApps: string[];
-  /** @deprecated Read only for backward-compatible config parsing. Image routing always uses the current
-   *  conversation model; a legacy secondary model must never receive attachments or task context. */
+  /** Optional explicit vision-first model. When set, every image is described by this model before the
+   *  conversation model runs. Only images and a focused transcription prompt are sent on this route. */
   visionModel: string | undefined;
-  /** @deprecated See visionModel. */
+  /** Optional endpoint override for a Personal/BYOK vision-first model. Managed routes ignore it. */
   visionBaseURL: string | undefined;
-  /** @deprecated See visionModel. */
+  /** Optional key override for a Personal/BYOK vision-first model. Managed routes ignore it. */
   visionApiKey: string | undefined;
   /** Per-model vision-capability overrides the user has confirmed (model id → "yes"|"no"). Built-in
    *  detection (classifyVision) handles known families; this records answers for unknown ones so we

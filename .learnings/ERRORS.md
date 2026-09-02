@@ -1870,11 +1870,16 @@ installed tree with `npm ls` and an executable-link check before starting tests 
 - Reproducible: yes
 - Related Files: package.json, package-lock.json
 - Tags: npm-ci, orchestration, session-polling, race, release-gate
+- Pattern-Key: release.serialize_dependency_mutation_and_tests
+- Recurrence-Count: 2
+- Last-Seen: 2026-09-02
 
 ### Resolution
 - **Resolved**: 2026-08-04T16:46:00+08:00
 - **Notes**: Waited until no npm install/test/audit process remained, then verified `tsc` and the full
-  dependency tree. Future long commands retain and poll their returned unified-exec session IDs.
+  dependency tree. Future long commands retain and poll their returned unified-exec session IDs. Recurred
+  on 2026-09-02 when a security-driven `npm install` overlapped an already-running full suite; the release
+  workflow now keeps dependency mutation and every consumer gate strictly serial.
 
 ---
 

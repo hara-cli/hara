@@ -240,8 +240,8 @@ export interface ServeDeps {
   /** Live per-project context policy. Production re-reads config for every completed turn; embedders that
    * omit it retain manual-only `session.compact` behavior. */
   autoCompact?: (cwd?: string) => { enabled: boolean; tokenCap?: number };
-  /** Validate and normalize image input for the session's pinned model. The callback may transcode the
-   * same attachments but must never translate or reroute them through a second model/provider. */
+  /** Validate and normalize image input for the session's pinned route: keep native images or explicitly
+   * translate them through the configured vision-first model. The callback is identity/Space-aware. */
   prepareImages?: (
     images: ImageAttachment[],
     opts: {
@@ -252,10 +252,11 @@ export interface ServeDeps {
       signal: AbortSignal;
       hint?: string;
     },
-  ) => Promise<{ images: ImageAttachment[] }>;
+  ) => Promise<{ images?: ImageAttachment[]; description?: string; viaModel?: string }>;
   /** Redacted provider/local-model control plane for Desktop settings. Credentials are accepted only by
    * save/test and must never be returned by these callbacks. */
   providerSettings?: (cwd?: string) => ProviderSettingsState;
+  saveVisionSettings?: (input: VisionSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
   saveProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
   testProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
   createProviderConnection?: (input: ProviderConnectionCreateInput, cwd?: string) => Promise<ProviderSettingsState>;
@@ -645,6 +646,26 @@ export interface ProviderSettingsState {
   providers: ProviderSettingsCatalogEntry[];
   connections?: ProviderConnectionSummary[];
   switchLocked?: boolean;
+  vision?: VisionSettingsState;
+}
+
+export interface VisionSettingsState {
+  enabled: boolean;
+  model?: string;
+  baseURL?: string;
+  apiKeyConfigured: boolean;
+  usesManagedCredential: boolean;
+  editable: boolean;
+  authorized: boolean;
+  authorizedModels?: string[];
+}
+
+export interface VisionSettingsInput {
+  enabled: boolean;
+  model?: string;
+  baseURL?: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
 }
 
 export interface ProviderConnectionSummary {
@@ -1880,6 +1901,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       let content = text;
       let preparedImages = attachments.images;
       let attachmentViews = attachments.views;
+      let imageDescription: string | undefined;
+      let imageContext = "";
       if (preparedImages.length) {
         sessionSpaceBinding(s.meta);
         const runtime = runtimeInfo(s.meta.cwd, s.meta.model, s.meta.profileId, s.meta.spaceId);
@@ -1893,16 +1916,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             signal: turnAbort.signal,
           });
           sessionSpaceBinding(s.meta);
-          const nativeImages = prepared.images;
-          if (!Array.isArray(nativeImages) || !nativeImages.length) {
-            throw new Error(`model '${s.meta.model}' has no native image route for this session`);
+          preparedImages = Array.isArray(prepared.images) ? prepared.images : [];
+          imageDescription = prepared.description?.trim() || undefined;
+          if (imageDescription) {
+            const viaModel = prepared.viaModel
+              ?? runtime.attachmentCapabilities?.image.viaModel
+              ?? "vision model";
+            attachmentViews = attachmentViews.map((attachment) =>
+              attachment.kind === "image"
+                ? { ...attachment, strategy: "vision-sidecar" }
+                : attachment,
+            );
+            imageContext = (
+              `\n\n[Attached image description — read first by ${viaModel} for ` +
+              `${s.meta.model}]\n${imageDescription}`
+            );
+          } else if (!preparedImages.length) {
+            throw new Error(`model '${s.meta.model}' has no authorized image route for this session`);
           }
-          preparedImages = nativeImages;
-        } else if (imageMode === "unsupported" || imageMode === "unknown") {
+        } else if (imageMode !== "native") {
           throw new Error(
             imageMode === "unsupported"
-              ? `model '${s.meta.model}' cannot read images; switch this conversation to an image-capable model`
-              : `image capability for model '${s.meta.model}' is unknown; choose a model with advertised image support or set an advanced modelVision override`,
+              ? `model '${s.meta.model}' cannot read images; configure a vision-first model or switch to an image-capable model`
+              : imageMode === "vision-sidecar"
+                ? "the configured vision-first route is unavailable in this engine"
+                : `image capability for model '${s.meta.model}' is unknown; choose a model with advertised image support or set an advanced modelVision override`,
           );
         }
       }
@@ -1916,20 +1954,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (sk.allowedTools !== undefined) slashSkillPolicy = { id: sk.id, allowedTools: sk.allowedTools };
         }
       }
-      // A recognized slash skill replaces the user's raw command with its instructions. Images remain
-      // first-class attachments on that same user message and go only to the selected model.
+      // A recognized slash skill replaces the user's raw command with its instructions. Append translated
+      // image context afterwards so the conversation model receives no raw bytes on a vision-first route.
+      content += imageContext;
       content += await expandExplicitAttachmentsAsync(
         attachments.contexts,
         s.meta.cwd,
         { signal: turnAbort.signal },
       );
       // @file mentions expand to file contents, same as the CLI (`@src/foo.ts` in the composer works).
-      // Pasted images ride along as NeutralMsg.images — a vision-capable model sees them inline.
+      // Native images ride along in NeutralMsg.images. Vision-first turns persist only the description
+      // plus attachment metadata, so resume/replay never re-sends the original image to the main model.
       s.history.push({
         role: "user",
         content: await expandMentionsAsync(content, s.meta.cwd, { signal: turnAbort.signal }),
         displayContent: displayText,
         ...(preparedImages.length ? { images: preparedImages } : {}),
+        ...(imageDescription ? { imageDescription } : {}),
         ...(attachmentViews.length ? { attachments: attachmentViews } : {}),
       });
       let outcome;
@@ -1986,6 +2027,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 hint,
               });
               sessionSpaceBinding(s.meta);
+              if (prepared.description?.trim()) {
+                return {
+                  text: prepared.description.trim(),
+                  model: prepared.viaModel
+                    ?? runtime.attachmentCapabilities?.image.viaModel
+                    ?? s.provider.model,
+                };
+              }
               images = Array.isArray(prepared.images) ? prepared.images : [];
             } else if (runtime.attachmentCapabilities?.image.mode !== "native") {
               throw new Error(
@@ -2459,7 +2508,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt",
             "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
-            "settings.providers.list", "settings.providers.test", "settings.providers.save",
+            "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
@@ -3746,6 +3795,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!deps.providerSettings) return reply(rpcError(id, ERR.METHOD, "provider settings not supported by this server"));
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             return reply(rpcResult(id!, redactSensitiveValue(deps.providerSettings(targetCwd)).value));
+          }
+          case "settings.vision.save": {
+            if (!deps.saveVisionSettings) return reply(rpcError(id, ERR.METHOD, "vision settings are not supported by this server"));
+            if (
+              typeof p.enabled !== "boolean"
+              || (p.model !== undefined && typeof p.model !== "string")
+              || (p.baseURL !== undefined && typeof p.baseURL !== "string")
+              || (p.apiKey !== undefined && typeof p.apiKey !== "string")
+              || (p.clearApiKey !== undefined && typeof p.clearApiKey !== "boolean")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "enabled is required; optional model/baseURL/apiKey/clearApiKey have invalid types"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const input: VisionSettingsInput = {
+              enabled: p.enabled,
+              ...(p.model !== undefined ? { model: p.model } : {}),
+              ...(p.baseURL !== undefined ? { baseURL: p.baseURL } : {}),
+              ...(p.apiKey !== undefined ? { apiKey: p.apiKey } : {}),
+              ...(p.clearApiKey !== undefined ? { clearApiKey: p.clearApiKey } : {}),
+            };
+            const result = await deps.saveVisionSettings(input, targetCwd);
+            return reply(rpcResult(id!, redactSensitiveValue(result).value));
           }
           case "settings.providers.connections.create": {
             if (!deps.createProviderConnection) return reply(rpcError(id, ERR.METHOD, "named provider connections are not supported by this server"));

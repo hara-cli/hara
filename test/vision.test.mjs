@@ -8,6 +8,7 @@ import {
   SCREENSHOT_SYSTEM,
   classifyVision,
   parseLocate,
+  visionSidecarAuthorized,
 } from "../dist/vision.js";
 
 test("parseLocate: grounding coords (per-mille / percent / fraction) → 0..1 fractions", () => {
@@ -88,7 +89,7 @@ test("classifyVision: per-model overrides win and don't leak across models", () 
   assert.equal(classifyVision("openai", "deepseek-chat", { "glm-5": "yes" }), "text");
 });
 
-test("effective attachment capabilities use only the selected model's native image route", () => {
+test("effective attachment capabilities prefer an explicit vision-first route", () => {
   assert.deepEqual(
     effectiveAttachmentCapabilities("openai", "gpt-5.4"),
     {
@@ -101,12 +102,12 @@ test("effective attachment capabilities use only the selected model's native ima
   assert.deepEqual(
     effectiveAttachmentCapabilities("openai", "deepseek-v4-pro", {}, "qwen3.7-plus"),
     {
-      image: { mode: "unsupported", maxBytes: 3_600_000 },
+      image: { mode: "vision-sidecar", maxBytes: 3_600_000, viaModel: "qwen3.7-plus" },
       textFile: "inline-text",
       directory: "bounded-inventory-and-tools",
       binaryFile: "agent-tool",
     },
-    "legacy sidecar settings never reroute a conversation image",
+    "Personal/BYOK configuration explicitly routes every image through the selected model",
   );
   assert.equal(
     effectiveAttachmentCapabilities("openai", "deepseek-v4-pro").image.mode,
@@ -130,6 +131,27 @@ test("effective attachment capabilities use only the selected model's native ima
     ).image.mode,
     "unsupported",
     "an unrelated global sidecar cannot widen a scoped organization connection",
+  );
+  assert.deepEqual(
+    effectiveAttachmentCapabilities(
+      "hara-gateway",
+      "deepseek-v4-flash-vision-exp",
+      {},
+      "deepseek-v4-flash-vision-exp",
+      ["deepseek-v4-flash-vision-exp"],
+    ).image,
+    { mode: "vision-sidecar", maxBytes: 3_600_000, viaModel: "deepseek-v4-flash-vision-exp" },
+    "vision-first also wins when the conversation model itself is multimodal",
+  );
+});
+
+test("vision-first authorization never widens a company credential", () => {
+  assert.equal(visionSidecarAuthorized("deepseek-v4-flash-vision-exp"), true);
+  assert.equal(visionSidecarAuthorized("deepseek-v4-flash-vision-exp", []), false);
+  assert.equal(visionSidecarAuthorized("deepseek-v4-flash-vision-exp", ["deepseek-v4-pro"]), false);
+  assert.equal(
+    visionSidecarAuthorized("deepseek-v4-flash-vision-exp", ["deepseek-v4-flash-vision-exp"]),
+    true,
   );
 });
 

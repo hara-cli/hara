@@ -9,6 +9,7 @@ import {
   effectiveAttachmentCapabilities,
   locateImage,
   classifyVision,
+  visionSidecarAuthorized,
   SCREENSHOT_SYSTEM,
 } from "./vision.js";
 import { setTheme } from "./tui/theme.js";
@@ -30,6 +31,7 @@ import {
   loadConfig,
   configPath,
   readRawConfig,
+  updateRawConfig,
   writeConfigValue,
   setModelVisionOverride,
   providerCatalog,
@@ -406,12 +408,27 @@ function organizationEnrollmentForSpace(cfg: HaraConfig, expectedSpaceId: string
   return candidates.find((profile) => profile.id === activeProfileId) ?? candidates[0] ?? null;
 }
 
+/** Return undefined only for an unconstrained Personal Space. Company Spaces always return a concrete
+ * server-authoritative catalog (possibly empty), so image routing fails closed while policy is unknown. */
+function authorizedVisionModelsForRoute(
+  cfg: HaraConfig,
+  profile: Profile,
+  expectedSpaceId: string,
+): readonly string[] | undefined {
+  if (expectedSpaceId === PERSONAL_ID) return undefined;
+  const enrollment = profile.kind === "gateway"
+    ? profile
+    : organizationEnrollmentForSpace(cfg, expectedSpaceId);
+  return enrollment?.availableModels ?? [];
+}
+
 async function buildProvider(
   cfg: HaraConfig,
   targetOverride?: ProviderTargetOverride,
   boundProfileId?: string,
   boundSpaceId?: string,
   reasoningEffortOverride?: HaraConfig["reasoningEffort"] | null,
+  forceTargetModel = false,
 ): Promise<Provider | null> {
   // Identity-profile is the source of truth for routing. `cfg` is the *merged* HaraConfig (env +
   // project + global) and still drives non-routing concerns (model overrides, baseURL fallbacks
@@ -432,7 +449,9 @@ async function buildProvider(
   if (ap.kind === "gateway") {
     if (!ap.gatewayUrl || !ap.deviceToken || deviceTokenExpired(ap.tokenExpiresAt)) return null;
     const baseURL = ap.baseURL || `${ap.gatewayUrl.replace(/\/$/, "")}/v1`;
-    const model = resolveGatewayModel(cfg, ap, process.env, targetOverride?.model);
+    const model = forceTargetModel && targetOverride?.model
+      ? targetOverride.model
+      : resolveGatewayModel(cfg, ap, process.env, targetOverride?.model);
     if (ap.availableModels?.length && !ap.availableModels.includes(model)) {
       throw new Error(`model '${model}' is not authorized for organization connection '${ap.id}'`);
     }
@@ -496,6 +515,43 @@ async function buildProvider(
     runtimeProfileBindings.set(cfg, ap.id);
   }
   return built;
+}
+
+/** Select the provider that is allowed to receive image bytes for this exact session route. Explicit
+ * vision configuration always wins, including when the conversation model is natively multimodal. */
+async function buildImageProviderForRoute(
+  cfg: HaraConfig,
+  primary: Provider,
+  profile: Profile,
+  expectedSpaceId: string,
+): Promise<{ provider: Provider; translated: boolean }> {
+  assertProfileAudience(cfg, profile.id, expectedSpaceId);
+  if (cfg.visionModel) {
+    const authorizedModels = authorizedVisionModelsForRoute(cfg, profile, expectedSpaceId);
+    if (!visionSidecarAuthorized(cfg.visionModel, authorizedModels)) {
+      throw new Error(
+        `vision-first model '${cfg.visionModel}' is not authorized for company Space '${expectedSpaceId}'; ` +
+        "choose a model advertised by this organization or disable the vision-first route",
+      );
+    }
+    const imageProvider = await buildProvider(cfg, {
+      model: cfg.visionModel,
+      ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
+      ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
+    }, profile.id, expectedSpaceId, null, true);
+    assertProfileAudience(cfg, profile.id, expectedSpaceId);
+    if (!imageProvider) {
+      throw new Error(`vision-first model '${cfg.visionModel}' is not authenticated for profile '${profile.id}'`);
+    }
+    return { provider: imageProvider, translated: true };
+  }
+  if (classifyVision(primary.id, primary.model, cfg.modelVision) !== "vision") {
+    throw new Error(
+      `model '${primary.model}' cannot inspect images through profile '${profile.id}'; ` +
+      "configure a vision-first model or switch to an image-capable conversation model",
+    );
+  }
+  return { provider: primary, translated: false };
 }
 
 /** Wrap the main provider with per-turn model routing when `routeModel` is configured: trivial/non-coding
@@ -827,6 +883,94 @@ function personalProfileForSettings(live: HaraConfig, resolution: ActiveResoluti
   return profileByIdForConfig(live, PERSONAL_ID)!;
 }
 
+const visionEnvironmentOverride = (): boolean => Boolean(
+  process.env.HARA_VISION_MODEL?.trim()
+  || process.env.HARA_VISION_BASE_URL?.trim()
+  || process.env.HARA_VISION_API_KEY?.trim(),
+);
+
+function visionSettingsSnapshot(live: HaraConfig, profile: Profile) {
+  const expectedSpaceId = spaceIdForProfile(profile);
+  const authorizedModels = authorizedVisionModelsForRoute(live, profile, expectedSpaceId);
+  return {
+    enabled: Boolean(live.visionModel),
+    ...(live.visionModel ? { model: live.visionModel } : {}),
+    ...(live.visionBaseURL && profile.kind !== "gateway" ? { baseURL: live.visionBaseURL } : {}),
+    apiKeyConfigured: Boolean(live.visionApiKey),
+    usesManagedCredential: profile.kind === "gateway",
+    editable: !visionEnvironmentOverride(),
+    authorized: !live.visionModel || visionSidecarAuthorized(live.visionModel, authorizedModels),
+    ...(authorizedModels ? { authorizedModels: [...authorizedModels] } : {}),
+  };
+}
+
+function normalizeVisionBaseURL(value: string | undefined): string | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("vision endpoint must be a valid HTTP(S) URL");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+    throw new Error("vision endpoint must be an HTTP(S) URL without embedded credentials");
+  }
+  parsed.hash = "";
+  return parsed.toString().replace(/\/$/, "");
+}
+
+function saveVisionSettings(
+  input: {
+    enabled: boolean;
+    model?: string;
+    baseURL?: string;
+    apiKey?: string;
+    clearApiKey?: boolean;
+  },
+  targetCwd: string,
+) {
+  if (visionEnvironmentOverride()) {
+    throw new Error("vision routing is overridden by HARA_VISION_* environment variables; remove the override before editing Settings");
+  }
+  const live = loadConfig({ cwd: targetCwd });
+  const profile = profileForConfig(live).profile;
+  if (!input.enabled) {
+    updateRawConfig((config) => {
+      delete config.visionModel;
+      delete config.visionBaseURL;
+      delete config.visionApiKey;
+    });
+    return providerSettingsSnapshot(targetCwd);
+  }
+  const model = input.model?.trim();
+  if (!model || model.length > 200 || /[\u0000-\u001f\u007f]/.test(model)) {
+    throw new Error("vision-first model must be a 1-200 character model ID");
+  }
+  const authorizedModels = authorizedVisionModelsForRoute(live, profile, spaceIdForProfile(profile));
+  if (!visionSidecarAuthorized(model, authorizedModels)) {
+    throw new Error(`vision-first model '${model}' is not authorized for the active company connection`);
+  }
+  if (profile.kind === "gateway" && (input.baseURL?.trim() || input.apiKey?.trim())) {
+    throw new Error("company vision routing uses the managed gateway credential and does not accept a separate endpoint or key");
+  }
+  const baseURL = profile.kind === "gateway" ? undefined : normalizeVisionBaseURL(input.baseURL);
+  const apiKey = input.apiKey?.trim();
+  updateRawConfig((config) => {
+    config.visionModel = model;
+    if (baseURL) config.visionBaseURL = baseURL;
+    else delete config.visionBaseURL;
+    if (profile.kind === "gateway") {
+      delete config.visionApiKey;
+    } else if (apiKey) {
+      config.visionApiKey = apiKey;
+    } else if (input.clearApiKey) {
+      delete config.visionApiKey;
+    }
+  });
+  return providerSettingsSnapshot(targetCwd);
+}
+
 function providerSettingsSnapshot(targetCwd: string) {
   const live = loadConfig({ cwd: targetCwd });
   const { profile, resolution } = profileForConfig(live);
@@ -860,6 +1004,7 @@ function providerSettingsSnapshot(targetCwd: string) {
       providers: catalog,
       connections,
       switchLocked,
+      vision: visionSettingsSnapshot(live, profile),
     };
   }
 
@@ -905,6 +1050,7 @@ function providerSettingsSnapshot(targetCwd: string) {
     providers: catalog,
     connections,
     switchLocked,
+    vision: visionSettingsSnapshot(live, profile),
   };
 }
 
@@ -2529,11 +2675,19 @@ function runDoctor(cfg: HaraConfig): string {
   const ad = assetsDir();
   const roles = loadActiveRoles(live.cwd, profile.id);
   const vcap = classifyVision(live.provider, live.model, live.modelVision);
-  const imageStatus = vcap === "vision"
-    ? c.dim("native on the main model")
-    : vcap === "text"
-      ? c.dim("off for this text-only model")
-      : c.dim("checked on first image");
+  const visionAuthorized = visionSidecarAuthorized(
+    live.visionModel,
+    authorizedVisionModelsForRoute(live, profile, spaceIdForProfile(profile)),
+  );
+  const imageStatus = live.visionModel
+    ? visionAuthorized
+      ? c.dim("vision-first via ") + c.bold(live.visionModel) + c.dim(` → text for ${live.model}`)
+      : c.yellow(`vision-first ${live.visionModel} is not authorized for this Space`)
+    : vcap === "vision"
+      ? c.dim("native on the conversation model")
+      : vcap === "text"
+        ? c.dim("off — configure visionModel or use an image-capable model")
+        : c.dim("checked on first image");
   const installation = activeInstallation();
   const lines = [
     c.bold("hara doctor"),
@@ -3739,11 +3893,34 @@ program
           const target = profile.kind === "gateway"
             ? { provider: "hara-gateway", model: opts.model }
             : { ...resolveByokProviderTarget(live, profile, false), model: opts.model };
+          if (live.visionModel) {
+            const authorizedModels = authorizedVisionModelsForRoute(live, profile, opts.spaceId);
+            if (!visionSidecarAuthorized(live.visionModel, authorizedModels)) {
+              throw new Error(
+                `vision-first model '${live.visionModel}' is not authorized for company Space '${opts.spaceId}'`,
+              );
+            }
+            const visionProvider = await buildProvider(live, {
+              model: live.visionModel,
+              ...(live.visionBaseURL ? { baseURL: live.visionBaseURL } : {}),
+              ...(live.visionApiKey ? { apiKey: live.visionApiKey } : {}),
+            }, profileId, opts.spaceId, null, true);
+            assertProfileAudience(live, profileId, opts.spaceId);
+            if (!visionProvider) {
+              throw new Error(`vision-first model '${live.visionModel}' is not authenticated for profile '${profile.id}'`);
+            }
+            const description = await describeImages(visionProvider, images, {
+              signal: opts.signal,
+              hint: opts.hint,
+            });
+            assertProfileAudience(live, profileId, opts.spaceId);
+            return { description, viaModel: live.visionModel };
+          }
           const native = classifyVision(target.provider, opts.model, live.modelVision);
           if (native === "vision") return { images };
           throw new Error(
             native === "text"
-              ? `model '${opts.model}' cannot read images; switch this conversation to an image-capable model`
+              ? `model '${opts.model}' cannot read images; configure a vision-first model or switch this conversation to an image-capable model`
               : (
                   `image capability for model '${opts.model}' is unknown; ` +
                   "choose a model with advertised image support or set a modelVision override"
@@ -3751,6 +3928,7 @@ program
           );
         },
         providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
+        saveVisionSettings: async (input, targetCwd) => saveVisionSettings(input, targetCwd ?? cwd),
         unpinProjectProfile: (targetCwd) => {
           const settingsCwd = targetCwd ?? cwd;
           const removed = unpinResolvedProjectProfile(settingsCwd);
@@ -3980,6 +4158,10 @@ program
               current.provider,
               model,
               live.modelVision,
+              live.visionModel,
+              expectedSpaceId === PERSONAL_ID
+                ? undefined
+                : organizationProfile?.availableModels ?? [],
             ),
             ...(profile.kind === "gateway" && profile.availableModels?.length
               ? { availableModels: [...profile.availableModels] }
@@ -5364,9 +5546,9 @@ program.action(async (opts) => {
     fbOpt = fallbackProv ? { provider: fallbackProv } : undefined;
     guardianOpt = nextGuardian;
   };
-  /** The engine owns local-file validation; this selector owns provider identity. Image inspection always
-   * stays on the current conversation model so a stale global helper cannot change vendor, billing, policy,
-   * or company data routing behind the user's back. No credential ever enters model context. */
+  /** The engine owns local-file validation; this selector owns provider identity. An explicitly configured
+   * vision-first model receives only the image and focused prompt; company authorization is checked against
+   * the current Space before and after the call. No credential ever enters model context. */
   const inspectImageWithCurrentRoute = async (
     primary: Provider,
     profile: Profile,
@@ -5376,18 +5558,17 @@ program.action(async (opts) => {
     expectedSpaceId?: string,
   ): Promise<{ text: string; model: string }> => {
     if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
-    const native = classifyVision(primary.id, primary.model, cfg.modelVision);
-    if (native !== "vision") {
-      throw new Error(
-        `model '${primary.model}' cannot inspect images through profile '${profile.id}'; ` +
-        "switch this conversation to an image-capable model",
-      );
-    }
-    const text = await describeImages(primary, [image], { hint, signal });
+    const route = await buildImageProviderForRoute(
+      cfg,
+      primary,
+      profile,
+      expectedSpaceId ?? spaceIdForProfile(profile),
+    );
+    const text = await describeImages(route.provider, [image], { hint, signal });
     if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
     return {
       text,
-      model: primary.model,
+      model: route.provider.model,
     };
   };
   // Safety UX: first line of stdout = "where am I sending requests right now". Stable, scriptable,
@@ -5478,16 +5659,18 @@ program.action(async (opts) => {
       if (!profileId || !spaceId) throw new Error("headless session has no durable Space binding");
       return assertProfileAudience(cfg, profileId, spaceId);
     };
-    // Headless image inspection uses the pinned conversation model. A background task must not silently
-    // send company screenshots to a second provider merely because legacy vision settings exist locally.
+    // Headless image inspection follows the same explicit vision-first route as interactive and Serve.
+    // Company sessions remain pinned to the session's exact profile + Space authorization.
     const describeImage = async (path: string, hint?: string, signal?: AbortSignal): Promise<string> => {
-      assertHeadlessAudience();
-      const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      const vp = cap === "vision" ? provider : null;
-      assertHeadlessAudience();
-      if (!vp) return "";
+      const routeProfile = assertHeadlessAudience();
       try {
-        const description = await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
+        const route = await buildImageProviderForRoute(
+          cfg,
+          provider,
+          routeProfile,
+          meta?.spaceId ?? headlessLaunchSpaceId,
+        );
+        const description = await describeImages(route.provider, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
         assertHeadlessAudience();
         return description;
       } catch {
@@ -6315,15 +6498,23 @@ program.action(async (opts) => {
     (meta.workingSet?.length ? `## Working memory (this task)\n${meta.workingSet.map((w) => `- ${w}`).join("\n")}\n\n` : "") + memorySnap;
   if (resumed) out(c.dim(`(resumed ${shortId(meta.id)} · ${history.length} msgs · model = ${cfg.model})\n`));
 
-  // `/vision main …` is only a capability override for custom model ids. Image routing itself remains
-  // pinned to the current conversation model; legacy sidecar settings are deliberately ignored.
+  // Explicit vision-first state is shared by `/vision`, pasted attachments, image tools, and computer use.
+  // When enabled it wins over native image support: the conversation model receives description text only.
+  const interactiveVisionSpaceId = meta.spaceId ?? spaceIdForProfile(__activeP);
+  let visionProvider: Provider | null | undefined;
   let remindedVision = false;
-  /** `/vision main yes|no|auto` sets the current model's native image capability. */
+  /** `/vision <model|off>` controls vision-first; `/vision main …` corrects native capability metadata. */
   const applyVision = (arg: string): string => {
     const parts = arg.trim().split(/\s+/).filter(Boolean);
     if (parts.length === 0) {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      return `images — current model ${cfg.model}: ${cap}${cap === "unknown" ? " (checked on first image)" : ""}`;
+      const authorizedModels = authorizedVisionModelsForRoute(cfg, __activeP, interactiveVisionSpaceId);
+      const configured = cfg.visionModel
+        ? visionSidecarAuthorized(cfg.visionModel, authorizedModels)
+          ? `${cfg.visionModel} (all images first)`
+          : `${cfg.visionModel} (not authorized for this Space)`
+        : "off";
+      return `images — vision-first: ${configured} · conversation model ${cfg.model}: ${cap}${cap === "unknown" ? " (checked on first image)" : ""}`;
     }
     if (parts[0] === "main") {
       const v = parts[1];
@@ -6339,7 +6530,30 @@ program.action(async (opts) => {
       }
       return `(${cfg.model} vision = ${v})`;
     }
-    return "usage: /vision main yes|no|auto (secondary vision models were removed; switch /model instead)";
+    if (parts.length === 1 && parts[0].toLowerCase() === "off") {
+      cfg.visionModel = undefined;
+      cfg.visionBaseURL = undefined;
+      cfg.visionApiKey = undefined;
+      visionProvider = undefined;
+      updateRawConfig((config) => {
+        delete config.visionModel;
+        delete config.visionBaseURL;
+        delete config.visionApiKey;
+      });
+      return "(vision-first off; image-capable conversation models now receive images directly)";
+    }
+    const model = parts.join(" ");
+    const authorizedModels = authorizedVisionModelsForRoute(cfg, __activeP, interactiveVisionSpaceId);
+    if (!visionSidecarAuthorized(model, authorizedModels)) {
+      return `(vision-first model '${model}' is not authorized for this company Space)`;
+    }
+    cfg.visionModel = model;
+    visionProvider = undefined;
+    writeConfigValue("visionModel", model);
+    const warn = classifyVision(cfg.provider, model, cfg.modelVision) === "text"
+      ? `  ⚠ ${model} is classified as text-only; choose an image-capable model if recognition fails.`
+      : "";
+    return `(vision-first → ${model}; every image will be described here before the conversation model runs)${warn}`;
   };
 
   const commands: Slash[] = [
@@ -6798,16 +7012,22 @@ program.action(async (opts) => {
       }
     }
     setTheme(cfg.theme);
-    // Images and computer screenshots stay on the current conversation model. Unknown custom model ids are
-    // asked once and remembered; text-only models must be switched instead of silently using another vendor.
-    // Lets the computer tool return a screenshot as text through the current multimodal model.
+    const getImageProvider = async (): Promise<Provider | null> => {
+      assertInteractiveAudience();
+      if (cfg.visionModel && visionProvider !== undefined) return visionProvider;
+      const route = await buildImageProviderForRoute(cfg, provider, __activeP, interactiveVisionSpaceId);
+      if (cfg.visionModel) visionProvider = route.provider;
+      assertInteractiveAudience();
+      return route.provider;
+    };
+    // Computer screenshots use the explicit vision-first model when configured, otherwise the current
+    // multimodal conversation model. Only a focused screenshot prompt accompanies the image bytes.
     // Uses the screenshot-tuned prompt (actionable UI elements + positions) + an optional focus hint, so a
     // native multimodal model gets actionable UI context rather than a generic transcription.
     const describeScreenshot = async (path: string, hint?: string, signal?: AbortSignal): Promise<string> => {
-      const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      const vp = cap === "vision" ? provider : null;
-      if (!vp) return "";
       try {
+        const vp = await getImageProvider();
+        if (!vp) return "";
         const description = await describeImages(vp, [{ path, mediaType: "image/png" }], { system: SCREENSHOT_SYSTEM, hint, signal });
         assertInteractiveAudience();
         return description;
@@ -6821,10 +7041,9 @@ program.action(async (opts) => {
     // grounding for accurate RPA: ask the vision model WHERE an element is (0..1 fractions) so the computer
     // tool can click it precisely instead of guessing pixels from a text description.
     const locateScreenshot = async (path: string, target: string, signal?: AbortSignal): Promise<{ x: number; y: number } | null> => {
-      const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
-      const vp = cap === "vision" ? provider : null;
-      if (!vp) return null;
       try {
+        const vp = await getImageProvider();
+        if (!vp) return null;
         const location = await locateImage(vp, { path, mediaType: "image/png" }, target, { signal });
         assertInteractiveAudience();
         return location;
@@ -6834,11 +7053,11 @@ program.action(async (opts) => {
       }
     };
     const remindVision = (sink: { notice: (s: string) => void }): void => {
-      if (remindedVision) return void sink.notice(`⚠ image skipped — ${cfg.model} is text-only. Switch to an image-capable main model.`);
+      if (remindedVision) return void sink.notice(`⚠ image skipped — ${cfg.model} is text-only. Configure /vision <model> or switch models.`);
       remindedVision = true;
       sink.notice(
         `⚠ ${cfg.model} is text-only and can't see images, so your image was skipped.\n` +
-          "  Switch this conversation to a model with native image support, then resend the image.",
+          "  Configure a vision-first model with /vision <model>, or switch to a native image model, then resend.",
       );
     };
     const resolveImages = async (
@@ -6846,6 +7065,21 @@ program.action(async (opts) => {
       h: { sink: { notice: (s: string) => void }; select: (t: string, o: { label: string; value: string }[]) => Promise<string>; signal?: AbortSignal },
     ): Promise<{ extraText?: string; attach?: ImageAttachment[]; skip?: boolean }> => {
       if (!imgs?.length) return {};
+      if (cfg.visionModel) {
+        try {
+          const vp = await getImageProvider();
+          if (!vp) throw new Error("vision-first provider is unavailable");
+          h.sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with ${cfg.visionModel} before ${cfg.model}…`);
+          const desc = await describeImages(vp, imgs, { signal: h.signal });
+          return { extraText: `\n\n[Attached image description — read first by ${cfg.visionModel}]\n${desc}` };
+        } catch (error) {
+          const message = h.signal?.aborted
+            ? "image description cancelled"
+            : `image description failed: ${error instanceof Error ? error.message : String(error)}`;
+          h.sink.notice(`(${message})`);
+          return { skip: true };
+        }
+      }
       let cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
       if (cap === "unknown") {
         const ans = await h.select(`Can your model "${cfg.model}" understand images (vision)?`, [
@@ -6859,7 +7093,7 @@ program.action(async (opts) => {
         setModelVisionOverride(cfg.model, ans as "yes" | "no");
         h.sink.notice(`(remembered: ${cfg.model} ${ans === "yes" ? "supports images" : "is text-only"})`);
       }
-      if (cap === "vision") return { attach: imgs }; // native vision — describer suspended
+      if (cap === "vision") return { attach: imgs };
       remindVision(h.sink);
       return { skip: true };
     };
@@ -6869,7 +7103,7 @@ program.action(async (opts) => {
     //     (route host only when baseURL is custom); org spreads to `org <label> · <id> → <host>`
     //     plus its own `model` line annotated with the source (org default / user override).
     //   • cwd line silently appends "· AGENTS.md" when loaded — we never show a negative noise line.
-    //   • Image capability is part of the selected model route; text-only routes get a one-shot notice.
+    //   • The optional vision-first route is visible because it changes where every image is processed.
     const __mainCap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
     const __routeForHeader = routeHost(__activeP);
     // Model-source label (org only). `loadConfig` already merges env > project > overlay > globals,
@@ -6881,9 +7115,11 @@ program.action(async (opts) => {
           ? "org default"
           : "user override"
         : undefined;
-    const __visionNotice = __mainCap === "text"
-      ? `${cfg.model} is text-only — switch models before attaching images`
-      : undefined;
+    const __visionNotice = cfg.visionModel
+      ? `vision-first ${cfg.visionModel} → text for ${cfg.model}`
+      : __mainCap === "text"
+        ? `${cfg.model} is text-only — configure /vision <model> or switch models before attaching images`
+        : undefined;
     await runTui({
       initialStatus: { sessionName: meta.title || shortId(meta.id), approval, input: stats.input, output: stats.output, ctxPct: 0, agents: 0 },
       model: cfg.model,

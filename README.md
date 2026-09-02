@@ -175,7 +175,8 @@ Responses API. Hara resends the complete durable message/tool history on every r
 endpoint is stateless: it never depends on `previous_response_id`, `conversation`, or server-side storage.
 Explicit custom or legacy ids are not silently remapped; their availability remains provider-side.
 DeepSeek V4 Flash and Pro remain text-only, while `deepseek-v4-flash-vision-exp` accepts native image
-input. Text-only conversations ask for a model switch and never forward an image to a secondary provider.
+input. You can also keep Flash/Pro as the conversation model and explicitly use the vision model as the
+image pre-processor described below.
 If live model discovery is unavailable, `/model` still offers the three documented V4 models as a
 host-scoped fallback; a successful live `/models` response remains authoritative.
 
@@ -222,14 +223,25 @@ manager's normal credential store. `HARA_PACKAGE_REGISTRY` is the environment eq
 Replies follow the latest user message's language by default. Use `hara --lang zh-CN` (or `en`) to pin one
 launch, and `hara --lang auto` to restore per-message matching.
 
-**Vision** — hara **auto-detects** whether the selected conversation model can see images. A multimodal
-model (Claude, GPT-4o, MiniMax-M3, qwen3.8-max/flash, qwen3.7-plus, qwen-vl, glm-4v,
-`deepseek-v4-flash-vision-exp`…) receives pasted
-images **inline**. A text-only model asks you to switch models instead of silently sending the image and
-conversation context to a secondary provider. If a custom model's capability is unknown, hara **asks once
-and remembers**; `/vision main yes|no|auto` corrects that native capability record. Legacy
-`visionModel` / `visionBaseURL` / `visionApiKey` values remain readable for config compatibility but are
-ignored by image routing.
+**Vision** — by default, hara auto-detects whether the selected conversation model can see images and sends
+images inline only to a known multimodal model. To make a dedicated model handle **all** recognition first,
+enable the explicit vision-first route:
+```bash
+hara config set visionModel deepseek-v4-flash-vision-exp
+# Optional for Personal/BYOK when vision is hosted elsewhere:
+hara config set visionBaseURL https://api.deepseek.com
+hara config set visionApiKey YOUR_VISION_KEY
+```
+Once configured, pasted images, Desktop/Serve attachments, `inspect_image`, and computer screenshots all go
+first to that model with only a focused transcription prompt. The main conversation model receives the
+resulting text and never the raw image—even when it supports vision itself. Use `/vision` to inspect the
+route, `/vision <model>` to change it, and `/vision off` to disable it. `/vision main yes|no|auto` still
+corrects native capability detection for custom models.
+
+Company Spaces fail closed: the configured vision model must appear in that connection's administrator-
+advertised model list, and the image request reuses the managed gateway credential. A local setting cannot
+widen a company Key. Desktop exposes the same setting under **Models & connections → Vision-first image
+recognition** and never returns a saved key to the renderer.
 
 **Reasoning effort** — choose from the levels the current model actually supports. Hara's internal vocabulary
 is `off` · `minimal` · `low` · `medium` · `high` · `xhigh` · `max`; binary and narrower providers expose only
@@ -316,9 +328,10 @@ provider reasoning never enters terminal or transcript state, while a typed phas
 turn is active. **shift+tab** cycles the approval mode, **Esc** interrupts a running
 turn, and tool approvals appear inline (y/N). **Ctrl+V** pastes an image from your clipboard (a screenshot,
 or a copied image) — or drag an image file into the terminal — and it appears as a highlighted `[Image #N]`
-token inline where your cursor is (backspace over it to remove it). hara auto-detects the model's capability —
-a multimodal model sees the image directly; a text-only model asks you to switch models and never silently
-uses a second image provider. Set `HARA_TUI=0` for the classic readline REPL.
+token inline where your cursor is (backspace over it to remove it). Without `visionModel`, a multimodal model
+sees the image directly. With `visionModel`, every image is described there first and the conversation model
+receives text only. A text-only route with neither option asks you to configure or switch models. Set
+`HARA_TUI=0` for the classic readline REPL.
 
 Text pasted by a modern terminal is handled as one bracketed-paste event, including multiline Claude/Codex
 output and a paste immediately followed by Enter. It is inserted for review and never auto-submitted merely
@@ -398,8 +411,10 @@ external MCP/agent confirmations remain stricter and cannot be bypassed by a rem
 **Screen control** (opt-in): the `computer` tool drives desktop software (screenshot → click/type), native per OS
 (mac `screencapture`+`cliclick` · Windows PowerShell · Linux `scrot`+`xdotool`). Off by default — enable a tier with
 `hara config set computerUse read|click|full` and allowlist apps with `hara config set computerApps "App, …"`. Guarded
-by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and per-action approval. Screenshots are read by the
-selected conversation model into **actionable** output — interactive elements + positions (pass `focus` to target what you're after). A text-only model must be switched before visual screen control.
+by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and per-action approval. Screenshots are
+read into **actionable** output—interactive elements + positions (pass `focus` to target what you're after)—by
+the configured vision-first model, or otherwise by the multimodal conversation model. A text-only route with
+neither option cannot perform visual screen control.
 **Sessions and task execution**: conversations are saved automatically — `-c` / `--resume <id>` or
 `hara resume <id>` to continue, `hara sessions` to list, `hara export [id] [--out file]` to render one as a
 Markdown transcript. The current task is persisted separately with stable task/turn identity and recovers as

@@ -201,6 +201,13 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
       authoritative: true,
       agentProfilePermission: "edit",
     }],
+    vision: {
+      enabled: false,
+      apiKeyConfigured: false,
+      usesManagedCredential: false,
+      editable: true,
+      authorized: true,
+    },
   }),
   useSpace: () => ({
     activeId: "personal",
@@ -1394,7 +1401,7 @@ test("serve e2e: structured attachments support image-only turns and expose path
   }
 });
 
-test("serve e2e: a legacy vision-sidecar result is rejected instead of rerouting the attachment", { timeout: 10000 }, async () => {
+test("serve e2e: vision-first persists description text and never sends raw images to the main model", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-sidecar-image-"));
   const store = memStore();
   mkdirSync(join(dir, ".git"));
@@ -1459,13 +1466,17 @@ test("serve e2e: a legacy vision-sidecar result is rejected instead of rerouting
       text: "/inspect-image",
       images: [{ path: imagePath, mediaType: "image/jpeg" }],
     });
-    assert.match(sent.error.message, /no native image route/);
-    assert.deepEqual(providerHistory, [], "the selected text model is never called with translated context");
-    assert.equal(
-      store.saved.get(sid).history.some((message) => message.imageDescription),
-      false,
-      "new histories never persist a sidecar description",
-    );
+    assert.equal(sent.error, undefined);
+    assert.equal(sent.result.reply, "understood");
+    const user = providerHistory.findLast((message) => message.role === "user");
+    assert.equal(user.images, undefined, "the main model receives no image bytes");
+    assert.match(user.content, /Use all supplied visual evidence/);
+    assert.match(user.content, /read first by vision-helper/);
+    assert.match(user.content, /three participants/);
+    const persistedUser = store.saved.get(sid).history.findLast((message) => message.role === "user");
+    assert.equal(persistedUser.images, undefined);
+    assert.equal(persistedUser.imageDescription, "A sequence diagram with three participants.");
+    assert.equal(persistedUser.attachments[0].strategy, "vision-sidecar");
   } finally {
     c.close();
     await srv.close();
@@ -2138,6 +2149,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     switchLocked: false,
   };
   let savedInput;
+  let savedVisionInput;
   let createdConnectionInput;
   let enrolledOrganizationInput;
   let unpinnedCwd;
@@ -2188,6 +2200,19 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     saveProviderSettings: async (input) => {
       savedInput = input;
       return { ...state, accidentalApiKey: input.apiKey };
+    },
+    saveVisionSettings: async (input) => {
+      savedVisionInput = input;
+      return {
+        ...state,
+        vision: {
+          ...state.vision,
+          enabled: input.enabled,
+          model: input.model,
+          apiKeyConfigured: Boolean(input.apiKey),
+        },
+        accidentalApiKey: input.apiKey,
+      };
     },
     createProviderConnection: async (input) => {
       createdConnectionInput = input;
@@ -2264,6 +2289,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.ok(init.result.capabilities.methods.includes("settings.providers.list"));
     assert.ok(init.result.capabilities.methods.includes("settings.providers.test"));
     assert.ok(init.result.capabilities.methods.includes("settings.providers.save"));
+    assert.ok(init.result.capabilities.methods.includes("settings.vision.save"));
     for (const method of [
       "settings.providers.connections.create",
       "settings.providers.connections.test",
@@ -2285,7 +2311,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
 
     const listed = await c.call("settings.providers.list", {});
     assert.equal(listed.result.current.provider, "ollama");
-    assert.equal(JSON.stringify(listed.result).includes("apiKey"), false);
+    assert.equal(JSON.stringify(listed.result).includes("\"apiKey\":"), false);
 
     const secret = "sk-testsecret-1234567890";
     const tested = await c.call("settings.providers.test", { provider: "openai", model: "gpt-test", apiKey: secret });
@@ -2295,6 +2321,15 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     const saved = await c.call("settings.providers.save", { provider: "openai", model: "gpt-test", apiKey: secret, activatePersonal: true });
     assert.equal(savedInput.apiKey, secret, "the authenticated callback receives the ephemeral credential");
     assert.equal(JSON.stringify(saved.result).includes(secret), false, "save results must never echo a submitted key");
+
+    const visionSaved = await c.call("settings.vision.save", {
+      enabled: true,
+      model: "deepseek-v4-flash-vision-exp",
+      apiKey: secret,
+    });
+    assert.equal(savedVisionInput.apiKey, secret, "the vision callback receives the transient credential");
+    assert.equal(visionSaved.result.vision.model, "deepseek-v4-flash-vision-exp");
+    assert.equal(JSON.stringify(visionSaved.result).includes(secret), false, "vision settings never echo a submitted key");
 
     const created = await c.call("settings.providers.connections.create", {
       id: "qwen-personal",

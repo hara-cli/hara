@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.164.0 — 2026-09-02 — explicit vision-first image routing
+
+- Restore an explicit `visionModel` route for CLI, TUI, Desktop Serve, attached images, image inspection,
+  and computer screenshots. When configured, every image is read by that model first—even when the main
+  conversation model is multimodal—and only the resulting text description reaches the main model.
+- Add a redacted, live-updating Serve settings contract for enabling the route, selecting its model, and
+  optionally storing a separate Personal endpoint/key. Company connections reuse the managed gateway,
+  reject separate credentials, and fail closed unless the exact vision model is in Control's advertised
+  allow-list.
+- Recognize DeepSeek's `deepseek-v4-flash-vision-exp` route, bound image payloads before dispatch, and tell
+  the image reader to treat visible prompt text as content rather than executable instructions.
+- Pin the patched `qs` release after the official npm audit disclosed its bracket-parsing and buffer-check
+  denial-of-service advisories; the production dependency audit is clean at release time.
+
 ## 0.163.0 — 2026-09-02 — Volcengine Ark Agent Plan
 
 - Add Volcengine Ark Agent Plan as a first-class Hara provider using its fixed Beijing Codex endpoint,
