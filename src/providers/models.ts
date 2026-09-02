@@ -12,6 +12,11 @@ import {
   isOfficialMiniMaxEndpoint,
   MINIMAX_TOKEN_PLAN_MODELS,
 } from "./minimax.js";
+import {
+  isOfficialVolcengineAgentPlanEndpoint,
+  isVolcengineAgentPlanInteractiveModel,
+  VOLCENGINE_AGENT_PLAN_MODELS,
+} from "./volcengine.js";
 
 // Alibaba Coding Plan's documented exact ids (verified 2026-07-18). Live `/models` remains authoritative;
 // this list is only a usability fallback because the coding endpoint/key combinations do not all enumerate.
@@ -55,6 +60,12 @@ export function miniMaxFallbackModels(baseURL: string | undefined): string[] {
   return isOfficialMiniMaxEndpoint(baseURL) ? [...MINIMAX_TOKEN_PLAN_MODELS] : [];
 }
 
+export function volcengineAgentPlanFallbackModels(baseURL: string | undefined): string[] {
+  return isOfficialVolcengineAgentPlanEndpoint(baseURL)
+    ? [...VOLCENGINE_AGENT_PLAN_MODELS]
+    : [];
+}
+
 // Model discovery — "what can this key run?" A plan / OpenAI-compatible key usually exposes many
 // models (Qwen, GLM, Kimi, …) via `GET {baseURL}/models`; the /model picker lists them so you switch by
 // arrow keys, not by memorizing ids. Live results win. A bounded request falls back to Alibaba's documented
@@ -73,6 +84,7 @@ export async function listModels(
     ...codingPlanFallbackModels(baseURL),
     ...deepSeekFallbackModels(baseURL),
     ...miniMaxFallbackModels(baseURL),
+    ...volcengineAgentPlanFallbackModels(baseURL),
   ];
   try {
     const url = baseURL.replace(/\/+$/, "") + "/models";
@@ -88,6 +100,8 @@ export async function listModels(
       ? discovered.filter((id) =>
           isTokenPlanInteractiveAgentModel(id)
           && (!isTokenPlanSupersededModel(id) || id === keep))
+      : isOfficialVolcengineAgentPlanEndpoint(baseURL)
+        ? discovered.filter(isVolcengineAgentPlanInteractiveModel)
       : discovered;
     return selectable.length ? selectable : fallback;
   } catch {

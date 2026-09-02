@@ -1394,6 +1394,7 @@ const SETUP_DEFAULT_MODEL: Record<string, string> = {
   anthropic: "claude-opus-4-8",
   "token-plan": "qwen3.8-max",
   "minimax-token-plan": "MiniMax-M3",
+  "volcengine-agent-plan": "ark-code-latest",
   qwen: "qwen-plus",
   openai: "gpt-4o-mini",
   glm: "glm-4.6",
@@ -1411,6 +1412,7 @@ const SETUP_MENU: { label: string; id: ProviderId | "custom" }[] = [
   { label: "OpenAI", id: "openai" },
   { label: "Alibaba Cloud Model Studio Token Plan (API key, Beijing)", id: "token-plan" },
   { label: "MiniMax Token Plan (API key, Responses)", id: "minimax-token-plan" },
+  { label: "Volcengine Ark Agent Plan (API key, Beijing, Responses)", id: "volcengine-agent-plan" },
   { label: "GLM (Zhipu)", id: "glm" },
   { label: "DeepSeek", id: "deepseek" },
   { label: "Ollama (local, no key)", id: "ollama" },
@@ -3213,7 +3215,7 @@ profileCmd
   .option("--code <code>", "(gateway) enrollment code from your admin")
   .option("--label <label>", "human-friendly label for the profile")
   .option("--byok", "(byok) BYOK profile — bring your own provider key")
-  .option("--provider <id>", "(byok/local) anthropic | token-plan | minimax-token-plan | openai-compatible | openai | glm | deepseek | openrouter | ollama | lmstudio (legacy: qwen | qwen-oauth)")
+  .option("--provider <id>", "(byok/local) anthropic | token-plan | minimax-token-plan | volcengine-agent-plan | openai-compatible | openai | glm | deepseek | openrouter | ollama | lmstudio (legacy: qwen | qwen-oauth)")
   .option("--key <key>", "(byok) API key for scripts; omit in a terminal for masked input")
   .option("--no-key-prompt", "(byok) do not prompt for a missing API key; resolve it from the provider environment at use-time")
   .option("--base-url <url>", "(byok) override the provider base URL (OpenAI-compatible endpoints)")
@@ -3314,7 +3316,7 @@ profileCmd
       out(c.dim(`Switch to it with \`hara profile use ${id}\`.\n`));
       return;
     }
-    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|token-plan|minimax-token-plan|openai-compatible|openai|glm|deepseek|openrouter|ollama|lmstudio [--base-url … --model …]\n"));
+    out(c.red("usage:\n") + c.dim("  hara profile add <id> --gateway <url> --code <code> [--label …]\n") + c.dim("  hara profile add <id> --byok --provider anthropic|token-plan|minimax-token-plan|volcengine-agent-plan|openai-compatible|openai|glm|deepseek|openrouter|ollama|lmstudio [--base-url … --model …]\n"));
     process.exit(1);
   });
 

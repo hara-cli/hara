@@ -167,6 +167,24 @@ test("legacy OpenAI profiles on the exact MiniMax endpoint canonicalize without 
   });
 });
 
+test("legacy OpenAI profiles on the exact Volcengine Agent Plan endpoint canonicalize without losing their saved key", () => {
+  const target = resolveByokProviderTarget(personalConfig, {
+    id: "legacy-volcengine",
+    kind: "byok",
+    label: "Ark Agent Plan",
+    provider: "openai",
+    apiKey: "saved-agent-plan-key",
+    baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+    defaultModel: "ark-code-latest",
+  }, false, {});
+  assert.deepEqual(target, {
+    provider: "volcengine-agent-plan",
+    apiKey: "saved-agent-plan-key",
+    baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+    model: "ark-code-latest",
+  });
+});
+
 test("local targets discard flat and environment cloud credentials", () => {
   const target = resolveByokProviderTarget(
     {

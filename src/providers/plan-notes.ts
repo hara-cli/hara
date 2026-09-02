@@ -26,6 +26,11 @@ const NOTES: Partial<Record<ProviderId, PlanNote>> = {
     billing: "Output pricing includes the thinking chain, so a high thinking level is billed, not free.",
     limits: "Quota runs on 5-hour and weekly windows that do not carry over. MiniMax also throttles dynamically at peak (weekdays 15:00–17:30) and caps how many agents one plan tier may run, so a slow turn is usually the tier rather than the client.",
   },
+  "volcengine-agent-plan": {
+    billing: "Agent Fuel Points are shared across every supported Agent Plan tool; model and Harness usage draw from the same subscription allowance.",
+    limits: "The plan uses a 5-hour cycle plus weekly and monthly limits. When an allowance is exhausted, service pauses unless overage billing is enabled in Ark.",
+    models: "ark-code-latest follows the model selected in the Ark console. Use an explicit model id when a session must stay pinned to one model.",
+  },
 };
 
 export function planNote(provider: ProviderId | string | undefined): PlanNote | undefined {

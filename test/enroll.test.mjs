@@ -853,7 +853,7 @@ test("managed role bundle sync is safe across real concurrent Hara processes", {
     else process.env.HOME = previousHome;
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 

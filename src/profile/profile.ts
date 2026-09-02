@@ -24,7 +24,7 @@
 //
 // Provider resolution (in src/index.ts buildProvider):
 //   profile.kind === 'gateway' → OpenAI-compatible w/ deviceToken + (baseURL || gatewayUrl+'/v1')
-//   profile.kind === 'byok'    → existing anthropic / qwen / openai / qwen-oauth dispatch
+//   profile.kind === 'byok'    → the saved first-class or compatible provider dispatch
 //
 // The `hara-gateway` ProviderId enum value is retired from new writes — buildProvider still
 // tolerates reading it from a legacy config.json (it just maps to the migrated gateway profile).
@@ -77,7 +77,7 @@ export interface Profile {
   /** Public organization display name returned by Control. Never used for authorization. */
   tenantName?: string;
   // byok-only
-  provider?: ProviderId; // anthropic | qwen | openai | qwen-oauth (NOT hara-gateway)
+  provider?: ProviderId; // any personal provider (NOT hara-gateway)
   apiKey?: string;
   baseURL?: string;
   // gateway-only (mirrors Enrollment)

@@ -36,7 +36,9 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   { rx: /qwen.*vl|qwen.*omni|qvq/i, cap: "vision" },
   { rx: /qwen3\.8-(?:max(?:-preview)?|flash)|qwen3\.[567]-(?:plus|flash)/i, cap: "vision" },
   { rx: /qwen.*(?:coder|plus|max|turbo|long|math)|qwq|qwen[\d.]*-?\d+b\b|qwen-?\d/i, cap: "text" },
-  // GLM / Zhipu — 4v/4.5v see images; glm-5, glm-4.7, glm-4-flash are text-only.
+  // GLM / Zhipu — Agent Plan's glm-5.3-flash is explicitly natively multimodal; 4v/4.5v also see
+  // images. Keep these before the broad text rule for glm-5/glm-latest and older families.
+  { rx: /^glm-5\.3-flash(?:-|$)/i, cap: "vision" },
   { rx: /glm-?\d(?:\.\d+)?v|cogvlm|glm.*vision/i, cap: "vision" },
   { rx: /glm-?\d(?:\.\d+)?(?:-(?:air|flash|plus|long|x|0520))?\b|glm-z|chatglm/i, cap: "text" },
   // DeepSeek (the exact official V4 vision model and VL families first, then the text families)

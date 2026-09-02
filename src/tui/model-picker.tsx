@@ -12,6 +12,7 @@ import {
   type ReasoningStyle,
   type Effort,
 } from "../providers/reasoning.js";
+import { volcengineAgentPlanCanDisableThinking } from "../providers/volcengine.js";
 
 /** The levels ←→ cycles for a style. Binary thinking toggles (DashScope, MiniMax adaptive, Ollama)
  *  show off/on; graded styles (OpenAI/Anthropic effort/budget) show the full dial; `none` → no control. */
@@ -22,6 +23,14 @@ export function levelsFor(style: ReasoningStyle, model = ""): Effort[] {
   }
   if (style === "deepseek" || style === "deepseek_responses") {
     return ["off", "low", "high", "max"];
+  }
+  if (style === "volcengine_responses") {
+    return [
+      ...(volcengineAgentPlanCanDisableThinking(model) ? ["off" as const] : []),
+      "low",
+      "medium",
+      "high",
+    ];
   }
   if (style === "qwen_responses" || style === "alibaba_responses") {
     return alibabaReasoningEffortLevels(model);

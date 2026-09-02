@@ -9,6 +9,7 @@ import { createResponsesProvider } from "./responses.js";
 import { deepSeekResponsesSupportsImages } from "./deepseek.js";
 import { isOfficialTokenPlanOpenAIEndpoint } from "./alibaba.js";
 import { resolvePlatform } from "./registry.js";
+import { isOfficialVolcengineAgentPlanEndpoint } from "./volcengine.js";
 import type { Provider } from "./types.js";
 import type { ProviderTarget } from "./target.js";
 
@@ -47,6 +48,7 @@ export async function createProviderForTarget(
   }
   if (wire === "responses") {
     const alibabaTokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
+    const volcengineAgentPlan = isOfficialVolcengineAgentPlanEndpoint(baseURL);
     return createResponsesProvider({
       apiKey: transportKey,
       model,
@@ -57,6 +59,7 @@ export async function createProviderForTarget(
       supportsImages: !/^deepseek-/i.test(model) || deepSeekResponsesSupportsImages(model),
       ...(options.reasoningAdvisory ? { reasoningAdvisory: true } : {}),
       ...(alibabaTokenPlan ? { store: false, dashscopeSessionCache: true } : {}),
+      ...(volcengineAgentPlan ? { store: false } : {}),
       omitAuthorization: providerIsLocal(provider),
       fetch,
     });

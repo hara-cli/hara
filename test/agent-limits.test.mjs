@@ -934,6 +934,10 @@ test("a synchronous provider cannot overrun the active budget and then start a s
 test("the 80% time boundary reaches the model as an in-band checkpoint instruction", async () => {
   let turn = 0;
   let sawCheckpoint = false;
+  let releaseCheckpoint;
+  const checkpointReached = new Promise((resolve) => {
+    releaseCheckpoint = resolve;
+  });
   const provider = {
     id: "checkpoint-aware",
     model: "checkpoint-aware",
@@ -949,15 +953,24 @@ test("the 80% time boundary reaches the model as an in-band checkpoint instructi
     },
   };
   const outcome = await runAgent([{ role: "user", content: "do a long staged task" }], base(provider, {
-    timeoutMs: 2_000,
+    timeoutMs: 5_000,
     maxRounds: 10,
+    ctx: {
+      cwd: process.cwd(),
+      ui: {
+        text() {}, reasoning() {}, tool() {}, diff() {},
+        notice(message) {
+          if (message.includes("active turn budget is 80% used")) releaseCheckpoint();
+        },
+      },
+    },
     extraTools: [{
       name: "slow_stage",
       description: "finishes one atomic stage near the checkpoint boundary",
       input_schema: { type: "object", properties: {} },
       kind: "read",
       async run() {
-        await tick(1_650);
+        await checkpointReached;
         return "stage artifact saved";
       },
     }],

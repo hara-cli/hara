@@ -781,6 +781,27 @@ test("provider catalog: MiniMax Token Plan exposes its fixed Codex endpoint and 
   );
 });
 
+test("provider catalog: Volcengine Agent Plan exposes its fixed Codex Responses endpoint", () => {
+  const volcengine = providerCatalog().find((provider) => provider.id === "volcengine-agent-plan");
+  assert.deepEqual(
+    {
+      auth: volcengine?.auth,
+      baseURL: volcengine?.defaultBaseURL,
+      model: volcengine?.defaultModel,
+      customBaseURL: volcengine?.customBaseURL,
+    },
+    {
+      auth: "api-key",
+      baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+      model: "ark-code-latest",
+      customBaseURL: false,
+    },
+  );
+  assert.ok(volcengine?.knownModels?.includes("glm-5.3-flash"));
+  assert.ok(volcengine?.knownModels?.includes("deepseek-v4-pro"));
+  assert.equal(volcengine?.knownModels?.some((model) => /seedream|seedance|embedding|tts|asr/i.test(model)), false);
+});
+
 test("provider settings pin Token Plan credentials to the official Beijing endpoint", () => {
   assert.equal(
     normalizePersonalProviderConfig({
@@ -816,6 +837,25 @@ test("provider settings pin MiniMax Token Plan credentials to the official Codex
       baseURL: "https://api.minimaxi.com/anthropic",
     }),
     /fixed endpoint/,
+  );
+});
+
+test("provider settings pin Volcengine Agent Plan credentials to the official Beijing endpoint", () => {
+  assert.equal(
+    normalizePersonalProviderConfig({
+      provider: "volcengine-agent-plan",
+      model: "ark-code-latest",
+      baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3/",
+    }).baseURL,
+    "https://ark.cn-beijing.volces.com/api/plan/v3",
+  );
+  assert.throws(
+    () => normalizePersonalProviderConfig({
+      provider: "volcengine-agent-plan",
+      model: "ark-code-latest",
+      baseURL: "https://ark.cn-beijing.volces.com/api/v3",
+    }),
+    /fixed Beijing endpoint/,
   );
 });
 

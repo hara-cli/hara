@@ -16,6 +16,7 @@ import {
 } from "../profile/profile.js";
 import { isOfficialTokenPlanOpenAIEndpoint } from "./alibaba.js";
 import { isOfficialMiniMaxEndpoint } from "./minimax.js";
+import { isOfficialVolcengineAgentPlanEndpoint } from "./volcengine.js";
 
 export interface ProviderTarget {
   provider: ProviderId;
@@ -108,7 +109,9 @@ export function resolveByokProviderTarget(
     ? "token-plan"
     : isOfficialMiniMaxEndpoint(baseURL)
       ? "minimax-token-plan"
-      : configuredProvider;
+      : isOfficialVolcengineAgentPlanEndpoint(baseURL)
+        ? "volcengine-agent-plan"
+        : configuredProvider;
   const envKey = providerEnvKey(provider);
   const providerEnvApiKey = envKey ? env[envKey] : undefined;
   const candidateApiKey = personalOrOverride

@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.163.0 — 2026-09-02 — Volcengine Ark Agent Plan
+
+- Add Volcengine Ark Agent Plan as a first-class Hara provider using its fixed Beijing Codex endpoint,
+  Responses streaming, `ARK_API_KEY`, `ark-code-latest`, live key-scoped model discovery, and a documented
+  text-model fallback that keeps embedding/image/video/speech models out of the conversation picker.
+- Keep Hara's durable history local with `store:false`, expose Ark's thinking-off switch plus the documented
+  Codex low/medium/high reasoning levels, preserve the always-thinking contract of `glm-5.3`, and recognize
+  Agent Plan context windows and native image input for `glm-5.3-flash`.
+- Replace the agent-budget test's fixed wall-clock guess with an observable checkpoint and make concurrent
+  enrollment-test cleanup retry bounded transient macOS directory races.
+
 ## 0.162.2 — 2026-09-02 — deterministic Intel release completion
 
 - Replace the TUI Markdown rendering test's fixed 80 ms sleep with an observable, bounded rendering

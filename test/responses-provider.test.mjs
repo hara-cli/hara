@@ -299,6 +299,28 @@ test("Token Plan off uses the Responses-native none level", async () => {
   }
 });
 
+test("Volcengine Agent Plan request uses Ark thinking controls without server-owned history", async () => {
+  const mock = await listen([completed([], { input_tokens: 2, output_tokens: 1 }, 0)]);
+  try {
+    await createResponsesProvider({
+      apiKey: "test-key",
+      baseURL: mock.baseURL,
+      model: "ark-code-latest",
+      reasoningEffort: "off",
+      reasoningStyle: "volcengine_responses",
+      store: false,
+    }).turn({ system: "test", history: [{ role: "user", content: "classify" }], tools: [], onText() {} });
+
+    assert.equal(mock.requests.length, 1);
+    assert.deepEqual(mock.requests[0].body.thinking, { type: "disabled" });
+    assert.equal(mock.requests[0].body.reasoning, undefined);
+    assert.equal(mock.requests[0].body.store, false);
+    assert.equal(mock.requests[0].body.previous_response_id, undefined);
+  } finally {
+    await new Promise((resolve) => mock.server.close(resolve));
+  }
+});
+
 test("Responses transport treats incomplete and missing terminal events as errors", async (t) => {
   await t.test("incomplete", async () => {
     const mock = await listen([{

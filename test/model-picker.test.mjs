@@ -10,6 +10,7 @@ import {
   deepSeekFallbackModels,
   listModels,
   miniMaxFallbackModels,
+  volcengineAgentPlanFallbackModels,
 } from "../dist/providers/models.js";
 import {
   TOKEN_PLAN_KNOWN_INTERACTIVE_AGENT_MODELS,
@@ -19,6 +20,10 @@ import {
   tokenPlanModelReplacement,
 } from "../dist/providers/alibaba.js";
 import { MINIMAX_TOKEN_PLAN_MODELS } from "../dist/providers/minimax.js";
+import {
+  VOLCENGINE_AGENT_PLAN_BASE_URL,
+  VOLCENGINE_AGENT_PLAN_MODELS,
+} from "../dist/providers/volcengine.js";
 
 test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSeek uses off plus native low/high/max; none → nothing", () => {
   assert.deepEqual(levelsFor("enable_thinking"), ["off", "high"]);
@@ -30,6 +35,8 @@ test("levelsFor: binary thinking styles → off/on; graded → full dial; DeepSe
   assert.deepEqual(levelsFor("thinking_budget"), ["off", "low", "medium", "high", "max"]);
   assert.deepEqual(levelsFor("deepseek"), ["off", "low", "high", "max"]);
   assert.deepEqual(levelsFor("deepseek_responses"), ["off", "low", "high", "max"]);
+  assert.deepEqual(levelsFor("volcengine_responses", "ark-code-latest"), ["off", "low", "medium", "high"]);
+  assert.deepEqual(levelsFor("volcengine_responses", "glm-5.3"), ["low", "medium", "high"]);
   assert.deepEqual(levelsFor("qwen_responses", "qwen3.8-max"), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   assert.deepEqual(levelsFor("qwen_responses", "qwen3.8-flash"), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
   assert.deepEqual(levelsFor("qwen_responses", "qwen3.7-max"), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -216,6 +223,36 @@ test("MiniMax Token Plan discovery falls back to M3 only on the exact official e
     await listModels("https://api.minimaxi.com/v1", "k", live),
     ["MiniMax-M3.1"],
     "live key-scoped discovery remains authoritative",
+  );
+});
+
+test("Volcengine Agent Plan discovery keeps text models and filters separate media APIs", async () => {
+  assert.equal(VOLCENGINE_AGENT_PLAN_MODELS[0], "ark-code-latest");
+  assert.deepEqual(
+    volcengineAgentPlanFallbackModels(VOLCENGINE_AGENT_PLAN_BASE_URL),
+    [...VOLCENGINE_AGENT_PLAN_MODELS],
+  );
+  assert.deepEqual(volcengineAgentPlanFallbackModels("https://ark.cn-beijing.volces.com/api/v3"), []);
+  assert.deepEqual(volcengineAgentPlanFallbackModels("https://ark.cn-beijing.volces.com.example/api/plan/v3"), []);
+
+  const live = async () => ({
+    ok: true,
+    json: async () => ({
+      data: [
+        { id: "ark-code-latest" },
+        { id: "glm-5.3-flash" },
+        { id: "future-code-model" },
+        { id: "doubao-embedding-vision" },
+        { id: "doubao-seedream-5.0-lite" },
+        { id: "doubao-seedance-2.0" },
+        { id: "doubao-seed-tts-2.0" },
+        { id: "doubao-seed-asr-2.0" },
+      ],
+    }),
+  });
+  assert.deepEqual(
+    await listModels(VOLCENGINE_AGENT_PLAN_BASE_URL, "k", live),
+    ["ark-code-latest", "future-code-model", "glm-5.3-flash"],
   );
 });
 

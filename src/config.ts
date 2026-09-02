@@ -25,11 +25,16 @@ import {
   MINIMAX_TOKEN_PLAN_BASE_URL,
   MINIMAX_TOKEN_PLAN_MODELS,
 } from "./providers/minimax.js";
+import {
+  VOLCENGINE_AGENT_PLAN_BASE_URL,
+  VOLCENGINE_AGENT_PLAN_MODELS,
+} from "./providers/volcengine.js";
 
 export type ProviderId =
   | "anthropic"
   | "token-plan"
   | "minimax-token-plan"
+  | "volcengine-agent-plan"
   | "qwen"
   | "qwen-oauth"
   | "openai"
@@ -153,6 +158,11 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
     baseURL: MINIMAX_TOKEN_PLAN_BASE_URL,
     envKey: "MINIMAX_API_KEY",
   },
+  "volcengine-agent-plan": {
+    model: "ark-code-latest",
+    baseURL: VOLCENGINE_AGENT_PLAN_BASE_URL,
+    envKey: "ARK_API_KEY",
+  },
   qwen: {
     model: "qwen-plus",
     baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -223,6 +233,13 @@ const PROVIDER_LABELS: Record<ProviderId, Omit<ProviderCatalogEntry, "id" | "def
     auth: "api-key",
     customBaseURL: false,
     knownModels: MINIMAX_TOKEN_PLAN_MODELS,
+  },
+  "volcengine-agent-plan": {
+    label: "Volcengine Ark Agent Plan",
+    location: "cloud",
+    auth: "api-key",
+    customBaseURL: false,
+    knownModels: VOLCENGINE_AGENT_PLAN_MODELS,
   },
   openai: { label: "OpenAI / compatible", location: "cloud", auth: "api-key", customBaseURL: true },
   qwen: { label: "Qwen (legacy DashScope)", location: "cloud", auth: "api-key", customBaseURL: true, legacy: true },
@@ -596,6 +613,18 @@ function cleanProviderBaseURL(provider: ProviderId, value: string | undefined): 
       throw new Error(`minimax-token-plan uses the fixed endpoint ${MINIMAX_TOKEN_PLAN_BASE_URL}`);
     }
     return MINIMAX_TOKEN_PLAN_BASE_URL;
+  }
+  if (provider === "volcengine-agent-plan") {
+    const expected = new URL(VOLCENGINE_AGENT_PLAN_BASE_URL);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (
+      url.protocol !== expected.protocol
+      || url.host.toLowerCase() !== expected.host.toLowerCase()
+      || pathname !== expected.pathname.replace(/\/+$/, "")
+    ) {
+      throw new Error(`volcengine-agent-plan uses the fixed Beijing endpoint ${VOLCENGINE_AGENT_PLAN_BASE_URL}`);
+    }
+    return VOLCENGINE_AGENT_PLAN_BASE_URL;
   }
   return normalized;
 }

@@ -21,7 +21,7 @@
   never expands permissions. Inspect with **`hara learning list`** and approve/reject/revoke explicitly. The
   separate `memory_*` layer retains curated facts/preferences, while `/evolve status|now` distills reviewable
   candidates and verified skills without rewriting product code, permissions, config, or system prompts.
-- **Multi-provider, all streamed** — Anthropic (Claude) or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI), with live Markdown answers while provider reasoning stays private.
+- **Multi-provider, all streamed** — Anthropic (Claude), Volcengine Ark Agent Plan, or any OpenAI-compatible endpoint (Qwen/DashScope, GLM, Kimi, OpenAI), with live Markdown answers while provider reasoning stays private.
 - **Delegate to other agents** — the **`external_agent`** tool hands a self-contained task to **Claude Code** or **Codex** running headless, and returns the result — so you pick the best engine per task. It is a trusted extension outside Hara's protected-file boundary: every interactive call requires confirmation, and non-interactive use is disabled by default.
 - **Honest under a slow network** — a live "waiting for the model… Ns" status, a stall watchdog that
   auto-fails-over instead of hanging, terminal-native bracketed paste, big pastes folding to a token, and a
@@ -99,6 +99,23 @@ automatically the first time you start `hara` unconfigured). Or configure it you
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+**Volcengine Ark Agent Plan — Codex/Responses route**
+```bash
+hara profile add ark-agent-plan --byok \
+  --provider volcengine-agent-plan \
+  --model ark-code-latest
+# Enter the Agent Plan key at Hara's masked prompt, then:
+hara profile use ark-agent-plan
+```
+
+Hara pins this provider to `https://ark.cn-beijing.volces.com/api/plan/v3`, reads `ARK_API_KEY` when no
+key is stored, and uses the Responses protocol documented for Codex. `ark-code-latest` follows the model
+selected in the Ark console; choose an explicit model id to pin a session. Hara keeps durable history local
+with `store:false`, filters non-conversation media models out of `/model`, and exposes the endpoint's native
+thinking controls. Agent Plan is licensed for supported interactive AI tools, not arbitrary backend API use.
+Direct Codex and Claude Code configuration, including their intentionally different endpoint/protocol,
+is documented in **[docs/volcengine-agent-plan.md](docs/volcengine-agent-plan.md)**.
 
 **Alibaba Model Studio Token Plan** (recommended subscription route)
 ```bash

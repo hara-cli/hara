@@ -93,6 +93,33 @@ test("reasoningParams MiniMax M3 exposes an adaptive thinking on/off switch", ()
   }
 });
 
+test("Volcengine Agent Plan uses the Codex Responses route and Ark-native thinking controls", () => {
+  const baseURL = "https://ark.cn-beijing.volces.com/api/plan/v3";
+  for (const provider of ["volcengine-agent-plan", "openai", "custom"]) {
+    const caps = resolvePlatform(provider, baseURL, undefined, "ark-code-latest");
+    assert.equal(caps.wireApi, "responses", provider);
+    assert.equal(caps.reasoning, "volcengine_responses", provider);
+  }
+  assert.deepEqual(reasoningParams("volcengine_responses", "off", "ark-code-latest"), {
+    thinking: { type: "disabled" },
+  });
+  assert.deepEqual(reasoningParams("volcengine_responses", "low", "ark-code-latest"), {
+    reasoning: { effort: "low" },
+  });
+  assert.deepEqual(reasoningParams("volcengine_responses", "medium", "deepseek-v4-pro"), {
+    reasoning: { effort: "medium" },
+  });
+  assert.deepEqual(
+    reasoningParams("volcengine_responses", "off", "glm-5.3"),
+    {},
+    "Agent Plan documents glm-5.3 as always-thinking",
+  );
+  assert.deepEqual(reasoningParams("volcengine_responses", "off", "glm-5.3-flash"), {
+    thinking: { type: "disabled" },
+  });
+  assert.equal(resolvePlatform("openai", "https://ark.cn-beijing.volces.com.example/api/plan/v3").wireApi, "chat");
+});
+
 test("reasoningParams DeepSeek Chat preserves its native low/high/max levels", () => {
   assert.deepEqual(reasoningParams("deepseek", "off", "deepseek-v4-pro"), { thinking: { type: "disabled" } });
   assert.deepEqual(reasoningParams("deepseek", "low", "deepseek-v4-pro"), {

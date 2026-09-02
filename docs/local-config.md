@@ -10,7 +10,7 @@ provider is required; everything else has a sane default.
 ## Required — the LLM provider
 | key | what | example |
 |---|---|---|
-| `provider` | `anthropic` \| `token-plan` \| `minimax-token-plan` \| `qwen` \| `qwen-oauth` \| `openai` \| `glm` \| `deepseek` \| `openrouter` \| `ollama` \| `lmstudio` \| `hara-gateway` | `token-plan` |
+| `provider` | `anthropic` \| `volcengine-agent-plan` \| `token-plan` \| `minimax-token-plan` \| `qwen` \| `qwen-oauth` \| `openai` \| `glm` \| `deepseek` \| `openrouter` \| `ollama` \| `lmstudio` \| `hara-gateway` | `volcengine-agent-plan` |
 | `apiKey` | provider key (env fallback per provider, e.g. `ANTHROPIC_API_KEY`) | `sk-…` |
 | `model` | default model | `glm-5` |
 | `baseURL` | OpenAI-compatible base (for qwen/openai) | `https://…/v1` |
@@ -25,6 +25,15 @@ native `low` / `high` / `max` grades (`off` is sent as Responses `none`).
 The model picker uses live discovery first and falls back to the two documented V4 ids only for the exact
 official DeepSeek host.
 
+The built-in Volcengine Ark Agent Plan profile uses the fixed Beijing Codex/Responses endpoint
+`https://ark.cn-beijing.volces.com/api/plan/v3`, reads `ARK_API_KEY`, and defaults to
+`ark-code-latest`. It cannot be pointed at the pay-as-you-go `/api/v3` endpoint or the Claude Code
+`/api/plan` endpoint because those are different credential/protocol routes. Live `/models` discovery wins;
+the documented Agent Plan text models are a bounded fallback and media/embedding models stay out of the
+conversation picker. Responses are stateless from Hara's perspective (`store:false`), so the complete local
+message/function history is replayed. See [volcengine-agent-plan.md](volcengine-agent-plan.md) for Hara,
+Codex, and Claude Code setup examples.
+
 The built-in Alibaba Token Plan profile uses the fixed Beijing endpoint. Its documented Qwen 3.8/3.7/3.6,
 DeepSeek V4, and GLM 5.2 Agent models use Responses; the Key-scoped live `/models` result controls what the
 picker marks usable. Qwen 3.8 Max/Flash, Qwen 3.7 Plus, and Qwen 3.6 Flash accept native images; Qwen 3.7 Max,
@@ -33,7 +42,12 @@ use `reasoning.effort`. Token Plan Responses uses `store:false` plus Alibaba's S
 Hara retains the durable transcript locally. Provider-side Harness tools are not automatically enabled,
 because doing so would bypass Hara's local approval and organization-policy tool boundary.
 
-## Subscription plans (Alibaba and MiniMax Token Plan)
+## Subscription plans (Volcengine, Alibaba, and MiniMax)
+
+Volcengine Agent Plan charges shared Agent Fuel Points against 5-hour, weekly, and monthly allowances. The
+5-hour allowance refreshes on a cycle anchored to the first request; the weekly allowance resets on Monday,
+and the monthly allowance follows the subscription month. Without overage billing, exhausting any applicable
+allowance pauses text generation until that period refreshes.
 
 Both Token Plans bill on a shape that surprises anyone expecting per-token pay-as-you-go. Three facts
 explain most "Hara got slow" and "Hara stopped answering" reports, and none of them are visible from a

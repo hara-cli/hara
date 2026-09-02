@@ -12,6 +12,11 @@ test("a subscription plan explains the cost shape a model list cannot show", () 
   // Throughput is the fact that decides whether a slow turn is the plan or the client.
   assert.match(minimax.limits, /15:00–17:30/);
   assert.match(minimax.limits, /tier rather than the client/);
+
+  const volcengine = planNote("volcengine-agent-plan");
+  assert.match(volcengine.billing, /shared across every supported Agent Plan tool/);
+  assert.match(volcengine.limits, /5-hour/);
+  assert.match(volcengine.models, /ark-code-latest/);
 });
 
 test("providers without a subscription plan add no noise", () => {
@@ -28,4 +33,5 @@ test("setup renders billing, limits, then models", () => {
   assert.match(lines[1], /carry over/);
   // MiniMax has no model decision to make yet — one entry in its catalog.
   assert.equal(planNoteLines("minimax-token-plan").length, 2);
+  assert.equal(planNoteLines("volcengine-agent-plan").length, 3);
 });

@@ -427,4 +427,12 @@ test("statusbar: Alibaba plan context windows use exact documented sizes", () =>
   assert.equal(contextWindow("glm-4.7"), 202_752);
   assert.equal(contextWindow("MiniMax-M2.5"), 196_608);
   assert.equal(contextWindow("MiniMax-M3"), 1_000_000);
+  assert.equal(contextWindow("glm-5.3"), 1_024_000);
+  assert.equal(contextWindow("glm-5.3-flash"), 1_024_000);
+  assert.equal(contextWindow("deepseek-v4-flash"), 1_024_000);
+  assert.equal(contextWindow("deepseek-v4-pro"), 1_024_000);
+  assert.equal(contextWindow("kimi-k3"), 1_024_000);
+  assert.equal(contextWindow("doubao-seed-evolving"), 1_024_000);
+  assert.equal(contextWindow("doubao-seed-2.1-turbo"), 256_000);
+  assert.equal(contextWindow("kimi-k2.7-code"), 256_000);
 });

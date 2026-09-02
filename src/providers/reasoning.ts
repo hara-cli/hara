@@ -5,6 +5,7 @@
 // genuinely new style appears (a new provider param shape).
 
 import { isTokenPlanQwenResponsesModel, isTokenPlanResponsesModel } from "./alibaba.js";
+import { volcengineAgentPlanCanDisableThinking } from "./volcengine.js";
 
 export type Effort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | undefined;
 
@@ -21,6 +22,8 @@ export type Effort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "
  *                         maps to `high`, which MiniMax documents as Adaptive Thinking rather than depth.
  *  - `deepseek_responses` — DeepSeek V4 Responses API: `reasoning: { effort }`, with DeepSeek's
  *                         documented none|low|high|max values (`none` disables thinking).
+ *  - `volcengine_responses` — Volcengine Ark Agent Plan Responses: Codex low|medium|high reasoning,
+ *                         plus Ark's native `thinking:{type:"disabled"}` switch where the model permits it.
  *  - `deepseek`         — DeepSeek V4 OpenAI-compat chat: a `thinking: { type }` on/off object PLUS a
  *                         `reasoning_effort` enum whose native values are `low`|`high`|`max` (the server
  *                         maps medium/xhigh → high). OFF must go through
@@ -31,7 +34,7 @@ export type Effort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "
  *  - `ollama_think`     — Ollama's OpenAI-compat endpoint: a `think` boolean that stops a local reasoning
  *                         model's thinking phase (measured: deepseek-r1:14b 17s → 0.6s). Off models ignore it.
  *  - `none`             — the platform has no thinking control; leave the request untouched. */
-export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "qwen_responses" | "alibaba_responses" | "minimax_responses" | "deepseek_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
+export type ReasoningStyle = "enable_thinking" | "reasoning_effort" | "reasoning_object" | "qwen_responses" | "alibaba_responses" | "minimax_responses" | "deepseek_responses" | "volcengine_responses" | "deepseek" | "thinking_budget" | "ollama_think" | "none";
 
 /** OpenAI reasoning families that accept `reasoning_effort` / `reasoning.effort`. Others reject it, so the
  *  `reasoning_effort` / `reasoning_object` styles no-op on non-reasoning models. */
@@ -170,6 +173,17 @@ export function reasoningParams(style: ReasoningStyle, effort: Effort, model = "
             : effort === "low" || effort === "max"
               ? effort
               : "high",
+        },
+      };
+    case "volcengine_responses":
+      if (effort === "off") {
+        return volcengineAgentPlanCanDisableThinking(model)
+          ? { thinking: { type: "disabled" } }
+          : {};
+      }
+      return {
+        reasoning: {
+          effort: effort === "low" || effort === "high" ? effort : "medium",
         },
       };
     case "deepseek":

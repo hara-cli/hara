@@ -1,6 +1,6 @@
 {
   "name": "@nanhara/hara",
-  "version": "0.162.2",
+  "version": "0.163.0",
   "description": "hara — a coding agent CLI that runs like an engineering org.",
   "bin": {
     "hara": "runtime-bootstrap.cjs"
@@ -11,6 +11,7 @@
     "!dist/bin",
     "runtime-bootstrap.cjs",
     "README.md",
+    "docs/volcengine-agent-plan.md",
     "CHANGELOG.md",
     "SECURITY.md",
     "LICENSE",

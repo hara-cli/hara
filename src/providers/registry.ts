@@ -14,6 +14,7 @@ import {
   isOfficialDeepSeekEndpoint,
 } from "./deepseek.js";
 import { isOfficialMiniMaxEndpoint } from "./minimax.js";
+import { isOfficialVolcengineAgentPlanEndpoint } from "./volcengine.js";
 
 /** The wire protocol used to talk to a platform (which transport builds the request + reads the stream). */
 export type WireApi = "chat" | "responses" | "anthropic";
@@ -68,6 +69,7 @@ const BY_PROVIDER: Record<string, Partial<PlatformCaps>> = {
   // the provider conservative if a future saved profile is missing its preset endpoint.
   "token-plan": { wireApi: "chat", reasoning: "none", cache: "auto" },
   "minimax-token-plan": { wireApi: "responses", reasoning: "minimax_responses", cache: "auto" },
+  "volcengine-agent-plan": { wireApi: "responses", reasoning: "volcengine_responses", cache: "auto" },
   qwen: { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" }, // DashScope
   "qwen-oauth": { wireApi: "chat", reasoning: "enable_thinking", cache: "auto" },
   glm: { wireApi: "chat", reasoning: "none", cache: "auto" }, // Zhipu native /paas/v4 — different thinking param; leave alone (its /anthropic endpoint resolves via baseURL)
@@ -91,6 +93,8 @@ export function resolvePlatform(
   const deepSeekResponses = isDeepSeekResponsesModel(providerId, baseURL, modelId);
   const miniMaxEndpoint = isOfficialMiniMaxEndpoint(baseURL);
   const miniMaxResponses = providerId === "minimax-token-plan" || miniMaxEndpoint;
+  const volcengineAgentPlan = providerId === "volcengine-agent-plan"
+    || isOfficialVolcengineAgentPlanEndpoint(baseURL);
   const tokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
   const tokenPlanResponses = tokenPlan && isTokenPlanResponsesModel(modelId ?? "");
   // baseURL shape is the strongest signal for a custom profile; else the provider-id override; else chat.
@@ -98,9 +102,11 @@ export function resolvePlatform(
     ? tokenPlanResponses
       ? { wireApi: "responses" as const, reasoning: "alibaba_responses" as const, cache: "auto" as const }
       : { wireApi: "chat" as const, reasoning: "none" as const, cache: "auto" as const }
-    : miniMaxEndpoint
-      ? { wireApi: "responses" as const, reasoning: "minimax_responses" as const, cache: "auto" as const }
-    : baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
+    : volcengineAgentPlan
+      ? { wireApi: "responses" as const, reasoning: "volcengine_responses" as const, cache: "auto" as const }
+      : miniMaxEndpoint
+        ? { wireApi: "responses" as const, reasoning: "minimax_responses" as const, cache: "auto" as const }
+        : baseURL ? BY_BASEURL.find((r) => r.test.test(baseURL))?.caps : undefined;
   const managedDeepSeekGateway =
     providerId === "hara-gateway"
     && /^(?:deepseek-v4-(?:flash|pro|flash-vision-exp)|deepseek-(?:chat|reasoner|pro))$/i.test(modelId ?? "");
@@ -116,11 +122,13 @@ export function resolvePlatform(
   if (wireApiOverride && wireApiOverride !== resolved.wireApi) {
     const reasoning = wireApiOverride === "responses" && deepSeekResponses
       ? "deepseek_responses"
-      : wireApiOverride === "responses" && miniMaxResponses
-        ? "minimax_responses"
-        : wireApiOverride === "chat" && isOfficialDeepSeekEndpoint(providerId, baseURL)
-          ? "deepseek"
-          : BY_WIRE[wireApiOverride].reasoning;
+      : wireApiOverride === "responses" && volcengineAgentPlan
+        ? "volcengine_responses"
+        : wireApiOverride === "responses" && miniMaxResponses
+          ? "minimax_responses"
+          : wireApiOverride === "chat" && isOfficialDeepSeekEndpoint(providerId, baseURL)
+            ? "deepseek"
+            : BY_WIRE[wireApiOverride].reasoning;
     return { ...resolved, wireApi: wireApiOverride, reasoning };
   }
   return resolved;

@@ -39,6 +39,7 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("openai", "kimi-k2.5"); // Coding Plan: 视觉理解
   V("openai", "glm-4v");
   V("openai", "glm-4.5v");
+  V("volcengine-agent-plan", "glm-5.3-flash");
   V("openai", "deepseek-vl2");
   V("deepseek", "deepseek-v4-flash-vision-exp");
   V("openai", "gemini-2.5-pro");
