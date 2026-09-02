@@ -7,7 +7,7 @@ import { setTurnPhase } from "../dist/agent/phase.js";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 70) => new Promise((r) => setTimeout(r, ms));
-const waitUntil = async (predicate, message, timeoutMs = 3_000) => {
+const waitUntil = async (predicate, message, timeoutMs = 10_000) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;

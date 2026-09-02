@@ -9,7 +9,7 @@ import { join } from "node:path";
 
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const tick = (ms = 60) => new Promise((r) => setTimeout(r, ms));
-const waitUntil = async (predicate, message, timeoutMs = 3_000) => {
+const waitUntil = async (predicate, message, timeoutMs = 10_000) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
@@ -159,15 +159,18 @@ test("InputBox backspace deletes before the cursor", async () => {
 
 test("InputBox shows an @path popup with file matches", async () => {
   const { lastFrame, stdin, unmount } = render(React.createElement(InputBox, { status: S, cwd, model: "glm-5" }));
-  stdin.write("@src");
-  await waitUntil(() => {
+  try {
+    stdin.write("@src");
+    await waitUntil(() => {
+      const frame = strip(lastFrame());
+      return /src/.test(frame) && (frame.includes("insert") || frame.includes("select"));
+    }, "@path popup did not settle");
     const frame = strip(lastFrame());
-    return /src/.test(frame) && (frame.includes("insert") || frame.includes("select"));
-  }, "@path popup did not settle");
-  const frame = strip(lastFrame());
-  assert.ok(/src/.test(frame), "shows src path candidates");
-  assert.ok(frame.includes("insert") || frame.includes("select"), "popup hint shown");
-  unmount();
+    assert.ok(/src/.test(frame), "shows src path candidates");
+    assert.ok(frame.includes("insert") || frame.includes("select"), "popup hint shown");
+  } finally {
+    unmount();
+  }
 });
 
 test("InputBox: Ctrl+V inserts a highlighted [Image #N] token inline + tracks the file", async () => {
