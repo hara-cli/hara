@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.162.2 — 2026-09-02 — deterministic Intel release completion
+
+- Replace the TUI Markdown rendering test's fixed 80 ms sleep with an observable, bounded rendering
+  handshake. A busy release-class Intel runner can no longer withhold otherwise verified native assets because
+  React rendered after the arbitrary delay.
+- Carry forward the complete `0.162.1` reliability fixes. That version reached npm, but its native release and
+  container were withheld after the Intel gate exposed this test race; upgrade to `0.162.2` instead.
+
 ## 0.162.1 — 2026-09-02 — reliable automation intake and resilient session discovery
 
 - Validate scheduled-delivery credentials and reject duplicate prompt-embedded routing before a job is

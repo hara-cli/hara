@@ -480,23 +480,31 @@ test("App Esc aborts the turn and removes a pending free-text ask", async () => 
 });
 
 test("App renders assistant markdown (bold/inline-code styled, not raw)", async () => {
+  let releaseTurn = () => {};
+  const holdTurn = new Promise((resolve) => { releaseTurn = resolve; });
   const onSubmit = async (line, h) => {
     h.sink.assistantDelta("Use **bold** and `code` now.");
-    await tick(200);
+    await holdTurn;
   };
   const { lastFrame, stdin, unmount } = render(
     React.createElement(App, { initialStatus: status, model: "glm-5", cwd: process.cwd(), onSubmit }),
   );
-  await tick();
-  stdin.write("hi");
-  await tick();
-  stdin.write("\r");
-  await tick(80);
-  const f = strip(lastFrame());
-  assert.ok(f.includes("bold") && f.includes("code"), "text content present");
-  assert.ok(!f.includes("**bold**"), "raw ** markers gone — markdown rendered, not literal");
-  // (color is TTY-only via the `c` helper; in a real terminal ink passes the ANSI through — verified by dogfooding)
-  unmount();
+  try {
+    await tick();
+    stdin.write("hi");
+    await waitUntil(() => strip(lastFrame()).includes("hi"), "task text was not rendered before submit");
+    stdin.write("\r");
+    await waitUntil(() => {
+      const frame = strip(lastFrame());
+      return frame.includes("bold") && frame.includes("code");
+    }, "rendered Markdown text did not become visible");
+    const frame = strip(lastFrame());
+    assert.ok(!frame.includes("**bold**"), "raw ** markers gone — markdown rendered, not literal");
+    // (color is TTY-only via the `c` helper; in a real terminal ink passes the ANSI through — verified by dogfooding)
+  } finally {
+    releaseTurn();
+    unmount();
+  }
 });
 
 test("App type-ahead: typing while working queues, then sends after the turn", async () => {
