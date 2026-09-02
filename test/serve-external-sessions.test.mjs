@@ -171,6 +171,15 @@ test("Serve advertises a Personal-only external session interaction surface", as
         controlMode: "live",
       };
     },
+    async resumeSession(requestedSessionId) {
+      assert.equal(requestedSessionId, sessionId);
+      return {
+        session: { ...(await this.listSessions()).sessions[0] },
+        messages: [{ id: "msg_0123456789abcdef01234567", role: "assistant", text: "existing reply" }],
+        readOnly: false,
+        controlMode: "managed",
+      };
+    },
     async forkSession(requestedSessionId) {
       assert.equal(requestedSessionId, sessionId);
       const source = (await this.listSessions()).sessions[0];
@@ -183,7 +192,7 @@ test("Serve advertises a Personal-only external session interaction surface", as
       };
     },
     async submit(requestedSessionId, text, sink) {
-      assert.equal(requestedSessionId, forkedSessionId);
+      assert.equal(requestedSessionId, sessionId);
       assert.equal(text, "continue safely");
       sink.notice("Starting continuation");
       sink.tool("Command", "npm test");
@@ -193,24 +202,24 @@ test("Serve advertises a Personal-only external session interaction surface", as
       await new Promise((resolve) => { finishAfterSteer = resolve; });
       sink.text("world");
       return {
-        sessionId: forkedSessionId,
+        sessionId,
         turnId: "provider-turn-is-not-exposed",
         status: "completed",
         reply: "hello world",
       };
     },
     async steer(requestedSessionId, text) {
-      assert.equal(requestedSessionId, forkedSessionId);
+      assert.equal(requestedSessionId, sessionId);
       assert.equal(text, "add one focused check");
       finishAfterSteer?.();
       return {
-        sessionId: forkedSessionId,
+        sessionId,
         turnId: "adapter-private-turn-is-not-exposed",
         accepted: true,
       };
     },
     async interrupt(requestedSessionId) {
-      assert.equal(requestedSessionId, forkedSessionId);
+      assert.equal(requestedSessionId, sessionId);
       interrupted += 1;
     },
     async close() { closed += 1; },
@@ -230,7 +239,9 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.interaction.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.live-control.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.native-resume.v1"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.create"));
+    assert.ok(initialized.result.capabilities.methods.includes("external.sessions.resume"));
     const listed = await client.call("external.sessions.list", { sourceId: "codex" });
     assert.equal(listed.result.sessions[0].id, sessionId);
     const read = await client.call("external.sessions.read", { sessionId });
@@ -244,33 +255,37 @@ test("Serve advertises a Personal-only external session interaction surface", as
     });
     assert.equal(created.result.session.sourceId, "runtime");
     assert.equal(created.result.controlMode, "live");
-    const forked = await client.call("external.sessions.fork", { sessionId });
-    assert.equal(forked.result.sourceSessionId, sessionId);
-    assert.equal(forked.result.session.id, forkedSessionId);
+    const resumed = await client.call("external.sessions.resume", { sessionId });
+    assert.equal(resumed.result.session.id, sessionId);
+    assert.equal(resumed.result.readOnly, false);
+    assert.equal(resumed.result.controlMode, "managed");
 
-    const submitted = client.call("external.sessions.submit", { sessionId: forkedSessionId, text: "continue safely" });
+    const submitted = client.call("external.sessions.submit", { sessionId, text: "continue safely" });
     const started = await client.waitFor("external.event.turn_start");
     const approval = await client.waitFor("external.approval.request");
-    assert.equal(approval.params.sessionId, forkedSessionId);
+    assert.equal(approval.params.sessionId, sessionId);
     assert.equal(approval.params.question, "Allow test command?");
     const approvalReply = await client.call("approval.reply", { approvalId: approval.params.approvalId, allow: true });
     assert.deepEqual(approvalReply.result, {});
     await client.waitFor("external.event.text");
     const steered = await client.call("external.sessions.steer", {
-      sessionId: forkedSessionId,
+      sessionId,
       text: "add one focused check",
     });
     assert.equal(steered.result.accepted, true);
     assert.equal(steered.result.turnId, started.params.turnId);
     assert.notEqual(steered.result.turnId, "adapter-private-turn-is-not-exposed");
     const completed = await submitted;
-    assert.equal(completed.result.sessionId, forkedSessionId);
+    assert.equal(completed.result.sessionId, sessionId);
     assert.equal(completed.result.reply, "hello world");
     assert.notEqual(completed.result.turnId, "provider-turn-is-not-exposed");
     assert.ok(client.events.some((event) => event.method === "external.event.text" && event.params.delta === "hello "));
     assert.ok(client.events.some((event) => event.method === "external.event.turn_end" && event.params.status === "completed"));
-    await client.call("external.sessions.interrupt", { sessionId: forkedSessionId });
+    await client.call("external.sessions.interrupt", { sessionId });
     assert.equal(interrupted, 1);
+    const forked = await client.call("external.sessions.fork", { sessionId });
+    assert.equal(forked.result.sourceSessionId, sessionId);
+    assert.equal(forked.result.session.id, forkedSessionId);
     client.ws.close();
     await personal.close();
     personal = null;

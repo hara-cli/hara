@@ -2436,7 +2436,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
-            "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.fork",
+            "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
@@ -2478,6 +2478,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.interaction.v1",
             "external.sessions.live-control.v1",
             "external.sessions.runtime.v1",
+            "external.sessions.native-resume.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
@@ -2620,6 +2621,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             return reply(rpcResult(id!, await externalSessions.readSession(p.sessionId)));
+          }
+          case "external.sessions.resume": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            return reply(rpcResult(id!, await externalSessions.resumeSession(p.sessionId)));
           }
           case "external.sessions.fork": {
             if (externalSessionSpaceId() !== "personal") {

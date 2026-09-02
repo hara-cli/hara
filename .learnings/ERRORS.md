@@ -7466,8 +7466,8 @@ sandbox.
 - Related Files: test/deepseek-factory.test.mjs, test/web.test.mjs, test/wecom-gateway.test.mjs, test/serve-agent-identity.test.mjs
 - Tags: tests, sandbox, loopback, websocket, http
 - Pattern-Key: tests.loopback_fixtures_require_release_runner
-- Recurrence-Count: 2
-- Last-Seen: 2026-08-25
+- Recurrence-Count: 3
+- Last-Seen: 2026-09-02
 
 ---
 

@@ -370,7 +370,7 @@ test("Codex App Server metadata is normalized and provider cursors remain server
   }
 });
 
-test("Codex official runtime supports bounded read, safety fork, approval, streaming, and interrupt-safe completion", async () => {
+test("Codex official runtime resumes the selected original session without a duplicate and keeps forking optional", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-external-codex-turn-"));
   try {
     const fixture = join(root, "fake-codex-turn.mjs");
@@ -450,24 +450,41 @@ test("Codex official runtime supports bounded read, safety fork, approval, strea
       ["user", "hello"],
       ["assistant", "prior answer"],
     ]);
-    const forked = await adapter.fork(sourceId);
-    assert.equal(forked.readOnly, false);
-    assert.match(forked.session.id, /^ext_codex_[a-f0-9]{24}$/);
-    assert.deepEqual(added, [["codex", forked.session.id]]);
+    await assert.rejects(
+      adapter.submit(sourceId, "continue too early", {
+        text: () => {},
+        tool: () => {},
+        notice: () => {},
+        confirm: async () => true,
+      }),
+      /resume the original Codex session explicitly/i,
+    );
+    const resumed = await adapter.resume(sourceId);
+    assert.equal(resumed.session.id, sourceId);
+    assert.equal(resumed.readOnly, false);
+    assert.equal(resumed.controlMode, "managed");
+    assert.deepEqual(added, [["codex", sourceId]]);
 
     const deltas = [];
     const approvals = [];
-    const turn = await adapter.submit(forked.session.id, "continue", {
+    const turn = await adapter.submit(sourceId, "continue", {
       text: (delta) => deltas.push(delta),
       tool: () => {},
       notice: () => {},
       confirm: async (request) => { approvals.push(request); return true; },
     });
+    assert.equal(turn.sessionId, sourceId);
     assert.equal(turn.status, "completed");
     assert.equal(turn.reply, "hello world", "stream whitespace is preserved across provider deltas");
     assert.deepEqual(deltas, ["hello ", "world"]);
     assert.match(approvals[0].question, /npm test/);
-    assert.doesNotMatch(JSON.stringify({ listed, read, forked, turn }), /native-(?:source|fork|turn|user-item|agent-item)|\/workspace\/private-project|provider-private-(?:turn|backwards)-cursor/);
+
+    // Forking remains available as an explicit branch operation, but is no longer the continuation path.
+    const forked = await adapter.fork(sourceId);
+    assert.equal(forked.readOnly, false);
+    assert.match(forked.session.id, /^ext_codex_[a-f0-9]{24}$/);
+    assert.deepEqual(added, [["codex", sourceId], ["codex", forked.session.id]]);
+    assert.doesNotMatch(JSON.stringify({ listed, read, resumed, forked, turn }), /native-(?:source|fork|turn|user-item|agent-item)|\/workspace\/private-project|provider-private-(?:turn|backwards)-cursor/);
     await adapter.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -617,7 +634,7 @@ test("Codex shared App Server daemon exposes a loaded thread and steers one acti
   }
 });
 
-test("Claude official Agent SDK mapping keeps native state in Core and makes only a Hara fork writable", async () => {
+test("Claude official Agent SDK resumes the selected original session without a duplicate and keeps forking optional", async () => {
   const sdkCalls = [];
   let queryOptions;
   let closed = false;
@@ -650,7 +667,10 @@ test("Claude official Agent SDK mapping keeps native state in Core and makes onl
       ];
     },
     async forkSession(sessionId, options) { sdkCalls.push(["fork", sessionId, options]); return { sessionId: fork.sessionId }; },
-    async getSessionInfo(sessionId) { sdkCalls.push(["info", sessionId]); return fork; },
+    async getSessionInfo(sessionId) {
+      sdkCalls.push(["info", sessionId]);
+      return sessionId === source.sessionId ? source : fork;
+    },
     query(input) {
       queryOptions = input.options;
       return {
@@ -688,24 +708,39 @@ test("Claude official Agent SDK mapping keeps native state in Core and makes onl
   const read = await adapter.read(sourceId);
   assert.equal(read.readOnly, true);
   assert.deepEqual(read.messages.map((message) => message.text), ["question", "answer"]);
-  const forked = await adapter.fork(sourceId);
-  assert.equal(forked.readOnly, false);
-  assert.ok(owned.has(forked.session.id));
+  await assert.rejects(
+    adapter.submit(sourceId, "continue too early", {
+      text: () => {},
+      tool: () => {},
+      notice: () => {},
+      confirm: async () => true,
+    }),
+    /resume the original Claude session explicitly/i,
+  );
+  const resumed = await adapter.resume(sourceId);
+  assert.equal(resumed.session.id, sourceId);
+  assert.equal(resumed.readOnly, false);
+  assert.equal(resumed.controlMode, "managed");
+  assert.ok(owned.has(sourceId));
   const text = [];
   const approvals = [];
-  const turn = await adapter.submit(forked.session.id, "continue", {
+  const turn = await adapter.submit(sourceId, "continue", {
     text: (delta) => text.push(delta),
     tool: () => {},
     notice: () => {},
     confirm: async (request) => { approvals.push(request); return true; },
   });
   assert.equal(turn.status, "completed");
+  assert.equal(turn.sessionId, sourceId);
   assert.deepEqual(text, ["completed"]);
   assert.equal(closed, true);
-  assert.equal(queryOptions.resume, fork.sessionId);
+  assert.equal(queryOptions.resume, source.sessionId);
   assert.equal(queryOptions.pathToClaudeCodeExecutable, realpathSync("/usr/bin/true"));
   assert.equal(queryOptions.env.OPENAI_API_KEY, undefined);
   assert.match(approvals[0].question, /npm test/);
-  assert.doesNotMatch(JSON.stringify({ listed, read, forked, turn }), /claude-native|\/workspace\/confidential-claude-project|private prompt|private summary/);
+  const forked = await adapter.fork(sourceId);
+  assert.equal(forked.readOnly, false);
+  assert.ok(owned.has(forked.session.id));
+  assert.doesNotMatch(JSON.stringify({ listed, read, resumed, forked, turn }), /claude-native|\/workspace\/confidential-claude-project|private prompt|private summary/);
   assert.ok(sdkCalls.some(([kind]) => kind === "fork"));
 });

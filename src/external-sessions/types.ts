@@ -74,11 +74,11 @@ export interface ExternalSessionMessage {
 export interface ExternalSessionReadResult {
   session: ExternalSessionInfo;
   messages: ExternalSessionMessage[];
-  /** True for provider-owned history. A Hara-created fork is writable on this device. */
+  /** True for provider history that has not yet been explicitly resumed through Hara. */
   readOnly: boolean;
   /**
-   * `live` is the provider's currently loaded session, `managed` is a Hara-owned continuation, and
-   * `history` is a protected provider session that must be forked before Hara writes to it.
+   * `live` is the provider's currently loaded session, `managed` is an explicitly resumed or
+   * Hara-created continuation, and `history` is protected provider history awaiting user consent.
    */
   controlMode: "history" | "managed" | "live";
 }
@@ -154,6 +154,7 @@ export interface ExternalSessionAdapter {
   list(input: { cursor?: string; limit: number; search?: string }): Promise<ExternalSessionAdapterPage>;
   create?(input: Omit<ExternalSessionCreateInput, "sourceId">): Promise<ExternalSessionReadResult>;
   read?(sessionId: string): Promise<ExternalSessionReadResult>;
+  resume?(sessionId: string): Promise<ExternalSessionReadResult>;
   fork?(sessionId: string): Promise<ExternalSessionForkResult>;
   submit?(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
   steer?(sessionId: string, text: string): Promise<ExternalSteerResult>;
@@ -166,6 +167,7 @@ export interface ExternalSessionService {
   listSessions(input?: ExternalSessionListInput): Promise<ExternalSessionListResult>;
   createSession(input: ExternalSessionCreateInput): Promise<ExternalSessionReadResult>;
   readSession(sessionId: string): Promise<ExternalSessionReadResult>;
+  resumeSession(sessionId: string): Promise<ExternalSessionReadResult>;
   forkSession(sessionId: string): Promise<ExternalSessionForkResult>;
   submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
   steer(sessionId: string, text: string): Promise<ExternalSteerResult>;

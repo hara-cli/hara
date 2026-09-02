@@ -191,6 +191,12 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     return await adapter.read(sessionId);
   }
 
+  async resumeSession(sessionId: string): Promise<ExternalSessionReadResult> {
+    const adapter = this.adapterForSession(sessionId);
+    if (!adapter.resume) throw new ExternalSessionInputError("external session source does not support native resume");
+    return await adapter.resume(sessionId);
+  }
+
   async forkSession(sessionId: string): Promise<ExternalSessionForkResult> {
     const adapter = this.adapterForSession(sessionId);
     if (!adapter.fork) throw new ExternalSessionInputError("external session source does not support forking");

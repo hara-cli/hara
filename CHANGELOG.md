@@ -5,6 +5,15 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.161.0 — 2026-09-02 — resume provider sessions in place
+
+- Add an explicit native-resume operation for stored Codex and Claude Code sessions. Selecting “resume in
+  place” keeps the provider's original session identity and history, then submits future messages through
+  Codex App Server or the official Claude Agent SDK instead of silently creating a duplicate branch.
+- Refuse to write to protected provider history until that explicit resume succeeds. Existing live Codex
+  turns remain steerable, Hara Live terminals remain separately managed through Herdr, and creating a fork
+  stays available only as an optional branch operation. Upgrade with `npm i -g @nanhara/hara@0.161.0`.
+
 ## 0.160.0 — 2026-09-02 — Hara Live coding-agent relay
 
 - Add Hara Live, an explicit device-local terminal relay for Codex and Claude Code. Hara starts an isolated

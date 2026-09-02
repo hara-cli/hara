@@ -420,6 +420,39 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
     };
   }
 
+  async resume(sessionId: string): Promise<ExternalSessionReadResult> {
+    const ref = this.ref(sessionId);
+    if (this.running.has(sessionId)) throw new Error("this external Codex session already has a Hara-controlled turn");
+    const result = await runJsonlRpcSequence<CodexThreadResponse>({
+      ...this.options,
+      appServerArgs: await this.appServerArgs(),
+      timeoutMs: this.options.timeoutMs ?? 30_000,
+      requests: this.initializeRequests({
+        id: 2,
+        method: "thread/resume",
+        params: {
+          threadId: ref.nativeId,
+          approvalsReviewer: "user",
+          excludeTurns: true,
+        },
+      }, { experimentalApi: true }),
+      resultId: 2,
+      maxOutputBytes: 16 * 1024 * 1024,
+    });
+    const resumed = result.thread && typeof result.thread === "object" && !Array.isArray(result.thread)
+      ? result.thread as Record<string, unknown>
+      : {};
+    if (typeof resumed.id === "string" && resumed.id !== ref.nativeId) {
+      throw new Error("Codex resumed a different session than the one selected");
+    }
+    const resumedState = stateFromStatus(resumed.status);
+    if (resumedState !== "unknown") ref.info = { ...ref.info, state: resumedState };
+    ref.owned = true;
+    ref.live = await this.usesManagedDaemon();
+    this.options.ownership?.add("codex", sessionId);
+    return await this.read(sessionId);
+  }
+
   async fork(sessionId: string): Promise<ExternalSessionForkResult> {
     const source = this.ref(sessionId);
     const result = await runJsonlRpcSequence<CodexThreadResponse>({
@@ -551,13 +584,10 @@ export class CodexAppServerAdapter implements ExternalSessionAdapter {
   }
 
   async submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult> {
-    let ref = this.ref(sessionId);
+    const ref = this.ref(sessionId);
     if (this.running.has(sessionId)) throw new Error("this external Codex session already has a Hara-controlled turn");
     if (!ref.owned && !ref.live) {
-      const forked = await this.fork(sessionId);
-      ref = this.ref(forked.session.id);
-      sessionId = ref.info.id;
-      sink.notice("Hara forked the Codex session before continuing, so the original remains unchanged.");
+      throw new Error("resume the original Codex session explicitly before sending a message");
     }
     const priorState = ref.info.state;
     const appServerArgs = await this.appServerArgs();

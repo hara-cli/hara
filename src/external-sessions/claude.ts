@@ -223,6 +223,20 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
     };
   }
 
+  async resume(sessionId: string): Promise<ExternalSessionReadResult> {
+    const ref = this.ref(sessionId);
+    if (this.running.has(sessionId)) throw new Error("this external Claude session already has a Hara-controlled turn");
+    const sdk = this.options.sdk ?? await loadOfficialSdk();
+    const metadata = await sdk.getSessionInfo(ref.nativeId, ref.cwd ? { dir: ref.cwd } : {});
+    if (!metadata || metadata.sessionId !== ref.nativeId) {
+      throw new Error("Claude Code could not resume the selected original session");
+    }
+    const info = this.remember(metadata, true);
+    if (!info || info.id !== sessionId) throw new Error("Claude Code resumed a different session than the one selected");
+    this.options.ownership?.add("claude", sessionId);
+    return await this.read(sessionId);
+  }
+
   async fork(sessionId: string): Promise<ExternalSessionForkResult> {
     const source = this.ref(sessionId);
     const sdk = this.options.sdk ?? await loadOfficialSdk();
@@ -254,13 +268,10 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
   }
 
   async submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult> {
-    let ref = this.ref(sessionId);
+    const ref = this.ref(sessionId);
     if (this.running.has(sessionId)) throw new Error("this external Claude session already has a Hara-controlled turn");
     if (!ref.owned) {
-      const forked = await this.fork(sessionId);
-      ref = this.ref(forked.session.id);
-      sessionId = ref.info.id;
-      sink.notice("Hara forked the Claude session before continuing, so the original remains unchanged.");
+      throw new Error("resume the original Claude session explicitly before sending a message");
     }
     const launch = resolveExternalCommandRuntime(this.options.command, this.options.env ?? process.env);
     if (!launch) throw new Error("Claude Code is no longer installed at its verified location");
