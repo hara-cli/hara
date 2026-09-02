@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.162.0 — 2026-09-02 — native Hara Live terminal view
+
+- Let Hara Live sessions start with provider-native model, reasoning-effort, and bounded work-mode
+  preferences. Codex supports read-only or workspace-write plus its fast service tier; Claude Code supports
+  its safe permission modes. Hara rejects unknown options and never exposes host-wide sandbox or permission
+  bypasses through this route.
+- Add a passive native-terminal mirror and bounded prompt/key relay for the exact Hara-owned Codex or Claude
+  Code process. Desktop can keep the structured workbench for status and approvals while opening the same
+  session's terminal view alongside it; refresh is local and does not call an LLM or consume model tokens.
+- Keep terminal drafts, workbench drafts, actions, approvals, and errors isolated by session so switching
+  between several coding agents cannot leak one session's state into another. Upgrade with
+  `npm i -g @nanhara/hara@0.162.0`.
+
 ## 0.161.0 — 2026-09-02 — resume provider sessions in place
 
 - Add an explicit native-resume operation for stored Codex and Claude Code sessions. Selecting “resume in

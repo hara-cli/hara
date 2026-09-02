@@ -14,12 +14,15 @@ import {
 import {
   ExternalSessionInputError,
   type ExternalRuntimeAgentKind,
+  type ExternalRuntimeLaunchOptions,
   type ExternalSessionAdapter,
   type ExternalSessionAdapterPage,
   type ExternalSessionInfo,
   type ExternalSessionMessage,
   type ExternalSessionReadResult,
   type ExternalSessionSourceInfo,
+  type ExternalTerminalKey,
+  type ExternalTerminalSnapshot,
   type ExternalTurnResult,
   type ExternalTurnSink,
 } from "./types.js";
@@ -75,6 +78,14 @@ const DEFAULT_RUNTIME_SESSION = "hara-runtime";
 // socket. Desktop starts it only on explicit user action, so allow one bounded cold-start window.
 const SERVER_START_TIMEOUT_MS = 30_000;
 const TURN_TIMEOUT_MS = 10 * 60_000;
+const SAFE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,159}$/u;
+const CODEX_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+const CLAUDE_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const CLAUDE_PERMISSION_MODES = new Set(["manual", "acceptEdits", "plan", "auto", "dontAsk"]);
+const CODEX_SANDBOX_MODES = new Set(["read-only", "workspace-write"]);
+const TERMINAL_KEYS = new Set<ExternalTerminalKey>([
+  "enter", "esc", "up", "down", "left", "right", "tab", "shift+tab", "ctrl+c", "ctrl+d", "ctrl+l",
+]);
 
 const digest = (kind: "session" | "workspace" | "message", value: string, identityKey: Buffer): string => (
   createHmac("sha256", identityKey)
@@ -144,6 +155,55 @@ const isServerAbsent = (result: ExternalCommandCaptureResult): boolean => (
   !result.ok && result.errorCode === "server_not_running"
 );
 
+const launchArguments = (
+  agentKind: ExternalRuntimeAgentKind,
+  input: ExternalRuntimeLaunchOptions | undefined,
+): string[] => {
+  const launch = input ?? {};
+  if (launch.model !== undefined && !SAFE_MODEL_ID.test(launch.model)) {
+    throw new ExternalSessionInputError("runtime model id is invalid");
+  }
+  if (agentKind === "codex") {
+    if (launch.permissionMode !== undefined) {
+      throw new ExternalSessionInputError("permissionMode applies only to Claude Code");
+    }
+    if (launch.effort !== undefined && !CODEX_EFFORTS.has(launch.effort)) {
+      throw new ExternalSessionInputError("Codex effort must be minimal, low, medium, high, or xhigh");
+    }
+    if (launch.sandboxMode !== undefined && !CODEX_SANDBOX_MODES.has(launch.sandboxMode)) {
+      throw new ExternalSessionInputError("Codex sandbox mode is invalid");
+    }
+    if (launch.serviceTier !== undefined && launch.serviceTier !== "fast") {
+      throw new ExternalSessionInputError("Codex service tier is invalid");
+    }
+    const args = [
+      "-c", "check_for_update_on_startup=false",
+      "--no-alt-screen",
+      // Hara Live cannot safely answer an arbitrary provider terminal approval dialog remotely.
+      "-a", "never",
+      "-s", launch.sandboxMode ?? "workspace-write",
+    ];
+    if (launch.model) args.push("-m", launch.model);
+    if (launch.effort) args.push("-c", `model_reasoning_effort=\"${launch.effort}\"`);
+    if (launch.serviceTier === "fast") args.push("-c", "service_tier=\"fast\"");
+    return args;
+  }
+
+  if (launch.sandboxMode !== undefined || launch.serviceTier !== undefined) {
+    throw new ExternalSessionInputError("sandboxMode and serviceTier apply only to Codex");
+  }
+  if (launch.effort !== undefined && !CLAUDE_EFFORTS.has(launch.effort)) {
+    throw new ExternalSessionInputError("Claude Code effort must be low, medium, high, xhigh, or max");
+  }
+  if (launch.permissionMode !== undefined && !CLAUDE_PERMISSION_MODES.has(launch.permissionMode)) {
+    throw new ExternalSessionInputError("Claude Code permission mode is invalid");
+  }
+  const args = ["--permission-mode", launch.permissionMode ?? "acceptEdits"];
+  if (launch.model) args.push("--model", launch.model);
+  if (launch.effort) args.push("--effort", launch.effort);
+  return args;
+};
+
 export class HaraRuntimeAdapter implements ExternalSessionAdapter {
   readonly id = "runtime" as const;
   private readonly command: ExternalCommandOptions;
@@ -197,6 +257,8 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
         submit: ready,
         steer: false,
         interrupt: ready,
+        terminalView: ready,
+        terminalInput: ready,
       },
     };
   }
@@ -408,7 +470,12 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     return started;
   }
 
-  async create(input: { cwd: string; agentKind: ExternalRuntimeAgentKind; title?: string }): Promise<ExternalSessionReadResult> {
+  async create(input: {
+    cwd: string;
+    agentKind: ExternalRuntimeAgentKind;
+    title?: string;
+    launch?: ExternalRuntimeLaunchOptions;
+  }): Promise<ExternalSessionReadResult> {
     if (!isAbsolute(input.cwd)) throw new ExternalSessionInputError("runtime workspace must be an absolute directory");
     let cwd: string;
     try {
@@ -437,11 +504,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     if (!paneId || !workspaceId) throw new Error("Hara Live could not create a workspace");
 
     const name = `hara-${input.agentKind}-${randomBytes(3).toString("hex")}`;
-    const providerArgs = input.agentKind === "codex"
-      ? ["-c", "check_for_update_on_startup=false", "--no-alt-screen", "-a", "never", "-s", "workspace-write"]
-      // Hara Live cannot safely answer an arbitrary terminal permission dialog on the user's behalf.
-      // acceptEdits keeps the useful workspace-edit path while avoiding Claude's Auto-mode onboarding.
-      : ["--permission-mode", "acceptEdits"];
+    const providerArgs = launchArguments(input.agentKind, input.launch);
     const started = await runExternalCommandCapture(this.command, [
       "agent", "start", name,
       "--kind", input.agentKind,
@@ -526,5 +589,43 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
       "agent", "send-keys", ref.target, "ctrl+c",
     ], { timeoutMs: 8_000, maxOutputBytes: 256 * 1024 });
     if (!result.ok && !runtime) throw new Error("Hara Live could not stop this session");
+  }
+
+  async terminalSnapshot(sessionId: string): Promise<ExternalTerminalSnapshot> {
+    const ref = await this.ref(sessionId);
+    const result = await runExternalCommandCapture(this.command, [
+      "agent", "read", ref.target,
+      "--source", "visible",
+      "--format", "text",
+    ], { timeoutMs: 8_000, maxOutputBytes: 2 * 1024 * 1024 });
+    if (!result.ok) throw new Error("Hara Live could not mirror this terminal");
+    const current = await this.currentAgent(ref);
+    return {
+      sessionId,
+      text: safeTerminalText(result.stdout),
+      state: current.info.state,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  async terminalInput(sessionId: string, text: string): Promise<void> {
+    const ref = await this.ref(sessionId);
+    const result = await runExternalCommandCapture(this.command, [
+      "agent", "prompt", ref.target, text,
+    ], { timeoutMs: 12_000, maxOutputBytes: 256 * 1024 });
+    if (!result.ok) {
+      throw new Error(result.errorCode === "agent_blocked"
+        ? "Hara Live terminal is waiting for an explicit key choice"
+        : "Hara Live could not send terminal input");
+    }
+  }
+
+  async terminalKey(sessionId: string, key: ExternalTerminalKey): Promise<void> {
+    if (!TERMINAL_KEYS.has(key)) throw new ExternalSessionInputError("terminal key is not allowed");
+    const ref = await this.ref(sessionId);
+    const result = await runExternalCommandCapture(this.command, [
+      "agent", "send-keys", ref.target, key,
+    ], { timeoutMs: 8_000, maxOutputBytes: 256 * 1024 });
+    if (!result.ok) throw new Error("Hara Live could not send this terminal key");
   }
 }

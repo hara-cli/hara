@@ -217,6 +217,7 @@ import {
 import { createExternalSessionRegistry } from "../external-sessions/registry.js";
 import {
   ExternalSessionInputError,
+  type ExternalRuntimeLaunchOptions,
   type ExternalSessionService,
   type ExternalSessionSourceId,
 } from "../external-sessions/types.js";
@@ -2438,6 +2439,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt",
+            "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
             "settings.providers.list", "settings.providers.test", "settings.providers.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
@@ -2479,6 +2481,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.live-control.v1",
             "external.sessions.runtime.v1",
             "external.sessions.native-resume.v1",
+            "external.sessions.launch-options.v1",
+            "external.sessions.terminal-mirror.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
@@ -2608,11 +2612,37 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (p.title !== undefined && (typeof p.title !== "string" || p.title.length > 120)) {
               return reply(rpcError(id, ERR.PARAMS, "title must be a string of at most 120 characters"));
             }
+            if (p.launch !== undefined && (!p.launch || typeof p.launch !== "object" || Array.isArray(p.launch))) {
+              return reply(rpcError(id, ERR.PARAMS, "launch must be an object"));
+            }
+            const launch = p.launch as Record<string, unknown> | undefined;
+            if (launch) {
+              const allowed = new Set(["model", "effort", "permissionMode", "sandboxMode", "serviceTier"]);
+              if (Object.keys(launch).some((key) => !allowed.has(key))) {
+                return reply(rpcError(id, ERR.PARAMS, "launch contains an unsupported option"));
+              }
+              if (launch.model !== undefined && (typeof launch.model !== "string" || launch.model.length > 160)) {
+                return reply(rpcError(id, ERR.PARAMS, "launch.model must be a string of at most 160 characters"));
+              }
+              if (launch.effort !== undefined && !["minimal", "low", "medium", "high", "xhigh", "max"].includes(String(launch.effort))) {
+                return reply(rpcError(id, ERR.PARAMS, "launch.effort is invalid"));
+              }
+              if (launch.permissionMode !== undefined && !["manual", "acceptEdits", "plan", "auto", "dontAsk"].includes(String(launch.permissionMode))) {
+                return reply(rpcError(id, ERR.PARAMS, "launch.permissionMode is invalid"));
+              }
+              if (launch.sandboxMode !== undefined && !["read-only", "workspace-write"].includes(String(launch.sandboxMode))) {
+                return reply(rpcError(id, ERR.PARAMS, "launch.sandboxMode is invalid"));
+              }
+              if (launch.serviceTier !== undefined && launch.serviceTier !== "fast") {
+                return reply(rpcError(id, ERR.PARAMS, "launch.serviceTier is invalid"));
+              }
+            }
             return reply(rpcResult(id!, await externalSessions.createSession({
               sourceId: "runtime",
               cwd: p.cwd,
               agentKind: p.agentKind,
               ...(typeof p.title === "string" ? { title: p.title } : {}),
+              ...(launch ? { launch: launch as ExternalRuntimeLaunchOptions } : {}),
             })));
           }
           case "external.sessions.read": {
@@ -2724,6 +2754,35 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             await externalSessions.interrupt(p.sessionId);
+            return reply(rpcResult(id!, {}));
+          }
+          case "external.sessions.terminal.snapshot": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            return reply(rpcResult(id!, await externalSessions.terminalSnapshot(p.sessionId)));
+          }
+          case "external.sessions.terminal.input": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
+            }
+            await externalSessions.terminalInput(p.sessionId, p.text);
+            return reply(rpcResult(id!, {}));
+          }
+          case "external.sessions.terminal.key": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string" || ![
+              "enter", "esc", "up", "down", "left", "right", "tab", "shift+tab", "ctrl+c", "ctrl+d", "ctrl+l",
+            ].includes(String(p.key))) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId + allowed terminal key required"));
+            }
+            await externalSessions.terminalKey(p.sessionId, p.key);
             return reply(rpcResult(id!, {}));
           }
           case "spaces.list": {

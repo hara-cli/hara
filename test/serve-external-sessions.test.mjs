@@ -121,6 +121,8 @@ test("Serve advertises a Personal-only external session interaction surface", as
   const sessionId = "ext_codex_0123456789abcdef01234567";
   const forkedSessionId = "ext_codex_89abcdef0123456789abcdef";
   let interrupted = 0;
+  let terminalInput = "";
+  let terminalKey = "";
   let closed = 0;
   const externalSessions = {
     async listSources() { return sourceResult; },
@@ -151,7 +153,13 @@ test("Serve advertises a Personal-only external session interaction surface", as
       };
     },
     async createSession(input) {
-      assert.deepEqual(input, { sourceId: "runtime", cwd: root, agentKind: "codex", title: "Release relay" });
+      assert.deepEqual(input, {
+        sourceId: "runtime",
+        cwd: root,
+        agentKind: "codex",
+        title: "Release relay",
+        launch: { model: "gpt-5.6-terra", effort: "high", sandboxMode: "read-only", serviceTier: "fast" },
+      });
       return {
         session: {
           id: "ext_runtime_0123456789abcdef01234567",
@@ -222,6 +230,18 @@ test("Serve advertises a Personal-only external session interaction surface", as
       assert.equal(requestedSessionId, sessionId);
       interrupted += 1;
     },
+    async terminalSnapshot(requestedSessionId) {
+      assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
+      return { sessionId: requestedSessionId, text: "native screen", state: "idle", updatedAt: "2026-08-28T00:01:00.000Z" };
+    },
+    async terminalInput(requestedSessionId, text) {
+      assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
+      terminalInput = text;
+    },
+    async terminalKey(requestedSessionId, key) {
+      assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
+      terminalKey = key;
+    },
     async close() { closed += 1; },
   };
   let personal;
@@ -240,6 +260,8 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.live-control.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.native-resume.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.launch-options.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-mirror.v1"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.create"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.resume"));
     const listed = await client.call("external.sessions.list", { sourceId: "codex" });
@@ -252,9 +274,17 @@ test("Serve advertises a Personal-only external session interaction surface", as
       cwd: root,
       agentKind: "codex",
       title: "Release relay",
+      launch: { model: "gpt-5.6-terra", effort: "high", sandboxMode: "read-only", serviceTier: "fast" },
     });
     assert.equal(created.result.session.sourceId, "runtime");
     assert.equal(created.result.controlMode, "live");
+    const terminalSessionId = created.result.session.id;
+    const terminal = await client.call("external.sessions.terminal.snapshot", { sessionId: terminalSessionId });
+    assert.equal(terminal.result.text, "native screen");
+    await client.call("external.sessions.terminal.input", { sessionId: terminalSessionId, text: "/status" });
+    await client.call("external.sessions.terminal.key", { sessionId: terminalSessionId, key: "esc" });
+    assert.equal(terminalInput, "/status");
+    assert.equal(terminalKey, "esc");
     const resumed = await client.call("external.sessions.resume", { sessionId });
     assert.equal(resumed.result.session.id, sessionId);
     assert.equal(resumed.result.readOnly, false);

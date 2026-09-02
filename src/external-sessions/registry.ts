@@ -16,6 +16,8 @@ import {
   type ExternalSessionSourceInfo,
   type ExternalSessionSourceId,
   type ExternalSteerResult,
+  type ExternalTerminalKey,
+  type ExternalTerminalSnapshot,
   type ExternalTurnResult,
   type ExternalTurnSink,
 } from "./types.js";
@@ -170,6 +172,7 @@ export class ExternalSessionRegistry implements ExternalSessionService {
       cwd: input.cwd,
       agentKind: input.agentKind,
       ...(input.title !== undefined ? { title: input.title } : {}),
+      ...(input.launch !== undefined ? { launch: input.launch } : {}),
     });
   }
 
@@ -226,6 +229,34 @@ export class ExternalSessionRegistry implements ExternalSessionService {
   async interrupt(sessionId: string): Promise<void> {
     const adapter = this.adapterForSession(sessionId);
     await adapter.interrupt?.(sessionId);
+  }
+
+  async terminalSnapshot(sessionId: string): Promise<ExternalTerminalSnapshot> {
+    const adapter = this.adapterForSession(sessionId);
+    if (!adapter.terminalSnapshot) {
+      throw new ExternalSessionInputError("this external session does not expose a live terminal");
+    }
+    return await adapter.terminalSnapshot(sessionId);
+  }
+
+  async terminalInput(sessionId: string, text: string): Promise<void> {
+    const adapter = this.adapterForSession(sessionId);
+    if (!adapter.terminalInput) {
+      throw new ExternalSessionInputError("this external session does not accept terminal input");
+    }
+    if (typeof text !== "string" || !text.trim()) throw new ExternalSessionInputError("terminal text is required");
+    if (Buffer.byteLength(text, "utf8") > 64 * 1024) {
+      throw new ExternalSessionInputError("terminal input exceeds 64 KiB");
+    }
+    await adapter.terminalInput(sessionId, text);
+  }
+
+  async terminalKey(sessionId: string, key: ExternalTerminalKey): Promise<void> {
+    const adapter = this.adapterForSession(sessionId);
+    if (!adapter.terminalKey) {
+      throw new ExternalSessionInputError("this external session does not accept terminal keys");
+    }
+    await adapter.terminalKey(sessionId, key);
   }
 
   async close(): Promise<void> {

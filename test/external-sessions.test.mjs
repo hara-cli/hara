@@ -164,6 +164,8 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
           writeState({ cwd });
         } else if (args[0] === "agent" && args[1] === "start") {
           const kind = args[args.indexOf("--kind") + 1];
+          const separator = args.indexOf("--");
+          const providerArgs = separator >= 0 ? args.slice(separator + 1) : [];
           const agent = {
             agent: kind,
             agent_status: "idle",
@@ -177,7 +179,7 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
             terminal_id: "native-terminal-secret",
             workspace_id: "native-workspace",
           };
-          writeState({ agent, text: kind + " ready" });
+          writeState({ agent, text: kind + " ready", providerArgs });
           json({ type: "agent_started", agent, argv: [kind] });
         } else if (args[0] === "agent" && args[1] === "read") {
           process.stdout.write(state.text || "");
@@ -186,6 +188,10 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
         } else if (args[0] === "agent" && args[1] === "prompt") {
           const text = args[3];
           writeState({ text: (state.text || "") + "\\n> " + text });
+          if (!args.includes("--wait")) {
+            json({ type: "agent_info", agent: state.agent });
+            process.exit(0);
+          }
           process.stderr.write(JSON.stringify({ id: "fixture", error: { code: "agent_prompt_stalled", message: "accepted but state transition was delayed" } }) + "\\n");
           process.exit(1);
         } else if (args[0] === "agent" && args[1] === "wait") {
@@ -202,7 +208,7 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
           });
           json({ type: "agent_info", agent });
         } else if (args[0] === "agent" && args[1] === "send-keys") {
-          writeState({ text: (state.text || "") + "\\ninterrupted" });
+          writeState({ text: (state.text || "") + "\\nkey:" + args[3], lastKey: args[3] });
           json({ type: "agent_info", agent: state.agent });
         } else if (args[0] === "workspace" && args[1] === "close") {
           json({ type: "ok" });
@@ -226,7 +232,12 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     assert.equal(source.capabilities.create, true);
     assert.deepEqual((await adapter.list({ limit: 10 })).sessions, []);
 
-    const created = await adapter.create({ cwd: root, agentKind: "codex", title: "Release worker" });
+    const created = await adapter.create({
+      cwd: root,
+      agentKind: "codex",
+      title: "Release worker",
+      launch: { model: "gpt-5.6-terra", effort: "high", sandboxMode: "read-only", serviceTier: "fast" },
+    });
     assert.equal(created.readOnly, false);
     assert.equal(created.controlMode, "live");
     assert.equal(created.session.sourceId, "runtime");
@@ -234,6 +245,20 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     assert.match(created.session.id, /^ext_runtime_[a-f0-9]{24}$/);
     assert.equal(created.session.workspaceName, basename(root));
     assert.deepEqual(created.messages.map(({ role, text }) => [role, text]), [["assistant", "codex ready"]]);
+    assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")).providerArgs, [
+      "-c", "check_for_update_on_startup=false", "--no-alt-screen", "-a", "never", "-s", "read-only",
+      "-m", "gpt-5.6-terra", "-c", 'model_reasoning_effort="high"', "-c", 'service_tier="fast"',
+    ]);
+
+    const snapshot = await adapter.terminalSnapshot(created.session.id);
+    assert.equal(snapshot.sessionId, created.session.id);
+    assert.match(snapshot.text, /codex ready/);
+    await adapter.terminalInput(created.session.id, "/status");
+    await adapter.terminalKey(created.session.id, "esc");
+    const terminalState = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.match(terminalState.text, /> \/status/);
+    assert.equal(terminalState.lastKey, "esc");
+    await assert.rejects(adapter.terminalKey(created.session.id, "ctrl+z"), /not allowed/);
 
     const listed = await adapter.list({ limit: 10 });
     const metadata = JSON.stringify({ source, listed });

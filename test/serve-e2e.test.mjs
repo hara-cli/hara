@@ -556,6 +556,8 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "external.sessions.live-control.v1",
         "external.sessions.runtime.v1",
         "external.sessions.native-resume.v1",
+        "external.sessions.launch-options.v1",
+        "external.sessions.terminal-mirror.v1",
         "spaces.tenant-boundary.v1",
       ],
       "persistent clients can negotiate attachments, model descriptors, safe recovery, explicit Space routing, reviewed learning, action ownership, Agent profiles, verified blueprints, Hara Live runtime control, and tenant Spaces",

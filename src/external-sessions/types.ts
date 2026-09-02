@@ -9,6 +9,26 @@ export type ExternalSessionSourceId = "codex" | "claude" | "runtime";
 
 export type ExternalRuntimeAgentKind = "codex" | "claude";
 
+export type ExternalRuntimeEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export type ExternalRuntimeClaudePermissionMode = "manual" | "acceptEdits" | "plan" | "auto" | "dontAsk";
+
+export type ExternalRuntimeCodexSandboxMode = "read-only" | "workspace-write";
+
+export type ExternalRuntimeServiceTier = "fast";
+
+/**
+ * Provider-native launch preferences for a Hara-owned terminal session. Hara deliberately exposes
+ * only bounded, non-bypass choices; full host access and permission bypass stay unavailable here.
+ */
+export interface ExternalRuntimeLaunchOptions {
+  model?: string;
+  effort?: ExternalRuntimeEffort;
+  permissionMode?: ExternalRuntimeClaudePermissionMode;
+  sandboxMode?: ExternalRuntimeCodexSandboxMode;
+  serviceTier?: ExternalRuntimeServiceTier;
+}
+
 export type ExternalSessionSourceState =
   | "ready"
   | "adapter_required"
@@ -33,6 +53,10 @@ export interface ExternalSessionSourceCapabilities {
   submit: boolean;
   steer: boolean;
   interrupt: boolean;
+  /** Hara Live can expose a passive snapshot of its original provider terminal. */
+  terminalView?: boolean;
+  /** Hara Live can relay an explicit prompt or a bounded logical key to that same terminal. */
+  terminalInput?: boolean;
 }
 
 export interface ExternalSessionSourceInfo {
@@ -130,7 +154,28 @@ export interface ExternalSessionCreateInput {
   cwd: string;
   agentKind: ExternalRuntimeAgentKind;
   title?: string;
+  launch?: ExternalRuntimeLaunchOptions;
 }
+
+export interface ExternalTerminalSnapshot {
+  sessionId: string;
+  text: string;
+  state: ExternalSessionState;
+  updatedAt: string;
+}
+
+export type ExternalTerminalKey =
+  | "enter"
+  | "esc"
+  | "up"
+  | "down"
+  | "left"
+  | "right"
+  | "tab"
+  | "shift+tab"
+  | "ctrl+c"
+  | "ctrl+d"
+  | "ctrl+l";
 
 export interface ExternalSessionListResult {
   sources: ExternalSessionSourceInfo[];
@@ -159,6 +204,9 @@ export interface ExternalSessionAdapter {
   submit?(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
   steer?(sessionId: string, text: string): Promise<ExternalSteerResult>;
   interrupt?(sessionId: string): Promise<void>;
+  terminalSnapshot?(sessionId: string): Promise<ExternalTerminalSnapshot>;
+  terminalInput?(sessionId: string, text: string): Promise<void>;
+  terminalKey?(sessionId: string, key: ExternalTerminalKey): Promise<void>;
   close?(): Promise<void>;
 }
 
@@ -172,6 +220,9 @@ export interface ExternalSessionService {
   submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
   steer(sessionId: string, text: string): Promise<ExternalSteerResult>;
   interrupt(sessionId: string): Promise<void>;
+  terminalSnapshot(sessionId: string): Promise<ExternalTerminalSnapshot>;
+  terminalInput(sessionId: string, text: string): Promise<void>;
+  terminalKey(sessionId: string, key: ExternalTerminalKey): Promise<void>;
   close(): Promise<void>;
 }
 
