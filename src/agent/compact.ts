@@ -11,6 +11,11 @@ export const AUTO_COMPACT_PCT = 85;
  *  regardless of how large the window is. Overridable via `HARA_AUTO_COMPACT_TOKENS`. */
 export const AUTO_COMPACT_TOKEN_CAP = 200_000;
 
+/** Durable transcripts can grow much faster than a provider's reported token usage when failed tool
+ * rounds append large diagnostics or image metadata. Compact before the request guard has to discard a
+ * large part of the working transcript, even if the previous model call failed and reported no usage. */
+export const AUTO_COMPACT_HISTORY_CHAR_CAP = 480_000;
+
 /** Parse the optional absolute trigger without letting NaN, infinity, zero, or a negative value turn
  * every ordinary conversation into a compaction request. */
 export function autoCompactTokenCap(value: unknown): number {
@@ -173,4 +178,16 @@ export function shouldAutoCompact(ctxPct: number, historyLen: number, autoCompac
  *  unreachable 850k. Either trigger (this OR the %-of-window one) compacts. */
 export function shouldAutoCompactTokens(lastInputTokens: number, historyLen: number, autoCompact: boolean, cap = AUTO_COMPACT_TOKEN_CAP): boolean {
   return autoCompact && historyLen >= 4 && lastInputTokens >= cap;
+}
+
+export function shouldAutoCompactHistoryChars(
+  durableHistoryChars: number,
+  historyLen: number,
+  autoCompact: boolean,
+  cap = AUTO_COMPACT_HISTORY_CHAR_CAP,
+): boolean {
+  return autoCompact
+    && historyLen >= 4
+    && Number.isFinite(durableHistoryChars)
+    && durableHistoryChars >= cap;
 }

@@ -107,6 +107,10 @@ export interface Profile {
   availableModels?: string[];
   /** Server-advertised thinking dial for the scoped gateway model. */
   thinkingEfforts?: string[];
+  /** User-selected default reasoning effort for this exact BYOK connection. Keeping this on the
+   *  connection (rather than the global Personal config) lets two accounts from the same provider
+   *  retain different defaults without sharing mutable state. */
+  reasoningEffort?: string;
   /** Modern Controls advertise reasoning levels per model. The shared `thinkingEfforts` field above
    * remains a backward-compatible intersection for older clients. */
   modelCapabilities?: GatewayModelCapability[];
@@ -124,8 +128,8 @@ export interface Profile {
    * without these fields. */
   createdAt?: string;
   updatedAt?: string;
-  /** Compatibility-only route retained so sessions created before the single-Personal-connection
-   * migration can still resume. It is never offered as another user-selectable Personal connection. */
+  /** Marker written by the short-lived single-Personal-connection migration. Modern releases expose the
+   * route as an ordinary independent account again while preserving the marker for downgrade compatibility. */
   archivedPersonalRoute?: boolean;
 }
 
@@ -292,6 +296,7 @@ function readPersonalFromConfig(): Profile {
       : undefined,
     visionBaseURL: typeof cfg.visionBaseURL === "string" ? cfg.visionBaseURL : undefined,
     visionApiKey: typeof cfg.visionApiKey === "string" ? cfg.visionApiKey : undefined,
+    reasoningEffort: typeof cfg.reasoningEffort === "string" ? cfg.reasoningEffort : undefined,
     // No per-profile override yet for the personal slot — `model` (override) and `defaultModel`
     // come from the same field in config.json. `hara model use X` writes `model` to config.json,
     // `hara model reset` clears it. Conceptually one slot, but the rest of the codebase only ever

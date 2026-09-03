@@ -36,9 +36,11 @@ import {
   normalizeCompactionSummary,
   recentHistoryForCompaction,
   shouldAutoCompact,
+  shouldAutoCompactHistoryChars,
   shouldAutoCompactTokens,
   workingSetFromSummary,
 } from "../agent/compact.js";
+import { historyChars } from "../agent/context-budget.js";
 import { rewindTo } from "../agent/rewind.js";
 import { analyzeContext } from "../agent/context-report.js";
 import { clearTouched, recentTouched } from "../agent/touched.js";
@@ -598,6 +600,7 @@ export function serveAutoCompactDecision(
   lastInput: number,
   historyLength: number,
   policy: { enabled: boolean; tokenCap?: number } | undefined,
+  durableHistoryChars = 0,
 ): ServeAutoCompactDecision {
   const safeLastInput = Number.isFinite(lastInput) ? Math.max(0, Math.floor(lastInput)) : 0;
   const tokenCap = autoCompactTokenCap(policy?.tokenCap);
@@ -606,7 +609,8 @@ export function serveAutoCompactDecision(
   return {
     compact:
       shouldAutoCompact(pct, historyLength, enabled)
-      || shouldAutoCompactTokens(safeLastInput, historyLength, enabled, tokenCap),
+      || shouldAutoCompactTokens(safeLastInput, historyLength, enabled, tokenCap)
+      || shouldAutoCompactHistoryChars(durableHistoryChars, historyLength, enabled),
     pct,
     tokenCap,
   };
@@ -1826,7 +1830,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     broadcast("event.turn_start", { sessionId, taskId: s.task.id, turnId: s.task.turnId });
     runtimeLog("turn.started", { sessionId });
     emitTaskState({ state: "running", phase: "starting" });
-    const historyStart = s.history.length;
+    let historyStart = s.history.length;
     const before = { input: s.stats.input, output: s.stats.output };
     const sink: UiSink = {
       text: (d) => {
@@ -1900,7 +1904,51 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     let stopTodoEvents = (): void => {};
     try {
       if (!(await refreshSessionProvider(s))) {
-        throw new Error(`provider not authenticated for pinned model '${s.meta.model}' at ${s.meta.cwd}`);
+        throw new Error(s.meta.spaceId && s.meta.spaceId !== "personal"
+          ? "company access expired or was revoked; local conversation history is unchanged; sign in or re-enroll before continuing"
+          : `provider not authenticated for pinned model '${s.meta.model}' at ${s.meta.cwd}`);
+      }
+      // Compact the durable transcript before building the next provider request. Failed tool rounds do
+      // not reach the successful-turn compactor below, but they can still append large diagnostics and
+      // image metadata. Waiting until after the next model call would make the request-only context guard
+      // discard useful history without replacing it with a durable checkpoint.
+      const preflightDecision = serveAutoCompactDecision(
+        s.meta.model,
+        // Percentage/token triggers are handled after every successful turn. Preflight exists for
+        // failure-grown durable history only; reusing the last watermark here would immediately
+        // summarize an already-compacted checkpoint again when a custom low token cap is configured.
+        0,
+        s.history.length,
+        deps.autoCompact?.(s.meta.cwd),
+        historyChars(s.history),
+      );
+      if (preflightDecision.compact && !turnAbort.signal.aborted) {
+        broadcast("event.notice", {
+          sessionId,
+          text: "✻ Auto-compacting large durable history before this request…",
+        });
+        const compactAbort = new AbortController();
+        const abortCompact = (): void => compactAbort.abort();
+        turnAbort.signal.addEventListener("abort", abortCompact, { once: true });
+        try {
+          const summary = await compactSession(s, compactAbort);
+          broadcast("event.notice", {
+            sessionId,
+            text: summary
+              ? `(auto-compacted — context replaced with a summary; ${s.meta.workingSet?.length ?? 0} notes kept)`
+              : "(auto-compact failed — conversation was kept and this request will continue)",
+          });
+        } catch {
+          broadcast("event.notice", {
+            sessionId,
+            text: "(auto-compact failed — conversation was kept and this request will continue)",
+          });
+        } finally {
+          turnAbort.signal.removeEventListener("abort", abortCompact);
+        }
+        // Compaction replaces the backing array. Reply extraction must start after the new checkpoint,
+        // not at the old (usually much larger) transcript index.
+        historyStart = s.history.length;
       }
       // Resolve company-managed roles only after the session/provider audience has been revalidated.
       const sessionRole = roleForSession(s);
@@ -2191,19 +2239,27 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           s.stats.lastInput ?? 0,
           s.history.length,
           deps.autoCompact?.(s.meta.cwd),
+          historyChars(s.history),
         );
         if (decision.compact && !turnAbort.signal.aborted) {
           broadcast("event.notice", {
             sessionId,
             text: `✻ Auto-compacting conversation (context ${decision.pct}% full, ~${Math.round((s.stats.lastInput ?? 0) / 1000)}k tok)…`,
           });
-          const summary = await compactSession(s, turnAbort);
-          broadcast("event.notice", {
-            sessionId,
-            text: summary
-              ? `(auto-compacted — context replaced with a summary; ${s.meta.workingSet?.length ?? 0} notes kept)`
-              : "(auto-compact failed — conversation was kept; use Compact or start a new conversation)",
-          });
+          const compactAbort = new AbortController();
+          const abortCompact = (): void => compactAbort.abort();
+          turnAbort.signal.addEventListener("abort", abortCompact, { once: true });
+          try {
+            const summary = await compactSession(s, compactAbort);
+            broadcast("event.notice", {
+              sessionId,
+              text: summary
+                ? `(auto-compacted — context replaced with a summary; ${s.meta.workingSet?.length ?? 0} notes kept)`
+                : "(auto-compact failed — conversation was kept; use Compact or start a new conversation)",
+            });
+          } finally {
+            turnAbort.signal.removeEventListener("abort", abortCompact);
+          }
         }
       } catch {
         broadcast("event.notice", {

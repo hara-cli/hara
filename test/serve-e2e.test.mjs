@@ -3594,6 +3594,70 @@ test("serve automatically compacts a completed Desktop turn without replacing it
   }
 });
 
+test("serve compacts oversized durable history before retrying after a failed turn", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-preflight-compact-"));
+  const store = memStore();
+  let summaryCalls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ history, onText, tools }) {
+      if (tools.length === 0) {
+        summaryCalls += 1;
+        return {
+          text: "Verified checkpoint: preserve the user's current task and the latest recovery request.",
+          toolUses: [],
+          stop: "end",
+          usage: { input: 20, output: 5 },
+        };
+      }
+      const latest = [...history].reverse().find((message) => message.role === "user")?.content ?? "";
+      if (latest.includes("FAIL_WITH_LARGE_HISTORY")) {
+        return { text: "", toolUses: [], stop: "error", errorMsg: "image adapter failed", usage: { input: 1, output: 0 } };
+      }
+      const reply = latest.includes("retry after compaction") ? "retry completed" : "seed completed";
+      onText?.(reply);
+      return { text: reply, toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    {
+      ...baseDeps(provider, store),
+      autoCompact: () => ({ enabled: true, tokenCap: 9_999_999 }),
+    },
+  );
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const sid = (await c.call("session.create", {})).result.sessionId;
+    assert.equal((await c.call("session.send", { sessionId: sid, text: "seed one" })).result.reply, "seed completed");
+    assert.equal((await c.call("session.send", { sessionId: sid, text: "seed two" })).result.reply, "seed completed");
+
+    const failed = await c.call("session.send", {
+      sessionId: sid,
+      text: `FAIL_WITH_LARGE_HISTORY\n${"diagnostic ".repeat(50_000)}`,
+    });
+    assert.equal(failed.error.code, -32603);
+    assert.equal(summaryCalls, 0, "a failed turn cannot use the success-only compactor");
+
+    const retried = await c.call("session.send", { sessionId: sid, text: "retry after compaction" });
+    assert.equal(retried.result.reply, "retry completed");
+    assert.equal(summaryCalls, 1, "the next request first creates one durable checkpoint");
+    assert.ok(store.saved.get(sid).history[0].content.startsWith("Execution checkpoint"));
+    assert.ok(
+      c.events
+        .filter((event) => event.method === "event.notice")
+        .some((event) => event.params.text.includes("before this request")),
+      "Desktop is told that recovery compaction happened before the retry",
+    );
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: files.search + session.context + compact + rewind (codex desktop parity set)", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-"));
   mkdirSync(join(dir, "src"), { recursive: true });

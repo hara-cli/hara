@@ -2,9 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   AUTO_COMPACT_PCT,
+  AUTO_COMPACT_HISTORY_CHAR_CAP,
   AUTO_COMPACT_TOKEN_CAP,
   autoCompactTokenCap,
   shouldAutoCompact,
+  shouldAutoCompactHistoryChars,
   shouldAutoCompactTokens,
 } from "../dist/agent/compact.js";
 
@@ -35,4 +37,12 @@ test("shouldAutoCompactTokens: absolute cap fires on huge-window models where 85
   assert.equal(shouldAutoCompactTokens(300_000, 10, false), false, "disabled (opt-out) wins");
   assert.equal(shouldAutoCompactTokens(300_000, 2, true), false, "too little history to bother");
   assert.equal(shouldAutoCompactTokens(120_000, 10, true, 100_000), true, "custom (lower) cap honored");
+});
+
+test("shouldAutoCompactHistoryChars: failed tool rounds still trigger proactive compaction", () => {
+  assert.equal(shouldAutoCompactHistoryChars(AUTO_COMPACT_HISTORY_CHAR_CAP, 4, true), true);
+  assert.equal(shouldAutoCompactHistoryChars(862_000, 12, true), true);
+  assert.equal(shouldAutoCompactHistoryChars(AUTO_COMPACT_HISTORY_CHAR_CAP - 1, 12, true), false);
+  assert.equal(shouldAutoCompactHistoryChars(862_000, 2, true), false);
+  assert.equal(shouldAutoCompactHistoryChars(862_000, 12, false), false);
 });

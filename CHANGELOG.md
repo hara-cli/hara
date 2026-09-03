@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.165.0 — 2026-09-03 — multiple personal model connections
+
+- Save any number of independent Personal model connections and switch the default used by new sessions.
+  Accounts from the same provider keep separate keys, endpoints, models, and reasoning defaults; testing,
+  removal, and session pinning always target the exact connection and never borrow another account's key.
+- Recover pre-`0.164.2` vision-first routes that stored an independent compatible endpoint without its
+  provider adapter. Images once again run through the fixed recognition prompt, and only the returned text
+  reaches the conversation model; credentials remain redacted and scoped to the owning connection.
+- Auto-compact an oversized durable Serve history before the next retry, including history enlarged by a
+  failed tool/image turn that reported no usable token watermark. Compaction has its own bounded cancellation
+  controller, so a summary timeout cannot abort the user's otherwise valid next request.
+- Return a focused, history-preserving re-enrollment error when a company connection is revoked or expires,
+  allowing Desktop to quarantine the route instead of displaying a raw provider-authentication diagnostic.
+
 ## 0.164.2 — 2026-09-03 — connection-bound vision and current Ark models
 
 - Bind the vision-first route to the exact Personal or company model connection. Company Spaces can select

@@ -93,8 +93,6 @@ import {
   useProfile,
   addProfile,
   removeProfile,
-  archiveHistoricalPersonalRoutes,
-  removeHistoricalPersonalRoutes,
   syncStoredPersonalProfile,
   setModel as setProfileModel,
   resetModel as resetProfileModel,
@@ -485,9 +483,12 @@ async function buildProvider(
 
   const baseTarget = resolveByokProviderTarget(cfg, ap, false);
   const target = overrideProviderTarget(baseTarget, targetOverride);
+  const connectionReasoningEffort = ap.id === PERSONAL_ID
+    ? cfg.reasoningEffort
+    : ap.reasoningEffort as HaraConfig["reasoningEffort"];
   const reasoningEffort = reasoningEffortOverride === null
     ? undefined
-    : reasoningEffortOverride ?? cfg.reasoningEffort;
+    : reasoningEffortOverride ?? connectionReasoningEffort;
   const rawProvider = await createProviderForTarget(target, reasoningEffort);
   let built = rawProvider;
   if (rawProvider && expectedSpaceId !== PERSONAL_ID) {
@@ -539,19 +540,16 @@ async function buildImageProviderForRoute(
     if (routeProfile.kind === "gateway" && vision.source === "custom") {
       throw new Error("company vision routing must reuse the managed provider connection");
     }
-    if (vision.source === "custom" && !vision.provider) {
-      throw new Error("the independent vision interface is missing its provider/protocol adapter");
-    }
-    const visionProviderId = vision.source === "custom" ? vision.provider! : primary.id;
+    const visionProviderId = visionProviderForRoute(cfg, vision, primary.id);
     if (classifyVision(visionProviderId, vision.model, cfg.modelVision) !== "vision") {
       throw new Error(`vision-first model '${vision.model}' is not confirmed to accept image input`);
     }
-    if (vision.source === "custom" && providerRequiresApiKey(vision.provider!) && !vision.apiKey) {
+    if (vision.source === "custom" && providerRequiresApiKey(visionProviderId) && !vision.apiKey) {
       throw new Error("the independent vision interface is missing its API key");
     }
     const imageProvider = await buildProvider(cfg, {
       ...(vision.source === "custom"
-        ? { provider: vision.provider!, baseURL: vision.baseURL, apiKey: vision.apiKey }
+        ? { provider: visionProviderId, baseURL: vision.baseURL, apiKey: vision.apiKey }
         : {}),
       model: vision.model,
     }, routeProfile.id, expectedSpaceId, null, true);
@@ -845,62 +843,52 @@ function personalProviderConnectionsSnapshot(
   resolution: ActiveResolution,
   catalog: ReturnType<typeof providerCatalog>,
 ) {
-  const personal = personalProfileForSettings(live, resolution);
-  const target = resolveByokProviderTarget(live, personal, false, {});
-  const entry = catalog.find((item) => item.id === target.provider)!;
-  const keyConfigured = providerIsLocal(target.provider)
-    || (target.provider === "qwen-oauth" ? loadQwenToken() !== null : !!target.apiKey);
-  const raw = readRawConfig();
-  const configured = personal.id !== PERSONAL_ID
-    || ["provider", "model", "baseURL", "apiKey"].some((key) => Object.hasOwn(raw, key));
-  const reasoningStyle = resolvePlatform(
-    target.provider,
-    target.baseURL ?? providerDefaultBaseURL(target.provider),
-    undefined,
-    target.model,
-  ).reasoning;
-  const effortLevels = levelsFor(reasoningStyle, target.model)
-    .filter((effort): effort is NonNullable<typeof effort> => !!effort);
-  const reasoningEffort = live.reasoningEffort
-    ? normalizeEffort(reasoningStyle, target.model, live.reasoningEffort)
-    : undefined;
-  return [{
-    id: PERSONAL_ID,
-    label: entry.label,
-    provider: target.provider,
-    model: target.model,
-    ...(target.baseURL ? { baseURL: target.baseURL } : {}),
-    location: entry.location as "cloud" | "local",
-    auth: entry.auth as "api-key" | "oauth" | "none",
-    keyConfigured,
-    authenticated: keyConfigured,
-    active: listProfiles().find((profile) => profile.id === resolution.id)?.kind === "byok",
-    legacyPersonal: true,
-    removable: configured,
-    ...(reasoningEffort ? { reasoningEffort } : {}),
-    effortLevels,
-    ...(target.apiKey ? { keyHint: maskKey(target.apiKey) } : {}),
-  }];
-}
-
-/** Desktop presents one Personal connection even when an older CLI/Desktop build left named BYOK routes.
- * Prefer the active compatible route, or the only unarchived legacy route while a company is active. The
- * route keeps its internal id so existing sessions remain bound, but it is exposed as the one Personal slot. */
-function personalProfileForSettings(live: HaraConfig, resolution: ActiveResolution): Profile {
-  const profiles = listProfiles();
-  const active = profiles.find((profile) => profile.id === resolution.id);
-  if (active?.kind === "byok" && !active.archivedPersonalRoute) {
-    return profileByIdForConfig(live, active.id) ?? active;
-  }
-  const compatible = profiles.filter((profile) => (
-    profile.kind === "byok"
-    && profile.id !== PERSONAL_ID
-    && !profile.archivedPersonalRoute
-  ));
-  if (compatible.length === 1) {
-    return profileByIdForConfig(live, compatible[0].id) ?? compatible[0];
-  }
-  return profileByIdForConfig(live, PERSONAL_ID)!;
+  const personal = profileByIdForConfig(live, PERSONAL_ID)!;
+  return listProfiles()
+    .filter((candidate) => candidate.kind === "byok")
+    .map((candidate) => candidate.id === PERSONAL_ID ? personal : candidate)
+    .filter((candidate) => !!candidate.provider && candidate.provider !== "hara-gateway")
+    .map((candidate) => {
+      // A card describes one persisted route. Provider ID is deliberately not a uniqueness key: two
+      // accounts at the same endpoint remain separate because their profile IDs and credentials differ.
+      const target = resolveByokProviderTarget(live, candidate, false, {});
+      const entry = catalog.find((item) => item.id === target.provider)!;
+      const keyConfigured = providerIsLocal(target.provider)
+        || (target.provider === "qwen-oauth" ? loadQwenToken() !== null : !!target.apiKey);
+      const reasoningStyle = resolvePlatform(
+        target.provider,
+        target.baseURL ?? providerDefaultBaseURL(target.provider),
+        undefined,
+        target.model,
+      ).reasoning;
+      const effortLevels = levelsFor(reasoningStyle, target.model)
+        .filter((effort): effort is NonNullable<typeof effort> => !!effort);
+      const savedEffort = candidate.id === PERSONAL_ID ? live.reasoningEffort : candidate.reasoningEffort;
+      const reasoningEffort = savedEffort
+        ? normalizeEffort(reasoningStyle, target.model, savedEffort as NonNullable<HaraConfig["reasoningEffort"]>)
+        : undefined;
+      const raw = candidate.id === PERSONAL_ID ? readRawConfig() : null;
+      const canonicalConfigured = candidate.id !== PERSONAL_ID
+        || ["provider", "model", "baseURL", "apiKey"].some((key) => raw && Object.hasOwn(raw, key));
+      return {
+        id: candidate.id,
+        label: candidate.label || (candidate.id === PERSONAL_ID ? entry.label : candidate.id),
+        provider: target.provider,
+        model: target.model,
+        ...(target.baseURL ? { baseURL: target.baseURL } : {}),
+        location: entry.location as "cloud" | "local",
+        auth: entry.auth as "api-key" | "oauth" | "none",
+        keyConfigured,
+        authenticated: keyConfigured,
+        active: resolution.id === candidate.id,
+        legacyPersonal: candidate.id === PERSONAL_ID,
+        removable: candidate.id !== PERSONAL_ID || canonicalConfigured,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        effortLevels,
+        ...(target.apiKey ? { keyHint: maskKey(target.apiKey) } : {}),
+        ...(candidate.createdAt ? { createdAt: candidate.createdAt } : {}),
+      };
+    });
 }
 
 const visionEnvironmentOverride = (): boolean => Boolean(
@@ -917,6 +905,27 @@ interface ConnectionVisionRoute {
   provider?: ProviderId;
   baseURL?: string;
   apiKey?: string;
+}
+
+/** Releases before provider-bound vision settings stored an independent OpenAI-compatible endpoint and
+ * key without the adapter ID. Recover those routes from an exact official endpoint when possible and
+ * otherwise use the generic OpenAI-compatible adapter. This is a read-time compatibility path only;
+ * the next explicit save persists the selected adapter. */
+function visionProviderForRoute(
+  cfg: HaraConfig,
+  route: ConnectionVisionRoute,
+  currentProvider: string,
+): ProviderId {
+  if (route.source === "current") return isProviderId(currentProvider) ? currentProvider : "openai";
+  if (route.provider) return route.provider;
+  return resolveByokProviderTarget(cfg, {
+    id: "legacy-vision-route",
+    kind: "byok",
+    provider: "openai",
+    baseURL: route.baseURL,
+    apiKey: route.apiKey,
+    defaultModel: route.model,
+  }, false, {}).provider;
 }
 
 /** Read vision routing from the exact model connection. Personal intentionally keeps using config.json;
@@ -966,9 +975,7 @@ function visionSettingsSnapshot(live: HaraConfig, profile: Profile) {
   const currentTarget = profile.kind === "gateway"
     ? { provider: "hara-gateway" as const, model: profile.model || profile.defaultModel || live.model }
     : resolveByokProviderTarget(live, profile, false, {});
-  const provider = source === "custom"
-    ? route.provider ?? currentTarget.provider
-    : currentTarget.provider;
+  const provider = visionProviderForRoute(live, route, currentTarget.provider);
   const providerEntry = providerSettingsCatalog().find((candidate) => candidate.id === provider);
   const availableModels = [...new Set([
     ...(authorizedModels ?? providerEntry?.knownVisionModels ?? []),
@@ -1076,7 +1083,7 @@ async function saveVisionSettings(
     provider = candidate.provider;
     baseURL = candidate.baseURL;
     apiKey = candidate.apiKey;
-    const previousProvider = existingRoute.provider ?? live.provider;
+    const previousProvider = visionProviderForRoute(live, existingRoute, currentTarget.provider);
     const sameRoute = existingRoute.source === "custom"
       && previousProvider === provider
       && normalizeVisionBaseURL(existingRoute.baseURL) === normalizeVisionBaseURL(baseURL);
@@ -1183,8 +1190,11 @@ function providerSettingsSnapshot(targetCwd: string) {
   ).reasoning;
   const effortLevels = levelsFor(reasoningStyle, model)
     .filter((effort): effort is NonNullable<typeof effort> => !!effort);
-  const reasoningEffort = live.reasoningEffort
-    ? normalizeEffort(reasoningStyle, model, live.reasoningEffort)
+  const savedReasoningEffort = profile.id === PERSONAL_ID
+    ? live.reasoningEffort
+    : profile.reasoningEffort as HaraConfig["reasoningEffort"];
+  const reasoningEffort = savedReasoningEffort
+    ? normalizeEffort(reasoningStyle, model, savedReasoningEffort)
     : undefined;
 
   return {
@@ -1242,22 +1252,18 @@ async function createNamedProviderConnection(
   },
   targetCwd: string,
 ) {
-  // Older Desktop builds call this named-connection method. Hara now has one Personal model connection,
-  // so keep the RPC compatible while treating it as an explicit replacement of that canonical slot.
-  cleanNamedProviderConnectionId(input.id);
-  cleanNamedProviderConnectionLabel(input.label);
+  const id = cleanNamedProviderConnectionId(input.id);
+  const label = cleanNamedProviderConnectionLabel(input.label);
+  if (getProfile(id)) {
+    throw new Error(`connection '${id}' already exists; choose a new name instead of overwriting it`);
+  }
   if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
     throw new Error("provider is not a configurable personal provider");
   }
   const resolution = resolveActive(targetCwd);
   const switchLocked = resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin";
-  const liveBefore = loadConfig({ cwd: targetCwd });
-  const activeBefore = profileByIdForConfig(liveBefore, resolution.id);
   if (input.activate && (switchLocked || providerEnvironmentOverride())) {
     throw new Error("the active connection is locked by a flag, environment variable, or project pin; save without switching or remove that override first");
-  }
-  if (activeBefore?.kind === "byok" && activeBefore.id !== PERSONAL_ID && switchLocked) {
-    throw new Error("the legacy personal route is selected by a flag, environment variable, or project pin; remove that override before replacing Personal");
   }
   const normalized = normalizePersonalProviderConfig({
     provider: input.provider,
@@ -1274,42 +1280,31 @@ async function createNamedProviderConnection(
     normalized.model,
     normalized.reasoningEffort,
   );
-  const currentPersonal = personalProfileForSettings(liveBefore, resolution);
-  const currentTarget = resolveByokProviderTarget(liveBefore, currentPersonal, false, {});
-  const reusableRaw = {
-    provider: currentTarget.provider,
-    baseURL: currentTarget.baseURL,
-    apiKey: currentTarget.apiKey,
-  };
-  const availableKey = reusablePersonalProviderApiKey(normalized, reusableRaw);
-  if (providerRequiresApiKey(normalized.provider) && !availableKey) {
-    throw new Error("a new API key is required when the provider or endpoint changes");
+  if (providerRequiresApiKey(normalized.provider) && !normalized.apiKey) {
+    throw new Error("a new API key is required for a named cloud connection");
   }
-  const storedKey = normalized.apiKey
-    ?? reusablePersonalProviderApiKey(normalized, reusableRaw, {});
-  updatePersonalProviderConfig({
-    ...normalized,
-    ...(input.reasoningEffort !== undefined
-      ? { reasoningEffort: input.reasoningEffort as HaraConfig["reasoningEffort"] }
-      : {}),
-    ...(input.clearReasoningEffort === true ? { clearReasoningEffort: true } : {}),
-    ...(storedKey ? { apiKey: storedKey } : {}),
-  });
-  archiveHistoricalPersonalRoutes({
-    activatePersonal: input.activate === true || activeBefore?.kind === "byok",
-  });
-  syncStoredPersonalProfile();
+  const now = new Date().toISOString();
+  const added = addProfile({
+    id,
+    kind: "byok",
+    label,
+    provider: normalized.provider,
+    apiKey: normalized.apiKey,
+    baseURL: normalized.baseURL,
+    defaultModel: normalized.model,
+    ...(normalized.reasoningEffort ? { reasoningEffort: normalized.reasoningEffort } : {}),
+    createdAt: now,
+    updatedAt: now,
+  }, { activate: input.activate === true });
+  if (!added.ok) throw new Error(added.reason);
   return providerSettingsSnapshot(targetCwd);
 }
 
 function useNamedProviderConnection(inputId: string, targetCwd: string) {
   const id = inputId.trim();
   if (!isValidProfileId(id)) throw new Error("invalid personal connection id");
-  const live = loadConfig({ cwd: targetCwd });
   const resolution = resolveActive(targetCwd);
-  const target = id === PERSONAL_ID
-    ? personalProfileForSettings(live, resolution)
-    : getProfile(id);
+  const target = getProfile(id);
   if (!target || target.kind !== "byok") throw new Error("personal connection was not found");
   if (
     resolution.source === "flag"
@@ -1330,8 +1325,7 @@ function removeNamedProviderConnection(inputId: string, targetCwd: string) {
       throw new Error("provider/model/base URL is overridden by HARA_* environment variables; remove the override before clearing Personal");
     }
     const live = loadConfig({ cwd: targetCwd });
-    const resolution = resolveActive(targetCwd);
-    const personal = personalProfileForSettings(live, resolution);
+    const personal = profileByIdForConfig(live, PERSONAL_ID)!;
     const target = resolveByokProviderTarget(live, personal, false, {});
     const credentialEnvKey = providerEnvKey(target.provider);
     if (
@@ -1340,7 +1334,6 @@ function removeNamedProviderConnection(inputId: string, targetCwd: string) {
     ) {
       throw new Error(`the Personal credential is supplied by ${process.env.HARA_API_KEY?.trim() ? "HARA_API_KEY" : credentialEnvKey}; remove that environment variable before clearing the connection`);
     }
-    removeHistoricalPersonalRoutes();
     clearPersonalProviderConfig();
     syncStoredPersonalProfile();
     return providerSettingsSnapshot(targetCwd);
@@ -1793,10 +1786,7 @@ async function testNamedProviderConnection(inputId: string, targetCwd: string) {
   const id = inputId.trim();
   if (!isValidProfileId(id)) throw new Error("invalid personal connection id");
   const live = loadConfig({ cwd: targetCwd });
-  const resolution = resolveActive(targetCwd);
-  const profile = id === PERSONAL_ID
-    ? personalProfileForSettings(live, resolution)
-    : getProfile(id);
+  const profile = getProfile(id);
   if (!profile || profile.kind !== "byok") throw new Error("personal connection was not found");
   // Test the persisted identity itself. Ambient one-shot HARA_* routing must not silently test another
   // endpoint or key, especially when two saved connections use the same provider.
@@ -4104,7 +4094,9 @@ program
             ? effort as HaraConfig["reasoningEffort"]
             : profile.kind === "gateway"
               ? gatewayDefaultReasoningEffort(profile, model)
-              : live.reasoningEffort;
+              : profile.id === PERSONAL_ID
+                ? live.reasoningEffort
+                : profile.reasoningEffort as HaraConfig["reasoningEffort"];
           const runtimeCfg = { ...live, reasoningEffort: resolvedEffort };
           return withRouting(
             await buildProvider(
@@ -4178,19 +4170,16 @@ program
             if (profile.kind === "gateway" && vision.source === "custom") {
               throw new Error("company vision routing must reuse the managed provider connection");
             }
-            if (vision.source === "custom" && !vision.provider) {
-              throw new Error("the independent vision interface is missing its provider/protocol adapter");
-            }
-            const visionProviderId = vision.source === "custom" ? vision.provider! : target.provider;
+            const visionProviderId = visionProviderForRoute(live, vision, target.provider);
             if (classifyVision(visionProviderId, vision.model, live.modelVision) !== "vision") {
               throw new Error(`vision-first model '${vision.model}' is not confirmed to accept image input`);
             }
-            if (vision.source === "custom" && providerRequiresApiKey(vision.provider!) && !vision.apiKey) {
+            if (vision.source === "custom" && providerRequiresApiKey(visionProviderId) && !vision.apiKey) {
               throw new Error("the independent vision interface is missing its API key");
             }
             const visionProvider = await buildProvider(live, {
               ...(vision.source === "custom"
-                ? { provider: vision.provider!, baseURL: vision.baseURL, apiKey: vision.apiKey }
+                ? { provider: visionProviderId, baseURL: vision.baseURL, apiKey: vision.apiKey }
                 : {}),
               model: vision.model,
             }, profileId, opts.spaceId, null, true);
@@ -4330,7 +4319,6 @@ program
           }
           const resolution = resolveActive(settingsCwd);
           const liveBefore = loadConfig({ cwd: settingsCwd });
-          const activeBefore = profileByIdForConfig(liveBefore, resolution.id);
           const switchLocked = resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin";
           if (
             resolution.id !== PERSONAL_ID
@@ -4338,9 +4326,6 @@ program
             && switchLocked
           ) {
             throw new Error(`profile '${resolution.id}' is selected by ${resolution.source}; switch or unpin it before activating Personal`);
-          }
-          if (activeBefore?.kind === "byok" && activeBefore.id !== PERSONAL_ID && switchLocked) {
-            throw new Error(`legacy personal route '${resolution.id}' is selected by ${resolution.source}; switch or unpin it before replacing Personal`);
           }
           const normalized = normalizePersonalProviderConfig({
             provider: input.provider,
@@ -4357,7 +4342,7 @@ program
             normalized.model,
             normalized.reasoningEffort,
           );
-          const currentPersonal = personalProfileForSettings(liveBefore, resolution);
+          const currentPersonal = profileByIdForConfig(liveBefore, PERSONAL_ID)!;
           const currentTarget = resolveByokProviderTarget(liveBefore, currentPersonal, false, {});
           const reusableRaw = {
             provider: currentTarget.provider,
@@ -4378,10 +4363,11 @@ program
             ...(input.clearReasoningEffort === true ? { clearReasoningEffort: true } : {}),
             ...(storedKey ? { apiKey: storedKey } : {}),
           });
-          archiveHistoricalPersonalRoutes({
-            activatePersonal: input.activatePersonal === true || activeBefore?.kind === "byok",
-          });
           syncStoredPersonalProfile();
+          if (input.activatePersonal === true) {
+            const switched = useProfile(PERSONAL_ID);
+            if (!switched.ok) throw new Error(switched.reason);
+          }
           return providerSettingsSnapshot(settingsCwd);
         },
         effortLevels: levelsFor(
@@ -4429,8 +4415,12 @@ program
           ).reasoning;
           const defaultReasoningEffort = profile.kind === "gateway"
             ? gatewayDefaultReasoningEffort(profile, model)
-            : live.reasoningEffort
-              ? normalizeEffort(reasoningStyle, model, live.reasoningEffort)
+            : (profile.id === PERSONAL_ID ? live.reasoningEffort : profile.reasoningEffort)
+              ? normalizeEffort(
+                  reasoningStyle,
+                  model,
+                  (profile.id === PERSONAL_ID ? live.reasoningEffort : profile.reasoningEffort) as NonNullable<HaraConfig["reasoningEffort"]>,
+                )
               : undefined;
           const visionRoute = visionRouteForProfile(live, profile);
           return {

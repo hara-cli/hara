@@ -95,6 +95,11 @@ The fastest path is **`hara setup`** — an interactive wizard for provider + ke
 automatically the first time you start `hara` unconfigured). Or configure it yourself — hara is
 **multi-provider**:
 
+Every `hara profile add <name> --byok ...` command creates an independent model connection. You can keep
+several providers—or several accounts from the same provider—with separate keys, endpoints, models, and
+reasoning defaults, then switch new work with `hara profile use <name>`. Existing sessions stay pinned to
+the exact connection they started with.
+
 **Anthropic (default)**
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -565,7 +570,7 @@ dangerous ones unless `-y`. Read-only tools run in parallel within a turn, and e
 **colored diff** of what changed. Shell output streams live; press **Esc** to interrupt a running
 turn, or **`/undo`** to revert the last edit. In-session **`/diff`**, **`/review`**, and **`/commit`** close the change → review → commit loop without leaving the prompt.
 - **Explicit live steering vs next-task queue**: keep typing while hara works and press Enter to fold a clarification into the next model call; use `/next <message>` to queue a separate task behind the live one. Accepted Desktop steering is persisted before ACK; **Esc** drops the local queue and stops.
-- **Bounded context + checkpoint compaction**: each provider call receives a non-destructive budgeted snapshot (old tool payloads/images cannot monopolize context). Overflow retries once with a tighter snapshot; `/compact` creates a structured execution checkpoint and retains the latest three user-turn groups plus current touched-file content. Auto-compaction is on by default for terminal, headless resumed sessions, and Desktop/Serve after a completed turn reaches either 85% of its model window or the bounded absolute token cap; `hara config set autoCompact false` opts out without removing manual compaction.
+- **Bounded context + checkpoint compaction**: each provider call receives a non-destructive budgeted snapshot (old tool payloads/images cannot monopolize context). Overflow retries once with a tighter snapshot; `/compact` creates a structured execution checkpoint and retains the latest three user-turn groups plus current touched-file content. Auto-compaction is on by default for terminal, headless resumed sessions, and Desktop/Serve after a completed turn reaches either 85% of its model window or the bounded absolute token cap. Serve also checkpoints oversized durable history before retrying after a failed turn, when no successful token watermark exists; `hara config set autoCompact false` opts out without removing manual compaction.
 - **Project context**: auto-loads `AGENTS.md` (the cross-tool standard) walking up to the repo root; `hara init` writes one by analyzing the repo.
 - **`@file` mentions**: attach file contents to a message (`@path`); Tab-completes with a **fuzzy** matcher over the project (subdirs, git-tracked + untracked) — `@idx` → `src/index.ts`. `@<dir>` loads a directory listing, `@src/`+Tab drills into a folder, and mistyped tool/file paths get a "did you mean" suggestion.
 - **Explicit workspace boundary**: launching at Home does not inventory its directories or permit coding mutations. Start Hara from a concrete project, or pass `hara --cwd /path/to/project`, to enable search, `@` completion, shell/external agents, and file edits; explicitly named single-file reads remain available at Home.
