@@ -98,6 +98,7 @@ import {
   syncStoredPersonalProfile,
   setModel as setProfileModel,
   resetModel as resetProfileModel,
+  setProfileVisionSettings,
   getProfile,
   effectiveModel,
   routingLabel,
@@ -525,29 +526,44 @@ async function buildImageProviderForRoute(
   profile: Profile,
   expectedSpaceId: string,
 ): Promise<{ provider: Provider; translated: boolean }> {
-  assertProfileAudience(cfg, profile.id, expectedSpaceId);
-  if (cfg.visionModel) {
-    const authorizedModels = authorizedVisionModelsForRoute(cfg, profile, expectedSpaceId);
-    if (!visionSidecarAuthorized(cfg.visionModel, authorizedModels)) {
+  const routeProfile = assertProfileAudience(cfg, profile.id, expectedSpaceId);
+  const vision = visionRouteForProfile(cfg, routeProfile);
+  if (vision.model) {
+    const authorizedModels = authorizedVisionModelsForRoute(cfg, routeProfile, expectedSpaceId);
+    if (!visionSidecarAuthorized(vision.model, authorizedModels)) {
       throw new Error(
-        `vision-first model '${cfg.visionModel}' is not authorized for company Space '${expectedSpaceId}'; ` +
+        `vision-first model '${vision.model}' is not authorized for company Space '${expectedSpaceId}'; ` +
         "choose a model advertised by this organization or disable the vision-first route",
       );
     }
+    if (routeProfile.kind === "gateway" && vision.source === "custom") {
+      throw new Error("company vision routing must reuse the managed provider connection");
+    }
+    if (vision.source === "custom" && !vision.provider) {
+      throw new Error("the independent vision interface is missing its provider/protocol adapter");
+    }
+    const visionProviderId = vision.source === "custom" ? vision.provider! : primary.id;
+    if (classifyVision(visionProviderId, vision.model, cfg.modelVision) !== "vision") {
+      throw new Error(`vision-first model '${vision.model}' is not confirmed to accept image input`);
+    }
+    if (vision.source === "custom" && providerRequiresApiKey(vision.provider!) && !vision.apiKey) {
+      throw new Error("the independent vision interface is missing its API key");
+    }
     const imageProvider = await buildProvider(cfg, {
-      model: cfg.visionModel,
-      ...(cfg.visionBaseURL ? { baseURL: cfg.visionBaseURL } : {}),
-      ...(cfg.visionApiKey ? { apiKey: cfg.visionApiKey } : {}),
-    }, profile.id, expectedSpaceId, null, true);
-    assertProfileAudience(cfg, profile.id, expectedSpaceId);
+      ...(vision.source === "custom"
+        ? { provider: vision.provider!, baseURL: vision.baseURL, apiKey: vision.apiKey }
+        : {}),
+      model: vision.model,
+    }, routeProfile.id, expectedSpaceId, null, true);
+    assertProfileAudience(cfg, routeProfile.id, expectedSpaceId);
     if (!imageProvider) {
-      throw new Error(`vision-first model '${cfg.visionModel}' is not authenticated for profile '${profile.id}'`);
+      throw new Error(`vision-first model '${vision.model}' is not authenticated for profile '${routeProfile.id}'`);
     }
     return { provider: imageProvider, translated: true };
   }
   if (classifyVision(primary.id, primary.model, cfg.modelVision) !== "vision") {
     throw new Error(
-      `model '${primary.model}' cannot inspect images through profile '${profile.id}'; ` +
+      `model '${primary.model}' cannot inspect images through profile '${routeProfile.id}'; ` +
       "configure a vision-first model or switch to an image-capable conversation model",
     );
   }
@@ -764,6 +780,10 @@ function personalReasoningEffortLevels(
 function providerSettingsCatalog() {
   return providerCatalog().map((provider) => ({
     ...provider,
+    knownVisionModels: [...new Set([
+      ...(provider.knownModels ?? []),
+      provider.defaultModel,
+    ])].filter((model) => classifyVision(provider.id, model) === "vision"),
     ...(provider.knownModels?.length
       ? {
           knownModelEntries: provider.knownModels.map((model) => ({
@@ -885,21 +905,96 @@ function personalProfileForSettings(live: HaraConfig, resolution: ActiveResoluti
 
 const visionEnvironmentOverride = (): boolean => Boolean(
   process.env.HARA_VISION_MODEL?.trim()
+  || process.env.HARA_VISION_SOURCE?.trim()
+  || process.env.HARA_VISION_PROVIDER?.trim()
   || process.env.HARA_VISION_BASE_URL?.trim()
   || process.env.HARA_VISION_API_KEY?.trim(),
 );
 
+interface ConnectionVisionRoute {
+  model?: string;
+  source: "current" | "custom";
+  provider?: ProviderId;
+  baseURL?: string;
+  apiKey?: string;
+}
+
+/** Read vision routing from the exact model connection. Personal intentionally keeps using config.json;
+ * company and legacy named connections own independent profile fields. Explicit HARA_VISION_* values
+ * overlay only the fields they name and never make an organization's route inherit Personal settings. */
+function visionRouteForProfile(live: HaraConfig, profile: Profile): ConnectionVisionRoute {
+  const personal = profile.id === PERSONAL_ID;
+  const base: ConnectionVisionRoute = personal
+    ? {
+        model: live.visionModel,
+        source: live.visionSource,
+        provider: live.visionProvider,
+        baseURL: live.visionBaseURL,
+        apiKey: live.visionApiKey,
+      }
+    : {
+        model: profile.visionModel,
+        source: profile.visionSource ?? "current",
+        provider: profile.visionProvider,
+        baseURL: profile.visionBaseURL,
+        apiKey: profile.visionApiKey,
+      };
+  if (personal || !visionEnvironmentOverride()) {
+    return profile.kind === "gateway" ? { ...base, source: "current" } : base;
+  }
+  const customRouteOverridden = Boolean(
+    process.env.HARA_VISION_SOURCE?.trim()
+    || process.env.HARA_VISION_PROVIDER?.trim()
+    || process.env.HARA_VISION_BASE_URL?.trim()
+    || process.env.HARA_VISION_API_KEY?.trim(),
+  );
+  const route: ConnectionVisionRoute = {
+    model: process.env.HARA_VISION_MODEL?.trim() ? live.visionModel : base.model,
+    source: customRouteOverridden ? live.visionSource : base.source,
+    provider: process.env.HARA_VISION_PROVIDER?.trim() ? live.visionProvider : base.provider,
+    baseURL: process.env.HARA_VISION_BASE_URL?.trim() ? live.visionBaseURL : base.baseURL,
+    apiKey: process.env.HARA_VISION_API_KEY?.trim() ? live.visionApiKey : base.apiKey,
+  };
+  return profile.kind === "gateway" ? { ...route, source: "current" } : route;
+}
+
 function visionSettingsSnapshot(live: HaraConfig, profile: Profile) {
   const expectedSpaceId = spaceIdForProfile(profile);
   const authorizedModels = authorizedVisionModelsForRoute(live, profile, expectedSpaceId);
+  const route = visionRouteForProfile(live, profile);
+  const source = route.source;
+  const currentTarget = profile.kind === "gateway"
+    ? { provider: "hara-gateway" as const, model: profile.model || profile.defaultModel || live.model }
+    : resolveByokProviderTarget(live, profile, false, {});
+  const provider = source === "custom"
+    ? route.provider ?? currentTarget.provider
+    : currentTarget.provider;
+  const providerEntry = providerSettingsCatalog().find((candidate) => candidate.id === provider);
+  const availableModels = [...new Set([
+    ...(authorizedModels ?? providerEntry?.knownVisionModels ?? []),
+    ...(source === "current" && classifyVision(provider, currentTarget.model, live.modelVision) === "vision"
+      ? [currentTarget.model]
+      : []),
+    ...(route.model && classifyVision(provider, route.model, live.modelVision) === "vision"
+      ? [route.model]
+      : []),
+  ])].filter((model) => classifyVision(provider, model, live.modelVision) === "vision");
+  const modelAuthorized = !route.model
+    || (
+      visionSidecarAuthorized(route.model, authorizedModels)
+      && classifyVision(provider, route.model, live.modelVision) === "vision"
+    );
   return {
-    enabled: Boolean(live.visionModel),
-    ...(live.visionModel ? { model: live.visionModel } : {}),
-    ...(live.visionBaseURL && profile.kind !== "gateway" ? { baseURL: live.visionBaseURL } : {}),
-    apiKeyConfigured: Boolean(live.visionApiKey),
+    enabled: Boolean(route.model),
+    source,
+    provider,
+    ...(route.model ? { model: route.model } : {}),
+    ...(source === "custom" && route.baseURL ? { baseURL: route.baseURL } : {}),
+    apiKeyConfigured: source === "custom" && Boolean(route.apiKey),
     usesManagedCredential: profile.kind === "gateway",
     editable: !visionEnvironmentOverride(),
-    authorized: !live.visionModel || visionSidecarAuthorized(live.visionModel, authorizedModels),
+    authorized: modelAuthorized,
+    availableModels,
     ...(authorizedModels ? { authorizedModels: [...authorizedModels] } : {}),
   };
 }
@@ -920,9 +1015,11 @@ function normalizeVisionBaseURL(value: string | undefined): string | undefined {
   return parsed.toString().replace(/\/$/, "");
 }
 
-function saveVisionSettings(
+async function saveVisionSettings(
   input: {
     enabled: boolean;
+    source?: "current" | "custom";
+    provider?: string;
     model?: string;
     baseURL?: string;
     apiKey?: string;
@@ -936,16 +1033,21 @@ function saveVisionSettings(
   const live = loadConfig({ cwd: targetCwd });
   const profile = profileForConfig(live).profile;
   if (!input.enabled) {
-    updateRawConfig((config) => {
-      delete config.visionModel;
-      delete config.visionBaseURL;
-      delete config.visionApiKey;
-    });
+    const cleared = setProfileVisionSettings(profile.id, undefined);
+    if (!cleared.ok) throw new Error(cleared.reason);
     return providerSettingsSnapshot(targetCwd);
   }
   const model = input.model?.trim();
   if (!model || model.length > 200 || /[\u0000-\u001f\u007f]/.test(model)) {
     throw new Error("vision-first model must be a 1-200 character model ID");
+  }
+  const existingRoute = visionRouteForProfile(live, profile);
+  const source = profile.kind === "gateway" ? "current" : input.source ?? existingRoute.source;
+  if (source !== "current" && source !== "custom") {
+    throw new Error("vision source must be current or custom");
+  }
+  if (profile.kind === "gateway" && input.source === "custom") {
+    throw new Error("company vision routing must reuse the managed provider connection");
   }
   const authorizedModels = authorizedVisionModelsForRoute(live, profile, spaceIdForProfile(profile));
   if (!visionSidecarAuthorized(model, authorizedModels)) {
@@ -954,20 +1056,75 @@ function saveVisionSettings(
   if (profile.kind === "gateway" && (input.baseURL?.trim() || input.apiKey?.trim())) {
     throw new Error("company vision routing uses the managed gateway credential and does not accept a separate endpoint or key");
   }
-  const baseURL = profile.kind === "gateway" ? undefined : normalizeVisionBaseURL(input.baseURL);
-  const apiKey = input.apiKey?.trim();
-  updateRawConfig((config) => {
-    config.visionModel = model;
-    if (baseURL) config.visionBaseURL = baseURL;
-    else delete config.visionBaseURL;
-    if (profile.kind === "gateway") {
-      delete config.visionApiKey;
-    } else if (apiKey) {
-      config.visionApiKey = apiKey;
-    } else if (input.clearApiKey) {
-      delete config.visionApiKey;
+  const currentTarget = profile.kind === "gateway"
+    ? { provider: "hara-gateway" as const }
+    : resolveByokProviderTarget(live, profile, false, {});
+  let provider: ProviderId | undefined;
+  let baseURL: string | undefined;
+  let apiKey: string | undefined;
+  if (source === "custom") {
+    if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
+      throw new Error("a custom vision route requires a supported provider/protocol adapter");
     }
+    const candidate = normalizePersonalProviderConfig({
+      provider: input.provider,
+      model,
+      baseURL: input.baseURL,
+      apiKey: input.apiKey,
+      clearApiKey: input.clearApiKey,
+    });
+    provider = candidate.provider;
+    baseURL = candidate.baseURL;
+    apiKey = candidate.apiKey;
+    const previousProvider = existingRoute.provider ?? live.provider;
+    const sameRoute = existingRoute.source === "custom"
+      && previousProvider === provider
+      && normalizeVisionBaseURL(existingRoute.baseURL) === normalizeVisionBaseURL(baseURL);
+    if (!apiKey && !input.clearApiKey && sameRoute) apiKey = existingRoute.apiKey;
+    if (providerRequiresApiKey(provider) && !apiKey) {
+      throw new Error("a custom vision interface requires its own API key; use the current-provider mode to reuse the active key");
+    }
+  }
+  const capabilityProvider = source === "custom" ? provider! : currentTarget.provider;
+  if (classifyVision(capabilityProvider, model, live.modelVision) !== "vision") {
+    throw new Error(`model '${model}' is not confirmed to accept image input`);
+  }
+  if (profile.kind !== "gateway") {
+    const providerEntry = providerSettingsCatalog().find((candidate) => candidate.id === capabilityProvider)!;
+    const currentPersonalTarget = source === "current"
+      ? resolveByokProviderTarget(live, profile, false, {})
+      : undefined;
+    const candidate = source === "custom"
+      ? {
+          provider: provider!,
+          model,
+          ...(baseURL ? { baseURL } : {}),
+          ...(apiKey ? { apiKey } : {}),
+        }
+      : {
+          provider: currentPersonalTarget!.provider,
+          model,
+          ...(currentPersonalTarget!.baseURL ? { baseURL: currentPersonalTarget!.baseURL } : {}),
+          ...(currentPersonalTarget!.apiKey ? { apiKey: currentPersonalTarget!.apiKey } : {}),
+        };
+    const tested = visionOnlyTestResult(
+      await testProviderSettingsCandidate(candidate, { reusePersonalApiKey: false }),
+      capabilityProvider,
+      providerEntry.knownVisionModels,
+      live.modelVision,
+    );
+    if (!tested.ok || !tested.models.includes(model)) {
+      throw new Error(tested.error || `the vision connection did not verify model '${model}'`);
+    }
+  }
+  const saved = setProfileVisionSettings(profile.id, {
+    model,
+    source,
+    ...(source === "custom" && provider ? { provider } : {}),
+    ...(source === "custom" && baseURL ? { baseURL } : {}),
+    ...(source === "custom" && apiKey ? { apiKey } : {}),
   });
+  if (!saved.ok) throw new Error(saved.reason);
   return providerSettingsSnapshot(targetCwd);
 }
 
@@ -1416,7 +1573,12 @@ async function testProviderSettingsCandidate(input: {
 }, options: { reusePersonalApiKey?: boolean } = {}): Promise<{
   ok: boolean;
   models: string[];
-  entries: Array<{ id: string; providerId: string; effortLevels: string[] }>;
+  entries: Array<{
+    id: string;
+    providerId: string;
+    effortLevels: string[];
+    attachmentCapabilities: ReturnType<typeof effectiveAttachmentCapabilities>;
+  }>;
   error?: string;
 }> {
   if (!isProviderId(input.provider) || input.provider === "hara-gateway") {
@@ -1468,6 +1630,7 @@ async function testProviderSettingsCandidate(input: {
       ).reasoning,
       model,
     ).filter((effort): effort is NonNullable<typeof effort> => !!effort),
+    attachmentCapabilities: effectiveAttachmentCapabilities(candidate.provider, model),
   }));
   const probeModel =
     providerIsLocal(candidate.provider) &&
@@ -1516,6 +1679,116 @@ async function testProviderSettingsCandidate(input: {
   return { ok: true, models, entries };
 }
 
+function visionOnlyTestResult(
+  result: Awaited<ReturnType<typeof testProviderSettingsCandidate>>,
+  provider: string,
+  extraModels: readonly string[],
+  overrides: HaraConfig["modelVision"],
+) {
+  const models = [...new Set([...result.models, ...extraModels])]
+    .filter((model) => classifyVision(provider, model, overrides) === "vision");
+  const byId = new Map(result.entries.map((entry) => [entry.id, entry]));
+  const entries = models.map((model) => byId.get(model) ?? {
+    id: model,
+    providerId: provider,
+    effortLevels: [],
+    attachmentCapabilities: effectiveAttachmentCapabilities(provider, model, overrides),
+  });
+  return {
+    ok: result.ok && models.length > 0,
+    models,
+    entries,
+    ...(result.error
+      ? { error: result.error }
+      : models.length === 0
+        ? { error: "This connection did not expose any model confirmed to accept image input" }
+        : {}),
+  };
+}
+
+async function testVisionSettingsCandidate(
+  input: {
+    source: "current" | "custom";
+    provider?: string;
+    model?: string;
+    baseURL?: string;
+    apiKey?: string;
+    clearApiKey?: boolean;
+  },
+  targetCwd: string,
+) {
+  const live = loadConfig({ cwd: targetCwd });
+  const profile = profileForConfig(live).profile;
+  if (input.source === "current") {
+    if (profile.kind === "gateway") {
+      const models = [...new Set(profile.availableModels ?? [])]
+        .filter((model) => classifyVision("hara-gateway", model, live.modelVision) === "vision");
+      return {
+        ok: models.length > 0,
+        models,
+        entries: models.map((model) => ({
+          id: model,
+          providerId: "hara-gateway",
+          effortLevels: gatewayReasoningEffortLevels(profile, model),
+          attachmentCapabilities: effectiveAttachmentCapabilities("hara-gateway", model, live.modelVision),
+        })),
+        ...(models.length === 0
+          ? { error: "This company connection has not authorized an image-capable model" }
+          : {}),
+      };
+    }
+    const target = resolveByokProviderTarget(live, profile, false, {});
+    const providerEntry = providerSettingsCatalog().find((candidate) => candidate.id === target.provider);
+    const result = await testProviderSettingsCandidate({
+      provider: target.provider,
+      model: input.model?.trim() || target.model,
+      ...(target.baseURL ? { baseURL: target.baseURL } : {}),
+      ...(target.apiKey ? { apiKey: target.apiKey } : {}),
+    }, { reusePersonalApiKey: false });
+    return visionOnlyTestResult(
+      result,
+      target.provider,
+      [...(providerEntry?.knownVisionModels ?? []), target.model],
+      live.modelVision,
+    );
+  }
+
+  if (profile.kind === "gateway") {
+    throw new Error("company vision routing must reuse the managed provider connection");
+  }
+  if (!isProviderId(input.provider) || input.provider === "hara-gateway" || input.provider === "qwen-oauth") {
+    throw new Error("a custom vision interface requires a supported API provider/protocol adapter");
+  }
+  const providerEntry = providerSettingsCatalog().find((candidate) => candidate.id === input.provider)!;
+  const model = input.model?.trim() || providerEntry.knownVisionModels[0] || providerEntry.defaultModel;
+  const candidate = normalizePersonalProviderConfig({
+    provider: input.provider,
+    model,
+    baseURL: input.baseURL,
+    apiKey: input.apiKey,
+    clearApiKey: input.clearApiKey,
+  });
+  const savedRoute = visionRouteForProfile(live, profile);
+  const sameSavedRoute = savedRoute.source === "custom"
+    && (savedRoute.provider ?? live.provider) === candidate.provider
+    && normalizeVisionBaseURL(savedRoute.baseURL) === normalizeVisionBaseURL(candidate.baseURL);
+  const apiKey = candidate.apiKey
+    ?? (!candidate.clearApiKey && sameSavedRoute ? savedRoute.apiKey : undefined);
+  const result = await testProviderSettingsCandidate({
+    provider: candidate.provider,
+    model: candidate.model,
+    ...(candidate.baseURL ? { baseURL: candidate.baseURL } : {}),
+    ...(apiKey ? { apiKey } : {}),
+    ...(candidate.clearApiKey ? { clearApiKey: true } : {}),
+  }, { reusePersonalApiKey: false });
+  return visionOnlyTestResult(
+    result,
+    candidate.provider,
+    providerEntry.knownVisionModels,
+    live.modelVision,
+  );
+}
+
 async function testNamedProviderConnection(inputId: string, targetCwd: string) {
   const id = inputId.trim();
   if (!isValidProfileId(id)) throw new Error("invalid personal connection id");
@@ -1540,7 +1813,7 @@ const SETUP_DEFAULT_MODEL: Record<string, string> = {
   anthropic: "claude-opus-4-8",
   "token-plan": "qwen3.8-max",
   "minimax-token-plan": "MiniMax-M3",
-  "volcengine-agent-plan": "ark-code-latest",
+  "volcengine-agent-plan": "auto",
   qwen: "qwen-plus",
   openai: "gpt-4o-mini",
   glm: "glm-4.6",
@@ -2675,14 +2948,15 @@ function runDoctor(cfg: HaraConfig): string {
   const ad = assetsDir();
   const roles = loadActiveRoles(live.cwd, profile.id);
   const vcap = classifyVision(live.provider, live.model, live.modelVision);
+  const visionRoute = visionRouteForProfile(live, profile);
   const visionAuthorized = visionSidecarAuthorized(
-    live.visionModel,
+    visionRoute.model,
     authorizedVisionModelsForRoute(live, profile, spaceIdForProfile(profile)),
   );
-  const imageStatus = live.visionModel
+  const imageStatus = visionRoute.model
     ? visionAuthorized
-      ? c.dim("vision-first via ") + c.bold(live.visionModel) + c.dim(` → text for ${live.model}`)
-      : c.yellow(`vision-first ${live.visionModel} is not authorized for this Space`)
+      ? c.dim("vision-first via ") + c.bold(visionRoute.model) + c.dim(` → text for ${live.model}`)
+      : c.yellow(`vision-first ${visionRoute.model} is not authorized for this Space`)
     : vcap === "vision"
       ? c.dim("native on the conversation model")
       : vcap === "text"
@@ -3893,28 +4167,40 @@ program
           const target = profile.kind === "gateway"
             ? { provider: "hara-gateway", model: opts.model }
             : { ...resolveByokProviderTarget(live, profile, false), model: opts.model };
-          if (live.visionModel) {
+          const vision = visionRouteForProfile(live, profile);
+          if (vision.model) {
             const authorizedModels = authorizedVisionModelsForRoute(live, profile, opts.spaceId);
-            if (!visionSidecarAuthorized(live.visionModel, authorizedModels)) {
+            if (!visionSidecarAuthorized(vision.model, authorizedModels)) {
               throw new Error(
-                `vision-first model '${live.visionModel}' is not authorized for company Space '${opts.spaceId}'`,
+                `vision-first model '${vision.model}' is not authorized for company Space '${opts.spaceId}'`,
               );
             }
+            if (profile.kind === "gateway" && vision.source === "custom") {
+              throw new Error("company vision routing must reuse the managed provider connection");
+            }
+            if (vision.source === "custom" && !vision.provider) {
+              throw new Error("the independent vision interface is missing its provider/protocol adapter");
+            }
+            const visionProviderId = vision.source === "custom" ? vision.provider! : target.provider;
+            if (classifyVision(visionProviderId, vision.model, live.modelVision) !== "vision") {
+              throw new Error(`vision-first model '${vision.model}' is not confirmed to accept image input`);
+            }
+            if (vision.source === "custom" && providerRequiresApiKey(vision.provider!) && !vision.apiKey) {
+              throw new Error("the independent vision interface is missing its API key");
+            }
             const visionProvider = await buildProvider(live, {
-              model: live.visionModel,
-              ...(live.visionBaseURL ? { baseURL: live.visionBaseURL } : {}),
-              ...(live.visionApiKey ? { apiKey: live.visionApiKey } : {}),
+              ...(vision.source === "custom"
+                ? { provider: vision.provider!, baseURL: vision.baseURL, apiKey: vision.apiKey }
+                : {}),
+              model: vision.model,
             }, profileId, opts.spaceId, null, true);
             assertProfileAudience(live, profileId, opts.spaceId);
             if (!visionProvider) {
-              throw new Error(`vision-first model '${live.visionModel}' is not authenticated for profile '${profile.id}'`);
+              throw new Error(`vision-first model '${vision.model}' is not authenticated for profile '${profile.id}'`);
             }
-            const description = await describeImages(visionProvider, images, {
-              signal: opts.signal,
-              hint: opts.hint,
-            });
+            const description = await describeImages(visionProvider, images, { signal: opts.signal });
             assertProfileAudience(live, profileId, opts.spaceId);
-            return { description, viaModel: live.visionModel };
+            return { description, viaModel: vision.model };
           }
           const native = classifyVision(target.provider, opts.model, live.modelVision);
           if (native === "vision") return { images };
@@ -3928,6 +4214,7 @@ program
           );
         },
         providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
+        testVisionSettings: (input, targetCwd) => testVisionSettingsCandidate(input, targetCwd ?? cwd),
         saveVisionSettings: async (input, targetCwd) => saveVisionSettings(input, targetCwd ?? cwd),
         unpinProjectProfile: (targetCwd) => {
           const settingsCwd = targetCwd ?? cwd;
@@ -4145,6 +4432,7 @@ program
             : live.reasoningEffort
               ? normalizeEffort(reasoningStyle, model, live.reasoningEffort)
               : undefined;
+          const visionRoute = visionRouteForProfile(live, profile);
           return {
             providerId: current.provider,
             model,
@@ -4158,7 +4446,7 @@ program
               current.provider,
               model,
               live.modelVision,
-              live.visionModel,
+              visionRoute.model,
               expectedSpaceId === PERSONAL_ID
                 ? undefined
                 : organizationProfile?.availableModels ?? [],
@@ -5564,7 +5852,11 @@ program.action(async (opts) => {
       profile,
       expectedSpaceId ?? spaceIdForProfile(profile),
     );
-    const text = await describeImages(route.provider, [image], { hint, signal });
+    const text = await describeImages(
+      route.provider,
+      [image],
+      route.translated ? { signal } : { hint, signal },
+    );
     if (expectedSpaceId) assertProfileAudience(cfg, profile.id, expectedSpaceId);
     return {
       text,
@@ -6501,6 +6793,7 @@ program.action(async (opts) => {
   // Explicit vision-first state is shared by `/vision`, pasted attachments, image tools, and computer use.
   // When enabled it wins over native image support: the conversation model receives description text only.
   const interactiveVisionSpaceId = meta.spaceId ?? spaceIdForProfile(__activeP);
+  let interactiveVisionRoute = visionRouteForProfile(cfg, __activeP);
   let visionProvider: Provider | null | undefined;
   let remindedVision = false;
   /** `/vision <model|off>` controls vision-first; `/vision main …` corrects native capability metadata. */
@@ -6509,10 +6802,10 @@ program.action(async (opts) => {
     if (parts.length === 0) {
       const cap = classifyVision(cfg.provider, cfg.model, cfg.modelVision);
       const authorizedModels = authorizedVisionModelsForRoute(cfg, __activeP, interactiveVisionSpaceId);
-      const configured = cfg.visionModel
-        ? visionSidecarAuthorized(cfg.visionModel, authorizedModels)
-          ? `${cfg.visionModel} (all images first)`
-          : `${cfg.visionModel} (not authorized for this Space)`
+      const configured = interactiveVisionRoute.model
+        ? visionSidecarAuthorized(interactiveVisionRoute.model, authorizedModels)
+          ? `${interactiveVisionRoute.model} (all images first)`
+          : `${interactiveVisionRoute.model} (not authorized for this Space)`
         : "off";
       return `images — vision-first: ${configured} · conversation model ${cfg.model}: ${cap}${cap === "unknown" ? " (checked on first image)" : ""}`;
     }
@@ -6531,15 +6824,24 @@ program.action(async (opts) => {
       return `(${cfg.model} vision = ${v})`;
     }
     if (parts.length === 1 && parts[0].toLowerCase() === "off") {
-      cfg.visionModel = undefined;
-      cfg.visionBaseURL = undefined;
-      cfg.visionApiKey = undefined;
+      if (visionEnvironmentOverride()) return "(HARA_VISION_* controls this route; remove the environment override first)";
+      const cleared = setProfileVisionSettings(__activeP.id, undefined);
+      if (!cleared.ok) return `(${cleared.reason})`;
+      interactiveVisionRoute = { source: "current" };
+      if (__activeP.id === PERSONAL_ID) {
+        cfg.visionModel = undefined;
+        cfg.visionSource = "current";
+        cfg.visionProvider = undefined;
+        cfg.visionBaseURL = undefined;
+        cfg.visionApiKey = undefined;
+      } else {
+        delete __activeP.visionModel;
+        delete __activeP.visionSource;
+        delete __activeP.visionProvider;
+        delete __activeP.visionBaseURL;
+        delete __activeP.visionApiKey;
+      }
       visionProvider = undefined;
-      updateRawConfig((config) => {
-        delete config.visionModel;
-        delete config.visionBaseURL;
-        delete config.visionApiKey;
-      });
       return "(vision-first off; image-capable conversation models now receive images directly)";
     }
     const model = parts.join(" ");
@@ -6547,13 +6849,28 @@ program.action(async (opts) => {
     if (!visionSidecarAuthorized(model, authorizedModels)) {
       return `(vision-first model '${model}' is not authorized for this company Space)`;
     }
-    cfg.visionModel = model;
+    if (classifyVision(provider.id, model, cfg.modelVision) !== "vision") {
+      return `(model '${model}' is not confirmed to accept image input; choose it in Desktop after loading the provider's visual models)`;
+    }
+    if (visionEnvironmentOverride()) return "(HARA_VISION_* controls this route; remove the environment override first)";
+    const saved = setProfileVisionSettings(__activeP.id, { model, source: "current" });
+    if (!saved.ok) return `(${saved.reason})`;
+    interactiveVisionRoute = { model, source: "current" };
+    if (__activeP.id === PERSONAL_ID) {
+      cfg.visionModel = model;
+      cfg.visionSource = "current";
+      cfg.visionProvider = undefined;
+      cfg.visionBaseURL = undefined;
+      cfg.visionApiKey = undefined;
+    } else {
+      __activeP.visionModel = model;
+      __activeP.visionSource = "current";
+      delete __activeP.visionProvider;
+      delete __activeP.visionBaseURL;
+      delete __activeP.visionApiKey;
+    }
     visionProvider = undefined;
-    writeConfigValue("visionModel", model);
-    const warn = classifyVision(cfg.provider, model, cfg.modelVision) === "text"
-      ? `  ⚠ ${model} is classified as text-only; choose an image-capable model if recognition fails.`
-      : "";
-    return `(vision-first → ${model}; every image will be described here before the conversation model runs)${warn}`;
+    return `(vision-first → ${model}; every image will be described here before the conversation model runs)`;
   };
 
   const commands: Slash[] = [
@@ -7014,9 +7331,9 @@ program.action(async (opts) => {
     setTheme(cfg.theme);
     const getImageProvider = async (): Promise<Provider | null> => {
       assertInteractiveAudience();
-      if (cfg.visionModel && visionProvider !== undefined) return visionProvider;
+      if (interactiveVisionRoute.model && visionProvider !== undefined) return visionProvider;
       const route = await buildImageProviderForRoute(cfg, provider, __activeP, interactiveVisionSpaceId);
-      if (cfg.visionModel) visionProvider = route.provider;
+      if (interactiveVisionRoute.model) visionProvider = route.provider;
       assertInteractiveAudience();
       return route.provider;
     };
@@ -7065,13 +7382,13 @@ program.action(async (opts) => {
       h: { sink: { notice: (s: string) => void }; select: (t: string, o: { label: string; value: string }[]) => Promise<string>; signal?: AbortSignal },
     ): Promise<{ extraText?: string; attach?: ImageAttachment[]; skip?: boolean }> => {
       if (!imgs?.length) return {};
-      if (cfg.visionModel) {
+      if (interactiveVisionRoute.model) {
         try {
           const vp = await getImageProvider();
           if (!vp) throw new Error("vision-first provider is unavailable");
-          h.sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with ${cfg.visionModel} before ${cfg.model}…`);
+          h.sink.notice(`✻ reading ${imgs.length} image${imgs.length === 1 ? "" : "s"} with ${interactiveVisionRoute.model} before ${cfg.model}…`);
           const desc = await describeImages(vp, imgs, { signal: h.signal });
-          return { extraText: `\n\n[Attached image description — read first by ${cfg.visionModel}]\n${desc}` };
+          return { extraText: `\n\n[Attached image description — read first by ${interactiveVisionRoute.model}]\n${desc}` };
         } catch (error) {
           const message = h.signal?.aborted
             ? "image description cancelled"
@@ -7115,8 +7432,8 @@ program.action(async (opts) => {
           ? "org default"
           : "user override"
         : undefined;
-    const __visionNotice = cfg.visionModel
-      ? `vision-first ${cfg.visionModel} → text for ${cfg.model}`
+    const __visionNotice = interactiveVisionRoute.model
+      ? `vision-first ${interactiveVisionRoute.model} → text for ${cfg.model}`
       : __mainCap === "text"
         ? `${cfg.model} is text-only — configure /vision <model> or switch models before attaching images`
         : undefined;

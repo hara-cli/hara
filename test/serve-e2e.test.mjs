@@ -2150,6 +2150,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
   };
   let savedInput;
   let savedVisionInput;
+  let testedVisionInput;
   let createdConnectionInput;
   let enrolledOrganizationInput;
   let unpinnedCwd;
@@ -2197,6 +2198,14 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       models: ["qwen3"],
       error: `upstream rejected apiKey=${input.apiKey}`,
     }),
+    testVisionSettings: async (input) => {
+      testedVisionInput = input;
+      return {
+        ok: false,
+        models: [],
+        error: `vision upstream rejected apiKey=${input.apiKey}`,
+      };
+    },
     saveProviderSettings: async (input) => {
       savedInput = input;
       return { ...state, accidentalApiKey: input.apiKey };
@@ -2290,6 +2299,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.ok(init.result.capabilities.methods.includes("settings.providers.test"));
     assert.ok(init.result.capabilities.methods.includes("settings.providers.save"));
     assert.ok(init.result.capabilities.methods.includes("settings.vision.save"));
+    assert.ok(init.result.capabilities.methods.includes("settings.vision.test"));
     for (const method of [
       "settings.providers.connections.create",
       "settings.providers.connections.test",
@@ -2322,8 +2332,19 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     assert.equal(savedInput.apiKey, secret, "the authenticated callback receives the ephemeral credential");
     assert.equal(JSON.stringify(saved.result).includes(secret), false, "save results must never echo a submitted key");
 
+    const visionTested = await c.call("settings.vision.test", {
+      source: "custom",
+      provider: "openai",
+      model: "gpt-4o-mini",
+      apiKey: secret,
+    });
+    assert.equal(testedVisionInput.apiKey, secret, "the vision probe receives its transient credential");
+    assert.equal(JSON.stringify(visionTested.result).includes(secret), false, "vision probe errors never echo a submitted key");
+
     const visionSaved = await c.call("settings.vision.save", {
       enabled: true,
+      source: "custom",
+      provider: "deepseek",
       model: "deepseek-v4-flash-vision-exp",
       apiKey: secret,
     });

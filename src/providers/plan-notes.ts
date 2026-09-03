@@ -29,7 +29,7 @@ const NOTES: Partial<Record<ProviderId, PlanNote>> = {
   "volcengine-agent-plan": {
     billing: "Agent Fuel Points are shared across every supported Agent Plan tool; model and Harness usage draw from the same subscription allowance.",
     limits: "The plan uses a 5-hour cycle plus weekly and monthly limits. When an allowance is exhausted, service pauses unless overage billing is enabled in Ark.",
-    models: "ark-code-latest follows the model selected in the Ark console. Use an explicit model id when a session must stay pinned to one model.",
+    models: "auto is the recommended quality/speed router. Pick an explicit model id when a session must stay pinned; ark-code-latest remains a compatibility alias for the model selected in Ark.",
   },
 };
 

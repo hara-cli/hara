@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.164.2 — 2026-09-03 — connection-bound vision and current Ark models
+
+- Bind the vision-first route to the exact Personal or company model connection. Company Spaces can select
+  only image-capable models in Control's current allow-list and can never attach a separate endpoint or Key;
+  Personal can either reuse its current provider or choose an independently authenticated protocol adapter.
+- Require a live verification before saving a Personal image route, keep arbitrary or text-only IDs out of
+  the vision picker, and pass the image model's returned text to the conversation model without rewriting it.
+  Every attachment still follows the fixed image-recognition task before the main model runs.
+- Make `auto` the recommended/default Volcengine Agent Plan route, align the catalog and multimodal labels
+  with the current Ark list, retain documented compatibility/tier entries, and keep embedding, speech,
+  image-generation, and video-generation endpoints out of Hara's conversation picker.
+
 ## 0.164.1 — 2026-09-03 — verified macOS scheduler registration
 
 - Register the per-user macOS scheduler with modern `launchctl bootstrap`, verify the live service in its GUI

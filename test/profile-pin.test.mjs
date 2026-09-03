@@ -29,6 +29,7 @@ const {
   removeProfile,
   removeHistoricalPersonalRoutes,
   syncStoredPersonalProfile,
+  setProfileVisionSettings,
   useProfile,
 } = await import("../dist/profile/profile.js");
 const { clearPersonalProviderConfig } = await import("../dist/config.js");
@@ -108,6 +109,44 @@ test("resolveActive: defaults to profiles.json `active` (source=default)", () =>
     assert.equal(r.id, "personal");
     assert.equal(r.source, "default");
     assert.equal(activeId(), "personal");
+  });
+});
+
+test("vision-first settings are isolated on the model connection that owns them", () => {
+  withHome((home) => {
+    const company = setProfileVisionSettings("org-x", { model: "glm-5", source: "current" });
+    assert.deepEqual(company, { ok: true });
+    let profiles = JSON.parse(readFileSync(join(home, ".hara", "profiles.json"), "utf8"));
+    assert.equal(profiles.profiles.find((profile) => profile.id === "org-x").visionModel, "glm-5");
+    assert.equal(profiles.profiles.find((profile) => profile.id === "org-y").visionModel, undefined);
+    assert.equal(existsSync(join(home, ".hara", "config.json")), false, "company settings never spill into Personal config");
+
+    assert.deepEqual(
+      setProfileVisionSettings("org-x", {
+        model: "glm-5",
+        source: "custom",
+        provider: "openai",
+        apiKey: "must-not-persist",
+      }),
+      { ok: false, reason: "company vision routing must reuse the managed connection" },
+    );
+    assert.equal(
+      JSON.stringify(JSON.parse(readFileSync(join(home, ".hara", "profiles.json"), "utf8"))).includes("must-not-persist"),
+      false,
+    );
+
+    assert.deepEqual(setProfileVisionSettings("personal", {
+      model: "gpt-4o-mini",
+      source: "custom",
+      provider: "openai",
+      baseURL: "https://api.openai.com/v1",
+      apiKey: "personal-vision-key",
+    }), { ok: true });
+    const personal = JSON.parse(readFileSync(join(home, ".hara", "config.json"), "utf8"));
+    assert.equal(personal.visionModel, "gpt-4o-mini");
+    assert.equal(personal.visionProvider, "openai");
+    profiles = JSON.parse(readFileSync(join(home, ".hara", "profiles.json"), "utf8"));
+    assert.equal(profiles.profiles.find((profile) => profile.id === "org-x").visionApiKey, undefined);
   });
 });
 

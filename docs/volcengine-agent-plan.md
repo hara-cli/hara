@@ -18,7 +18,7 @@ Interactive setup (the key prompt is masked):
 ```bash
 hara profile add ark-agent-plan --byok \
   --provider volcengine-agent-plan \
-  --model ark-code-latest
+  --model auto
 hara profile use ark-agent-plan
 hara doctor
 ```
@@ -29,15 +29,21 @@ For a trusted launcher that already exports the key, avoid storing another copy:
 export ARK_API_KEY="<YOUR_AGENT_PLAN_KEY>"
 hara profile add ark-agent-plan --byok \
   --provider volcengine-agent-plan \
-  --model ark-code-latest \
+  --model auto \
   --no-key-prompt
 hara profile use ark-agent-plan
 ```
 
-`ark-code-latest` follows the model selected in the Ark console. Use `/model` or pass an explicit current
-text-model id when a session needs to stay pinned. Hara uses Responses streaming and function calling,
+`auto` is the recommended quality/speed router. `ark-code-latest` remains a compatibility alias that follows
+the model selected in the Ark console; use `/model` or pass an explicit current conversation-model id when a
+session needs to stay pinned. Hara uses Responses streaming and function calling,
 keeps its durable transcript locally with `store:false`, and does not automatically enable provider-side
 Harness tools because local approvals and organization policy remain the authority.
+
+The main model picker hides embedding, speech, image-generation, and video-generation endpoints. Multimodal
+conversation models remain available. In the connection-bound vision-first setting, Hara lists only models
+it has confirmed accept image input; `auto` is never offered as a fixed image preprocessor because its routed
+model can change between requests.
 
 ## Codex CLI or Codex mode in ChatGPT Desktop
 
@@ -45,7 +51,7 @@ Install current Codex, then put this provider in `~/.codex/config.toml` (Windows
 `%USERPROFILE%\.codex\config.toml`):
 
 ```toml
-model = "ark-code-latest"
+model = "auto"
 model_provider = "volcengine-agent-plan"
 model_supports_reasoning_summaries = true
 model_reasoning_effort = "medium"
@@ -74,11 +80,11 @@ following `env` object into `~/.claude/settings.json` (Windows:
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "<YOUR_AGENT_PLAN_KEY>",
     "ANTHROPIC_BASE_URL": "https://ark.cn-beijing.volces.com/api/plan",
-    "ANTHROPIC_MODEL": "ark-code-latest",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ark-code-latest",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "ark-code-latest",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "ark-code-latest",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "ark-code-latest",
+    "ANTHROPIC_MODEL": "auto",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "auto",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "auto",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "auto",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "auto",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
 }

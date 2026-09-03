@@ -534,7 +534,14 @@ export function upsertGatewayProfileFromEnrollment(
     enrolledAt: enrollment.enrolledAt,
   };
   const previous = getProfile(profile.id);
-  upsertProfile(profile);
+  const nextProfile = previous?.visionModel && profile.availableModels?.includes(previous.visionModel)
+    ? {
+        ...profile,
+        visionModel: previous.visionModel,
+        visionSource: "current" as const,
+      }
+    : profile;
+  upsertProfile(nextProfile);
   try {
     if (enrollment.desk) saveProfileCreds(enrollment.desk, identity);
     else removeMismatchedProfileCreds(identity);
@@ -546,7 +553,7 @@ export function upsertGatewayProfileFromEnrollment(
     else removeProfile(profile.id);
     throw error;
   }
-  return profile;
+  return nextProfile;
 }
 
 /** Desktop/profile-native enrollment: no legacy file is written, and the one-time code is never
@@ -674,10 +681,22 @@ function persistHeartbeatCatalog(e: Enrollment, persistence: HeartbeatPersistenc
   const selected = current.model && e.availableModels?.includes(current.model)
     ? current.model
     : undefined;
+  const visionModel = current.visionModel && e.availableModels?.includes(current.visionModel)
+    ? current.visionModel
+    : undefined;
   upsertProfile({
     ...current,
     defaultModel: e.model,
     ...(selected ? { model: selected } : { model: undefined }),
+    ...(visionModel
+      ? { visionModel, visionSource: "current" }
+      : {
+          visionModel: undefined,
+          visionSource: undefined,
+          visionProvider: undefined,
+          visionBaseURL: undefined,
+          visionApiKey: undefined,
+        }),
     availableModels: e.availableModels,
     thinkingEfforts: e.thinkingEfforts,
     modelCapabilities: e.modelCapabilities,

@@ -49,6 +49,11 @@ export function profileByIdForConfig(cfg: HaraConfig, profileId: string): Profil
       apiKey: cfg.apiKey,
       baseURL: cfg.baseURL,
       defaultModel: cfg.model,
+      visionModel: cfg.visionModel,
+      visionSource: cfg.visionSource,
+      visionProvider: cfg.visionProvider,
+      visionBaseURL: cfg.visionBaseURL,
+      visionApiKey: cfg.visionApiKey,
     };
   }
   return getProfile(profileId) ?? null;

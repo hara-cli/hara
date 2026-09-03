@@ -104,14 +104,15 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ```bash
 hara profile add ark-agent-plan --byok \
   --provider volcengine-agent-plan \
-  --model ark-code-latest
+  --model auto
 # Enter the Agent Plan key at Hara's masked prompt, then:
 hara profile use ark-agent-plan
 ```
 
 Hara pins this provider to `https://ark.cn-beijing.volces.com/api/plan/v3`, reads `ARK_API_KEY` when no
-key is stored, and uses the Responses protocol documented for Codex. `ark-code-latest` follows the model
-selected in the Ark console; choose an explicit model id to pin a session. Hara keeps durable history local
+key is stored, and uses the Responses protocol documented for Codex. `auto` is the recommended quality/speed
+router; `ark-code-latest` remains available for compatibility with the model selected in the Ark console.
+Choose an explicit model id to pin a session. Hara keeps durable history local
 with `store:false`, filters non-conversation media models out of `/model`, and exposes the endpoint's native
 thinking controls. Agent Plan is licensed for supported interactive AI tools, not arbitrary backend API use.
 Direct Codex and Claude Code configuration, including their intentionally different endpoint/protocol,

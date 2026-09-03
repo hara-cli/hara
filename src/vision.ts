@@ -56,6 +56,9 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   { rx: /^glm-5\.3-flash(?:-|$)/i, cap: "vision" },
   { rx: /glm-?\d(?:\.\d+)?v|cogvlm|glm.*vision/i, cap: "vision" },
   { rx: /glm-?\d(?:\.\d+)?(?:-(?:air|flash|plus|long|x|0520))?\b|glm-z|chatglm/i, cap: "text" },
+  // Volcengine Agent Plan explicitly advertises Doubao Seed 2.1 Turbo as multimodal. Older Seed
+  // aliases stay unknown/text unless their own catalog says otherwise.
+  { rx: /^doubao-seed-2\.1-turbo(?:-|$)/i, cap: "vision" },
   // DeepSeek (the exact official V4 vision model and VL families first, then the text families)
   { rx: /^deepseek-v4-flash-vision-exp$/i, cap: "vision" },
   { rx: /deepseek.*vl/i, cap: "vision" },
@@ -69,8 +72,8 @@ const MODEL_VISION_MAP: { rx: RegExp; cap: "vision" | "text" }[] = [
   // Meta Llama (3.2-11B/90B + 4 see; the rest text)
   { rx: /llama-?3\.2-(?:11|90)b|llama.*vision|llama-?4/i, cap: "vision" },
   { rx: /llama|codellama/i, cap: "text" },
-  // Moonshot / Kimi — kimi-k2.5 sees images (Coding Plan); older Kimi text.
-  { rx: /kimi-?k?2\.5|kimi.*vl|moonshot.*(?:vl|vision)/i, cap: "vision" },
+  // Moonshot / Kimi — K3 and K2.7 Code accept image input on Agent Plan (K2.7 also accepts video).
+  { rx: /^kimi-(?:k3|k2\.7-code)(?:-|$)|kimi-?k?2\.5|kimi.*vl|moonshot.*(?:vl|vision)/i, cap: "vision" },
   { rx: /kimi|moonshot/i, cap: "text" },
   // xAI Grok
   { rx: /grok.*vision|grok-[\d.]*v\b|grok-4/i, cap: "vision" },
@@ -208,5 +211,7 @@ export async function describeImages(
     onText: () => {},
   }, { timeoutMs: opts.timeoutMs ?? 90_000, signal: opts.signal, label: "image description" });
   if (r.stop === "error") throw new Error(r.errorMsg || "vision provider error");
-  return r.text.trim();
+  // Preserve the vision model's response byte-for-byte at the string level. The caller may place a fixed
+  // boundary around it for the conversation model, but must not summarize, normalize, or rewrite it.
+  return r.text;
 }

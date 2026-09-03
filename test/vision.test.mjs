@@ -41,6 +41,9 @@ test("classifyVision: vision-capable families → 'vision'", () => {
   V("openai", "glm-4v");
   V("openai", "glm-4.5v");
   V("volcengine-agent-plan", "glm-5.3-flash");
+  V("volcengine-agent-plan", "doubao-seed-2.1-turbo");
+  V("volcengine-agent-plan", "kimi-k2.7-code");
+  V("volcengine-agent-plan", "kimi-k3");
   V("openai", "deepseek-vl2");
   V("deepseek", "deepseek-v4-flash-vision-exp");
   V("openai", "gemini-2.5-pro");
@@ -81,6 +84,11 @@ test("classifyVision: text-only families → 'text'", () => {
 test("classifyVision: genuinely unknown models → 'unknown' (ask the user)", () => {
   assert.equal(classifyVision("openai", "some-mystery-llm-9000"), "unknown");
   assert.equal(classifyVision("openai", "frobnicator-x1"), "unknown");
+  assert.equal(
+    classifyVision("volcengine-agent-plan", "auto"),
+    "unknown",
+    "a dynamic router must never masquerade as one fixed image preprocessor",
+  );
 });
 
 test("classifyVision: per-model overrides win and don't leak across models", () => {
@@ -163,11 +171,11 @@ function fakeProvider(result) {
   };
 }
 
-test("describeImages forwards images to the vision provider and returns its (trimmed) text", async () => {
+test("describeImages forwards images and returns the vision model text unchanged", async () => {
   const { provider, calls } = fakeProvider({ text: "  a red login button over a dark form  ", toolUses: [], stop: "end" });
   const images = [{ path: "/tmp/x.png", mediaType: "image/png" }];
   const out = await describeImages(provider, images);
-  assert.equal(out, "a red login button over a dark form");
+  assert.equal(out, "  a red login button over a dark form  ");
   assert.equal(calls.length, 1);
   assert.equal(calls[0].system, DESCRIBE_SYSTEM);
   const userMsg = calls[0].history[0];

@@ -66,6 +66,20 @@ export function volcengineAgentPlanFallbackModels(baseURL: string | undefined): 
     : [];
 }
 
+/** Hara's model picker is an Agent/conversation surface. Capability-specific endpoints such as
+ * embeddings, rerankers, speech, image/video generation and realtime voice belong in their own tools,
+ * while multimodal conversation models (VL/vision models) deliberately remain selectable. */
+export function isInteractiveConversationModel(model: string): boolean {
+  const id = model.toLowerCase();
+  return !(
+    /(?:^|[-_/])(?:embedding|rerank)(?:[-_/]|$)/.test(id)
+    || /(?:^|[-_/])(?:tts|asr|stt|whisper|realtime|audio|speech)(?:[-_/]|$)/.test(id)
+    || /(?:seedream|seedance|dall-e|gpt-image|image-generation|stable-diffusion)/.test(id)
+    || /(?:^|[-_/])(?:image|t2i|i2i|sora|veo|t2v|i2v|v2v)(?:[-_/]|$)/.test(id)
+    || /(?:^|[-_/])flux(?:[-_/]|$)/.test(id)
+  );
+}
+
 // Model discovery — "what can this key run?" A plan / OpenAI-compatible key usually exposes many
 // models (Qwen, GLM, Kimi, …) via `GET {baseURL}/models`; the /model picker lists them so you switch by
 // arrow keys, not by memorizing ids. Live results win. A bounded request falls back to Alibaba's documented
@@ -95,7 +109,9 @@ export async function listModels(
     const j = (await r.json()) as { data?: { id?: unknown }[] };
     const ids = (j?.data ?? []).map((m) => m?.id).filter((x): x is string => typeof x === "string" && x.length > 0);
     // Stable order + de-dup so the picker list doesn't jump around between opens.
-    const discovered = [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+    const discovered = [...new Set(ids)]
+      .filter(isInteractiveConversationModel)
+      .sort((a, b) => a.localeCompare(b));
     const selectable = isOfficialTokenPlanOpenAIEndpoint(baseURL)
       ? discovered.filter((id) =>
           isTokenPlanInteractiveAgentModel(id)

@@ -45,6 +45,7 @@ export type ProviderId =
   | "lmstudio"
   | "hara-gateway";
 export type ApprovalMode = "suggest" | "auto-edit" | "full-auto";
+export type VisionModelSource = "current" | "custom";
 
 export interface McpServerConfig {
   command: string;
@@ -75,9 +76,13 @@ export interface HaraConfig {
   /** Optional explicit vision-first model. When set, every image is described by this model before the
    *  conversation model runs. Only images and a focused transcription prompt are sent on this route. */
   visionModel: string | undefined;
-  /** Optional endpoint override for a Personal/BYOK vision-first model. Managed routes ignore it. */
+  /** Reuse the active connection, or use an independently configured provider/credential boundary. */
+  visionSource: VisionModelSource;
+  /** Provider/protocol adapter for a custom vision route. Current-provider routes deliberately omit it. */
+  visionProvider: ProviderId | undefined;
+  /** Endpoint for a custom Personal/BYOK vision-first model. Managed/current routes ignore it. */
   visionBaseURL: string | undefined;
-  /** Optional key override for a Personal/BYOK vision-first model. Managed routes ignore it. */
+  /** Credential for a custom Personal/BYOK vision-first model. Managed/current routes ignore it. */
   visionApiKey: string | undefined;
   /** Per-model vision-capability overrides the user has confirmed (model id → "yes"|"no"). Built-in
    *  detection (classifyVision) handles known families; this records answers for unknown ones so we
@@ -159,7 +164,7 @@ const PROVIDER_DEFAULTS: Record<ProviderId, { model: string; baseURL?: string; e
     envKey: "MINIMAX_API_KEY",
   },
   "volcengine-agent-plan": {
-    model: "ark-code-latest",
+    model: "auto",
     baseURL: VOLCENGINE_AGENT_PLAN_BASE_URL,
     envKey: "ARK_API_KEY",
   },
@@ -282,7 +287,7 @@ export function providerCatalog(): ProviderCatalogEntry[] {
   }));
 }
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionSource", "visionProvider", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = [
   "off",
   "minimal",
@@ -410,7 +415,7 @@ export function readRawConfig(): Record<string, any> {
 const ROUTING_CONFIG_KEYS = new Set([
   "provider", "apiKey", "model", "baseURL",
   "fallbackProvider", "fallbackApiKey", "fallbackModel", "fallbackBaseURL",
-  "visionApiKey", "visionModel", "visionBaseURL",
+  "visionApiKey", "visionModel", "visionSource", "visionProvider", "visionBaseURL",
   "embedProvider", "embedApiKey", "embedModel", "embedBaseURL",
   "routeApiKey", "routeModel", "routeBaseURL",
 ]);
@@ -796,8 +801,17 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     : "off";
   const computerApps = String(process.env.HARA_COMPUTER_APPS ?? merged.computerApps ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const visionModel = nonBlankEnv(process.env.HARA_VISION_MODEL) ?? merged.visionModel;
+  const requestedVisionProvider = nonBlankEnv(process.env.HARA_VISION_PROVIDER) ?? merged.visionProvider;
+  const visionProvider = isProviderId(requestedVisionProvider) && requestedVisionProvider !== "hara-gateway"
+    ? requestedVisionProvider
+    : undefined;
   const visionBaseURL = nonBlankEnv(process.env.HARA_VISION_BASE_URL) ?? merged.visionBaseURL;
   const visionApiKey = nonBlankEnv(process.env.HARA_VISION_API_KEY) ?? merged.visionApiKey;
+  const requestedVisionSource = nonBlankEnv(process.env.HARA_VISION_SOURCE) ?? merged.visionSource;
+  const visionSource: VisionModelSource = requestedVisionSource === "custom"
+    || (requestedVisionSource !== "current" && Boolean(visionProvider || visionBaseURL || visionApiKey))
+    ? "custom"
+    : "current";
   const modelVision = merged.modelVision && typeof merged.modelVision === "object" ? (merged.modelVision as Record<string, "yes" | "no">) : {};
   const embedProvider = (nonBlankEnv(process.env.HARA_EMBED_PROVIDER) ?? merged.embedProvider ?? "off") as "off" | "ollama" | "qwen" | "openai";
   const embedModel = nonBlankEnv(process.env.HARA_EMBED_MODEL) ?? merged.embedModel;
@@ -842,7 +856,7 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     ? (reasoningRaw as NonNullable<HaraConfig["reasoningEffort"]>)
     : undefined;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionSource, visionProvider, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

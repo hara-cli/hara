@@ -9,6 +9,7 @@ import {
   codingPlanFallbackModels,
   deepSeekFallbackModels,
   listModels,
+  isInteractiveConversationModel,
   miniMaxFallbackModels,
   volcengineAgentPlanFallbackModels,
 } from "../dist/providers/models.js";
@@ -104,6 +105,23 @@ test("listModels: parses /models, de-dups + sorts; [] on non-ok / no baseURL / t
   assert.deepEqual(await listModels("https://x/v1", "k", boom), [], "throw → [] (best-effort)");
 });
 
+test("the Hara model picker excludes capability-only media and vector endpoints", () => {
+  for (const hidden of [
+    "text-embedding-3-large",
+    "qwen-audio-3.0-tts-plus",
+    "doubao-seed-asr-2.0",
+    "wan2.7-image-pro",
+    "happyhorse-1.1-t2v",
+    "doubao-seedance-2.0",
+  ]) assert.equal(isInteractiveConversationModel(hidden), false, hidden);
+  for (const visible of [
+    "glm-5.3-flash",
+    "kimi-k2.7-code",
+    "deepseek-v4-flash-vision-exp",
+    "minimax-m3",
+  ]) assert.equal(isInteractiveConversationModel(visible), true, visible);
+});
+
 test("Coding Plan model discovery uses live ids first and the documented exact list only as a host-scoped fallback", async () => {
   assert.deepEqual(codingPlanFallbackModels("https://coding.dashscope.aliyuncs.com/v1"), [...CODING_PLAN_FALLBACK_MODELS]);
   assert.deepEqual(codingPlanFallbackModels("https://coding-intl.dashscope.aliyuncs.com/v1"), [...CODING_PLAN_FALLBACK_MODELS]);
@@ -148,17 +166,8 @@ test("Token Plan discovery follows the key-scoped live catalog but hides models 
   );
   assert.deepEqual(
     await listModels("https://another.example/v1", "k", live),
-    [
-      "deepseek-v4-pro",
-      "glm-5.2",
-      "happyhorse-1.1-t2v",
-      "qwen-audio-3.0-realtime-plus",
-      "qwen-audio-3.0-tts-plus",
-      "qwen3.8-max",
-      "wan2.7-image",
-      "wan2.7-image-pro",
-    ],
-    "media filtering is scoped to the exact Token Plan endpoint",
+    ["deepseek-v4-pro", "glm-5.2", "qwen3.8-max"],
+    "Hara's Agent picker hides capability-only media endpoints on compatible providers too",
   );
   const unavailable = async () => ({ ok: false, json: async () => ({}) });
   assert.deepEqual(
@@ -226,8 +235,21 @@ test("MiniMax Token Plan discovery falls back to M3 only on the exact official e
   );
 });
 
-test("Volcengine Agent Plan discovery keeps text models and filters separate media APIs", async () => {
-  assert.equal(VOLCENGINE_AGENT_PLAN_MODELS[0], "ark-code-latest");
+test("Volcengine Agent Plan discovery keeps agent models and filters separate media APIs", async () => {
+  assert.equal(VOLCENGINE_AGENT_PLAN_MODELS[0], "auto");
+  assert.ok(VOLCENGINE_AGENT_PLAN_MODELS.includes("ark-code-latest"));
+  assert.deepEqual(VOLCENGINE_AGENT_PLAN_MODELS.slice(0, 10), [
+    "auto",
+    "doubao-seed-evolving",
+    "doubao-seed-2.1-turbo",
+    "doubao-seed-2.0-lite",
+    "doubao-seed-2.0-mini",
+    "glm-5.3-flash",
+    "glm-5.3",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+    "minimax-m3",
+  ]);
   assert.deepEqual(
     volcengineAgentPlanFallbackModels(VOLCENGINE_AGENT_PLAN_BASE_URL),
     [...VOLCENGINE_AGENT_PLAN_MODELS],

@@ -6,22 +6,24 @@ const VOLCENGINE_AGENT_PLAN_PATH = "/api/plan/v3";
 export const VOLCENGINE_AGENT_PLAN_BASE_URL =
   `https://${VOLCENGINE_AGENT_PLAN_HOST}${VOLCENGINE_AGENT_PLAN_PATH}`;
 
-/** Current Agent Plan text-model catalog documented by Volcengine (verified 2026-09-02). The stable
- * control-plane alias comes first and is the default. Live key-scoped discovery remains authoritative. */
+/** Current Agent Plan conversation-model catalog documented by Volcengine (verified 2026-09-03).
+ * `auto` is the product's first/default choice; compatibility aliases remain at the end so existing
+ * configurations stay editable. Live key-scoped discovery remains authoritative. */
 export const VOLCENGINE_AGENT_PLAN_MODELS = Object.freeze([
-  "ark-code-latest",
-  "doubao-seed-2.0-mini",
-  "doubao-seed-2.0-lite",
-  "deepseek-v4-flash",
-  "glm-5.3-flash",
-  "doubao-seed-2.1-turbo",
+  "auto",
   "doubao-seed-evolving",
-  "minimax-m3",
+  "doubao-seed-2.1-turbo",
+  "doubao-seed-2.0-lite",
+  "doubao-seed-2.0-mini",
+  "glm-5.3-flash",
   "glm-5.3",
-  "glm-latest",
-  "kimi-k2.7-code",
   "deepseek-v4-pro",
+  "deepseek-v4-flash",
+  "minimax-m3",
+  "kimi-k2.7-code",
   "kimi-k3",
+  "ark-code-latest",
+  "glm-latest",
 ]);
 
 export function isOfficialVolcengineAgentPlanEndpoint(baseURL: string | undefined): boolean {

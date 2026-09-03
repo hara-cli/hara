@@ -793,11 +793,12 @@ test("provider catalog: Volcengine Agent Plan exposes its fixed Codex Responses 
     {
       auth: "api-key",
       baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
-      model: "ark-code-latest",
+      model: "auto",
       customBaseURL: false,
     },
   );
   assert.ok(volcengine?.knownModels?.includes("glm-5.3-flash"));
+  assert.ok(volcengine?.knownModels?.includes("auto"));
   assert.ok(volcengine?.knownModels?.includes("deepseek-v4-pro"));
   assert.equal(volcengine?.knownModels?.some((model) => /seedream|seedance|embedding|tts|asr/i.test(model)), false);
 });

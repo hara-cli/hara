@@ -257,6 +257,7 @@ export interface ServeDeps {
    * save/test and must never be returned by these callbacks. */
   providerSettings?: (cwd?: string) => ProviderSettingsState;
   saveVisionSettings?: (input: VisionSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
+  testVisionSettings?: (input: VisionSettingsTestInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
   saveProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
   testProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
   createProviderConnection?: (input: ProviderConnectionCreateInput, cwd?: string) => Promise<ProviderSettingsState>;
@@ -620,6 +621,8 @@ export interface ProviderSettingsCatalogEntry {
   defaultBaseURL?: string;
   customBaseURL: boolean;
   knownModels?: readonly string[];
+  /** Models this engine version has positively classified as accepting image input. */
+  knownVisionModels?: readonly string[];
   knownModelEntries?: Array<{ id: string; effortLevels: string[] }>;
   legacy?: boolean;
 }
@@ -651,17 +654,32 @@ export interface ProviderSettingsState {
 
 export interface VisionSettingsState {
   enabled: boolean;
+  source: "current" | "custom";
+  provider: string;
   model?: string;
   baseURL?: string;
   apiKeyConfigured: boolean;
   usesManagedCredential: boolean;
   editable: boolean;
   authorized: boolean;
+  /** Image-capable choices only; generation/audio/embedding and text-only models are excluded. */
+  availableModels: string[];
   authorizedModels?: string[];
 }
 
 export interface VisionSettingsInput {
   enabled: boolean;
+  source?: "current" | "custom";
+  provider?: string;
+  model?: string;
+  baseURL?: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+
+export interface VisionSettingsTestInput {
+  source: "current" | "custom";
+  provider?: string;
   model?: string;
   baseURL?: string;
   apiKey?: string;
@@ -707,7 +725,12 @@ export interface ProviderConnectionCreateInput extends ProviderSettingsInput {
 export interface ProviderSettingsTestResult {
   ok: boolean;
   models: string[];
-  entries?: Array<{ id: string; providerId: string; effortLevels: string[] }>;
+  entries?: Array<{
+    id: string;
+    providerId: string;
+    effortLevels: string[];
+    attachmentCapabilities?: EffectiveAttachmentCapabilities;
+  }>;
   error?: string;
 }
 
@@ -1919,7 +1942,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           });
           sessionSpaceBinding(s.meta);
           preparedImages = Array.isArray(prepared.images) ? prepared.images : [];
-          imageDescription = prepared.description?.trim() || undefined;
+          imageDescription = prepared.description?.trim() ? prepared.description : undefined;
           if (imageDescription) {
             const viaModel = prepared.viaModel
               ?? runtime.attachmentCapabilities?.image.viaModel
@@ -2031,7 +2054,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               sessionSpaceBinding(s.meta);
               if (prepared.description?.trim()) {
                 return {
-                  text: prepared.description.trim(),
+                  text: prepared.description,
                   model: prepared.viaModel
                     ?? runtime.attachmentCapabilities?.image.viaModel
                     ?? s.provider.model,
@@ -2510,7 +2533,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt",
             "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
-            "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.save",
+            "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.test", "settings.vision.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
@@ -3798,20 +3821,48 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             return reply(rpcResult(id!, redactSensitiveValue(deps.providerSettings(targetCwd)).value));
           }
-          case "settings.vision.save": {
-            if (!deps.saveVisionSettings) return reply(rpcError(id, ERR.METHOD, "vision settings are not supported by this server"));
+          case "settings.vision.test": {
+            if (!deps.testVisionSettings) return reply(rpcError(id, ERR.METHOD, "vision settings are not supported by this server"));
             if (
-              typeof p.enabled !== "boolean"
+              (p.source !== "current" && p.source !== "custom")
+              || (p.provider !== undefined && typeof p.provider !== "string")
               || (p.model !== undefined && typeof p.model !== "string")
               || (p.baseURL !== undefined && typeof p.baseURL !== "string")
               || (p.apiKey !== undefined && typeof p.apiKey !== "string")
               || (p.clearApiKey !== undefined && typeof p.clearApiKey !== "boolean")
             ) {
-              return reply(rpcError(id, ERR.PARAMS, "enabled is required; optional model/baseURL/apiKey/clearApiKey have invalid types"));
+              return reply(rpcError(id, ERR.PARAMS, "source must be current/custom; optional provider/model/baseURL/apiKey/clearApiKey have invalid types"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const input: VisionSettingsTestInput = {
+              source: p.source,
+              ...(p.provider !== undefined ? { provider: p.provider } : {}),
+              ...(p.model !== undefined ? { model: p.model } : {}),
+              ...(p.baseURL !== undefined ? { baseURL: p.baseURL } : {}),
+              ...(p.apiKey !== undefined ? { apiKey: p.apiKey } : {}),
+              ...(p.clearApiKey !== undefined ? { clearApiKey: p.clearApiKey } : {}),
+            };
+            const result = await deps.testVisionSettings(input, targetCwd);
+            return reply(rpcResult(id!, redactSensitiveValue(result).value));
+          }
+          case "settings.vision.save": {
+            if (!deps.saveVisionSettings) return reply(rpcError(id, ERR.METHOD, "vision settings are not supported by this server"));
+            if (
+              typeof p.enabled !== "boolean"
+              || (p.source !== undefined && p.source !== "current" && p.source !== "custom")
+              || (p.provider !== undefined && typeof p.provider !== "string")
+              || (p.model !== undefined && typeof p.model !== "string")
+              || (p.baseURL !== undefined && typeof p.baseURL !== "string")
+              || (p.apiKey !== undefined && typeof p.apiKey !== "string")
+              || (p.clearApiKey !== undefined && typeof p.clearApiKey !== "boolean")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "enabled is required; optional source/provider/model/baseURL/apiKey/clearApiKey have invalid types"));
             }
             const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
             const input: VisionSettingsInput = {
               enabled: p.enabled,
+              ...(p.source !== undefined ? { source: p.source } : {}),
+              ...(p.provider !== undefined ? { provider: p.provider } : {}),
               ...(p.model !== undefined ? { model: p.model } : {}),
               ...(p.baseURL !== undefined ? { baseURL: p.baseURL } : {}),
               ...(p.apiKey !== undefined ? { apiKey: p.apiKey } : {}),

@@ -34,7 +34,12 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join, dirname, parse as parsePath, relative, resolve as resolvePath } from "node:path";
 import { lstatSync, realpathSync } from "node:fs";
-import { readRawConfig, updateRawConfig, type ProviderId } from "../config.js";
+import {
+  readRawConfig,
+  updateRawConfig,
+  type ProviderId,
+  type VisionModelSource,
+} from "../config.js";
 import { readVerifiedRegularFileSnapshotSync, type RegularFileSnapshot } from "../fs-read.js";
 import {
   atomicWriteText,
@@ -89,6 +94,14 @@ export interface Profile {
   defaultModel?: string;
   /** the user's per-profile override of `defaultModel`. Cleared by `model reset`. */
   model?: string;
+  /** Optional image-recognition route owned by this model connection. Personal keeps these same fields
+   * in config.json; company and legacy named connections keep them in profiles.json. */
+  visionModel?: string;
+  visionSource?: VisionModelSource;
+  /** Only Personal/BYOK connections may point vision at an independent provider boundary. */
+  visionProvider?: ProviderId;
+  visionBaseURL?: string;
+  visionApiKey?: string;
   /** Server-authorized catalog for a gateway connection; byok stays empty (no list constraint).
    *  Control may refresh this in place during heartbeat without rotating the credential. */
   availableModels?: string[];
@@ -272,6 +285,13 @@ function readPersonalFromConfig(): Profile {
     apiKey: cfg.apiKey,
     baseURL: cfg.baseURL,
     defaultModel: cfg.model,
+    visionModel: typeof cfg.visionModel === "string" ? cfg.visionModel : undefined,
+    visionSource: cfg.visionSource === "custom" ? "custom" : "current",
+    visionProvider: typeof cfg.visionProvider === "string" && cfg.visionProvider !== "hara-gateway"
+      ? cfg.visionProvider as ProviderId
+      : undefined,
+    visionBaseURL: typeof cfg.visionBaseURL === "string" ? cfg.visionBaseURL : undefined,
+    visionApiKey: typeof cfg.visionApiKey === "string" ? cfg.visionApiKey : undefined,
     // No per-profile override yet for the personal slot — `model` (override) and `defaultModel`
     // come from the same field in config.json. `hara model use X` writes `model` to config.json,
     // `hara model reset` clears it. Conceptually one slot, but the rest of the codebase only ever
@@ -813,6 +833,83 @@ export function resetModel(id: string): { ok: true } | { ok: false; reason: stri
     if (i < 0) return { ok: false, reason: `no profile '${id}'` };
     const { model: _drop, ...rest } = state.value.profiles[i];
     state.value.profiles[i] = rest;
+    persistProfilesFile(state.value, state.snapshot.text);
+    return { ok: true };
+  });
+}
+
+export interface ProfileVisionSettings {
+  model: string;
+  source: VisionModelSource;
+  provider?: ProviderId;
+  baseURL?: string;
+  apiKey?: string;
+}
+
+/** Persist the optional image-recognition route on the exact model connection that owns it.
+ * Personal remains config.json-backed for compatibility; every other connection is updated atomically
+ * in profiles.json. Passing undefined disables the route and removes any separate credential. */
+export function setProfileVisionSettings(
+  id: string,
+  settings: ProfileVisionSettings | undefined,
+): { ok: true } | { ok: false; reason: string } {
+  if (id === PERSONAL_ID) {
+    updateRawConfig((config) => {
+      delete config.visionModel;
+      delete config.visionSource;
+      delete config.visionProvider;
+      delete config.visionBaseURL;
+      delete config.visionApiKey;
+      if (!settings) return;
+      config.visionModel = settings.model;
+      config.visionSource = settings.source;
+      if (settings.source === "custom") {
+        if (settings.provider) config.visionProvider = settings.provider;
+        if (settings.baseURL) config.visionBaseURL = settings.baseURL;
+        if (settings.apiKey) config.visionApiKey = settings.apiKey;
+      }
+    });
+    return { ok: true };
+  }
+  return withProfilesLock(() => {
+    const state = maybeMigrateUnlocked();
+    const index = state.value.profiles.findIndex((profile) => profile.id === id);
+    if (index < 0) return { ok: false, reason: `no profile '${id}'` };
+    const profile = state.value.profiles[index];
+    if (profile.kind === "gateway" && settings?.source === "custom") {
+      return { ok: false, reason: "company vision routing must reuse the managed connection" };
+    }
+    if (
+      profile.kind === "gateway"
+      && settings
+      && (!profile.availableModels?.length || !profile.availableModels.includes(settings.model))
+    ) {
+      return { ok: false, reason: `'${settings.model}' is not authorized by this company connection` };
+    }
+    const {
+      visionModel: _visionModel,
+      visionSource: _visionSource,
+      visionProvider: _visionProvider,
+      visionBaseURL: _visionBaseURL,
+      visionApiKey: _visionApiKey,
+      ...withoutVision
+    } = profile;
+    state.value.profiles[index] = settings
+      ? {
+          ...withoutVision,
+          visionModel: settings.model,
+          visionSource: profile.kind === "gateway" ? "current" : settings.source,
+          ...(profile.kind !== "gateway" && settings.source === "custom" && settings.provider
+            ? { visionProvider: settings.provider }
+            : {}),
+          ...(profile.kind !== "gateway" && settings.source === "custom" && settings.baseURL
+            ? { visionBaseURL: settings.baseURL }
+            : {}),
+          ...(profile.kind !== "gateway" && settings.source === "custom" && settings.apiKey
+            ? { visionApiKey: settings.apiKey }
+            : {}),
+        }
+      : withoutVision;
     persistProfilesFile(state.value, state.snapshot.text);
     return { ok: true };
   });
