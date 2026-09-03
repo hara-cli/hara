@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.165.1 — 2026-09-04 — deletable Personal model connections
+
+- Separate the reserved Personal Space identity from its user-owned model connection. Removing the original
+  migrated Personal route now makes the saved-connection list genuinely empty while preserving local session
+  ownership and history; the persistent add action can then create any number of named provider accounts.
+- Delete every connection-owned secret and setting together, including an independent vision-first endpoint
+  and Key. The internal Personal fallback row remains credential-free for isolation and recovery only.
+
 ## 0.165.0 — 2026-09-03 — multiple personal model connections
 
 - Save any number of independent Personal model connections and switch the default used by new sessions.

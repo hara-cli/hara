@@ -734,7 +734,8 @@ export function updatePersonalProviderConfig(input: PersonalProviderConfigUpdate
 }
 
 /** Clear the single user-owned model connection without deleting the Personal Space itself.
- * Organization profiles and every unrelated personal setting remain untouched. */
+ * Vision-first routing is connection-owned, so deleting this route must also delete its model,
+ * endpoint, and credential. Organization profiles and unrelated personal settings remain untouched. */
 export function clearPersonalProviderConfig(): void {
   updateRawConfig((config) => {
     delete config.provider;
@@ -742,6 +743,11 @@ export function clearPersonalProviderConfig(): void {
     delete config.baseURL;
     delete config.apiKey;
     delete config.reasoningEffort;
+    delete config.visionModel;
+    delete config.visionSource;
+    delete config.visionProvider;
+    delete config.visionBaseURL;
+    delete config.visionApiKey;
   });
 }
 

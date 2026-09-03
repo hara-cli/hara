@@ -153,6 +153,7 @@ test("real serve keeps multiple accounts from the same provider independent and 
   const keyA = "sk-named-connection-a-1111";
   const keyB = "sk-named-connection-b-2222";
   const keyC = "sk-named-connection-c-3333";
+  const personalVisionKey = "sk-personal-vision-4444";
   const port = await reservePort();
   const provider = await providerFixture();
   mkdirSync(haraHome, { recursive: true });
@@ -166,6 +167,11 @@ test("real serve keeps multiple accounts from the same provider independent and 
   writeFileSync(join(haraHome, "config.json"), JSON.stringify({
     provider: "ollama",
     model: "qwen3",
+    visionModel: "gpt-4o-mini",
+    visionSource: "custom",
+    visionProvider: "openai",
+    visionBaseURL: provider.baseURL,
+    visionApiKey: personalVisionKey,
     guardian: "off",
     updateCheck: false,
   }), { mode: 0o600 });
@@ -236,6 +242,7 @@ test("real serve keeps multiple accounts from the same provider independent and 
     .replaceAll(keyA, "[REDACTED]")
     .replaceAll(keyB, "[REDACTED]")
     .replaceAll(keyC, "[REDACTED]")
+    .replaceAll(personalVisionKey, "[REDACTED]")
     .trim();
 
   let client;
@@ -249,6 +256,7 @@ test("real serve keeps multiple accounts from the same provider independent and 
     const initial = await client.call("settings.providers.list", {});
     assert.equal(initial.result.current.profileId, "legacy-openai");
     assert.deepEqual(initial.result.connections.map((connection) => connection.id), ["personal", "legacy-openai"]);
+    assert.equal(initial.result.connections.find((connection) => connection.id === "personal").removable, true);
     assert.equal(initial.result.connections.find((connection) => connection.id === "legacy-openai").active, true);
     assert.equal(JSON.stringify(initial).includes(keyA), false, "the legacy current key is never echoed over RPC");
     assert.equal(initial.result.vision.provider, "openai", "a legacy route infers the generic compatible adapter");
@@ -285,6 +293,29 @@ test("real serve keeps multiple accounts from the same provider independent and 
     assert.equal(legacyAfterSave.visionProvider, "openai");
     assert.equal(legacyAfterSave.visionApiKey, keyA,
       "saving an inferred legacy route keeps its credential without asking the user to re-enter it");
+
+    const usedPersonal = await client.call("settings.providers.connections.use", { id: "personal" });
+    assert.equal(usedPersonal.error, undefined, usedPersonal.error?.message);
+    assert.equal(usedPersonal.result.current.profileId, "personal");
+    const removedPersonal = await client.call("settings.providers.connections.remove", { id: "personal" });
+    assert.equal(removedPersonal.error, undefined, removedPersonal.error?.message);
+    assert.equal(removedPersonal.result.current.profileId, "personal",
+      "deleting the active connection keeps the empty Personal identity boundary selected");
+    assert.deepEqual(removedPersonal.result.connections.map((connection) => connection.id), ["legacy-openai"],
+      "the reserved Personal identity is not advertised as a saved connection after its route is deleted");
+    const clearedPersonal = JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8"));
+    for (const key of [
+      "provider", "model", "baseURL", "apiKey", "reasoningEffort",
+      "visionModel", "visionSource", "visionProvider", "visionBaseURL", "visionApiKey",
+    ]) {
+      assert.equal(Object.hasOwn(clearedPersonal, key), false, `${key} is removed with the Personal connection`);
+    }
+    const storedAfterPersonalRemoval = readFileSync(profilesPath, "utf8");
+    assert.equal(storedAfterPersonalRemoval.includes(personalVisionKey), false,
+      "the deleted Personal vision credential is not retained in compatibility storage");
+    const restoredLegacy = await client.call("settings.providers.connections.use", { id: "legacy-openai" });
+    assert.equal(restoredLegacy.error, undefined, restoredLegacy.error?.message);
+    assert.equal(restoredLegacy.result.current.profileId, "legacy-openai");
 
     const createdA = await client.call("settings.providers.connections.create", {
       id: "team-openai-a",
@@ -370,7 +401,7 @@ test("real serve keeps multiple accounts from the same provider independent and 
 
     const removedA = await client.call("settings.providers.connections.remove", { id: "team-openai-a" });
     assert.equal(removedA.result.current.profileId, "personal");
-    assert.deepEqual(removedA.result.connections.map((connection) => connection.id), ["personal", "legacy-openai"]);
+    assert.deepEqual(removedA.result.connections.map((connection) => connection.id), ["legacy-openai"]);
     const remainingProfiles = readFileSync(profilesPath, "utf8");
     assert.equal(remainingProfiles.includes(keyB), false);
     assert.equal(remainingProfiles.includes(keyC), false);

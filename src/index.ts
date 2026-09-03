@@ -844,9 +844,29 @@ function personalProviderConnectionsSnapshot(
   catalog: ReturnType<typeof providerCatalog>,
 ) {
   const personal = profileByIdForConfig(live, PERSONAL_ID)!;
+  const rawPersonal = readRawConfig();
+  const canonicalConfigured = [
+    "provider",
+    "model",
+    "baseURL",
+    "apiKey",
+    "reasoningEffort",
+    "visionModel",
+    "visionSource",
+    "visionProvider",
+    "visionBaseURL",
+    "visionApiKey",
+  ].some((key) => {
+    const value = rawPersonal[key];
+    return typeof value === "string" ? value.trim().length > 0 : value !== undefined && value !== null;
+  });
   return listProfiles()
     .filter((candidate) => candidate.kind === "byok")
     .map((candidate) => candidate.id === PERSONAL_ID ? personal : candidate)
+    // Personal is an identity boundary, not an undeletable provider account. Keep the reserved row in
+    // profiles.json for fallback/session ownership, but do not advertise it as a saved connection after
+    // its connection-owned settings have been explicitly cleared.
+    .filter((candidate) => candidate.id !== PERSONAL_ID || canonicalConfigured)
     .filter((candidate) => !!candidate.provider && candidate.provider !== "hara-gateway")
     .map((candidate) => {
       // A card describes one persisted route. Provider ID is deliberately not a uniqueness key: two
@@ -867,9 +887,6 @@ function personalProviderConnectionsSnapshot(
       const reasoningEffort = savedEffort
         ? normalizeEffort(reasoningStyle, target.model, savedEffort as NonNullable<HaraConfig["reasoningEffort"]>)
         : undefined;
-      const raw = candidate.id === PERSONAL_ID ? readRawConfig() : null;
-      const canonicalConfigured = candidate.id !== PERSONAL_ID
-        || ["provider", "model", "baseURL", "apiKey"].some((key) => raw && Object.hasOwn(raw, key));
       return {
         id: candidate.id,
         label: candidate.label || (candidate.id === PERSONAL_ID ? entry.label : candidate.id),
@@ -882,7 +899,7 @@ function personalProviderConnectionsSnapshot(
         authenticated: keyConfigured,
         active: resolution.id === candidate.id,
         legacyPersonal: candidate.id === PERSONAL_ID,
-        removable: candidate.id !== PERSONAL_ID || canonicalConfigured,
+        removable: true,
         ...(reasoningEffort ? { reasoningEffort } : {}),
         effortLevels,
         ...(target.apiKey ? { keyHint: maskKey(target.apiKey) } : {}),
