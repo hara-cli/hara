@@ -2587,7 +2587,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
-            "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt",
+            "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt", "external.sessions.remove",
             "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
             "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.test", "settings.vision.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
@@ -2632,6 +2632,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.native-resume.v1",
             "external.sessions.launch-options.v1",
             "external.sessions.terminal-mirror.v1",
+            "external.sessions.runtime-remove.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
@@ -2903,6 +2904,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             await externalSessions.interrupt(p.sessionId);
+            return reply(rpcResult(id!, {}));
+          }
+          case "external.sessions.remove": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            if (externalWireTurns.has(p.sessionId)) {
+              return reply(rpcError(id, ERR.BUSY, "stop the active external coding-agent turn before removing it"));
+            }
+            await externalSessions.removeSession(p.sessionId);
             return reply(rpcResult(id!, {}));
           }
           case "external.sessions.terminal.snapshot": {

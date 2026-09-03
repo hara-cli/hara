@@ -25,6 +25,7 @@
 //   external.sessions.submit {sessionId,text}       → {sessionId,turnId,status,reply,error?}
 //   external.sessions.steer {sessionId,text}        → {sessionId,turnId,accepted:true}
 //   external.sessions.interrupt {sessionId}         → {}
+//   external.sessions.remove {sessionId}            → {} (Hara Live only; closes the original terminal)
 //                                                        Personal Space only. Provider-native IDs, full paths,
 //                                                        provider cursors and credentials never cross Serve. A
 //                                                        source history is read-only until explicitly resumed in

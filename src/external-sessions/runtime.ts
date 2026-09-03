@@ -45,6 +45,7 @@ interface HerdrAgent {
 
 interface RuntimeRef {
   target: string;
+  workspaceTarget: string;
   nativeIdentity: string;
   stateChangeSeq: number | null;
   info: ExternalSessionInfo;
@@ -257,6 +258,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
         submit: ready,
         steer: false,
         interrupt: ready,
+        remove: ready,
         terminalView: ready,
         terminalInput: ready,
       },
@@ -292,6 +294,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
     };
     const ref = {
       target: paneId,
+      workspaceTarget: workspaceNativeId,
       nativeIdentity: terminalId,
       stateChangeSeq: cleanCounter(agent.state_change_seq),
       info,
@@ -601,6 +604,20 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
       "agent", "send-keys", ref.target, "ctrl+c",
     ], { timeoutMs: 8_000, maxOutputBytes: 256 * 1024 });
     if (!result.ok && !runtime) throw new Error("Hara Live could not stop this session");
+  }
+
+  async remove(sessionId: string): Promise<void> {
+    const ref = await this.ref(sessionId);
+    if (this.running.has(sessionId)) {
+      throw new ExternalSessionInputError("stop the active Hara Live turn before removing this session");
+    }
+    const result = await runExternalCommandCapture(this.command, [
+      "workspace", "close", ref.workspaceTarget,
+    ], { timeoutMs: 8_000, maxOutputBytes: 256 * 1024 });
+    if (!result.ok) throw new Error("Hara Live could not remove this session");
+    this.refs.delete(sessionId);
+    this.firstSeen.delete(sessionId);
+    this.running.delete(sessionId);
   }
 
   async terminalSnapshot(sessionId: string): Promise<ExternalTerminalSnapshot> {

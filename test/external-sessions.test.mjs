@@ -218,6 +218,11 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
           writeState({ text: (state.text || "") + "\\nkey:" + args[3], lastKey: args[3] });
           json({ type: "agent_info", agent: state.agent });
         } else if (args[0] === "workspace" && args[1] === "close") {
+          if (state.agent && args[2] !== state.agent.workspace_id) {
+            process.stderr.write(JSON.stringify({ id: "fixture", error: { code: "workspace_not_found", message: "wrong workspace" } }) + "\\n");
+            process.exit(1);
+          }
+          if (state.agent) writeState({ agent: null, closedWorkspace: args[2] });
           json({ type: "ok" });
         } else {
           process.stderr.write(JSON.stringify({ id: "fixture", error: { code: "unsupported", message: "unsupported" } }) + "\\n");
@@ -237,6 +242,7 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     const source = await adapter.inspect();
     assert.equal(source.state, "ready");
     assert.equal(source.capabilities.create, true);
+    assert.equal(source.capabilities.remove, true);
     assert.deepEqual((await adapter.list({ limit: 10 })).sessions, []);
 
     const created = await adapter.create({
@@ -296,6 +302,10 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     assert.deepEqual(text, [turn.reply]);
     assert.match(notices[0], /original terminal session/i);
     await adapter.interrupt(created.session.id);
+    await adapter.remove(created.session.id);
+    assert.equal(JSON.parse(readFileSync(statePath, "utf8")).closedWorkspace, "native-workspace");
+    assert.deepEqual((await adapter.list({ limit: 10 })).sessions, []);
+    await assert.rejects(adapter.read(created.session.id), /no longer available/);
   } finally {
     if (existsSync(statePath)) {
       const state = JSON.parse(readFileSync(statePath, "utf8"));

@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.165.3 — 2026-09-04 — recoverable Hara Live session lifecycle
+
+- Let Personal Space explicitly end and remove a Hara Live session, with the Desktop responsible for
+  confirming the destructive action first. Active turns must be stopped before their original terminal pane
+  can be closed, and provider-history sessions remain protected from this runtime-only operation.
+- Pair the removal escape hatch with the `0.165.2` blocked-terminal read fallback so an input prompt is either
+  actionable in its original terminal or clearly removable instead of remaining in an ambiguous waiting state.
+
 ## 0.165.2 — 2026-09-04 — readable Hara Live input states
 
 - Keep Hara Live sessions readable while Codex or Claude Code is waiting for interactive input. When

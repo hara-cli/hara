@@ -254,6 +254,14 @@ export class ExternalSessionRegistry implements ExternalSessionService {
     await adapter.interrupt?.(sessionId);
   }
 
+  async removeSession(sessionId: string): Promise<void> {
+    const adapter = this.adapterForSession(sessionId);
+    if (!adapter.remove) {
+      throw new ExternalSessionInputError("this external session cannot be removed by Hara");
+    }
+    await adapter.remove(sessionId);
+  }
+
   async terminalSnapshot(sessionId: string): Promise<ExternalTerminalSnapshot> {
     const adapter = this.adapterForSession(sessionId);
     if (!adapter.terminalSnapshot) {

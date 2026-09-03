@@ -123,6 +123,7 @@ test("Serve advertises a Personal-only external session interaction surface", as
   let interrupted = 0;
   let terminalInput = "";
   let terminalKey = "";
+  let removed = 0;
   let closed = 0;
   const externalSessions = {
     async listSources() { return sourceResult; },
@@ -242,6 +243,10 @@ test("Serve advertises a Personal-only external session interaction surface", as
       assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
       terminalKey = key;
     },
+    async removeSession(requestedSessionId) {
+      assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
+      removed += 1;
+    },
     async close() { closed += 1; },
   };
   let personal;
@@ -262,8 +267,10 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.native-resume.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.launch-options.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-mirror.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime-remove.v1"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.create"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.resume"));
+    assert.ok(initialized.result.capabilities.methods.includes("external.sessions.remove"));
     const listed = await client.call("external.sessions.list", { sourceId: "codex" });
     assert.equal(listed.result.sessions[0].id, sessionId);
     const read = await client.call("external.sessions.read", { sessionId });
@@ -285,6 +292,8 @@ test("Serve advertises a Personal-only external session interaction surface", as
     await client.call("external.sessions.terminal.key", { sessionId: terminalSessionId, key: "esc" });
     assert.equal(terminalInput, "/status");
     assert.equal(terminalKey, "esc");
+    await client.call("external.sessions.remove", { sessionId: terminalSessionId });
+    assert.equal(removed, 1);
     const resumed = await client.call("external.sessions.resume", { sessionId });
     assert.equal(resumed.result.session.id, sessionId);
     assert.equal(resumed.result.readOnly, false);
@@ -329,6 +338,10 @@ test("Serve advertises a Personal-only external session interaction surface", as
     await companyClient.call("initialize", { token: "company-token" });
     const denied = await companyClient.call("external.sessions.list", { sourceId: "codex" });
     assert.equal(denied.error.code, -32001);
+    const removeDenied = await companyClient.call("external.sessions.remove", {
+      sessionId: "ext_runtime_0123456789abcdef01234567",
+    });
+    assert.equal(removeDenied.error.code, -32001);
     companyClient.ws.close();
   } finally {
     await personal?.close();

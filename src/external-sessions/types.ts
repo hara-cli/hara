@@ -53,6 +53,8 @@ export interface ExternalSessionSourceCapabilities {
   submit: boolean;
   steer: boolean;
   interrupt: boolean;
+  /** Hara Live can explicitly terminate and remove a relay session created on this device. */
+  remove?: boolean;
   /** Hara Live can expose a passive snapshot of its original provider terminal. */
   terminalView?: boolean;
   /** Hara Live can relay an explicit prompt or a bounded logical key to that same terminal. */
@@ -204,6 +206,7 @@ export interface ExternalSessionAdapter {
   submit?(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
   steer?(sessionId: string, text: string): Promise<ExternalSteerResult>;
   interrupt?(sessionId: string): Promise<void>;
+  remove?(sessionId: string): Promise<void>;
   terminalSnapshot?(sessionId: string): Promise<ExternalTerminalSnapshot>;
   terminalInput?(sessionId: string, text: string): Promise<void>;
   terminalKey?(sessionId: string, key: ExternalTerminalKey): Promise<void>;
@@ -220,6 +223,7 @@ export interface ExternalSessionService {
   submit(sessionId: string, text: string, sink: ExternalTurnSink): Promise<ExternalTurnResult>;
   steer(sessionId: string, text: string): Promise<ExternalSteerResult>;
   interrupt(sessionId: string): Promise<void>;
+  removeSession(sessionId: string): Promise<void>;
   terminalSnapshot(sessionId: string): Promise<ExternalTerminalSnapshot>;
   terminalInput(sessionId: string, text: string): Promise<void>;
   terminalKey(sessionId: string, key: ExternalTerminalKey): Promise<void>;
