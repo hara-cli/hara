@@ -5,6 +5,12 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.165.2 — 2026-09-04 — readable Hara Live input states
+
+- Keep Hara Live sessions readable while Codex or Claude Code is waiting for interactive input. When
+  alternate-screen history cannot be scrolled in that state, Hara now falls back to the provider's visible
+  terminal snapshot instead of leaving Session Center on an unreadable error page.
+
 ## 0.165.1 — 2026-09-04 — deletable Personal model connections
 
 - Separate the reserved Personal Space identity from its user-owned model connection. Removing the original

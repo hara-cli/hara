@@ -346,14 +346,26 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
   }
 
   private async terminalText(ref: RuntimeRef): Promise<string> {
-    const result = await runExternalCommandCapture(this.command, [
+    const history = await runExternalCommandCapture(this.command, [
       "agent", "read", ref.target,
       "--source", "recent-unwrapped",
       "--lines", "240",
       "--format", "text",
     ], { timeoutMs: 8_000, maxOutputBytes: 2 * 1024 * 1024 });
-    if (!result.ok) throw new Error("Hara Live could not read this session");
-    return safeTerminalText(result.stdout);
+    if (history.ok) return safeTerminalText(history.stdout);
+    // Herdr cannot scroll alternate-screen history while a provider is blocked on an interactive
+    // question. The visible terminal is still safe and readable, so keep the session usable instead
+    // of turning a normal "input required" state into a dead detail page.
+    if (history.errorCode !== "agent_not_idle") {
+      throw new Error("Hara Live could not read this session");
+    }
+    const visible = await runExternalCommandCapture(this.command, [
+      "agent", "read", ref.target,
+      "--source", "visible",
+      "--format", "text",
+    ], { timeoutMs: 8_000, maxOutputBytes: 2 * 1024 * 1024 });
+    if (!visible.ok) throw new Error("Hara Live could not read this session");
+    return safeTerminalText(visible.stdout);
   }
 
   private async currentAgent(ref: RuntimeRef): Promise<RuntimeRef> {

@@ -182,6 +182,13 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
           writeState({ agent, text: kind + " ready", providerArgs });
           json({ type: "agent_started", agent, argv: [kind] });
         } else if (args[0] === "agent" && args[1] === "read") {
+          const source = args[args.indexOf("--source") + 1];
+          if (source === "recent-unwrapped" && state.agent?.agent_status === "blocked") {
+            writeState({ rejectedBlockedHistoryRead: true });
+            process.stderr.write(JSON.stringify({ id: "fixture", error: { code: "agent_not_idle", message: "alternate-screen history is unavailable while blocked" } }) + "\\n");
+            process.exit(1);
+          }
+          if (source === "visible") writeState({ visibleReadFallback: true });
           process.stdout.write(state.text || "");
         } else if (args[0] === "agent" && args[1] === "get") {
           json({ type: "agent_info", agent: state.agent });
@@ -253,6 +260,17 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     const snapshot = await adapter.terminalSnapshot(created.session.id);
     assert.equal(snapshot.sessionId, created.session.id);
     assert.match(snapshot.text, /codex ready/);
+    const blockedState = JSON.parse(readFileSync(statePath, "utf8"));
+    writeFileSync(statePath, JSON.stringify({
+      ...blockedState,
+      agent: { ...blockedState.agent, agent_status: "blocked", revision: 2, state_change_seq: 2 },
+    }));
+    const blockedRead = await adapter.read(created.session.id);
+    assert.equal(blockedRead.session.state, "waiting");
+    assert.match(blockedRead.messages[0]?.text ?? "", /codex ready/);
+    const blockedFallback = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(blockedFallback.rejectedBlockedHistoryRead, true);
+    assert.equal(blockedFallback.visibleReadFallback, true);
     await adapter.terminalInput(created.session.id, "/status");
     await adapter.terminalKey(created.session.id, "esc");
     const terminalState = JSON.parse(readFileSync(statePath, "utf8"));
