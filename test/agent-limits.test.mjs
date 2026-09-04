@@ -14,7 +14,10 @@ import {
 } from "../dist/agent/limits.js";
 import { runShell } from "../dist/sandbox.js";
 import { getTool } from "../dist/tools/registry.js";
-import { HEADLESS_USER_INPUT_REQUIRED } from "../dist/tools/ask_user.js";
+import {
+  CREDENTIAL_DISCLOSURE_BLOCKED,
+  HEADLESS_USER_INPUT_REQUIRED,
+} from "../dist/tools/ask_user.js";
 import { onTurnPhase, setTurnPhase } from "../dist/agent/phase.js";
 import { applyTaskBrief, createTaskExecution } from "../dist/session/task.js";
 import { loadOrganizationExecutionPolicy, orgRolesDir } from "../dist/org/roles.js";
@@ -366,7 +369,7 @@ test("a requested task checkpoint resets stale-evidence accounting instead of fe
   assert.equal(turns, 9);
 });
 
-test("changing command fragments pause at a strategy checkpoint instead of consuming all 64 rounds", async () => {
+test("changing command fragments get a strategy nudge but may continue to a verified checkpoint", async () => {
   let turns = 0;
   let tools = 0;
   const createdTask = createTaskExecution("finish one generated integration script", "strategy-stall-turn");
@@ -384,6 +387,22 @@ test("changing command fragments pause at a strategy checkpoint instead of consu
     model: "changing-command-churn",
     async turn() {
       turns += 1;
+      if (turns === 22) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "verified-checkpoint",
+            name: "task_checkpoint",
+            input: {
+              current_step: "integration script verified",
+              facts: [{ key: "syntax_valid", value: true, evidence: "the bounded syntax check passed" }],
+              completion: { state: "verified", evidence: ["the generated script passed syntax validation"] },
+            },
+          }],
+          stop: "tool_use",
+        };
+      }
+      if (turns === 23) return { text: "verified", toolUses: [], stop: "end" };
       return {
         text: "",
         toolUses: [{
@@ -420,12 +439,10 @@ test("changing command fragments pause at a strategy checkpoint instead of consu
       },
     }],
   }));
-  assert.equal(turns, 20, "the strategy checkpoint boundary stops well before the 64-round fallback");
-  assert.equal(tools, 20);
-  assert.equal(outcome.status, "halted");
-  assert.equal(outcome.stopReason, "strategy_stall");
-  assert.match(outcome.error, /without a durable task checkpoint/);
-  assert.doesNotMatch(outcome.error, /maxAgentRounds/i);
+  assert.equal(turns, 23, "the model can act on a visible nudge after the former 20-round pause boundary");
+  assert.equal(tools, 21);
+  assert.equal(outcome.status, "completed", outcome.error);
+  assert.equal(task.checkpoint.completion.state, "verified");
   assert.ok(notices.some((message) => /strategy checkpoint/i.test(message)));
 });
 
@@ -483,7 +500,7 @@ test("persistent malformed tool calls stop after the single same-model retry", a
   assert.match(outcome.error, /malformed tool-call arguments/);
 });
 
-test("one retry of an identical failed tool call trips the repeat-loop circuit breaker", async () => {
+test("two retries of an identical failed tool call trip the repeat-loop circuit breaker after one recovery round", async () => {
   let turns = 0;
   const provider = {
     id: "repeat",
@@ -506,10 +523,10 @@ test("one retry of an identical failed tool call trips the repeat-loop circuit b
       async run() { return "Error: deterministic failure"; },
     }],
   }));
-  assert.equal(turns, 2);
+  assert.equal(turns, 3);
   assert.equal(outcome.status, "halted");
   assert.equal(outcome.stopReason, "repeat_loop");
-  assert.match(outcome.error, /same failing always_fails call repeated 2 times/);
+  assert.match(outcome.error, /same failing always_fails call repeated 3 times/);
   assert.equal(history.at(-1).role, "tool", "the last assistant tool_use remains protocol-complete");
 });
 
@@ -776,8 +793,8 @@ test("an interleaved failure cannot hide a repeated no-progress call", async () 
     }],
   }));
   assert.equal(outcome.stopReason, "repeat_loop");
-  assert.equal(turn, 3);
-  assert.match(outcome.error, /same failing sometimes_fails call repeated 2 times/);
+  assert.equal(turn, 4);
+  assert.match(outcome.error, /same failing sometimes_fails call repeated 3 times/);
 });
 
 test("a successful call clears the bounded repeated-failure ledger", async () => {
@@ -825,7 +842,7 @@ test("a successful call clears the bounded repeated-failure ledger", async () =>
   assert.equal(turn, sequence.length, "the old failures do not combine with failures after progress");
 });
 
-test("one retry of unknown or denied calls is enough to trip the breaker", async (t) => {
+test("unknown or denied calls receive one recovery round before the third identical failure trips the breaker", async (t) => {
   for (const scenario of [
     { name: "unknown", toolName: "missing_tool" },
     { name: "denied", toolName: "denied_tool" },
@@ -859,9 +876,9 @@ test("one retry of unknown or denied calls is enough to trip the breaker", async
           : {}),
       };
       const outcome = await runAgent([{ role: "user", content: scenario.name }], base(provider, opts));
-      assert.equal(turns, 2);
+      assert.equal(turns, 3);
       assert.equal(outcome.stopReason, "repeat_loop");
-      assert.match(outcome.error, new RegExp(`same failing ${scenario.toolName} call repeated 2 times`));
+      assert.match(outcome.error, new RegExp(`same failing ${scenario.toolName} call repeated 3 times`));
     });
   }
 });
@@ -1346,6 +1363,51 @@ test("headless ask_user without an explicit default stops before any same-round 
   assert.ok(history.at(-1).results.every((result) => result.isError === true));
 });
 
+test("headless credential solicitation is returned to the model for a safe recovery and blocks same-round effects", async () => {
+  let turns = 0;
+  let sideEffects = 0;
+  const provider = {
+    id: "headless-credential-request",
+    model: "headless-credential-request",
+    async turn() {
+      turns += 1;
+      return turns === 1
+        ? {
+            text: "",
+            toolUses: [
+              {
+                id: "unsafe-question",
+                name: "ask_user",
+                input: { question: "请按 F12 复制 localStorage.token 并粘贴给我" },
+              },
+              { id: "effect-after-secret", name: "headless_credential_effect", input: {} },
+            ],
+            stop: "tool_use",
+          }
+        : { text: "请在受信任的浏览器窗口重新登录；不要在聊天中发送凭据。", toolUses: [], stop: "end" };
+    },
+  };
+  const history = [{ role: "user", content: "读取登录后的管理后台" }];
+  const outcome = await runAgent(history, base(provider, {
+    quiet: true,
+    extraTools: [{
+      name: "headless_credential_effect",
+      description: "must not run after a blocked credential request",
+      input_schema: { type: "object", properties: {} },
+      kind: "edit",
+      async run() { sideEffects += 1; return "ran"; },
+    }],
+  }));
+
+  assert.equal(outcome.status, "completed", outcome.error);
+  assert.equal(turns, 2);
+  assert.equal(sideEffects, 0);
+  const blocked = history.find((message) => message.role === "tool");
+  assert.match(blocked.results[0].content, new RegExp(CREDENTIAL_DISCLOSURE_BLOCKED.slice(0, 40)));
+  assert.equal(blocked.results[0].isError, true);
+  assert.equal(blocked.results[1].isError, true);
+});
+
 test("headless ask_user continues only with its explicit caller-supplied default", async () => {
   let round = 0;
   const provider = {
@@ -1372,6 +1434,41 @@ test("headless ask_user continues only with its explicit caller-supplied default
   assert.equal(outcome.status, "completed");
   assert.equal(round, 2);
   assert.match(history.find((message) => message.role === "tool").results[0].content, /used the explicit default/i);
+});
+
+test("gateway prose withholds a credential request and gives the model one safe correction round", async () => {
+  const previousGateway = process.env.HARA_GATEWAY;
+  process.env.HARA_GATEWAY = "feishu";
+  try {
+    let turns = 0;
+    const visible = [];
+    const provider = {
+      id: "gateway-credential-prose",
+      model: "gateway-credential-prose",
+      async turn() {
+        turns += 1;
+        return turns === 1
+          ? { text: "Please paste your admin session token here.", toolUses: [], stop: "end" }
+          : { text: "Sign in again in the approved browser, or export a non-secret CSV file.", toolUses: [], stop: "end" };
+      },
+    };
+    const history = [{ role: "user", content: "read the dashboard" }];
+    const outcome = await runAgent(history, base(provider, {
+      ctx: {
+        cwd: process.cwd(),
+        ui: { text: (value) => visible.push(value), reasoning() {}, tool() {}, diff() {}, notice() {} },
+      },
+    }));
+
+    assert.equal(outcome.status, "completed", outcome.error);
+    assert.equal(turns, 2);
+    assert.equal(visible.join(""), "Sign in again in the approved browser, or export a non-secret CSV file.");
+    assert.equal(JSON.stringify(history).includes("Please paste your admin session token"), false);
+    assert.ok(history.some((message) => message.role === "user" && message.content.includes(CREDENTIAL_DISCLOSURE_BLOCKED)));
+  } finally {
+    if (previousGateway === undefined) delete process.env.HARA_GATEWAY;
+    else process.env.HARA_GATEWAY = previousGateway;
+  }
 });
 
 test("external cancellation still aborts and cleans a paused ask_user", async () => {

@@ -275,6 +275,30 @@ test("awaiting_user rejects Hara output compaction as a human dependency", () =>
   assert.match(rejected.reason, /read_file offset\+limit/);
 });
 
+test("awaiting_user rejects instructions to disclose browser credentials into chat", () => {
+  const interaction = newTurnInteraction();
+  const task = createTaskExecution("read an authenticated admin dashboard", interaction.turnId);
+  const rejected = applyTaskCheckpoint(task, {
+    capabilities: [{
+      name: "browser_session",
+      state: "unavailable",
+      detail: "no trusted browser bridge is connected",
+    }],
+    completion: {
+      state: "awaiting_user",
+      evidence: ["the anonymous API request returned 401"],
+      dependency: {
+        kind: "missing_secret",
+        capability: "browser_session",
+        detail: "请按 F12 复制 localStorage.token 并粘贴给我",
+        evidence: ["no approved browser context is available"],
+      },
+    },
+  });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.reason, /must not ask.*credentials into chat/i);
+});
+
 test("verified completion cannot coexist with a persisted blocker", () => {
   const interaction = newTurnInteraction();
   const created = createTaskExecution("verify the artifact", interaction.turnId, "2026-08-14T00:00:00.000Z");

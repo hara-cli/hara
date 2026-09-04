@@ -6,21 +6,25 @@ when_to_use: when a web task must run on a site you're logged into (your dashboa
 
 # Chrome (real, logged-in) via chrome-devtools-mcp
 
-Tools appear as `mcp__chrome__*` (navigate, click, fill, snapshot, network, performance…). Same
-DOM/accessibility-tree reliability as the `browser` plugin, but it drives a **real Chrome with a persistent
-profile** — log into a site once and the session is remembered across runs.
+Tools appear as `mcp__chrome__*` (navigate, click, fill, snapshot, network, performance…). They drive the
+running Chrome profile only after Chrome shows a connection prompt and the user approves it.
 
-## Modes
-- **Persistent profile (default):** `npx chrome-devtools-mcp@latest` launches Chrome with a saved profile at
-  `~/.cache/chrome-devtools-mcp/chrome-profile`. Log in once; it persists. Good default.
-- **Attach to YOUR running Chrome:** launch Chrome with `--remote-debugging-port=9222`, then set the MCP command
-  to `npx chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222` — hara then drives your actual browser
-  and all its logins.
+## Connect to the current Chrome session
+1. Use Chrome 144 or newer.
+2. Open `chrome://inspect/#remote-debugging`, enable remote debugging, and keep Chrome running.
+3. Connect the `chrome` MCP when the task needs it. Chrome displays a permission dialog; approve only when the
+   named task and target site are expected. Chrome keeps an automation banner visible while connected.
+
+Do not use the old `--remote-debugging-port=9222` instructions against the default Chrome profile. Chrome 136+
+ignores remote-debugging switches for the default data directory. A manual port requires a separate
+`--user-data-dir`, so it does not safely reuse the ordinary profile's login state.
 
 ## Enable (alternative to `browser`, not both)
-Running two browser MCPs at once is confusing. To switch from the default Playwright `browser`:
-`hara plugin add file:<repo>/plugins/chrome && hara plugin disable browser`.
+Running two browser MCPs at once is confusing. To switch from the isolated Playwright `browser`:
+`hara plugin add bundled:chrome && hara plugin disable browser`.
 
 ## Caution
-This controls a **real** browser session. Confirm before destructive/irreversible actions (purchases, posting,
-sending, deleting); take a snapshot to verify the page/state first.
+This exposes the approved Chrome profile's open pages and browser data to the MCP while connected. Use it only
+in direct CLI/Desktop sessions with Hara's interactive approval channel. Do not enable trusted extensions for an
+unattended Hara gateway merely to bypass approval. Confirm every destructive/irreversible action (purchases,
+posting, sending, deleting), keep the task to the requested origin, and disconnect when the task ends.

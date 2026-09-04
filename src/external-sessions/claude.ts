@@ -11,6 +11,7 @@ import type { ExternalSessionOwnershipStore } from "./identity.js";
 import {
   probeExternalCommand,
   resolveExternalCommandRuntime,
+  runExternalCommandCapture,
   type ExternalCommandOptions,
 } from "./process.js";
 import type {
@@ -24,6 +25,7 @@ import type {
   ExternalTurnResult,
   ExternalTurnSink,
 } from "./types.js";
+import { ExternalSessionInputError } from "./types.js";
 
 const MAX_TEXT_BYTES = 128 * 1024;
 const MAX_MESSAGES = 1_000;
@@ -121,14 +123,52 @@ export interface ClaudeAgentSdkAdapterOptions extends ExternalCommandOptions {
   ownership?: ExternalSessionOwnershipStore;
   /** Hermetic tests may inject the official SDK surface without reading a real user's session store. */
   sdk?: ClaudeAgentSdkFacade;
+  /** Hermetic authentication probe. Production asks the verified Claude CLI and retains no account fields. */
+  authenticationStatus?: () => Promise<"authenticated" | "missing" | "unknown">;
 }
 
 export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
   readonly id = "claude" as const;
   private readonly refs = new Map<string, ClaudeNativeRef>();
   private readonly running = new Map<string, { close(): void }>();
+  private authenticationCache?: { value: "authenticated" | "missing" | "unknown"; expiresAt: number };
 
   constructor(private readonly options: ClaudeAgentSdkAdapterOptions) {}
+
+  private async authenticationStatus(force = false): Promise<"authenticated" | "missing" | "unknown"> {
+    const now = Date.now();
+    if (!force && this.authenticationCache && this.authenticationCache.expiresAt > now) {
+      return this.authenticationCache.value;
+    }
+    let value: "authenticated" | "missing" | "unknown";
+    if (this.options.authenticationStatus) {
+      value = await this.options.authenticationStatus();
+    } else {
+      const result = await runExternalCommandCapture(this.options, ["auth", "status", "--json"], {
+        timeoutMs: 5_000,
+        maxOutputBytes: 16 * 1024,
+        retainStdoutOnFailure: true,
+      });
+      try {
+        // Current Claude Code intentionally exits 1 for loggedIn:false while still returning this bounded
+        // JSON document on stdout. Only the explicit boolean is authoritative; an old/failed CLI that exits
+        // non-zero without the schema remains unknown and gets a chance to surface its real SDK error.
+        const parsed = JSON.parse(result.stdout) as { loggedIn?: unknown };
+        value = parsed.loggedIn === true ? "authenticated" : parsed.loggedIn === false ? "missing" : "unknown";
+      } catch {
+        value = "unknown";
+      }
+    }
+    this.authenticationCache = { value, expiresAt: now + 5_000 };
+    return value;
+  }
+
+  private async requireAuthentication(): Promise<void> {
+    if (await this.authenticationStatus(true) !== "missing") return;
+    throw new ExternalSessionInputError(
+      "Claude Code authentication is not available to Hara. The history remains readable, but continuing it requires a Claude Code login or provider configuration visible to Hara; the original terminal may be using temporary environment variables.",
+    );
+  }
 
   async inspect(): Promise<ExternalSessionSourceInfo> {
     const probe = await probeExternalCommand(this.options);
@@ -212,20 +252,25 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
       ...(ref.cwd ? { dir: ref.cwd } : {}),
       limit: MAX_MESSAGES,
     });
+    const authentication = await this.authenticationStatus();
+    const authenticationRequired = authentication === "missing";
+    const writable = ref.owned && !authenticationRequired;
     return {
       session: ref.info,
       messages: rows.flatMap((row) => {
         const mapped = mapMessage(row, ref.nativeId, this.options.identityKey);
         return mapped ? [mapped] : [];
       }),
-      readOnly: !ref.owned,
-      controlMode: ref.owned ? "managed" : "history",
+      readOnly: !writable,
+      controlMode: writable ? "managed" : "history",
+      ...(authenticationRequired ? { continuationUnavailableReason: "authentication_required" as const } : {}),
     };
   }
 
   async resume(sessionId: string): Promise<ExternalSessionReadResult> {
     const ref = this.ref(sessionId);
     if (this.running.has(sessionId)) throw new Error("this external Claude session already has a Hara-controlled turn");
+    await this.requireAuthentication();
     const sdk = this.options.sdk ?? await loadOfficialSdk();
     const metadata = await sdk.getSessionInfo(ref.nativeId, ref.cwd ? { dir: ref.cwd } : {});
     if (!metadata || metadata.sessionId !== ref.nativeId) {
@@ -273,6 +318,7 @@ export class ClaudeAgentSdkAdapter implements ExternalSessionAdapter {
     if (!ref.owned) {
       throw new Error("resume the original Claude session explicitly before sending a message");
     }
+    await this.requireAuthentication();
     const launch = resolveExternalCommandRuntime(this.options.command, this.options.env ?? process.env);
     if (!launch) throw new Error("Claude Code is no longer installed at its verified location");
     const sdk = this.options.sdk ?? await loadOfficialSdk();

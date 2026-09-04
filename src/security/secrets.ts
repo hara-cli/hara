@@ -7,6 +7,54 @@ export interface SecretRedaction {
   redactions: string[];
 }
 
+const DISCLOSURE_CREDENTIAL =
+  /(?:api[ _-]?key|access[ _-]?token|auth(?:entication|orization)?[ _-]?token|session[ _-]?token|refresh[ _-]?token|bearer[ _-]?token|authorization(?: header)?|cookie|localstorage|sessionstorage|document\.cookie|password|passcode|client[ _-]?secret|app[ _-]?secret|private[ _-]?key|jwt|密钥|秘钥|令牌|口令|密码|凭据|授权头|认证信息|登录态)/iu;
+const DISCLOSURE_TRANSFER =
+  /(?:\bpaste\b|\bprovide(?:\s+(?:it|that|this|the\s+value))?(?:\s+to\s+me)?\b|\bsend(?:\s+me)?\b|\bshare(?:\s+with\s+me)?\b|\bgive(?:\s+me)?\b|\breply\s+with\b|\bpost(?:\s+it)?\b|\btell\s+me\b|粘贴|提供(?:给我|一下)?|发送|发给|发来|分享|贴出|回复(?:给我)?|告诉我|提交(?:给我)?|给我)/iu;
+const DISCLOSURE_CHAT_INPUT =
+  /(?:(?:\b(?:enter|input|type|copy)\b|输入|复制).{0,48}(?:\b(?:here|chat|conversation|message)\b|这里|聊天|对话|消息|群里)|(?:\b(?:here|chat|conversation|message)\b|这里|聊天|对话|消息|群里).{0,48}(?:\b(?:enter|input|type|copy)\b|输入|复制))/iu;
+const DISCLOSURE_TRUSTED_SURFACE =
+  /(?:\b(?:hara\s+)?settings?\b|\bprovider\s+(?:configuration|settings?)\b|\benvironment\s+variable\b|\bkeychain\b|\bpassword\s+manager\b|\bcredential\s+store\b|\b(?:masked|secure)\s+(?:terminal\s+)?prompt\b|\b(?:login|sign[ -]?in)\s+(?:page|window)\b|设置(?:页|页面|界面)?|供应商配置|环境变量|钥匙串|密码管理器|凭据存储|(?:隐藏|遮罩|受保护的?)输入|终端提示|登录(?:页|页面|窗口)|受信任(?:页面|窗口|界面))/iu;
+const DISCLOSURE_DIRECT_TO_REQUESTER =
+  /(?:\b(?:send|give|tell|show)\s+me\b|\bprovide(?:\s+(?:it|that|this|the\s+value))?\s+to\s+me\b|\bshare(?:\s+(?:it|that|this|the\s+value))?\s+with\s+me\b|(?:粘贴|提供|发送|分享|回复|提交|告诉)(?:给我|给机器人)|发给我|发来|给我)/iu;
+const BROWSER_SECRET_EXTRACTION =
+  /(?:(?:\bf12\b|\bdevtools\b|\bconsole\b|开发者工具|控制台).{0,180}(?:localstorage|sessionstorage|document\.cookie|cookie|token|令牌)|(?:localstorage|sessionstorage|document\.cookie).{0,180}(?:\bcopy\b|复制|粘贴|paste))/iu;
+
+/** Remove an explicitly prohibited disclosure phrase before looking for an affirmative request. This keeps
+ * safe guidance such as “never paste your token; sign in in the browser” visible, while a later positive
+ * clause (for example “but send it to me”) is still caught independently. */
+function withoutNegatedDisclosureRequests(text: string): string {
+  return text
+    .replace(
+      /\b(?:do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|never|must\s+not|should\s+not|cannot|can't|will\s+not|won't|no\s+need\s+to)\b.{0,80}?(?:\bpaste\b|\bprovide\b|\bsend\b|\bshare\b|\bgive\b|\breply\s+with\b|\bpost\b|\btell\s+me\b|\benter\b|\binput\b|\bcopy\b).{0,100}/giu,
+      "",
+    )
+    .replace(/(?:不要|请勿|禁止|不能|不可|无需|不需要|未|没有|不会).{0,80}?(?:粘贴|提供|发送|发给|发来|分享|贴出|回复|告诉我|提交|输入|复制).{0,100}/gu, "");
+}
+
+/** Detect model-authored instructions that ask a person to disclose a credential into chat. This is
+ * intentionally distinct from secret-value redaction: a solicitation may contain no secret yet, but must be
+ * stopped before the user answers. Local trusted flows such as “configure the key in Settings” contain no
+ * transfer/chat-input verb and remain allowed. */
+export function requestsCredentialDisclosure(text: string): boolean {
+  if (!text.trim()) return false;
+  const clauses = text.split(/[\n。！？!?;；,，]+/u);
+  return clauses.some((rawClause) => {
+    const clause = withoutNegatedDisclosureRequests(rawClause);
+    if (!DISCLOSURE_CREDENTIAL.test(clause)) return false;
+    if (BROWSER_SECRET_EXTRACTION.test(clause)) return true;
+    // A credential belongs in a trusted local configuration surface, not in chat. Do not block legitimate
+    // setup guidance merely because it uses a verb such as “paste”; direct-to-requester/chat wording remains
+    // blocked even when the same sentence also mentions Settings.
+    if (
+      DISCLOSURE_TRUSTED_SURFACE.test(clause)
+      && !DISCLOSURE_CHAT_INPUT.test(clause)
+      && !DISCLOSURE_DIRECT_TO_REQUESTER.test(clause)
+    ) return false;
+    return DISCLOSURE_TRANSFER.test(clause) || DISCLOSURE_CHAT_INPUT.test(clause);
+  });
+}
+
 type Pattern = {
   label: string;
   re: RegExp;

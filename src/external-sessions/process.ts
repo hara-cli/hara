@@ -43,6 +43,9 @@ export interface ExternalCommandRunOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
   cwd?: string;
+  /** Preserve bounded stdout on a non-zero exit only for callers that parse a documented structured
+   * response. It must never be forwarded to users or diagnostics because provider output may hold account data. */
+  retainStdoutOnFailure?: boolean;
 }
 
 const safeExternalErrorCode = (stderr: string): string | undefined => {
@@ -129,7 +132,7 @@ export async function runExternalCommandCapture(
     child.once("close", (code) => {
       finish({
         ok: code === 0,
-        stdout: code === 0 ? stdout : "",
+        stdout: code === 0 || run.retainStdoutOnFailure === true ? stdout : "",
         code,
         timedOut: false,
         ...(code === 0 ? {} : { errorCode: safeExternalErrorCode(stderr) ?? "command_failed" }),

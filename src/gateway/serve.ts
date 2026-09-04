@@ -1010,7 +1010,7 @@ export function defaultWorkspace(): string {
   const agents = join(dir, "AGENTS.md");
   const LEGACY =
     "# hara chat workspace\n\nDefault working directory for `hara gateway` (Telegram/WeChat). Each message runs here with `--approval full-auto`. A safe scratch — pass `--cwd <dir>` to point the gateway at a real project instead.\n";
-  const TEMPLATE =
+  const PREVIOUS_TEMPLATE =
     "# hara chat workspace\n\n" +
     "Default working directory for `hara gateway`. Each message runs here with `--approval full-auto`. " +
     "A safe scratch — pass `--cwd <dir>` to point the gateway at a real project instead.\n\n" +
@@ -1021,10 +1021,25 @@ export function defaultWorkspace(): string {
     "screen control is disabled in gateway runs.\n" +
     "- You often lack project context here. If a request concerns a specific project, say so and suggest `/cd <project>` " +
     "(or answer from what you can read) rather than guessing.\n";
+  const TEMPLATE =
+    "# hara chat workspace\n\n" +
+    "Default working directory for `hara gateway`. Each message runs here with `--approval full-auto`. " +
+    "A safe scratch — pass `--cwd <dir>` to point the gateway at a real project instead.\n\n" +
+    "## How to work here\n\n" +
+    "- You are a chat-driven assistant on the user's machine. Deliver files/images with the `send_file` tool.\n" +
+    "- To interact with chat/work platforms (Feishu, Slack, WeChat, email, …), use an available skill or their HTTP API — " +
+    "check `skill` and the user's configured skills FIRST. Do NOT try to control other desktop apps' windows; " +
+    "screen control is disabled in gateway runs.\n" +
+    "- Never ask a chat user to paste or send an API key, password, cookie, Authorization header, localStorage/sessionStorage " +
+    "value, or session token. Use a registered trusted provider/browser capability. If none is available, say that the " +
+    "capability is unavailable and offer an exported file that contains no account access data.\n" +
+    "- You often lack project context here. If a request concerns a specific project, say so and suggest `/cd <project>` " +
+    "(or answer from what you can read) rather than guessing.\n";
   if (!existsSync(agents)) writeFileSync(agents, TEMPLATE, { mode: 0o600 });
   else {
     try {
-      if (readFileSync(agents, "utf8") === LEGACY) writeFileSync(agents, TEMPLATE); // refresh unmodified old default
+      const current = readFileSync(agents, "utf8");
+      if (current === LEGACY || current === PREVIOUS_TEMPLATE) writeFileSync(agents, TEMPLATE); // refresh unmodified old default
       chmodSync(agents, 0o600);
     } catch {
       /* unreadable — leave it alone */

@@ -6,12 +6,14 @@ import {
   cpSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   readlinkSync,
   readdirSync,
   realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -38,6 +40,7 @@ import {
   type PluginManifest,
   type VerifiedPluginManifest,
 } from "./manifest.js";
+import { bundledPluginFiles } from "./bundled.js";
 
 export type { PanelSpec, PluginManifest } from "./manifest.js";
 
@@ -443,7 +446,22 @@ function clonePluginRepository(url: string, staging: string, kind: PluginGitSour
 }
 
 function populateStaging(source: string, staging: string): void {
-  if (source.startsWith("file:")) {
+  if (source.startsWith("bundled:")) {
+    const name = safePluginId(source.slice("bundled:".length), "bundled plugin name");
+    const files = bundledPluginFiles(name);
+    if (!files) throw new Error(`bundled plugin '${name}' is not available in this Hara package`);
+    mkdirSync(staging, { recursive: false, mode: 0o700 });
+    for (const [rawPath, contents] of Object.entries(files)) {
+      const rel = safePluginRelativePath(rawPath, `bundled plugin '${name}' file`);
+      const path = resolve(staging, rel);
+      const relToStage = relative(staging, path);
+      if (!relToStage || relToStage.startsWith("..") || isAbsolute(relToStage)) {
+        throw new Error(`bundled plugin '${name}' file escaped its staging directory`);
+      }
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      writeFileSync(path, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    }
+  } else if (source.startsWith("file:")) {
     const requested = resolve(source.slice("file:".length));
     const info = lstatSync(requested);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`plugin source '${requested}' must be a real directory`);
@@ -461,7 +479,7 @@ function populateStaging(source: string, staging: string): void {
   } else if (source.startsWith("git:")) {
     clonePluginRepository(validGitSource(source), staging, "git");
   } else {
-    throw new Error("source must be file:<path>, github:<owner/repo>, or git:<url>");
+    throw new Error("source must be bundled:<name>, file:<path>, github:<owner/repo>, or git:<url>");
   }
   safeTemporaryRemove(join(staging, ".git"));
   safeTemporaryRemove(join(staging, ".learnings"));

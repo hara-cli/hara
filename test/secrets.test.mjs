@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { redactKnownSecrets, redactSensitiveText, redactSensitiveValue } from "../dist/security/secrets.js";
+import {
+  redactKnownSecrets,
+  redactSensitiveText,
+  redactSensitiveValue,
+  requestsCredentialDisclosure,
+} from "../dist/security/secrets.js";
 import { issueTitle } from "../dist/feedback.js";
 
 test("secret redaction covers chat, env, JSON, headers, flags, and nested tool data", () => {
@@ -93,4 +98,28 @@ test("public feedback titles are redacted before truncation", () => {
   assert.ok(!title.includes(secret));
   assert.match(title, /API_KEY=\*\*\*/);
   assert.ok(title.length <= 70);
+});
+
+test("credential-disclosure detection blocks chat transfer and browser-storage extraction without blocking safe login guidance", () => {
+  for (const unsafe of [
+    "Please paste the admin access token here.",
+    "Send me the Authorization header so I can continue.",
+    "请按 F12，在控制台复制 localStorage.token 后粘贴给我。",
+    "请提供后台登录态 cookie。",
+    "Type your API key in this chat.",
+  ]) assert.equal(requestsCredentialDisclosure(unsafe), true, unsafe);
+
+  for (const safe of [
+    "Never paste your token; sign in again in the approved browser window.",
+    "请勿在群里粘贴 cookie，请在受信任的登录页面重新登录。",
+    "Configure the API key in Hara Settings.",
+    "Paste your API key into Hara Settings.",
+    "请在 Hara 设置页输入 API Key。",
+    "Paste the API key into the masked terminal prompt.",
+    "请在终端的隐藏输入中粘贴 API Key。",
+    "The browser_session capability is unavailable; export a non-secret CSV file instead.",
+    "The provider returned 401 because no session token was available.",
+    "The provider did not provide an access token.",
+    "后台没有提供 session token。",
+  ]) assert.equal(requestsCredentialDisclosure(safe), false, safe);
 });

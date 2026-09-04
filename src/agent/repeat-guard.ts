@@ -3,7 +3,8 @@
 // same wall; Nx the same failing build command). The guardian breaker only covers DENIED actions; this
 // covers FAILED ones. Deterministic and session-scoped (module state, same pattern as net-reachability):
 // when an identical (tool, args) call fails twice without any successful action between the failures, the
-// tool result gets an explicit "stop repeating this" note the model can't miss. A model cannot evade the
+// tool result gets an explicit "stop repeating this" note and one model round in which to obey it. A third
+// unchanged failure stops the run. A model cannot evade the
 // guard by alternating several failing tools. Successful repeats are NOT flagged — a re-read after an edit
 // or a re-run after a fix is legitimate, and any success resets the bounded no-progress ledger. Serve can run several
 // sessions in one process, so streaks are keyed by the same run scope as todo/reminder state.
@@ -202,7 +203,8 @@ export interface FailureIdentity {
   kind: "exact" | "home_boundary" | "empty_recall" | "strategy";
 }
 
-/** All no-progress failure identities. Exact calls stop on the second attempt; materially different
+/** All no-progress failure identities. Exact calls warn on the second attempt and stop on the third;
+ * materially different
  * command variants sharing one stable endpoint/script + high-signal error stop on the third. */
 export function failureIdentities(
   name: string,
@@ -241,7 +243,7 @@ export function failureIdentities(
     key: keyOf(name, input),
     label: `${name} call`,
     semantic: false,
-    hardStopAfter: 2,
+    hardStopAfter: 3,
     kind: "exact",
   }];
   if (failed) {

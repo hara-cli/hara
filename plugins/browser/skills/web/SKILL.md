@@ -20,8 +20,11 @@ counterpart to the fragile desktop `computer` tool: prefer it for anything on th
 
 ## Notes
 - First run downloads a browser once: `npx playwright install chromium`.
-- The Playwright MCP uses its **own** browser (no logins). For tasks needing your **real logged-in Chrome**, use
-  `chrome-devtools-mcp` instead (drives your actual Chrome via CDP) — swap the mcpServers command to
-  `npx chrome-devtools-mcp@latest`. (This is what openclaw/cc-haha use.)
+- The Playwright MCP uses its **own** browser (no existing logins). For tasks needing the running Chrome
+  profile, use Hara's `chrome` plugin instead. Its `chrome-devtools-mcp --autoConnect` route requires Chrome
+  144+, remote debugging enabled at `chrome://inspect/#remote-debugging`, and explicit approval in Chrome.
+  Install it from the signed Hara package with `hara plugin add bundled:chrome`, then disable this isolated
+  plugin with `hara plugin disable browser` so the two browser routes are not ambiguous.
+  Do not copy cookies, localStorage, Authorization headers, or session tokens into chat as a workaround.
 - **Confirm before irreversible actions** — purchases, posting, sending messages, deleting. Verify the page/state
   with a snapshot first.

@@ -950,3 +950,88 @@ test("Claude official Agent SDK resumes the selected original session without a 
   assert.doesNotMatch(JSON.stringify({ listed, read, resumed, forked, turn }), /claude-native|\/workspace\/confidential-claude-project|private prompt|private summary/);
   assert.ok(sdkCalls.some(([kind]) => kind === "fork"));
 });
+
+test("Claude history stays read-only when Hara cannot reuse the original terminal authentication", async () => {
+  const source = {
+    sessionId: "claude-auth-missing",
+    cwd: "/workspace/auth-missing",
+    customTitle: "Authentication boundary",
+    createdAt: 1_780_000_000_000,
+    lastModified: 1_780_000_010_000,
+  };
+  const sdk = {
+    async listSessions() { return [source]; },
+    async getSessionMessages() { return []; },
+    async getSessionInfo() { return source; },
+    async forkSession() { throw new Error("not used"); },
+    query() { throw new Error("an unauthenticated query must not start"); },
+  };
+  const adapter = new ClaudeAgentSdkAdapter({
+    command: "/usr/bin/true",
+    identityKey: Buffer.alloc(32, 10),
+    ownership: { has: () => true, add: () => {} },
+    sdk,
+    authenticationStatus: async () => "missing",
+  });
+  const listed = await adapter.list({ limit: 10 });
+  const sessionId = listed.sessions[0].id;
+  const read = await adapter.read(sessionId);
+  assert.equal(read.readOnly, true);
+  assert.equal(read.controlMode, "history");
+  assert.equal(read.continuationUnavailableReason, "authentication_required");
+  await assert.rejects(adapter.resume(sessionId), /authentication is not available to Hara/i);
+  await assert.rejects(
+    adapter.submit(sessionId, "continue", {
+      text: () => {},
+      tool: () => {},
+      notice: () => {},
+      confirm: async () => true,
+    }),
+    /authentication is not available to Hara/i,
+  );
+});
+
+test("Claude authentication trusts structured loggedIn:false on exit 1 but not an unrelated command failure", {
+  skip: process.platform === "win32" ? "POSIX executable fixture" : false,
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-claude-auth-probe-"));
+  const source = {
+    sessionId: "claude-auth-probe",
+    cwd: root,
+    customTitle: "Authentication probe",
+    createdAt: 1_780_000_000_000,
+    lastModified: 1_780_000_010_000,
+  };
+  const sdk = {
+    async listSessions() { return [source]; },
+    async getSessionMessages() { return []; },
+    async getSessionInfo() { return source; },
+    async forkSession() { throw new Error("not used"); },
+    query() { throw new Error("not used"); },
+  };
+  const makeAdapter = (command) => new ClaudeAgentSdkAdapter({
+    command,
+    identityKey: Buffer.alloc(32, 11),
+    ownership: { has: () => true, add: () => {} },
+    sdk,
+  });
+  try {
+    const loggedOut = join(root, "logged-out");
+    writeFileSync(loggedOut, "#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":false}'\nexit 1\n", { mode: 0o755 });
+    chmodSync(loggedOut, 0o755);
+    const missing = makeAdapter(loggedOut);
+    const missingId = (await missing.list({ limit: 10 })).sessions[0].id;
+    assert.equal((await missing.read(missingId)).continuationUnavailableReason, "authentication_required");
+
+    const unrelatedFailure = join(root, "unrelated-failure");
+    writeFileSync(unrelatedFailure, "#!/bin/sh\nprintf '%s\\n' 'unsupported command'\nexit 1\n", { mode: 0o755 });
+    chmodSync(unrelatedFailure, 0o755);
+    const unknown = makeAdapter(unrelatedFailure);
+    const unknownId = (await unknown.list({ limit: 10 })).sessions[0].id;
+    const unknownRead = await unknown.read(unknownId);
+    assert.equal(unknownRead.continuationUnavailableReason, undefined);
+    assert.equal(unknownRead.readOnly, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

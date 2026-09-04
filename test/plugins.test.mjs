@@ -95,6 +95,32 @@ test("plugin Git source rejects embedded HTTPS credentials before network access
   );
 });
 
+test("a signed package can install its bundled Chrome capability without a development checkout", () => {
+  const name = "chrome";
+  try {
+    const plugin = installPlugin("bundled:chrome");
+    assert.equal(plugin.name, name);
+    assert.equal(plugin.manifest.mcpServers.chrome.args.at(-1), "--autoConnect");
+    assert.deepEqual(
+      plugin.manifest,
+      JSON.parse(readFileSync(join(process.cwd(), "plugins", "chrome", ".hara-plugin", "plugin.json"), "utf8")),
+      "the binary-embedded manifest stays in sync with the reviewed package asset",
+    );
+    assert.equal(
+      readFileSync(join(plugin.root, "skills", "chrome", "SKILL.md"), "utf8"),
+      readFileSync(join(process.cwd(), "plugins", "chrome", "skills", "chrome", "SKILL.md"), "utf8"),
+      "the binary-embedded skill stays in sync with the reviewed package asset",
+    );
+    assert.ok(pluginSkillDirs().some((dir) => dir.includes(`${name}/skills`)));
+    assert.ok(pluginMcpServers().chrome, "bundled Chrome MCP is available after explicit installation");
+    assert.equal(uninstallPlugin(name), true);
+  } finally {
+    rmSync(installedRoot(name), { recursive: true, force: true });
+    rmSync(receiptPath(name), { force: true });
+    cleanPluginFlag(name);
+  }
+});
+
 test("plugin install → skills/roles/mcp auto-contribute; disable hides them; uninstall removes", () => {
   const pname = "hara-test-plugin-" + Math.random().toString(36).slice(2, 8);
   const src = makeDemoPlugin(pname);

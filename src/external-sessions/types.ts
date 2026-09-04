@@ -107,6 +107,8 @@ export interface ExternalSessionReadResult {
    * Hara-created continuation, and `history` is protected provider history awaiting user consent.
    */
   controlMode: "history" | "managed" | "live";
+  /** A bounded reason why provider history cannot currently become writable. No credential detail crosses Serve. */
+  continuationUnavailableReason?: "authentication_required";
 }
 
 export interface ExternalSessionForkResult extends ExternalSessionReadResult {

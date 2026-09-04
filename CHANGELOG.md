@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.166.1 — 2026-09-04 — safer recovery and explicit browser sessions
+
+- Give an identical failed tool call one real recovery round after the second-attempt warning and stop only
+  on the third unchanged failure. A long but advancing task now receives a strategy/checkpoint nudge without
+  the former early 20-round stop; the normal active-time, 64-round and cumulative task boundaries remain.
+- Block model-authored requests to paste or send API keys, passwords, cookies, authorization headers, browser
+  storage values or session tokens into chat. Gateway prose is withheld for one safe correction round,
+  `ask_user` blocks same-round side effects, and persisted human handoffs reject the same unsafe request while
+  legitimate Key entry in Hara Settings remains available.
+- Make the reviewed Chrome MCP installable from npm and the single-file Desktop sidecar with
+  `hara plugin add bundled:chrome`. It connects to Chrome 144+ through `--autoConnect` only after remote
+  debugging is enabled and Chrome receives explicit user approval; it is not enabled as an unattended gateway
+  bypass and does not claim per-domain isolation.
+- Keep readable Claude Code history separate from continuation authority. Hara now parses the CLI's structured
+  `loggedIn` status even when the documented logged-out response exits non-zero, while unrelated command
+  failures remain unknown instead of being mislabeled as an authentication failure.
+
 ## 0.166.0 — 2026-09-04 — interactive Hara Live terminal stream
 
 - Add a renderer-neutral, device-local Hara Live terminal stream with bounded ANSI frames, resize and scroll

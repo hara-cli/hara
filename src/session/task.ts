@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { RunOutcome } from "../agent/loop.js";
 import type { Todo } from "../tools/todo.js";
-import { redactSensitiveText } from "../security/secrets.js";
+import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
 
 export const TASK_SCHEMA_VERSION = 1;
 export const MAX_TASK_OBJECTIVE_CHARS = 4096;
@@ -541,6 +541,20 @@ function completionInput(
     }
     const manualAction = manualActionInput(raw.manual_action);
     if (!manualAction.ok) return manualAction;
+    const handoffText = [
+      detail,
+      manualAction.value?.command,
+      manualAction.value?.verifyCommand,
+      manualAction.value?.resumePhrase,
+      ...(manualAction.value?.hints ?? []).flatMap((hint) => [hint.term, hint.detail]),
+    ].filter((part): part is string => typeof part === "string").join("\n");
+    if (requestsCredentialDisclosure(handoffText)) {
+      return {
+        ok: false,
+        reason:
+          "a user dependency must not ask the user to paste or send credentials into chat; use a registered trusted login/provider surface or an exported file that contains no account access data",
+      };
+    }
     dependency = {
       kind: raw.kind as TaskUserDependencyKind,
       detail,

@@ -8,11 +8,22 @@
 // of allowing later calls to act on an invented answer.
 // kind:"read" so it never itself triggers the approval gate (the interaction IS the prompt).
 import { getTool, registerTool, type Tool, type ToolContext } from "./registry.js";
+import { requestsCredentialDisclosure } from "../security/secrets.js";
 
 /** Returned when nobody can answer and the caller supplied no deterministic fallback. */
 export const NO_INTERACTIVE_USER = "(no interactive user available — question skipped; no answer was inferred)";
 export const HEADLESS_USER_INPUT_REQUIRED =
   "Headless run stopped: ask_user required an answer, but no interactive user or explicit default was available.";
+export const CREDENTIAL_DISCLOSURE_BLOCKED =
+  "Credential disclosure blocked: never ask the user to paste or send API keys, passwords, cookies, Authorization headers, browser localStorage/sessionStorage values, or session tokens into chat. Use a registered trusted provider/browser capability, or ask the user to sign in inside that trusted surface. If the capability is unavailable, record it as unavailable and offer an exported CSV/file that contains no account access data; do not repeat this request.";
+
+export function askUserRequestsCredential(input: unknown): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+  const value = input as Record<string, unknown>;
+  const parts = [value.header, value.context, value.question, ...(Array.isArray(value.options) ? value.options : [])]
+    .filter((part): part is string => typeof part === "string");
+  return requestsCredentialDisclosure(parts.join("\n"));
+}
 
 function unavailableResult(explicitDefault: string, reason = ""): string {
   const result = explicitDefault
@@ -34,7 +45,8 @@ const definition: Tool = {
     "answer (chosen option or free text) as its result. " +
     "For non-interactive runs, provide `default` only when the task itself defines a safe deterministic " +
     "fallback. Without one, the engine stops the headless run with a clear blocker and no later tool in that " +
-    "round executes; do not call ask_user for uncertainty that is not genuinely blocking.",
+    "round executes; do not call ask_user for uncertainty that is not genuinely blocking. Never use ask_user " +
+    "to request a password, API key, cookie, Authorization header, browser storage value, or session token.",
   kind: "read", // the prompt itself is the interaction; never route it through the approval gate
   classify: () => ({ effect: "interactive", concurrencySafe: false }),
   input_schema: {
@@ -58,6 +70,7 @@ const definition: Tool = {
   async run(input: any, ctx: ToolContext): Promise<string> {
     const question = typeof input.question === "string" ? input.question.trim() : "";
     if (!question) return "ask_user needs a non-empty `question`.";
+    if (askUserRequestsCredential(input)) return `Error: ${CREDENTIAL_DISCLOSURE_BLOCKED}`;
     const explicitDefault = typeof input.default === "string" ? input.default.trim() : "";
 
     // No interactive user: do not block and, critically, do not manufacture a preference on the user's behalf.

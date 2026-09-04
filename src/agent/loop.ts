@@ -49,7 +49,7 @@ import { setTurnPhase } from "./phase.js";
 import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
 import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
-import { redactSensitiveText } from "../security/secrets.js";
+import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
 import { safeProviderErrorMessage } from "../providers/errors.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { prepareHistoryForModel } from "./context-budget.js";
@@ -66,7 +66,9 @@ import {
 } from "../session/task.js";
 import { captureLearning } from "../learning/store.js";
 import {
+  askUserRequestsCredential,
   askUserTool,
+  CREDENTIAL_DISCLOSURE_BLOCKED,
   HEADLESS_USER_INPUT_REQUIRED,
   NO_INTERACTIVE_USER,
 } from "../tools/ask_user.js";
@@ -203,7 +205,15 @@ its completed checkpoint is retained. Keep JWT, refresh-token, raw error-code, a
 the primary summary; never repeat an actual credential value. On an explicit continuation after the user signs
 in, check the previously blocked capability before resuming business actions, and remain paused if it is still
 unavailable. A login action or URL is safe to offer only when it comes from a registered trusted capability,
-never from model-authored prose.
+never from model-authored prose. Never ask a user to paste or send a password, API key, cookie, Authorization
+header, browser localStorage/sessionStorage value, or session token into chat. Use the registered trusted
+provider/browser capability; if none is available, checkpoint that capability as unavailable and offer a
+data-only export/file workflow. Do not repeat the credential request in ask_user, task_checkpoint, or prose.
+For a direct local CLI/Desktop task that specifically needs the user's already signed-in Chrome and has no
+chrome MCP tools, the reviewed first-party setup route is \`hara plugin add bundled:chrome\`: after restarting
+Hara, Chrome 144+ must have remote debugging enabled at \`chrome://inspect/#remote-debugging\`, and Chrome itself
+must show and receive the user's connection approval. Never offer this as an unattended gateway bypass, never
+claim that it provides per-domain isolation, and never substitute copied browser storage for the real connection.
 The latest direct user correction outranks your earlier assumption. If the user says you misunderstood the
 machine, path, process, or execution location, do not repeat your old claim or ask the same question again:
 run one bounded read-only check such as hostname, pwd, uname, or process inspection and update the hypothesis
@@ -505,11 +515,10 @@ export interface RunLimitEvent {
 }
 
 const RUN_STOPPED = Symbol("agent-run-stopped");
-const REPEATED_FAILURE_LIMIT = 2;
+const REPEATED_FAILURE_LIMIT = 3;
 const NO_PROGRESS_NUDGE_ROUNDS = 2;
 const NO_PROGRESS_STOP_ROUNDS = 6;
 const NO_CHECKPOINT_NUDGE_ROUNDS = 8;
-const NO_CHECKPOINT_PAUSE_ROUNDS = 20;
 const MAX_PROGRESS_OBSERVATIONS = 512;
 
 /** Keep successful-call observations opaque and run-local. Tool arguments/results can contain project data;
@@ -804,7 +813,7 @@ function hardStop(
     : kind === "max_rounds"
       ? `⏸ agent paused at the ${life.maxRounds}-round safety boundary after ${formatAgentDuration(elapsedMs)}. Hara stopped before spending more tokens because the current strategy did not converge. Completed file changes and the latest task checkpoint remain in this conversation. Review the current artifact, then use \`/continue\` for one bounded, materially different strategy; raising the round limit is not the first recovery step.`
       : kind === "strategy_stall"
-        ? `⏸ agent paused early after ${detail?.count ?? NO_CHECKPOINT_PAUSE_ROUNDS} consecutive working round(s) without a durable task checkpoint. Hara preserved completed changes and stopped before the general round limit. Review the current artifact and acceptance checks, then use \`/continue\` with one bounded, materially different strategy.`
+        ? `⏸ agent paused early after ${detail?.count ?? 20} consecutive working round(s) without a durable task checkpoint. Hara preserved completed changes and stopped before the general round limit. Review the current artifact and acceptance checks, then use \`/continue\` with one bounded, materially different strategy.`
       : detail?.mode === "no_progress"
         ? `⛔ agent run stopped early: ${detail.label ?? "the same tool/evidence cycle"} produced no new evidence for ${detail.count ?? NO_PROGRESS_STOP_ROUNDS} consecutive round(s). Hara stopped before the general round limit to prevent a model loop and unnecessary token use. Review the last verified checkpoint, then retry with a materially different strategy.`
       : `⛔ agent run stopped: the same failing ${detail?.label ?? "tool call"} repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
@@ -1109,6 +1118,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
   let actionOwnershipRetries = 0; // accepted change tasks may not terminate as advice without a typed blocker
   let completionReceiptRetries = 0; // performed work gets one bounded chance to record final verification
+  let credentialDisclosureRetries = 0; // gateway prose gets one hidden correction before a safe hard stop
   let successfulOwnedActionObserved = false; // reads alone never satisfy execution ownership
   let recallExhausted = false; // after three empty attempts, hide only recall and allow a natural final answer
   const interruptedOutcome = (): RunOutcome => {
@@ -1259,6 +1269,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       intakeTask?.brief?.intent === "change"
       && !freshTaskCompletion(intakeTask)
       && !(successfulOwnedActionObserved && completionReceiptRetries > 0);
+    const guardGatewayProse = !!process.env.HARA_GATEWAY;
     const assembledSystem = composeSystem(
       ctx.cwd,
       opts.projectContext,
@@ -1381,7 +1392,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         if (attempt.signal.aborted) return;
         alive();
         const visible = assistantText.push(d);
-        if (suppressUnverifiedActionProse) deferredActionProse += visible;
+        if (suppressUnverifiedActionProse || guardGatewayProse) deferredActionProse += visible;
         else emitVisibleText(visible);
       },
       onReasoning: () => {
@@ -1414,7 +1425,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       removeAttemptStop();
       runSignal.removeEventListener("abort", onRunAbort);
       const finalVisible = assistantText.finish();
-      if (suppressUnverifiedActionProse) {
+      if (guardGatewayProse) {
+        deferredActionProse += finalVisible;
+      } else if (suppressUnverifiedActionProse) {
         deferredActionProse += finalVisible;
         // Buffer until the provider commits to an actual tool round. This keeps a useful "I'll handle it"
         // acknowledgement before execution while ensuring a prose-only delegation can still be discarded
@@ -1446,6 +1459,25 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
+    if (guardGatewayProse) {
+      const guardedText = [r.text, deferredActionProse].filter(Boolean).join("\n");
+      if (requestsCredentialDisclosure(guardedText)) {
+        if (credentialDisclosureRetries < 1) {
+          credentialDisclosureRetries += 1;
+          history.push({
+            role: "user",
+            content: wrapReminders([
+              `${CREDENTIAL_DISCLOSURE_BLOCKED} Your previous response was withheld and no credential was requested from the user. Continue through a safe registered capability or state the non-secret blocker/workflow.`,
+            ]),
+          });
+          continue;
+        }
+        const message = "Hara blocked a repeated request to disclose account credentials in chat. Use a trusted login/provider surface or an exported file that contains no account access data instead.";
+        emitVisibleText(message);
+        return { status: "error", error: message };
+      }
+      emitVisibleText(r.text || deferredActionProse);
+    }
     if (ctx.spaceId && ctx.spaceId !== "personal") {
       try {
         organizationPolicy = loadOrganizationExecutionPolicy(ctx.spaceId);
@@ -1650,6 +1682,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     const results: ToolResult[] = new Array(r.toolUses.length);
     const headlessQuestionWithoutDefault = !ctx.ask && r.toolUses.some((toolUse) => {
       if (toolUse.name !== "ask_user") return false;
+      if (askUserRequestsCredential(toolUse.input)) return false;
       const question = (toolUse.input as { question?: unknown } | null)?.question;
       const explicitDefault = (toolUse.input as { default?: unknown } | null)?.default;
       return typeof question === "string"
@@ -1702,6 +1735,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
     let repeatHalt: { label: string; count: number } | null = null;
     let unansweredUserQuestion = false;
+    let credentialQuestionBlocked = false;
     const noteCall = (name: string, input: unknown, content: string, isError = false): string => {
       let note = recordCall(name, input, content, isError, ctx.todoScope);
       const identities = failureIdentities(name, input, content, isError);
@@ -2149,11 +2183,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     const successfulRoundObservations: string[] = [];
     const runOne = async (idx: number, p: Plan): Promise<void> => {
       if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
-      if (unansweredUserQuestion) {
+      if (unansweredUserQuestion || credentialQuestionBlocked) {
         results[idx] = {
           id: p.tu.id,
           name: p.tu.name,
-          content: "Error: not executed because an unanswered ask_user call stopped this run.",
+          content: credentialQuestionBlocked
+            ? "Error: not executed because an earlier ask_user call requested credential disclosure."
+            : "Error: not executed because an unanswered ask_user call stopped this run.",
           isError: true,
         };
         return;
@@ -2265,6 +2301,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           if (!settled.ok) throw settled.error;
         }
         const res = toolResult === RUN_STOPPED ? (settled as { ok: true; value: string }).value : toolResult;
+        if (p.tool === askUserTool && askUserRequestsCredential(p.tu.input)) {
+          credentialQuestionBlocked = true;
+          results[idx] = {
+            id: p.tu.id,
+            name: p.tu.name,
+            content: res,
+            isError: true,
+          };
+          return;
+        }
         if (p.tool === askUserTool && res.startsWith(NO_INTERACTIVE_USER)) {
           unansweredUserQuestion = true;
           results[idx] = {
@@ -2367,7 +2413,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // Exact observation hashes catch literal repeats, but a model can still churn by changing one shell
     // fragment, offset, or temporary filename on every nominally successful round. Persistent tasks already
     // provide a typed checkpoint tool. Require one periodically instead of pretending every unique command
-    // is outcome progress; pausing here preserves real edits and avoids burning all 64 rounds.
+    // is outcome progress. Unlike the old 20-round hard pause, the checkpoint is advisory: a provider that
+    // is still producing new evidence may continue to the general run/task budget, matching Codex's
+    // model-visible recovery loop instead of being stopped before it can obey the nudge.
     const successfulTaskCheckpoint = r.toolUses.some((toolUse, index) => {
       const result = results[index];
       return toolUse.name === "task_checkpoint"
@@ -2386,12 +2434,6 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       checkpointNudged = false;
     } else if (opts.taskIntake && substantiveWorkRound) {
       workRoundsWithoutCheckpoint += 1;
-      if (workRoundsWithoutCheckpoint >= NO_CHECKPOINT_PAUSE_ROUNDS) {
-        return hardStop(opts, life, "strategy_stall", {
-          label: "working rounds without a durable task checkpoint",
-          count: workRoundsWithoutCheckpoint,
-        });
-      }
       if (workRoundsWithoutCheckpoint >= NO_CHECKPOINT_NUDGE_ROUNDS && !checkpointNudged) {
         checkpointNudged = true;
         if (!opts.quiet) {

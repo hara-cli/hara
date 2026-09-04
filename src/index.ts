@@ -5348,7 +5348,7 @@ const pluginCmd = program
   .description("manage plugins (bundle skills/roles/MCP servers)");
 pluginCmd
   .command("add <source>")
-  .description("install a plugin from file:<path> | github:<owner/repo> | git:<url>")
+  .description("install a plugin from bundled:<name> | file:<path> | github:<owner/repo> | git:<url>")
   .action((source: string) => {
     try {
       const p = installPlugin(source);
@@ -5376,7 +5376,7 @@ pluginCmd
       for (const _hook of [...(m.hooks?.PreToolUse ?? []), ...(m.hooks?.PostToolUse ?? [])]) execs.push("hook configured (command hidden)");
       if (execs.length) {
         out(
-          c.yellow(`⚠ ${p.name} will run these commands on every hara launch (a plugin is code you run — review them):\n`) +
+          c.yellow(`⚠ ${p.name} makes these commands available when Hara connects the capability (a plugin is code you run — review them):\n`) +
             execs.map((e) => c.dim(`    ${e}`)).join("\n") +
             c.dim(`\n    disable: hara plugin disable ${p.name}\n`),
         );

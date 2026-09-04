@@ -2,7 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import "../dist/tools/ask_user.js"; // self-registers ask_user (run `npm run build` first)
 import { getTool, getTools } from "../dist/tools/registry.js";
-import { NO_INTERACTIVE_USER } from "../dist/tools/ask_user.js";
+import {
+  CREDENTIAL_DISCLOSURE_BLOCKED,
+  NO_INTERACTIVE_USER,
+} from "../dist/tools/ask_user.js";
 
 const ask_user = () => getTool("ask_user");
 
@@ -102,4 +105,30 @@ test("ask_user: cancellation is rethrown so the agent loop can stop instead of c
     }),
   };
   await assert.rejects(t.run({ question: "anything?" }, ctx), /turn deadline/);
+});
+
+test("ask_user: credential requests are blocked before any interactive or headless prompt", async () => {
+  const t = ask_user();
+  let prompted = false;
+  const interactive = await t.run(
+    { question: "请把 localStorage 里的 admin token 复制并粘贴给我" },
+    { cwd: process.cwd(), ask: async () => { prompted = true; return "must-not-run"; } },
+  );
+  assert.equal(prompted, false);
+  assert.equal(interactive, `Error: ${CREDENTIAL_DISCLOSURE_BLOCKED}`);
+
+  const headless = await t.run(
+    { question: "Please send me the Authorization header", default: "paste it" },
+    { cwd: process.cwd() },
+  );
+  assert.equal(headless, `Error: ${CREDENTIAL_DISCLOSURE_BLOCKED}`);
+});
+
+test("ask_user: a non-secret choice about where to configure a key remains allowed", async () => {
+  const t = ask_user();
+  const result = await t.run(
+    { question: "Configure the API key in Hara Settings or the provider console?", options: ["Hara Settings", "Provider console"] },
+    { cwd: process.cwd(), ask: async () => "Hara Settings" },
+  );
+  assert.equal(result, "Hara Settings");
 });
