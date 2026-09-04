@@ -17,7 +17,12 @@ import {
   type ExternalSessionSourceId,
   type ExternalSteerResult,
   type ExternalTerminalKey,
+  type ExternalNativeTerminalOpenInput,
+  type ExternalNativeTerminalResult,
   type ExternalTerminalSnapshot,
+  type ExternalTerminalStream,
+  type ExternalTerminalStreamOpenInput,
+  type ExternalTerminalStreamSink,
   type ExternalTurnResult,
   type ExternalTurnSink,
 } from "./types.js";
@@ -288,6 +293,29 @@ export class ExternalSessionRegistry implements ExternalSessionService {
       throw new ExternalSessionInputError("this external session does not accept terminal keys");
     }
     await adapter.terminalKey(sessionId, key);
+  }
+
+  async openTerminalStream(
+    sessionId: string,
+    input: ExternalTerminalStreamOpenInput,
+    sink: ExternalTerminalStreamSink,
+  ): Promise<ExternalTerminalStream> {
+    const adapter = this.adapterForSession(sessionId);
+    if (!adapter.openTerminalStream) {
+      throw new ExternalSessionInputError("this external session does not expose a streaming terminal");
+    }
+    return await adapter.openTerminalStream(sessionId, input, sink);
+  }
+
+  async openNativeTerminal(
+    sessionId: string,
+    input: ExternalNativeTerminalOpenInput,
+  ): Promise<ExternalNativeTerminalResult> {
+    const adapter = this.adapterForSession(sessionId);
+    if (!adapter.openNativeTerminal) {
+      throw new ExternalSessionInputError("this external session does not support a native terminal handoff");
+    }
+    return await adapter.openNativeTerminal(sessionId, input);
   }
 
   async close(): Promise<void> {

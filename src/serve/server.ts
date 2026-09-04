@@ -226,6 +226,7 @@ import {
   type ExternalRuntimeLaunchOptions,
   type ExternalSessionService,
   type ExternalSessionSourceId,
+  type ExternalTerminalStream,
 } from "../external-sessions/types.js";
 
 /** What the CLI entry injects (built in index.ts, where config/providers/guardian already live). */
@@ -1510,6 +1511,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const port = (wss.address() as { port: number }).port;
 
   const authed = new Set<WebSocket>();
+  interface OwnedExternalTerminalStream {
+    streamId: string;
+    sessionId: string;
+    mode: "observe" | "control";
+    stream: ExternalTerminalStream;
+  }
+  const externalTerminalStreams = new Map<WebSocket, Map<string, OwnedExternalTerminalStream>>();
+  const externalTerminalControllers = new Map<string, { ws: WebSocket; streamId: string }>();
   const pendingApprovals = new Map<string, {
     finish: (v: boolean | "always") => void;
     allowAlways: boolean;
@@ -1644,6 +1653,39 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const broadcast = (method: string, params: Record<string, unknown>): void => {
     const frame = rpcNotify(method, params);
     for (const ws of authed) if (ws.readyState === ws.OPEN) ws.send(frame);
+  };
+  const notifySocket = (ws: WebSocket, method: string, params: Record<string, unknown>): boolean => {
+    if (ws.readyState !== ws.OPEN) return false;
+    // A terminal can repaint quickly. Fail closed instead of buffering unbounded private terminal data
+    // in memory behind a suspended renderer/mobile client.
+    if (ws.bufferedAmount > 4 * 1024 * 1024) return false;
+    ws.send(rpcNotify(method, params));
+    return true;
+  };
+  const releaseExternalTerminal = async (
+    ws: WebSocket,
+    streamId: string,
+    reason: "released" | "control_transferred" | "slow_client" = "released",
+    notify = true,
+  ): Promise<void> => {
+    const owned = externalTerminalStreams.get(ws)?.get(streamId);
+    if (!owned) return;
+    externalTerminalStreams.get(ws)?.delete(streamId);
+    if (externalTerminalStreams.get(ws)?.size === 0) externalTerminalStreams.delete(ws);
+    const controller = externalTerminalControllers.get(owned.sessionId);
+    if (controller?.ws === ws && controller.streamId === streamId) {
+      externalTerminalControllers.delete(owned.sessionId);
+    }
+    await owned.stream.release().catch(() => {});
+    if (notify) notifySocket(ws, "external.event.terminal.closed", {
+      sessionId: owned.sessionId,
+      streamId,
+      reason,
+    });
+  };
+  const releaseExternalTerminalsForSocket = async (ws: WebSocket): Promise<void> => {
+    const ids = [...(externalTerminalStreams.get(ws)?.keys() ?? [])];
+    await Promise.all(ids.map((streamId) => releaseExternalTerminal(ws, streamId, "released", false)));
   };
   // Adapter turn identifiers never cross Serve. Keep the one active wire id per opaque session so a
   // follow-up (`steer`) is correlated with the same stream that Desktop is already rendering.
@@ -2589,6 +2631,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt", "external.sessions.remove",
             "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
+            "external.sessions.terminal.attach", "external.sessions.terminal.raw-input", "external.sessions.terminal.resize",
+            "external.sessions.terminal.scroll", "external.sessions.terminal.release", "external.sessions.terminal.open-wezterm",
             "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.test", "settings.vision.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
@@ -2632,6 +2676,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.native-resume.v1",
             "external.sessions.launch-options.v1",
             "external.sessions.terminal-mirror.v1",
+            "external.sessions.terminal-stream.v2",
             "external.sessions.runtime-remove.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
@@ -2657,6 +2702,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 "event.task_state", "event.workforce_state", "event.surface",
                 "external.event.turn_start", "external.event.text", "external.event.tool",
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
+                "external.event.terminal.frame", "external.event.terminal.closed",
               ],
               features,
             },
@@ -2945,6 +2991,172 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             await externalSessions.terminalKey(p.sessionId, p.key);
             return reply(rpcResult(id!, {}));
+          }
+          case "external.sessions.terminal.attach": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (
+              typeof p.sessionId !== "string"
+              || (p.mode !== "observe" && p.mode !== "control")
+              || !Number.isInteger(p.cols) || p.cols < 2 || p.cols > 1_000
+              || !Number.isInteger(p.rows) || p.rows < 2 || p.rows > 1_000
+              || (p.takeover !== undefined && typeof p.takeover !== "boolean")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId, terminal mode, cols, and rows are required"));
+            }
+            if (p.takeover && p.mode !== "control") {
+              return reply(rpcError(id, ERR.PARAMS, "terminal takeover requires control mode"));
+            }
+            const socketStreams = externalTerminalStreams.get(ws);
+            const priorForSession = [...(socketStreams?.values() ?? [])]
+              .find((candidate) => candidate.sessionId === p.sessionId);
+            if (priorForSession) await releaseExternalTerminal(ws, priorForSession.streamId, "released", false);
+            if (p.mode === "control") {
+              const priorController = externalTerminalControllers.get(p.sessionId);
+              if (priorController && !p.takeover) {
+                return reply(rpcError(id, ERR.BUSY, "this terminal is controlled by another client; confirm takeover or observe it read-only"));
+              }
+              if (priorController) {
+                await releaseExternalTerminal(priorController.ws, priorController.streamId, "control_transferred");
+              }
+            }
+            const streamId = `terminal_${randomUUID()}`;
+            let ready = false;
+            let closedBeforeReady: string | null = null;
+            const pendingFrames: Array<Record<string, unknown>> = [];
+            let pendingBytes = 0;
+            const publishFrame = (frame: Record<string, unknown>): void => {
+              const current = externalTerminalStreams.get(ws)?.get(streamId);
+              if (!current) return;
+              if (!notifySocket(ws, "external.event.terminal.frame", {
+                sessionId: p.sessionId,
+                streamId,
+                ...frame,
+              })) {
+                void releaseExternalTerminal(ws, streamId, "slow_client");
+              }
+            };
+            const stream = await externalSessions.openTerminalStream(p.sessionId, {
+              mode: p.mode,
+              cols: p.cols,
+              rows: p.rows,
+              ...(p.takeover ? { takeover: true } : {}),
+            }, {
+              frame: (frame) => {
+                if (ready) publishFrame(frame as unknown as Record<string, unknown>);
+                else {
+                  pendingBytes += frame.bytes.length;
+                  if (pendingFrames.length >= 32 || pendingBytes > 4 * 1024 * 1024) {
+                    closedBeforeReady = "slow_client";
+                    return;
+                  }
+                  pendingFrames.push(frame as unknown as Record<string, unknown>);
+                }
+              },
+              closed: (reason) => {
+                if (!ready) {
+                  closedBeforeReady = reason;
+                  return;
+                }
+                const current = externalTerminalStreams.get(ws)?.get(streamId);
+                if (!current) return;
+                externalTerminalStreams.get(ws)?.delete(streamId);
+                if (externalTerminalStreams.get(ws)?.size === 0) externalTerminalStreams.delete(ws);
+                const controller = externalTerminalControllers.get(p.sessionId);
+                if (controller?.ws === ws && controller.streamId === streamId) {
+                  externalTerminalControllers.delete(p.sessionId);
+                }
+                notifySocket(ws, "external.event.terminal.closed", { sessionId: p.sessionId, streamId, reason });
+              },
+            });
+            if (closedBeforeReady) {
+              await stream.release().catch(() => {});
+              throw new Error("Hara Live terminal stream closed while attaching");
+            }
+            const owned: OwnedExternalTerminalStream = { streamId, sessionId: p.sessionId, mode: p.mode, stream };
+            const ownedBySocket = externalTerminalStreams.get(ws) ?? new Map<string, OwnedExternalTerminalStream>();
+            ownedBySocket.set(streamId, owned);
+            externalTerminalStreams.set(ws, ownedBySocket);
+            if (p.mode === "control") externalTerminalControllers.set(p.sessionId, { ws, streamId });
+            reply(rpcResult(id!, { sessionId: p.sessionId, streamId, mode: p.mode, cols: p.cols, rows: p.rows }));
+            ready = true;
+            for (const frame of pendingFrames) publishFrame(frame);
+            return;
+          }
+          case "external.sessions.terminal.raw-input": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.streamId !== "string" || typeof p.text !== "string" || Buffer.byteLength(p.text, "utf8") > 64 * 1024) {
+              return reply(rpcError(id, ERR.PARAMS, "streamId and terminal text up to 64 KiB are required"));
+            }
+            const owned = externalTerminalStreams.get(ws)?.get(p.streamId);
+            if (!owned || owned.mode !== "control") return reply(rpcError(id, ERR.UNAUTHORIZED, "this client does not control that terminal stream"));
+            owned.stream.input(p.text);
+            return reply(rpcResult(id!, {}));
+          }
+          case "external.sessions.terminal.resize": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (
+              typeof p.streamId !== "string"
+              || !Number.isInteger(p.cols) || p.cols < 2 || p.cols > 1_000
+              || !Number.isInteger(p.rows) || p.rows < 2 || p.rows > 1_000
+            ) return reply(rpcError(id, ERR.PARAMS, "streamId, cols, and rows are required"));
+            const owned = externalTerminalStreams.get(ws)?.get(p.streamId);
+            if (!owned || owned.mode !== "control") return reply(rpcError(id, ERR.UNAUTHORIZED, "this client does not control that terminal stream"));
+            owned.stream.resize(p.cols, p.rows);
+            return reply(rpcResult(id!, {}));
+          }
+          case "external.sessions.terminal.scroll": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (
+              typeof p.streamId !== "string"
+              || (p.direction !== "up" && p.direction !== "down")
+              || !Number.isInteger(p.lines) || p.lines < 1 || p.lines > 1_000
+            ) return reply(rpcError(id, ERR.PARAMS, "streamId, scroll direction, and lines are required"));
+            const owned = externalTerminalStreams.get(ws)?.get(p.streamId);
+            if (!owned || owned.mode !== "control") return reply(rpcError(id, ERR.UNAUTHORIZED, "this client does not control that terminal stream"));
+            owned.stream.scroll(p.direction, p.lines);
+            return reply(rpcResult(id!, {}));
+          }
+          case "external.sessions.terminal.release": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (typeof p.streamId !== "string") return reply(rpcError(id, ERR.PARAMS, "streamId required"));
+            if (!externalTerminalStreams.get(ws)?.has(p.streamId)) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "this client does not own that terminal stream"));
+            }
+            await releaseExternalTerminal(ws, p.streamId, "released", false);
+            return reply(rpcResult(id!, {}));
+          }
+          case "external.sessions.terminal.open-wezterm": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (
+              typeof p.sessionId !== "string"
+              || (p.takeover !== undefined && typeof p.takeover !== "boolean")
+            ) return reply(rpcError(id, ERR.PARAMS, "sessionId and optional takeover flag required"));
+            const priorController = externalTerminalControllers.get(p.sessionId);
+            if (priorController && !p.takeover) {
+              return reply(rpcError(id, ERR.BUSY, "another client controls this terminal; confirm takeover before opening WezTerm"));
+            }
+            const result = await externalSessions.openNativeTerminal(p.sessionId, {
+              terminal: "wezterm",
+              ...(p.takeover ? { takeover: true } : {}),
+            });
+            // Do not strand the user if WezTerm is missing or cannot start. A successful `--takeover`
+            // launch claims the same Herdr terminal first; only then retire Hara's controller lease.
+            if (priorController) {
+              await releaseExternalTerminal(priorController.ws, priorController.streamId, "control_transferred");
+            }
+            return reply(rpcResult(id!, result));
           }
           case "spaces.list": {
             if (!deps.spaces) return reply(rpcError(id, ERR.METHOD, "Spaces are not supported by this server"));
@@ -5185,6 +5397,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     });
     ws.on("close", () => {
       authed.delete(ws);
+      void releaseExternalTerminalsForSocket(ws);
       if (authed.size === 0) {
         // nobody left to answer — deny pending approvals now instead of stalling turns for the timeout
         for (const approval of pendingApprovals.values()) approval.finish(false);
@@ -5209,6 +5422,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
       for (const approval of pendingApprovals.values()) approval.finish(false);
       pendingApprovals.clear();
+      await Promise.all([...externalTerminalStreams.keys()].map((client) => releaseExternalTerminalsForSocket(client)));
       const ownedAutomationRuns = [...automationRuns.entries()];
       for (const [controller] of ownedAutomationRuns) {
         controller.abort(new Error("Hara Serve is shutting down"));

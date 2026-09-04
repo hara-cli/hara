@@ -7,7 +7,10 @@ import {
   resolveByokProviderTarget,
   resolveGatewayModel,
 } from "../dist/providers/target.js";
-import { createProviderForTarget } from "../dist/providers/factory.js";
+import {
+  createProviderForTarget,
+  withVolcengineAgentPlanAutoFallback,
+} from "../dist/providers/factory.js";
 
 const personalConfig = {
   provider: "openai",
@@ -35,6 +38,80 @@ const personalConfig = {
   mcpServers: {},
   cwd: "/tmp/project",
 };
+
+test("Volcengine auto retries the stable alias only for an empty Agent Plan capability rejection", async () => {
+  let primaryTurns = 0;
+  let fallbackTurns = 0;
+  const primary = {
+    id: "volcengine-agent-plan",
+    model: "auto",
+    async turn() {
+      primaryTurns += 1;
+      return {
+        text: "",
+        toolUses: [],
+        stop: "error",
+        errorMsg: "404 The requested model does not support the agent plan feature",
+      };
+    },
+  };
+  const fallback = {
+    id: "volcengine-agent-plan",
+    model: "ark-code-latest",
+    async turn() {
+      fallbackTurns += 1;
+      return { text: "ok", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const provider = withVolcengineAgentPlanAutoFallback(primary, fallback);
+  const result = await provider.turn({ system: "reply", history: [], tools: [], onText() {} });
+  assert.equal(provider.model, "auto", "the user-visible router choice stays unchanged");
+  assert.equal(result.text, "ok");
+  assert.equal(primaryTurns, 1);
+  assert.equal(fallbackTurns, 1);
+
+  const generic = withVolcengineAgentPlanAutoFallback({
+    ...primary,
+    async turn() {
+      return { text: "", toolUses: [], stop: "error", errorMsg: "404 route not found" };
+    },
+  }, fallback);
+  const genericResult = await generic.turn({ system: "reply", history: [], tools: [], onText() {} });
+  assert.equal(genericResult.errorMsg, "404 route not found");
+  assert.equal(fallbackTurns, 1, "generic routing errors never trigger another request");
+
+  const partial = withVolcengineAgentPlanAutoFallback({
+    ...primary,
+    async turn() {
+      return {
+        text: "partial",
+        toolUses: [],
+        stop: "error",
+        errorMsg: "404 The requested model does not support the agent plan feature",
+      };
+    },
+  }, fallback);
+  const partialResult = await partial.turn({ system: "reply", history: [], tools: [], onText() {} });
+  assert.equal(partialResult.text, "partial");
+  assert.equal(fallbackTurns, 1, "a streamed response is never replayed against another model");
+
+  const streamed = withVolcengineAgentPlanAutoFallback({
+    ...primary,
+    async turn(args) {
+      args.onText("already shown");
+      return {
+        text: "",
+        toolUses: [],
+        stop: "error",
+        errorMsg: "404 The requested model does not support the agent plan feature",
+      };
+    },
+  }, fallback);
+  const streamedText = [];
+  await streamed.turn({ system: "reply", history: [], tools: [], onText: (delta) => streamedText.push(delta) });
+  assert.deepEqual(streamedText, ["already shown"]);
+  assert.equal(fallbackTurns, 1, "an emitted text delta is never replayed even if a provider returns an empty aggregate");
+});
 
 test("named BYOK profile is the routing source of truth over personal/global config", () => {
   const target = resolveByokProviderTarget(

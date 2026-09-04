@@ -166,6 +166,50 @@ export interface ExternalTerminalSnapshot {
   updatedAt: string;
 }
 
+/** A renderer-neutral terminal stream. ANSI stays opaque so Desktop and future mobile clients can
+ * choose their own terminal renderer without exposing Herdr's native pane or terminal identifiers. */
+export type ExternalTerminalStreamMode = "observe" | "control";
+
+export interface ExternalTerminalFrame {
+  seq: number;
+  encoding: "ansi-base64";
+  width: number;
+  height: number;
+  full: boolean;
+  bytes: string;
+}
+
+export interface ExternalTerminalStreamOpenInput {
+  mode: ExternalTerminalStreamMode;
+  cols: number;
+  rows: number;
+  takeover?: boolean;
+}
+
+export interface ExternalTerminalStreamSink {
+  frame(frame: ExternalTerminalFrame): void;
+  closed(reason: "released" | "runtime_closed" | "sequence_gap" | "invalid_frame" | "transport_error"): void;
+}
+
+export interface ExternalTerminalStream {
+  readonly mode: ExternalTerminalStreamMode;
+  input(text: string): void;
+  resize(cols: number, rows: number): void;
+  scroll(direction: "up" | "down", lines: number): void;
+  release(): Promise<void>;
+}
+
+export interface ExternalNativeTerminalResult {
+  terminal: "wezterm";
+  opened: true;
+}
+
+export interface ExternalNativeTerminalOpenInput {
+  terminal: "wezterm";
+  /** True only after the user explicitly agrees to transfer the single input lease. */
+  takeover?: boolean;
+}
+
 export type ExternalTerminalKey =
   | "enter"
   | "esc"
@@ -210,6 +254,12 @@ export interface ExternalSessionAdapter {
   terminalSnapshot?(sessionId: string): Promise<ExternalTerminalSnapshot>;
   terminalInput?(sessionId: string, text: string): Promise<void>;
   terminalKey?(sessionId: string, key: ExternalTerminalKey): Promise<void>;
+  openTerminalStream?(
+    sessionId: string,
+    input: ExternalTerminalStreamOpenInput,
+    sink: ExternalTerminalStreamSink,
+  ): Promise<ExternalTerminalStream>;
+  openNativeTerminal?(sessionId: string, input: ExternalNativeTerminalOpenInput): Promise<ExternalNativeTerminalResult>;
   close?(): Promise<void>;
 }
 
@@ -227,6 +277,12 @@ export interface ExternalSessionService {
   terminalSnapshot(sessionId: string): Promise<ExternalTerminalSnapshot>;
   terminalInput(sessionId: string, text: string): Promise<void>;
   terminalKey(sessionId: string, key: ExternalTerminalKey): Promise<void>;
+  openTerminalStream(
+    sessionId: string,
+    input: ExternalTerminalStreamOpenInput,
+    sink: ExternalTerminalStreamSink,
+  ): Promise<ExternalTerminalStream>;
+  openNativeTerminal(sessionId: string, input: ExternalNativeTerminalOpenInput): Promise<ExternalNativeTerminalResult>;
   close(): Promise<void>;
 }
 

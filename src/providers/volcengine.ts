@@ -6,6 +6,11 @@ const VOLCENGINE_AGENT_PLAN_PATH = "/api/plan/v3";
 export const VOLCENGINE_AGENT_PLAN_BASE_URL =
   `https://${VOLCENGINE_AGENT_PLAN_HOST}${VOLCENGINE_AGENT_PLAN_PATH}`;
 
+/** Ark documents `ark-code-latest` as the stable Codex-compatible alias. Some otherwise valid Agent Plan
+ * keys currently reject the newer `auto` router id with a model-capability 404, so Hara may use this alias
+ * for one bounded compatibility retry after the request has failed before producing any output. */
+export const VOLCENGINE_AGENT_PLAN_AUTO_FALLBACK_MODEL = "ark-code-latest";
+
 /** Current Agent Plan conversation-model catalog documented by Volcengine (verified 2026-09-03).
  * `auto` is the product's first/default choice; compatibility aliases remain at the end so existing
  * configurations stay editable. Live key-scoped discovery remains authoritative. */
@@ -57,4 +62,14 @@ export function isVolcengineAgentPlanInteractiveModel(model: string): boolean {
 export function volcengineAgentPlanCanDisableThinking(model: string): boolean {
   const id = model.split("/").at(-1)?.toLowerCase() ?? model.toLowerCase();
   return !/^(?:glm-5\.3|glm-latest)$/.test(id);
+}
+
+/** Match only Ark's model-capability response. A generic 404 can mean a wrong endpoint, proxy, or account
+ * route and must remain visible instead of silently trying a second billable request. */
+export function isVolcengineAgentPlanUnsupportedModelError(message: string | undefined): boolean {
+  if (!message) return false;
+  const normalized = message.toLowerCase().replace(/[_-]+/g, " ");
+  return normalized.includes("requested model does not support the agent plan feature")
+    || normalized.includes("model does not support agent plan")
+    || /(?:请求|指定).{0,12}模型.{0,20}不支持.{0,12}agent plan/iu.test(message);
 }

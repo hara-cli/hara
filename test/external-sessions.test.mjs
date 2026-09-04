@@ -9,6 +9,7 @@ import { ClaudeAgentSdkAdapter } from "../dist/external-sessions/claude.js";
 import { CodexAppServerAdapter } from "../dist/external-sessions/codex.js";
 import { HaraRuntimeAdapter } from "../dist/external-sessions/runtime.js";
 import { ExternalSessionRegistry } from "../dist/external-sessions/registry.js";
+import { HerdrTerminalStream } from "../dist/external-sessions/terminal-stream.js";
 import {
   JsonlRpcClient,
   probeExternalCommand,
@@ -124,12 +125,55 @@ test("a timed-out App Server request closes the uncertain provider process", {
   }
 });
 
+test("the Herdr terminal bridge fails closed on a missing incremental frame", {
+  skip: process.platform === "win32" ? "POSIX process fixture" : false,
+}, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-terminal-stream-gap-"));
+  let stream;
+  try {
+    const fixture = join(root, "terminal-gap.mjs");
+    writeFileSync(fixture, `
+      const frame = (seq, full, text) => process.stdout.write(JSON.stringify({
+        type: "terminal.frame", seq, encoding: "ansi", width: 80, height: 24, full,
+        bytes: Buffer.from(text).toString("base64"),
+      }) + "\\n");
+      frame(1, true, "full");
+      frame(3, false, "unsafe diff");
+      setInterval(() => {}, 60_000);
+    `);
+    const frames = [];
+    const closed = [];
+    stream = await HerdrTerminalStream.start({ command: process.execPath, argsPrefix: [fixture] }, "native-pane", {
+      mode: "control",
+      cols: 80,
+      rows: 24,
+    }, {
+      frame: (frame) => frames.push(frame),
+      closed: (reason) => closed.push(reason),
+    });
+    for (let attempt = 0; attempt < 40 && closed.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(frames.map((frame) => frame.seq), [1]);
+    assert.deepEqual(closed, ["sequence_gap"]);
+    assert.throws(() => stream.input("should not be accepted"), /does not hold input control/);
+  } finally {
+    await stream?.release().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Hara Live starts an isolated runtime, creates a coding-agent relay, and keeps native ids behind Core", {
   skip: process.platform === "win32" ? "POSIX detached runtime fixture" : false,
 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-live-runtime-"));
   const statePath = join(root, "runtime-state.json");
+  const weztermArgsPath = join(root, "wezterm-args.txt");
   try {
+    const wezterm = join(root, ".local", "bin", "wezterm");
+    mkdirSync(join(root, ".local", "bin"), { recursive: true });
+    writeFileSync(wezterm, `#!/bin/sh\nprintf '%s\\n' "$@" > '${weztermArgsPath}'\n`, { mode: 0o755 });
+    chmodSync(wezterm, 0o755);
     const fixture = join(root, "fake-herdr.mjs");
     writeFileSync(fixture, `
       import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -217,6 +261,34 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
         } else if (args[0] === "agent" && args[1] === "send-keys") {
           writeState({ text: (state.text || "") + "\\nkey:" + args[3], lastKey: args[3] });
           json({ type: "agent_info", agent: state.agent });
+        } else if (args[0] === "terminal" && args[1] === "session" && (args[2] === "control" || args[2] === "observe")) {
+          const mode = args[2];
+          writeState({ terminalStreamArgs: args });
+          process.stdout.write(JSON.stringify({
+            type: "terminal.frame",
+            seq: 7,
+            encoding: "ansi",
+            width: Number(args[args.indexOf("--cols") + 1]),
+            height: Number(args[args.indexOf("--rows") + 1]),
+            full: true,
+            bytes: Buffer.from("\\u001b[2Jstream ready").toString("base64"),
+          }) + "\\n");
+          if (mode === "observe") setInterval(() => {}, 60_000);
+          else {
+            const { createInterface } = await import("node:readline");
+            createInterface({ input: process.stdin }).on("line", (line) => {
+              const command = JSON.parse(line);
+              const current = readState();
+              if (command.type === "terminal.input") writeState({ terminalInput: (current.terminalInput || "") + command.text });
+              if (command.type === "terminal.resize") writeState({ terminalResize: [command.cols, command.rows] });
+              if (command.type === "terminal.scroll") writeState({ terminalScroll: [command.direction, command.lines] });
+              if (command.type === "terminal.release") {
+                writeState({ terminalReleased: true });
+                process.stdout.write(JSON.stringify({ type: "terminal.closed", reason: "released" }) + "\\n");
+                process.exit(0);
+              }
+            });
+          }
         } else if (args[0] === "workspace" && args[1] === "close") {
           if (state.agent && args[2] !== state.agent.workspace_id) {
             process.stderr.write(JSON.stringify({ id: "fixture", error: { code: "workspace_not_found", message: "wrong workspace" } }) + "\\n");
@@ -283,6 +355,48 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
     assert.match(terminalState.text, /> \/status/);
     assert.equal(terminalState.lastKey, "esc");
     await assert.rejects(adapter.terminalKey(created.session.id, "ctrl+z"), /not allowed/);
+
+    const streamedFrames = [];
+    const streamClosed = [];
+    const stream = await adapter.openTerminalStream(created.session.id, {
+      mode: "control",
+      cols: 96,
+      rows: 31,
+    }, {
+      frame: (frame) => streamedFrames.push(frame),
+      closed: (reason) => streamClosed.push(reason),
+    });
+    for (let attempt = 0; attempt < 40 && streamedFrames.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(Buffer.from(streamedFrames[0].bytes, "base64").toString(), "\u001b[2Jstream ready");
+    assert.equal(streamedFrames[0].encoding, "ansi-base64");
+    stream.input("\u0003中文");
+    stream.resize(101, 33);
+    stream.scroll("up", 4);
+    await stream.release();
+    const streamedState = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(streamedState.terminalInput, "\u0003中文");
+    assert.deepEqual(streamedState.terminalResize, [101, 33]);
+    assert.deepEqual(streamedState.terminalScroll, ["up", 4]);
+    assert.equal(streamedState.terminalReleased, true);
+    assert.deepEqual(streamClosed, ["released"]);
+    assert.deepEqual(await adapter.openNativeTerminal(created.session.id, { terminal: "wezterm", takeover: true }), {
+      terminal: "wezterm",
+      opened: true,
+    });
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const complete = existsSync(weztermArgsPath)
+        && readFileSync(weztermArgsPath, "utf8").trim().split("\n").length >= 11;
+      if (complete) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(existsSync(weztermArgsPath), true, "the detached WezTerm fixture must receive the handoff");
+    const weztermArgs = readFileSync(weztermArgsPath, "utf8").trim().split("\n");
+    assert.deepEqual(weztermArgs.slice(0, 4), ["start", "--no-auto-connect", "--always-new-process", "--"]);
+    assert.deepEqual(weztermArgs.slice(-4), ["terminal", "attach", "native-terminal-secret", "--takeover"]);
+    assert.doesNotMatch(weztermArgs.join(" "), /agent start|\bcodex\b|\bclaude\b/,
+      "the WezTerm companion attaches to the existing terminal and never launches another agent");
 
     const listed = await adapter.list({ limit: 10 });
     const metadata = JSON.stringify({ source, listed });

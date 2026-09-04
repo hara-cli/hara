@@ -52,6 +52,33 @@ try {
     throw new Error(`${error.message} (post-start status: ${status.errorCode || (status.ok ? "ready" : "unknown")})`);
   }
   if (created.readOnly || created.controlMode !== "live") throw new Error("created relay is not writable live mode");
+  let terminalStream;
+  try {
+    let settleFrame;
+    let rejectFrame;
+    const firstFrame = new Promise((resolve, reject) => {
+      settleFrame = resolve;
+      rejectFrame = reject;
+    });
+    terminalStream = await adapter.openTerminalStream(created.session.id, {
+      mode: "observe",
+      cols: 80,
+      rows: 24,
+    }, {
+      frame: (frame) => settleFrame(frame),
+      closed: (reason) => rejectFrame(new Error(`terminal stream closed before its first frame (${reason})`)),
+    });
+    const timeout = new Promise((_, reject) => {
+      const timer = setTimeout(() => reject(new Error("terminal stream did not publish a frame within 8 seconds")), 8_000);
+      timer.unref();
+    });
+    const frame = await Promise.race([firstFrame, timeout]);
+    if (!frame.full || frame.encoding !== "ansi-base64" || frame.width < 2 || frame.height < 2) {
+      throw new Error("terminal stream did not begin with a valid full ANSI frame");
+    }
+  } finally {
+    await terminalStream?.release().catch(() => {});
+  }
   const marker = `HARA_LIVE_${agentKind.toUpperCase()}_OK`;
   const turn = await adapter.submit(
     created.session.id,
@@ -68,7 +95,7 @@ try {
       : fullDetail;
     throw new Error(`live relay did not return the expected marker (status ${turn.status}; ${detail})`);
   }
-  console.log(`✓ Hara Live ${agentKind} relay created, messaged, observed, and verified`);
+  console.log(`✓ Hara Live ${agentKind} relay and terminal stream created, messaged, observed, and verified`);
 } finally {
   stopSession();
   rmSync(scratch, { recursive: true, force: true });

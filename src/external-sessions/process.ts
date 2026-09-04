@@ -292,6 +292,14 @@ const resolveExternalCommandLaunch = (
         join(userHome, "Applications", "ChatGPT.app", "Contents", "Resources", "codex"),
       );
     }
+    if (platform() === "darwin" && command === "wezterm") {
+      // WezTerm's command shim is shipped beside wezterm-gui inside the signed app bundle. Resolve only
+      // these documented application locations; never execute a project-local binary from PATH.
+      candidates.push(
+        join("/Applications", "WezTerm.app", "Contents", "MacOS", "wezterm"),
+        join(userHome, "Applications", "WezTerm.app", "Contents", "MacOS", "wezterm"),
+      );
+    }
     if (windows) {
       const appData = env.APPDATA;
       const localAppData = env.LOCALAPPDATA;

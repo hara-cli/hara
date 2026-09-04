@@ -9,9 +9,55 @@ import { createResponsesProvider } from "./responses.js";
 import { deepSeekResponsesSupportsImages } from "./deepseek.js";
 import { isOfficialTokenPlanOpenAIEndpoint } from "./alibaba.js";
 import { resolvePlatform } from "./registry.js";
-import { isOfficialVolcengineAgentPlanEndpoint } from "./volcengine.js";
-import type { Provider } from "./types.js";
+import {
+  isOfficialVolcengineAgentPlanEndpoint,
+  isVolcengineAgentPlanUnsupportedModelError,
+  VOLCENGINE_AGENT_PLAN_AUTO_FALLBACK_MODEL,
+} from "./volcengine.js";
+import type { Provider, TurnResult } from "./types.js";
 import type { ProviderTarget } from "./target.js";
+
+function emptyFailedTurn(result: TurnResult): boolean {
+  return result.stop === "error"
+    && result.text === ""
+    && result.toolUses.length === 0
+    && (result.usage?.output ?? 0) === 0;
+}
+
+/** Keep Ark's documented `auto` router as the visible model while tolerating the subset of Agent Plan
+ * keys that currently accept only the stable Codex alias. The retry is intentionally narrow: it can run
+ * only before any streamed output/tool call, and only for Ark's exact unsupported-model response. */
+export function withVolcengineAgentPlanAutoFallback(primary: Provider, fallback: Provider): Provider {
+  return {
+    ...primary,
+    async turn(args) {
+      let emittedText = false;
+      const result = await primary.turn({
+        ...args,
+        onText(delta) {
+          if (delta) emittedText = true;
+          args.onText(delta);
+        },
+      });
+      if (
+        args.signal?.aborted
+        || emittedText
+        || !emptyFailedTurn(result)
+        || !isVolcengineAgentPlanUnsupportedModelError(result.errorMsg)
+      ) {
+        return result;
+      }
+      const recovered = await fallback.turn(args);
+      if (!emptyFailedTurn(recovered) || !isVolcengineAgentPlanUnsupportedModelError(recovered.errorMsg)) {
+        return recovered;
+      }
+      return {
+        ...recovered,
+        errorMsg: `${recovered.errorMsg ?? "Agent Plan rejected the compatibility model."} Verify that this is an Agent Plan dedicated API key, then choose a model enabled for the subscribed plan.`,
+      };
+    },
+  };
+}
 
 export async function createProviderForTarget(
   target: ProviderTarget,
@@ -49,7 +95,7 @@ export async function createProviderForTarget(
   if (wire === "responses") {
     const alibabaTokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
     const volcengineAgentPlan = isOfficialVolcengineAgentPlanEndpoint(baseURL);
-    return createResponsesProvider({
+    const responseOptions = {
       apiKey: transportKey,
       model,
       baseURL,
@@ -62,7 +108,16 @@ export async function createProviderForTarget(
       ...(volcengineAgentPlan ? { store: false } : {}),
       omitAuthorization: providerIsLocal(provider),
       fetch,
-    });
+    };
+    const primary = createResponsesProvider(responseOptions);
+    if (volcengineAgentPlan && model.toLowerCase() === "auto") {
+      const fallback = createResponsesProvider({
+        ...responseOptions,
+        model: VOLCENGINE_AGENT_PLAN_AUTO_FALLBACK_MODEL,
+      });
+      return withVolcengineAgentPlanAutoFallback(primary, fallback);
+    }
+    return primary;
   }
   return createOpenAIProvider({
     apiKey: transportKey,

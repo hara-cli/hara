@@ -123,6 +123,12 @@ test("Serve advertises a Personal-only external session interaction surface", as
   let interrupted = 0;
   let terminalInput = "";
   let terminalKey = "";
+  let terminalRawInput = "";
+  let terminalResize = [];
+  let terminalScroll = [];
+  let terminalStreamReleased = 0;
+  let nativeTerminalOpen = null;
+  let failNativeTerminalOpen = false;
   let removed = 0;
   let closed = 0;
   const externalSessions = {
@@ -243,6 +249,31 @@ test("Serve advertises a Personal-only external session interaction surface", as
       assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
       terminalKey = key;
     },
+    async openTerminalStream(requestedSessionId, input, sink) {
+      assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
+      assert.ok(input.mode === "control" || input.mode === "observe");
+      queueMicrotask(() => sink.frame({
+        seq: 4,
+        encoding: "ansi-base64",
+        width: input.cols,
+        height: input.rows,
+        full: true,
+        bytes: Buffer.from(`${input.mode} stream frame`).toString("base64"),
+      }));
+      return {
+        mode: input.mode,
+        input(text) { terminalRawInput += text; },
+        resize(cols, rows) { terminalResize = [cols, rows]; },
+        scroll(direction, lines) { terminalScroll = [direction, lines]; },
+        async release() { terminalStreamReleased += 1; },
+      };
+    },
+    async openNativeTerminal(requestedSessionId, input) {
+      assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
+      if (failNativeTerminalOpen) throw new Error("WezTerm is not installed");
+      nativeTerminalOpen = input;
+      return { terminal: "wezterm", opened: true };
+    },
     async removeSession(requestedSessionId) {
       assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
       removed += 1;
@@ -267,6 +298,7 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.native-resume.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.launch-options.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-mirror.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-stream.v2"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime-remove.v1"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.create"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.resume"));
@@ -292,6 +324,57 @@ test("Serve advertises a Personal-only external session interaction surface", as
     await client.call("external.sessions.terminal.key", { sessionId: terminalSessionId, key: "esc" });
     assert.equal(terminalInput, "/status");
     assert.equal(terminalKey, "esc");
+    const attached = await client.call("external.sessions.terminal.attach", {
+      sessionId: terminalSessionId,
+      mode: "control",
+      cols: 96,
+      rows: 31,
+    });
+    assert.equal(attached.result.mode, "control");
+    assert.match(attached.result.streamId, /^terminal_/);
+    const terminalFrame = await client.waitFor("external.event.terminal.frame");
+    assert.equal(terminalFrame.params.streamId, attached.result.streamId);
+    assert.equal(Buffer.from(terminalFrame.params.bytes, "base64").toString(), "control stream frame");
+    await client.call("external.sessions.terminal.raw-input", { streamId: attached.result.streamId, text: "\u0003" });
+    await client.call("external.sessions.terminal.resize", { streamId: attached.result.streamId, cols: 101, rows: 33 });
+    await client.call("external.sessions.terminal.scroll", { streamId: attached.result.streamId, direction: "down", lines: 5 });
+    assert.equal(terminalRawInput, "\u0003");
+    assert.deepEqual(terminalResize, [101, 33]);
+    assert.deepEqual(terminalScroll, ["down", 5]);
+    const observerClient = await connect(personal.port);
+    await observerClient.call("initialize", { token: "personal-token" });
+    const deniedController = await observerClient.call("external.sessions.terminal.attach", {
+      sessionId: terminalSessionId,
+      mode: "control",
+      cols: 80,
+      rows: 24,
+    });
+    assert.ok(deniedController.error, "a second controller needs an explicit takeover");
+    const observer = await observerClient.call("external.sessions.terminal.attach", {
+      sessionId: terminalSessionId,
+      mode: "observe",
+      cols: 80,
+      rows: 24,
+    });
+    const observerFrame = await observerClient.waitFor("external.event.terminal.frame");
+    assert.equal(observerFrame.params.streamId, observer.result.streamId);
+    assert.equal(Buffer.from(observerFrame.params.bytes, "base64").toString(), "observe stream frame");
+    assert.equal(client.events.some((event) => event.params?.streamId === observer.result.streamId), false,
+      "private terminal frames go only to the socket that attached that stream");
+    await observerClient.call("external.sessions.terminal.release", { streamId: observer.result.streamId });
+    observerClient.ws.close();
+    const unconfirmedNativeTerminal = await client.call("external.sessions.terminal.open-wezterm", { sessionId: terminalSessionId });
+    assert.ok(unconfirmedNativeTerminal.error, "even the current controller must explicitly confirm a native-terminal transfer");
+    assert.equal(terminalStreamReleased, 1, "an unconfirmed native handoff keeps the in-app controller alive");
+    failNativeTerminalOpen = true;
+    const failedNativeTerminal = await client.call("external.sessions.terminal.open-wezterm", { sessionId: terminalSessionId, takeover: true });
+    assert.ok(failedNativeTerminal.error, "a failed WezTerm launch remains visible to the requester");
+    assert.equal(terminalStreamReleased, 1, "a failed WezTerm launch must not strand the in-app controller");
+    failNativeTerminalOpen = false;
+    const nativeTerminal = await client.call("external.sessions.terminal.open-wezterm", { sessionId: terminalSessionId, takeover: true });
+    assert.deepEqual(nativeTerminal.result, { terminal: "wezterm", opened: true });
+    assert.deepEqual(nativeTerminalOpen, { terminal: "wezterm", takeover: true });
+    assert.equal(terminalStreamReleased, 2, "observers and the in-app controller release independently before WezTerm takes control");
     await client.call("external.sessions.remove", { sessionId: terminalSessionId });
     assert.equal(removed, 1);
     const resumed = await client.call("external.sessions.resume", { sessionId });

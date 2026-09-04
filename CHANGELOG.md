@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.166.0 — 2026-09-04 — interactive Hara Live terminal stream
+
+- Add a renderer-neutral, device-local Hara Live terminal stream with bounded ANSI frames, resize and scroll
+  events, real keyboard input, explicit controller takeover, multiple read-only observers, sequence-gap
+  detection, and per-client backpressure. Terminal bytes stay out of logs and are sent only to the authenticated
+  Personal Space socket that attached the stream.
+- Let Desktop or a future mobile client control the same Herdr-owned Codex or Claude Code terminal without
+  starting another agent process. An optional WezTerm handoff attaches to that exact terminal after explicit
+  confirmation; a missing or failed WezTerm launch leaves the built-in controller intact.
+- Keep Volcengine Agent Plan's documented `auto` model visible while making one narrowly bounded compatibility
+  retry with `ark-code-latest` only after Ark returns its exact unsupported-model 404 before any text or tool
+  output. Generic routing errors and partially streamed turns are never replayed.
+- Extend the real Hara Live smoke path to require a valid full terminal frame as well as a successful Codex
+  message round-trip before release.
+
 ## 0.165.3 — 2026-09-04 — recoverable Hara Live session lifecycle
 
 - Let Personal Space explicitly end and remove a Hara Live session, with the Desktop responsible for

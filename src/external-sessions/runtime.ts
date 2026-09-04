@@ -1,6 +1,6 @@
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, platform } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { redactSensitiveText } from "../security/secrets.js";
 import {
@@ -11,6 +11,7 @@ import {
   type ExternalCommandCaptureResult,
   type ExternalCommandOptions,
 } from "./process.js";
+import { HerdrTerminalStream } from "./terminal-stream.js";
 import {
   ExternalSessionInputError,
   type ExternalRuntimeAgentKind,
@@ -22,7 +23,12 @@ import {
   type ExternalSessionReadResult,
   type ExternalSessionSourceInfo,
   type ExternalTerminalKey,
+  type ExternalNativeTerminalOpenInput,
+  type ExternalNativeTerminalResult,
   type ExternalTerminalSnapshot,
+  type ExternalTerminalStream,
+  type ExternalTerminalStreamOpenInput,
+  type ExternalTerminalStreamSink,
   type ExternalTurnResult,
   type ExternalTurnSink,
 } from "./types.js";
@@ -212,6 +218,7 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
   private readonly refs = new Map<string, RuntimeRef>();
   private readonly firstSeen = new Map<string, string>();
   private readonly running = new Map<string, RunningTurn>();
+  private readonly terminalStreams = new Set<ExternalTerminalStream>();
   private serverStart?: Promise<boolean>;
 
   constructor(private readonly options: HaraRuntimeAdapterOptions) {
@@ -656,5 +663,60 @@ export class HaraRuntimeAdapter implements ExternalSessionAdapter {
       "agent", "send-keys", ref.target, key,
     ], { timeoutMs: 8_000, maxOutputBytes: 256 * 1024 });
     if (!result.ok) throw new Error("Hara Live could not send this terminal key");
+  }
+
+  async openTerminalStream(
+    sessionId: string,
+    input: ExternalTerminalStreamOpenInput,
+    sink: ExternalTerminalStreamSink,
+  ): Promise<ExternalTerminalStream> {
+    const ref = await this.ref(sessionId);
+    let stream: ExternalTerminalStream | null = null;
+    let closedBeforeRegistration = false;
+    const trackedSink: ExternalTerminalStreamSink = {
+      frame: (frame) => sink.frame(frame),
+      closed: (reason) => {
+        if (stream) this.terminalStreams.delete(stream);
+        else closedBeforeRegistration = true;
+        sink.closed(reason);
+      },
+    };
+    stream = await HerdrTerminalStream.start(this.command, ref.target, input, trackedSink);
+    if (!closedBeforeRegistration) this.terminalStreams.add(stream);
+    return stream;
+  }
+
+  async openNativeTerminal(
+    sessionId: string,
+    input: ExternalNativeTerminalOpenInput,
+  ): Promise<ExternalNativeTerminalResult> {
+    if (input.terminal !== "wezterm") throw new ExternalSessionInputError("native terminal is not supported");
+    if (platform() === "win32") {
+      throw new ExternalSessionInputError("WezTerm handoff is not available on Windows yet; use Hara's built-in terminal");
+    }
+    const ref = await this.ref(sessionId);
+    const runtime = resolveExternalCommand(this.command.command, this.command.env ?? process.env, this.options.identityHome ?? homedir());
+    if (!runtime) throw new Error("Hara Live runtime was not found");
+    const wezterm = resolveExternalCommand("wezterm", this.command.env ?? process.env, this.options.identityHome ?? homedir());
+    if (!wezterm) throw new ExternalSessionInputError("WezTerm is not installed; install WezTerm or keep using Hara's built-in terminal");
+    const started = await spawnExternalCommandDetached({
+      command: wezterm,
+      env: this.command.env,
+      spawnProcess: this.command.spawnProcess,
+    }, [
+      "start", "--no-auto-connect", "--always-new-process", "--",
+      runtime,
+      ...(this.command.argsPrefix ?? []),
+      "terminal", "attach", ref.nativeIdentity,
+      ...(input.takeover ? ["--takeover"] : []),
+    ]);
+    if (!started) throw new Error("Hara could not open this session in WezTerm");
+    return { terminal: "wezterm", opened: true };
+  }
+
+  async close(): Promise<void> {
+    const streams = [...this.terminalStreams];
+    this.terminalStreams.clear();
+    await Promise.all(streams.map((stream) => stream.release().catch(() => {})));
   }
 }
