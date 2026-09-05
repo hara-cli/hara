@@ -296,6 +296,223 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
   quietDiscovery: true,
 });
 
+test("serve e2e: a reconnect replays and acknowledges one exact broadcast-event tail", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-event-replay-"));
+  const store = memStore();
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(textProvider, store),
+  );
+  const first = await connect(srv.port);
+  let second;
+  try {
+    const initialized = await first.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.methods.includes("events.replay"));
+    assert.ok(initialized.result.capabilities.methods.includes("events.ack"));
+    assert.ok(initialized.result.capabilities.features.includes("events.cursor-replay.v1"));
+    assert.equal(typeof initialized.result.eventStream.streamId, "string");
+    assert.ok(initialized.result.eventStream.streamId.length > 0);
+    assert.equal(initialized.result.eventStream.currentSequence, 0);
+
+    const created = await first.call("session.create", {});
+    await first.call("session.send", { sessionId: created.result.sessionId, text: "replay me" });
+    await first.waitEvent("event.turn_end");
+    const live = first.events.filter((event) => event.params?.deliveryCursor);
+    assert.ok(live.length > 4, "the turn publishes a useful control/status tail");
+    assert.ok(live.every((event) => event.params.deliveryCursor.streamId === initialized.result.eventStream.streamId));
+    assert.ok(live.every((event, index) => index === 0
+      || event.params.deliveryCursor.sequence === live[index - 1].params.deliveryCursor.sequence + 1));
+    const after = live[1].params.deliveryCursor.sequence;
+    const expected = live.slice(2).map((event) => ({
+      method: event.method,
+      sequence: event.params.deliveryCursor.sequence,
+    }));
+
+    first.close();
+    second = await connect(srv.port);
+    const reinitialized = await second.call("initialize", { token: "tok" });
+    assert.equal(reinitialized.result.eventStream.currentSequence, live.at(-1).params.deliveryCursor.sequence);
+    const replayed = await second.call("events.replay", {
+      streamId: initialized.result.eventStream.streamId,
+      after,
+      limit: 1_000,
+    });
+    assert.equal(replayed.result.snapshotRequired, false);
+    assert.equal(replayed.result.replayed, expected.length);
+    assert.deepEqual(
+      second.events.map((event) => ({ method: event.method, sequence: event.params.deliveryCursor.sequence })),
+      expected,
+    );
+    const acked = await second.call("events.ack", {
+      streamId: initialized.result.eventStream.streamId,
+      sequence: replayed.result.throughSequence,
+    });
+    assert.equal(acked.result.duplicate, false);
+    const duplicate = await second.call("events.ack", {
+      streamId: initialized.result.eventStream.streamId,
+      sequence: replayed.result.throughSequence,
+    });
+    assert.equal(duplicate.result.duplicate, true);
+    const future = await second.call("events.ack", {
+      streamId: initialized.result.eventStream.streamId,
+      sequence: replayed.result.currentSequence + 1,
+    });
+    assert.equal(future.error.code, -32005);
+    const staleStream = await second.call("events.replay", { streamId: "old-serve", after: 0 });
+    assert.equal(staleStream.result.snapshotRequired, true);
+    assert.equal(staleStream.result.resetReason, "stream_changed");
+  } finally {
+    first.close();
+    second?.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: one controller owns Agent input and takeover fences delayed commands", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-control-lease-"));
+  const store = memStore();
+  let providerCalls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      providerCalls += 1;
+      onText(`reply-${providerCalls}`);
+      return { text: `reply-${providerCalls}`, toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(provider, store),
+  );
+  const first = await connect(srv.port);
+  const second = await connect(srv.port);
+  try {
+    const initialized = await first.call("initialize", { token: "tok" });
+    await second.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.methods.includes("session.control.acquire"));
+    assert.ok(initialized.result.capabilities.features.includes("sessions.control-lease.v1"));
+    const sessionId = (await first.call("session.create", {})).result.sessionId;
+    const firstLease = (await first.call("session.control.acquire", { sessionId })).result.lease;
+    assert.equal(firstLease.epoch, 1);
+
+    const held = await second.call("session.control.acquire", { sessionId });
+    assert.equal(held.error.code, -32002);
+    const unowned = await second.call("session.submit", { sessionId, text: "must not run" });
+    assert.equal(unowned.error.code, -32005);
+    assert.equal(providerCalls, 0);
+
+    const commandId = randomUUID();
+    const firstResult = await first.call("session.submit", {
+      sessionId,
+      text: "run exactly once",
+      commandId,
+      controlLease: firstLease,
+    });
+    assert.equal(firstResult.result.reply, "reply-1");
+    assert.equal(providerCalls, 1);
+
+    const takeover = await second.call("session.control.acquire", { sessionId, takeover: true });
+    assert.equal(takeover.result.lease.epoch, 2);
+    const revoked = await first.waitEvent("event.control_revoked");
+    assert.equal(revoked.params.sessionId, sessionId);
+    assert.equal(revoked.params.epoch, 2);
+    const delayed = await first.call("session.submit", {
+      sessionId,
+      text: "stale delayed command",
+      commandId: randomUUID(),
+      controlLease: firstLease,
+    });
+    assert.equal(delayed.error.code, -32005);
+    assert.equal(providerCalls, 1);
+
+    const durableReplay = await second.call("session.submit", {
+      sessionId,
+      text: "run exactly once",
+      commandId,
+      controlLease: takeover.result.lease,
+    });
+    assert.deepEqual(durableReplay.result, firstResult.result);
+    assert.equal(providerCalls, 1, "a lease rotation does not make a completed command run twice");
+
+    const released = await second.call("session.control.release", {
+      sessionId,
+      controlLease: takeover.result.lease,
+    });
+    assert.equal(released.result.released, true);
+    const legacy = await first.call("session.submit", { sessionId, text: "legacy client remains compatible" });
+    assert.equal(legacy.result.reply, "reply-2");
+    assert.equal(providerCalls, 2);
+  } finally {
+    first.close();
+    second.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: rewind rebuilds the Agent projection instead of retaining future task state", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-rewind-projection-"));
+  const store = memStore();
+  const sessionId = "session-rewind-projection";
+  const at = "2026-09-06T00:00:00.000Z";
+  const todos = [{
+    id: "todo-future",
+    text: "Ship the discarded future",
+    activeForm: "Shipping the discarded future",
+    status: "in_progress",
+  }];
+  const task = finishTaskExecution(
+    createTaskExecution("Discarded future task", "turn-future", at),
+    { status: "halted", stopReason: "max_rounds" },
+    todos,
+    false,
+    at,
+  );
+  store.save({
+    id: sessionId,
+    cwd: dir,
+    profileId: "personal",
+    spaceId: "personal",
+    provider: "fake",
+    model: "fake-1",
+    title: "Rewind projection",
+    createdAt: at,
+    updatedAt: at,
+    approval: "full-auto",
+    source: "interactive",
+    todos,
+  }, [
+    { role: "user", content: "keep" },
+    { role: "assistant", text: "kept", toolUses: [], stop: "end" },
+    { role: "user", content: "discard" },
+    { role: "assistant", text: "discarded", toolUses: [], stop: "end" },
+  ], task);
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(textProvider, store),
+  );
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const resumed = await client.call("session.resume", { sessionId });
+    assert.equal(resumed.result.task.status, "paused");
+    const rewound = await client.call("session.rewind", { sessionId, n: 1 });
+    assert.deepEqual(rewound.result.history.map((message) => message.text), ["keep", "kept"]);
+    assert.equal(store.saved.get(sessionId).task, undefined);
+    assert.equal(store.saved.get(sessionId).meta.todos, undefined);
+    const invalidated = client.events.find((event) =>
+      event.method === "event.session_changed" && event.params.change === "rewound");
+    assert.equal(invalidated.params.historyRefreshRequired, true);
+    assert.equal(typeof invalidated.params.deliveryCursor.sequence, "number");
+  } finally {
+    client.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: revoked organization access returns a safe re-enrollment error", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-org-auth-"));
   const store = memStore();
@@ -620,8 +837,10 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       [
         "composer.attachments.v1",
         "events.bounded-delivery.v1",
+        "events.cursor-replay.v1",
         "models.capabilities.v1",
         "sessions.command-idempotency.v1",
+        "sessions.control-lease.v1",
         "sessions.readonly-history.v1",
         "sessions.cross-profile-fork.v1",
         "sessions.space-route.v1",
@@ -2852,6 +3071,10 @@ test("serve e2e: commandId replays one durable session result across reconnect a
       externalCommandReceipts: 64,
       externalCommandResultBytes: 256 * 1024,
       socketBufferedBytes: 4 * 1024 * 1024,
+      eventReplayEvents: 10_000,
+      eventReplayBytes: 8 * 1024 * 1024,
+      eventReplayPage: 1_000,
+      controlLeaseResources: 4_096,
     });
     sessionId = (await client.call("session.create", {})).result.sessionId;
     const request = { sessionId, text: "perform this only once", commandId };

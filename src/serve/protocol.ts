@@ -8,6 +8,17 @@
 //                                                   (additive feature detection)
 //   server.shutdown   {}                         → {accepted:true} (authenticated graceful local shutdown;
 //                                                   BUSY while any client work/approval is active)
+//   events.replay     {streamId,after,limit?}     → {streamId,currentSequence,earliestSequence,
+//                                                   snapshotRequired,resetReason?,replayed,
+//                                                   throughSequence,hasMore}; retained broadcast notifications
+//                                                   are emitted again before this result with their original
+//                                                   deliveryCursor. A changed/expired cursor requires clients to
+//                                                   refresh authoritative session/terminal snapshots first.
+//   events.ack        {streamId,sequence}         → {streamId,acknowledged,duplicate}; ACKs are monotonic per
+//                                                   authenticated socket and prepare an exact flush/handoff fence.
+//                                                   Every replayable broadcast notification carries
+//                                                   params.deliveryCursor:{streamId,sequence}. Private terminal
+//                                                   stream frames keep their stream-specific snapshot contract.
 //   session.list      {cwd?,cursor?,limit?,archived?} → {sessions:[{id,title,cwd,model,profileId?,updatedAt}],
 //                                                        page:{hasMore,limit,nextCursor?}}
 //                                                        Interactive sessions only; automation history has
@@ -73,7 +84,14 @@
 //                      attachments: [{kind:"image"|"file"|"directory",path,mediaType?}]
 //                      File-picker paths avoid lossy @mention encoding; Serve enforces type/security limits.
 //   session.interrupt {sessionId,commandId?}     → {}
-//   approval.reply    {approvalId,allow,always?}  → {} (`always` persists only the engine-declared project scope)
+//   session.control.acquire {sessionId,takeover?} → {sessionId,lease:{leaseId,epoch},acquired}; one socket owns
+//                                                    mutation input while observers remain read-only. Takeover
+//                                                    rotates the epoch and notifies the previous controller.
+//   session.control.release {sessionId,controlLease} → {sessionId,released,epoch}
+//                      Once a lease is active, session submit/send/steer/interrupt, approval replies, model or
+//                      approval changes, compaction, rewind, and deletion require the exact
+//                      controlLease:{leaseId,epoch}. With no active lease, older local clients remain compatible.
+//   approval.reply    {approvalId,allow,always?,controlLease?} → {} (`always` persists only the engine-declared project scope)
 //   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
 //   plugins.set       {name,enabled}              → {name,enabled}   (applies to future sessions/turns)
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}

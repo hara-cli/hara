@@ -140,6 +140,18 @@ import {
   type TaskLifecycleCursor,
 } from "./task-events.js";
 import { WorkforceStateLedger } from "./workforce-events.js";
+import {
+  DEFAULT_EVENT_REPLAY_MAX_BYTES,
+  DEFAULT_EVENT_REPLAY_MAX_EVENTS,
+  MAX_EVENT_REPLAY_PAGE,
+  ServeEventReplayBuffer,
+} from "./event-replay.js";
+import {
+  ControlLeaseError,
+  ControlLeaseRegistry,
+  DEFAULT_CONTROL_LEASE_RESOURCES,
+  type ControlLeaseToken,
+} from "./control-lease.js";
 import type { SubagentLifecycleObserver } from "../subagent/runtime.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
@@ -1123,13 +1135,16 @@ function canonicalCommandValue(
   throw new Error("command parameters must be JSON values");
 }
 
-/** Hash the complete mutation request except its transport-only commandId. Equivalent JSON objects produce
- * the same digest even when a reconnect serializes object keys in another order. No prompt/path is retained. */
+/** Hash the logical mutation request except transport authority metadata. A reconnect may acquire a newer
+ * control lease and still ask for the first command's durable outcome; neither token changes what the command
+ * means. Equivalent JSON objects produce the same digest even when key order changes. No prompt/path is retained. */
 export function sessionCommandRequestHash(
   method: string,
   params: Record<string, unknown>,
 ): string {
-  const request = Object.fromEntries(Object.entries(params).filter(([key]) => key !== "commandId"));
+  const request = Object.fromEntries(Object.entries(params).filter(
+    ([key]) => key !== "commandId" && key !== "controlLease",
+  ));
   return createHash("sha256")
     .update("hara-session-command-v1\0")
     .update(method)
@@ -1621,6 +1636,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const port = (wss.address() as { port: number }).port;
 
   const authed = new Set<WebSocket>();
+  const eventAcks = new Map<WebSocket, number>();
   interface OwnedExternalTerminalStream {
     streamId: string;
     sessionId: string;
@@ -1635,6 +1651,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const pendingApprovals = new Map<string, {
     finish: (v: boolean | "always") => void;
     allowAlways: boolean;
+    scope: "session" | "external";
+    sessionId: string;
   }>();
   const inFlightRequests = new Set<Promise<void>>();
   const sessionSubmissionTails = new Map<string, Promise<void>>();
@@ -1644,6 +1662,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const activeOperations = new Set<Promise<unknown>>();
   let taskEventSequence = 0;
   const workforceLedger = new WorkforceStateLedger(instanceId);
+  const eventReplay = new ServeEventReplayBuffer(instanceId);
+  const controlLeases = new ControlLeaseRegistry<WebSocket>();
   let closing = false;
   let closePromise: Promise<void> | null = null;
 
@@ -1764,7 +1784,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     );
 
   const broadcast = (method: string, params: Record<string, unknown>): void => {
-    const frame = rpcNotify(method, params);
+    const { frame } = eventReplay.publish(method, params);
     for (const ws of authed) sendBoundedSocketFrame(ws, frame);
   };
   const notifySocket = (ws: WebSocket, method: string, params: Record<string, unknown>): boolean => {
@@ -1818,7 +1838,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const onAbort = (): void => finish(false);
     timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS);
     timer.unref();
-    pendingApprovals.set(approvalId, { finish, allowAlways });
+    pendingApprovals.set(approvalId, { finish, allowAlways, scope: "external", sessionId });
     if (signal.aborted) finish(false);
     else {
       signal.addEventListener("abort", onAbort, { once: true });
@@ -2036,7 +2056,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         };
         const onAbort = (): void => finish(false);
         timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS); // unanswered → deny, turn continues
-        pendingApprovals.set(approvalId, { finish, allowAlways });
+        pendingApprovals.set(approvalId, { finish, allowAlways, scope: "session", sessionId });
         if (signal.aborted) finish(false);
         else {
           // `signal` composes the owning turn cancellation with runAgent's lifecycle cancellation. Listening
@@ -2472,6 +2492,55 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       this.name = "SessionCommandRpcError";
     }
   }
+
+  const sessionControlResource = (sessionId: string): string => `session:${sessionId}`;
+  const controlLeaseFromParams = (params: Record<string, unknown>): ControlLeaseToken | undefined => {
+    if (params.controlLease === undefined) return undefined;
+    const candidate = params.controlLease;
+    if (
+      !candidate
+      || typeof candidate !== "object"
+      || Array.isArray(candidate)
+      || !validSessionCommandId((candidate as Record<string, unknown>).leaseId)
+      || !Number.isSafeInteger((candidate as Record<string, unknown>).epoch)
+      || ((candidate as Record<string, unknown>).epoch as number) < 1
+    ) {
+      throw new SessionCommandRpcError(ERR.PARAMS, "controlLease must contain a UUID leaseId and positive epoch");
+    }
+    return {
+      leaseId: (candidate as { leaseId: string }).leaseId,
+      epoch: (candidate as { epoch: number }).epoch,
+    };
+  };
+  const leaseFailure = (error: unknown): SessionCommandRpcError => {
+    if (error instanceof SessionCommandRpcError) return error;
+    if (error instanceof ControlLeaseError) {
+      return new SessionCommandRpcError(
+        error.reason === "held" || error.reason === "capacity" ? ERR.BUSY : ERR.CONFLICT,
+        error.message,
+      );
+    }
+    return new SessionCommandRpcError(ERR.INTERNAL, error instanceof Error ? error.message : String(error));
+  };
+  const authorizeSessionMutation = (
+    ws: WebSocket,
+    sessionId: string,
+    params: Record<string, unknown>,
+  ): void => {
+    try {
+      controlLeases.authorize(sessionControlResource(sessionId), ws, controlLeaseFromParams(params));
+    } catch (error) {
+      throw leaseFailure(error);
+    }
+  };
+  const publishSessionControlState = (
+    sessionId: string,
+    state: "controlled" | "released",
+    epoch: number,
+    reason: "acquired" | "takeover" | "released" | "disconnected" | "session_removed",
+  ): void => {
+    broadcast("event.control_state", { scope: "session", sessionId, state, epoch, reason });
+  };
 
   interface InFlightSessionCommand {
     method: SessionCommandMethod;
@@ -3041,7 +3110,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         }
         const { req } = parsed;
         const id = req.id ?? null;
-        const reply = (frame: string): void => void (id !== null && ws.readyState === ws.OPEN && ws.send(frame));
+        const reply = (frame: string): void => {
+          if (id !== null) sendBoundedSocketFrame(ws, frame);
+        };
         const p = (req.params ?? {}) as Record<string, any>;
         try {
         if (req.method === "initialize") {
@@ -3056,7 +3127,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
             "server.shutdown",
-            "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.set-model", "session.set-approval",
+            "events.replay", "events.ack",
+            "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
@@ -3093,8 +3165,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           const features = [
             "composer.attachments.v1",
             "events.bounded-delivery.v1",
+            "events.cursor-replay.v1",
             "models.capabilities.v1",
             "sessions.command-idempotency.v1",
+            "sessions.control-lease.v1",
             "sessions.readonly-history.v1",
             "sessions.cross-profile-fork.v1",
             "sessions.space-route.v1",
@@ -3131,10 +3205,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             provider: runtime.providerId,
             model: runtime.model,
             setupState,
+            eventStream: eventReplay.state(),
             capabilities: {
               methods,
               events: [
-                "event.task_state", "event.workforce_state", "event.surface",
+                "event.task_state", "event.workforce_state", "event.surface", "event.session_changed",
+                "event.control_state", "event.control_revoked",
                 "external.event.turn_start", "external.event.text", "external.event.tool",
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
                 "external.event.terminal.frame", "external.event.terminal.closed",
@@ -3146,6 +3222,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 externalCommandReceipts: MAX_EXTERNAL_COMMAND_RECEIPTS,
                 externalCommandResultBytes: MAX_SESSION_COMMAND_RESULT_BYTES,
                 socketBufferedBytes: MAX_SERVE_SOCKET_BUFFERED_BYTES,
+                eventReplayEvents: DEFAULT_EVENT_REPLAY_MAX_EVENTS,
+                eventReplayBytes: DEFAULT_EVENT_REPLAY_MAX_BYTES,
+                eventReplayPage: MAX_EVENT_REPLAY_PAGE,
+                controlLeaseResources: DEFAULT_CONTROL_LEASE_RESOURCES,
               },
             },
           }));
@@ -3153,6 +3233,120 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
 
         switch (req.method) {
+          case "events.replay": {
+            if (typeof p.streamId !== "string" || !p.streamId) {
+              return reply(rpcError(id, ERR.PARAMS, "streamId is required"));
+            }
+            if (!Number.isSafeInteger(p.after) || p.after < 0) {
+              return reply(rpcError(id, ERR.PARAMS, "after must be a non-negative safe integer"));
+            }
+            if (
+              p.limit !== undefined
+              && (!Number.isSafeInteger(p.limit) || p.limit < 1 || p.limit > MAX_EVENT_REPLAY_PAGE)
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, `limit must be an integer from 1 to ${MAX_EVENT_REPLAY_PAGE}`));
+            }
+            let replay;
+            try {
+              replay = eventReplay.replay(p.streamId, p.after, p.limit);
+            } catch (error) {
+              return reply(rpcError(id, ERR.CONFLICT, String((error as Error).message ?? error)));
+            }
+            // The handler performs no await between taking the replay page and writing it, so live events
+            // cannot interleave inside this exact prefix. The original frames retain their original cursor.
+            for (const frame of replay.frames) {
+              if (!sendBoundedSocketFrame(ws, frame)) return;
+            }
+            return reply(rpcResult(id!, {
+              streamId: replay.streamId,
+              currentSequence: replay.currentSequence,
+              earliestSequence: replay.earliestSequence,
+              snapshotRequired: replay.snapshotRequired,
+              ...(replay.resetReason ? { resetReason: replay.resetReason } : {}),
+              replayed: replay.frames.length,
+              throughSequence: replay.throughSequence,
+              hasMore: replay.hasMore,
+            }));
+          }
+          case "events.ack": {
+            if (typeof p.streamId !== "string" || p.streamId !== eventReplay.streamId) {
+              return reply(rpcError(id, ERR.CONFLICT, "event stream changed — refresh snapshots before acknowledging"));
+            }
+            if (!Number.isSafeInteger(p.sequence) || p.sequence < 0) {
+              return reply(rpcError(id, ERR.PARAMS, "sequence must be a non-negative safe integer"));
+            }
+            if (p.sequence > eventReplay.currentSequence) {
+              return reply(rpcError(id, ERR.CONFLICT, "cannot acknowledge an event that has not been published"));
+            }
+            const previous = eventAcks.get(ws) ?? 0;
+            const acknowledged = Math.max(previous, p.sequence);
+            eventAcks.set(ws, acknowledged);
+            return reply(rpcResult(id!, {
+              streamId: eventReplay.streamId,
+              acknowledged,
+              duplicate: p.sequence <= previous,
+            }));
+          }
+          case "session.control.acquire": {
+            if (typeof p.sessionId !== "string" || !p.sessionId) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId is required"));
+            }
+            if (p.takeover !== undefined && typeof p.takeover !== "boolean") {
+              return reply(rpcError(id, ERR.PARAMS, "takeover must be a boolean"));
+            }
+            if (!hub.get(p.sessionId)) {
+              return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId} — session.create/resume first`));
+            }
+            let acquisition;
+            try {
+              acquisition = controlLeases.acquire(sessionControlResource(p.sessionId), ws, p.takeover === true);
+            } catch (error) {
+              throw leaseFailure(error);
+            }
+            if (acquisition.previousOwner) {
+              notifySocket(acquisition.previousOwner, "event.control_revoked", {
+                scope: "session",
+                sessionId: p.sessionId,
+                epoch: acquisition.lease.epoch,
+                reason: "takeover",
+              });
+            }
+            if (acquisition.acquired) {
+              publishSessionControlState(
+                p.sessionId,
+                "controlled",
+                acquisition.lease.epoch,
+                acquisition.previousOwner ? "takeover" : "acquired",
+              );
+            }
+            return reply(rpcResult(id!, {
+              sessionId: p.sessionId,
+              lease: acquisition.lease,
+              acquired: acquisition.acquired,
+            }));
+          }
+          case "session.control.release": {
+            if (typeof p.sessionId !== "string" || !p.sessionId) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId is required"));
+            }
+            let lease;
+            try {
+              lease = controlLeaseFromParams(p);
+            } catch (error) {
+              throw leaseFailure(error);
+            }
+            if (!lease) return reply(rpcError(id, ERR.PARAMS, "controlLease is required"));
+            let released;
+            try {
+              released = controlLeases.release(sessionControlResource(p.sessionId), ws, lease);
+            } catch (error) {
+              throw leaseFailure(error);
+            }
+            if (released.released) {
+              publishSessionControlState(p.sessionId, "released", released.epoch, "released");
+            }
+            return reply(rpcResult(id!, { sessionId: p.sessionId, ...released }));
+          }
           case "server.shutdown": {
             // The updater's stop request must never abort another client's turn or dismiss its approval.
             // The current shutdown request is not inserted into inFlightRequests until this synchronous
@@ -4218,6 +4412,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.PARAMS, "expectedModel required with expectedEffort"));
             }
             const result = await runIdempotentSessionCommand("session.submit", p, s, async () => {
+              authorizeSessionMutation(ws, p.sessionId, p);
               try {
                 const decision = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
                     text: p.text,
@@ -4254,6 +4449,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.PARAMS, "attachments must be an array"));
             }
             const legacy = await runIdempotentSessionCommand("session.send", p, s, async () => {
+              authorizeSessionMutation(ws, p.sessionId, p);
               try {
                 const decision = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
                     text: p.text,
@@ -4292,6 +4488,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
             const steered = await runIdempotentSessionCommand("session.steer", p, s, async () => {
+              authorizeSessionMutation(ws, p.sessionId, p);
               const result = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
                   text: p.text,
                   mode: "steer",
@@ -4313,6 +4510,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const s = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
             const interrupted = await runIdempotentSessionCommand("session.interrupt", p, s, async () => {
+              authorizeSessionMutation(ws, p.sessionId, p);
               if (s.abort && s.task?.status === "running") {
                 broadcastTaskState(s, { state: "running", phase: "stopping", detail: "Stopping at a safe boundary" });
               }
@@ -4328,6 +4526,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.approvalId !== "string") return reply(rpcError(id, ERR.PARAMS, "approvalId required"));
             const approval = pendingApprovals.get(p.approvalId);
             if (approval) {
+              if (approval.scope === "session") authorizeSessionMutation(ws, approval.sessionId, p);
               approval.finish(p.always === true && approval.allowAlways ? "always" : p.allow === true);
             }
             return reply(rpcResult(id!, {})); // idempotent — a late/duplicate reply is a no-op
@@ -4590,6 +4789,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           case "session.delete": {
             // permanent removal (codex thread/delete) — archive is the soft path; this one is forever
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            if (hub.get(p.sessionId)) authorizeSessionMutation(ws, p.sessionId, p);
             const r = hub.delete(p.sessionId);
             if (r === "busy") return reply(rpcError(id, ERR.BUSY, "a turn is running — delete after it finishes"));
             if (r === "missing") return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId} (or held by another process)`));
@@ -4598,6 +4798,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             resetRepeatGuard(p.sessionId);
             clearTouched(p.sessionId);
             workforceLedger.forget(p.sessionId);
+            const released = controlLeases.release(
+              sessionControlResource(p.sessionId),
+              ws,
+              controlLeaseFromParams(p),
+            );
+            if (released.released) {
+              publishSessionControlState(p.sessionId, "released", released.epoch, "session_removed");
+            }
             return reply(rpcResult(id!, { sessionId: p.sessionId, deleted: true }));
           }
           case "models.list": {
@@ -4927,6 +5135,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            authorizeSessionMutation(ws, p.sessionId, p);
             if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — switch after it finishes"));
             try {
               const binding = sessionSpaceBinding(s.meta);
@@ -4997,6 +5206,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (!isApprovalMode(p.approval)) {
               return reply(rpcError(id, ERR.PARAMS, "approval must be suggest, auto-edit, or full-auto"));
             }
+            if (hub.get(p.sessionId)) authorizeSessionMutation(ws, p.sessionId, p);
             const changed = hub.setApproval(p.sessionId, p.approval);
             if (changed === "missing") return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
             if (changed === "busy") {
@@ -5876,6 +6086,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            authorizeSessionMutation(ws, p.sessionId, p);
             if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — compact after it finishes"));
             if (s.history.length < 2) return reply(rpcError(id, ERR.PARAMS, "nothing to compact yet"));
             s.busy = true;
@@ -5889,6 +6100,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               const summary = await compactSession(s, compactAbort);
               if (!summary) return reply(rpcError(id, ERR.INTERNAL, "compaction failed — try again or /clear"));
               broadcast("event.notice", { sessionId: s.meta.id, text: `(compacted — history replaced with a summary; ${s.meta.workingSet?.length ?? 0} notes kept)` });
+              broadcast("event.session_changed", {
+                sessionId: s.meta.id,
+                change: "compacted",
+                historyRefreshRequired: true,
+              });
               return reply(rpcResult(id!, { sessionId: s.meta.id, ctx: ctxOf(s), notes: s.meta.workingSet?.length ?? 0, history: historyForClient(s.history) }));
             } finally {
               if (s.abort === compactAbort) s.abort = null;
@@ -5901,12 +6117,25 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string" || !Number.isInteger(p.n)) return reply(rpcError(id, ERR.PARAMS, "sessionId + n required"));
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            authorizeSessionMutation(ws, p.sessionId, p);
             if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — rewind after it finishes"));
             const next = rewindTo(s.history, p.n);
             if (!next) return reply(rpcError(id, ERR.PARAMS, `n out of range (1..${s.history.filter((m) => m.role === "user").length})`));
             // Like compaction, rewind is a projection transaction: persistence sees the complete candidate
-            // first, and the attached session changes only after that write succeeds.
-            hub.replaceSnapshot(s, { ...s.meta }, next, undefined);
+            // first, and the attached session changes only after that write succeeds. Task/todo/reminder state
+            // belongs to the discarded future and must not leak back into the next Agent turn.
+            const candidateMeta = { ...s.meta };
+            delete candidateMeta.todos;
+            hub.replaceSnapshot(s, candidateMeta, next, undefined);
+            disposeTodoScope(s.meta.id);
+            disposeReminderScope(s.meta.id);
+            resetRepeatGuard(s.meta.id);
+            s.stats.lastInput = compactedHistoryTokenEstimate(next);
+            broadcast("event.session_changed", {
+              sessionId: s.meta.id,
+              change: "rewound",
+              historyRefreshRequired: true,
+            });
             return reply(rpcResult(id!, { sessionId: s.meta.id, history: historyForClient(s.history) }));
           }
           default:
@@ -5951,6 +6180,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     });
     ws.on("close", () => {
       authed.delete(ws);
+      eventAcks.delete(ws);
+      for (const released of controlLeases.releaseOwner(ws)) {
+        if (!released.resourceId.startsWith("session:")) continue;
+        publishSessionControlState(
+          released.resourceId.slice("session:".length),
+          "released",
+          released.epoch,
+          "disconnected",
+        );
+      }
       void releaseExternalTerminalsForSocket(ws);
       if (authed.size === 0) {
         // nobody left to answer — deny pending approvals now instead of stalling turns for the timeout
