@@ -120,6 +120,8 @@ test("Serve advertises a Personal-only external session interaction surface", as
   const root = mkdtempSync(join(tmpdir(), "hara-serve-external-"));
   const sessionId = "ext_codex_0123456789abcdef01234567";
   const forkedSessionId = "ext_codex_89abcdef0123456789abcdef";
+  let submittedCount = 0;
+  let steeredCount = 0;
   let interrupted = 0;
   let terminalInput = "";
   let terminalKey = "";
@@ -209,6 +211,7 @@ test("Serve advertises a Personal-only external session interaction surface", as
     async submit(requestedSessionId, text, sink) {
       assert.equal(requestedSessionId, sessionId);
       assert.equal(text, "continue safely");
+      submittedCount += 1;
       sink.notice("Starting continuation");
       sink.tool("Command", "npm test");
       const verdict = await sink.confirm({ question: "Allow test command?", allowAlways: true }, new AbortController().signal);
@@ -226,6 +229,7 @@ test("Serve advertises a Personal-only external session interaction surface", as
     async steer(requestedSessionId, text) {
       assert.equal(requestedSessionId, sessionId);
       assert.equal(text, "add one focused check");
+      steeredCount += 1;
       finishAfterSteer?.();
       return {
         sessionId,
@@ -297,12 +301,16 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.native-resume.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.launch-options.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.command-idempotency.serve-lifetime.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-mirror.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-stream.v2"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-input-sequence.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime-remove.v1"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.create"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.resume"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.remove"));
+    assert.equal(initialized.result.capabilities.limits.externalCommandReceipts, 64);
+    assert.equal(initialized.result.capabilities.limits.externalCommandResultBytes, 256 * 1024);
     const listed = await client.call("external.sessions.list", { sourceId: "codex" });
     assert.equal(listed.result.sessions[0].id, sessionId);
     const read = await client.call("external.sessions.read", { sessionId });
@@ -331,14 +339,50 @@ test("Serve advertises a Personal-only external session interaction surface", as
       rows: 31,
     });
     assert.equal(attached.result.mode, "control");
+    assert.equal(attached.result.nextInputSeq, 1);
     assert.match(attached.result.streamId, /^terminal_/);
     const terminalFrame = await client.waitFor("external.event.terminal.frame");
     assert.equal(terminalFrame.params.streamId, attached.result.streamId);
     assert.equal(Buffer.from(terminalFrame.params.bytes, "base64").toString(), "control stream frame");
     await client.call("external.sessions.terminal.raw-input", { streamId: attached.result.streamId, text: "\u0003" });
+    const firstSequencedInput = await client.call("external.sessions.terminal.raw-input", {
+      streamId: attached.result.streamId,
+      text: "x",
+      inputSeq: 1,
+    });
+    assert.deepEqual(firstSequencedInput.result, {
+      accepted: true,
+      duplicate: false,
+      inputSeq: 1,
+      nextInputSeq: 2,
+    });
+    const duplicateInput = await client.call("external.sessions.terminal.raw-input", {
+      streamId: attached.result.streamId,
+      text: "x",
+      inputSeq: 1,
+    });
+    assert.equal(duplicateInput.result.duplicate, true);
+    const reusedInput = await client.call("external.sessions.terminal.raw-input", {
+      streamId: attached.result.streamId,
+      text: "different",
+      inputSeq: 1,
+    });
+    assert.equal(reusedInput.error.code, -32005);
+    const inputGap = await client.call("external.sessions.terminal.raw-input", {
+      streamId: attached.result.streamId,
+      text: "too early",
+      inputSeq: 3,
+    });
+    assert.equal(inputGap.error.code, -32005);
+    assert.match(inputGap.error.message, /expected 2/i);
+    await client.call("external.sessions.terminal.raw-input", {
+      streamId: attached.result.streamId,
+      text: "z",
+      inputSeq: 2,
+    });
     await client.call("external.sessions.terminal.resize", { streamId: attached.result.streamId, cols: 101, rows: 33 });
     await client.call("external.sessions.terminal.scroll", { streamId: attached.result.streamId, direction: "down", lines: 5 });
-    assert.equal(terminalRawInput, "\u0003");
+    assert.equal(terminalRawInput, "\u0003xz", "duplicate, conflicting, and out-of-order input never reaches the PTY");
     assert.deepEqual(terminalResize, [101, 33]);
     assert.deepEqual(terminalScroll, ["down", 5]);
     const observerClient = await connect(personal.port);
@@ -382,29 +426,79 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.equal(resumed.result.readOnly, false);
     assert.equal(resumed.result.controlMode, "managed");
 
-    const submitted = client.call("external.sessions.submit", { sessionId, text: "continue safely" });
+    const submitCommandId = "11111111-1111-4111-8111-111111111111";
+    const submitted = client.call("external.sessions.submit", {
+      sessionId,
+      text: "continue safely",
+      commandId: submitCommandId,
+    });
     const started = await client.waitFor("external.event.turn_start");
+    const retryClient = await connect(personal.port);
+    await retryClient.call("initialize", { token: "personal-token" });
+    const submittedAfterReconnect = retryClient.call("external.sessions.submit", {
+      commandId: submitCommandId,
+      text: "continue safely",
+      sessionId,
+    });
+    const conflictingSubmit = await retryClient.call("external.sessions.submit", {
+      sessionId,
+      text: "different input",
+      commandId: submitCommandId,
+    });
+    assert.equal(conflictingSubmit.error.code, -32005);
+    assert.equal(submittedCount, 1, "a reconnect retry must share the original provider submit");
     const approval = await client.waitFor("external.approval.request");
     assert.equal(approval.params.sessionId, sessionId);
     assert.equal(approval.params.question, "Allow test command?");
     const approvalReply = await client.call("approval.reply", { approvalId: approval.params.approvalId, allow: true });
     assert.deepEqual(approvalReply.result, {});
     await client.waitFor("external.event.text");
+    const staleSteer = await client.call("external.sessions.steer", {
+      sessionId,
+      text: "add one focused check",
+      expectedTurnId: "extturn_stale",
+      commandId: "22222222-2222-4222-8222-222222222222",
+    });
+    assert.equal(staleSteer.error.code, -32005);
+    assert.equal(steeredCount, 0, "stale input must not reach the provider adapter");
+    const steerCommandId = "33333333-3333-4333-8333-333333333333";
     const steered = await client.call("external.sessions.steer", {
       sessionId,
       text: "add one focused check",
+      expectedTurnId: started.params.turnId,
+      commandId: steerCommandId,
+    });
+    const duplicateSteer = await retryClient.call("external.sessions.steer", {
+      commandId: steerCommandId,
+      expectedTurnId: started.params.turnId,
+      text: "add one focused check",
+      sessionId,
     });
     assert.equal(steered.result.accepted, true);
+    assert.deepEqual(duplicateSteer.result, steered.result);
+    assert.equal(steeredCount, 1);
     assert.equal(steered.result.turnId, started.params.turnId);
     assert.notEqual(steered.result.turnId, "adapter-private-turn-is-not-exposed");
     const completed = await submitted;
+    const completedAfterReconnect = await submittedAfterReconnect;
     assert.equal(completed.result.sessionId, sessionId);
     assert.equal(completed.result.reply, "hello world");
+    assert.deepEqual(completedAfterReconnect.result, completed.result);
     assert.notEqual(completed.result.turnId, "provider-turn-is-not-exposed");
     assert.ok(client.events.some((event) => event.method === "external.event.text" && event.params.delta === "hello "));
     assert.ok(client.events.some((event) => event.method === "external.event.turn_end" && event.params.status === "completed"));
-    await client.call("external.sessions.interrupt", { sessionId });
+    const interruptCommandId = "44444444-4444-4444-8444-444444444444";
+    await client.call("external.sessions.interrupt", { sessionId, commandId: interruptCommandId });
+    await retryClient.call("external.sessions.interrupt", { commandId: interruptCommandId, sessionId });
     assert.equal(interrupted, 1);
+    const staleInterrupt = await retryClient.call("external.sessions.interrupt", {
+      sessionId,
+      expectedTurnId: started.params.turnId,
+      commandId: "55555555-5555-4555-8555-555555555555",
+    });
+    assert.equal(staleInterrupt.error.code, -32005);
+    assert.equal(interrupted, 1, "an interrupt for an ended turn must not hit the provider adapter");
+    retryClient.ws.close();
     const forked = await client.call("external.sessions.fork", { sessionId });
     assert.equal(forked.result.sourceSessionId, sessionId);
     assert.equal(forked.result.session.id, forkedSessionId);

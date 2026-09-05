@@ -4,7 +4,7 @@
 //
 // Client → server requests:
 //   initialize        {token,capabilities?}      → {name,version,protocol,cwd,provider,model,setupState,
-//                                                   capabilities:{methods:[…],events:[…],features:[…]}}
+//                                                   capabilities:{methods:[…],events:[…],features:[…],limits:{…}}}
 //                                                   (additive feature detection)
 //   server.shutdown   {}                         → {accepted:true} (authenticated graceful local shutdown;
 //                                                   BUSY while any client work/approval is active)
@@ -22,10 +22,24 @@
 //   external.sessions.read {sessionId}              → {session,messages:[{id,role,text}],readOnly:boolean}
 //   external.sessions.resume {sessionId}            → {session,messages,readOnly:false,controlMode:"managed"|"live"}
 //   external.sessions.fork {sessionId}              → {sourceSessionId,session,messages,readOnly:false}
-//   external.sessions.submit {sessionId,text}       → {sessionId,turnId,status,reply,error?}
-//   external.sessions.steer {sessionId,text}        → {sessionId,turnId,accepted:true}
-//   external.sessions.interrupt {sessionId}         → {}
+//   external.sessions.submit {sessionId,text,commandId?}
+//                                                   → {sessionId,turnId,status,reply,error?}
+//   external.sessions.steer {sessionId,text,expectedTurnId?,commandId?}
+//                                                   → {sessionId,turnId,accepted:true}
+//   external.sessions.interrupt {sessionId,expectedTurnId?,commandId?} → {}
+//                      commandId is a client UUID. Matching reconnect retries share the first result during
+//                      the current Serve lifetime; conflicting reuse is rejected. Since the provider owns
+//                      these sessions, after a Serve restart clients must resume/read before deciding what
+//                      to send. expectedTurnId fences delayed steer/interrupt input to one active turn.
 //   external.sessions.remove {sessionId}            → {} (Hara Live only; closes the original terminal)
+//   external.sessions.terminal.attach {sessionId,mode,cols,rows,takeover?}
+//                                                   → {streamId,mode,cols,rows,nextInputSeq?}
+//   external.sessions.terminal.raw-input {streamId,text,inputSeq?}
+//                                                   → {} for legacy input, or
+//                                                     {accepted,duplicate,inputSeq,nextInputSeq}
+//                      inputSeq is monotonic within one private control stream. Matching retries are
+//                      acknowledged without another PTY write; gaps and same-sequence/different-text reuse
+//                      are rejected. Reattach creates a new stream and restarts the sequence at 1.
 //                                                        Personal Space only. Provider-native IDs, full paths,
 //                                                        provider cursors and credentials never cross Serve. A
 //                                                        source history is read-only until explicitly resumed in
@@ -40,7 +54,7 @@
 //   session.fork      {sessionId,targetProfileId?,targetModel?,transferHistory?}
 //                                                   → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    Cross-route copies require transferHistory:true.
-//   session.submit    {sessionId,text,images?,attachments?,newTask?,mode?,expectedTurnId?,expectedModel?,expectedEffort?}
+//   session.submit    {sessionId,text,images?,attachments?,newTask?,mode?,expectedTurnId?,expectedModel?,expectedEffort?,commandId?}
 //                                                   → {submission:"started",reply,usage,taskId,turnId,…}
 //                                                   | {submission:"steered",taskId,turnId}
 //                                                   | {submission:"not_submitted",reason,activeTurnId?}
@@ -50,13 +64,15 @@
 //                                   after the session is idle.
 //                      expectedModel + expectedEffort guard a staged next-turn route from starting on an
 //                                   older provider configuration during an idle transition.
-//   session.send      {sessionId,text,images?,attachments?,newTask?} → (legacy start_if_idle; streams events, then)
+//                      commandId: client-generated UUID; the first terminal result is durably replayed for
+//                                   matching retries and conflicting reuse is rejected.
+//   session.send      {sessionId,text,images?,attachments?,newTask?,commandId?} → (legacy start_if_idle; streams events, then)
 //                                                             {reply,usage,taskId,turnId,status?,stopReason?}
-//   session.steer     {sessionId,text,expectedTurnId} → {accepted,taskId,turnId} (legacy strict steer)
+//   session.steer     {sessionId,text,expectedTurnId,commandId?} → {accepted,taskId,turnId} (legacy strict steer)
 //                      images: [{path,mediaType?}] — pasted screenshots etc., inlined for vision models
 //                      attachments: [{kind:"image"|"file"|"directory",path,mediaType?}]
 //                      File-picker paths avoid lossy @mention encoding; Serve enforces type/security limits.
-//   session.interrupt {sessionId}                → {}
+//   session.interrupt {sessionId,commandId?}     → {}
 //   approval.reply    {approvalId,allow,always?}  → {} (`always` persists only the engine-declared project scope)
 //   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
 //   plugins.set       {name,enabled}              → {name,enabled}   (applies to future sessions/turns)

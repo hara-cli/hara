@@ -113,7 +113,17 @@ import { listPending, resolvePending } from "../gateway/flows-pending.js";
 import { disposeTodoScope, onTodosChange, restoreTodos, serializeTodos } from "../tools/todo.js";
 import { INTERJECT_PREFIX, disposeReminderScope } from "../agent/reminders.js";
 import { SessionHub, realStore, type SessionStore, type ServeSession } from "./sessions.js";
-import { ensureSessionMetadataIndex, sanitizeSessionTitle, type SessionMeta } from "../session/store.js";
+import {
+  ensureSessionMetadataIndex,
+  MAX_SESSION_COMMAND_RECEIPTS,
+  MAX_SESSION_COMMAND_REPLAY_RESULTS,
+  MAX_SESSION_COMMAND_RESULT_BYTES,
+  sanitizeSessionTitle,
+  type SessionCommandMethod,
+  type SessionCommandOutcome,
+  type SessionCommandReceipt,
+  type SessionMeta,
+} from "../session/store.js";
 import {
   parseFrame,
   rpcResult,
@@ -1062,6 +1072,106 @@ const sameToken = (a: string, b: string): boolean => {
   return timingSafeEqual(ha, hb);
 };
 
+const SESSION_COMMAND_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+export function validSessionCommandId(value: unknown): value is string {
+  return typeof value === "string" && SESSION_COMMAND_ID.test(value);
+}
+
+interface CanonicalCommandState {
+  nodes: number;
+  ancestors: Set<object>;
+}
+
+function canonicalCommandValue(
+  value: unknown,
+  state: CanonicalCommandState = { nodes: 0, ancestors: new Set() },
+  depth = 0,
+): string {
+  state.nodes += 1;
+  if (state.nodes > 100_000 || depth > 64) {
+    throw new Error("command parameters exceed safe hashing complexity");
+  }
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("command parameters must contain finite JSON numbers");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    if (state.ancestors.has(value)) throw new Error("command parameters must not be cyclic");
+    state.ancestors.add(value);
+    try {
+      return `[${value.map((item) => canonicalCommandValue(item, state, depth + 1)).join(",")}]`;
+    } finally {
+      state.ancestors.delete(value);
+    }
+  }
+  if (value && typeof value === "object") {
+    if (state.ancestors.has(value)) throw new Error("command parameters must not be cyclic");
+    state.ancestors.add(value);
+    const object = value as Record<string, unknown>;
+    try {
+      return `{${Object.keys(object)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}:${canonicalCommandValue(object[key], state, depth + 1)}`)
+        .join(",")}}`;
+    } finally {
+      state.ancestors.delete(value);
+    }
+  }
+  throw new Error("command parameters must be JSON values");
+}
+
+/** Hash the complete mutation request except its transport-only commandId. Equivalent JSON objects produce
+ * the same digest even when a reconnect serializes object keys in another order. No prompt/path is retained. */
+export function sessionCommandRequestHash(
+  method: string,
+  params: Record<string, unknown>,
+): string {
+  const request = Object.fromEntries(Object.entries(params).filter(([key]) => key !== "commandId"));
+  return createHash("sha256")
+    .update("hara-session-command-v1\0")
+    .update(method)
+    .update("\0")
+    .update(canonicalCommandValue(request))
+    .digest("hex");
+}
+
+export const MAX_SERVE_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
+
+interface BoundedSocketWriter {
+  readyState: number;
+  OPEN: number;
+  bufferedAmount: number;
+  send(frame: string): void;
+  close(code?: number, reason?: string): void;
+}
+
+/** A sleeping renderer/mobile observer must reconnect and refresh instead of retaining an unbounded private
+ * event queue in Core. Closing with 1013 makes the loss explicit; clients can resume from durable history. */
+export function sendBoundedSocketFrame(socket: BoundedSocketWriter, frame: string): boolean {
+  if (socket.readyState !== socket.OPEN) return false;
+  const frameBytes = Buffer.byteLength(frame, "utf8");
+  if (
+    frameBytes > MAX_SERVE_SOCKET_BUFFERED_BYTES
+    || socket.bufferedAmount > MAX_SERVE_SOCKET_BUFFERED_BYTES - frameBytes
+  ) {
+    try {
+      socket.close(1013, "client too slow; reconnect and refresh");
+    } catch {
+      // A concurrent socket close already makes the frame undeliverable.
+    }
+    return false;
+  }
+  try {
+    socket.send(frame);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Last assistant text in a history — the turn's "reply" for request/response clients. */
 export function lastAssistantText(history: NeutralMsg[]): string {
   for (let i = history.length - 1; i >= 0; i--) {
@@ -1516,6 +1626,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     sessionId: string;
     mode: "observe" | "control";
     stream: ExternalTerminalStream;
+    /** Monotonic only within this private stream lease. A reconnect receives a new streamId and starts at 1. */
+    lastInputSeq: number;
+    inputDigests: Map<number, string>;
   }
   const externalTerminalStreams = new Map<WebSocket, Map<string, OwnedExternalTerminalStream>>();
   const externalTerminalControllers = new Map<string, { ws: WebSocket; streamId: string }>();
@@ -1652,15 +1765,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
   const broadcast = (method: string, params: Record<string, unknown>): void => {
     const frame = rpcNotify(method, params);
-    for (const ws of authed) if (ws.readyState === ws.OPEN) ws.send(frame);
+    for (const ws of authed) sendBoundedSocketFrame(ws, frame);
   };
   const notifySocket = (ws: WebSocket, method: string, params: Record<string, unknown>): boolean => {
-    if (ws.readyState !== ws.OPEN) return false;
-    // A terminal can repaint quickly. Fail closed instead of buffering unbounded private terminal data
-    // in memory behind a suspended renderer/mobile client.
-    if (ws.bufferedAmount > 4 * 1024 * 1024) return false;
-    ws.send(rpcNotify(method, params));
-    return true;
+    return sendBoundedSocketFrame(ws, rpcNotify(method, params));
   };
   const releaseExternalTerminal = async (
     ws: WebSocket,
@@ -2358,6 +2466,296 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
 
   class SessionSubmitParamsError extends Error {}
 
+  class SessionCommandRpcError extends Error {
+    constructor(readonly code: number, message: string) {
+      super(message);
+      this.name = "SessionCommandRpcError";
+    }
+  }
+
+  interface InFlightSessionCommand {
+    method: SessionCommandMethod;
+    requestHash: string;
+    promise: Promise<unknown>;
+    durable: boolean;
+  }
+  const inFlightSessionCommands = new Map<string, InFlightSessionCommand>();
+  const MAX_IN_FLIGHT_SESSION_COMMANDS = 256;
+
+  const commandFailure = (error: unknown): SessionCommandRpcError => {
+    if (error instanceof SessionCommandRpcError) return error;
+    const organizationAuthorizationRejected = isOrganizationAuthorizationRejection(error);
+    const code = error instanceof SessionSpaceBoundaryError || organizationAuthorizationRejected
+      ? ERR.UNAUTHORIZED
+      : error instanceof SessionSubmitParamsError || error instanceof ExternalSessionInputError
+        ? ERR.PARAMS
+        : ERR.INTERNAL;
+    const message = organizationAuthorizationRejected
+      ? organizationAuthorizationRecoveryMessage()
+      : redactSensitiveText(error instanceof Error ? error.message : String(error)).text;
+    return new SessionCommandRpcError(code, message);
+  };
+
+  const commandFromReceipt = (receipt: SessionCommandReceipt): unknown => {
+    if (receipt.outcome.kind === "error") {
+      throw new SessionCommandRpcError(receipt.outcome.code, receipt.outcome.message);
+    }
+    if (receipt.outcome.kind === "result_omitted") {
+      throw new SessionCommandRpcError(ERR.CONFLICT, receipt.outcome.message);
+    }
+    try {
+      return JSON.parse(receipt.outcome.json) as unknown;
+    } catch {
+      throw new SessionCommandRpcError(
+        ERR.CONFLICT,
+        "this command completed earlier, but its durable result is unreadable; inspect session.history before issuing another command",
+      );
+    }
+  };
+
+  const persistCommandReceipt = (
+    session: ServeSession,
+    receipt: SessionCommandReceipt,
+  ): void => {
+    const prior = session.meta.commandReceipts ?? [];
+    const bounded = [
+      ...prior.filter((item) => item.commandId !== receipt.commandId),
+      receipt,
+    ].slice(-MAX_SESSION_COMMAND_RECEIPTS);
+    const replayBoundary = Math.max(0, bounded.length - MAX_SESSION_COMMAND_REPLAY_RESULTS);
+    const next = bounded.map((item, index): SessionCommandReceipt => {
+      if (index >= replayBoundary || item.outcome.kind !== "result") return item;
+      return {
+        ...item,
+        outcome: {
+          kind: "result_omitted",
+          message: "this command completed earlier and remains deduplicated, but its result aged out of the replay window; inspect session.history before issuing another command",
+        },
+      };
+    });
+    hub.replaceSnapshot(
+      session,
+      { ...session.meta, commandReceipts: next },
+      [...session.history],
+      session.task,
+    );
+  };
+
+  /** Run a remote session mutation at most once for one client UUID. The first terminal outcome is saved
+   * before the RPC response is returned; concurrent reconnects share the same in-flight Promise. */
+  const runIdempotentSessionCommand = async <T>(
+    method: SessionCommandMethod,
+    params: Record<string, unknown>,
+    session: ServeSession,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    if (params.commandId === undefined) return operation();
+    if (!validSessionCommandId(params.commandId)) {
+      throw new SessionCommandRpcError(ERR.PARAMS, "commandId must be a UUID");
+    }
+    const commandId = params.commandId;
+    let requestHash: string;
+    try {
+      requestHash = sessionCommandRequestHash(method, params);
+    } catch {
+      throw new SessionCommandRpcError(ERR.PARAMS, "command parameters exceed safe hashing limits");
+    }
+    const prior = session.meta.commandReceipts?.find((item) => item.commandId === commandId);
+    if (prior) {
+      if (prior.method !== method || prior.requestHash !== requestHash) {
+        throw new SessionCommandRpcError(
+          ERR.CONFLICT,
+          "commandId was already used for a different session command",
+        );
+      }
+      return commandFromReceipt(prior) as T;
+    }
+
+    const key = `${session.meta.id}\0${commandId}`;
+    const active = inFlightSessionCommands.get(key);
+    if (active) {
+      if (active.method !== method || active.requestHash !== requestHash) {
+        throw new SessionCommandRpcError(
+          ERR.CONFLICT,
+          "commandId is already running with different parameters",
+        );
+      }
+      return active.promise as Promise<T>;
+    }
+    if (inFlightSessionCommands.size >= MAX_IN_FLIGHT_SESSION_COMMANDS) {
+      throw new SessionCommandRpcError(ERR.BUSY, "too many unacknowledged session commands");
+    }
+
+    const entry: InFlightSessionCommand = {
+      method,
+      requestHash,
+      promise: Promise.resolve(),
+      durable: false,
+    };
+    entry.promise = Promise.resolve().then(async () => {
+      let result: T;
+      let outcome: SessionCommandOutcome;
+      try {
+        result = await operation();
+        const safeResult = redactSensitiveValue(result).value;
+        const json = JSON.stringify(safeResult);
+        outcome = typeof json === "string" && Buffer.byteLength(json, "utf8") <= MAX_SESSION_COMMAND_RESULT_BYTES
+          ? { kind: "result", json }
+          : {
+              kind: "result_omitted",
+              message: "this command completed earlier, but its result exceeded the durable replay limit; inspect session.history before issuing another command",
+            };
+      } catch (error) {
+        const failure = commandFailure(error);
+        outcome = { kind: "error", code: failure.code, message: failure.message.slice(0, 2_000) };
+        try {
+          persistCommandReceipt(session, {
+            v: 1,
+            commandId,
+            method,
+            requestHash,
+            completedAt: new Date().toISOString(),
+            outcome,
+          });
+          entry.durable = true;
+        } catch {
+          throw new SessionCommandRpcError(
+            ERR.INTERNAL,
+            "the command reached a terminal state, but its idempotency receipt could not be saved; inspect session.history before retrying",
+          );
+        }
+        throw failure;
+      }
+
+      try {
+        persistCommandReceipt(session, {
+          v: 1,
+          commandId,
+          method,
+          requestHash,
+          completedAt: new Date().toISOString(),
+          outcome,
+        });
+        entry.durable = true;
+      } catch {
+        throw new SessionCommandRpcError(
+          ERR.INTERNAL,
+          "the command completed, but its idempotency receipt could not be saved; inspect session.history before retrying",
+        );
+      }
+      return result;
+    });
+    inFlightSessionCommands.set(key, entry);
+    try {
+      return await entry.promise as T;
+    } finally {
+      // A durable receipt becomes the long-lived dedupe source. If persistence failed, retain the rejected
+      // Promise for this Serve lifetime so an immediate retry still cannot duplicate an uncertain action.
+      if (entry.durable && inFlightSessionCommands.get(key) === entry) {
+        inFlightSessionCommands.delete(key);
+      }
+    }
+  };
+
+  interface ExternalCommandEntry {
+    method: string;
+    requestHash: string;
+    promise?: Promise<unknown>;
+    outcome?: SessionCommandOutcome;
+  }
+  const externalCommandReceipts = new Map<string, ExternalCommandEntry>();
+  const MAX_EXTERNAL_COMMAND_RECEIPTS = 64;
+
+  const externalCommandFromOutcome = (outcome: SessionCommandOutcome): unknown => {
+    if (outcome.kind === "error") {
+      throw new SessionCommandRpcError(outcome.code, outcome.message);
+    }
+    if (outcome.kind === "result_omitted") {
+      throw new SessionCommandRpcError(ERR.CONFLICT, outcome.message);
+    }
+    try {
+      return JSON.parse(outcome.json) as unknown;
+    } catch {
+      throw new SessionCommandRpcError(
+        ERR.CONFLICT,
+        "this external-session command completed earlier, but its replay result is unreadable; resume and inspect the provider-native session",
+      );
+    }
+  };
+
+  /** External Codex/Claude sessions are provider-owned rather than SessionStore projections. Retain a
+   * bounded Serve-lifetime receipt so socket reconnects share the first action/result. A later Serve restart
+   * must resume and inspect the provider-native session; this layer never guesses that an action was absent. */
+  const runIdempotentExternalCommand = async <T>(
+    method: "external.sessions.submit" | "external.sessions.steer" | "external.sessions.interrupt",
+    params: Record<string, unknown>,
+    externalSessionId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    if (params.commandId === undefined) return operation();
+    if (!validSessionCommandId(params.commandId)) {
+      throw new SessionCommandRpcError(ERR.PARAMS, "commandId must be a UUID");
+    }
+    let requestHash: string;
+    try {
+      requestHash = sessionCommandRequestHash(method, params);
+    } catch {
+      throw new SessionCommandRpcError(ERR.PARAMS, "command parameters exceed safe hashing limits");
+    }
+    const key = `${externalSessionId}\0${params.commandId}`;
+    const prior = externalCommandReceipts.get(key);
+    if (prior) {
+      if (prior.method !== method || prior.requestHash !== requestHash) {
+        throw new SessionCommandRpcError(
+          ERR.CONFLICT,
+          "commandId was already used for different external-session input",
+        );
+      }
+      if (prior.promise) return prior.promise as Promise<T>;
+      if (prior.outcome) return externalCommandFromOutcome(prior.outcome) as T;
+      throw new SessionCommandRpcError(ERR.INTERNAL, "external-session command receipt is incomplete");
+    }
+    if (externalCommandReceipts.size >= MAX_EXTERNAL_COMMAND_RECEIPTS) {
+      for (const [receiptKey, receipt] of externalCommandReceipts) {
+        if (!receipt.outcome) continue;
+        externalCommandReceipts.delete(receiptKey);
+        if (externalCommandReceipts.size < MAX_EXTERNAL_COMMAND_RECEIPTS) break;
+      }
+      if (externalCommandReceipts.size >= MAX_EXTERNAL_COMMAND_RECEIPTS) {
+        throw new SessionCommandRpcError(ERR.BUSY, "too many external-session commands are still running");
+      }
+    }
+    const entry: ExternalCommandEntry = {
+      method,
+      requestHash,
+    };
+    const running = Promise.resolve()
+      .then(operation)
+      .catch((error) => {
+        throw commandFailure(error);
+      });
+    entry.promise = running;
+    externalCommandReceipts.set(key, entry);
+    try {
+      const result = await running as T;
+      const safeResult = redactSensitiveValue(result).value;
+      const json = JSON.stringify(safeResult);
+      entry.outcome = typeof json === "string" && Buffer.byteLength(json, "utf8") <= MAX_SESSION_COMMAND_RESULT_BYTES
+        ? { kind: "result", json }
+        : {
+            kind: "result_omitted",
+            message: "this external-session command completed earlier, but its result exceeded the replay limit; resume and inspect the provider-native session before sending another command",
+          };
+      return result;
+    } catch (error) {
+      const failure = commandFailure(error);
+      entry.outcome = { kind: "error", code: failure.code, message: failure.message.slice(0, 2_000) };
+      throw failure;
+    } finally {
+      delete entry.promise;
+    }
+  };
+
   /** One server-owned admission point for user input. The busy/turn check and the chosen mutation are
    * contiguous before the first awaited start, so renderer event lag cannot turn a send→steer retry into
    * input for the wrong logical turn. Mention expansion deliberately happens only after routing accepts a
@@ -2694,7 +3092,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (deps.organizationLearningSync) methods.push("learning.sync");
           const features = [
             "composer.attachments.v1",
+            "events.bounded-delivery.v1",
             "models.capabilities.v1",
+            "sessions.command-idempotency.v1",
             "sessions.readonly-history.v1",
             "sessions.cross-profile-fork.v1",
             "sessions.space-route.v1",
@@ -2708,8 +3108,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.runtime.v1",
             "external.sessions.native-resume.v1",
             "external.sessions.launch-options.v1",
+            "external.sessions.command-idempotency.serve-lifetime.v1",
             "external.sessions.terminal-mirror.v1",
             "external.sessions.terminal-stream.v2",
+            "external.sessions.terminal-input-sequence.v1",
             "external.sessions.runtime-remove.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
@@ -2738,6 +3140,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 "external.event.terminal.frame", "external.event.terminal.closed",
               ],
               features,
+              limits: {
+                sessionCommandReceipts: MAX_SESSION_COMMAND_RECEIPTS,
+                sessionCommandReplayResults: MAX_SESSION_COMMAND_REPLAY_RESULTS,
+                externalCommandReceipts: MAX_EXTERNAL_COMMAND_RECEIPTS,
+                externalCommandResultBytes: MAX_SESSION_COMMAND_RESULT_BYTES,
+                socketBufferedBytes: MAX_SERVE_SOCKET_BUFFERED_BYTES,
+              },
             },
           }));
         }
@@ -2903,59 +3312,67 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
             }
             const externalSessionId = p.sessionId;
-            const externalTurnId = `extturn_${randomUUID()}`;
-            if (externalWireTurns.has(externalSessionId)) {
-              return reply(rpcError(id, ERR.BUSY, "this external coding-agent session is already running"));
-            }
-            externalWireTurns.set(externalSessionId, externalTurnId);
-            broadcast("external.event.turn_start", { sessionId: externalSessionId, turnId: externalTurnId });
-            try {
-              const result = await externalSessions.submit(externalSessionId, p.text, {
-                text: (delta) => broadcast("external.event.text", { sessionId: externalSessionId, turnId: externalTurnId, delta }),
-                tool: (name, preview) => broadcast("external.event.tool", {
-                  sessionId: externalSessionId,
-                  turnId: externalTurnId,
-                  name,
-                  preview,
-                }),
-                notice: (text) => broadcast("external.event.notice", { sessionId: externalSessionId, turnId: externalTurnId, text }),
-                confirm: (request, signal) => confirmExternalSessionAction(
-                  externalSessionId,
-                  request.question,
-                  signal,
-                  request.allowAlways === true,
-                ),
-              });
-              const wireResult = { ...result, turnId: externalTurnId };
-              broadcast("external.event.turn_end", {
-                sessionId: wireResult.sessionId,
-                requestedSessionId: externalSessionId,
-                turnId: wireResult.turnId,
-                reply: wireResult.reply,
-                status: wireResult.status,
-                ...(wireResult.error ? { error: wireResult.error } : {}),
-              });
-              return reply(rpcResult(id!, wireResult));
-            } catch (error) {
-              const message = redactSensitiveText(String(error instanceof Error ? error.message : error)).text.slice(0, 2_000);
-              runtimeLog("external.turn.failed", {
-                sessionId: externalSessionId,
-                category: serveRuntimeFailureCategory(error),
-              });
-              broadcast("external.event.turn_end", {
-                sessionId: externalSessionId,
-                requestedSessionId: externalSessionId,
-                turnId: externalTurnId,
-                reply: "",
-                status: "failed",
-                error: message,
-              });
-              throw error;
-            } finally {
-              if (externalWireTurns.get(externalSessionId) === externalTurnId) {
-                externalWireTurns.delete(externalSessionId);
-              }
-            }
+            const wireResult = await runIdempotentExternalCommand(
+              "external.sessions.submit",
+              p,
+              externalSessionId,
+              async () => {
+                const externalTurnId = `extturn_${randomUUID()}`;
+                if (externalWireTurns.has(externalSessionId)) {
+                  throw new SessionCommandRpcError(ERR.BUSY, "this external coding-agent session is already running");
+                }
+                externalWireTurns.set(externalSessionId, externalTurnId);
+                broadcast("external.event.turn_start", { sessionId: externalSessionId, turnId: externalTurnId });
+                try {
+                  const result = await externalSessions.submit(externalSessionId, p.text, {
+                    text: (delta) => broadcast("external.event.text", { sessionId: externalSessionId, turnId: externalTurnId, delta }),
+                    tool: (name, preview) => broadcast("external.event.tool", {
+                      sessionId: externalSessionId,
+                      turnId: externalTurnId,
+                      name,
+                      preview,
+                    }),
+                    notice: (text) => broadcast("external.event.notice", { sessionId: externalSessionId, turnId: externalTurnId, text }),
+                    confirm: (request, signal) => confirmExternalSessionAction(
+                      externalSessionId,
+                      request.question,
+                      signal,
+                      request.allowAlways === true,
+                    ),
+                  });
+                  const resultForWire = { ...result, turnId: externalTurnId };
+                  broadcast("external.event.turn_end", {
+                    sessionId: resultForWire.sessionId,
+                    requestedSessionId: externalSessionId,
+                    turnId: resultForWire.turnId,
+                    reply: resultForWire.reply,
+                    status: resultForWire.status,
+                    ...(resultForWire.error ? { error: resultForWire.error } : {}),
+                  });
+                  return resultForWire;
+                } catch (error) {
+                  const message = redactSensitiveText(String(error instanceof Error ? error.message : error)).text.slice(0, 2_000);
+                  runtimeLog("external.turn.failed", {
+                    sessionId: externalSessionId,
+                    category: serveRuntimeFailureCategory(error),
+                  });
+                  broadcast("external.event.turn_end", {
+                    sessionId: externalSessionId,
+                    requestedSessionId: externalSessionId,
+                    turnId: externalTurnId,
+                    reply: "",
+                    status: "failed",
+                    error: message,
+                  });
+                  throw error;
+                } finally {
+                  if (externalWireTurns.get(externalSessionId) === externalTurnId) {
+                    externalWireTurns.delete(externalSessionId);
+                  }
+                }
+              },
+            );
+            return reply(rpcResult(id!, wireResult));
           }
           case "external.sessions.steer": {
             if (externalSessionSpaceId() !== "personal") {
@@ -2964,17 +3381,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
               return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
             }
-            const externalTurnId = externalWireTurns.get(p.sessionId);
-            if (!externalTurnId) {
-              return reply(rpcError(id, ERR.BUSY, "this external coding-agent session has no active turn"));
+            if (p.expectedTurnId !== undefined && typeof p.expectedTurnId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "expectedTurnId must be a string"));
             }
-            const result = await externalSessions.steer(p.sessionId, p.text);
-            const wireResult = { ...result, turnId: externalTurnId };
-            broadcast("external.event.notice", {
-              sessionId: wireResult.sessionId,
-              turnId: wireResult.turnId,
-              text: "Follow-up delivered to the active coding-agent turn.",
-            });
+            const wireResult = await runIdempotentExternalCommand(
+              "external.sessions.steer",
+              p,
+              p.sessionId,
+              async () => {
+                const externalTurnId = externalWireTurns.get(p.sessionId);
+                if (!externalTurnId) {
+                  throw new SessionCommandRpcError(ERR.BUSY, "this external coding-agent session has no active turn");
+                }
+                if (p.expectedTurnId !== undefined && p.expectedTurnId !== externalTurnId) {
+                  throw new SessionCommandRpcError(ERR.CONFLICT, "expectedTurnId does not own the active external turn");
+                }
+                const result = await externalSessions.steer(p.sessionId, p.text);
+                const resultForWire = { ...result, turnId: externalTurnId };
+                broadcast("external.event.notice", {
+                  sessionId: resultForWire.sessionId,
+                  turnId: resultForWire.turnId,
+                  text: "Follow-up delivered to the active coding-agent turn.",
+                });
+                return resultForWire;
+              },
+            );
             return reply(rpcResult(id!, wireResult));
           }
           case "external.sessions.interrupt": {
@@ -2982,8 +3413,25 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
             }
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
-            await externalSessions.interrupt(p.sessionId);
-            return reply(rpcResult(id!, {}));
+            if (p.expectedTurnId !== undefined && typeof p.expectedTurnId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "expectedTurnId must be a string"));
+            }
+            const interrupted = await runIdempotentExternalCommand(
+              "external.sessions.interrupt",
+              p,
+              p.sessionId,
+              async () => {
+                if (
+                  p.expectedTurnId !== undefined
+                  && externalWireTurns.get(p.sessionId) !== p.expectedTurnId
+                ) {
+                  throw new SessionCommandRpcError(ERR.CONFLICT, "expectedTurnId does not own the active external turn");
+                }
+                await externalSessions.interrupt(p.sessionId);
+                return {};
+              },
+            );
+            return reply(rpcResult(id!, interrupted));
           }
           case "external.sessions.remove": {
             if (externalSessionSpaceId() !== "personal") {
@@ -3107,12 +3555,26 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               await stream.release().catch(() => {});
               throw new Error("Hara Live terminal stream closed while attaching");
             }
-            const owned: OwnedExternalTerminalStream = { streamId, sessionId: p.sessionId, mode: p.mode, stream };
+            const owned: OwnedExternalTerminalStream = {
+              streamId,
+              sessionId: p.sessionId,
+              mode: p.mode,
+              stream,
+              lastInputSeq: 0,
+              inputDigests: new Map(),
+            };
             const ownedBySocket = externalTerminalStreams.get(ws) ?? new Map<string, OwnedExternalTerminalStream>();
             ownedBySocket.set(streamId, owned);
             externalTerminalStreams.set(ws, ownedBySocket);
             if (p.mode === "control") externalTerminalControllers.set(p.sessionId, { ws, streamId });
-            reply(rpcResult(id!, { sessionId: p.sessionId, streamId, mode: p.mode, cols: p.cols, rows: p.rows }));
+            reply(rpcResult(id!, {
+              sessionId: p.sessionId,
+              streamId,
+              mode: p.mode,
+              cols: p.cols,
+              rows: p.rows,
+              ...(p.mode === "control" ? { nextInputSeq: 1 } : {}),
+            }));
             ready = true;
             for (const frame of pendingFrames) publishFrame(frame);
             return;
@@ -3121,13 +3583,58 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (externalSessionSpaceId() !== "personal") {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
             }
-            if (typeof p.streamId !== "string" || typeof p.text !== "string" || Buffer.byteLength(p.text, "utf8") > 64 * 1024) {
-              return reply(rpcError(id, ERR.PARAMS, "streamId and terminal text up to 64 KiB are required"));
+            if (
+              typeof p.streamId !== "string"
+              || typeof p.text !== "string"
+              || Buffer.byteLength(p.text, "utf8") > 64 * 1024
+              || (p.inputSeq !== undefined && (!Number.isSafeInteger(p.inputSeq) || p.inputSeq < 1))
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "streamId, terminal text up to 64 KiB, and optional positive inputSeq are required"));
             }
             const owned = externalTerminalStreams.get(ws)?.get(p.streamId);
             if (!owned || owned.mode !== "control") return reply(rpcError(id, ERR.UNAUTHORIZED, "this client does not control that terminal stream"));
+            const inputDigest = p.inputSeq === undefined
+              ? undefined
+              : createHash("sha256").update(p.text, "utf8").digest("hex");
+            if (p.inputSeq !== undefined) {
+              if (p.inputSeq <= owned.lastInputSeq) {
+                if (owned.inputDigests.get(p.inputSeq) !== inputDigest) {
+                  return reply(rpcError(
+                    id,
+                    ERR.CONFLICT,
+                    "terminal inputSeq was already used for different or expired input",
+                  ));
+                }
+                return reply(rpcResult(id!, {
+                  accepted: true,
+                  duplicate: true,
+                  inputSeq: p.inputSeq,
+                  nextInputSeq: owned.lastInputSeq + 1,
+                }));
+              }
+              if (p.inputSeq !== owned.lastInputSeq + 1) {
+                return reply(rpcError(
+                  id,
+                  ERR.CONFLICT,
+                  `terminal input sequence gap; expected ${owned.lastInputSeq + 1}`,
+                ));
+              }
+            }
             owned.stream.input(p.text);
-            return reply(rpcResult(id!, {}));
+            if (p.inputSeq === undefined) return reply(rpcResult(id!, {}));
+            owned.lastInputSeq = p.inputSeq;
+            owned.inputDigests.set(p.inputSeq, inputDigest!);
+            while (owned.inputDigests.size > 256) {
+              const oldest = owned.inputDigests.keys().next().value;
+              if (oldest === undefined) break;
+              owned.inputDigests.delete(oldest);
+            }
+            return reply(rpcResult(id!, {
+              accepted: true,
+              duplicate: false,
+              inputSeq: p.inputSeq,
+              nextInputSeq: owned.lastInputSeq + 1,
+            }));
           }
           case "external.sessions.terminal.resize": {
             if (externalSessionSpaceId() !== "personal") {
@@ -3710,27 +4217,29 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (p.expectedEffort !== undefined && p.expectedModel === undefined) {
               return reply(rpcError(id, ERR.PARAMS, "expectedModel required with expectedEffort"));
             }
-            try {
-              const decision = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
-                  text: p.text,
-                  images: p.images,
-                  attachments: p.attachments,
-                  newTask: p.newTask === true,
-                  mode,
-                  expectedTurnId: p.expectedTurnId,
-                  expectedModel: p.expectedModel,
-                  expectedEffort: p.expectedEffort,
-                }, true));
-              const result = decision.submission === "starting"
-                ? { submission: "started" as const, ...await decision.completion }
-                : decision;
-              return reply(rpcResult(id!, result));
-            } catch (error) {
-              if (error instanceof SessionSubmitParamsError) {
-                return reply(rpcError(id, ERR.PARAMS, error.message));
+            const result = await runIdempotentSessionCommand("session.submit", p, s, async () => {
+              try {
+                const decision = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
+                    text: p.text,
+                    images: p.images,
+                    attachments: p.attachments,
+                    newTask: p.newTask === true,
+                    mode,
+                    expectedTurnId: p.expectedTurnId,
+                    expectedModel: p.expectedModel,
+                    expectedEffort: p.expectedEffort,
+                  }, true));
+                return decision.submission === "starting"
+                  ? { submission: "started" as const, ...await decision.completion }
+                  : decision;
+              } catch (error) {
+                if (error instanceof SessionSubmitParamsError) {
+                  throw new SessionCommandRpcError(ERR.PARAMS, error.message);
+                }
+                throw error;
               }
-              throw error;
-            }
+            });
+            return reply(rpcResult(id!, result));
           }
           case "session.send": {
             if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
@@ -3744,34 +4253,37 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (p.attachments !== undefined && !Array.isArray(p.attachments)) {
               return reply(rpcError(id, ERR.PARAMS, "attachments must be an array"));
             }
-            try {
-              const decision = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
-                  text: p.text,
-                  images: p.images,
-                  attachments: p.attachments,
-                  newTask: p.newTask === true,
-                  mode: "start_if_idle",
-                }, true));
-              const result = decision.submission === "starting"
-                ? { submission: "started" as const, ...await decision.completion }
-                : decision;
-              if (result.submission === "not_submitted") {
-                if (result.reason === "empty_input") {
-                  return reply(rpcError(id, ERR.PARAMS, "text or at least one attachment is required"));
+            const legacy = await runIdempotentSessionCommand("session.send", p, s, async () => {
+              try {
+                const decision = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
+                    text: p.text,
+                    images: p.images,
+                    attachments: p.attachments,
+                    newTask: p.newTask === true,
+                    mode: "start_if_idle",
+                  }, true));
+                const result = decision.submission === "starting"
+                  ? { submission: "started" as const, ...await decision.completion }
+                  : decision;
+                if (result.submission === "not_submitted") {
+                  if (result.reason === "empty_input") {
+                    throw new SessionCommandRpcError(ERR.PARAMS, "text or at least one attachment is required");
+                  }
+                  throw new SessionCommandRpcError(ERR.BUSY, "this session is busy or changing configuration");
                 }
-                return reply(rpcError(id, ERR.BUSY, "this session is busy or changing configuration"));
+                if (result.submission !== "started") {
+                  throw new SessionCommandRpcError(ERR.INTERNAL, "legacy session.send unexpectedly steered");
+                }
+                const { submission: _submission, ...response } = result;
+                return response;
+              } catch (error) {
+                if (error instanceof SessionSubmitParamsError) {
+                  throw new SessionCommandRpcError(ERR.PARAMS, error.message);
+                }
+                throw error;
               }
-              if (result.submission !== "started") {
-                return reply(rpcError(id, ERR.INTERNAL, "legacy session.send unexpectedly steered"));
-              }
-              const { submission: _submission, ...legacy } = result;
-              return reply(rpcResult(id!, legacy));
-            } catch (error) {
-              if (error instanceof SessionSubmitParamsError) {
-                return reply(rpcError(id, ERR.PARAMS, error.message));
-              }
-              throw error;
-            }
+            });
+            return reply(rpcResult(id!, legacy));
           }
           case "session.steer": {
             if (typeof p.sessionId !== "string" || typeof p.text !== "string" || !p.text || typeof p.expectedTurnId !== "string") {
@@ -3779,32 +4291,38 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             const s = hub.get(p.sessionId);
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
-            const result = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
-                text: p.text,
-                mode: "steer",
-                expectedTurnId: p.expectedTurnId,
-              }));
-            if (result.submission !== "steered") {
-              const detail = result.submission === "not_submitted"
-                ? result.reason === "expected_turn_mismatch"
-                  ? `stale steer for turn ${p.expectedTurnId}; active turn is ${result.activeTurnId ?? "none"}`
-                  : result.detail ?? result.reason
-                : "steer unexpectedly started a turn";
-              return reply(rpcError(id, ERR.BUSY, detail));
-            }
-            return reply(rpcResult(id!, { accepted: true, taskId: result.taskId, turnId: result.turnId }));
+            const steered = await runIdempotentSessionCommand("session.steer", p, s, async () => {
+              const result = await enqueueSessionSubmission(p.sessionId, () => submitSessionInput(s, {
+                  text: p.text,
+                  mode: "steer",
+                  expectedTurnId: p.expectedTurnId,
+                }));
+              if (result.submission !== "steered") {
+                const detail = result.submission === "not_submitted"
+                  ? result.reason === "expected_turn_mismatch"
+                    ? `stale steer for turn ${p.expectedTurnId}; active turn is ${result.activeTurnId ?? "none"}`
+                    : result.detail ?? result.reason
+                  : "steer unexpectedly started a turn";
+                throw new SessionCommandRpcError(ERR.BUSY, detail);
+              }
+              return { accepted: true, taskId: result.taskId, turnId: result.turnId };
+            });
+            return reply(rpcResult(id!, steered));
           }
           case "session.interrupt": {
             const s = typeof p.sessionId === "string" ? hub.get(p.sessionId) : undefined;
             if (!s) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
-            if (s.abort && s.task?.status === "running") {
-              broadcastTaskState(s, { state: "running", phase: "stopping", detail: "Stopping at a safe boundary" });
-            }
-            if (s.abort) {
-              runtimeLog("turn.interrupted", { sessionId: s.meta.id, category: "cancelled" });
-              s.abort.abort();
-            }
-            return reply(rpcResult(id!, {}));
+            const interrupted = await runIdempotentSessionCommand("session.interrupt", p, s, async () => {
+              if (s.abort && s.task?.status === "running") {
+                broadcastTaskState(s, { state: "running", phase: "stopping", detail: "Stopping at a safe boundary" });
+              }
+              if (s.abort) {
+                runtimeLog("turn.interrupted", { sessionId: s.meta.id, category: "cancelled" });
+                s.abort.abort();
+              }
+              return {};
+            });
+            return reply(rpcResult(id!, interrupted));
           }
           case "approval.reply": {
             if (typeof p.approvalId !== "string") return reply(rpcError(id, ERR.PARAMS, "approvalId required"));
@@ -5396,9 +5914,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         }
         } catch (e: any) {
           const organizationAuthorizationRejected = isOrganizationAuthorizationRejection(e);
-          const code = e instanceof SessionSpaceBoundaryError || organizationAuthorizationRejected
-            ? ERR.UNAUTHORIZED
-            : e instanceof ExternalSessionInputError ? ERR.PARAMS : ERR.INTERNAL;
+          const code = e instanceof SessionCommandRpcError
+            ? e.code
+            : e instanceof SessionSpaceBoundaryError || organizationAuthorizationRejected
+              ? ERR.UNAUTHORIZED
+              : e instanceof ExternalSessionInputError ? ERR.PARAMS : ERR.INTERNAL;
           runtimeLog("rpc.failed", {
             method: req.method,
             code,
@@ -5409,7 +5929,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           return reply(rpcError(
             id,
             code,
-            organizationAuthorizationRejected
+            e instanceof SessionCommandRpcError
+              ? e.message
+              : organizationAuthorizationRejected
               ? organizationAuthorizationRecoveryMessage()
               : redactSensitiveText(String(e?.message ?? e)).text,
           ));

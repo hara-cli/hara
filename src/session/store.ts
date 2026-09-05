@@ -78,6 +78,33 @@ export interface SessionCompactionWindow {
   inputAccounting: "provider" | "estimated";
 }
 
+export type SessionCommandMethod =
+  | "session.submit"
+  | "session.send"
+  | "session.steer"
+  | "session.interrupt";
+
+export type SessionCommandOutcome =
+  | { kind: "result"; json: string }
+  | { kind: "error"; code: number; message: string }
+  | { kind: "result_omitted"; message: string };
+
+/** A client-generated UUID binds one remote mutation to its first terminal outcome. Request bodies stay
+ * out of this record; only their canonical SHA-256 is retained. Bounded receipts let Desktop/mobile retry
+ * after a socket loss or Serve restart without starting the same model/tool work again. */
+export interface SessionCommandReceipt {
+  v: 1;
+  commandId: string;
+  method: SessionCommandMethod;
+  requestHash: string;
+  completedAt: string;
+  outcome: SessionCommandOutcome;
+}
+
+export const MAX_SESSION_COMMAND_RECEIPTS = 64;
+export const MAX_SESSION_COMMAND_REPLAY_RESULTS = 8;
+export const MAX_SESSION_COMMAND_RESULT_BYTES = 256 * 1024;
+
 const AUTOMATION_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 /** Derive the session source from the spawn environment — the gateway subprocess runs with
@@ -156,6 +183,9 @@ export interface SessionMeta {
   /** Last atomically installed context window. The transcript remains authoritative; this identity lets
    * reconnecting clients and future event replay distinguish a real replacement from a repeated notice. */
   compaction?: SessionCompactionWindow;
+  /** Recent mutation receipts are part of the authoritative transcript projection, but are intentionally
+   * omitted from the lightweight metadata sidecar and every session-list response. */
+  commandReceipts?: SessionCommandReceipt[];
 }
 export interface SessionData {
   meta: SessionMeta;
@@ -1208,6 +1238,22 @@ function redactedSessionCopy(data: SessionData): SessionData {
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
   if (data.meta.agentRef !== undefined) safe.meta.agentRef = data.meta.agentRef;
   if (data.meta.compaction !== undefined) safe.meta.compaction = { ...data.meta.compaction };
+  if (data.meta.commandReceipts && safe.meta.commandReceipts) {
+    for (let index = 0; index < data.meta.commandReceipts.length; index++) {
+      const source = data.meta.commandReceipts[index];
+      const target = safe.meta.commandReceipts[index];
+      if (!source || !target) continue;
+      target.v = source.v;
+      target.commandId = source.commandId;
+      target.method = source.method;
+      target.requestHash = source.requestHash;
+      target.completedAt = source.completedAt;
+      target.outcome.kind = source.outcome.kind;
+      if (source.outcome.kind === "error" && target.outcome.kind === "error") {
+        target.outcome.code = source.outcome.code;
+      }
+    }
+  }
   if (data.task && safe.task) {
     // Task objective/steering are free-form and stay redacted. Execution identity and transition metadata
     // are structural: preserve them exactly so resume/expectedTurnId validation cannot be corrupted by a
@@ -1424,11 +1470,14 @@ function appendSessionProjectionEvent(
 }
 
 function writeSessionMetadataSidecar(meta: SessionMeta, generation: string): void {
+  // Command receipts may contain a bounded copy of a model result. Keep them only in the authoritative
+  // transcript rather than duplicating conversational content into the metadata/listing accelerator.
+  const { commandReceipts: _commandReceipts, ...metadataOnly } = meta;
   const sidecar: SessionMetadataSidecar = {
     v: 1,
     generation,
     routes: SESSION_INDEX_ROUTE_SCHEMA,
-    meta,
+    meta: metadataOnly,
   };
   const encoded = JSON.stringify(sidecar);
   if (Buffer.byteLength(encoded, "utf8") > MAX_SESSION_METADATA_FILE_BYTES) return;
@@ -1625,6 +1674,41 @@ function isSessionCompactionWindow(value: unknown): value is SessionCompactionWi
   );
 }
 
+function isSessionCommandReceipt(value: unknown): value is SessionCommandReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Partial<Record<keyof SessionCommandReceipt, unknown>>;
+  if (
+    receipt.v !== 1
+    || typeof receipt.commandId !== "string"
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(receipt.commandId)
+    || (
+      receipt.method !== "session.submit"
+      && receipt.method !== "session.send"
+      && receipt.method !== "session.steer"
+      && receipt.method !== "session.interrupt"
+    )
+    || typeof receipt.requestHash !== "string"
+    || !/^[0-9a-f]{64}$/u.test(receipt.requestHash)
+    || !isTimestamp(receipt.completedAt)
+    || !receipt.outcome
+    || typeof receipt.outcome !== "object"
+    || Array.isArray(receipt.outcome)
+  ) return false;
+  const outcome = receipt.outcome as Partial<SessionCommandOutcome> & Record<string, unknown>;
+  if (outcome.kind === "result") {
+    return typeof outcome.json === "string"
+      && Buffer.byteLength(outcome.json, "utf8") <= MAX_SESSION_COMMAND_RESULT_BYTES;
+  }
+  if (outcome.kind === "error") {
+    return Number.isSafeInteger(outcome.code)
+      && typeof outcome.message === "string"
+      && outcome.message.length <= 2_000;
+  }
+  return outcome.kind === "result_omitted"
+    && typeof outcome.message === "string"
+    && outcome.message.length <= 2_000;
+}
+
 function isAssistantContinuation(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const continuation = value as Record<string, unknown>;
@@ -1754,6 +1838,11 @@ function isSessionMeta(value: unknown): value is SessionMeta {
     (meta.archived === undefined || typeof meta.archived === "boolean") &&
     (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string") &&
     (meta.compaction === undefined || isSessionCompactionWindow(meta.compaction)) &&
+    (meta.commandReceipts === undefined || (
+      Array.isArray(meta.commandReceipts)
+      && meta.commandReceipts.length <= MAX_SESSION_COMMAND_RECEIPTS
+      && meta.commandReceipts.every(isSessionCommandReceipt)
+    )) &&
     (meta.agentRef === undefined || (
       typeof meta.agentRef === "string"
       && meta.agentRef.length >= 3

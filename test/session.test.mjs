@@ -108,6 +108,52 @@ test("session persistence validates and retains stable compaction window identit
   }
 });
 
+test("session command receipts round-trip redacted and stay out of metadata sidecars", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-command-receipt-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const id = "command-receipt-fixture";
+    const at = "2026-09-06T01:00:00.000Z";
+    const commandId = "11111111-1111-4111-8111-111111111111";
+    const fakeSecret = "sk-commandreceipt1234567890";
+    saveSession({
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "receipt fixture",
+      createdAt: at,
+      updatedAt: at,
+      commandReceipts: [{
+        v: 1,
+        commandId,
+        method: "session.submit",
+        requestHash: "a".repeat(64),
+        completedAt: at,
+        outcome: { kind: "result", json: JSON.stringify({ reply: `done ${fakeSecret}` }) },
+      }],
+    }, [{ role: "user", content: "run once" }]);
+
+    const loaded = loadSession(id);
+    assert.equal(loaded.meta.commandReceipts[0].commandId, commandId);
+    assert.equal(loaded.meta.commandReceipts[0].requestHash, "a".repeat(64));
+    assert.doesNotMatch(loaded.meta.commandReceipts[0].outcome.json, new RegExp(fakeSecret));
+    const sidecar = readFileSync(join(home, ".hara", "sessions", `${id}.metadata`), "utf8");
+    assert.doesNotMatch(sidecar, /commandReceipts|sk-commandreceipt/);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("session projection journal is append-only, chained, and ignores a torn final record", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-session-journal-"));
   const previousHome = process.env.HOME;

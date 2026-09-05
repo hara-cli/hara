@@ -10,7 +10,15 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
-import { historyForClient, serveAutoCompactDecision, startServe } from "../dist/serve/server.js";
+import {
+  historyForClient,
+  MAX_SERVE_SOCKET_BUFFERED_BYTES,
+  sendBoundedSocketFrame,
+  serveAutoCompactDecision,
+  sessionCommandRequestHash,
+  startServe,
+  validSessionCommandId,
+} from "../dist/serve/server.js";
 import { addJob, cronDir, findJob, loadJobs, removeJob, saveJobs } from "../dist/cron/store.js";
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
@@ -39,6 +47,67 @@ test("serve auto-compaction policy is opt-in for embedders and rejects unsafe ca
     false,
     "a corrupt cap falls back to the production default instead of compacting every turn",
   );
+});
+
+test("session command identity is UUID-bound and hashes equivalent JSON deterministically", () => {
+  const commandId = "11111111-1111-4111-8111-111111111111";
+  assert.equal(validSessionCommandId(commandId), true);
+  assert.equal(validSessionCommandId("user supplied retry key"), false);
+  const first = sessionCommandRequestHash("session.submit", {
+    commandId,
+    sessionId: "session-a",
+    text: "continue",
+    nested: { z: 2, a: [true, null] },
+  });
+  const reordered = sessionCommandRequestHash("session.submit", {
+    nested: { a: [true, null], z: 2 },
+    text: "continue",
+    sessionId: "session-a",
+    commandId: "22222222-2222-4222-8222-222222222222",
+  });
+  assert.equal(first, reordered, "commandId and JSON key order do not alter the request identity");
+  assert.notEqual(first, sessionCommandRequestHash("session.submit", {
+    sessionId: "session-a",
+    text: "different",
+    nested: { z: 2, a: [true, null] },
+  }));
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assert.throws(
+    () => sessionCommandRequestHash("session.submit", cyclic),
+    /must not be cyclic/,
+  );
+});
+
+test("Serve socket writes close a slow observer instead of buffering without bound", () => {
+  const sent = [];
+  const closed = [];
+  const socket = {
+    OPEN: 1,
+    readyState: 1,
+    bufferedAmount: MAX_SERVE_SOCKET_BUFFERED_BYTES - Buffer.byteLength("frame-1", "utf8"),
+    send: (frame) => sent.push(frame),
+    close: (code, reason) => closed.push({ code, reason }),
+  };
+  assert.equal(sendBoundedSocketFrame(socket, "frame-1"), true);
+  assert.deepEqual(sent, ["frame-1"]);
+  socket.bufferedAmount += 1;
+  assert.equal(sendBoundedSocketFrame(socket, "frame-2"), false);
+  assert.deepEqual(sent, ["frame-1"]);
+  assert.deepEqual(closed, [{ code: 1013, reason: "client too slow; reconnect and refresh" }]);
+  socket.readyState = 3;
+  assert.equal(sendBoundedSocketFrame(socket, "frame-3"), false);
+  assert.equal(closed.length, 1, "an already-closed observer is not closed twice");
+
+  const oversizedClosed = [];
+  assert.equal(sendBoundedSocketFrame({
+    OPEN: 1,
+    readyState: 1,
+    bufferedAmount: 0,
+    send: () => assert.fail("an oversized frame must not be sent"),
+    close: (code, reason) => oversizedClosed.push({ code, reason }),
+  }, "x".repeat(MAX_SERVE_SOCKET_BUFFERED_BYTES + 1)), false);
+  assert.deepEqual(oversizedClosed, [{ code: 1013, reason: "client too slow; reconnect and refresh" }]);
 });
 
 /** Tiny JSON-RPC-over-ws test client: request/response correlation + notification capture. */
@@ -550,7 +619,9 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       init.result.capabilities.features,
       [
         "composer.attachments.v1",
+        "events.bounded-delivery.v1",
         "models.capabilities.v1",
+        "sessions.command-idempotency.v1",
         "sessions.readonly-history.v1",
         "sessions.cross-profile-fork.v1",
         "sessions.space-route.v1",
@@ -564,8 +635,10 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "external.sessions.runtime.v1",
         "external.sessions.native-resume.v1",
         "external.sessions.launch-options.v1",
+        "external.sessions.command-idempotency.serve-lifetime.v1",
         "external.sessions.terminal-mirror.v1",
         "external.sessions.terminal-stream.v2",
+        "external.sessions.terminal-input-sequence.v1",
         "external.sessions.runtime-remove.v1",
         "spaces.tenant-boundary.v1",
       ],
@@ -2747,6 +2820,172 @@ test("serve e2e: session.submit atomically starts or steers and reports non-subm
     releaseFirst?.();
     if (starting) await starting.catch(() => {});
     c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: commandId replays one durable session result across reconnect and rejects conflicting reuse", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-command-replay-"));
+  const store = memStore();
+  const commandId = randomUUID();
+  let providerCalls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      providerCalls += 1;
+      onText("completed once");
+      return { text: "completed once", toolUses: [], stop: "end", usage: { input: 2, output: 3 } };
+    },
+  };
+  let firstServer = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  let client = await connect(firstServer.port);
+  let sessionId;
+  let firstResult;
+  try {
+    const initialized = await client.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.features.includes("sessions.command-idempotency.v1"));
+    assert.deepEqual(initialized.result.capabilities.limits, {
+      sessionCommandReceipts: 64,
+      sessionCommandReplayResults: 8,
+      externalCommandReceipts: 64,
+      externalCommandResultBytes: 256 * 1024,
+      socketBufferedBytes: 4 * 1024 * 1024,
+    });
+    sessionId = (await client.call("session.create", {})).result.sessionId;
+    const request = { sessionId, text: "perform this only once", commandId };
+    firstResult = (await client.call("session.submit", request)).result;
+    assert.equal(firstResult.reply, "completed once");
+    assert.equal(providerCalls, 1);
+
+    const sameConnection = await client.call("session.submit", request);
+    assert.deepEqual(sameConnection.result, firstResult);
+    assert.equal(providerCalls, 1, "same-process retry reads the durable receipt");
+    assert.equal(store.saved.get(sessionId).meta.commandReceipts.length, 1);
+  } finally {
+    client.close();
+    await firstServer.close();
+  }
+
+  firstServer = null;
+  client = null;
+  const restarted = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const reconnected = await connect(restarted.port);
+  try {
+    await reconnected.call("initialize", { token: "tok" });
+    assert.equal((await reconnected.call("session.resume", { sessionId })).error, undefined);
+    const replayed = await reconnected.call("session.submit", {
+      commandId,
+      text: "perform this only once",
+      sessionId,
+    });
+    assert.deepEqual(replayed.result, firstResult, "reordered reconnect payload replays the first result");
+    assert.equal(providerCalls, 1, "a Serve restart does not repeat provider work");
+
+    const conflict = await reconnected.call("session.submit", {
+      sessionId,
+      text: "different command",
+      commandId,
+    });
+    assert.equal(conflict.error.code, -32005);
+    assert.match(conflict.error.message, /different session command/i);
+    assert.equal(providerCalls, 1);
+  } finally {
+    reconnected.close();
+    await restarted.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: commandId also persists a terminal provider error across restart", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-command-error-replay-"));
+  const store = memStore();
+  const commandId = randomUUID();
+  const requestText = "fail without replaying";
+  let providerCalls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn() {
+      providerCalls += 1;
+      return { text: "", toolUses: [], stop: "error", errorMsg: "upstream unavailable" };
+    },
+  };
+  const firstServer = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const firstClient = await connect(firstServer.port);
+  let sessionId;
+  let firstError;
+  try {
+    await firstClient.call("initialize", { token: "tok" });
+    sessionId = (await firstClient.call("session.create", {})).result.sessionId;
+    firstError = (await firstClient.call("session.submit", {
+      sessionId,
+      text: requestText,
+      commandId,
+    })).error;
+    assert.equal(firstError.code, -32603);
+    assert.match(firstError.message, /upstream unavailable/i);
+    assert.equal(providerCalls, 1);
+  } finally {
+    firstClient.close();
+    await firstServer.close();
+  }
+
+  const restarted = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const reconnected = await connect(restarted.port);
+  try {
+    await reconnected.call("initialize", { token: "tok" });
+    await reconnected.call("session.resume", { sessionId });
+    const replayed = await reconnected.call("session.submit", {
+      sessionId,
+      text: requestText,
+      commandId,
+    });
+    assert.deepEqual(replayed.error, firstError);
+    assert.equal(providerCalls, 1, "a terminal failure is not a license to replay uncertain provider work");
+  } finally {
+    reconnected.close();
+    await restarted.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: an unsaved command receipt fails closed and blocks an immediate duplicate", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-command-receipt-failure-"));
+  const stored = memStore();
+  const store = {
+    ...stored,
+    save(meta, history, task) {
+      if (meta.commandReceipts?.length) throw new Error("simulated receipt storage failure");
+      stored.save(meta, history, task);
+    },
+  };
+  let providerCalls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      providerCalls += 1;
+      onText("action completed");
+      return { text: "action completed", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const sessionId = (await client.call("session.create", {})).result.sessionId;
+    const request = { sessionId, text: "run once", commandId: randomUUID() };
+    const first = await client.call("session.submit", request);
+    assert.equal(first.error.code, -32603);
+    assert.match(first.error.message, /receipt could not be saved/i);
+    const duplicate = await client.call("session.submit", request);
+    assert.equal(duplicate.error.code, -32603);
+    assert.match(duplicate.error.message, /receipt could not be saved/i);
+    assert.equal(providerCalls, 1, "uncertain persistence never permits an immediate duplicate action");
+  } finally {
+    client.close();
     await srv.close();
     rmSync(dir, { recursive: true, force: true });
   }
