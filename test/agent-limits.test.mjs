@@ -250,6 +250,130 @@ test("an active tool loop hard-stops at maxRounds and alerts exactly once", asyn
   assert.equal(notices.filter((message) => /agent paused/.test(message)).length, 1);
 });
 
+test("a recently checkpointed task crosses the ordinary round boundary automatically", async () => {
+  const created = createTaskExecution("finish a healthy bounded task", "auto-continue-turn");
+  const accepted = applyTaskBrief(created, {
+    intent: "investigate",
+    goal: "finish a healthy bounded task",
+    acceptance: ["the final observation is reported"],
+    steps: ["checkpoint", "inspect", "finish"],
+  });
+  assert.equal(accepted.ok, true);
+  let task = accepted.task;
+  let turns = 0;
+  const notices = [];
+  const provider = {
+    id: "healthy-auto-continue",
+    model: "healthy-auto-continue",
+    async turn() {
+      turns += 1;
+      if (turns === 1) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "healthy-checkpoint",
+            name: "task_checkpoint",
+            input: {
+              current_step: "inspect the changing evidence",
+              facts: [{ key: "checkpoint_ready", value: true, evidence: "task strategy was reviewed" }],
+            },
+          }],
+          stop: "tool_use",
+        };
+      }
+      if (turns <= 3) {
+        return {
+          text: "",
+          toolUses: [{ id: `healthy-probe-${turns}`, name: "healthy_probe", input: { turn: turns } }],
+          stop: "tool_use",
+        };
+      }
+      return { text: "verified after automatic continuation", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "finish the task" }], base(provider, {
+    ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
+    maxRounds: 3,
+    timeoutMs: "10s",
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate: (next) => { task = next; },
+      onCheckpoint: (next) => { task = next; },
+      onRoundUsage: (next) => { task = next; },
+    },
+    extraTools: [{
+      name: "healthy_probe",
+      description: "returns changing bounded evidence",
+      input_schema: { type: "object", properties: { turn: { type: "number" } }, required: ["turn"] },
+      kind: "read",
+      async run(input) { return `observation-${input.turn}`; },
+    }],
+  }));
+  assert.equal(outcome.status, "completed", outcome.error);
+  assert.equal(turns, 4);
+  assert.equal(task.roundsUsed, 4, "closed rounds are persisted once across the automatic boundary");
+  assert.ok(notices.some((message) => /continuing automatically.*run 3→6/.test(message)));
+});
+
+test("autoContinue false preserves the explicit round pause even after a checkpoint", async () => {
+  const created = createTaskExecution("pause at the configured boundary", "manual-continue-turn");
+  const accepted = applyTaskBrief(created, {
+    intent: "investigate",
+    goal: "pause at the configured boundary",
+    acceptance: ["the boundary is observed"],
+    steps: ["checkpoint", "inspect"],
+  });
+  assert.equal(accepted.ok, true);
+  let task = accepted.task;
+  let turns = 0;
+  const provider = {
+    id: "manual-continue",
+    model: "manual-continue",
+    async turn() {
+      turns += 1;
+      return turns === 1
+        ? {
+            text: "",
+            toolUses: [{
+              id: "manual-checkpoint",
+              name: "task_checkpoint",
+              input: { current_step: "pause after bounded inspection" },
+            }],
+            stop: "tool_use",
+          }
+        : {
+            text: "",
+            toolUses: [{ id: `manual-probe-${turns}`, name: "manual_probe", input: { turn: turns } }],
+            stop: "tool_use",
+          };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "inspect with an explicit stop" }], base(provider, {
+    maxRounds: 3,
+    autoContinue: false,
+    timeoutMs: "10s",
+    quiet: true,
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate: (next) => { task = next; },
+      onCheckpoint: (next) => { task = next; },
+      onRoundUsage: (next) => { task = next; },
+    },
+    extraTools: [{
+      name: "manual_probe",
+      description: "returns changing evidence",
+      input_schema: { type: "object", properties: { turn: { type: "number" } }, required: ["turn"] },
+      kind: "read",
+      async run(input) { return `manual-observation-${input.turn}`; },
+    }],
+  }));
+  assert.equal(outcome.stopReason, "max_rounds");
+  assert.equal(turns, 3);
+  assert.equal(task.roundsUsed, 3);
+});
+
 test("unchanged successful tool evidence stops before the general round limit", async () => {
   let turns = 0;
   let tools = 0;
@@ -1031,7 +1155,7 @@ test("the cumulative 50-round task checkpoint reaches the next provider request"
   assert.equal(task.roundsUsed, 50);
   assert.equal(sawCheckpoint, true);
   assert.ok(notices.some((message) => /task checkpoint: 50\/100/.test(message)));
-  assert.match(taskRoundCheckpointReminder(50, 100), /only an explicit \/continue opens the next bounded tranche/);
+  assert.match(taskRoundCheckpointReminder(50, 100), /may open the next bounded tranche automatically/);
 });
 
 test("the cumulative 100-round task cap pauses before another provider call", async () => {
@@ -1323,6 +1447,56 @@ test("ask_user wait does not consume active budget and resumes the same tool rou
   assert.ok(Date.now() - started > 1_050);
   const toolRound = history.find((message) => message.role === "tool");
   assert.equal(toolRound.results[0].content, "use the gallery");
+});
+
+test("ask_user persists a verified decision before the next provider round", async () => {
+  let task = createTaskExecution("choose one database", "retained-decision-turn");
+  let turns = 0;
+  let checkpoints = 0;
+  let nextSystem = "";
+  const provider = {
+    id: "retained-decision",
+    model: "retained-decision",
+    async turn({ system }) {
+      turns += 1;
+      if (turns === 1) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "ask-database",
+            name: "ask_user",
+            input: { question: "Which database should the project use?", options: ["PostgreSQL", "SQLite"] },
+          }],
+          stop: "tool_use",
+        };
+      }
+      nextSystem = system;
+      return { text: "using the retained choice", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "choose the database with me" }], base(provider, {
+    timeoutMs: "10s",
+    maxRounds: 10,
+    quiet: true,
+    ctx: {
+      cwd: process.cwd(),
+      ask: async () => "PostgreSQL",
+    },
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate: (next) => { task = next; },
+      onCheckpoint: (next) => { task = next; checkpoints += 1; },
+      onRoundUsage: (next) => { task = next; },
+    },
+  }));
+  assert.equal(outcome.status, "completed", outcome.error);
+  assert.equal(checkpoints, 1, "the decision is durable at the closed ask_user tool boundary");
+  assert.equal(task.decisions.length, 1);
+  assert.equal(task.decisions[0].answer, "PostgreSQL");
+  assert.equal(task.decisions[0].source, "interactive");
+  assert.match(nextSystem, /Verified user decisions/);
+  assert.match(nextSystem, /PostgreSQL/);
 });
 
 test("headless ask_user without an explicit default stops before any same-round side effect", async () => {

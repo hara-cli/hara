@@ -1,4 +1,4 @@
-import type { Provider, NeutralMsg, ToolResult } from "../providers/types.js";
+import type { Provider, NeutralMsg, ProviderRetryEvent, ToolResult } from "../providers/types.js";
 import {
   approvalKindForOperation,
   getTool,
@@ -40,7 +40,7 @@ import {
   pythonSyntaxRecoveryNote,
   recordCall,
 } from "./repeat-guard.js";
-import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration } from "./limits.js";
+import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration, MAX_AGENT_MAX_ROUNDS } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
@@ -57,10 +57,13 @@ import { rolesDigest } from "../org/roles.js";
 import {
   applyTaskBrief,
   applyTaskCheckpoint,
+  extendTaskRoundBudget,
   freshTaskCompletion,
+  recordTaskDecision,
   recordTaskRoundUsage,
   taskRoundBudget,
   taskCheckpointContext,
+  TASK_ROUND_CHECKPOINT_INTERVAL,
   type TaskBrief,
   type TaskExecution,
 } from "../session/task.js";
@@ -336,7 +339,12 @@ export function composeSystem(
   memory?: string,
   continuationSession = false,
   executionContext?: string,
-  intake?: { enabled: boolean; brief?: TaskBrief; checkpoint?: TaskExecution["checkpoint"] },
+  intake?: {
+    enabled: boolean;
+    brief?: TaskBrief;
+    checkpoint?: TaskExecution["checkpoint"];
+    decisions?: TaskExecution["decisions"];
+  },
   profileId?: string,
   runtimeTime?: RuntimeTimePromptOptions,
 ): AssembledSystemPrompt {
@@ -344,7 +352,7 @@ export function composeSystem(
   assembler.add("core", "static", "core", override || HARA_SYSTEM());
   const skills = skillsDigest(cwd);
   const roles = override ? "" : rolesDigest(cwd, profileId);
-  const checkpointContext = taskCheckpointContext(intake?.checkpoint);
+  const checkpointContext = taskCheckpointContext(intake?.checkpoint, intake?.decisions);
   const intakeContext = !intake?.enabled
     ? ""
     : intake.brief
@@ -472,12 +480,18 @@ export interface RunOpts {
   timeoutMs?: number | string;
   /** Maximum provider/tool rounds for this run. Defaults to 64, hard max 256. */
   maxRounds?: number | string;
+  /** Continue a healthy, checkpointed task into another bounded round tranche. Defaults on for main tasks;
+   * repeat/no-progress guards, the active deadline, and the absolute 256-round ceiling remain hard stops. */
+  autoContinue?: boolean;
   /** One-shot observer for a hard lifecycle stop. Messages contain metadata only, never prompts/tool args. */
   onLimit?: (event: RunLimitEvent) => void;
   /** Observe each provider Promise's physical lifetime. The agent loop races cancellation against providers
    *  that ignore AbortSignal, but serve keeps its cross-process session lock until the abandoned Promise
    *  actually settles. Observers must attach both fulfillment and rejection handlers. */
   onProviderTurn?: (turn: Promise<unknown>) => void;
+  /** Credential-free transport retry telemetry. Persistent hosts may journal/log this without request
+   * bodies, prompts, URLs, or authorization material. */
+  onProviderRetry?: (event: ProviderRetryEvent) => void;
   /** Observe each tool Promise's physical lifetime. A lifecycle deadline stops logical progress immediately,
    * while persistent hosts retain the session lease until a non-cooperative tool actually settles. */
   onToolRun?: (run: Promise<unknown>, tool: { name: string; kind: Tool["kind"] }) => void;
@@ -548,6 +562,7 @@ interface RunLifecycle {
   pauseDepth: number;
   timeoutMs: number;
   maxRounds: number;
+  roundTrancheSize: number;
   rounds: number;
   timedOut: boolean;
   warned: boolean;
@@ -563,6 +578,7 @@ interface RunLifecycle {
     readObserved: boolean;
   };
   taskRoundsUsed: number;
+  taskRoundsCommitted: number;
   taskRoundLimit?: number;
   taskRoundCheckpointAt?: number;
   taskRoundCheckpointInjected: boolean;
@@ -594,7 +610,8 @@ export function taskRoundCheckpointReminder(used: number, limit: number): string
     `Task-level round checkpoint: ${used}/${limit} cumulative provider rounds have been used across this task. ` +
     "Before expanding work, verify the original objective and acceptance checks, summarize concrete evidence and errors, " +
     "inspect existing workspace tools/scripts, and state a materially different strategy if progress has stalled. " +
-    `The task will pause at ${limit} rounds and only an explicit /continue opens the next bounded tranche.`
+    `At ${limit} rounds Hara may open the next bounded tranche automatically only when this run records a ` +
+    "fresh durable checkpoint and continues making new progress; otherwise it pauses for explicit /continue."
   );
 }
 
@@ -774,6 +791,7 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
     pauseDepth: 0,
     timeoutMs,
     maxRounds,
+    roundTrancheSize: maxRounds,
     rounds: 0,
     timedOut: false,
     warned: false,
@@ -783,6 +801,7 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
     disposed: false,
     failedCalls: new Map<string, number>(),
     taskRoundsUsed: taskBudget?.used ?? 0,
+    taskRoundsCommitted: 0,
     ...(taskBudget ? {
       taskRoundLimit: taskBudget.limit,
       taskRoundCheckpointAt: taskBudget.checkpointAt,
@@ -831,9 +850,10 @@ export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<Ru
   const life = createRunLifecycle(opts);
   try {
     const outcome = await runAgentInner(history, opts, life);
-    if (life.rounds > 0 && opts.taskIntake?.onRoundUsage) {
+    const uncommittedRounds = life.rounds - life.taskRoundsCommitted;
+    if (uncommittedRounds > 0 && opts.taskIntake?.onRoundUsage) {
       const current = opts.taskIntake.current?.() ?? opts.taskIntake.task;
-      opts.taskIntake.onRoundUsage(recordTaskRoundUsage(current, life.rounds));
+      opts.taskIntake.onRoundUsage(recordTaskRoundUsage(current, uncommittedRounds));
     }
     return outcome;
   } finally {
@@ -1170,6 +1190,52 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   let noProgressNudged = false;
   let workRoundsWithoutCheckpoint = 0;
   let checkpointNudged = false;
+  let lastDurableCheckpointRound = 0;
+
+  /** A hard numeric boundary is allowed to roll forward only when the model has recently written a real
+   * task checkpoint and has not entered an unchanged-evidence cycle. This is intentionally stricter than
+   * "a tool returned success": it keeps the old safety pause for blind loops while removing routine
+   * /continue interruptions from long, converging work. */
+  const canAutoContinue = (): boolean => {
+    syncIntakeTask();
+    const completion = freshTaskCompletion(intakeTask);
+    const checkpointAge = life.rounds - lastDurableCheckpointRound;
+    return opts.autoContinue !== false
+      && Boolean(opts.taskIntake)
+      && typeof opts.taskIntake?.onRoundUsage === "function"
+      && intakeTask?.status === "running"
+      && completion?.state !== "awaiting_user"
+      && lastDurableCheckpointRound > 0
+      && checkpointAge >= 0
+      && checkpointAge <= Math.max(16, Math.ceil(life.roundTrancheSize / 4))
+      && noProgressRounds === 0;
+  };
+
+  /** Persist the exact rounds already consumed before opening another tranche. A crash after this boundary
+   * can therefore resume from the new budget without replaying or under-counting the closed provider work. */
+  const persistAutomaticTranche = (extendTaskBudget: boolean): { previousTaskLimit?: number; nextTaskLimit?: number } => {
+    syncIntakeTask();
+    if (!intakeTask || !opts.taskIntake) throw new Error("automatic continuation requires an active task");
+    const uncommittedRounds = life.rounds - life.taskRoundsCommitted;
+    let nextTask = uncommittedRounds > 0
+      ? recordTaskRoundUsage(intakeTask, uncommittedRounds)
+      : intakeTask;
+    const previousTaskLimit = taskRoundBudget(nextTask).limit;
+    if (extendTaskBudget) nextTask = extendTaskRoundBudget(nextTask);
+    const nextTaskLimit = taskRoundBudget(nextTask).limit;
+    if (extendTaskBudget && nextTaskLimit === previousTaskLimit) {
+      throw new Error("task reached the absolute cumulative round limit");
+    }
+    intakeTask = nextTask;
+    opts.taskIntake.onRoundUsage?.(nextTask);
+    life.taskRoundsCommitted = life.rounds;
+    if (extendTaskBudget) {
+      life.taskRoundLimit = nextTaskLimit;
+      life.taskRoundCheckpointAt = Math.max(0, nextTaskLimit - TASK_ROUND_CHECKPOINT_INTERVAL);
+      life.taskRoundCheckpointInjected = false;
+    }
+    return { previousTaskLimit, nextTaskLimit };
+  };
 
   // Guardian: engaged only on HIGH-RISK actions (see classifyRisk). `on` gates the whole layer so normal
   // work never pays for it; the breaker is per-run (a hard stop after repeated blocks).
@@ -1184,10 +1250,42 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // A cancellation that already happened is authoritative: do not start pending-input work, a provider
     // request, or any later tool round merely to give it an already-aborted signal.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
-    if (life.taskRoundLimit !== undefined && life.taskRoundsUsed + life.rounds >= life.taskRoundLimit) {
-      return hardStop(opts, life, "task_round_budget");
+    const taskBoundary = life.taskRoundLimit !== undefined
+      && life.taskRoundsUsed + life.rounds >= life.taskRoundLimit;
+    const runBoundary = life.rounds >= life.maxRounds;
+    if (taskBoundary || runBoundary) {
+      const runCanExtend = !runBoundary || life.maxRounds < MAX_AGENT_MAX_ROUNDS;
+      if (runCanExtend && canAutoContinue()) {
+        try {
+          const taskLimits = persistAutomaticTranche(taskBoundary);
+          const previousRunLimit = life.maxRounds;
+          if (runBoundary) {
+            life.maxRounds = Math.min(MAX_AGENT_MAX_ROUNDS, life.maxRounds + life.roundTrancheSize);
+          }
+          const details = [
+            ...(runBoundary ? [`run ${previousRunLimit}→${life.maxRounds}`] : []),
+            ...(taskBoundary && taskLimits.previousTaskLimit !== taskLimits.nextTaskLimit
+              ? [`task ${taskLimits.previousTaskLimit}→${taskLimits.nextTaskLimit}`]
+              : []),
+          ];
+          showRunNotice(
+            opts,
+            `✻ durable progress verified; continuing automatically in a fresh bounded tranche (${details.join(", ")}).`,
+          );
+          history.push({
+            role: "user",
+            content: wrapReminders([
+              "Automatic continuation boundary: Hara persisted the closed round usage and accepted the recent durable task checkpoint. Continue from that checkpoint without repeating completed work. Re-check the original acceptance criteria, keep the next step bounded, and stop normally when verified; unchanged evidence, human-only dependencies, the active deadline, and the absolute run ceiling still halt execution.",
+            ]),
+          });
+          continue;
+        } catch (error) {
+          return interactionFailure("automatic continuation checkpoint", error);
+        }
+      }
+      if (taskBoundary) return hardStop(opts, life, "task_round_budget");
+      return hardStop(opts, life, "max_rounds");
     }
-    if (life.rounds >= life.maxRounds) return hardStop(opts, life, "max_rounds");
     life.rounds += 1;
     const cumulativeTaskRounds = life.taskRoundsUsed + life.rounds;
     if (
@@ -1277,7 +1375,12 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       opts.memory,
       opts.continuationSession,
       opts.executionContext,
-      { enabled: !!opts.taskIntake, brief: intakeTask?.brief, checkpoint: intakeTask?.checkpoint },
+      {
+        enabled: !!opts.taskIntake,
+        brief: intakeTask?.brief,
+        checkpoint: intakeTask?.checkpoint,
+        decisions: intakeTask?.decisions,
+      },
       ctx.profileId,
     );
     const system = assembledSystem.text;
@@ -1387,6 +1490,15 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       onActivity: () => {
         if (attempt.signal.aborted) return;
         lastEvent = Date.now();
+      },
+      onRetry: (event) => {
+        if (attempt.signal.aborted) return;
+        lastEvent = Date.now();
+        opts.onProviderRetry?.(event);
+        if (opts.quiet) return;
+        const note = `✻ ${event.kind} · provider attempt ${event.nextAttempt} in ${Math.max(0, Math.ceil(event.delayMs / 100) / 10)}s…`;
+        if (sink) sink.notice(note);
+        else out(c.dim(`${note}\n`));
       },
       onText: (d) => {
         if (attempt.signal.aborted) return;
@@ -1519,7 +1631,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
         continue;
       }
-      const kind = classifyError(r.errorMsg ?? "");
+      const kind = classifyError(r.errorMsg ?? "", r.errorMetadata?.status);
       if (kind === "context_overflow" && !contextOverflowRetried) {
         contextOverflowRetried = true;
         contextBudgetScale = 0.5;
@@ -2371,6 +2483,44 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }
     await flush();
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
+    let decisionRetentionError: string | undefined;
+    if (opts.taskIntake) {
+      for (let index = 0; index < r.toolUses.length; index++) {
+        const toolUse = r.toolUses[index];
+        const result = results[index];
+        if (
+          toolUse.name !== "ask_user"
+          || !result
+          || result.isError === true
+          || looksFailed(result.content, toolUse.name)
+        ) continue;
+        syncIntakeTask();
+        const rawInput = toolUse.input && typeof toolUse.input === "object" && !Array.isArray(toolUse.input)
+          ? toolUse.input as Record<string, unknown>
+          : {};
+        const explicitDefault = typeof rawInput.default === "string" ? rawInput.default.trim() : "";
+        const usedDefault = result.content.startsWith("(no interactive user available — used the explicit default:");
+        const question = [rawInput.header, rawInput.context, rawInput.question]
+          .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+          .map((part) => part.trim())
+          .join("\n");
+        const retained = recordTaskDecision(intakeTask, {
+          turnId: intakeTask?.turnId ?? "",
+          callId: toolUse.id,
+          question,
+          answer: usedDefault && explicitDefault ? explicitDefault : result.content,
+          source: usedDefault ? "default" : "interactive",
+        });
+        if (!retained.ok) {
+          decisionRetentionError = retained.reason;
+          break;
+        }
+        if (retained.task !== intakeTask) {
+          intakeTask = retained.task;
+          taskStateDirty = true;
+        }
+      }
+    }
     const boundedContents = limitToolResultBatch(results.map((result) => result.content));
     for (let i = 0; i < results.length; i++) results[i].content = boundedContents[i];
     history.push({ role: "tool", results });
@@ -2383,6 +2533,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         // this exact boundary instead of overwriting that acknowledged input with the earlier snapshot.
         const acceptedBrief = intakeTask.brief;
         const acceptedCheckpoint = intakeTask.checkpoint;
+        const acceptedDecisions = intakeTask.decisions;
         const acceptedUpdatedAt = intakeTask.updatedAt;
         syncIntakeTask();
         // The current owner may still carry the previous brief when this call is a revision. The accepted
@@ -2393,6 +2544,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             ...intakeTask,
             ...(acceptedBrief ? { brief: acceptedBrief } : {}),
             ...(acceptedCheckpoint ? { checkpoint: acceptedCheckpoint } : {}),
+            ...(acceptedDecisions ? { decisions: acceptedDecisions } : {}),
             updatedAt: Date.parse(acceptedUpdatedAt) >= Date.parse(intakeTask.updatedAt)
               ? acceptedUpdatedAt
               : intakeTask.updatedAt,
@@ -2407,6 +2559,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     }
     if (unansweredUserQuestion) {
       return { status: "error", error: HEADLESS_USER_INPUT_REQUIRED };
+    }
+    if (decisionRetentionError) {
+      return interactionFailure("user-decision retention", decisionRetentionError);
     }
     if (repeatHalt) return hardStop(opts, life, "repeat_loop", repeatHalt);
 
@@ -2430,6 +2585,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       "ask_user",
     ].includes(toolUse.name));
     if (opts.taskIntake && successfulTaskCheckpoint) {
+      lastDurableCheckpointRound = life.rounds;
       workRoundsWithoutCheckpoint = 0;
       checkpointNudged = false;
     } else if (opts.taskIntake && substantiveWorkRound) {

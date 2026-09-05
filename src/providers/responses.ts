@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
+import { providerErrorMetadata } from "./retry.js";
 import { assembleToolCalls } from "./openai.js";
 import { reasoningParams, type Effort, type ReasoningStyle } from "./reasoning.js";
 import { applyReasoningParams, reasoningRouteKey, sendWithReasoningFallback } from "./reasoning-fallback.js";
@@ -183,7 +184,7 @@ export function createResponsesProvider(opts: {
   if (opts.dashscopeSessionCache) defaultHeaders["x-dashscope-session-cache"] = "enable";
   const client = new OpenAI({
     apiKey: opts.apiKey,
-    maxRetries: 4,
+    maxRetries: 0,
     ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
     ...(Object.keys(defaultHeaders).length ? { defaultHeaders } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
@@ -404,11 +405,13 @@ export function createResponsesProvider(opts: {
       } catch (error: any) {
         if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
         const networkFailure = safeModelNetworkFailureMessage(error);
+        const errorMetadata = providerErrorMetadata(error);
         return {
           text: "",
           toolUses: [],
           stop: "error",
           errorMsg: networkFailure ?? safeProviderErrorMessage(error, [opts.apiKey]),
+          ...(errorMetadata ? { errorMetadata } : {}),
         };
       }
 

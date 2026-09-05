@@ -111,6 +111,21 @@ test("Volcengine auto retries the stable alias only for an empty Agent Plan capa
   await streamed.turn({ system: "reply", history: [], tools: [], onText: (delta) => streamedText.push(delta) });
   assert.deepEqual(streamedText, ["already shown"]);
   assert.equal(fallbackTurns, 1, "an emitted text delta is never replayed even if a provider returns an empty aggregate");
+
+  const reasoning = withVolcengineAgentPlanAutoFallback({
+    ...primary,
+    async turn(args) {
+      args.onReasoning?.("private progress");
+      return {
+        text: "",
+        toolUses: [],
+        stop: "error",
+        errorMsg: "404 The requested model does not support the agent plan feature",
+      };
+    },
+  }, fallback);
+  await reasoning.turn({ system: "reply", history: [], tools: [], onText() {}, onReasoning() {} });
+  assert.equal(fallbackTurns, 1, "reasoning activity also makes the compatibility request non-replayable");
 });
 
 test("named BYOK profile is the routing source of truth over personal/global config", () => {

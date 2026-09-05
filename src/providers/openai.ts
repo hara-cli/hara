@@ -3,6 +3,7 @@ import type { Provider, NeutralMsg, ToolUse, TurnArgs, TurnResult } from "./type
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
+import { providerErrorMetadata } from "./retry.js";
 import { reasoningParams, type Effort, type ReasoningStyle } from "./reasoning.js";
 import { applyReasoningParams, reasoningRouteKey, sendWithReasoningFallback } from "./reasoning-fallback.js";
 import { resolvePlatform } from "./registry.js";
@@ -113,7 +114,9 @@ export function createOpenAIProvider(opts: {
 }): Provider {
   const client = new OpenAI({
     apiKey: opts.apiKey,
-    maxRetries: 4,
+    // Hara owns retry safety/backoff above every provider. SDK-local retries cannot know whether another
+    // adapter already emitted activity and make cancellation/attempt telemetry inconsistent.
+    maxRetries: 0,
     ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
     ...(opts.omitAuthorization ? { defaultHeaders: { Authorization: null } } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
@@ -192,11 +195,13 @@ export function createOpenAIProvider(opts: {
       } catch (e: any) {
         if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
         const networkFailure = safeModelNetworkFailureMessage(e);
+        const errorMetadata = providerErrorMetadata(e);
         return {
           text: "",
           toolUses: [],
           stop: "error",
           errorMsg: networkFailure ?? safeProviderErrorMessage(e, [opts.apiKey]),
+          ...(errorMetadata ? { errorMetadata } : {}),
         };
       }
 

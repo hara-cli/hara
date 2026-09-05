@@ -7,6 +7,7 @@ import {
   constants,
   existsSync,
   fstatSync,
+  fchmodSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -45,6 +46,8 @@ export const MAX_SESSION_JSON_NODES = 250_000;
 export const MAX_SESSION_ARRAY_ITEMS = 50_000;
 export const MAX_SESSION_STRING_CHARS = 8 * 1024 * 1024;
 export const MAX_SESSION_METADATA_FILE_BYTES = 4 * 1024 * 1024;
+export const MAX_SESSION_JOURNAL_BYTES = 16 * 1024 * 1024;
+export const MAX_SESSION_JOURNAL_LINE_BYTES = 4 * 1024;
 
 /** Who created a session. Absent = legacy/interactive. Drives UI segregation (desktop: automated
  *  sessions render as a status timeline, never mixed into the manual list) and the title strategy
@@ -59,6 +62,20 @@ export interface AutomationSessionRun {
   finishedAt?: string;
   durationMs?: number;
   error?: string;
+}
+
+export interface SessionCompactionWindow {
+  /** Stable identity of the installed compacted context window. */
+  windowId: string;
+  /** Window replaced by this installation, when the session was compacted before. */
+  previousWindowId?: string;
+  /** One summarizer attempt. It differs from windowId so retries never masquerade as one request. */
+  attemptId: string;
+  installedAt: string;
+  sourceMessages: number;
+  replacementMessages: number;
+  sourceInputTokens: number;
+  inputAccounting: "provider" | "estimated";
 }
 
 const AUTOMATION_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -136,6 +153,9 @@ export interface SessionMeta {
    * one transcript to one explicit project/global role so clients never silently reuse history as another
    * persona. */
   agentRef?: string;
+  /** Last atomically installed context window. The transcript remains authoritative; this identity lets
+   * reconnecting clients and future event replay distinguish a real replacement from a repeated notice. */
+  compaction?: SessionCompactionWindow;
 }
 export interface SessionData {
   meta: SessionMeta;
@@ -145,6 +165,44 @@ export interface SessionData {
   /** Internal storage generation. Callers must treat it as opaque; it binds acceleration data to the
    * atomically replaced transcript so an interrupted sidecar/index update can never expose stale metadata. */
   storageGeneration?: string;
+}
+
+/** Credential-free commit record for the durable session projection. The transcript keeps content; this
+ * append-only chain records identity, ordering, and hashes so recovery can detect an interrupted/missing
+ * commit without duplicating prompts or tool results into another plaintext store. */
+export interface SessionProjectionEvent {
+  v: 1;
+  type: "projection.committed";
+  eventId: string;
+  sessionId: string;
+  sequence: number;
+  at: string;
+  storageGeneration: string;
+  previousGeneration?: string;
+  snapshotSha256: string;
+  historyLength: number;
+  taskId?: string;
+  taskTurnId?: string;
+  taskStatus?: TaskExecution["status"];
+  compactionWindowId?: string;
+}
+
+export interface SessionJournalRead {
+  events: SessionProjectionEvent[];
+  /** A partial final write is ignored instead of making the complete prefix unreadable. */
+  truncatedTail: boolean;
+  /** Complete malformed lines are isolated; valid later records remain inspectable. */
+  invalidRecords: number;
+}
+
+export interface SessionJournalReplay {
+  last?: SessionProjectionEvent;
+  gaps: Array<{
+    sequence: number;
+    expectedSequence: number;
+    expectedPreviousGeneration: string;
+    actualPreviousGeneration?: string;
+  }>;
 }
 
 export interface SessionMetadataPageOptions {
@@ -708,6 +766,10 @@ function sessionMetadataFile(id: string): string {
   return join(sessionsDir(), `${checkedSessionId(id)}.metadata`);
 }
 
+function sessionJournalFile(id: string): string {
+  return join(sessionsDir(), `${checkedSessionId(id)}.journal`);
+}
+
 /** Session ids become filenames. Gateway/platform ids are not always UUIDs, so allow printable filename
  * characters broadly while rejecting separators, traversal sentinels, NULs, and unbounded names. */
 export function validSessionId(id: unknown): id is string {
@@ -1010,6 +1072,11 @@ export function deleteSession(id: string): boolean {
       // The transcript is authoritative. A stale sidecar cannot resume a deleted session and paged
       // listing requires the transcript filename, so cleanup failure is safe and can be retried later.
     }
+    try {
+      rmSync(sessionJournalFile(id), { force: true });
+    } catch {
+      // As with the sidecar, a journal cannot resume a deleted transcript. Leave an unlink failure inert.
+    }
     deleted = true;
     return true;
   } catch {
@@ -1140,6 +1207,7 @@ function redactedSessionCopy(data: SessionData): SessionData {
   if (data.meta.archived !== undefined) safe.meta.archived = data.meta.archived;
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
   if (data.meta.agentRef !== undefined) safe.meta.agentRef = data.meta.agentRef;
+  if (data.meta.compaction !== undefined) safe.meta.compaction = { ...data.meta.compaction };
   if (data.task && safe.task) {
     // Task objective/steering are free-form and stay redacted. Execution identity and transition metadata
     // are structural: preserve them exactly so resume/expectedTurnId validation cannot be corrupted by a
@@ -1165,8 +1233,194 @@ function redactedSessionCopy(data: SessionData): SessionData {
         if (source.consumedAt !== undefined) target.consumedAt = source.consumedAt;
       }
     }
+    if (data.task.decisions && safe.task.decisions) {
+      for (let index = 0; index < data.task.decisions.length; index++) {
+        const source = data.task.decisions[index];
+        const target = safe.task.decisions[index];
+        if (!source || !target) continue;
+        target.id = source.id;
+        target.turnId = source.turnId;
+        target.callId = source.callId;
+        target.source = source.source;
+        target.createdAt = source.createdAt;
+      }
+    }
   }
   return safe;
+}
+
+function isSessionProjectionEvent(value: unknown, sessionId?: string): value is SessionProjectionEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Partial<Record<keyof SessionProjectionEvent, unknown>>;
+  return event.v === 1
+    && event.type === "projection.committed"
+    && typeof event.eventId === "string"
+    && SESSION_STORAGE_GENERATION.test(event.eventId)
+    && validSessionId(event.sessionId)
+    && (sessionId === undefined || event.sessionId === sessionId)
+    && Number.isSafeInteger(event.sequence)
+    && Number(event.sequence) >= 1
+    && isTimestamp(event.at)
+    && typeof event.storageGeneration === "string"
+    && SESSION_STORAGE_GENERATION.test(event.storageGeneration)
+    && (event.previousGeneration === undefined || (
+      typeof event.previousGeneration === "string"
+      && SESSION_STORAGE_GENERATION.test(event.previousGeneration)
+    ))
+    && typeof event.snapshotSha256 === "string"
+    && /^[0-9a-f]{64}$/u.test(event.snapshotSha256)
+    && Number.isSafeInteger(event.historyLength)
+    && Number(event.historyLength) >= 0
+    && (event.taskId === undefined || typeof event.taskId === "string")
+    && (event.taskTurnId === undefined || typeof event.taskTurnId === "string")
+    && (event.taskStatus === undefined || ["running", "paused", "completed", "blocked"].includes(event.taskStatus as string))
+    && (event.compactionWindowId === undefined || (
+      typeof event.compactionWindowId === "string"
+      && SESSION_STORAGE_GENERATION.test(event.compactionWindowId)
+    ));
+}
+
+/** Read an append-only projection journal. Invalid complete records are counted and skipped; a torn final
+ * record is explicitly reported and ignored, which is the only safe interpretation after a crash. */
+export function readSessionJournal(id: string): SessionJournalRead {
+  if (!validSessionId(id)) return { events: [], truncatedTail: false, invalidRecords: 0 };
+  const path = sessionJournalFile(id);
+  if (!existsSync(path)) return { events: [], truncatedTail: false, invalidRecords: 0 };
+  try {
+    const raw = readVerifiedRegularFileSnapshotSync(path, MAX_SESSION_JOURNAL_BYTES, {
+      action: "read Hara session journal",
+      protectSensitive: false,
+      rejectHardLinks: true,
+    }).text;
+    const truncatedTail = raw.length > 0 && !raw.endsWith("\n");
+    const lines = raw.split("\n");
+    if (truncatedTail) lines.pop();
+    const events: SessionProjectionEvent[] = [];
+    let invalidRecords = 0;
+    for (const line of lines) {
+      if (!line) continue;
+      if (Buffer.byteLength(line, "utf8") > MAX_SESSION_JOURNAL_LINE_BYTES) {
+        invalidRecords += 1;
+        continue;
+      }
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (isSessionProjectionEvent(parsed, id)) events.push(parsed);
+        else invalidRecords += 1;
+      } catch {
+        invalidRecords += 1;
+      }
+    }
+    return { events, truncatedTail, invalidRecords };
+  } catch {
+    return { events: [], truncatedTail: false, invalidRecords: 1 };
+  }
+}
+
+/** Deterministically verify the commit chain in file order. A gap never guesses or rewrites state; the
+ * authoritative transcript remains usable and the missing generation is visible to diagnostics. */
+export function replaySessionJournal(events: readonly SessionProjectionEvent[]): SessionJournalReplay {
+  let last: SessionProjectionEvent | undefined;
+  const gaps: SessionJournalReplay["gaps"] = [];
+  for (const event of events) {
+    if (!isSessionProjectionEvent(event)) continue;
+    if (
+      last
+      && (
+        event.sequence !== last.sequence + 1
+        || event.previousGeneration !== last.storageGeneration
+      )
+    ) {
+      gaps.push({
+        sequence: event.sequence,
+        expectedSequence: last.sequence + 1,
+        expectedPreviousGeneration: last.storageGeneration,
+        ...(event.previousGeneration ? { actualPreviousGeneration: event.previousGeneration } : {}),
+      });
+    }
+    last = event;
+  }
+  return { ...(last ? { last } : {}), gaps };
+}
+
+function journalTail(path: string): { sequence: number; needsBoundary: boolean } {
+  if (!existsSync(path)) return { sequence: 0, needsBoundary: false };
+  let fd: number | undefined;
+  try {
+    const before = lstatSync(path);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink > 1 || before.size > MAX_SESSION_JOURNAL_BYTES) {
+      return { sequence: 0, needsBoundary: false };
+    }
+    fd = openSync(path, constants.O_RDONLY | optionalPosixOpenFlag("O_NOFOLLOW"));
+    const opened = fstatSync(fd);
+    if (!sameOpenedFileIdentity(before, opened) || opened.size !== before.size) {
+      return { sequence: 0, needsBoundary: false };
+    }
+    const length = Math.min(opened.size, MAX_SESSION_JOURNAL_LINE_BYTES * 3);
+    const bytes = Buffer.allocUnsafe(length);
+    const read = length ? readSync(fd, bytes, 0, length, opened.size - length) : 0;
+    const text = bytes.subarray(0, read).toString("utf8");
+    const needsBoundary = opened.size > 0 && !text.endsWith("\n");
+    const lines = text.split("\n");
+    if (needsBoundary) lines.pop();
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index];
+      if (!line) continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (isSessionProjectionEvent(parsed)) return { sequence: parsed.sequence, needsBoundary };
+      } catch {
+        // Preserve corrupt bytes and continue to the most recent complete valid record.
+      }
+    }
+    return { sequence: 0, needsBoundary };
+  } catch {
+    return { sequence: 0, needsBoundary: false };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function appendSessionProjectionEvent(
+  id: string,
+  event: Omit<SessionProjectionEvent, "v" | "type" | "eventId" | "sessionId" | "sequence">,
+): boolean {
+  const path = sessionJournalFile(id);
+  const tail = journalTail(path);
+  const record: SessionProjectionEvent = {
+    v: 1,
+    type: "projection.committed",
+    eventId: randomUUID(),
+    sessionId: id,
+    sequence: tail.sequence + 1,
+    ...event,
+  };
+  const line = `${JSON.stringify(record)}\n`;
+  const boundary = tail.needsBoundary ? "\n" : "";
+  if (Buffer.byteLength(line, "utf8") > MAX_SESSION_JOURNAL_LINE_BYTES) return false;
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      path,
+      constants.O_WRONLY
+        | constants.O_APPEND
+        | constants.O_CREAT
+        | optionalPosixOpenFlag("O_NOFOLLOW"),
+      0o600,
+    );
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.nlink > 1) return false;
+    const addition = Buffer.byteLength(boundary + line, "utf8");
+    if (info.size + addition > MAX_SESSION_JOURNAL_BYTES) return false;
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, boundary + line, "utf8");
+    fsyncSync(fd);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 function writeSessionMetadataSidecar(meta: SessionMeta, generation: string): void {
@@ -1240,6 +1494,15 @@ function persistSessionSnapshot(
   }
 
   const target = sessionFile(meta.id);
+  let previousGeneration: string | undefined;
+  try {
+    if (existsSync(target)) {
+      const currentInfo = lstatSync(target);
+      previousGeneration = readSessionGenerationPrefix(target, currentInfo) ?? undefined;
+    }
+  } catch {
+    previousGeneration = undefined;
+  }
   const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
   let fd: number | undefined;
   try {
@@ -1262,6 +1525,22 @@ function persistSessionSnapshot(
     // A small redacted sidecar lets paged timelines avoid reopening full transcripts. The transcript is
     // already durable and remains authoritative if this best-effort acceleration write is unavailable.
     writeSessionMetadataSidecar(safe.meta, generation);
+    // The transcript commit is authoritative and already durable. Journal failure must not turn that
+    // success into a false client error; the next record's generation link exposes a missing commit as a
+    // gap. Append before advancing the directory watermark because creating a journal changes that state.
+    appendSessionProjectionEvent(meta.id, {
+      at: safe.meta.updatedAt,
+      storageGeneration: generation,
+      ...(previousGeneration ? { previousGeneration } : {}),
+      snapshotSha256: createHash("sha256").update(encoded).digest("hex"),
+      historyLength: safe.history.length,
+      ...(safe.task ? {
+        taskId: safe.task.id,
+        taskTurnId: safe.task.turnId,
+        taskStatus: safe.task.status,
+      } : {}),
+      ...(safe.meta.compaction?.windowId ? { compactionWindowId: safe.meta.compaction.windowId } : {}),
+    });
     if (knownDirectoryState) writeCurrentWriterDirectoryMarker();
   } catch (error) {
     if (fd !== undefined) {
@@ -1320,6 +1599,29 @@ function isAutomationSessionRun(value: unknown): value is AutomationSessionRun {
       || (Number.isSafeInteger(run.durationMs) && Number(run.durationMs) >= 0)
     )
     && (run.error === undefined || (typeof run.error === "string" && run.error.length <= 4_096))
+  );
+}
+
+function isSessionCompactionWindow(value: unknown): value is SessionCompactionWindow {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const window = value as Partial<Record<keyof SessionCompactionWindow, unknown>>;
+  return (
+    typeof window.windowId === "string"
+    && SESSION_STORAGE_GENERATION.test(window.windowId)
+    && (window.previousWindowId === undefined || (
+      typeof window.previousWindowId === "string"
+      && SESSION_STORAGE_GENERATION.test(window.previousWindowId)
+    ))
+    && typeof window.attemptId === "string"
+    && SESSION_STORAGE_GENERATION.test(window.attemptId)
+    && isTimestamp(window.installedAt)
+    && Number.isSafeInteger(window.sourceMessages)
+    && Number(window.sourceMessages) >= 2
+    && Number.isSafeInteger(window.replacementMessages)
+    && Number(window.replacementMessages) >= 1
+    && Number.isSafeInteger(window.sourceInputTokens)
+    && Number(window.sourceInputTokens) >= 0
+    && (window.inputAccounting === "provider" || window.inputAccounting === "estimated")
   );
 }
 
@@ -1451,6 +1753,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
       || meta.approval === "full-auto") &&
     (meta.archived === undefined || typeof meta.archived === "boolean") &&
     (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string") &&
+    (meta.compaction === undefined || isSessionCompactionWindow(meta.compaction)) &&
     (meta.agentRef === undefined || (
       typeof meta.agentRef === "string"
       && meta.agentRef.length >= 3

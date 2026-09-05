@@ -147,6 +147,68 @@ test("loadConfig: blank env/project routing values do not hide global credential
   }
 });
 
+test("loadConfig: autoContinue defaults on and an explicit environment value overrides global config", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-auto-continue-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  mkdirSync(join(home, ".hara"), { recursive: true });
+  mkdirSync(project, { recursive: true });
+  writeFileSync(join(project, "package.json"), "{}");
+  const saved = {
+    HOME: process.env.HOME,
+    USERPROFILE: process.env.USERPROFILE,
+    HARA_AUTO_CONTINUE: process.env.HARA_AUTO_CONTINUE,
+  };
+  try {
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    delete process.env.HARA_AUTO_CONTINUE;
+    writeFileSync(join(home, ".hara", "config.json"), "{}");
+    assert.equal(loadConfig({ cwd: project }).autoContinue, true);
+
+    writeFileSync(join(home, ".hara", "config.json"), JSON.stringify({ autoContinue: false }));
+    assert.equal(loadConfig({ cwd: project }).autoContinue, false);
+    process.env.HARA_AUTO_CONTINUE = "1";
+    assert.equal(loadConfig({ cwd: project }).autoContinue, true);
+    process.env.HARA_AUTO_CONTINUE = "0";
+    assert.equal(loadConfig({ cwd: project }).autoContinue, false);
+    process.env.HARA_AUTO_CONTINUE = "false";
+    assert.equal(loadConfig({ cwd: project }).autoContinue, false);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("config set accepts only explicit booleans for autoContinue", () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-config-auto-continue-cli-"));
+  const home = join(root, "home");
+  mkdirSync(home, { recursive: true });
+  try {
+    const accepted = spawnSync(
+      process.execPath,
+      [join(process.cwd(), "runtime-bootstrap.cjs"), "config", "set", "autoContinue", "false"],
+      { cwd: process.cwd(), encoding: "utf8", env: { ...process.env, HOME: home, USERPROFILE: home } },
+    );
+    assert.equal(accepted.status, 0, accepted.stderr);
+    assert.equal(JSON.parse(readFileSync(join(home, ".hara", "config.json"), "utf8")).autoContinue, "false");
+
+    const rejected = spawnSync(
+      process.execPath,
+      [join(process.cwd(), "runtime-bootstrap.cjs"), "config", "set", "autoContinue", "sometimes"],
+      { cwd: process.cwd(), encoding: "utf8", env: { ...process.env, HOME: home, USERPROFILE: home } },
+    );
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stdout, /Invalid autoContinue value/);
+    assert.equal(JSON.parse(readFileSync(join(home, ".hara", "config.json"), "utf8")).autoContinue, "false");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("config set persists computerUse and explains a conflicting environment override", () => {
   const root = mkdtempSync(join(tmpdir(), "hara-config-computer-use-"));
   const home = join(root, "home");

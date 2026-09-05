@@ -472,7 +472,14 @@ take effect immediately. Answering resumes the remaining budget rather than rese
 five active minutes or at 75% of the round budget, stops after one unchanged retry of an identical failing tool call, and surfaces
 the final reason in CLI, Desktop, or gateway output. Tune intentional long work with
 `hara config set runTimeoutMs 45m` (1s..2h) and `hara config set maxAgentRounds 96` (1..256), or
-`HARA_RUN_TIMEOUT_MS` / `HARA_MAX_AGENT_ROUNDS`; neither boundary can be disabled. Sub-agents are capped at
+`HARA_RUN_TIMEOUT_MS` / `HARA_MAX_AGENT_ROUNDS`; neither boundary can be disabled. A main task with a recent
+durable checkpoint and fresh evidence may cross an ordinary numeric round boundary into another bounded
+tranche automatically. Disable that behavior with `hara config set autoContinue false` or
+`HARA_AUTO_CONTINUE=0`; the active deadline, unchanged-evidence guards, cumulative task checkpoints, and
+absolute run/task ceilings still apply. Empty, pre-output rate-limit, overload, timeout, and transient provider
+failures use a central three-attempt replay-safe policy that schedules retries only within 60 seconds and
+never retries earlier than a bounded `Retry-After`;
+Hara never retries after any stream activity, text, tool call, or output token. Sub-agents are capped at
 8 minutes/24 rounds and inherit the parent's cancellation. Auxiliary model work (planning, verification,
 compaction, naming, commit messages, the guardian, and vision) has its own short hard deadline as well, so a
 provider that ignores cancellation cannot strand the CLI outside the main loop.

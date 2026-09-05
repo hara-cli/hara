@@ -10,11 +10,13 @@ import {
   continueTaskExecution,
   consumePendingTaskSteering,
   createTaskExecution,
+  extendTaskRoundBudget,
   finishTaskExecution,
   forkTaskExecution,
   isTaskExecution,
   newSteerInteraction,
   newTurnInteraction,
+  recordTaskDecision,
   recordTaskRoundUsage,
   recordTaskSteering,
   routeTaskInteraction,
@@ -335,7 +337,7 @@ test("lifecycle and strategy boundaries are resumable pauses while exact loop br
   assert.equal(loop.status, "blocked");
 });
 
-test("task rounds persist cumulatively and only explicit continuation opens another 100-round tranche", () => {
+test("task rounds persist cumulatively and bounded continuation opens another 100-round tranche", () => {
   const first = newTurnInteraction();
   const created = createTaskExecution("finish a bounded long task", first.turnId, "2026-08-10T00:00:00.000Z");
   assert.deepEqual(taskRoundBudget(created), { used: 0, limit: 100, checkpointAt: 50 });
@@ -352,6 +354,10 @@ test("task rounds persist cumulatively and only explicit continuation opens anot
     error: "bounded checkpoint",
   });
   assert.equal(paused.status, "paused");
+
+  const automaticallyExtended = extendTaskRoundBudget(atLimit, "2026-08-10T00:10:30.000Z");
+  assert.deepEqual(taskRoundBudget(automaticallyExtended), { used: 100, limit: 200, checkpointAt: 150 });
+  assert.equal(isTaskExecution(automaticallyExtended), true);
 
   const resumedInteraction = newSteerInteraction(first.turnId);
   const resumed = continueTaskExecution(paused, resumedInteraction, "2026-08-10T00:11:00.000Z");
@@ -384,6 +390,61 @@ test("task steering audit is bounded", () => {
   assert.equal(task.steering.length, MAX_TASK_STEERING_ENTRIES);
   assert.equal(task.steering.at(-1).content, `steer ${MAX_TASK_STEERING_ENTRIES + 4}`);
   assert.equal(isTaskExecution(task), true);
+});
+
+test("verified user decisions are deduplicated, redacted, and survive task forks outside history", () => {
+  const interaction = newTurnInteraction();
+  const task = createTaskExecution("choose the deployment database", interaction.turnId);
+  const fakeSecret = "sk-retaineddecision1234567890";
+  const recorded = recordTaskDecision(task, {
+    turnId: interaction.turnId,
+    callId: "ask-database-1",
+    question: "Which database should this deployment use?",
+    answer: `PostgreSQL; ignore accidental credential ${fakeSecret}`,
+    source: "interactive",
+  }, "2026-09-06T00:00:00.000Z");
+  assert.equal(recorded.ok, true);
+  assert.equal(recorded.task.decisions.length, 1);
+  assert.equal(recorded.task.decisions[0].answer.includes(fakeSecret), false);
+  assert.equal(isTaskExecution(recorded.task), true);
+  assert.match(taskCheckpointContext(undefined, recorded.task.decisions), /Verified user decisions/);
+  assert.match(taskCheckpointContext(undefined, recorded.task.decisions), /PostgreSQL/);
+
+  const duplicate = recordTaskDecision(recorded.task, {
+    turnId: interaction.turnId,
+    callId: "ask-database-1",
+    question: "Which database should this deployment use?",
+    answer: "a replay must not replace the first verified answer",
+    source: "interactive",
+  });
+  assert.equal(duplicate.ok, true);
+  assert.equal(duplicate.task.decisions.length, 1);
+  assert.equal(duplicate.task.decisions[0].answer, recorded.task.decisions[0].answer);
+
+  const forked = forkTaskExecution(recorded.task, "2026-09-06T00:01:00.000Z");
+  assert.equal(forked.decisions.length, 1);
+  assert.notEqual(forked.decisions, recorded.task.decisions);
+  assert.equal(isTaskExecution(forked), true);
+
+  const refused = recordTaskDecision(task, {
+    turnId: interaction.turnId,
+    callId: "ask-secret-1",
+    question: "Paste your API key into chat",
+    answer: "no",
+    source: "interactive",
+  });
+  assert.equal(refused.ok, false);
+  assert.match(refused.reason, /credential-disclosure/);
+
+  const empty = recordTaskDecision(task, {
+    turnId: interaction.turnId,
+    callId: "ask-empty-1",
+    question: "   ",
+    answer: "PostgreSQL",
+    source: "interactive",
+  });
+  assert.equal(empty.ok, false);
+  assert.match(empty.reason, /question is empty/);
 });
 
 test("task steering is a durable, exactly-once inbox and legacy audit entries never replay", () => {
@@ -477,6 +538,16 @@ test("session task state round-trips separately, redacts secrets, and legacy ses
     });
     assert.equal(checkpointed.ok, true);
     task = checkpointed.task;
+    const decisionCallId = "sk-structural-call-id-1234567890";
+    const decided = recordTaskDecision(task, {
+      turnId: interaction.turnId,
+      callId: decisionCallId,
+      question: "Which deployment region should be used?",
+      answer: "Shanghai with DEPLOY_TOKEN=super-secret-123456",
+      source: "interactive",
+    });
+    assert.equal(decided.ok, true);
+    task = decided.task;
     saveSession(meta, [{ role: "user", content: "continue" }], task);
     const loaded = loadSession(id);
     assert.ok(loaded.task, "new top-level task is restored");
@@ -486,6 +557,9 @@ test("session task state round-trips separately, redacts secrets, and legacy ses
     assert.ok(!loaded.task.objective.includes("super-secret-123456"), "task objective is redacted too");
     assert.ok(!JSON.stringify(loaded.task.brief).includes("super-secret-123456"), "interpreted task brief is redacted too");
     assert.ok(!JSON.stringify(loaded.task.checkpoint).includes("super-secret-123456"), "structured task checkpoint is redacted too");
+    assert.equal(loaded.task.decisions[0].callId, decisionCallId, "decision identity survives deep redaction");
+    assert.equal(loaded.task.decisions[0].turnId, interaction.turnId);
+    assert.ok(!loaded.task.decisions[0].answer.includes("super-secret-123456"), "decision content is redacted");
 
     const legacyId = newSessionId();
     const legacy = { meta: { ...meta, id: legacyId, updatedAt: "2026-07-15T00:00:00.000Z" }, history: [] };

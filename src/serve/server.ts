@@ -2207,6 +2207,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         stats: s.stats,
         signal: turnAbort.signal,
         onProviderTurn: (turn) => observeProviderTurn(s, turn),
+        onProviderRetry: (event) => runtimeLog("provider.retry_scheduled", {
+          sessionId: s.meta.id,
+          provider: event.provider,
+          model: event.model,
+          retryKind: event.kind,
+          attempt: event.attempt,
+          nextAttempt: event.nextAttempt,
+          delayMs: event.delayMs,
+          elapsedMs: event.elapsedMs,
+          ...(event.status !== undefined ? { status: event.status } : {}),
+        }),
         onToolRun: (toolRun, tool) => observeToolRun(s, toolRun, tool),
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
@@ -2525,6 +2536,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
    *  cwd because serve is multi-session (recentTouched is process-wide and must not leak across projects). */
   const compactSession = async (s: ServeSession, controller: AbortController): Promise<string | null> => {
     const timeoutMs = Math.max(1, Math.min(deps.compactTimeoutMs ?? COMPACT_TIMEOUT_MS, COMPACT_TIMEOUT_MS));
+    const attemptId = randomUUID();
+    const windowId = randomUUID();
+    const sourceMessages = s.history.length;
+    const estimatedSourceInput = Math.ceil(historyChars(s.history) / 4);
     const recent = recentHistoryForCompaction(s.history);
     const r = await new Promise<Awaited<ReturnType<Provider["turn"]>>>((resolve, reject) => {
       let settled = false;
@@ -2586,12 +2601,30 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       }
     });
     if (controller.signal.aborted) return null;
-    s.meta.workingSet = workingSet;
     const compacted = compactedConversationHistory(summary, recent, restore);
-    s.history.length = 0;
-    s.history.push(...compacted);
+    const providerInput = r.usage?.input;
+    const candidateMeta = {
+      ...s.meta,
+      workingSet,
+      compaction: {
+        windowId,
+        ...(s.meta.compaction?.windowId ? { previousWindowId: s.meta.compaction.windowId } : {}),
+        attemptId,
+        installedAt: new Date().toISOString(),
+        sourceMessages,
+        replacementMessages: compacted.length,
+        sourceInputTokens: Number.isSafeInteger(providerInput) && providerInput! > 0
+          ? providerInput!
+          : estimatedSourceInput,
+        inputAccounting: Number.isSafeInteger(providerInput) && providerInput! > 0
+          ? "provider" as const
+          : "estimated" as const,
+      },
+    };
+    // Persist the complete replacement before installing it into the live session. If storage rejects the
+    // candidate, callers keep both the original history and its previous context watermark.
+    hub.replaceSnapshot(s, candidateMeta, compacted, s.task);
     s.stats.lastInput = compactedHistoryTokenEstimate(compacted);
-    hub.save(s);
     return summary;
   };
 
@@ -5353,10 +5386,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (s.busy || s.configuring) return reply(rpcError(id, ERR.BUSY, "a turn/configuration change is running — rewind after it finishes"));
             const next = rewindTo(s.history, p.n);
             if (!next) return reply(rpcError(id, ERR.PARAMS, `n out of range (1..${s.history.filter((m) => m.role === "user").length})`));
-            s.history.length = 0;
-            s.history.push(...next);
-            s.task = undefined;
-            hub.save(s);
+            // Like compaction, rewind is a projection transaction: persistence sees the complete candidate
+            // first, and the attached session changes only after that write succeeds.
+            hub.replaceSnapshot(s, { ...s.meta }, next, undefined);
             return reply(rpcResult(id!, { sessionId: s.meta.id, history: historyForClient(s.history) }));
           }
           default:

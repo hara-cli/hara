@@ -14,6 +14,7 @@ test("classifyError: maps message/status to a kind (incl. DashScope/GLM Chinese 
   assert.equal(classifyError("maximum context length exceeded"), "context_overflow");
   assert.equal(classifyError("上下文长度超过限制"), "context_overflow");
   assert.equal(classifyError("socket hang up"), "timeout");
+  assert.equal(classifyError("", 408), "timeout");
   assert.equal(classifyError("", 500), "transient");
   assert.equal(classifyError("weird"), "unknown");
 });

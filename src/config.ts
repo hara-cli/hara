@@ -145,6 +145,9 @@ export interface HaraConfig {
   runTimeoutMs: number;
   /** hard provider/tool-round ceiling for one agent run (default 64). */
   maxAgentRounds: number;
+  /** Let a task with a recent durable checkpoint and healthy progress cross numeric round boundaries in
+   * another bounded tranche. Loop/deadline/absolute ceilings remain enforced. Default on. */
+  autoContinue: boolean;
   /** modal (vim) keybindings in the TUI input box (opt-in) */
   vimMode: boolean;
   mcpServers: Record<string, McpServerConfig>;
@@ -287,7 +290,7 @@ export function providerCatalog(): ProviderCatalogEntry[] {
   }));
 }
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionSource", "visionProvider", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionSource", "visionProvider", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "autoContinue", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = [
   "off",
   "minimal",
@@ -838,6 +841,12 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   const notify = (process.env.HARA_NOTIFY ?? merged.notify ?? "off") as NotifyMode;
   const runTimeoutMs = agentRunTimeoutMs(process.env.HARA_RUN_TIMEOUT_MS ?? merged.runTimeoutMs);
   const maxAgentRounds = agentMaxRounds(process.env.HARA_MAX_AGENT_ROUNDS ?? merged.maxAgentRounds);
+  const autoContinueRaw = nonBlankEnv(process.env.HARA_AUTO_CONTINUE) ?? merged.autoContinue;
+  const autoContinue = !(
+    autoContinueRaw === "0"
+    || autoContinueRaw === false
+    || autoContinueRaw === "false"
+  );
   const vimMode = process.env.HARA_VIM === "1" || merged.vimMode === true || merged.vimMode === "true";
   const autoCompact = !(process.env.HARA_AUTO_COMPACT === "0" || merged.autoCompact === false || merged.autoCompact === "false"); // default ON
   const fileCheckpoints = !(process.env.HARA_CHECKPOINTS === "0" || merged.fileCheckpoints === false || merged.fileCheckpoints === "false"); // default ON
@@ -862,7 +871,7 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     ? (reasoningRaw as NonNullable<HaraConfig["reasoningEffort"]>)
     : undefined;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionSource, visionProvider, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionSource, visionProvider, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, autoContinue, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

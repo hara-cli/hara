@@ -1,9 +1,9 @@
 // Why a slow turn is slow.
 //
-// Provider SDKs retry a 429 internally with backoff: several silent minutes can pass with no stream
-// event, and Hara's spinner says only "waiting for the model". Being throttled and being slow to think
-// then look identical, so a plan-tier rate limit reads as "Hara is slow". This records the throttle at
-// the one layer that sees the HTTP status — Hara's own model fetch — so the UI can name the cause.
+// A provider retry can spend time in backoff with no stream event, while Hara's spinner otherwise says only
+// "waiting for the model". Being throttled and being slow to think then look identical, so a plan-tier rate
+// limit reads as "Hara is slow". This records the throttle at the one layer that sees the HTTP status —
+// Hara's own model fetch — so the UI can name the cause.
 //
 // Deliberately a process-local signal in the shape of activity.ts: it is a transient transport
 // observation, never user state, and it must not outlive the condition it describes.

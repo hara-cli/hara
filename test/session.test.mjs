@@ -28,6 +28,8 @@ import {
   sessionFileExists,
   MAX_SESSION_FILE_BYTES,
   MAX_SESSION_JSON_DEPTH,
+  readSessionJournal,
+  replaySessionJournal,
 } from "../dist/session/store.js";
 import { SessionHub } from "../dist/serve/sessions.js";
 
@@ -57,6 +59,111 @@ test("deriveTitle: auto-summarizes the first message, keeps CJK, drops slash-com
   const fakeSecret = "sk-sessiontitle1234567890";
   assert.equal(deriveTitle(`排查登录 ${fakeSecret}`), "排查登录 credential");
   assert.equal(sanitizeSessionTitle(`API_KEY=${fakeSecret}`), "credential");
+});
+
+test("session persistence validates and retains stable compaction window identity", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-compaction-window-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const id = "compaction-window-fixture";
+    const at = "2026-09-06T00:00:00.000Z";
+    saveSession({
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "window fixture",
+      createdAt: at,
+      updatedAt: at,
+      compaction: {
+        windowId: "11111111-1111-4111-8111-111111111111",
+        attemptId: "22222222-2222-4222-8222-222222222222",
+        installedAt: at,
+        sourceMessages: 8,
+        replacementMessages: 3,
+        sourceInputTokens: 1_234,
+        inputAccounting: "provider",
+      },
+    }, [{ role: "user", content: "checkpoint" }]);
+    assert.deepEqual(loadSession(id)?.meta.compaction, {
+      windowId: "11111111-1111-4111-8111-111111111111",
+      attemptId: "22222222-2222-4222-8222-222222222222",
+      installedAt: at,
+      sourceMessages: 8,
+      replacementMessages: 3,
+      sourceInputTokens: 1_234,
+      inputAccounting: "provider",
+    });
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session projection journal is append-only, chained, and ignores a torn final record", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-journal-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const id = "projection-journal-fixture";
+    const meta = {
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "journal",
+      createdAt: "2026-09-06T00:00:00.000Z",
+      updatedAt: "2026-09-06T00:00:00.000Z",
+    };
+    saveSession(meta, [{ role: "user", content: "first" }]);
+    saveSession(meta, [
+      { role: "user", content: "first" },
+      { role: "assistant", text: "second", toolUses: [] },
+    ]);
+    const complete = readSessionJournal(id);
+    assert.deepEqual(complete.events.map((event) => event.sequence), [1, 2]);
+    assert.equal(complete.events[1].previousGeneration, complete.events[0].storageGeneration);
+    assert.equal(complete.events[1].historyLength, 2);
+    assert.equal(replaySessionJournal(complete.events).gaps.length, 0);
+    assert.equal(replaySessionJournal(complete.events).last.storageGeneration, loadSession(id).storageGeneration);
+    const skippedSequence = structuredClone(complete.events);
+    skippedSequence[1].sequence += 1;
+    assert.deepEqual(replaySessionJournal(skippedSequence).gaps.map((gap) => ({
+      sequence: gap.sequence,
+      expectedSequence: gap.expectedSequence,
+    })), [{ sequence: 3, expectedSequence: 2 }]);
+
+    const journalPath = join(home, ".hara", "sessions", `${id}.journal`);
+    writeFileSync(journalPath, '{"v":1,"type":"projection.committed"', { flag: "a" });
+    const torn = readSessionJournal(id);
+    assert.equal(torn.truncatedTail, true);
+    assert.equal(torn.events.length, 2, "the complete prefix remains replayable");
+
+    saveSession(meta, [{ role: "user", content: "third" }]);
+    const repaired = readSessionJournal(id);
+    assert.deepEqual(repaired.events.map((event) => event.sequence), [1, 2, 3]);
+    assert.equal(repaired.invalidRecords, 1, "the preserved torn bytes are isolated from later records");
+    assert.equal(repaired.truncatedTail, false);
+    assert.equal(replaySessionJournal(repaired.events).gaps.length, 0);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("session persistence and the v3 compatibility pass remove legacy credentials from titles and sidecars", async () => {
@@ -1650,6 +1757,60 @@ test("SessionHub acquires before load and locks offline rename/archive mutations
   events.length = 0;
   assert.equal(hub.rename("stored", "must not write"), false);
   assert.deepEqual(events, ["acquire:stored"], "a held lock prevents even the pre-write load");
+});
+
+test("SessionHub installs a replacement projection only after its candidate snapshot is durable", () => {
+  const saved = new Map();
+  let rejectReplacement = false;
+  const store = {
+    acquire: () => ({ ok: true }),
+    release: () => {},
+    load: (id) => saved.get(id) ?? null,
+    save(meta, history, task) {
+      if (rejectReplacement) throw new Error("simulated snapshot write failure");
+      saved.set(meta.id, structuredClone({ meta, history, ...(task ? { task } : {}) }));
+    },
+    list: () => [],
+    delete: (id) => saved.delete(id),
+  };
+  const provider = { id: "fake", model: "fake-1", async turn() { throw new Error("unused"); } };
+  const hub = new SessionHub(store, "0.166.1-test");
+  const session = hub.create({
+    cwd: "/tmp/transactional-replacement",
+    provider,
+    providerId: provider.id,
+    model: provider.model,
+    approval: "suggest",
+  });
+  session.history.push({ role: "user", content: "original durable history" });
+  hub.save(session);
+  const originalUpdatedAt = session.meta.updatedAt;
+
+  rejectReplacement = true;
+  assert.throws(
+    () => hub.replaceSnapshot(
+      session,
+      { ...session.meta, workingSet: ["candidate only"] },
+      [{ role: "user", content: "compacted candidate" }],
+      session.task,
+    ),
+    /simulated snapshot write failure/,
+  );
+  assert.deepEqual(session.history, [{ role: "user", content: "original durable history" }]);
+  assert.equal(session.meta.workingSet, undefined);
+  assert.equal(session.meta.updatedAt, originalUpdatedAt);
+  assert.deepEqual(saved.get(session.meta.id).history, [{ role: "user", content: "original durable history" }]);
+
+  rejectReplacement = false;
+  hub.replaceSnapshot(
+    session,
+    { ...session.meta, workingSet: ["candidate committed"] },
+    [{ role: "user", content: "compacted candidate" }],
+    session.task,
+  );
+  assert.deepEqual(session.history, [{ role: "user", content: "compacted candidate" }]);
+  assert.deepEqual(session.meta.workingSet, ["candidate committed"]);
+  assert.deepEqual(saved.get(session.meta.id).history, [{ role: "user", content: "compacted candidate" }]);
 });
 
 test("SessionHub releaseIdle keeps in-flight locks and releases only quiescent sessions", () => {

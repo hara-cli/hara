@@ -46,3 +46,35 @@ test("Serve runtime failure categories expose only stable diagnostics", () => {
   assert.equal(serveRuntimeFailureCategory(new Error("429 too many requests")), "rate_limit");
   assert.equal(serveRuntimeFailureCategory(new Error("opaque failure")), "internal");
 });
+
+test("Serve runtime diagnostics retain bounded provider retry facts and redact unsafe model ids", () => {
+  const lines = [];
+  const fakeSecret = "sk-retrylog1234567890";
+  const log = createServeRuntimeLogger({
+    write: (line) => lines.push(line),
+    now: () => new Date("2026-09-06T00:00:00.000Z"),
+  });
+  log("provider.retry_scheduled", {
+    sessionId: "retry-session",
+    provider: "openai",
+    model: `custom-${fakeSecret}`,
+    retryKind: "rate_limit",
+    attempt: 1,
+    nextAttempt: 2,
+    delayMs: 2_500.4,
+    elapsedMs: 130.6,
+    status: 429,
+  });
+  assert.equal(lines.length, 1);
+  const record = JSON.parse(lines[0].replace(/^\[hara-runtime\] /, ""));
+  assert.equal(record.event, "provider.retry_scheduled");
+  assert.equal(record.provider, "openai");
+  assert.equal(record.model, "redacted");
+  assert.equal(record.retryKind, "rate_limit");
+  assert.equal(record.attempt, 1);
+  assert.equal(record.nextAttempt, 2);
+  assert.equal(record.delayMs, 2500);
+  assert.equal(record.elapsedMs, 131);
+  assert.equal(record.status, 429);
+  assert.doesNotMatch(lines[0], new RegExp(fakeSecret));
+});

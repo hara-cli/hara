@@ -20,6 +20,7 @@ export type ServeRuntimeEvent =
   | "provider.started"
   | "provider.completed"
   | "provider.failed"
+  | "provider.retry_scheduled"
   | "external.turn.failed"
   | "serve.stopping"
   | "log.limit";
@@ -45,6 +46,14 @@ export interface ServeRuntimeFields {
   durationMs?: number;
   version?: string;
   port?: number;
+  provider?: string;
+  model?: string;
+  retryKind?: "rate_limit" | "overloaded" | "timeout" | "transient";
+  attempt?: number;
+  nextAttempt?: number;
+  delayMs?: number;
+  elapsedMs?: number;
+  status?: number;
 }
 
 export function serveRuntimeFailureCategory(error: unknown): ServeRuntimeFailureCategory {
@@ -106,6 +115,16 @@ export function createServeRuntimeLogger(options: {
     if (Number.isFinite(fields.durationMs)) record.durationMs = Math.max(0, Math.round(fields.durationMs!));
     const version = safeName(fields.version);
     if (version) record.version = version;
+    const provider = safeName(fields.provider);
+    if (provider) record.provider = provider;
+    const model = safeName(fields.model);
+    if (model) record.model = model;
+    if (fields.retryKind) record.retryKind = fields.retryKind;
+    if (Number.isSafeInteger(fields.attempt) && fields.attempt! > 0) record.attempt = fields.attempt;
+    if (Number.isSafeInteger(fields.nextAttempt) && fields.nextAttempt! > 0) record.nextAttempt = fields.nextAttempt;
+    if (Number.isFinite(fields.delayMs)) record.delayMs = Math.max(0, Math.round(fields.delayMs!));
+    if (Number.isFinite(fields.elapsedMs)) record.elapsedMs = Math.max(0, Math.round(fields.elapsedMs!));
+    if (Number.isInteger(fields.status) && fields.status! >= 100 && fields.status! <= 599) record.status = fields.status;
     if (Number.isInteger(fields.port) && fields.port! > 0 && fields.port! <= 65_535) record.port = fields.port;
     let line = `[hara-runtime] ${JSON.stringify(record)}\n`;
     if (Buffer.byteLength(line, "utf8") > MAX_RUNTIME_LOG_LINE_BYTES) return;

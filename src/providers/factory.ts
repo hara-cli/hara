@@ -16,6 +16,7 @@ import {
 } from "./volcengine.js";
 import type { Provider, TurnResult } from "./types.js";
 import type { ProviderTarget } from "./target.js";
+import { withProviderRetry } from "./retry.js";
 
 function emptyFailedTurn(result: TurnResult): boolean {
   return result.stop === "error"
@@ -31,17 +32,25 @@ export function withVolcengineAgentPlanAutoFallback(primary: Provider, fallback:
   return {
     ...primary,
     async turn(args) {
-      let emittedText = false;
+      let streamActivity = false;
       const result = await primary.turn({
         ...args,
+        onActivity() {
+          streamActivity = true;
+          args.onActivity?.();
+        },
         onText(delta) {
-          if (delta) emittedText = true;
+          if (delta) streamActivity = true;
           args.onText(delta);
+        },
+        onReasoning(delta) {
+          if (delta) streamActivity = true;
+          args.onReasoning?.(delta);
         },
       });
       if (
         args.signal?.aborted
-        || emittedText
+        || streamActivity
         || !emptyFailedTurn(result)
         || !isVolcengineAgentPlanUnsupportedModelError(result.errorMsg)
       ) {
@@ -72,14 +81,14 @@ export async function createProviderForTarget(
   if (provider === "qwen-oauth") {
     const auth = await getValidQwenAuth();
     if (!auth) return null;
-    return createOpenAIProvider({
+    return withProviderRetry(createOpenAIProvider({
       apiKey: auth.accessToken,
       baseURL: auth.baseURL,
       model,
       label: provider,
       reasoningEffort,
       fetch,
-    });
+    }));
   }
 
   // The OpenAI SDK requires a non-empty constructor value even when a compatible local endpoint has no
@@ -90,7 +99,7 @@ export async function createProviderForTarget(
   const caps = resolvePlatform(provider, baseURL, undefined, model);
   const wire = caps.wireApi;
   if (wire === "anthropic") {
-    return createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort, fetch });
+    return withProviderRetry(createAnthropicProvider({ apiKey: transportKey, model, baseURL, reasoningEffort, fetch }));
   }
   if (wire === "responses") {
     const alibabaTokenPlan = isOfficialTokenPlanOpenAIEndpoint(baseURL);
@@ -115,11 +124,11 @@ export async function createProviderForTarget(
         ...responseOptions,
         model: VOLCENGINE_AGENT_PLAN_AUTO_FALLBACK_MODEL,
       });
-      return withVolcengineAgentPlanAutoFallback(primary, fallback);
+      return withProviderRetry(withVolcengineAgentPlanAutoFallback(primary, fallback));
     }
-    return primary;
+    return withProviderRetry(primary);
   }
-  return createOpenAIProvider({
+  return withProviderRetry(createOpenAIProvider({
     apiKey: transportKey,
     model,
     baseURL,
@@ -128,5 +137,5 @@ export async function createProviderForTarget(
     reasoningEffort,
     omitAuthorization: providerIsLocal(provider),
     fetch,
-  });
+  }));
 }

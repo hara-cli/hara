@@ -78,7 +78,27 @@ export interface TurnResult {
   /** Opaque-to-the-UI provider state needed to continue this exact tool-call turn. */
   continuation?: AssistantContinuation;
   errorMsg?: string;
+  /** Bounded, credential-free transport facts used by the central replay-safe retry policy. */
+  errorMetadata?: ProviderErrorMetadata;
   usage?: { input: number; output: number };
+}
+
+export interface ProviderErrorMetadata {
+  status?: number;
+  retryAfterMs?: number;
+  code?: string;
+}
+
+export interface ProviderRetryEvent {
+  provider: string;
+  model: string;
+  /** Attempt that failed; attempts are one-based. */
+  attempt: number;
+  nextAttempt: number;
+  kind: "rate_limit" | "overloaded" | "timeout" | "transient";
+  delayMs: number;
+  elapsedMs: number;
+  status?: number;
 }
 
 export interface TurnArgs {
@@ -97,6 +117,8 @@ export interface TurnArgs {
    *  time out mid-thinking. Providers call it on every chunk; the loop keeps the connection considered
    *  alive. */
   onActivity?: () => void;
+  /** One credential-free event before a replay-safe transport retry sleeps. */
+  onRetry?: (event: ProviderRetryEvent) => void;
   /** abort the in-flight request (user interrupt) */
   signal?: AbortSignal;
   /** Company persona/policy snapshot expected by the caller. Organization-bound providers refresh Control

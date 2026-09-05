@@ -27,6 +27,7 @@ import { readFileSync, existsSync, realpathSync, statSync, writeFileSync, rmSync
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { delimiter, dirname, join, relative, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   loadConfig,
   configPath,
@@ -2031,8 +2032,10 @@ async function runSetup(): Promise<void> {
   }
 }
 
-function agentRunLimits(cfg: Pick<HaraConfig, "runTimeoutMs" | "maxAgentRounds">): { timeoutMs: number; maxRounds: number } {
-  return { timeoutMs: cfg.runTimeoutMs, maxRounds: cfg.maxAgentRounds };
+function agentRunLimits(
+  cfg: Pick<HaraConfig, "runTimeoutMs" | "maxAgentRounds" | "autoContinue">,
+): { timeoutMs: number; maxRounds: number; autoContinue: boolean } {
+  return { timeoutMs: cfg.runTimeoutMs, maxRounds: cfg.maxAgentRounds, autoContinue: cfg.autoContinue };
 }
 
 async function runInit(
@@ -2706,6 +2709,10 @@ async function compactConversation(
   onProviderTurn?: RunOpts["onProviderTurn"],
 ): Promise<string | null> {
   if (history.length < 2 || signal?.aborted) return null;
+  const attemptId = randomUUID();
+  const windowId = randomUUID();
+  const sourceMessages = history.length;
+  const estimatedSourceInput = compactedHistoryTokenEstimate(history);
   const recent = recentHistoryForCompaction(history);
   const r = await boundedProviderTurn(provider, {
     system: COMPACT_SYSTEM,
@@ -2734,12 +2741,32 @@ async function compactConversation(
   });
   // Cancellation during the file snapshot must leave the original conversation untouched.
   if (signal?.aborted) return null;
-  meta.workingSet = workingSet; // survives the history wipe + injects into the next turns
   const compacted = compactedConversationHistory(summary, recent, restore);
-  history.length = 0;
-  history.push(...compacted);
+  const providerInput = r.usage?.input;
+  const candidateMeta: SessionMeta = {
+    ...meta,
+    workingSet,
+    compaction: {
+      windowId,
+      ...(meta.compaction?.windowId ? { previousWindowId: meta.compaction.windowId } : {}),
+      attemptId,
+      installedAt: new Date().toISOString(),
+      sourceMessages,
+      replacementMessages: compacted.length,
+      sourceInputTokens: Number.isSafeInteger(providerInput) && providerInput! > 0
+        ? providerInput!
+        : estimatedSourceInput,
+      inputAccounting: Number.isSafeInteger(providerInput) && providerInput! > 0
+        ? "provider"
+        : "estimated",
+    },
+  };
+  // The candidate snapshot becomes durable before it replaces the live projection. A failed save therefore
+  // leaves the original conversation, working set, and context watermark usable in this process.
+  saveSession(candidateMeta, compacted, task);
+  Object.assign(meta, candidateMeta);
+  history.splice(0, history.length, ...compacted);
   stats.lastInput = compactedHistoryTokenEstimate(compacted); // reflect replacement, not the large summarizer request
-  saveSession(meta, history, task);
   return summary;
 }
 
@@ -5488,6 +5515,10 @@ config
         process.exit(1);
       }
     }
+    if (key === "autoContinue" && value !== "true" && value !== "false") {
+      out(c.red("Invalid autoContinue value. Use true or false.\n"));
+      process.exit(1);
+    }
     writeConfigValue(key, value);
     out(c.green(`Set ${key} → ${configPath()}\n`));
     const computerUseOverride = String(process.env.HARA_COMPUTER_USE ?? "").trim();
@@ -5515,6 +5546,7 @@ config
           `sandbox:  ${raw.sandbox ?? "(default off)"}\n` +
           `timeout:  ${raw.runTimeoutMs ?? "(default 30m)"}\n` +
           `rounds:   ${raw.maxAgentRounds ?? "(default 64)"}\n` +
+          `continue: ${raw.autoContinue ?? "(default true)"}\n` +
           `proxy:    ${maskProxy(raw.proxy)}\n` +
           `apiKey:   ${maskKey(raw.apiKey)}\n`,
       );
@@ -7158,11 +7190,12 @@ program.action(async (opts) => {
         }
         const nh = rewindTo(history, Number(arg));
         if (!nh) return void out(c.dim(`(no such turn: ${arg})\n`));
-        history.length = 0;
-        history.push(...nh);
-        task = undefined; // the dropped transcript may have owned the current task; do not retain stale identity
+        const candidateMeta = { ...meta };
+        saveSession(candidateMeta, nh, undefined);
+        Object.assign(meta, candidateMeta);
+        history.splice(0, history.length, ...nh);
+        task = undefined; // installed only after durability; the dropped transcript may have owned it
         resumeTaskPending = false;
-        persistSession();
         out(c.green(`(rewound — dropped the last ${arg} turn(s); ${history.length} messages kept. Files are unchanged. Type your next message.)\n`));
       },
     },
@@ -7714,11 +7747,12 @@ program.action(async (opts) => {
             }
             const nh = rewindTo(history, Number(arg));
             if (!nh) return void h.sink.notice(`(no such turn: ${arg})`);
-            history.length = 0;
-            history.push(...nh);
+            const candidateMeta = { ...meta };
+            saveSession(candidateMeta, nh, undefined);
+            Object.assign(meta, candidateMeta);
+            history.splice(0, history.length, ...nh);
             task = undefined;
             resumeTaskPending = false;
-            persistSession();
             return void h.sink.notice(`(rewound — kept ${history.length} messages; files unchanged. Type your next message.)`);
           }
           if (nm === "checkpoint") {

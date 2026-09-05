@@ -3068,7 +3068,7 @@ test("serve e2e: an active deadline returns a recoverable paused result instead 
   }
 });
 
-test("serve e2e: cumulative task rounds pause at 100 and explicit continuation opens the next tranche", { timeout: 10000 }, async () => {
+test("serve e2e: a fresh checkpoint crosses the cumulative task boundary automatically", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-task-round-budget-"));
   const store = memStore();
   const sessionId = randomUUID();
@@ -3135,20 +3135,17 @@ test("serve e2e: cumulative task rounds pause at 100 and explicit continuation o
     const opened = await c.call("session.resume", { sessionId });
     assert.equal(opened.error, undefined);
 
-    const capped = await c.call("session.send", { sessionId, text: "continue to the safety checkpoint" });
-    assert.equal(capped.error, undefined);
-    assert.equal(capped.result.status, "paused");
-    assert.equal(capped.result.stopReason, "task_round_budget");
-    assert.match(capped.result.reply, /100 cumulative provider round\(s\).*\/continue/is);
-    assert.equal(store.saved.get(sessionId).task.roundsUsed, 100);
-    assert.equal(store.saved.get(sessionId).task.roundBudgetLimit, 100);
-    assert.equal(store.saved.get(sessionId).task.status, "paused");
-
-    const resumed = await c.call("session.send", { sessionId, text: "/continue" });
-    assert.equal(resumed.error, undefined);
-    assert.equal(resumed.result.reply, "continued in the next bounded tranche");
+    const continued = await c.call("session.send", { sessionId, text: "continue to the safety checkpoint" });
+    assert.equal(continued.error, undefined);
+    assert.equal(continued.result.reply, "continued in the next bounded tranche");
+    assert.equal(continued.result.stopReason, undefined, "a completed send has no paused boundary");
     assert.equal(store.saved.get(sessionId).task.roundsUsed, 101);
     assert.equal(store.saved.get(sessionId).task.roundBudgetLimit, 200);
+    assert.equal(store.saved.get(sessionId).task.status, "completed");
+    assert.equal(
+      c.events.some((event) => event.method === "event.notice" && /continuing automatically/.test(event.params.text)),
+      true,
+    );
   } finally {
     c.close();
     await srv.close();
@@ -3712,6 +3709,12 @@ test("serve e2e: files.search + session.context + compact + rewind (codex deskto
     assert.ok(comp.result.history.some((message) => message.text === "one"), "recent exact turn survives compaction");
     assert.ok(comp.result.notes >= 1, "working notes distilled");
     assert.ok(comp.result.ctx && typeof comp.result.ctx.pct === "number", "compact returns fresh ctx");
+    const installedWindow = store.saved.get(sid).meta.compaction;
+    assert.match(installedWindow.windowId, /^[0-9a-f-]{36}$/);
+    assert.match(installedWindow.attemptId, /^[0-9a-f-]{36}$/);
+    assert.equal(installedWindow.sourceMessages, 2);
+    assert.equal(installedWindow.replacementMessages, comp.result.history.length);
+    assert.equal(installedWindow.inputAccounting, "provider");
     const notices = c.events.filter((e) => e.method === "event.notice").map((e) => e.params.text);
     assert.ok(notices.some((t) => t.includes("Compacting")), "compaction announced");
     assert.equal(store.saved.get(sid).history.length, comp.result.history.length, "checkpoint and recent anchor persisted together");

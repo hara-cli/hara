@@ -3,6 +3,7 @@ import type { Provider, NeutralMsg, SystemPromptPart, TurnArgs, TurnResult } fro
 import { imageToBase64 } from "../images.js";
 import { safeModelNetworkFailureMessage } from "../network/model-fetch.js";
 import { safeProviderErrorMessage } from "./errors.js";
+import { providerErrorMetadata } from "./retry.js";
 import type { Effort } from "./reasoning.js";
 
 export function toAnthropic(history: NeutralMsg[]): Anthropic.MessageParam[] {
@@ -136,7 +137,7 @@ export function buildThinkingParam(model: string, effort?: Effort):
 export function createAnthropicProvider(opts: { apiKey: string; model: string; baseURL?: string; reasoningEffort?: Effort; fetch?: typeof fetch }): Provider {
   const client = new Anthropic({
     apiKey: opts.apiKey,
-    maxRetries: 4,
+    maxRetries: 0,
     ...(opts.baseURL ? { baseURL: opts.baseURL } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
   });
@@ -167,7 +168,14 @@ export function createAnthropicProvider(opts: { apiKey: string; model: string; b
         if (signal?.aborted) return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
         const errorMsg = safeModelNetworkFailureMessage(e)
           ?? safeProviderErrorMessage(e, [opts.apiKey]);
-        return { text: "", toolUses: [], stop: "error", errorMsg };
+        const errorMetadata = providerErrorMetadata(e);
+        return {
+          text: "",
+          toolUses: [],
+          stop: "error",
+          errorMsg,
+          ...(errorMetadata ? { errorMetadata } : {}),
+        };
       }
 
       const text = msg.content

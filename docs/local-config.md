@@ -107,7 +107,13 @@ configured always stays listed, and `/model <id>` still accepts any id the key i
   activity cannot renew it, while time spent waiting for an engine-owned human question or approval is
   excluded. Esc/shutdown still cancel immediately, and answering resumes the remaining budget rather than
   resetting it. `0`/invalid values do not disable safety. Equivalent environment overrides are
-  `HARA_RUN_TIMEOUT_MS` and `HARA_MAX_AGENT_ROUNDS`. Read-only sub-agents use the tighter of the configured
+  `HARA_RUN_TIMEOUT_MS` and `HARA_MAX_AGENT_ROUNDS`. A main task with a recent durable checkpoint and fresh
+  evidence can cross an ordinary numeric boundary into another bounded tranche automatically; use
+  `hara config set autoContinue false` or `HARA_AUTO_CONTINUE=0` to require explicit continuation. This does
+  not relax the active deadline, unchanged-evidence guards, cumulative task checkpoints, or absolute run/task
+  ceilings. Empty provider failures may be retried only before any stream activity, within three total
+  attempts; another attempt is scheduled only during a 60-second window and never earlier than a bounded
+  `Retry-After`. Read-only sub-agents use the tighter of the configured
   limit and `8m`/`24` rounds, and always inherit the parent's remaining active budget/cancellation. One-shot
   planner, verifier, compaction, naming, commit, guardian, and vision calls also have operation-specific hard
   deadlines even when a custom provider ignores `AbortSignal`.

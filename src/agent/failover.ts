@@ -1,6 +1,6 @@
-// App-level failover — what to do when a provider turn ENDS in an error (the SDK already retried transient
-// 429/5xx via maxRetries; this handles what's left). runAgent first retries context overflow once with a
-// tighter bounded snapshot; this module then decides whether a remaining error gets one fallback-model try.
+// App-level failover — what to do when a provider turn ENDS in an error after the central replay-safe
+// transport retry policy has finished. runAgent first retries context overflow once with a tighter bounded
+// snapshot; this module then decides whether a remaining error gets one fallback-model try.
 
 export type ErrKind = "context_overflow" | "rate_limit" | "overloaded" | "auth" | "timeout" | "transient" | "interrupted" | "unknown";
 
@@ -13,7 +13,7 @@ export function classifyError(msg: string, status?: number): ErrKind {
   if (status === 429 || /rate.?limit|too many requests|\b429\b|请求过于频繁|限流/.test(m)) return "rate_limit";
   if (status === 529 || status === 503 || /overload|capacity|service unavailable|temporarily unavailable|\b503\b|\b529\b|繁忙|过载/.test(m)) return "overloaded";
   if (/context length|context window|maximum context|maximum.*token|too long|reduce the length|超过最大长度|上下文长度|输入过长/.test(m)) return "context_overflow";
-  if (/timeout|timed out|etimedout|econnreset|socket hang up|network/.test(m)) return "timeout";
+  if (status === 408 || /timeout|timed out|etimedout|econnreset|socket hang up|network/.test(m)) return "timeout";
   if (typeof status === "number" && status >= 500) return "transient";
   return "unknown";
 }

@@ -397,6 +397,35 @@ export class SessionHub {
     s.durable = true;
   }
 
+  /** Atomically replace the live projection only after its complete candidate snapshot is durable. This is
+   * used by compaction/reducers whose new history must never become visible in memory when persistence
+   * fails. The store may normalize title/version/timestamps on the candidate meta; those values are
+   * installed onto the stable live meta object only after save returns. */
+  replaceSnapshot(
+    s: ServeSession,
+    candidateMeta: SessionMeta,
+    history: NeutralMsg[],
+    task: TaskExecution | undefined,
+  ): void {
+    if (this.sessions.get(s.meta.id) !== s || candidateMeta.id !== s.meta.id) {
+      throw new Error("cannot replace a session snapshot that is not owned by this hub");
+    }
+    if (!candidateMeta.title) {
+      const first = history.find((m) => m.role === "user");
+      if (first && "content" in first && typeof first.content === "string") {
+        candidateMeta.title = deriveTitle(first.content);
+      }
+    }
+    this.stampVersion(candidateMeta);
+    if (!(s.durable === false && history.length === 0 && !task)) {
+      this.store.save(candidateMeta, history, task);
+    }
+    Object.assign(s.meta, candidateMeta);
+    s.history.splice(0, s.history.length, ...history);
+    s.task = task;
+    s.durable = true;
+  }
+
   /** Rename a session (live or on-disk). Returns false when the id is unknown. */
   rename(id: string, title: string): boolean {
     const safeTitle = sanitizeSessionTitle(title);
