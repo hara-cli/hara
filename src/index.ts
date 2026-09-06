@@ -4637,6 +4637,17 @@ program
   });
 
 program
+  .command("mobile [action]")
+  .description("pair Hara Mobile with this Desktop and bridge explicitly published local sessions")
+  .option("--phone <number>", "Nayi phone number for mobile login")
+  .option("--code <digits>", "short-lived Nayi SMS verification code")
+  .option("--yes", "approve the currently displayed mobile pairing request")
+  .action(async (action, options) => {
+    const { runMobileCommand } = await import("./mobile/command.js");
+    await runMobileCommand(action, options);
+  });
+
+program
   .command("remote [action] [text]")
   .description("register THIS tmux pane for explicit /remote send relays from chat. actions: ask \"<q>\" | bind | back | status")
   .action(async (action = "status", text?: string) => {
