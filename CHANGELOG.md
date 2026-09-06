@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.167.0 — 2026-09-06 — resumable remote control and durable agent teams
+
+- Keep long-running work advancing through bounded provider retries, retry hints, task checkpoints and durable
+  continuation state. Repeated failures still stop safely, while transient throttling and recoverable transport
+  failures no longer make Hara abandon an otherwise progressing task.
+- Make remote commands replay-safe with durable request identity, receipts and results. Reconnecting Desktop or
+  mobile clients can retry an uncertain delivery without executing the same command twice, and can recover the
+  ordered event stream from a cursor instead of silently losing state across a network gap.
+- Add explicit controller leases and resumable event delivery for Hara Live. One authorized controller owns input
+  at a time, observers stay read-only, expired ownership can be reclaimed, and sequence gaps require a bounded
+  snapshot recovery rather than accepting an inconsistent terminal or task view.
+- Add durable read-only Agent Team topology and collaboration events to the Serve protocol. Authorized clients can
+  follow agents, messages and completion state without receiving private prompts, credentials or raw terminal data.
+- Preserve every provider's native subscription-accounting authority. Transport token counters are never presented
+  as billing, plan windows or currency; automatic exhaustion failover requires a fresh authoritative provider or
+  Control signal, and unavailable usage remains explicitly unknown instead of being estimated.
+
 ## 0.166.1 — 2026-09-04 — safer recovery and explicit browser sessions
 
 - Give an identical failed tool call one real recovery round after the second-attempt warning and stop only
