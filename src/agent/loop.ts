@@ -96,6 +96,18 @@ const RECALL_TOOLS = new Set(["memory_search", "session_search"]);
 /** Engine-owned, non-authority helpers. Role filters still govern every deferred target activated by
  * tool_search; these two only reveal an allowed schema or page an already-redacted result. */
 const RUNTIME_HELPER_TOOLS = new Set(["tool_search", "tool_result_read"]);
+/** Persistent-session collaboration must not be advertised by direct CLI/headless runs that cannot
+ * actually host a durable Agent tree. Keeping the schemas out of those prompts avoids a predictable
+ * unavailable-tool loop while still allowing the older one-shot `agent` primitive there. */
+const DURABLE_AGENT_TEAM_TOOLS = new Set([
+  "spawn_agent",
+  "send_message",
+  "followup_task",
+  "interrupt_agent",
+  "resume_agent",
+  "list_agents",
+  "wait_agent",
+]);
 
 /** Stall watchdog ceiling: a model attempt that streams NOTHING for this long is treated as a dead /
  *  stalled connection and aborted into the normal error→failover path — instead of hanging on
@@ -260,7 +272,11 @@ listed below, delegate only a bounded question that materially benefits from tha
 the minimum self-contained context, relevant paths, constraints, and expected output. Do not dump the whole
 conversation, spawn overlapping roles, or delegate a simple lookup. Reconcile conflicting specialist advice
 yourself before acting. Role-based \`agent\` calls stay read-only; the main agent owns approved edits, while
-\`hara org\` / \`hara plan\` provide write-capable role execution behind their normal gates. Messages the user sends
+\`hara org\` / \`hara plan\` provide write-capable role execution behind their normal gates. In persistent
+sessions where \`spawn_agent\` is available, use it instead of one-shot \`agent\` for delegated work that may
+need progress inspection, follow-up guidance, interruption, or restart recovery. Its children remain read-only:
+use \`list_agents\`, \`wait_agent\`, \`send_message\`, \`followup_task\`, \`interrupt_agent\`, and
+\`resume_agent\` rather than inventing status or spawning a duplicate child. Messages the user sends
 mid-task arrive marked as interjections — triage them (refine current / queue as todo / urgent-switch)
 instead of blindly folding everything into the current task; the todo list is your task queue. For a multi-step task, call \`todo_write\` to plan a short checklist and keep it updated as
 you go (one item in_progress at a time) — skip it for trivial one-step tasks. You have a persistent
@@ -875,6 +891,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     !organizationPolicy?.toolDeny?.includes(name);
   const runtimeToolAllowed = (name: string): boolean =>
     organizationAllowsTool(name)
+    && (ctx.agentTeam !== undefined || !DURABLE_AGENT_TEAM_TOOLS.has(name))
     && (!opts.toolFilter || RUNTIME_HELPER_TOOLS.has(name) || opts.toolFilter(name));
   const activatedDeferredTools = new Set<string>();
   let activeSkillToolPolicy: SkillToolPolicy | undefined;

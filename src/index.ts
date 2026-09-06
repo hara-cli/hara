@@ -192,7 +192,9 @@ import {
   SubagentRuntime,
   subagentResultText,
   type SubagentLifecycleObserver,
+  type SubagentResult,
 } from "./subagent/runtime.js";
+import type { AgentMailboxDelivery, AgentTeamController } from "./subagent/team.js";
 import {
   overrideProviderTarget,
   profileByIdForConfig,
@@ -345,6 +347,7 @@ import "./tools/search.js"; // register grep/glob/ls
 import "./tools/patch.js"; // register apply_patch
 import "./tools/web.js"; // register web_fetch
 import "./tools/agent.js"; // register agent (subagent spawn)
+import "./tools/collaboration.js"; // register durable Agent tree + mailbox tools
 import "./tools/memory.js"; // register memory_search/get/write/forget/skill_create
 import "./tools/learning.js"; // register reviewable execution-time learning capture
 import { automaticSessionRecall } from "./tools/session-search.js"; // register + deterministic explicit-cue recall
@@ -2559,7 +2562,24 @@ async function runResume(o: OrgOpts): Promise<RunOutcome> {
   return executePlan(plan, roles, o);
 }
 
-const READONLY_TOOLS = new Set(["read_file", "inspect_image", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write"]);
+const READONLY_TOOLS = new Set([
+  "read_file",
+  "inspect_image",
+  "grep",
+  "glob",
+  "ls",
+  "web_fetch",
+  "web_search",
+  "codebase_search",
+  "todo_write",
+  "spawn_agent",
+  "send_message",
+  "followup_task",
+  "interrupt_agent",
+  "resume_agent",
+  "list_agents",
+  "wait_agent",
+]);
 const REVIEW_SYSTEM =
   "You are a senior code reviewer. Review the safe Git status metadata the user provides for: correctness bugs, security " +
   "issues, missing error handling, unclear naming, and missing/weak tests. You may read files (read-only) " +
@@ -2816,6 +2836,78 @@ function subagentRuntimeFor(stats: object): SubagentRuntime<NativeSubagentReques
   return runtime;
 }
 
+async function runSubagentResult(
+  cfg: HaraConfig,
+  baseProvider: Provider,
+  cwd: string,
+  sandbox: SandboxMode,
+  projectContext: string | undefined,
+  stats: { input: number; output: number; lastInput?: number },
+  task: string,
+  roleId?: string,
+  signal?: AbortSignal,
+  observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun"> & {
+    onSubagentLifecycle?: SubagentLifecycleObserver;
+  },
+  boundProfileId?: string,
+  expectedSpaceId?: string,
+  durable?: {
+    id: string;
+    agentTeam: AgentTeamController;
+    pendingInput: () => Promise<AgentMailboxDelivery[]>;
+  },
+): Promise<SubagentResult> {
+  const executionProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
+  const assertAudience = (): void => {
+    if (!expectedSpaceId) return;
+    if (!executionProfileId) throw new Error("subagent session has no bound provider identity");
+    assertProfileAudience(cfg, executionProfileId, expectedSpaceId);
+  };
+  assertAudience();
+  const result = await subagentRuntimeFor(stats).run(NATIVE_SUBAGENT_PROVIDER_ID, {
+    ...(durable ? { id: durable.id } : {}),
+    task,
+    ...(roleId !== undefined ? { role: roleId } : {}),
+    signal,
+    baseProvider,
+    cwd,
+    sandbox,
+    projectContext,
+    profileId: executionProfileId,
+    spaceId: expectedSpaceId,
+    parentStats: stats,
+    timeoutMs: cfg.runTimeoutMs,
+    maxRounds: cfg.maxAgentRounds,
+    ...(durable ? {
+      agentTeam: durable.agentTeam,
+      pendingInput: async (): Promise<NeutralMsg[]> => {
+        const messages = await durable.pendingInput();
+        return messages.map((message): NeutralMsg => ({
+          role: "user",
+          content:
+            "[Message from " + message.sourcePath + "; " + message.kind + "]\n\n"
+            + message.content,
+        }));
+      },
+    } : {}),
+    ...(observers ? {
+      observers: {
+        onProviderTurn: observers.onProviderTurn,
+        onToolRun: observers.onToolRun,
+      },
+    } : {}),
+    isReadonlyTool: (name) => READONLY_TOOLS.has(name),
+    assertAudience,
+    resolveProvider: async (model, profileId) => {
+      assertAudience();
+      const resolved = await buildProvider(cfg, { model }, profileId);
+      assertAudience();
+      return resolved;
+    },
+  }, observers?.onSubagentLifecycle);
+  return result;
+}
+
 async function runSubagent(
   cfg: HaraConfig,
   baseProvider: Provider,
@@ -2832,42 +2924,20 @@ async function runSubagent(
   boundProfileId?: string,
   expectedSpaceId?: string,
 ): Promise<string> {
-  const executionProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
-  const assertAudience = (): void => {
-    if (!expectedSpaceId) return;
-    if (!executionProfileId) throw new Error("subagent session has no bound provider identity");
-    assertProfileAudience(cfg, executionProfileId, expectedSpaceId);
-  };
-  assertAudience();
-  const result = await subagentRuntimeFor(stats).run(NATIVE_SUBAGENT_PROVIDER_ID, {
-    task,
-    ...(roleId !== undefined ? { role: roleId } : {}),
-    signal,
+  return subagentResultText(await runSubagentResult(
+    cfg,
     baseProvider,
     cwd,
     sandbox,
     projectContext,
-    profileId: executionProfileId,
-    spaceId: expectedSpaceId,
-    parentStats: stats,
-    timeoutMs: cfg.runTimeoutMs,
-    maxRounds: cfg.maxAgentRounds,
-    ...(observers ? {
-      observers: {
-        onProviderTurn: observers.onProviderTurn,
-        onToolRun: observers.onToolRun,
-      },
-    } : {}),
-    isReadonlyTool: (name) => READONLY_TOOLS.has(name),
-    assertAudience,
-    resolveProvider: async (model, profileId) => {
-      assertAudience();
-      const resolved = await buildProvider(cfg, { model }, profileId);
-      assertAudience();
-      return resolved;
-    },
-  }, observers?.onSubagentLifecycle);
-  return subagentResultText(result);
+    stats,
+    task,
+    roleId,
+    signal,
+    observers,
+    boundProfileId,
+    expectedSpaceId,
+  ));
 }
 
 /** Check the hara setup and print a health summary (provider/auth/model/node/assets/roles). */
@@ -4501,6 +4571,36 @@ program
         spawnSubagent: (provider, scwd, projectContext, stats, task, role, signal, observers, profileId, spaceId) => {
           const live = loadConfig({ cwd: scwd });
           return runSubagent(live, provider, scwd, sandbox, projectContext, stats, task, role, signal, observers, profileId, spaceId);
+        },
+        spawnSubagentResult: (
+          provider,
+          scwd,
+          projectContext,
+          stats,
+          task,
+          role,
+          signal,
+          observers,
+          profileId,
+          spaceId,
+          durable,
+        ) => {
+          const live = loadConfig({ cwd: scwd });
+          return runSubagentResult(
+            live,
+            provider,
+            scwd,
+            sandbox,
+            projectContext,
+            stats,
+            task,
+            role,
+            signal,
+            observers,
+            profileId,
+            spaceId,
+            durable,
+          );
         },
         guardian: guardianOpt,
         buildGuardian: async (targetCwd, profileId, spaceId) => {

@@ -848,6 +848,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "agent.action-ownership.v1",
         "agent.public-profile-edit.v1",
         "agent.blueprint-provenance.v1",
+        "agents.durable-team.v1",
         "external.sessions.metadata.v1",
         "external.sessions.interaction.v1",
         "external.sessions.live-control.v1",

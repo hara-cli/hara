@@ -133,3 +133,21 @@ test("SubagentRuntime publishes metadata-only lifecycle without letting observer
   assert.ok(events.every((event) => event.role === "research"));
   assert.doesNotMatch(JSON.stringify(events), /private task|private result/);
 });
+
+test("SubagentRuntime preserves an engine-owned stable id and rejects malformed ids", async () => {
+  const runtime = new SubagentRuntime({ maxConcurrent: 1 });
+  runtime.register({
+    id: "fixture",
+    async run(request) {
+      return { status: "completed", text: request.task };
+    },
+  });
+  const stableId = "d94efdb0-3142-4fef-a3bf-395ed0a8be21";
+  const result = await runtime.run("fixture", { id: stableId, task: "durable" });
+  assert.equal(result.id, stableId);
+
+  const invalid = await runtime.run("fixture", { id: "../not-engine-owned", task: "blocked" });
+  assert.equal(invalid.status, "error");
+  assert.match(invalid.error, /stable sub-agent id is invalid/i);
+  assert.notEqual(invalid.id, "../not-engine-owned");
+});

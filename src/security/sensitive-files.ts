@@ -49,7 +49,7 @@ const HARA_PRIVATE_FILES = new Set([
   "flows-pending.json",
   "permissions.json",
 ]);
-const HARA_PRIVATE_DIRS = new Set(["sessions", "checkpoints", "index", "gateway", "cron"]);
+const HARA_PRIVATE_DIRS = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "agent-teams"]);
 const HARA_AGENT_CONTENT_DIRS = new Set([
   "workspace", "plugins", "skills", "roles", "org-roles", "memory", "code-assets", "bin", "tts",
 ]);

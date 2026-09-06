@@ -118,6 +118,24 @@ test("reviewer/readOnly roles cannot smuggle writes through an allowed bash tool
   }
 });
 
+test("readOnly roles may coordinate durable descendants only when their declared policy allows it", () => {
+  const defaultFilter = roleToolFilter({ id: "reviewer", description: "", owns: [], rejects: [], readOnly: true, system: "review" });
+  for (const tool of ["spawn_agent", "send_message", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent"]) {
+    assert.equal(defaultFilter(tool), true, `${tool} is a read-only Agent-team coordination primitive`);
+  }
+  const narrowed = roleToolFilter({
+    id: "reviewer",
+    description: "",
+    owns: [],
+    rejects: [],
+    readOnly: true,
+    allowTools: ["read_file", "list_agents"],
+    system: "review",
+  });
+  assert.equal(narrowed("list_agents"), true);
+  assert.equal(narrowed("spawn_agent"), false, "the declared allow-list still narrows collaboration");
+});
+
 test("role policies intersect allowTools and denyTools so an explicit deny always wins", () => {
   const role = { id: "mixed", description: "", owns: [], rejects: [], allowTools: ["read_file", "grep"], denyTools: ["grep"], system: "mixed" };
   const normal = roleToolFilter(role);

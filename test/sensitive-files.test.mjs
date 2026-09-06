@@ -203,6 +203,7 @@ test("sensitive path policy covers Hara control-plane state, NTFS aliases, and n
     assert.equal(sensitiveFileReason(join(home, ".docker-safe", "config.json")), null, "lookalike directories are not overblocked");
     assert.match(sensitiveFileReason(join(home, "project", ".hara", "permissions.json")) ?? "", /private Hara/i);
     assert.match(sensitiveFileReason(join(home, "project", ".hara. ", "sessions", "missing.json")) ?? "", /private Hara/i);
+    assert.match(sensitiveFileReason(join(home, "project", ".hara", "agent-teams", "run.json")) ?? "", /private Hara/i);
 
     // Explicit agent-authored surfaces remain usable even though the rest of ~/.hara defaults private.
     assert.equal(sensitiveFileReason(join(state, "workspace", "notes.md")), null);

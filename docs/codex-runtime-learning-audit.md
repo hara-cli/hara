@@ -32,7 +32,7 @@ providers behind that boundary, not competing user-facing control products.
 | Tool approvals and sandbox boundary | Implemented | Engine policy remains authoritative rather than trusting prose in the transcript. |
 | Background jobs and bounded output | Implemented | Long-running processes and large tool output do not have to block or flood the main model context. |
 | Deferred tool discovery | Implemented | Optional web, desktop, scheduler, external-agent, and MCP schemas stay out of the base prompt until provider-neutral `tool_search` activates an allowed capability. |
-| Bounded read-only delegation | Partially implemented | The current `agent` tool has FIFO admission, cancellation, specialist roles, bounded concurrency, and read-only policy enforcement. A child is still an ephemeral call that returns one result, not a durable addressable member of an Agent tree. |
+| Durable read-only Agent teams | Foundation implemented after 0.166.1 | Persistent Serve sessions now own stable nested Agent IDs/paths, parent/root turn provenance, a redacted durable mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. The original `agent` tool remains the faster one-shot path. |
 | Provider-independent runtime | Stronger Hara requirement | Hara keeps Anthropic/OpenAI-compatible/subscription/enterprise connections behind one engine contract. |
 | External Codex app-server adapter | Implemented | Hara can preserve the provider's native execution path without leaking its native session ID into UI clients. |
 
@@ -75,23 +75,29 @@ window. Full typed replay will eventually make recovery deterministic rather tha
 
 ### 2.3 Durable Agent tree, mailbox, and cold resume
 
-This is now the largest Agent-specific gap. Codex's multi-Agent runtime is not merely parallel prompting: a root
-thread owns a registry of named descendants, every child has a stable path and parent/root turn provenance, and
-the runtime supports spawn, follow-up, queued message, wait, interrupt, listing, and cold resume. Role/model/
-reasoning/sandbox settings survive the child identity, and one rollout budget and concurrency policy cover the
-whole tree.
+The provider-neutral foundation is now implemented for persistent Serve/Desktop sessions. A session owns a
+durable tree with stable child UUIDs and paths, parent/root turn provenance, role and lifecycle generation. The
+private `0600` store uses locked atomic writes and retains redacted instructions, mailbox deliveries, lifecycle
+state, aggregate usage, and terminal outcomes across process restarts.
 
-Hara currently has a safe but intentionally smaller primitive: the `agent` tool starts a bounded read-only
-sub-run, waits for one terminal result, reports a process-local lifecycle event, and then discards the child.
-To reach durable Agent parity, add a provider-neutral tree with:
+The collaboration surface now supports background `spawn`, queued `message`, a new-generation `followup`,
+targeted `wait`, `interrupt`, `list`, and cold `resume`. Nested descendants inherit the same bounded
+`SubagentRuntime` concurrency policy. Mailbox deliveries are drained exactly once at a child run boundary;
+unfinished children are reconstructed as interrupted after a cold start rather than being shown as live. Safe
+Agent metadata is exposed through `session.agents.list` and replayable `event.agent_state` events, while prompts,
+messages, results, credentials, and provider payloads remain outside the public projection. The original `agent`
+tool remains available as the lower-overhead one-shot path.
 
-- stable `agentPath`, child ID, parent turn ID, root turn ID, role, and lifecycle generation;
-- persisted spawn receipts and terminal outcomes so a restart cannot duplicate a child;
-- a mailbox that distinguishes current-turn steering from queue-only next-turn context;
-- explicit `spawn/followup/message/wait/interrupt/list/resume` operations with bounded command receipts;
-- cold reconstruction of surviving children and nested descendants;
-- one concurrency limit and token/time/cost budget shared by the complete tree;
-- child completion/failure messages that retain provenance and cannot silently target a newer turn.
+The remaining Agent hardening is narrower:
+
+- enforce one explicit token/time/cost ceiling for the complete tree, beyond shared concurrency and aggregate
+  accounting;
+- add payload-bound idempotent command receipts for mailbox delivery and follow-up retries;
+- fence automatic child completion delivery to its intended parent turn, so it cannot silently target a newer
+  turn;
+- expose the durable host to direct non-Serve CLI sessions; the persistent implementation currently belongs to
+  Serve/Desktop sessions;
+- add richer Desktop/mobile presentation and control for the existing safe Agent state projection.
 
 Writable children should remain disabled until managed worktree isolation, diff ownership, and an explicit merge
 step exist. Hara should preserve its present rule that parallel children cannot mutate the same working tree.
@@ -191,8 +197,9 @@ success.
    10,000-event duplicate/gap coverage, and explicit snapshot fallback exist.
 5. **Completed control foundation — session lease**: one controller, takeover/revocation, epoch fencing, socket
    release, and legacy compatibility when unleased are covered by two-client integration tests.
-6. **Next Agent slice — durable tree**: stable child identity/path, mailbox, lifecycle commands, shared budget,
-   nested descendant recovery, and cold-resume tests.
+6. **Completed Agent foundation — durable tree**: stable child identity/path, mailbox, lifecycle commands,
+   nested descendant recovery, safe state projection, and shared concurrency/accounting are implemented. The
+   next slice is hard tree-wide budgets, idempotent receipts, parent-turn delivery fencing, and direct CLI hosting.
 7. **Next handoff slice — suspend/resume**: flush-before-suspend, pending-input disposition, successor readiness,
    and Desktop/mobile/terminal contention tests.
 8. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.

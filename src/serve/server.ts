@@ -152,7 +152,13 @@ import {
   DEFAULT_CONTROL_LEASE_RESOURCES,
   type ControlLeaseToken,
 } from "./control-lease.js";
-import type { SubagentLifecycleObserver } from "../subagent/runtime.js";
+import type { SubagentLifecycleObserver, SubagentResult } from "../subagent/runtime.js";
+import {
+  AgentTeamStore,
+  DurableAgentTeam,
+  type AgentMailboxDelivery,
+  type AgentTeamController,
+} from "../subagent/team.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
@@ -368,6 +374,27 @@ export interface ServeDeps {
     profileId?: string,
     spaceId?: string,
   ) => Promise<string>;
+  /** Structured variant used by durable Agent teams. Older embedders can omit it and retain the one-shot
+   * string adapter; production provides it so stable ids, usage and terminal status remain truthful. */
+  spawnSubagentResult?: (
+    provider: Provider,
+    cwd: string,
+    projectContext: string | undefined,
+    stats: { input: number; output: number; lastInput?: number },
+    task: string,
+    role: string | undefined,
+    signal: AbortSignal,
+    observers: Pick<RunOpts, "onProviderTurn" | "onToolRun"> & {
+      onSubagentLifecycle?: SubagentLifecycleObserver;
+    },
+    profileId: string | undefined,
+    spaceId: string | undefined,
+    durable: {
+      id: string;
+      agentTeam: AgentTeamController;
+      pendingInput: () => Promise<AgentMailboxDelivery[]>;
+    },
+  ) => Promise<SubagentResult>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
   buildGuardian?: (cwd?: string, profileId?: string, spaceId?: string) => Promise<{ provider?: Provider | null; enabled?: boolean } | undefined>;
   sandbox: SandboxMode;
@@ -376,6 +403,7 @@ export interface ServeDeps {
   quietDiscovery?: boolean; // tests: skip ~/.hara/serve.json
   discoveryHome?: string; // tests: isolate the discovery file from the real home directory
   artifactHome?: string; // tests/embedders: isolate ~/.hara/artifacts from the real home directory
+  agentTeamHome?: string; // tests/embedders: isolate ~/.hara/agent-teams from the real home directory
   compactTimeoutMs?: number; // tests/embedders: bound a provider that ignores cancellation
   /** Optional hermetic/session-provider override. Production uses official local adapters and never parses
    * private transcript files in the renderer or protocol layer. */
@@ -1497,6 +1525,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
   const hub = new SessionHub(deps.store ?? realStore, deps.version);
+  const agentTeamStore = new AgentTeamStore(deps.agentTeamHome ?? deps.discoveryHome ?? homedir());
+  const agentTeams = new Map<string, DurableAgentTeam>();
   const externalSessions = deps.externalSessions ?? createExternalSessionRegistry({ haraVersion: deps.version });
   // Existing pre-index transcripts are imported in yielding batches. The server can accept health/init
   // traffic immediately; only metadata listing waits for the one-time compatibility view to be complete.
@@ -1872,6 +1902,86 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       nextTaskEventCursor(),
     );
     publishTaskState(event);
+  };
+
+  const agentTeamFor = (session: ServeSession): DurableAgentTeam => {
+    const existing = agentTeams.get(session.meta.id);
+    if (existing) return existing;
+    const team = new DurableAgentTeam({
+      sessionId: session.meta.id,
+      store: agentTeamStore,
+      executor: async (request) => {
+        sessionSpaceBinding(session.meta);
+        const taskId = session.task?.id;
+        const turnId = session.task?.turnId;
+        const observers = {
+          onProviderTurn: (turn: Promise<unknown>) => observeProviderTurn(session, turn),
+          onToolRun: (toolRun: Promise<unknown>, tool: { name: string }) =>
+            observeToolRun(session, toolRun, tool),
+          onSubagentLifecycle: (event: Parameters<NonNullable<SubagentLifecycleObserver>>[0]) => {
+            if (!taskId || !turnId) return;
+            const snapshot = workforceLedger.recordSubagent(
+              session.meta.id,
+              taskId,
+              turnId,
+              event,
+            );
+            if (snapshot) broadcast("event.workforce_state", { ...snapshot });
+          },
+        };
+        if (deps.spawnSubagentResult) {
+          const result = await deps.spawnSubagentResult(
+            session.provider,
+            session.meta.cwd,
+            session.projectContext,
+            session.stats,
+            request.task,
+            request.role,
+            request.signal,
+            observers,
+            session.meta.profileId,
+            session.meta.spaceId,
+            {
+              id: request.id,
+              agentTeam: request.controller,
+              pendingInput: request.pendingInput,
+            },
+          );
+          sessionSpaceBinding(session.meta);
+          return {
+            status: result.status,
+            text: result.text,
+            ...(result.model ? { model: result.model } : {}),
+            ...(result.error ? { error: result.error } : {}),
+            ...(result.usage ? { usage: result.usage } : {}),
+          };
+        }
+        const text = await deps.spawnSubagent(
+          session.provider,
+          session.meta.cwd,
+          session.projectContext,
+          session.stats,
+          request.task,
+          request.role,
+          request.signal,
+          observers,
+          session.meta.profileId,
+          session.meta.spaceId,
+        );
+        sessionSpaceBinding(session.meta);
+        return /^Error:\s/u.test(text)
+          ? { status: "error", text: "", error: text.replace(/^Error:\s*/u, "") }
+          : { status: "completed", text };
+      },
+      onChange: (agent) => {
+        broadcast("event.agent_state", { sessionId: session.meta.id, agent });
+      },
+      onRun: (run) => {
+        observeToolRun(session, run, { name: "agent_team" });
+      },
+    });
+    agentTeams.set(session.meta.id, team);
+    return team;
   };
 
   // Discovery file — the desktop shell reads this to find the running server (like a pid/port file).
@@ -2255,6 +2365,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             sessionSpaceBinding(s.meta);
             return result;
           },
+          agentTeam: agentTeamFor(s).controller("/root", {
+            ...(s.task?.turnId ? { parentTurnId: s.task.turnId, rootTurnId: s.task.turnId } : {}),
+          }),
           ui: sink,
           inspectImage: async (image, hint, signal) => {
             sessionSpaceBinding(s.meta);
@@ -3128,7 +3241,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           const methods = [
             "server.shutdown",
             "events.replay", "events.ack",
-            "session.list", "session.create", "session.resume", "session.history", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
+            "session.list", "session.create", "session.resume", "session.history", "session.agents.list", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
@@ -3176,6 +3289,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "agent.action-ownership.v1",
             "agent.public-profile-edit.v1",
             "agent.blueprint-provenance.v1",
+            "agents.durable-team.v1",
             "external.sessions.metadata.v1",
             "external.sessions.interaction.v1",
             "external.sessions.live-control.v1",
@@ -3209,7 +3323,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             capabilities: {
               methods,
               events: [
-                "event.task_state", "event.workforce_state", "event.surface", "event.session_changed",
+                "event.task_state", "event.workforce_state", "event.agent_state", "event.surface", "event.session_changed",
                 "event.control_state", "event.control_revoked",
                 "external.event.turn_start", "external.event.text", "external.event.tool",
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
@@ -3399,6 +3513,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 limit: page.limit,
                 ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
               },
+            }));
+          }
+          case "session.agents.list": {
+            if (typeof p.sessionId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            }
+            const session = hub.get(p.sessionId);
+            if (!session) {
+              return reply(rpcError(id, ERR.NO_SESSION, "resume the session before listing its Agent team"));
+            }
+            sessionSpaceBinding(session.meta);
+            return reply(rpcResult(id!, {
+              sessionId: session.meta.id,
+              agents: agentTeamFor(session).list(),
             }));
           }
           case "external.sources.list": {
@@ -4793,6 +4921,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const r = hub.delete(p.sessionId);
             if (r === "busy") return reply(rpcError(id, ERR.BUSY, "a turn is running — delete after it finishes"));
             if (r === "missing") return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId} (or held by another process)`));
+            const team = agentTeams.get(p.sessionId);
+            if (team) team.removeStoredState();
+            else agentTeamStore.remove(p.sessionId);
+            agentTeams.delete(p.sessionId);
             disposeTodoScope(p.sessionId);
             disposeReminderScope(p.sessionId);
             resetRepeatGuard(p.sessionId);
@@ -6127,6 +6259,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const candidateMeta = { ...s.meta };
             delete candidateMeta.todos;
             hub.replaceSnapshot(s, candidateMeta, next, undefined);
+            const team = agentTeams.get(s.meta.id);
+            if (team) team.removeStoredState();
+            else agentTeamStore.remove(s.meta.id);
+            agentTeams.delete(s.meta.id);
             disposeTodoScope(s.meta.id);
             disposeReminderScope(s.meta.id);
             resetRepeatGuard(s.meta.id);
@@ -6220,6 +6356,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       for (const [controller] of ownedAutomationRuns) {
         controller.abort(new Error("Hara Serve is shutting down"));
       }
+      for (const team of agentTeams.values()) team.close();
       for (const session of hub.active()) session.abort?.abort();
       await externalSessions.close?.().catch(() => {});
       await deps.closeGatewayLogins?.().catch(() => {});

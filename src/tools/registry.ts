@@ -3,6 +3,7 @@ import type { SandboxMode } from "../sandbox.js";
 import { prepareToolResult } from "./result-limit.js";
 import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
 import type { SkillToolPolicyActivation } from "../skills/tool-policy.js";
+import type { AgentTeamController } from "../subagent/team.js";
 
 /** Where agent-side output goes. In the TUI it drives ink state; in plain mode it's absent and
  *  the loop/tools fall back to writing the terminal directly. */
@@ -57,6 +58,9 @@ export interface ToolContext {
   restrictToolsForSkill?: (skillId: string, allowedTools: readonly string[]) => SkillToolPolicyActivation;
   /** spawn a sub-agent for a sub-task (set by the REPL/-p; absent inside sub-agents) */
   spawn?: (task: string, role?: string, signal?: AbortSignal) => Promise<string>;
+  /** Durable read-only Agent tree owned by a persistent session. It is scoped to the current Agent path,
+   * so nested children can collaborate without receiving access to another session's mailbox. */
+  agentTeam?: AgentTeamController;
   /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */
   ui?: UiSink;
   /** Ask the user a structured question mid-turn and await their answer (drives the `ask_user` tool).

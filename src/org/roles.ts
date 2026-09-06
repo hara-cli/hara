@@ -845,7 +845,12 @@ export function roleToolFilter(role: Role | undefined): ((name: string) => boole
   if (role.readOnly) {
     // Raw bash is intentionally absent: even commands that look read-only can hide redirection, command
     // substitution, hooks, or an executable with side effects. Reviewers get dedicated read/search tools.
-    const safe = new Set(["read_file", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write"]);
+    const safe = new Set([
+      "read_file", "grep", "glob", "ls", "web_fetch", "web_search", "codebase_search", "todo_write",
+      // These mutate only the engine-owned private mailbox/tree and every descendant remains constrained
+      // by subagentToolFilter's read-only boundary. They do not grant filesystem or process mutation.
+      "spawn_agent", "send_message", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent",
+    ]);
     return (name) => safe.has(name) && declared(name);
   }
   return role.allowTools || role.denyTools ? declared : undefined;

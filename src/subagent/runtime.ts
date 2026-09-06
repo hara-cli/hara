@@ -9,6 +9,8 @@ export interface SubagentUsage {
 }
 
 export interface SubagentRequest {
+  /** Optional engine-owned stable identity. Model/user input must never choose this directly. */
+  id?: string;
   task: string;
   role?: string;
   signal?: AbortSignal;
@@ -72,6 +74,9 @@ type Waiter = {
 function iso(): string {
   return new Date().toISOString();
 }
+
+const STABLE_SUBAGENT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function boundedMessage(value: unknown, fallback: string): string {
   const raw = value instanceof Error ? value.message : typeof value === "string" ? value : "";
@@ -178,7 +183,7 @@ export class SubagentRuntime<Request extends SubagentRequest> {
     request: Request,
     onLifecycle?: SubagentLifecycleObserver,
   ): Promise<SubagentResult> {
-    const id = randomUUID();
+    const id = request.id && STABLE_SUBAGENT_ID.test(request.id) ? request.id : randomUUID();
     const queuedAt = iso();
     const publish = (event: SubagentLifecycleEvent): void => {
       try {
@@ -193,6 +198,11 @@ export class SubagentRuntime<Request extends SubagentRequest> {
       ...(request.role ? { role: request.role } : {}),
       queuedAt,
     };
+    if (request.id !== undefined && request.id !== id) {
+      const result = this.failure(id, providerId, request.role, queuedAt, "error", "stable sub-agent id is invalid");
+      publish({ ...lifecycleBase, state: "failed", endedAt: result.endedAt });
+      return result;
+    }
     const provider = this.providers.get(providerId);
     if (!provider) {
       const result = this.failure(id, providerId, request.role, queuedAt, "error", `provider '${providerId}' is not registered`);

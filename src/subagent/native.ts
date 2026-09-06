@@ -15,6 +15,7 @@ import type { Provider, NeutralMsg } from "../providers/types.js";
 import type { SandboxMode } from "../sandbox.js";
 import { effectiveRoleModel } from "../session/session-model.js";
 import { disposeTodoScope } from "../tools/todo.js";
+import type { AgentTeamController } from "./team.js";
 import type { SubagentProvider, SubagentRequest, SubagentSettlement, SubagentUsage } from "./runtime.js";
 
 export const NATIVE_SUBAGENT_PROVIDER_ID = "native-readonly";
@@ -38,6 +39,10 @@ export interface NativeSubagentRequest extends SubagentRequest {
   timeoutMs: number;
   maxRounds: number;
   observers?: Pick<RunOpts, "onProviderTurn" | "onToolRun">;
+  /** Scoped durable collaboration surface. Only engine-created team children receive it. */
+  agentTeam?: AgentTeamController;
+  /** Durable mailbox drain, already converted into neutral user messages by the owning host. */
+  pendingInput?: () => Promise<NeutralMsg[]>;
   isReadonlyTool: (name: string) => boolean;
   /** Revalidates the parent conversation's immutable audience around lazy role/provider work. */
   assertAudience?: () => void;
@@ -117,6 +122,7 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
         todoScope,
         profileId: request.profileId,
         spaceId: request.spaceId,
+        ...(request.agentTeam ? { agentTeam: request.agentTeam } : {}),
       },
       approval: "full-auto",
       approvalChannel: false,
@@ -132,6 +138,7 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
       signal: request.signal,
       timeoutMs: Math.min(request.timeoutMs, 8 * 60_000),
       maxRounds: Math.min(request.maxRounds, 24),
+      ...(request.pendingInput ? { pendingInput: request.pendingInput } : {}),
       ...(request.observers ?? {}),
     });
   } finally {
