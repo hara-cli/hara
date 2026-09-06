@@ -684,3 +684,46 @@ that this harness does not model.
 - Recurrence-Count: 1
 
 ---
+
+## [LRN-20260906-PROVIDER-NATIVE-SUBSCRIPTION-METERING] correction
+
+**Logged**: 2026-09-06T19:25:18+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: providers
+
+### Summary
+
+Hara may unify execution safety and a display contract, but it must never infer one token/cost formula for
+BYOK, vendor subscription plans, and company-managed gateways.
+
+### Details
+
+The durable Agent-team roadmap incorrectly described the next guard as a universal tree-wide
+"token/time/cost" budget. Time, rounds, and concurrency are provider-neutral runtime safety limits. Economic
+allowance is not: each provider can meter different native units, coefficients, windows, tools, seats, or
+overage rules, and a company gateway may apply its own subscribed entitlement. Hara token telemetry is useful
+for context and diagnostics but is not proof of billable cost or remaining subscription allowance.
+
+### Suggested Action
+
+Model three separate layers: provider-neutral runtime safety; opaque provider-native usage/quota snapshots;
+and administrator/user routing policy. Display native units and source attribution, use provider-reported
+reset/remaining state for admission or switching, and show unavailable when the provider exposes no usage API.
+
+### Metadata
+
+- Source: user_feedback
+- Related Files: docs/codex-runtime-learning-audit.md, src/providers/types.ts, src/providers/plan-notes.ts
+- Tags: providers, subscriptions, managed-gateway, metering, quota, billing
+- Pattern-Key: providers.preserve_native_subscription_metering
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-06T20:05:00+08:00
+- **Notes**: Split provider-neutral execution safety from provider/Control-native accounting, exposed the
+  accounting authority per catalog entry and saved connection, removed hard-coded subscription formulas from
+  setup and roadmap text, and gated automatic usage failover on a fresh authoritative exhaustion snapshot.
+
+---

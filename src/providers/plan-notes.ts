@@ -1,35 +1,32 @@
-// Subscription-plan cost shape, in the one place a user will actually read it: the end of `hara setup`.
+// Subscription-plan authority, in the one place a user will actually read it: the end of `hara setup`.
 //
-// Both Token Plans bill on a shape that surprises people who expect per-token pay-as-you-go — output
-// pricing that includes the thinking chain, a fixed window whose unused quota never carries over, and a
-// service pause rather than an overage bill. None of that is visible from a model list, and getting it
-// wrong looks like "Hara is slow" or "Hara stopped working". Pure and provider-keyed so a new plan is a
-// new entry, not new code at the call site.
+// Each provider and plan can use different units, coefficients, windows, tools, seats and overage rules.
+// These notes therefore explain where truth comes from instead of freezing a pricing formula into Hara.
 import type { ProviderId } from "../config.js";
 
 export interface PlanNote {
-  /** What the plan charges for, phrased as the thing that surprises people. */
-  billing: string;
-  /** The one throughput/availability fact that explains a bad session before blaming the client. */
-  limits: string;
-  /** Which model to start on and when to move, when the catalog makes that a real decision. */
+  /** Who owns the subscription calculation and entitlement decision. */
+  metering: string;
+  /** Where the user can see an authoritative remaining allowance. */
+  visibility: string;
+  /** Stable selection guidance only; live key-scoped discovery remains authoritative. */
   models?: string;
 }
 
 const NOTES: Partial<Record<ProviderId, PlanNote>> = {
   "token-plan": {
-    billing: "Output pricing includes the thinking chain, so a high thinking level is billed, not free.",
-    limits: "Quota runs on a fixed window; unused quota does not carry over, and the service pauses when it is spent.",
-    models: "qwen3.8-flash is the cheapest daily driver and stays flat-rate to 1M context; qwen3.8-max is half price 22:00–08:00. Switch any time with /model.",
+    metering: "Alibaba Cloud is authoritative for this account's subscription units, coefficients, windows, and exhaustion state; Hara request tokens are context telemetry, not a billing calculation.",
+    visibility: "Check remaining allowance and reset state in the Alibaba Cloud console. Hara will show unavailable rather than estimate them when no authenticated usage adapter is available.",
+    models: "Choose from the live key-scoped model list; available models and entitlements can differ by account and plan. Switch any time with /model.",
   },
   "minimax-token-plan": {
-    billing: "Output pricing includes the thinking chain, so a high thinking level is billed, not free.",
-    limits: "Quota runs on 5-hour and weekly windows that do not carry over. MiniMax also throttles dynamically at peak (weekdays 15:00–17:30) and caps how many agents one plan tier may run, so a slow turn is usually the tier rather than the client.",
+    metering: "MiniMax is authoritative for this account's subscription units, coefficients, windows, and exhaustion state; Hara request tokens are context telemetry, not a billing calculation.",
+    visibility: "Check remaining allowance and reset state through MiniMax's account usage surface. Hara will show unavailable rather than estimate them when no authenticated usage adapter is available.",
   },
   "volcengine-agent-plan": {
-    billing: "Agent Fuel Points are shared across every supported Agent Plan tool; model and Harness usage draw from the same subscription allowance.",
-    limits: "The plan uses a 5-hour cycle plus weekly and monthly limits. When an allowance is exhausted, service pauses unless overage billing is enabled in Ark.",
-    models: "auto is the recommended quality/speed router. Pick an explicit model id when a session must stay pinned; ark-code-latest remains a compatibility alias for the model selected in Ark.",
+    metering: "Volcengine Ark is authoritative for this account's Agent Plan units, coefficients, windows, and exhaustion state; Hara request tokens are context telemetry, not a Fuel Point or billing calculation.",
+    visibility: "Check remaining allowance and reset state in Ark. Hara will show unavailable rather than estimate them when no authenticated usage adapter is available.",
+    models: "Use auto for Ark-managed routing, or choose an entitled explicit model when a session must stay pinned; the live account catalog is authoritative.",
   },
 };
 
@@ -41,5 +38,5 @@ export function planNote(provider: ProviderId | string | undefined): PlanNote | 
 export function planNoteLines(provider: ProviderId | string | undefined): string[] {
   const note = planNote(provider);
   if (!note) return [];
-  return [note.billing, note.limits, ...(note.models ? [note.models] : [])];
+  return [note.metering, note.visibility, ...(note.models ? [note.models] : [])];
 }

@@ -865,6 +865,21 @@ test("provider catalog: Volcengine Agent Plan exposes its fixed Codex Responses 
   assert.equal(volcengine?.knownModels?.some((model) => /seedream|seedance|embedding|tts|asr/i.test(model)), false);
 });
 
+test("provider catalog exposes accounting authority without inventing one billing formula", () => {
+  const catalog = providerCatalog();
+  assert.deepEqual(catalog.find((provider) => provider.id === "token-plan")?.accounting, {
+    authority: "provider",
+    mode: "subscription",
+    usageReadMethod: "provider-console",
+    haraMayInferBillingFromTransportTokens: false,
+    failoverPolicy: "authoritative-exhaustion-only",
+  });
+  assert.equal(catalog.find((provider) => provider.id === "hara-gateway")?.accounting.authority, "organization");
+  assert.equal(catalog.find((provider) => provider.id === "openai")?.accounting.mode, "provider-defined");
+  assert.equal(catalog.find((provider) => provider.id === "lmstudio")?.accounting.mode, "local");
+  assert.equal(catalog.every((provider) => provider.accounting.haraMayInferBillingFromTransportTokens === false), true);
+});
+
 test("provider settings pin Token Plan credentials to the official Beijing endpoint", () => {
   assert.equal(
     normalizePersonalProviderConfig({

@@ -54,6 +54,7 @@ import type {
   Provider,
   UserAttachmentView,
 } from "../providers/types.js";
+import type { ProviderAccountingDescriptor } from "../providers/accounting.js";
 import type { GatewayStatus } from "../gateway/serve.js";
 import type { GatewayLoginSnapshot } from "../gateway/login.js";
 import type { UiSink } from "../tools/registry.js";
@@ -675,6 +676,8 @@ export interface ProviderSettingsCatalogEntry {
   defaultModel: string;
   defaultBaseURL?: string;
   customBaseURL: boolean;
+  /** Provider/Control-owned accounting boundary; Desktop must not price response tokens itself. */
+  accounting: ProviderAccountingDescriptor;
   knownModels?: readonly string[];
   /** Models this engine version has positively classified as accepting image input. */
   knownVisionModels?: readonly string[];
@@ -695,6 +698,7 @@ export interface ProviderSettingsState {
     profileKind: "byok" | "gateway";
     profileSource: "flag" | "env" | "pin" | "default" | "fallback";
     editable: boolean;
+    accounting: ProviderAccountingDescriptor;
     environmentOverride?: boolean;
     reasoningEffort?: string;
     effortLevels?: string[];
@@ -754,6 +758,8 @@ export interface ProviderConnectionSummary {
   active: boolean;
   legacyPersonal: boolean;
   removable: boolean;
+  /** Usage belongs to this account/connection even when another row uses the same provider. */
+  accounting: ProviderAccountingDescriptor;
   keyHint?: string;
   createdAt?: string;
   reasoningEffort?: string;

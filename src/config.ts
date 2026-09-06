@@ -29,6 +29,7 @@ import {
   VOLCENGINE_AGENT_PLAN_BASE_URL,
   VOLCENGINE_AGENT_PLAN_MODELS,
 } from "./providers/volcengine.js";
+import { providerAccounting, type ProviderAccountingDescriptor } from "./providers/accounting.js";
 
 export type ProviderId =
   | "anthropic"
@@ -220,13 +221,15 @@ export interface ProviderCatalogEntry {
   defaultModel: string;
   defaultBaseURL?: string;
   customBaseURL: boolean;
+  /** Native metering authority/capability. Contains no inferred price or quota formula. */
+  accounting: ProviderAccountingDescriptor;
   /** Setup-time suggestions only. A live key-scoped `/models` response is authoritative. */
   knownModels?: readonly string[];
   /** Kept loadable for existing profiles but hidden from new-connection setup. */
   legacy?: boolean;
 }
 
-const PROVIDER_LABELS: Record<ProviderId, Omit<ProviderCatalogEntry, "id" | "defaultModel" | "defaultBaseURL">> = {
+const PROVIDER_LABELS: Record<ProviderId, Omit<ProviderCatalogEntry, "id" | "defaultModel" | "defaultBaseURL" | "accounting">> = {
   anthropic: { label: "Anthropic", location: "cloud", auth: "api-key", customBaseURL: true },
   "token-plan": {
     label: "Alibaba Cloud Model Studio Token Plan",
@@ -285,6 +288,7 @@ export function providerCatalog(): ProviderCatalogEntry[] {
   return PROVIDER_IDS.map((id) => ({
     id,
     ...PROVIDER_LABELS[id],
+    accounting: providerAccounting(id),
     defaultModel: PROVIDER_DEFAULTS[id].model,
     ...(PROVIDER_DEFAULTS[id].baseURL ? { defaultBaseURL: PROVIDER_DEFAULTS[id].baseURL } : {}),
   }));

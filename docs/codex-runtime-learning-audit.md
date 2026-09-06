@@ -90,8 +90,9 @@ tool remains available as the lower-overhead one-shot path.
 
 The remaining Agent hardening is narrower:
 
-- enforce one explicit token/time/cost ceiling for the complete tree, beyond shared concurrency and aggregate
-  accounting;
+- enforce provider-neutral tree safety ceilings for concurrency, active time, and rounds; subscription allowance
+  must remain a separate provider/Control-native decision because units, coefficients, windows, and overage rules
+  differ by provider and plan;
 - add payload-bound idempotent command receipts for mailbox delivery and follow-up retries;
 - fence automatic child completion delivery to its intended parent turn, so it cannot silently target a newer
   turn;
@@ -199,7 +200,9 @@ success.
    release, and legacy compatibility when unleased are covered by two-client integration tests.
 6. **Completed Agent foundation — durable tree**: stable child identity/path, mailbox, lifecycle commands,
    nested descendant recovery, safe state projection, and shared concurrency/accounting are implemented. The
-   next slice is hard tree-wide budgets, idempotent receipts, parent-turn delivery fencing, and direct CLI hosting.
+   next slice is hard tree-wide execution safety plus provider-native allowance admission, idempotent receipts,
+   parent-turn delivery fencing, and direct CLI hosting. Hara must never derive cost or subscription exhaustion
+   from transport token counters.
 7. **Next handoff slice — suspend/resume**: flush-before-suspend, pending-input disposition, successor readiness,
    and Desktop/mobile/terminal contention tests.
 8. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.

@@ -69,7 +69,9 @@ Neither is reused as the other service's credential, and neither is exposed thro
 1. **Phase 0 spike — ✅ done.** LiteLLM proxies `/v1` streaming + tool calls end-to-end.
 2. **Phase 1 MVP — ✅ done (built + dogfooded on a real gateway).** enroll-code → device-token mint (LiteLLM
    adapter), device registry, `/v1/heartbeat`, hash-chained `audit_log`, read-only **fleet view** (machine /
-   who / today's tokens+cost / model / token status / revoke), org-unit hierarchy, per-key budget + model scope.
+   who / provider-native usage and entitlement source / model / credential status / revoke), org-unit hierarchy,
+   Control-authored per-credential policy + model scope. The gateway preserves each upstream subscription's
+   native units and rules; it does not turn response token counters into a universal cost formula.
 3. **Phase 2 — next.** Built-in accounts + login + **RBAC** (open; the self-host "super-user" floor) and a
    `hara login` **device flow (RFC 8628)** so devices self-onboard against a company URL — both spec'd in
    `hara-control/docs/AUTH_SPEC.md`. enroll-code already covers onboarding until then. **2FA is delegated to

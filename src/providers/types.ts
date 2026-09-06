@@ -80,6 +80,8 @@ export interface TurnResult {
   errorMsg?: string;
   /** Bounded, credential-free transport facts used by the central replay-safe retry policy. */
   errorMetadata?: ProviderErrorMetadata;
+  /** Request transport token telemetry for context sizing and diagnostics only.
+   * It is not billable cost, subscription credit usage, or remaining entitlement. */
   usage?: { input: number; output: number };
 }
 
