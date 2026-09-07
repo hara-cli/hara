@@ -17,10 +17,12 @@ import {
   newSteerInteraction,
   newTurnInteraction,
   recordTaskDecision,
+  recordAwaitingTaskDecision,
   recordTaskRoundUsage,
   recordTaskSteering,
   routeTaskInteraction,
   requestsTaskContinuation,
+  taskAwaitsUserDecision,
   recoverTaskExecution,
   taskRoundBudget,
   taskExecutionContext,
@@ -146,6 +148,44 @@ test("task completion remains paused while durable todos are unfinished", () => 
   assert.equal(paused.status, "paused");
   const completed = finishTaskExecution(task, { status: "completed" }, [{ text: "publish", status: "done" }]);
   assert.equal(completed.status, "completed");
+});
+
+test("a pre-brief headless question remains paused and addressable by the next conversation reply", () => {
+  const interaction = newTurnInteraction();
+  const task = createTaskExecution("configure the automation", interaction.turnId, "2026-09-07T00:00:00.000Z");
+  const waiting = applyTaskCheckpoint(task, {
+    completion: {
+      state: "awaiting_user",
+      evidence: ["this persisted run has no live interactive answer channel"],
+      dependency: {
+        kind: "material_choice",
+        detail: "Which destination should receive the report?",
+        evidence: ["ask_user requested a destination choice"],
+        options: ["Operations", "Engineering"],
+      },
+    },
+  }, "2026-09-07T00:01:00.000Z");
+  assert.equal(waiting.ok, true);
+  const paused = finishTaskExecution(waiting.task, { status: "completed" }, [], false, "2026-09-07T00:02:00.000Z");
+  assert.equal(paused.status, "paused");
+  assert.equal(taskAwaitsUserDecision(paused), true);
+  assert.equal(taskAwaitsUserDecision(task), false);
+
+  const answered = recordAwaitingTaskDecision(paused, "2", "2026-09-07T00:03:00.000Z");
+  assert.equal(answered.ok, true);
+  assert.equal(answered.task.status, "paused", "retaining an answer does not start provider work");
+  assert.equal(answered.task.decisions.length, 1);
+  assert.equal(answered.task.decisions[0].question, "Which destination should receive the report?");
+  assert.equal(answered.task.decisions[0].answer, "Engineering");
+  assert.equal(answered.task.checkpoint.blockedStep, undefined);
+  assert.equal(answered.task.checkpoint.blockReason, undefined);
+  assert.equal(answered.task.checkpoint.currentStep, "apply the retained user decision");
+  assert.match(taskCheckpointContext(undefined, answered.task.decisions), /Engineering/);
+
+  const replay = recordAwaitingTaskDecision(answered.task, "Operations", "2026-09-07T00:04:00.000Z");
+  assert.equal(replay.ok, true);
+  assert.equal(replay.task.decisions.length, 1);
+  assert.equal(replay.task.decisions[0].answer, "Engineering", "the first durable answer wins on retry");
 });
 
 test("an accepted brief requires a fresh engine-readable completion receipt", () => {

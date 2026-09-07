@@ -113,6 +113,8 @@ test("understanding gate blocks a direct edit, checkpoints task_intake, then per
   assert.equal(checkpointSawClosedRound, true, "checkpoint happens after the task_intake tool result closes the protocol round");
   assert.match(JSON.stringify(history), /Understanding gate: this action was NOT executed/);
   assert.match(p.systems[0], /Do not jump from a raw request straight into side effects/);
+  assert.match(p.systems[0], /task-completeness pass against EVERY accepted check/);
+  assert.match(p.systems[0], /scheduler registration.*does not prove an automation delivered its real result/s);
   assert.match(p.systems.at(-1), /The task brief below is the accepted interpretation/);
 });
 
@@ -230,7 +232,7 @@ test("the action ownership guard fails closed when a model refuses to act twice"
   assert.doesNotMatch(JSON.stringify(history), /Do it yourself|Still do it yourself/);
 });
 
-test("successful owned work is preserved when the model omits its completion receipt twice", async () => {
+test("successful owned work is paused without exposing success prose to a remote gateway when the model omits its completion receipt twice", async () => {
   const turn = newTurnInteraction();
   let task = createTaskExecution("save the requested records", turn.turnId);
   let writes = 0;
@@ -253,41 +255,55 @@ test("successful owned work is preserved when the model omits its completion rec
     { text: "The records were saved successfully.", toolUses: [], stop: "end" },
   ]);
   const history = [{ role: "user", content: "save the requested records" }];
-  const outcome = await runAgent(history, {
-    provider: p,
-    ctx: {
-      cwd: process.cwd(),
-      ui: {
-        text: (value) => visible.push(value),
-        reasoning: () => {},
-        tool: () => {},
-        diff: () => {},
-        notice: (value) => notices.push(value),
+  const previousGateway = process.env.HARA_GATEWAY;
+  process.env.HARA_GATEWAY = "feishu";
+  let outcome;
+  try {
+    outcome = await runAgent(history, {
+      provider: p,
+      ctx: {
+        cwd: process.cwd(),
+        ui: {
+          text: (value) => visible.push(value),
+          reasoning: () => {},
+          tool: () => {},
+          diff: () => {},
+          notice: (value) => notices.push(value),
+        },
       },
-    },
-    approval: "full-auto",
-    confirm: async () => true,
-    extraTools: [write],
-    taskIntake: {
-      task,
-      current: () => task,
-      onUpdate(next) {
-        task = next;
+      approval: "full-auto",
+      confirm: async () => true,
+      extraTools: [write],
+      taskIntake: {
+        task,
+        current: () => task,
+        onUpdate(next) {
+          task = next;
+        },
+        onCheckpoint(next) {
+          task = next;
+        },
       },
-      onCheckpoint(next) {
-        task = next;
-      },
-    },
-  });
+    });
+  } finally {
+    if (previousGateway === undefined) delete process.env.HARA_GATEWAY;
+    else process.env.HARA_GATEWAY = previousGateway;
+  }
 
-  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.status, "halted");
+  assert.equal(outcome.stopReason, "completion_verification");
   assert.equal(writes, 1, "finished work is not repeated merely to satisfy a missing receipt");
   assert.equal(task.checkpoint.completion, undefined, "the engine never fabricates verified evidence");
   assert.match(notices.join("\n"), /completion receipt guard/);
   assert.match(notices.join("\n"), /resumable checkpoint/);
   assert.doesNotMatch(notices.join("\n"), /advice was not accepted|twice returned advice/);
-  assert.equal(visible.join("").match(/records were saved successfully/gi)?.length, 1);
+  assert.doesNotMatch(visible.join(""), /records were saved successfully/i);
   assert.match(JSON.stringify(history), /Completion receipt correction/);
+  assert.doesNotMatch(
+    JSON.stringify(history),
+    /The records were saved successfully/,
+    "withheld success prose is not resurrected by a later Desktop/Mobile session resume",
+  );
 });
 
 test("task_intake and an edit in the same model response cannot bypass the round boundary", async () => {

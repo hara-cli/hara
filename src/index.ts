@@ -282,15 +282,18 @@ import {
   consumePendingTaskSteering,
   continueTaskExecution,
   createTaskExecution,
+  freshTaskCompletion,
   finishTaskExecution,
   formatTaskExecution,
   hasPendingTaskSteering,
   newSteerInteraction,
   newTurnInteraction,
+  recordAwaitingTaskDecision,
   recordTaskSteering,
   recoverTaskExecution,
   routeTaskInteraction,
   requestsTaskContinuation,
+  taskAwaitsUserDecision,
   taskExecutionContext,
   type TaskExecution,
   type TaskInteraction,
@@ -6427,12 +6430,29 @@ program.action(async (opts) => {
     // A resumed unfinished task keeps its objective; this prompt is a new turn that steers it. A completed
     // task (or a stateless -p run) starts a fresh execution identity. Persist before provider side effects so
     // a crash is recoverable as paused rather than looking like a completed turn.
+    const answeringDurableQuestion = taskAwaitsUserDecision(task);
     const headlessInteraction: TaskInteraction = task && task.status !== "completed" &&
-      (recoveredHeadlessSteering !== null || requestsTaskContinuation(String(opts.print)))
+      (recoveredHeadlessSteering !== null || answeringDurableQuestion || requestsTaskContinuation(String(opts.print)))
       ? newSteerInteraction(task.turnId)
       : newTurnInteraction();
     if (headlessInteraction.kind === "steer") {
+      if (answeringDurableQuestion) {
+        const recorded = recordAwaitingTaskDecision(task, printText);
+        if (!recorded.ok) {
+          process.stderr.write(`hara: cannot retain the answer for this paused task — ${recorded.reason}.\n`);
+          process.exitCode = 2;
+          await closeMcp();
+          return;
+        }
+        task = recorded.task;
+      }
       const continued = continueTaskExecution(task, headlessInteraction);
+      if (!continued.ok && answeringDurableQuestion) {
+        process.stderr.write(`hara: cannot continue the task after retaining its answer — ${continued.reason}.\n`);
+        process.exitCode = 2;
+        await closeMcp();
+        return;
+      }
       task = continued.ok ? continued.task : createTaskExecution(String(opts.print), headlessInteraction.turnId);
     } else {
       task = createTaskExecution(String(opts.print), headlessInteraction.turnId);
@@ -6544,18 +6564,36 @@ program.action(async (opts) => {
           }
         : {}),
     };
+    const currentHeadlessQuestion = (): string | undefined => {
+      const completion = freshTaskCompletion(task);
+      return completion?.state === "awaiting_user" && completion.dependency?.kind === "material_choice"
+        ? completion.dependency.detail
+        : undefined;
+    };
     let runOutcome = await runAgent(history, printRunOpts);
     if (schemaObj) {
       // The tool call IS the answer — if the model finished without it, nudge and retry (bounded).
-      for (let attempt = 0; attempt < 2 && !structuredSet && runOutcome.status === "completed"; attempt++) {
+      // A durable ask_user pause is a stronger boundary than the missing-output retry: only a real later
+      // user reply may open the next provider tranche, never a synthetic structured nudge.
+      for (
+        let attempt = 0;
+        attempt < 2 && !structuredSet && runOutcome.status === "completed" && !currentHeadlessQuestion();
+        attempt++
+      ) {
         history.push({ role: "user", content: STRUCTURED_NUDGE });
         runOutcome = await runAgent(history, printRunOpts);
       }
       const failure = runFailureDetail(runOutcome);
+      const pendingQuestion = currentHeadlessQuestion();
       if (failure) {
         // A valid structured_output call is provisional until the whole agent run completes. A later provider
         // error or safety halt must never be hidden behind stale-looking success JSON on stdout.
         process.stderr.write(`hara: structured run failed (${runOutcome.status}) — ${failure}\n`);
+        process.exitCode = 2;
+      }
+      else if (pendingQuestion) {
+        const safeQuestion = redactSensitiveText(pendingQuestion).text.replace(/\s+/gu, " ").trim().slice(0, 500);
+        process.stderr.write(`hara: structured run paused (awaiting_user) — ${safeQuestion || "a material choice is required"}\n`);
         process.exitCode = 2;
       }
       else if (structuredSet) out(JSON.stringify(structured) + "\n");
@@ -6570,8 +6608,10 @@ program.action(async (opts) => {
         process.exitCode = 2;
       }
     }
+    let durableQuestionPause = false;
     if (meta) {
       task = finishTaskExecution(task, runOutcome, meta.todos ?? [], false);
+      durableQuestionPause = taskAwaitsUserDecision(task);
       // Long-session safety: auto-compact before saving so a long chat/cron thread never overflows context.
       // Silent (no-op notify) in headless mode so nothing leaks into a captured -p reply. Opt-out via config.
       if (runOutcome.status === "completed") {
@@ -6588,8 +6628,16 @@ program.action(async (opts) => {
         );
       }
       saveSession(meta, history, task); // persist when resuming/continuing; plain -p stays stateless
+      if (!schemaObj && process.env.HARA_CRON === "1" && durableQuestionPause) {
+        const safeQuestion = redactSensitiveText(freshTaskCompletion(task)?.dependency?.detail ?? "")
+          .text.replace(/\s+/gu, " ").trim().slice(0, 500);
+        process.stderr.write(`hara: headless run paused (awaiting_user) — ${safeQuestion || "a material choice is required"}\n`);
+        process.exitCode = 2;
+      }
     }
-    if (!schemaObj && runOutcome.status === "completed" && (stats.input || stats.output)) out(statusLine(headlessProvider.model, stats.input, stats.output) + "\n");
+    if (!schemaObj && !durableQuestionPause && runOutcome.status === "completed" && (stats.input || stats.output)) {
+      out(statusLine(headlessProvider.model, stats.input, stats.output) + "\n");
+    }
     await closeMcp();
     return;
     } finally {

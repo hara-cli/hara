@@ -438,13 +438,13 @@ export function agentRunExitSummary(output: string, code: number | null): string
     .map((line) => line.trim())
     .filter(Boolean);
   const runtimeFailure = lines.at(-1);
-  if (!runtimeFailure || !/^hara:\s+(?:headless|structured) run failed\b/iu.test(runtimeFailure)) {
+  if (!runtimeFailure || !/^hara:\s+(?:headless|structured) run (?:failed|paused)\b/iu.test(runtimeFailure)) {
     return code === null ? "agent process exited without a status code" : `exited ${code}`;
   }
   const separator = runtimeFailure.indexOf(" — ");
   const detail = (separator >= 0
     ? runtimeFailure.slice(separator + 3)
-    : runtimeFailure.replace(/^hara:\s+(?:headless|structured) run failed(?:\s*\([^)]*\))?\s*[-—:]?\s*/iu, ""))
+    : runtimeFailure.replace(/^hara:\s+(?:headless|structured) run (?:failed|paused)(?:\s*\([^)]*\))?\s*[-—:]?\s*/iu, ""))
     .replace(/\s+/gu, " ")
     .trim();
   if (!detail) return code === null ? "agent process exited without a status code" : `exited ${code}`;

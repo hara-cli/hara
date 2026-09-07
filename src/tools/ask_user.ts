@@ -3,9 +3,9 @@
 // on a decision only the user can make (an ambiguous requirement, a real fork in approach) — never for
 // anything you can derive from the code/context. The question (and optional numbered choices) is shown
 // through the SAME input channel as the approval prompt (ctx.ask), so it works in both the classic REPL and
-// the TUI. In headless / non-TTY / `-p` / gateway runs there is no interactive user (ctx.ask is absent): an
-// explicit default is used when supplied, otherwise the agent loop closes the tool round and stops instead
-// of allowing later calls to act on an invented answer.
+// the TUI. In headless / non-TTY / `-p` / gateway runs there is no in-process user (ctx.ask is absent): an
+// explicit default is used when supplied; otherwise a persisted session closes the tool round as a durable
+// question and resumes on its next reply, while a stateless run stops rather than inventing an answer.
 // kind:"read" so it never itself triggers the approval gate (the interaction IS the prompt).
 import { getTool, registerTool, type Tool, type ToolContext } from "./registry.js";
 import { requestsCredentialDisclosure } from "../security/secrets.js";
@@ -15,7 +15,7 @@ export const NO_INTERACTIVE_USER = "(no interactive user available — question 
 export const HEADLESS_USER_INPUT_REQUIRED =
   "Headless run stopped: ask_user required an answer, but no interactive user or explicit default was available.";
 export const CREDENTIAL_DISCLOSURE_BLOCKED =
-  "Credential disclosure blocked: never ask the user to paste or send API keys, passwords, cookies, Authorization headers, browser localStorage/sessionStorage values, or session tokens into chat. Use a registered trusted provider/browser capability, or ask the user to sign in inside that trusted surface. If the capability is unavailable, record it as unavailable and offer an exported CSV/file that contains no account access data; do not repeat this request.";
+  "Credential disclosure blocked: never ask the user to paste or send API keys, webhook URLs, passwords, cookies, Authorization headers, browser localStorage/sessionStorage values, or session tokens into chat, and never put them in echo/export/setx/inline PowerShell commands that enter shell or process history. Use a registered trusted provider/browser/settings capability or a masked local prompt. If the capability is unavailable, record it as unavailable and offer an exported CSV/file that contains no account access data; do not repeat this request.";
 
 export function askUserRequestsCredential(input: unknown): boolean {
   if (!input || typeof input !== "object" || Array.isArray(input)) return false;
@@ -44,8 +44,9 @@ const definition: Tool = {
     "numbered menu — but the user may always type a free-text answer instead. The tool returns the user's " +
     "answer (chosen option or free text) as its result. " +
     "For non-interactive runs, provide `default` only when the task itself defines a safe deterministic " +
-    "fallback. Without one, the engine stops the headless run with a clear blocker and no later tool in that " +
-    "round executes; do not call ask_user for uncertainty that is not genuinely blocking. Never use ask_user " +
+    "fallback. Without one, a persisted headless conversation pauses with one durable question and resumes " +
+    "from its next reply; a stateless run stops, and no later tool in that round executes. Do not call ask_user " +
+    "for uncertainty that is not genuinely blocking. Never use ask_user " +
     "to request a password, API key, cookie, Authorization header, browser storage value, or session token.",
   kind: "read", // the prompt itself is the interaction; never route it through the approval gate
   classify: () => ({ effect: "interactive", concurrencySafe: false }),

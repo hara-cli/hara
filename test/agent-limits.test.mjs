@@ -19,7 +19,12 @@ import {
   HEADLESS_USER_INPUT_REQUIRED,
 } from "../dist/tools/ask_user.js";
 import { onTurnPhase, setTurnPhase } from "../dist/agent/phase.js";
-import { applyTaskBrief, createTaskExecution } from "../dist/session/task.js";
+import {
+  applyTaskBrief,
+  createTaskExecution,
+  finishTaskExecution,
+  taskAwaitsUserDecision,
+} from "../dist/session/task.js";
 import { loadOrganizationExecutionPolicy, orgRolesDir } from "../dist/org/roles.js";
 import "../dist/tools/builtin.js";
 import "../dist/tools/memory.js";
@@ -1610,6 +1615,78 @@ test("headless ask_user continues only with its explicit caller-supplied default
   assert.match(history.find((message) => message.role === "tool").results[0].content, /used the explicit default/i);
 });
 
+test("a persisted headless session exposes ask_user as a resumable question instead of failing the task", async () => {
+  const visible = [];
+  const provider = {
+    id: "headless-persisted-question",
+    model: "headless-persisted-question",
+    async turn() {
+      return {
+        text: "",
+        toolUses: [{
+          id: "ask-persisted-defaulted",
+          name: "ask_user",
+          input: {
+            header: "Timezone",
+            question: "Use the standard timezone?",
+            options: ["UTC"],
+            default: "UTC",
+          },
+        }, {
+          id: "ask-persisted",
+          name: "ask_user",
+          input: {
+            header: "Destination",
+            question: "Which approved channel should receive the report?",
+            options: ["Operations", "Engineering"],
+          },
+        }, {
+          id: "ask-persisted-later",
+          name: "ask_user",
+          input: {
+            header: "Format",
+            question: "Which report format should be used?",
+            options: ["Markdown", "PDF"],
+          },
+        }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const history = [{ role: "user", content: "configure the report automation" }];
+  let task = createTaskExecution("configure the report automation", "turn-persisted");
+  const outcome = await runAgent(history, base(provider, {
+    ctx: {
+      cwd: process.cwd(),
+      sessionId: "persisted-session",
+      ui: { text: (value) => visible.push(value), reasoning() {}, tool() {}, diff() {}, notice() {} },
+    },
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) { task = next; },
+      onCheckpoint(next) { task = next; },
+      onRoundUsage(next) { task = next; },
+    },
+  }));
+
+  assert.equal(outcome.status, "completed");
+  assert.match(visible.join("\n"), /Which approved channel/);
+  assert.match(visible.join("\n"), /Operations/);
+  assert.match(visible.at(-1), /\n$/, "the token footer starts on its own line after a durable question");
+  assert.doesNotMatch(visible.join("\n"), /standard timezone/, "an earlier defaulted question is not mistaken for the pending question");
+  assert.doesNotMatch(visible.join("\n"), /Which report format/, "headless turns present one question at a time");
+  const toolRound = history.find((message) => message.role === "tool");
+  assert.equal(toolRound.results[0].isError, true, "the round pauses before using an unrelated default");
+  assert.equal(toolRound.results[1].isError, false);
+  assert.equal(toolRound.results[2].isError, true);
+  assert.match(toolRound.results[2].content, /one material question at a time/i);
+  assert.equal(task.checkpoint.completion.state, "awaiting_user");
+  const paused = finishTaskExecution(task, outcome, []);
+  assert.equal(paused.status, "paused");
+  assert.equal(taskAwaitsUserDecision(paused), true);
+});
+
 test("gateway prose withholds a credential request and gives the model one safe correction round", async () => {
   const previousGateway = process.env.HARA_GATEWAY;
   process.env.HARA_GATEWAY = "feishu";
@@ -1642,6 +1719,82 @@ test("gateway prose withholds a credential request and gives the model one safe 
   } finally {
     if (previousGateway === undefined) delete process.env.HARA_GATEWAY;
     else process.env.HARA_GATEWAY = previousGateway;
+  }
+});
+
+test("gateway prose withholds shell-history credential enrollment commands", async () => {
+  const previousGateway = process.env.HARA_GATEWAY;
+  process.env.HARA_GATEWAY = "feishu";
+  try {
+    let turns = 0;
+    const visible = [];
+    const provider = {
+      id: "gateway-shell-credential-prose",
+      model: "gateway-shell-credential-prose",
+      async turn() {
+        turns += 1;
+        return turns === 1
+          ? {
+              text: "Run echo 'FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx' > ~/.hara/secrets/daily.env",
+              toolUses: [],
+              stop: "end",
+            }
+          : { text: "Open Hara Settings and use the masked integration credential form.", toolUses: [], stop: "end" };
+      },
+    };
+    const history = [{ role: "user", content: "finish the Feishu automation" }];
+    const outcome = await runAgent(history, base(provider, {
+      ctx: {
+        cwd: process.cwd(),
+        ui: { text: (value) => visible.push(value), reasoning() {}, tool() {}, diff() {}, notice() {} },
+      },
+    }));
+
+    assert.equal(outcome.status, "completed", outcome.error);
+    assert.equal(turns, 2);
+    assert.equal(visible.join(""), "Open Hara Settings and use the masked integration credential form.");
+    assert.equal(JSON.stringify(history).includes("FEISHU_WEBHOOK=https://"), false);
+  } finally {
+    if (previousGateway === undefined) delete process.env.HARA_GATEWAY;
+    else process.env.HARA_GATEWAY = previousGateway;
+  }
+});
+
+test("cron prose also withholds shell-history credential enrollment commands", async () => {
+  const previousCron = process.env.HARA_CRON;
+  process.env.HARA_CRON = "1";
+  try {
+    let turns = 0;
+    const visible = [];
+    const provider = {
+      id: "cron-shell-credential-prose",
+      model: "cron-shell-credential-prose",
+      async turn() {
+        turns += 1;
+        return turns === 1
+          ? {
+              text: "Run export FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx and restart the job.",
+              toolUses: [],
+              stop: "end",
+            }
+          : { text: "Open Hara Settings and use the masked integration credential form.", toolUses: [], stop: "end" };
+      },
+    };
+    const history = [{ role: "user", content: "finish the scheduled report" }];
+    const outcome = await runAgent(history, base(provider, {
+      ctx: {
+        cwd: process.cwd(),
+        ui: { text: (value) => visible.push(value), reasoning() {}, tool() {}, diff() {}, notice() {} },
+      },
+    }));
+
+    assert.equal(outcome.status, "completed", outcome.error);
+    assert.equal(turns, 2);
+    assert.equal(visible.join(""), "Open Hara Settings and use the masked integration credential form.");
+    assert.equal(JSON.stringify(history).includes("FEISHU_WEBHOOK=https://"), false);
+  } finally {
+    if (previousCron === undefined) delete process.env.HARA_CRON;
+    else process.env.HARA_CRON = previousCron;
   }
 });
 

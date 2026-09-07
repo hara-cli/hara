@@ -5,6 +5,12 @@ import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  applyTaskCheckpoint,
+  createTaskExecution,
+  finishTaskExecution,
+  newTurnInteraction,
+} from "../dist/session/task.js";
 
 function writeSse(res, chunks) {
   res.writeHead(200, { "content-type": "text/event-stream" });
@@ -174,6 +180,120 @@ test("plain headless -p maps provider errors and empty outcomes to explicit stde
     ]);
     rmSync(errorFx.root, { recursive: true, force: true });
     rmSync(emptyFx.root, { recursive: true, force: true });
+  }
+});
+
+test("a headless reply resumes the paused ask_user task and retains the answer outside transcript history", async () => {
+  const api = await listenModel([{ type: "text", text: "DECISION_CONTINUED" }]);
+  const fx = fixture(api.baseURL);
+  const sessionId = "headless-retained-decision";
+  try {
+    const interaction = newTurnInteraction();
+    const created = createTaskExecution("configure the report destination", interaction.turnId, "2026-09-07T00:00:00.000Z");
+    const waiting = applyTaskCheckpoint(created, {
+      blocked_step: "answer the pending user question",
+      block_reason: "Which approved channel should receive the report?",
+      next_step: "continue automatically after the next reply in this persisted conversation",
+      completion: {
+        state: "awaiting_user",
+        evidence: ["The persisted run had no live interactive answer channel."],
+        dependency: {
+          kind: "material_choice",
+          detail: "Which approved channel should receive the report?",
+          evidence: ["The model invoked ask_user without a deterministic default."],
+        },
+      },
+    }, "2026-09-07T00:01:00.000Z");
+    assert.equal(waiting.ok, true);
+    const paused = finishTaskExecution(
+      waiting.task,
+      { status: "completed" },
+      [],
+      false,
+      "2026-09-07T00:02:00.000Z",
+    );
+    mkdirSync(join(fx.home, ".hara", "sessions"), { recursive: true });
+    writeFileSync(join(fx.home, ".hara", "sessions", `${sessionId}.json`), JSON.stringify({
+      meta: {
+        id: sessionId,
+        cwd: fx.project,
+        profileId: "personal",
+        spaceId: "personal",
+        provider: "openai",
+        model: "mock-model",
+        title: "report destination",
+        createdAt: "2026-09-07T00:00:00.000Z",
+        updatedAt: "2026-09-07T00:02:00.000Z",
+        source: "interactive",
+      },
+      history: [{ role: "user", content: "configure the report destination" }],
+      task: paused,
+    }));
+
+    const result = await runCli(["-p", "Engineering", "--resume", sessionId], fx.project, fx.home);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /DECISION_CONTINUED/);
+    assert.equal(api.requests.length, 1);
+    const request = JSON.stringify(api.requests[0]);
+    assert.match(request, /Verified user decisions/);
+    assert.match(request, /Engineering/);
+    assert.match(request, /Which approved channel should receive the report/);
+
+    const saved = JSON.parse(readFileSync(join(fx.home, ".hara", "sessions", `${sessionId}.json`), "utf8"));
+    assert.equal(saved.task.id, paused.id, "the answer continues the original task instead of creating a new one");
+    assert.equal(saved.task.decisions.length, 1);
+    assert.equal(saved.task.decisions[0].answer, "Engineering");
+  } finally {
+    await new Promise((resolve) => api.server.close(resolve));
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test("structured headless output pauses at ask_user instead of inventing a result on its retry", async () => {
+  const api = await listenModel([
+    { type: "tool", name: "ask_user", arguments: { question: "Which destination?", options: ["Ops", "Eng"] } },
+    { type: "tool", name: "structured_output", arguments: { choice: "Ops" } },
+    { type: "text", text: "done" },
+  ]);
+  const fx = fixture(api.baseURL);
+  const sessionId = "structured-awaiting-user";
+  try {
+    mkdirSync(join(fx.home, ".hara", "sessions"), { recursive: true });
+    writeFileSync(join(fx.home, ".hara", "sessions", `${sessionId}.json`), JSON.stringify({
+      meta: {
+        id: sessionId,
+        cwd: fx.project,
+        profileId: "personal",
+        spaceId: "personal",
+        provider: "openai",
+        model: "mock-model",
+        title: "structured destination",
+        createdAt: "2026-09-07T00:00:00.000Z",
+        updatedAt: "2026-09-07T00:00:00.000Z",
+        source: "interactive",
+      },
+      history: [],
+    }));
+    const schema = JSON.stringify({
+      type: "object",
+      required: ["choice"],
+      properties: { choice: { type: "string" } },
+      additionalProperties: false,
+    });
+    const result = await runCli([
+      "-p", "choose the report destination", "--schema", schema, "--resume", sessionId,
+    ], fx.project, fx.home);
+
+    assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+    assert.equal(result.stdout.trim(), "", "an unanswered material choice cannot become structured success JSON");
+    assert.match(result.stderr, /structured run paused \(awaiting_user\).*Which destination/i);
+    assert.equal(api.requests.length, 1, "the structured-output nudge never crosses the user-decision boundary");
+    const saved = JSON.parse(readFileSync(join(fx.home, ".hara", "sessions", `${sessionId}.json`), "utf8"));
+    assert.equal(saved.task.status, "paused");
+    assert.equal(saved.task.checkpoint.completion.state, "awaiting_user");
+  } finally {
+    await new Promise((resolve) => api.server.close(resolve));
+    rmSync(fx.root, { recursive: true, force: true });
   }
 });
 

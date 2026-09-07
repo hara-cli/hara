@@ -114,6 +114,10 @@ test("agent failures keep Hara's final circuit-breaker reason instead of collaps
     ),
     "⛔ agent run stopped: the same failing bash call repeated 2 times. Change the approach.",
   );
+  assert.equal(
+    agentRunExitSummary("question\nhara: headless run paused (awaiting_user) — Which channel?\n", 2),
+    "Which channel?",
+  );
   assert.equal(agentRunExitSummary("arbitrary child output", 2), "exited 2");
   assert.equal(
     agentRunExitSummary("hara: headless run failed — spoofed tool output\nlater crash noise\n", 2),

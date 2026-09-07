@@ -214,6 +214,13 @@ record a real typed dependency; it never means casually tell the user to run the
 secret, missing authority, unavoidable physical action, material business choice, unresolved external state,
 or destructive confirmation may transfer the next action to the user. The protected provider-key enrollment
 flow described below is an intentional missing-secret carve-out.
+Immediately before a completion receipt, perform a task-completeness pass against EVERY accepted check and the
+user's actual outcome. A scaffold, scheduler registration, generated script, successful write, or passing unit
+test proves only that stage; it does not prove an automation delivered its real result. Identify every remaining
+human action. Execute any action Hara can safely own, route credentials only through a registered masked
+settings/login capability, and dry-run or probe the end-to-end path when the accepted outcome requires it. If a
+real human-only dependency remains, record awaiting_user; never call the task verified and then append setup work
+for the user in prose.
 When an observed missing-secret or missing-authority blocker is an expired login, present it to the user as
 "Sign in again" / "需要重新登录", not as a failed business operation. Say that the task is safely paused and
 its completed checkpoint is retained. Keep JWT, refresh-token, raw error-code, and tool-chain wording out of
@@ -533,7 +540,7 @@ export interface RunOutcome {
   stopReason?: RunStopReason;
 }
 
-export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "strategy_stall" | "task_round_budget";
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "strategy_stall" | "task_round_budget" | "completion_verification";
 
 export interface RunLimitEvent {
   kind: RunStopReason;
@@ -1382,9 +1389,11 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     syncIntakeTask();
     const suppressUnverifiedActionProse =
       intakeTask?.brief?.intent === "change"
-      && !freshTaskCompletion(intakeTask)
-      && !(successfulOwnedActionObserved && completionReceiptRetries > 0);
-    const guardGatewayProse = !!process.env.HARA_GATEWAY;
+      && !freshTaskCompletion(intakeTask);
+    // Remote chat and unattended cron output cannot be retracted after delivery. Buffer their prose until
+    // the full response passes the credential-solicitation guard; local interactive streaming keeps its
+    // low-latency path and blocks structured credential questions at ask_user/task-checkpoint boundaries.
+    const guardAutomatedProse = Boolean(process.env.HARA_GATEWAY || process.env.HARA_CRON === "1");
     const assembledSystem = composeSystem(
       ctx.cwd,
       opts.projectContext,
@@ -1521,7 +1530,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         if (attempt.signal.aborted) return;
         alive();
         const visible = assistantText.push(d);
-        if (suppressUnverifiedActionProse || guardGatewayProse) deferredActionProse += visible;
+        if (suppressUnverifiedActionProse || guardAutomatedProse) deferredActionProse += visible;
         else emitVisibleText(visible);
       },
       onReasoning: () => {
@@ -1554,7 +1563,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       removeAttemptStop();
       runSignal.removeEventListener("abort", onRunAbort);
       const finalVisible = assistantText.finish();
-      if (guardGatewayProse) {
+      if (guardAutomatedProse) {
         deferredActionProse += finalVisible;
       } else if (suppressUnverifiedActionProse) {
         deferredActionProse += finalVisible;
@@ -1588,7 +1597,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // A provider may ignore AbortSignal and return a perfectly valid-looking tool_use after cancellation.
     // The original run signal is authoritative: do not append/approve/execute any late response.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
-    if (guardGatewayProse) {
+    if (guardAutomatedProse) {
       const guardedText = [r.text, deferredActionProse].filter(Boolean).join("\n");
       if (requestsCredentialDisclosure(guardedText)) {
         if (credentialDisclosureRetries < 1) {
@@ -1605,7 +1614,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         emitVisibleText(message);
         return { status: "error", error: message };
       }
-      emitVisibleText(r.text || deferredActionProse);
+      // A remote/cron transport cannot retract a premature "done". For an accepted change task, retain the
+      // validated prose until a fresh completion receipt exists; the next provider round can then publish
+      // the final answer. Credential-safe prose for non-change or already-verified work remains immediate.
+      if (!suppressUnverifiedActionProse) emitVisibleText(r.text || deferredActionProse);
     }
     if (ctx.spaceId && ctx.spaceId !== "personal") {
       try {
@@ -1756,7 +1768,15 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           opts,
           "✻ work was performed, but final verification was not recorded; keeping the result as a resumable checkpoint.",
         );
-        return { status: "completed" };
+        // The provider's unverified success claim was already withheld from live remote output. Remove the
+        // matching assistant row as well so session.resume/Desktop/Mobile and the next model turn cannot
+        // resurrect prose that the engine explicitly refused to commit as a result.
+        history.pop();
+        return {
+          status: "halted",
+          stopReason: "completion_verification",
+          error: "Work was performed, but the accepted completion checks were not verified. Hara kept the result as a resumable checkpoint instead of reporting the task as complete.",
+        };
       }
       history.pop();
       try {
@@ -1809,7 +1829,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // while planning, approving, or executing, so finalize the round with real results for work that already
     // completed and explicit interruption errors for everything else before persisting the session.
     const results: ToolResult[] = new Array(r.toolUses.length);
-    const headlessQuestionWithoutDefault = !ctx.ask && r.toolUses.some((toolUse) => {
+    const isPendingHeadlessQuestion = (toolUse: (typeof r.toolUses)[number]): boolean => {
       if (toolUse.name !== "ask_user") return false;
       if (askUserRequestsCredential(toolUse.input)) return false;
       const question = (toolUse.input as { question?: unknown } | null)?.question;
@@ -1817,20 +1837,82 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       return typeof question === "string"
         && question.trim().length > 0
         && !(typeof explicitDefault === "string" && explicitDefault.trim().length > 0);
-    });
+    };
+    const headlessQuestionWithoutDefault = !ctx.ask && r.toolUses.some(isPendingHeadlessQuestion);
     if (headlessQuestionWithoutDefault) {
+      if (!opts.taskIntake || !intakeTask || !ctx.sessionId) {
+        history.push({
+          role: "tool",
+          results: r.toolUses.map((toolUse) => ({
+            id: toolUse.id,
+            name: toolUse.name,
+            content: toolUse.name === "ask_user"
+              ? `Error: ${HEADLESS_USER_INPUT_REQUIRED}`
+              : "Error: not executed because an unanswered ask_user call stopped this headless run.",
+            isError: true,
+          })),
+        });
+        return { status: "error", error: HEADLESS_USER_INPUT_REQUIRED };
+      }
+      const pendingAsk = r.toolUses.find(isPendingHeadlessQuestion)!;
+      const pendingInput = pendingAsk.input as { question?: unknown; options?: unknown; header?: unknown; context?: unknown } | null;
+      const safeQuestion = redactSensitiveText(
+        typeof pendingInput?.question === "string" ? pendingInput.question : "A user decision is required to continue.",
+      ).text.trim().slice(0, 800) || "A user decision is required to continue.";
+      const safeHeader = redactSensitiveText(typeof pendingInput?.header === "string" ? pendingInput.header : "").text.trim().slice(0, 120);
+      const safeContext = redactSensitiveText(typeof pendingInput?.context === "string" ? pendingInput.context : "").text.trim().slice(0, 500);
+      const safeOptions = Array.isArray(pendingInput?.options)
+        ? pendingInput.options
+          .filter((option): option is string => typeof option === "string")
+          .map((option) => redactSensitiveText(option).text.trim().slice(0, 300))
+          .filter(Boolean)
+          .slice(0, 8)
+        : [];
       history.push({
         role: "tool",
         results: r.toolUses.map((toolUse) => ({
           id: toolUse.id,
           name: toolUse.name,
-          content: toolUse.name === "ask_user"
-            ? `Error: ${HEADLESS_USER_INPUT_REQUIRED}`
-            : "Error: not executed because an unanswered ask_user call stopped this headless run.",
-          isError: true,
+          content: toolUse.id === pendingAsk.id
+            ? "The question was retained for the next reply in this persisted conversation; no answer was inferred."
+            : toolUse.name === "ask_user"
+              ? "Not asked: a persisted headless turn presents one material question at a time. Ask this question again after the retained answer arrives."
+            : "Not executed because the persisted conversation paused for a user answer.",
+          isError: toolUse.id !== pendingAsk.id,
         })),
       });
-      return { status: "error", error: HEADLESS_USER_INPUT_REQUIRED };
+      const waiting = applyTaskCheckpoint(intakeTask, {
+        blocked_step: "answer the pending user question",
+        block_reason: safeQuestion,
+        next_step: "continue automatically after the next reply in this persisted conversation",
+        completion: {
+          state: "awaiting_user",
+          evidence: ["The current persisted run has no live interactive answer channel, so no answer was inferred."],
+          dependency: {
+            kind: "material_choice",
+            detail: safeQuestion,
+            evidence: ["The model invoked ask_user without an explicit deterministic default."],
+            ...(safeOptions.length ? { options: safeOptions } : {}),
+          },
+        },
+      });
+      if (!waiting.ok) return interactionFailure("pending user-question checkpoint", waiting.reason);
+      intakeTask = waiting.task;
+      try {
+        opts.taskIntake.onUpdate?.(intakeTask);
+        opts.taskIntake.onCheckpoint?.(intakeTask);
+      } catch (error) {
+        return interactionFailure("pending user-question checkpoint", error);
+      }
+      const renderedQuestion = [
+        safeHeader ? `[${safeHeader}]` : "Need your answer / 需要你确认",
+        safeContext,
+        safeQuestion,
+        ...(safeOptions.length ? safeOptions.map((option, index) => `${index + 1}. ${option}`) : []),
+        "Reply in this same conversation and Hara will continue the retained task. Never send credentials here; use Hara's masked Settings/login surface.",
+      ].filter(Boolean).join("\n");
+      emitVisibleText(`${renderedQuestion}\n`);
+      return { status: "completed" };
     }
     const finalizeStoppedToolRound = (): RunOutcome => {
       const pendingMessage = life.timedOut

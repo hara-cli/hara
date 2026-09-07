@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.168.1 — 2026-09-07 — resumable automation questions and honest completion
+
+- Turn `ask_user` calls from persisted headless/gateway/cron sessions into durable paused questions instead of
+  terminating the automation. The next reply in the same conversation resumes the original task, and Hara
+  redacts, deduplicates, and saves that decision outside compactable transcript history before invoking a model.
+  Numbered replies retain their option meaning, and structured-output retries cannot cross the unanswered choice.
+- Require a fresh engine-readable completion receipt after change actions. If a model omits the receipt after
+  correction, preserve the work as a resumable checkpoint and withhold unverified success prose instead of
+  reporting a scaffold, file write, or scheduler registration as the completed end-to-end result.
+- Withhold model-authored instructions that put API keys, tokens, webhook URLs, passwords, or private keys into
+  `echo`, `export`, `setx`, or inline PowerShell commands. Enrollment must use a trusted masked Settings, login,
+  or terminal-prompt surface so credentials are not copied into chat, shell history, or process arguments.
+
 ## 0.168.0 — 2026-09-07 — restart-safe execution across Desktop and Mobile
 
 - Persist a private write-ahead command receipt before every remote Hara, Codex, or Claude Code mutation.

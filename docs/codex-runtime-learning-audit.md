@@ -21,7 +21,8 @@ providers behind that boundary, not competing user-facing control products.
 | Atomic compaction installation | Implemented | Each installed window has stable window/attempt identity, records observed versus estimated input accounting, and saves the complete replacement before changing live history. Failed persistence leaves the prior window untouched. |
 | Repeated-failure guard | Implemented in 0.166.1 | The second identical failure requires a strategy change; the third stops that exact loop. It no longer ends healthy work merely because 20 rounds passed. |
 | Healthy long-task continuation | Implemented after 0.166.1 | A fresh durable checkpoint and new evidence can open another bounded tranche automatically; deadlines, no-progress detection, cumulative task limits, and the absolute 256-round ceiling remain hard stops. |
-| Verified user-decision retention | Implemented after 0.166.1 | Successful `ask_user` decisions are redacted, deduplicated, persisted outside the compactable transcript, and restored in future task prompts and forks. |
+| Verified user-decision retention | Implemented after 0.166.1; headless continuation completed after 0.168.0 | Successful in-process `ask_user` decisions are redacted, deduplicated, persisted outside the compactable transcript, and restored in future task prompts and forks. A persisted headless/gateway/cron question now closes as an addressable pause; the next same-conversation reply is durably retained before the original task and provider turn resume. |
+| Honest end-to-end completion | Hardened after 0.168.0 | Change tasks require a fresh engine-readable completion receipt against every accepted check. File writes, scaffolds, tests, and scheduler registration prove only their stage. Missing verification preserves a resumable checkpoint and suppresses success prose; unavoidable questions pause durably instead of ending the task. Model-authored credential enrollment through chat or shell-history commands is withheld in favor of trusted masked surfaces. |
 | Replay-safe provider retry | Implemented after 0.166.1 | One provider-neutral coordinator classifies empty pre-output failures, honors bounded `Retry-After`, backs off cancellably, and never replays after stream activity, output, or a tool call. SDK-local automatic retries are disabled. |
 | Projection commit journal | Foundation implemented after 0.166.1 | Every durable snapshot appends a credential-free generation/hash record. Readers isolate malformed lines, ignore a torn final line, and report chain gaps. This detects projection loss but is not yet a typed event-source for every task action. |
 | Remote mutation deduplication | Implemented after 0.166.1; write-ahead restart hardening completed after 0.167.0 | `session.submit/send/steer/interrupt` accept a client UUID, persist a prompt-free started receipt before model/tool execution, share concurrent work, save the first terminal result before ACK, replay across Serve restarts, and reject same-ID/different-payload reuse. A crash-window or failed terminal save blocks later mutation until an explicit authoritative resume reconciles task/history state. Provider-owned Codex/Claude submit, steer, and interrupt use the same contract in a private ledger, publish committed/failed receipts, and reconcile through provider read/resume. Desktop retains only opaque retry IDs plus salted payload fingerprints and fences delayed steer/interrupt by turn ID. Controlled terminal streams reject duplicate, conflicting, and out-of-order `inputSeq` values before the PTY write. |
@@ -100,6 +101,12 @@ The remaining Agent hardening is narrower:
 - expose the durable host to direct non-Serve CLI sessions; the persistent implementation currently belongs to
   Serve/Desktop sessions;
 - add richer Desktop/mobile presentation and control for the existing safe Agent state projection.
+
+The direct headless task path now also preserves an unanswered structured question and its bounded options as a
+durable pause, normalizes a numbered remote reply to the retained option, and records it in the verified decision
+ledger before model execution. Structured-output retries stop at that pause instead of guessing an answer. This closes the common
+gateway/cron failure mode where a task either died at `ask_user` or forgot the answer after compaction; it does not
+turn missing credentials into chat input, and credential enrollment remains restricted to a trusted masked surface.
 
 Writable children should remain disabled until managed worktree isolation, diff ownership, and an explicit merge
 step exist. Hara should preserve its present rule that parallel children cannot mutate the same working tree.
@@ -220,13 +227,17 @@ success.
    next slice is hard tree-wide execution safety plus provider-native allowance admission, idempotent receipts,
    parent-turn delivery fencing, and direct CLI hosting. Hara must never derive cost or subscription exhaustion
    from transport token counters.
-7. **In progress — Mobile companion**: account/device pairing, encrypted relay protocol, explicit publication,
+7. **Completed headless interaction slice — questions and completion**: persisted `ask_user` pauses, exact-task
+   answer continuation, decision retention, credential-safe handoff, and fail-closed completion receipts are covered
+   by unit and spawned-CLI integration tests. A full masked integration-secret editor remains a Desktop/Mobile UI
+   delivery item rather than a reason to accept credentials through chat.
+8. **In progress — Mobile companion**: account/device pairing, encrypted relay protocol, explicit publication,
    leases, command replay, and terminal sequencing exist in CLI. Complete the account/relay deployment and native
    mobile client against the versioned contract before broadening publication beyond coding-agent sessions.
-8. **Next handoff slice — suspend/resume**: flush-before-suspend, pending-input disposition, successor readiness,
+9. **Next handoff slice — suspend/resume**: flush-before-suspend, pending-input disposition, successor readiness,
    and Desktop/mobile/terminal contention tests.
-9. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.
-10. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
+10. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.
+11. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
    root-controlled merge/rejection.
 
 No slice is complete until it has unit tests, an interruption/crash test, bounded logs, and a real CLI/Desktop

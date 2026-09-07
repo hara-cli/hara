@@ -20,6 +20,8 @@ export const MAX_TASK_CHECKPOINT_FACTS = 64;
 export const MAX_TASK_CHECKPOINT_CAPABILITIES = 32;
 export const MAX_TASK_COMPLETION_EVIDENCE = 12;
 export const MAX_TASK_DEPENDENCY_EVIDENCE = 8;
+export const MAX_TASK_DEPENDENCY_OPTIONS = 8;
+export const MAX_TASK_DEPENDENCY_OPTION_CHARS = 300;
 export const MAX_TASK_MANUAL_COMMAND_CHARS = 2_048;
 export const MAX_TASK_VERIFY_COMMAND_CHARS = 2_048;
 export const MAX_TASK_RESUME_PHRASE_CHARS = 500;
@@ -110,6 +112,9 @@ export interface TaskUserDependency {
   kind: TaskUserDependencyKind;
   detail: string;
   evidence: string[];
+  /** Engine-retained ask_user choices. A remote numeric reply is normalized to this stable label before the
+   * next provider tranche, so compacted Desktop/Mobile sessions do not lose what "1" meant. */
+  options?: string[];
   capability?: string;
   manualAction?: {
     /** Display/copy only. Desktop never executes this command. Recognizable credentials are redacted. */
@@ -336,6 +341,7 @@ interface TaskUserDependencyInput {
   kind?: unknown;
   detail?: unknown;
   evidence?: unknown;
+  options?: unknown;
   capability?: unknown;
   manual_action?: unknown;
 }
@@ -538,6 +544,24 @@ function completionInput(
     if (!dependencyEvidence.length) {
       return { ok: false, reason: "dependency requires at least one observed evidence item" };
     }
+    if (raw.options !== undefined && !Array.isArray(raw.options)) {
+      return { ok: false, reason: "dependency options must be an array" };
+    }
+    const options: string[] = [];
+    const optionSeen = new Set<string>();
+    for (const item of raw.options ?? []) {
+      if (typeof item !== "string") return { ok: false, reason: "every dependency option must be a string" };
+      const normalized = redactSensitiveText(item).text.replace(/\r\n?/g, "\n").trim().slice(0, MAX_TASK_DEPENDENCY_OPTION_CHARS);
+      if (!normalized || optionSeen.has(normalized)) continue;
+      optionSeen.add(normalized);
+      options.push(normalized);
+      if (options.length > MAX_TASK_DEPENDENCY_OPTIONS) {
+        return { ok: false, reason: `dependency options cannot exceed ${MAX_TASK_DEPENDENCY_OPTIONS} entries` };
+      }
+    }
+    if (options.length && raw.kind !== "material_choice") {
+      return { ok: false, reason: "dependency options are valid only for a material_choice" };
+    }
     if (describesEngineRecoverableOutputBoundary([detail, ...evidence, ...dependencyEvidence])) {
       return {
         ok: false,
@@ -566,6 +590,7 @@ function completionInput(
     if (!manualAction.ok) return manualAction;
     const handoffText = [
       detail,
+      ...options,
       manualAction.value?.command,
       manualAction.value?.verifyCommand,
       manualAction.value?.resumePhrase,
@@ -582,6 +607,7 @@ function completionInput(
       kind: raw.kind as TaskUserDependencyKind,
       detail,
       evidence: dependencyEvidence,
+      ...(options.length ? { options } : {}),
       ...(capability ? { capability } : {}),
       ...(manualAction.value ? { manualAction: manualAction.value } : {}),
     };
@@ -955,6 +981,20 @@ export function recordTaskDecision(
 ): { ok: true; task: TaskExecution; decision: TaskDecision } | { ok: false; reason: string } {
   if (!task) return { ok: false, reason: "there is no task to retain this decision" };
   if (task.status !== "running") return { ok: false, reason: `task ${task.id} is ${task.status}, not running` };
+  return retainTaskDecision(task, input, at);
+}
+
+function retainTaskDecision(
+  task: TaskExecution,
+  input: {
+    turnId: string;
+    callId: string;
+    question: string;
+    answer: string;
+    source: TaskDecisionSource;
+  },
+  at: Date | string,
+): { ok: true; task: TaskExecution; decision: TaskDecision } | { ok: false; reason: string } {
   if (task.turnId !== input.turnId) return { ok: false, reason: `decision belongs to stale turn ${input.turnId}` };
   if (!validId(input.callId)) return { ok: false, reason: "decision call id is invalid" };
   if (input.source !== "interactive" && input.source !== "default") {
@@ -994,6 +1034,60 @@ export function recordTaskDecision(
   };
 }
 
+/** Retain the reply that resolves a durable headless `ask_user` pause before opening the next provider
+ * tranche. The synthetic call identity is derived from the immutable task/question receipt, so an input
+ * retry is idempotent and the answer survives transcript compaction just like an in-process answer. */
+export function recordAwaitingTaskDecision(
+  task: TaskExecution | undefined,
+  answer: string,
+  at: Date | string = new Date(),
+): { ok: true; task: TaskExecution; decision: TaskDecision } | { ok: false; reason: string } {
+  if (!task) return { ok: false, reason: "there is no task waiting for a decision" };
+  const completion = freshTaskCompletion(task);
+  if (!taskAwaitsUserDecision(task) || !completion?.dependency) {
+    return { ok: false, reason: `task ${task.id} is not paused for a material choice` };
+  }
+  const question = completion.dependency.detail;
+  const rawAnswer = answer.replace(/\r\n?/g, "\n").trim();
+  const numericChoice = /^(?:#|选)?\s*([1-9]\d*)$/u.exec(rawAnswer);
+  const choiceIndex = numericChoice ? Number(numericChoice[1]) - 1 : -1;
+  const normalizedAnswer = choiceIndex >= 0 && choiceIndex < (completion.dependency.options?.length ?? 0)
+    ? completion.dependency.options![choiceIndex]!
+    : answer;
+  const callId = `headless-${createHash("sha256")
+    .update(task.id)
+    .update("\0")
+    .update(task.turnId)
+    .update("\0")
+    .update(completion.updatedAt)
+    .update("\0")
+    .update(question)
+    .update("\0")
+    .update(JSON.stringify(completion.dependency.options ?? []))
+    .digest("hex")
+    .slice(0, 32)}`;
+  const retained = retainTaskDecision(task, {
+    turnId: task.turnId,
+    callId,
+    question,
+    answer: normalizedAnswer,
+    source: "interactive",
+  }, at);
+  if (!retained.ok || !retained.task.checkpoint) return retained;
+  const checkpoint = {
+    ...retained.task.checkpoint,
+    currentStep: "apply the retained user decision",
+    nextStep: "continue the original task with the retained answer",
+    updatedAt: retained.decision.createdAt,
+  };
+  delete checkpoint.blockedStep;
+  delete checkpoint.blockReason;
+  return {
+    ...retained,
+    task: { ...retained.task, checkpoint, updatedAt: retained.decision.createdAt },
+  };
+}
+
 export interface ConsumedTaskSteering {
   task: TaskExecution;
   entries: TaskSteering[];
@@ -1027,6 +1121,17 @@ export function requestsTaskContinuation(text: string): boolean {
   return /^(?:\/continue(?:\s|$)|(?:continue|resume|go\s+on)(?:[\s,.:;!?，。：；！？]|$)|(?:继续|接着|接着做|继续处理|重新执行|现在去执行任务)(?:[\s,.:;!?，。：；！？]|$))/.test(value);
 }
 
+/** A non-interactive channel can close one turn while retaining an engine-owned question. The next message
+ * in that same persisted conversation is the answer, not an unrelated new task. This is deliberately narrow:
+ * only `ask_user` material choices qualify; typed secret/authority/physical-action blockers still require an
+ * explicit continuation after their trusted workflow succeeds. */
+export function taskAwaitsUserDecision(task: TaskExecution | undefined): boolean {
+  const completion = freshTaskCompletion(task);
+  return task?.status === "paused"
+    && completion?.state === "awaiting_user"
+    && completion.dependency?.kind === "material_choice";
+}
+
 /** A receipt is authoritative only for the current execution tranche and the latest accepted brief. */
 export function freshTaskCompletion(task: TaskExecution | undefined): TaskCompletion | undefined {
   const completion = task?.checkpoint?.completion;
@@ -1051,15 +1156,17 @@ export function finishTaskExecution(
   const acceptedBriefVerified = !task.brief
     || (completionIsFresh && completion?.state === "verified");
   const lastOutcome = interrupted ? "interrupted" : (outcome?.status ?? "interrupted");
+  const awaitingUser = completion?.state === "awaiting_user";
   const status: TaskExecutionStatus = interrupted
     ? "paused"
     : outcome?.status === "completed"
-      ? (incomplete || !acceptedBriefVerified ? "paused" : "completed")
+      ? (awaitingUser || incomplete || !acceptedBriefVerified ? "paused" : "completed")
       : outcome?.status === "halted" && (
           outcome.stopReason === "deadline"
           || outcome.stopReason === "task_round_budget"
           || outcome.stopReason === "max_rounds"
           || outcome.stopReason === "strategy_stall"
+          || outcome.stopReason === "completion_verification"
         )
         ? "paused"
       : outcome?.status === "error" || outcome?.status === "empty" || outcome?.status === "halted"
@@ -1088,17 +1195,17 @@ export function finishTaskExecution(
   } else if (current) {
     checkpoint.currentStep = boundedText(current.activeForm || current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
     checkpoint.nextStep ??= boundedText(current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
-  } else if (outcome?.status === "completed" && task.brief && !acceptedBriefVerified) {
-    if (completionIsFresh && completion?.state === "awaiting_user") {
+  } else if (outcome?.status === "completed" && awaitingUser) {
+    if (completionIsFresh) {
       checkpoint.blockedStep ??= "complete the accepted task";
       checkpoint.blockReason ??= completion.dependency?.detail ?? completion.waitingFor ?? "required user input is missing";
       checkpoint.nextStep ??= completion.waitingFor
         ? `Continue after the user provides: ${completion.waitingFor}`
         : "continue after the required user input arrives";
-    } else {
-      checkpoint.currentStep = "verify the accepted completion checks";
-      checkpoint.nextStep = "record a verified completion receipt or the exact input still needed from the user";
     }
+  } else if (outcome?.status === "completed" && task.brief && !acceptedBriefVerified) {
+    checkpoint.currentStep = "verify the accepted completion checks";
+    checkpoint.nextStep = "record a verified completion receipt or the exact input still needed from the user";
   }
   if (status === "blocked") {
     const checkpointUpdatedThisRun = Date.parse(prior.updatedAt) >= Date.parse(task.startedAt);
@@ -1356,6 +1463,15 @@ function validTaskCheckpoint(value: unknown): value is TaskCheckpoint {
       && dependencyObject.evidence.length > 0
       && dependencyObject.evidence.length <= MAX_TASK_DEPENDENCY_EVIDENCE
       && dependencyObject.evidence.every((item) => typeof item === "string" && item.length > 0 && item.length <= MAX_TASK_EVIDENCE_CHARS)
+      && (dependencyObject.options === undefined || (
+        dependencyKind === "material_choice"
+        && Array.isArray(dependencyObject.options)
+        && dependencyObject.options.length > 0
+        && dependencyObject.options.length <= MAX_TASK_DEPENDENCY_OPTIONS
+        && dependencyObject.options.every((item) => (
+          typeof item === "string" && item.length > 0 && item.length <= MAX_TASK_DEPENDENCY_OPTION_CHARS
+        ))
+      ))
       && (dependencyCapability === undefined
         || (typeof dependencyCapability === "string"
           && taskStateKey(dependencyCapability, "dependency capability").ok

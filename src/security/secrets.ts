@@ -8,7 +8,7 @@ export interface SecretRedaction {
 }
 
 const DISCLOSURE_CREDENTIAL =
-  /(?:api[ _-]?key|access[ _-]?token|auth(?:entication|orization)?[ _-]?token|session[ _-]?token|refresh[ _-]?token|bearer[ _-]?token|authorization(?: header)?|cookie|localstorage|sessionstorage|document\.cookie|password|passcode|client[ _-]?secret|app[ _-]?secret|private[ _-]?key|jwt|密钥|秘钥|令牌|口令|密码|凭据|授权头|认证信息|登录态)/iu;
+  /(?:api[ _-]?key|access[ _-]?token|auth(?:entication|orization)?[ _-]?token|session[ _-]?token|refresh[ _-]?token|bearer[ _-]?token|authorization(?: header)?|cookie|localstorage|sessionstorage|document\.cookie|password|passcode|client[ _-]?secret|app[ _-]?secret|private[ _-]?key|webhook(?:[ _-]?(?:url|secret))?|jwt|密钥|秘钥|令牌|口令|密码|凭据|授权头|认证信息|登录态|回调(?:地址|链接|密钥)?)/iu;
 const DISCLOSURE_TRANSFER =
   /(?:\bpaste\b|\bprovide(?:\s+(?:it|that|this|the\s+value))?(?:\s+to\s+me)?\b|\bsend(?:\s+me)?\b|\bshare(?:\s+with\s+me)?\b|\bgive(?:\s+me)?\b|\breply\s+with\b|\bpost(?:\s+it)?\b|\btell\s+me\b|粘贴|提供(?:给我|一下)?|发送|发给|发来|分享|贴出|回复(?:给我)?|告诉我|提交(?:给我)?|给我)/iu;
 const DISCLOSURE_CHAT_INPUT =
@@ -19,6 +19,14 @@ const DISCLOSURE_DIRECT_TO_REQUESTER =
   /(?:\b(?:send|give|tell|show)\s+me\b|\bprovide(?:\s+(?:it|that|this|the\s+value))?\s+to\s+me\b|\bshare(?:\s+(?:it|that|this|the\s+value))?\s+with\s+me\b|(?:粘贴|提供|发送|分享|回复|提交|告诉)(?:给我|给机器人)|发给我|发来|给我)/iu;
 const BROWSER_SECRET_EXTRACTION =
   /(?:(?:\bf12\b|\bdevtools\b|\bconsole\b|开发者工具|控制台).{0,180}(?:localstorage|sessionstorage|document\.cookie|cookie|token|令牌)|(?:localstorage|sessionstorage|document\.cookie).{0,180}(?:\bcopy\b|复制|粘贴|paste))/iu;
+const SHELL_CREDENTIAL_NAME =
+  String.raw`(?:[A-Z][A-Z0-9_]*(?:_API_KEY|_ACCESS_TOKEN|_AUTH_TOKEN|_SESSION_TOKEN|_REFRESH_TOKEN|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_PRIVATE_KEY|_WEBHOOK(?:_URL)?)|(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|SESSION_TOKEN|REFRESH_TOKEN|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|WEBHOOK(?:_URL)?))`;
+const SHELL_CREDENTIAL_PLACEHOLDER =
+  String.raw`(?:paste|enter|replace)[-_ ]+(?:your[-_ ]+)?(?:api[-_ ]?key|access[-_ ]?token|secret|password|webhook)(?:[-_ ]+here)?`;
+const UNSAFE_SHELL_CREDENTIAL_ENTRY = new RegExp(
+  String.raw`(?:\b(?:echo|printf)\b[^\n\r]{0,480}(?:\$(?:\{${SHELL_CREDENTIAL_NAME}\}|${SHELL_CREDENTIAL_NAME})|\b${SHELL_CREDENTIAL_NAME}\b(?:\s*=|(?=[\s'"]{0,3}(?:>|$)))|\b${SHELL_CREDENTIAL_PLACEHOLDER}\b)|\bexport\s+${SHELL_CREDENTIAL_NAME}\b\s*=|\bsetx\s+${SHELL_CREDENTIAL_NAME}\b(?:\s|=)|\$env:${SHELL_CREDENTIAL_NAME}\b\s*=|\bSetEnvironmentVariable\s*\([^\n\r]{0,240}\b${SHELL_CREDENTIAL_NAME}\b)`,
+  "iu",
+);
 
 /** Remove an explicitly prohibited disclosure phrase before looking for an affirmative request. This keeps
  * safe guidance such as “never paste your token; sign in in the browser” visible, while a later positive
@@ -32,12 +40,44 @@ function withoutNegatedDisclosureRequests(text: string): string {
     .replace(/(?:不要|请勿|禁止|不能|不可|无需|不需要|未|没有|不会).{0,80}?(?:粘贴|提供|发送|发给|发来|分享|贴出|回复|告诉我|提交|输入|复制).{0,100}/gu, "");
 }
 
+/** Shell command lines are a disclosure surface even when the model never says “send it to me”: values in
+ * `echo`, `export`, `setx`, or inline PowerShell arguments are retained by shell/process history and copied
+ * into the conversation transcript. A masked prompt or trusted Settings form is the safe enrollment path. */
+function requestsShellCredentialEntry(text: string): boolean {
+  // A warning and a later positive command often share one line ("never echo the old key; export the new
+  // key"). Split explicit contrast/sequence conjunctions first, then remove only the delimited negated
+  // command clause. Never let one safe prefix erase a later actionable credential command.
+  const actionable = text
+    .replace(/,\s*(?=(?:but|then|instead|use|run|execute)\b)/giu, "; ")
+    .replace(/，\s*(?=(?:但|但是|然后|改为|请执行|执行|请运行|运行))/gu, "；")
+    .replace(
+      /\s+(?:(?:and\s+)?then|but|instead)\s+(?=(?:(?:run|execute|use)\s+)?(?:echo|printf|export|setx|\$env:|\bSetEnvironmentVariable\b|\[[^\]\r\n]*Environment\]))/giu,
+      "; ",
+    )
+    .replace(
+      /\s*(?:但(?:是)?|然后|改为|而是)\s*(?=(?:请)?(?:执行|运行|使用)?\s*(?:echo|printf|export|setx|\$env:|\bSetEnvironmentVariable\b|\[[^\]\r\n]*Environment\]))/gu,
+      "；",
+    )
+    .replace(
+      /\b(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|avoid)\b[^\n\r;；.。！？!?]{0,120}\b(?:echo|printf|export|setx|SetEnvironmentVariable)\b[^\n\r;；.。！？!?]{0,520}/giu,
+      "",
+    )
+    .replace(/(?:不要|请勿|禁止|不能|不可|避免)[^\n\r;；.。！？!?]{0,120}(?:echo|printf|export|setx|SetEnvironmentVariable)[^\n\r;；.。！？!?]{0,520}/gu, "");
+  if (UNSAFE_SHELL_CREDENTIAL_ENTRY.test(actionable)) return true;
+  // A literal credential-shaped value can omit a variable name entirely (`echo 'sk-…' > file`). Reuse the
+  // canonical redactor's token knowledge, but only inside an actionable echo/printf command so ordinary
+  // diagnostics that merely mention a redacted token remain allowed.
+  return /\b(?:echo|printf)\b[^\n\r]{0,480}/iu.test(actionable)
+    && redactSensitiveText(actionable).redactions.length > 0;
+}
+
 /** Detect model-authored instructions that ask a person to disclose a credential into chat. This is
  * intentionally distinct from secret-value redaction: a solicitation may contain no secret yet, but must be
  * stopped before the user answers. Local trusted flows such as “configure the key in Settings” contain no
  * transfer/chat-input verb and remain allowed. */
 export function requestsCredentialDisclosure(text: string): boolean {
   if (!text.trim()) return false;
+  if (requestsShellCredentialEntry(text)) return true;
   const clauses = text.split(/[\n。！？!?;；,，]+/u);
   return clauses.some((rawClause) => {
     const clause = withoutNegatedDisclosureRequests(rawClause);
@@ -61,7 +101,7 @@ type Pattern = {
   replace: string | ((...args: string[]) => string);
 };
 
-const CREDENTIAL_NAME = String.raw`(?:[A-Za-z][A-Za-z0-9_.-]*(?:api[_-]?key|apikey|secret|token|password|passwd)[A-Za-z0-9_.-]*|(?:api[_-]?key|apikey|secret|token|password|passwd)[A-Za-z0-9_.-]*)`;
+const CREDENTIAL_NAME = String.raw`(?:[A-Za-z][A-Za-z0-9_.-]*(?:api[_-]?key|apikey|secret|token|password|passwd|webhook)[A-Za-z0-9_.-]*|(?:api[_-]?key|apikey|secret|token|password|passwd|webhook)[A-Za-z0-9_.-]*)`;
 const CREDENTIAL_FLAG = String.raw`--?(?:api[-_]?key|token|secret|password|passwd)`;
 
 const PATTERNS: Pattern[] = [
@@ -77,6 +117,11 @@ const PATTERNS: Pattern[] = [
   { label: "npm-token", re: /\bnpm_[A-Za-z0-9]{20,}\b/g, replace: "npm_***" },
   { label: "google-api-key", re: /\bAIza[A-Za-z0-9_-]{20,}\b/g, replace: "AIza***" },
   { label: "stripe-live-key", re: /\b(?:sk|rk)_live_[A-Za-z0-9]{12,}\b/g, replace: "stripe-live-***" },
+  {
+    label: "webhook-url",
+    re: /\bhttps?:\/\/[^\s"'<>]*(?:webhooks?|hooks?)[^\s"'<>]*/gi,
+    replace: "<REDACTED:webhook-url>",
+  },
   { label: "aws-key", re: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, replace: "AWS-KEY-***" },
   { label: "jwt", re: /\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, replace: "JWT-***" },
   {
@@ -93,7 +138,7 @@ const PATTERNS: Pattern[] = [
     // Quoted credentials may legitimately contain whitespace. Handle them before the unquoted patterns so
     // `PASSWORD="correct horse battery staple"` is redacted as one value rather than leaking its tail.
     label: "environment-credential",
-    re: /(\b[A-Z][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|_PASSWORD|_PASSWD)\b\s*=\s*)(["'])([\s\S]*?)\2/g,
+    re: /(\b[A-Z][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|_PASSWORD|_PASSWD|_WEBHOOK(?:_URL)?)\b\s*=\s*)(["'])([\s\S]*?)\2/g,
     replace: (_match: string, prefix: string, quote: string) => `${prefix}${quote}***${quote}`,
   },
   {
@@ -115,7 +160,7 @@ const PATTERNS: Pattern[] = [
     // Generic all-caps environment variables such as OPENAI_KEY / SOME_SERVICE_PRIVATE_KEY. Keep this
     // case-sensitive so ordinary prose/code identifiers ending in "key" are not over-redacted.
     label: "environment-credential",
-    re: /(\b[A-Z][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|_PASSWORD|_PASSWD)\b\s*=\s*)(["']?)([^\s"',;}\]]{6,})(["']?)/g,
+    re: /(\b[A-Z][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|_PASSWORD|_PASSWD|_WEBHOOK(?:_URL)?)\b\s*=\s*)(["']?)([^\s"',;}\]]{6,})(["']?)/g,
     replace: (_match: string, prefix: string, open: string, _value: string, close: string) => `${prefix}${open}***${close}`,
   },
   {

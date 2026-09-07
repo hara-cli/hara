@@ -45,6 +45,7 @@ test("secret redaction handles quoted whitespace, URL credentials, and common st
     "npm_abcdefghijklmnopqrstuvwxyz123456",
     "AIzaabcdefghijklmnopqrstuvwxyz123456",
     "sk_live_abcdefghijklmnop",
+    "https://open.feishu.cn/open-apis/bot/v2/hook/abcdefghijklmnop123456",
   ];
   const input = [
     `PASSWORD="${values[0]}"`,
@@ -107,6 +108,18 @@ test("credential-disclosure detection blocks chat transfer and browser-storage e
     "请按 F12，在控制台复制 localStorage.token 后粘贴给我。",
     "请提供后台登录态 cookie。",
     "Type your API key in this chat.",
+    "Send me the Feishu webhook URL.",
+    "请把 webhook 地址粘贴给我。",
+    "Run: echo 'FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx' > ~/.hara/secrets/daily.env",
+    "Run echo 'YOUR_API_KEY' > ~/.hara/secrets/provider.key",
+    "Run printf '%s' '$OPENAI_API_KEY' > ~/.hara/secrets/provider.key",
+    "Execute echo 'paste-your-api-key-here' > .env",
+    "Run echo 'sk-live-example12345678' > ~/.hara/secrets/provider.key",
+    "请执行 export OPENAI_API_KEY=YOUR_API_KEY 后继续。",
+    "setx ARK_API_KEY YOUR_API_KEY",
+    "pwsh -Command [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY', 'YOUR_API_KEY', 'User')",
+    "[Environment]::SetEnvironmentVariable('OPENAI_API_KEY', 'YOUR_API_KEY', 'User')",
+    "$env:OPENAI_API_KEY = 'YOUR_API_KEY'",
   ]) assert.equal(requestsCredentialDisclosure(unsafe), true, unsafe);
 
   for (const safe of [
@@ -117,9 +130,22 @@ test("credential-disclosure detection blocks chat transfer and browser-storage e
     "请在 Hara 设置页输入 API Key。",
     "Paste the API key into the masked terminal prompt.",
     "请在终端的隐藏输入中粘贴 API Key。",
+    "Never run echo 'API_KEY=value'; use the masked Hara Settings form instead.",
+    "请勿执行 echo 'FEISHU_WEBHOOK=...'，请使用 Hara 设置中的隐藏输入。",
     "The browser_session capability is unavailable; export a non-secret CSV file instead.",
     "The provider returned 401 because no session token was available.",
     "The provider did not provide an access token.",
     "后台没有提供 session token。",
   ]) assert.equal(requestsCredentialDisclosure(safe), false, safe);
+
+  for (const mixed of [
+    "Never echo API_KEY=value; export OPENAI_API_KEY=YOUR_KEY",
+    "Do not echo API_KEY=value, but run export OPENAI_API_KEY=YOUR_KEY",
+    "请勿执行 echo 'API_KEY=x'；请执行 export OPENAI_API_KEY=YOUR_KEY",
+    "Don't use export OLD_API_KEY=x; use setx OPENAI_API_KEY YOUR_KEY instead",
+    "Never echo API_KEY=value. Export OPENAI_API_KEY=YOUR_KEY",
+    "Never echo API_KEY=value and then export OPENAI_API_KEY=YOUR_KEY",
+    "Do not echo API_KEY=value but run export OPENAI_API_KEY=YOUR_KEY",
+    "请勿执行 echo API_KEY=x 然后请执行 export OPENAI_API_KEY=YOUR_KEY",
+  ]) assert.equal(requestsCredentialDisclosure(mixed), true, mixed);
 });
