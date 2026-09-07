@@ -168,12 +168,12 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
 }, async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-live-runtime-"));
   const statePath = join(root, "runtime-state.json");
-  const weztermArgsPath = join(root, "wezterm-args.txt");
   try {
     const wezterm = join(root, ".local", "bin", "wezterm");
     mkdirSync(join(root, ".local", "bin"), { recursive: true });
-    writeFileSync(wezterm, `#!/bin/sh\nprintf '%s\\n' "$@" > '${weztermArgsPath}'\n`, { mode: 0o755 });
+    writeFileSync(wezterm, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     chmodSync(wezterm, 0o755);
+    let nativeTerminalArgs = null;
     const fixture = join(root, "fake-herdr.mjs");
     writeFileSync(fixture, `
       import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -310,6 +310,10 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
       identityKey: Buffer.alloc(32, 23),
       identityHome: root,
       runtimeRoot: join(root, "runtime"),
+      spawnProcess(command, args, options) {
+        if (command === realpathSync(wezterm)) nativeTerminalArgs = [...args];
+        return spawn(command, [...args], options);
+      },
     });
     const source = await adapter.inspect();
     assert.equal(source.state, "ready");
@@ -385,17 +389,10 @@ test("Hara Live starts an isolated runtime, creates a coding-agent relay, and ke
       terminal: "wezterm",
       opened: true,
     });
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const complete = existsSync(weztermArgsPath)
-        && readFileSync(weztermArgsPath, "utf8").trim().split("\n").length >= 11;
-      if (complete) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    assert.equal(existsSync(weztermArgsPath), true, "the detached WezTerm fixture must receive the handoff");
-    const weztermArgs = readFileSync(weztermArgsPath, "utf8").trim().split("\n");
-    assert.deepEqual(weztermArgs.slice(0, 4), ["start", "--no-auto-connect", "--always-new-process", "--"]);
-    assert.deepEqual(weztermArgs.slice(-4), ["terminal", "attach", "native-terminal-secret", "--takeover"]);
-    assert.doesNotMatch(weztermArgs.join(" "), /agent start|\bcodex\b|\bclaude\b/,
+    assert.ok(nativeTerminalArgs, "the detached WezTerm fixture must receive the handoff");
+    assert.deepEqual(nativeTerminalArgs.slice(0, 4), ["start", "--no-auto-connect", "--always-new-process", "--"]);
+    assert.deepEqual(nativeTerminalArgs.slice(-4), ["terminal", "attach", "native-terminal-secret", "--takeover"]);
+    assert.doesNotMatch(nativeTerminalArgs.join(" "), /agent start|\bcodex\b|\bclaude\b/,
       "the WezTerm companion attaches to the existing terminal and never launches another agent");
 
     const listed = await adapter.list({ limit: 10 });

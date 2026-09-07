@@ -148,6 +148,12 @@ import {
   ServeEventReplayBuffer,
 } from "./event-replay.js";
 import {
+  DEFAULT_REMOTE_COMMAND_RECEIPTS,
+  MAX_REMOTE_COMMAND_RESULT_BYTES,
+  RemoteCommandLedger,
+  type RemoteCommandOutcome,
+} from "./remote-command-ledger.js";
+import {
   ControlLeaseError,
   ControlLeaseRegistry,
   DEFAULT_CONTROL_LEASE_RESOURCES,
@@ -405,6 +411,11 @@ export interface ServeDeps {
   discoveryHome?: string; // tests: isolate the discovery file from the real home directory
   artifactHome?: string; // tests/embedders: isolate ~/.hara/artifacts from the real home directory
   agentTeamHome?: string; // tests/embedders: isolate ~/.hara/agent-teams from the real home directory
+  /** Private home for restart-safe Serve control state. Quiet test embedders remain in-memory unless they
+   * opt in explicitly; production defaults to the discovery home / user home. */
+  serveStateHome?: string;
+  /** Hermetic tests may inject a receipt ledger to exercise fail-closed persistence boundaries. */
+  remoteCommandLedger?: RemoteCommandLedger;
   compactTimeoutMs?: number; // tests/embedders: bound a provider that ignores cancellation
   /** Optional hermetic/session-provider override. Production uses official local adapters and never parses
    * private transcript files in the renderer or protocol layer. */
@@ -1059,6 +1070,32 @@ const syncDirectory = (dir: string): void => {
 const writeDiscovery = async (dir: string, path: string, record: DiscoveryRecord): Promise<void> => {
   ensurePrivateDiscoveryDir(dir);
   await withDiscoveryLock(dir, record.instanceId, () => {
+    let existingFd: number | undefined;
+    try {
+      existingFd = openSync(path, fsConstants.O_RDONLY | optionalPosixOpenFlag("O_NOFOLLOW"));
+      const opened = fstatSync(existingFd);
+      if (opened.isFile() && opened.size <= 64 * 1024) {
+        const existing = JSON.parse(readFileSync(existingFd, "utf8")) as Partial<DiscoveryRecord>;
+        const linked = lstatSync(path);
+        const ownedByAnotherLiveServe = linked.isFile()
+          && !linked.isSymbolicLink()
+          && sameOpenedFileIdentity(linked, opened)
+          && typeof existing.instanceId === "string"
+          && existing.instanceId.length > 0
+          && existing.instanceId !== record.instanceId
+          && typeof existing.pid === "number"
+          && isPidAlive(existing.pid);
+        if (ownedByAnotherLiveServe) {
+          throw new Error(`another Hara Serve instance is already running (pid ${existing.pid})`);
+        }
+      }
+    } catch (error: any) {
+      if (error?.code !== "ENOENT" && error?.code !== "ELOOP" && !(error instanceof SyntaxError)) throw error;
+      // Missing, symlinked, and malformed legacy discovery entries are replaced atomically below.
+    } finally {
+      if (existingFd !== undefined) closeSync(existingFd);
+    }
+
     const temp = join(dir, `.serve.json.${process.pid}.${record.instanceId}.tmp`);
     let fd: number | undefined;
     try {
@@ -1530,6 +1567,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const runtimeLog = createServeRuntimeLogger({ enabled: !deps.quietDiscovery });
   const token = opts.token ?? randomBytes(16).toString("hex");
   const instanceId = randomUUID();
+  // Bind restart state before opening a socket. A corrupt/private-state path must fail without leaving
+  // an unadvertised listener behind; once the socket is live, discovery owns the remaining cleanup path.
+  const serveStateHome = deps.serveStateHome
+    ?? (!deps.quietDiscovery ? deps.discoveryHome ?? homedir() : undefined);
+  const eventReplay = new ServeEventReplayBuffer(instanceId, {
+    ...(serveStateHome ? { persistence: { home: serveStateHome } } : {}),
+  });
+  const remoteCommandLedger = deps.remoteCommandLedger ?? new RemoteCommandLedger({
+    ...(serveStateHome ? { home: serveStateHome } : {}),
+  });
   const hub = new SessionHub(deps.store ?? realStore, deps.version);
   const agentTeamStore = new AgentTeamStore(deps.agentTeamHome ?? deps.discoveryHome ?? homedir());
   const agentTeams = new Map<string, DurableAgentTeam>();
@@ -1689,6 +1736,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     allowAlways: boolean;
     scope: "session" | "external";
     sessionId: string;
+    question: string;
   }>();
   const inFlightRequests = new Set<Promise<void>>();
   const sessionSubmissionTails = new Map<string, Promise<void>>();
@@ -1698,7 +1746,6 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const activeOperations = new Set<Promise<unknown>>();
   let taskEventSequence = 0;
   const workforceLedger = new WorkforceStateLedger(instanceId);
-  const eventReplay = new ServeEventReplayBuffer(instanceId);
   const controlLeases = new ControlLeaseRegistry<WebSocket>();
   let closing = false;
   let closePromise: Promise<void> | null = null;
@@ -1874,7 +1921,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const onAbort = (): void => finish(false);
     timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS);
     timer.unref();
-    pendingApprovals.set(approvalId, { finish, allowAlways, scope: "external", sessionId });
+    pendingApprovals.set(approvalId, { finish, allowAlways, scope: "external", sessionId, question });
     if (signal.aborted) finish(false);
     else {
       signal.addEventListener("abort", onAbort, { once: true });
@@ -2172,7 +2219,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         };
         const onAbort = (): void => finish(false);
         timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS); // unanswered → deny, turn continues
-        pendingApprovals.set(approvalId, { finish, allowAlways, scope: "session", sessionId });
+        pendingApprovals.set(approvalId, { finish, allowAlways, scope: "session", sessionId, question: q });
         if (signal.aborted) finish(false);
         else {
           // `signal` composes the owning turn cancellation with runAgent's lifecycle cancellation. Listening
@@ -2182,7 +2229,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             state: "waiting",
             phase: "approval",
             detail: q,
-            approval: { id: approvalId, question: q },
+            approval: { id: approvalId, question: q, allowAlways },
           });
           broadcast("approval.request", { sessionId, approvalId, question: q, allowAlways });
         }
@@ -2662,10 +2709,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   };
 
   interface InFlightSessionCommand {
+    commandId: string;
+    sessionId: string;
     method: SessionCommandMethod;
     requestHash: string;
     promise: Promise<unknown>;
     durable: boolean;
+    settled: boolean;
+    outcome?: SessionCommandOutcome;
   }
   const inFlightSessionCommands = new Map<string, InFlightSessionCommand>();
   const MAX_IN_FLIGHT_SESSION_COMMANDS = 256;
@@ -2685,6 +2736,12 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   };
 
   const commandFromReceipt = (receipt: SessionCommandReceipt): unknown => {
+    if (!receipt.outcome) {
+      throw new SessionCommandRpcError(
+        ERR.CONFLICT,
+        "this command started before Hara could save its terminal outcome; resume and inspect session.history before retrying",
+      );
+    }
     if (receipt.outcome.kind === "error") {
       throw new SessionCommandRpcError(receipt.outcome.code, receipt.outcome.message);
     }
@@ -2709,10 +2766,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const bounded = [
       ...prior.filter((item) => item.commandId !== receipt.commandId),
       receipt,
-    ].slice(-MAX_SESSION_COMMAND_RECEIPTS);
-    const replayBoundary = Math.max(0, bounded.length - MAX_SESSION_COMMAND_REPLAY_RESULTS);
-    const next = bounded.map((item, index): SessionCommandReceipt => {
-      if (index >= replayBoundary || item.outcome.kind !== "result") return item;
+    ];
+    while (bounded.length > MAX_SESSION_COMMAND_RECEIPTS) {
+      const evictable = bounded.findIndex((item) => item.outcome !== undefined);
+      if (evictable < 0) {
+        throw new SessionCommandRpcError(ERR.BUSY, "too many session commands have unresolved outcomes");
+      }
+      bounded.splice(evictable, 1);
+    }
+    const exactResults = bounded.filter((item) => item.outcome?.kind === "result");
+    const exactReplayIds = new Set(
+      exactResults.slice(-MAX_SESSION_COMMAND_REPLAY_RESULTS).map((item) => item.commandId),
+    );
+    const next = bounded.map((item): SessionCommandReceipt => {
+      if (item.outcome?.kind !== "result" || exactReplayIds.has(item.commandId)) return item;
       return {
         ...item,
         outcome: {
@@ -2727,6 +2794,51 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       [...session.history],
       session.task,
     );
+  };
+
+  const unresolvedSessionReceipt = (session: ServeSession): SessionCommandReceipt | undefined => (
+    session.meta.commandReceipts?.find((receipt) => {
+      if (receipt.outcome) return false;
+      const active = inFlightSessionCommands.get(`${session.meta.id}\0${receipt.commandId}`);
+      return !active || active.settled;
+    })
+  );
+
+  /** An explicit resume is the authoritative recovery boundary for a command whose process disappeared
+   * or whose terminal receipt failed. Known in-process outcomes are preserved; a cold restart records an
+   * omitted result so the original UUID remains deduplicated without pretending to know its exact reply. */
+  const reconcileSessionCommandReceipts = (session: ServeSession): number => {
+    if (session.busy || session.configuring) return 0;
+    const receipts = session.meta.commandReceipts ?? [];
+    const replacements = new Map<string, SessionCommandReceipt>();
+    for (const receipt of receipts) {
+      if (receipt.outcome) continue;
+      const key = `${session.meta.id}\0${receipt.commandId}`;
+      const active = inFlightSessionCommands.get(key);
+      if (active && !active.settled) continue;
+      replacements.set(receipt.commandId, {
+        ...receipt,
+        completedAt: new Date().toISOString(),
+        outcome: active?.outcome ?? {
+          kind: "result_omitted",
+          message: "the session was authoritatively resumed after an interrupted command; the command remains deduplicated but its exact result is unavailable in session.history",
+        },
+      });
+    }
+    if (replacements.size === 0) return 0;
+    const candidate = receipts.map((receipt) => replacements.get(receipt.commandId) ?? receipt);
+    hub.replaceSnapshot(
+      session,
+      { ...session.meta, commandReceipts: candidate },
+      [...session.history],
+      session.task,
+    );
+    for (const [key, entry] of inFlightSessionCommands) {
+      if (entry.sessionId !== session.meta.id || !entry.settled || !replacements.has(entry.commandId)) continue;
+      entry.durable = true;
+      inFlightSessionCommands.delete(key);
+    }
+    return replacements.size;
   };
 
   /** Run a remote session mutation at most once for one client UUID. The first terminal outcome is saved
@@ -2748,17 +2860,6 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     } catch {
       throw new SessionCommandRpcError(ERR.PARAMS, "command parameters exceed safe hashing limits");
     }
-    const prior = session.meta.commandReceipts?.find((item) => item.commandId === commandId);
-    if (prior) {
-      if (prior.method !== method || prior.requestHash !== requestHash) {
-        throw new SessionCommandRpcError(
-          ERR.CONFLICT,
-          "commandId was already used for a different session command",
-        );
-      }
-      return commandFromReceipt(prior) as T;
-    }
-
     const key = `${session.meta.id}\0${commandId}`;
     const active = inFlightSessionCommands.get(key);
     if (active) {
@@ -2770,15 +2871,51 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       }
       return active.promise as Promise<T>;
     }
+    const prior = session.meta.commandReceipts?.find((item) => item.commandId === commandId);
+    if (prior) {
+      if (prior.method !== method || prior.requestHash !== requestHash) {
+        throw new SessionCommandRpcError(
+          ERR.CONFLICT,
+          "commandId was already used for a different session command",
+        );
+      }
+      return commandFromReceipt(prior) as T;
+    }
+    if (unresolvedSessionReceipt(session)) {
+      throw new SessionCommandRpcError(
+        ERR.CONFLICT,
+        "this session has a command with an uncertain outcome; resume and inspect session.history before sending another mutation",
+      );
+    }
     if (inFlightSessionCommands.size >= MAX_IN_FLIGHT_SESSION_COMMANDS) {
       throw new SessionCommandRpcError(ERR.BUSY, "too many unacknowledged session commands");
     }
 
+    const startedAt = new Date().toISOString();
+    try {
+      persistCommandReceipt(session, {
+        v: 1,
+        commandId,
+        method,
+        requestHash,
+        startedAt,
+      });
+    } catch (error) {
+      if (error instanceof SessionCommandRpcError) throw error;
+      throw new SessionCommandRpcError(
+        ERR.INTERNAL,
+        "the command idempotency receipt could not be saved; no model or tool action was started",
+      );
+    }
+
     const entry: InFlightSessionCommand = {
+      commandId,
+      sessionId: session.meta.id,
       method,
       requestHash,
       promise: Promise.resolve(),
       durable: false,
+      settled: false,
     };
     entry.promise = Promise.resolve().then(async () => {
       let result: T;
@@ -2796,12 +2933,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       } catch (error) {
         const failure = commandFailure(error);
         outcome = { kind: "error", code: failure.code, message: failure.message.slice(0, 2_000) };
+        entry.outcome = outcome;
+        entry.settled = true;
         try {
           persistCommandReceipt(session, {
             v: 1,
             commandId,
             method,
             requestHash,
+            startedAt,
             completedAt: new Date().toISOString(),
             outcome,
           });
@@ -2821,16 +2961,21 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           commandId,
           method,
           requestHash,
+          startedAt,
           completedAt: new Date().toISOString(),
           outcome,
         });
         entry.durable = true;
       } catch {
+        entry.outcome = outcome;
+        entry.settled = true;
         throw new SessionCommandRpcError(
           ERR.INTERNAL,
           "the command completed, but its idempotency receipt could not be saved; inspect session.history before retrying",
         );
       }
+      entry.outcome = outcome;
+      entry.settled = true;
       return result;
     });
     inFlightSessionCommands.set(key, entry);
@@ -2846,15 +2991,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   };
 
   interface ExternalCommandEntry {
+    commandId: string;
     method: string;
+    resourceHash: string;
     requestHash: string;
-    promise?: Promise<unknown>;
-    outcome?: SessionCommandOutcome;
+    promise: Promise<unknown>;
+    durable: boolean;
   }
-  const externalCommandReceipts = new Map<string, ExternalCommandEntry>();
-  const MAX_EXTERNAL_COMMAND_RECEIPTS = 64;
+  const inFlightExternalCommands = new Map<string, ExternalCommandEntry>();
+  const MAX_EXTERNAL_COMMAND_RECEIPTS = DEFAULT_REMOTE_COMMAND_RECEIPTS;
 
-  const externalCommandFromOutcome = (outcome: SessionCommandOutcome): unknown => {
+  const externalCommandFromOutcome = (outcome: RemoteCommandOutcome): unknown => {
     if (outcome.kind === "error") {
       throw new SessionCommandRpcError(outcome.code, outcome.message);
     }
@@ -2871,9 +3018,36 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     }
   };
 
-  /** External Codex/Claude sessions are provider-owned rather than SessionStore projections. Retain a
-   * bounded Serve-lifetime receipt so socket reconnects share the first action/result. A later Serve restart
-   * must resume and inspect the provider-native session; this layer never guesses that an action was absent. */
+  const reconcileExternalCommandLedger = (externalSessionId: string, state: string): void => {
+    // A provider read can lag the live local turn. Never let a stale `idle` projection resolve the
+    // uncertainty barrier while this Serve process still owns an active writer for the session.
+    if (externalWireTurns.has(externalSessionId)) return;
+    const resourceHash = createHash("sha256").update(externalSessionId).digest("hex");
+    try {
+      remoteCommandLedger.reconcileResource(resourceHash, state);
+    } catch {
+      throw new SessionCommandRpcError(
+        ERR.INTERNAL,
+        "the authoritative session was read, but its remote-command recovery receipt could not be saved; retry the read before sending another command",
+      );
+    }
+    // A durability failure keeps the rejected Promise in memory. Once the authoritative read has repaired
+    // the ledger, retire that process-local barrier so the same UUID replays from the durable receipt.
+    for (const [key, entry] of inFlightExternalCommands) {
+      if (entry.resourceHash !== resourceHash || entry.durable) continue;
+      const recovered = remoteCommandLedger.claim({
+        commandId: entry.commandId,
+        method: entry.method,
+        resourceHash,
+        requestHash: entry.requestHash,
+      });
+      if (recovered.kind === "completed") inFlightExternalCommands.delete(key);
+    }
+  };
+
+  /** External Codex/Claude sessions are provider-owned rather than SessionStore projections. A private
+   * started receipt crosses fsync before the provider action. Exact terminal outcomes are bounded and
+   * restart-replayable; a crash-window receipt blocks new mutation until an authoritative read/resume. */
   const runIdempotentExternalCommand = async <T>(
     method: "external.sessions.submit" | "external.sessions.steer" | "external.sessions.interrupt",
     params: Record<string, unknown>,
@@ -2890,57 +3064,105 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     } catch {
       throw new SessionCommandRpcError(ERR.PARAMS, "command parameters exceed safe hashing limits");
     }
-    const key = `${externalSessionId}\0${params.commandId}`;
-    const prior = externalCommandReceipts.get(key);
-    if (prior) {
-      if (prior.method !== method || prior.requestHash !== requestHash) {
+    const commandId = params.commandId;
+    const key = `${externalSessionId}\0${commandId}`;
+    const active = inFlightExternalCommands.get(key);
+    if (active) {
+      if (active.method !== method || active.requestHash !== requestHash) {
         throw new SessionCommandRpcError(
           ERR.CONFLICT,
-          "commandId was already used for different external-session input",
+          "commandId is already running with different external-session input",
         );
       }
-      if (prior.promise) return prior.promise as Promise<T>;
-      if (prior.outcome) return externalCommandFromOutcome(prior.outcome) as T;
-      throw new SessionCommandRpcError(ERR.INTERNAL, "external-session command receipt is incomplete");
+      return active.promise as Promise<T>;
     }
-    if (externalCommandReceipts.size >= MAX_EXTERNAL_COMMAND_RECEIPTS) {
-      for (const [receiptKey, receipt] of externalCommandReceipts) {
-        if (!receipt.outcome) continue;
-        externalCommandReceipts.delete(receiptKey);
-        if (externalCommandReceipts.size < MAX_EXTERNAL_COMMAND_RECEIPTS) break;
-      }
-      if (externalCommandReceipts.size >= MAX_EXTERNAL_COMMAND_RECEIPTS) {
-        throw new SessionCommandRpcError(ERR.BUSY, "too many external-session commands are still running");
-      }
-    }
-    const entry: ExternalCommandEntry = {
-      method,
-      requestHash,
-    };
-    const running = Promise.resolve()
-      .then(operation)
-      .catch((error) => {
-        throw commandFailure(error);
-      });
-    entry.promise = running;
-    externalCommandReceipts.set(key, entry);
+    const resourceHash = createHash("sha256").update(externalSessionId).digest("hex");
+    let claim;
     try {
-      const result = await running as T;
+      claim = remoteCommandLedger.claim({ commandId, method, resourceHash, requestHash });
+    } catch {
+      throw new SessionCommandRpcError(
+        ERR.INTERNAL,
+        "the remote command idempotency receipt could not be saved; no provider action was started",
+      );
+    }
+    if (claim.kind === "completed") return externalCommandFromOutcome(claim.outcome) as T;
+    if (claim.kind === "conflict" || claim.kind === "uncertain") {
+      throw new SessionCommandRpcError(ERR.CONFLICT, claim.message);
+    }
+    if (claim.kind === "busy") throw new SessionCommandRpcError(ERR.BUSY, claim.message);
+
+    const entry: ExternalCommandEntry = {
+      commandId,
+      method,
+      resourceHash,
+      requestHash,
+      promise: Promise.resolve(),
+      durable: false,
+    };
+    const committed = Promise.resolve().then(async () => {
+      let result: T;
+      try {
+        result = await operation();
+      } catch (error) {
+        const failure = commandFailure(error);
+        try {
+          remoteCommandLedger.complete(commandId, {
+            kind: "error",
+            code: failure.code,
+            message: failure.message.slice(0, 2_000),
+          });
+          entry.durable = true;
+        } catch {
+          throw new SessionCommandRpcError(
+            ERR.INTERNAL,
+            "the remote command reached a terminal state, but its idempotency result could not be saved; inspect the provider-native session before retrying",
+          );
+        }
+        broadcast("external.event.command_failed", {
+          sessionId: externalSessionId,
+          commandId,
+          commandMethod: method,
+          code: failure.code,
+          message: failure.message.slice(0, 2_000),
+        });
+        throw failure;
+      }
       const safeResult = redactSensitiveValue(result).value;
       const json = JSON.stringify(safeResult);
-      entry.outcome = typeof json === "string" && Buffer.byteLength(json, "utf8") <= MAX_SESSION_COMMAND_RESULT_BYTES
+      const outcome: RemoteCommandOutcome = typeof json === "string" && Buffer.byteLength(json, "utf8") <= MAX_REMOTE_COMMAND_RESULT_BYTES
         ? { kind: "result", json }
         : {
             kind: "result_omitted",
-            message: "this external-session command completed earlier, but its result exceeded the replay limit; resume and inspect the provider-native session before sending another command",
+            message: "this external-session command completed earlier, but its result exceeded the durable replay limit; resume and inspect the provider-native session before sending another command",
           };
+      try {
+        remoteCommandLedger.complete(commandId, outcome);
+        entry.durable = true;
+      } catch {
+        throw new SessionCommandRpcError(
+          ERR.INTERNAL,
+          "the remote command completed, but its idempotency result could not be saved; inspect the provider-native session before retrying",
+        );
+      }
+      broadcast("external.event.command_committed", {
+        sessionId: externalSessionId,
+        commandId,
+        commandMethod: method,
+      });
       return result;
-    } catch (error) {
-      const failure = commandFailure(error);
-      entry.outcome = { kind: "error", code: failure.code, message: failure.message.slice(0, 2_000) };
-      throw failure;
+    });
+    // Concurrent/retried callers must observe the full provider + durable-receipt transaction. Keeping
+    // only the provider promise here would let a retry report success after the provider returned but the
+    // terminal receipt failed to persist—the exact crash window this ledger exists to close.
+    entry.promise = committed;
+    inFlightExternalCommands.set(key, entry);
+    try {
+      return await committed;
     } finally {
-      delete entry.promise;
+      if (entry.durable && inFlightExternalCommands.get(key) === entry) {
+        inFlightExternalCommands.delete(key);
+      }
     }
   };
 
@@ -3246,7 +3468,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           // (client-declared) is accepted and currently unused — reserved for opt-outs/experimental gating.
           const methods = [
             "server.shutdown",
-            "events.replay", "events.ack",
+            "events.replay", "events.ack", "events.snapshot",
             "session.list", "session.create", "session.resume", "session.history", "session.agents.list", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
@@ -3285,8 +3507,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "composer.attachments.v1",
             "events.bounded-delivery.v1",
             "events.cursor-replay.v1",
+            "events.restart-replay.v1",
+            "events.authoritative-snapshot.v1",
             "models.capabilities.v1",
             "sessions.command-idempotency.v1",
+            "sessions.command-idempotency.durable.v2",
             "sessions.control-lease.v1",
             "sessions.readonly-history.v1",
             "sessions.cross-profile-fork.v1",
@@ -3303,6 +3528,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.native-resume.v1",
             "external.sessions.launch-options.v1",
             "external.sessions.command-idempotency.serve-lifetime.v1",
+            "external.sessions.command-idempotency.durable.v2",
             "external.sessions.terminal-mirror.v1",
             "external.sessions.terminal-stream.v2",
             "external.sessions.terminal-input-sequence.v1",
@@ -3333,6 +3559,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 "event.control_state", "event.control_revoked",
                 "external.event.turn_start", "external.event.text", "external.event.tool",
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
+                "external.event.command_committed", "external.event.command_failed",
                 "external.event.terminal.frame", "external.event.terminal.closed",
               ],
               features,
@@ -3340,7 +3567,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 sessionCommandReceipts: MAX_SESSION_COMMAND_RECEIPTS,
                 sessionCommandReplayResults: MAX_SESSION_COMMAND_REPLAY_RESULTS,
                 externalCommandReceipts: MAX_EXTERNAL_COMMAND_RECEIPTS,
-                externalCommandResultBytes: MAX_SESSION_COMMAND_RESULT_BYTES,
+                externalCommandResultBytes: MAX_REMOTE_COMMAND_RESULT_BYTES,
                 socketBufferedBytes: MAX_SERVE_SOCKET_BUFFERED_BYTES,
                 eventReplayEvents: DEFAULT_EVENT_REPLAY_MAX_EVENTS,
                 eventReplayBytes: DEFAULT_EVENT_REPLAY_MAX_BYTES,
@@ -3353,6 +3580,65 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
 
         switch (req.method) {
+          case "events.snapshot": {
+            if (!Array.isArray(p.sessionIds) || p.sessionIds.length > 100) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionIds must be an array of at most 100 session IDs"));
+            }
+            if (p.sessionIds.some((sessionId: unknown) => (
+              typeof sessionId !== "string"
+              || !sessionId
+              || sessionId.length > 256
+            ))) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionIds contains an invalid session ID"));
+            }
+            const sessionIds = [...new Set(p.sessionIds as string[])];
+            const requested = new Set(sessionIds);
+            const taskStates = sessionIds.flatMap((sessionId) => {
+              const snapshot = hub.read(sessionId);
+              if (!snapshot?.task) return [];
+              const pending = [...pendingApprovals.entries()].find(([, approval]) => (
+                approval.scope === "session" && approval.sessionId === sessionId
+              ));
+              const activity: TaskLifecycleActivity = pending
+                ? {
+                    state: "waiting",
+                    phase: "approval",
+                    approval: {
+                      id: pending[0],
+                      question: pending[1].question,
+                      allowAlways: pending[1].allowAlways,
+                    },
+                  }
+                : { phase: "restored" };
+              return [taskLifecycleEvent(
+                sessionId,
+                snapshot.task,
+                snapshot.meta.todos ?? [],
+                activity,
+                nextTaskEventCursor(),
+              )];
+            });
+            return reply(rpcResult(id!, {
+              streamId: eventReplay.streamId,
+              throughSequence: eventReplay.currentSequence,
+              taskStates,
+              workforceStates: workforceLedger.readAll().filter((state) => requested.has(state.sessionId)),
+              externalTurns: externalSessionSpaceId() === "personal"
+                ? [...externalWireTurns].map(([sessionId, turnId]) => ({ sessionId, turnId }))
+                : [],
+              approvals: [...pendingApprovals]
+                .filter(([, approval]) => approval.scope === "session"
+                  ? requested.has(approval.sessionId)
+                  : externalSessionSpaceId() === "personal")
+                .map(([approvalId, approval]) => ({
+                  approvalId,
+                  sessionId: approval.sessionId,
+                  scope: approval.scope,
+                  question: approval.question,
+                  allowAlways: approval.allowAlways,
+                })),
+            }));
+          }
           case "events.replay": {
             if (typeof p.streamId !== "string" || !p.streamId) {
               return reply(rpcError(id, ERR.PARAMS, "streamId is required"));
@@ -3401,9 +3687,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const previous = eventAcks.get(ws) ?? 0;
             const acknowledged = Math.max(previous, p.sequence);
             eventAcks.set(ws, acknowledged);
+            const durableThrough = eventReplay.checkpoint();
             return reply(rpcResult(id!, {
               streamId: eventReplay.streamId,
               acknowledged,
+              durableThrough,
               duplicate: p.sequence <= previous,
             }));
           }
@@ -3475,6 +3763,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (hasActiveClientWork()) {
               return reply(rpcError(id, ERR.BUSY, "server has active work — retry shutdown after all sessions and approvals are idle"));
             }
+            // Make the last bounded control/status tail durable before telling Desktop it may replace the
+            // writer. If the private checkpoint cannot commit, keep this process alive and fail closed.
+            eventReplay.checkpoint(true);
             closing = true;
             reply(rpcResult(id!, { accepted: true }));
             const shutdown = setTimeout(() => void close(), 0);
@@ -3616,14 +3907,18 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
             }
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
-            return reply(rpcResult(id!, await externalSessions.readSession(p.sessionId)));
+            const result = await externalSessions.readSession(p.sessionId);
+            reconcileExternalCommandLedger(p.sessionId, result.session.state);
+            return reply(rpcResult(id!, result));
           }
           case "external.sessions.resume": {
             if (externalSessionSpaceId() !== "personal") {
               return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
             }
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
-            return reply(rpcResult(id!, await externalSessions.resumeSession(p.sessionId)));
+            const result = await externalSessions.resumeSession(p.sessionId);
+            reconcileExternalCommandLedger(p.sessionId, result.session.state);
+            return reply(rpcResult(id!, result));
           }
           case "external.sessions.fork": {
             if (externalSessionSpaceId() !== "personal") {
@@ -4479,8 +4774,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
             if (migratedProfileBinding || migratedSpaceBinding || migratedRuntimeDefaults || migratedApproval) hub.save(r.session);
+            try {
+              reconcileSessionCommandReceipts(r.session);
+            } catch {
+              hub.detach(r.session.meta.id);
+              return reply(rpcError(
+                id,
+                ERR.INTERNAL,
+                "the session was resumed, but its uncertain command receipt could not be reconciled; retry resume before sending input",
+              ));
+            }
             r.session.projectContext = loadAgentContext(r.session.meta.cwd) || undefined;
-            broadcastTaskState(r.session, { phase: "restored" });
+            const pendingApproval = [...pendingApprovals.entries()].find(([, approval]) => (
+              approval.scope === "session" && approval.sessionId === r.session.meta.id
+            ));
+            broadcastTaskState(r.session, pendingApproval
+              ? {
+                  state: "waiting",
+                  phase: "approval",
+                  approval: {
+                    id: pendingApproval[0],
+                    question: pendingApproval[1].question,
+                    allowAlways: pendingApproval[1].allowAlways,
+                  },
+                }
+              : { phase: "restored" });
             return reply(rpcResult(id!, {
               sessionId: r.session.meta.id,
               model: r.session.meta.model,
@@ -6413,6 +6731,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ]);
       }
       clearTimeout(terminateTimer);
+      // Signal/host shutdown can bypass `server.shutdown`. Persist any terminal lifecycle events emitted
+      // during cooperative cancellation before releasing the final process resources.
+      try {
+        eventReplay.checkpoint(true);
+      } catch (error) {
+        runtimeLog("event_replay.checkpoint_failed", {
+          category: serveRuntimeFailureCategory(error),
+        });
+      }
       authed.clear();
     })();
     return closePromise;

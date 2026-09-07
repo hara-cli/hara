@@ -108,6 +108,42 @@ test("session persistence validates and retains stable compaction window identit
   }
 });
 
+test("session persistence retains a write-ahead command receipt without prompt content", () => {
+  const project = mkdtempSync(join(tmpdir(), "hara-session-command-started-"));
+  const id = newSessionId();
+  const at = "2026-09-07T00:00:00.000Z";
+  try {
+    saveSession({
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "",
+      createdAt: at,
+      updatedAt: at,
+      commandReceipts: [{
+        v: 1,
+        commandId: "11111111-1111-4111-8111-111111111111",
+        method: "session.submit",
+        requestHash: "a".repeat(64),
+        startedAt: at,
+      }],
+    }, []);
+    const loaded = loadSession(id);
+    assert.deepEqual(loaded?.meta.commandReceipts, [{
+      v: 1,
+      commandId: "11111111-1111-4111-8111-111111111111",
+      method: "session.submit",
+      requestHash: "a".repeat(64),
+      startedAt: at,
+    }]);
+    assert.doesNotMatch(readFileSync(join(homedir(), ".hara", "sessions", `${id}.json`), "utf8"), /possibly executed|run once/);
+  } finally {
+    deleteSession(id);
+    rmSync(project, { recursive: true, force: true });
+  }
+});
+
 test("session command receipts round-trip redacted and stay out of metadata sidecars", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-session-command-receipt-"));
   const previousHome = process.env.HOME;

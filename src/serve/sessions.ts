@@ -417,13 +417,19 @@ export class SessionHub {
       }
     }
     this.stampVersion(candidateMeta);
-    if (!(s.durable === false && history.length === 0 && !task)) {
+    const shouldPersist = !(
+      s.durable === false
+      && history.length === 0
+      && !task
+      && !(candidateMeta.commandReceipts?.length)
+    );
+    if (shouldPersist) {
       this.store.save(candidateMeta, history, task);
     }
     Object.assign(s.meta, candidateMeta);
     s.history.splice(0, s.history.length, ...history);
     s.task = task;
-    s.durable = true;
+    if (shouldPersist) s.durable = true;
   }
 
   /** Rename a session (live or on-disk). Returns false when the id is unknown. */

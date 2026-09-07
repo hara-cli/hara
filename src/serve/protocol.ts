@@ -12,13 +12,19 @@
 //                                                   snapshotRequired,resetReason?,replayed,
 //                                                   throughSequence,hasMore}; retained broadcast notifications
 //                                                   are emitted again before this result with their original
-//                                                   deliveryCursor. A changed/expired cursor requires clients to
-//                                                   refresh authoritative session/terminal snapshots first.
-//   events.ack        {streamId,sequence}         → {streamId,acknowledged,duplicate}; ACKs are monotonic per
-//                                                   authenticated socket and prepare an exact flush/handoff fence.
+//                                                   deliveryCursor. Production checkpoints a bounded, redacted
+//                                                   tail across orderly Serve replacement. A changed, expired, or
+//                                                   ahead cursor requires authoritative snapshots first.
+//   events.ack        {streamId,sequence}         → {streamId,acknowledged,durableThrough,duplicate}; ACKs are
+//                                                   monotonic per authenticated socket and checkpoint a bounded
+//                                                   exact flush/handoff fence when needed.
 //                                                   Every replayable broadcast notification carries
 //                                                   params.deliveryCursor:{streamId,sequence}. Private terminal
 //                                                   stream frames keep their stream-specific snapshot contract.
+//   events.snapshot   {sessionIds:[…]}             → {streamId,throughSequence,taskStates,workforceStates,
+//                                                    externalTurns,approvals}; a bounded authoritative recovery
+//                                                    fence. Clients apply it before buffered events newer than
+//                                                    throughSequence, so reconnect never depends on replay alone.
 //   session.list      {cwd?,cursor?,limit?,archived?} → {sessions:[{id,title,cwd,model,profileId?,updatedAt}],
 //                                                        page:{hasMore,limit,nextCursor?}}
 //                                                        Interactive sessions only; automation history has
@@ -38,10 +44,15 @@
 //   external.sessions.steer {sessionId,text,expectedTurnId?,commandId?}
 //                                                   → {sessionId,turnId,accepted:true}
 //   external.sessions.interrupt {sessionId,expectedTurnId?,commandId?} → {}
-//                      commandId is a client UUID. Matching reconnect retries share the first result during
-//                      the current Serve lifetime; conflicting reuse is rejected. Since the provider owns
-//                      these sessions, after a Serve restart clients must resume/read before deciding what
-//                      to send. expectedTurnId fences delayed steer/interrupt input to one active turn.
+//                      commandId is a client UUID. A private started receipt is durable before the provider
+//                      action; matching terminal results replay across reconnect and Serve restart. A crash
+//                      window blocks mutation until read/resume observes the authoritative provider session
+//                      outside a live state. Conflicting reuse is rejected. expectedTurnId fences delayed
+//                      steer/interrupt input to one active turn.
+//   external.event.command_committed {sessionId,commandId,commandMethod}
+//   external.event.command_failed    {sessionId,commandId,commandMethod,code,message}
+//                      is emitted only after the terminal receipt is durable. A client may forget its local
+//                      uncertain-retry marker only after this event or the matching terminal RPC response.
 //   external.sessions.remove {sessionId}            → {} (Hara Live only; closes the original terminal)
 //   external.sessions.terminal.attach {sessionId,mode,cols,rows,takeover?}
 //                                                   → {streamId,mode,cols,rows,nextInputSeq?}
@@ -75,8 +86,11 @@
 //                                   after the session is idle.
 //                      expectedModel + expectedEffort guard a staged next-turn route from starting on an
 //                                   older provider configuration during an idle transition.
-//                      commandId: client-generated UUID; the first terminal result is durably replayed for
-//                                   matching retries and conflicting reuse is rejected.
+//                      commandId: client-generated UUID; a write-ahead started receipt is durable before
+//                                   model/tool execution. Matching terminal results replay across reconnect
+//                                   and restart; a crash-window receipt blocks new mutation until an explicit
+//                                   session.resume reconciles authoritative task/history state. Conflicting
+//                                   reuse is rejected.
 //   session.send      {sessionId,text,images?,attachments?,newTask?,commandId?} → (legacy start_if_idle; streams events, then)
 //                                                             {reply,usage,taskId,turnId,status?,stopReason?}
 //   session.steer     {sessionId,text,expectedTurnId,commandId?} → {accepted,taskId,turnId} (legacy strict steer)

@@ -1,6 +1,6 @@
 # Codex runtime learning audit
 
-> Snapshot: 2026-09-06. Reference checkout:
+> Snapshot: 2026-09-07. Reference checkout:
 > `/Users/zhujianbo/work/projects/ai/codex` at locally inspected revision `8e6a44b428`.
 
 Hara should learn Codex's reliability mechanisms, not turn into an OpenAI-only clone. This audit compares the
@@ -24,9 +24,9 @@ providers behind that boundary, not competing user-facing control products.
 | Verified user-decision retention | Implemented after 0.166.1 | Successful `ask_user` decisions are redacted, deduplicated, persisted outside the compactable transcript, and restored in future task prompts and forks. |
 | Replay-safe provider retry | Implemented after 0.166.1 | One provider-neutral coordinator classifies empty pre-output failures, honors bounded `Retry-After`, backs off cancellably, and never replays after stream activity, output, or a tool call. SDK-local automatic retries are disabled. |
 | Projection commit journal | Foundation implemented after 0.166.1 | Every durable snapshot appends a credential-free generation/hash record. Readers isolate malformed lines, ignore a torn final line, and report chain gaps. This detects projection loss but is not yet a typed event-source for every task action. |
-| Remote mutation deduplication | Implemented after 0.166.1 | `session.submit/send/steer/interrupt` accept a client UUID, share concurrent work, save the first terminal result before ACK, replay across Serve restarts, and reject same-ID/different-payload reuse. Provider-owned Codex/Claude submit, steer, and interrupt commands are deduplicated across socket reconnects during one Serve lifetime and support turn fencing. Controlled terminal streams reject duplicate, conflicting, and out-of-order `inputSeq` values before the PTY write. |
+| Remote mutation deduplication | Implemented after 0.166.1; write-ahead restart hardening completed after 0.167.0 | `session.submit/send/steer/interrupt` accept a client UUID, persist a prompt-free started receipt before model/tool execution, share concurrent work, save the first terminal result before ACK, replay across Serve restarts, and reject same-ID/different-payload reuse. A crash-window or failed terminal save blocks later mutation until an explicit authoritative resume reconciles task/history state. Provider-owned Codex/Claude submit, steer, and interrupt use the same contract in a private ledger, publish committed/failed receipts, and reconcile through provider read/resume. Desktop retains only opaque retry IDs plus salted payload fingerprints and fences delayed steer/interrupt by turn ID. Controlled terminal streams reject duplicate, conflicting, and out-of-order `inputSeq` values before the PTY write. |
 | Slow-client memory boundary | Implemented after 0.166.1 | All Serve notifications share a 4 MiB per-socket queue ceiling. A sleeping/stalled renderer is closed with an explicit reconnect-and-refresh reason instead of retaining unbounded terminal or task frames. |
-| Cursor/ACK/event replay | Implemented after 0.166.1 | Broadcast events carry a process-stream UUID and monotonic sequence. A reconnecting Desktop/mobile client can replay the exact retained tail, ACK its cursor, and receives an explicit `snapshotRequired` result for a restart, eviction, or oversized-frame gap instead of silently losing events. The retained tail is bounded to 10,000 events and 8 MiB. |
+| Cursor/ACK/event replay | Restart-safe foundation completed after 0.167.0 | Broadcast events carry a stream UUID and monotonic sequence. A reconnecting client replays an exact bounded tail and ACKs its cursor. The redacted tail is checkpointed in private state and keeps its stream identity across an orderly Serve replacement. For a changed, expired, ahead, or oversized-frame cursor, `events.snapshot` supplies one authoritative fence for task, workforce, external-turn, and approval projections; Desktop applies it before buffered events newer than the fence. The tail remains bounded to 10,000 events and 8 MiB. |
 | Single-writer Agent control | Implemented after 0.166.1 | One Desktop/mobile socket can acquire a session control lease. Takeover rotates an opaque lease ID and monotonic epoch, revokes the old controller, and fails stale delayed writes closed. Observer clients stay read-only; old clients remain compatible only while no lease is active. |
 | Rewind projection repair | Implemented after 0.166.1 | Rewinding history also invalidates future task/todo/reminder/repeat-guard state and tells every client to refresh history. It deliberately does not pretend that transcript rewind reverted files. |
 | Tool approvals and sandbox boundary | Implemented | Engine policy remains authoritative rather than trusting prose in the transcript. |
@@ -35,6 +35,7 @@ providers behind that boundary, not competing user-facing control products.
 | Durable read-only Agent teams | Foundation implemented after 0.166.1 | Persistent Serve sessions now own stable nested Agent IDs/paths, parent/root turn provenance, a redacted durable mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. The original `agent` tool remains the faster one-shot path. |
 | Provider-independent runtime | Stronger Hara requirement | Hara keeps Anthropic/OpenAI-compatible/subscription/enterprise connections behind one engine contract. |
 | External Codex app-server adapter | Implemented | Hara can preserve the provider's native execution path without leaking its native session ID into UI clients. |
+| Hara Mobile companion bridge | Foundation implemented after 0.167.0 | CLI owns account login, Desktop device registration, explicit phone pairing, signed end-to-end encrypted relay envelopes, bounded publication of Personal coding-agent sessions, expiring control leases, idempotent remote commands, and sequenced terminal input. The mobile app and cloud account/relay deployment remain separate delivery work; the phone never receives provider credentials or native session IDs. |
 
 These are not placeholders. They are current runtime contracts documented in
 `conversation-task-execution.md` and covered by engine tests/evals.
@@ -135,26 +136,39 @@ The remaining Codex lesson is to connect that classified health to route selecti
 
 ### 2.6 Durable event replay across Serve replacement
 
-Hara now has cursor/ACK/exact-tail replay, a 10,000-event no-gap/no-duplicate test, bounded socket queues, and a
-single-writer session lease. The replay stream is deliberately process-local. After Serve replacement its stream
-ID changes and clients are told to fetch a fresh authoritative snapshot. The next step is a small durable event
-tail or relay-owned stream cursor so a process upgrade can resume without a full refresh. That work must preserve
-the existing fail-closed gap result and must never turn terminal byte streams into an unbounded database.
+The local replacement path is now implemented. Hara checkpoints a credential-redacted, size/event-bounded tail
+under the same private-state rules as other control data, preserves its stream ID on an orderly Serve restart,
+and rejects a second live writer. ACK traffic coalesces checkpoints; shutdown forces the final checkpoint before
+the old writer acknowledges replacement. Desktop combines replay with `events.snapshot`, buffers frames arriving
+during the snapshot, discards frames covered by its fence, then drains the newer suffix in order.
+
+Remaining work is narrower: an abrupt process/host loss can still lose the small interval after the last
+coalesced checkpoint, so the authoritative snapshot remains mandatory; a future cloud relay needs its own
+bounded delivery/ACK cursor rather than treating a local Serve cursor as globally durable. Raw PTY byte streams
+must continue to use terminal snapshots and must never enter this retained event database.
 
 ### 2.7 Idempotent remote commands
 
-The canonical session mutation methods now support client-generated UUID `commandId` values. Core persists 64
-recent identities, keeps exact results for the newest eight, returns matching durable outcomes across reconnect
-and restart, and rejects payload reuse; if result retention expires, it still refuses to repeat the action and
-directs the client to `session.history`. Raw input on a private terminal stream has a monotonic, payload-bound
-`inputSeq`; a new stream starts a new sequence. Provider-owned Codex/Claude commands use the same payload-bound
-UUID contract across reconnecting sockets, while `expectedTurnId` keeps delayed steer/interrupt requests on the
-intended turn. The cache retains at most 64 command identities and 256 KiB per exact replay result. Their
-receipts are deliberately Serve-lifetime only: after a process restart the provider-native session must be
-resumed and inspected because Hara cannot prove a remote action did not happen. Session writes now also require
-the current lease ID/epoch whenever a controller is active. Remaining: bind approval replies and legacy terminal
-helper methods to command identity, give externally published Codex/Claude sessions a durable publication epoch,
-and reconcile provider-owned receipts after restart before permitting a retry.
+The canonical session mutation methods now support client-generated UUID `commandId` values. Core first
+persists a content-free started receipt, then crosses the model/tool boundary. It retains 64 recent identities,
+keeps exact results for the newest eight, returns matching durable outcomes across reconnect and restart, and
+rejects payload reuse. If Core dies or the terminal save fails, the old UUID and new mutations fail closed until
+an explicit `session.resume` reconciles the authoritative task/history projection; an unknown cold-start result
+stays deduplicated as omitted rather than being guessed or executed twice. Desktop keeps the original UUID on
+an outcome-unknown retry and forces resume before sending it again. Raw input on a private terminal stream has
+a monotonic, payload-bound `inputSeq`; a new stream starts a new sequence.
+
+Provider-owned Codex/Claude commands now use the same durable write-ahead contract. A started receipt crosses the
+private fsync/rename boundary before the provider action; a bounded redacted result/error is committed before RPC
+success/failure and before the corresponding `external.event.command_committed/failed` event. A crash between
+those boundaries blocks the old UUID and all new mutation for that native session until `read`/`resume` observes
+an authoritative non-live state. Desktop persists only the UUID and a salted payload fingerprint so it can retry
+the exact logical action after renderer restart without storing prompt text. `expectedTurnId` keeps delayed
+steer/interrupt input on the intended turn.
+
+Remaining: bind approval replies and legacy terminal helper methods to command identity, persist the mobile
+bridge's publication/receipt projection across bridge restart, and use the same durable receipt contract for
+Agent mailbox/follow-up delivery.
 
 ### 2.8 Typed provider capabilities and circuit health
 
@@ -167,8 +181,10 @@ health/circuit state. Failover selection only considers compatible, user-authori
 Mobile should not have to scrape terminal prose such as “searched files” or infer whether a tool is running.
 Promote model turns, reasoning/progress summaries, tool calls, approvals, diffs, todos, child-Agent activity, and
 terminal outcomes into versioned item lifecycle events. Each item needs stable identity and
-`started/completed/failed/cancelled` transitions. The existing redacted workforce projection and replay stream
-are useful transport foundations, but they do not yet form an authoritative resumable item trace.
+`started/completed/failed/cancelled` transitions. Hara now has an authoritative reconnect snapshot for task,
+workforce, active external turns, and approvals, plus a restart-safe event tail. Tool/diff/message items still do
+not form a complete durable, replay-derived trace, so Mobile must use bounded conversation/terminal snapshot APIs
+for those surfaces instead of inferring lifecycle from partial events.
 
 ### 2.10 Managed workspace isolation for future writing Agents
 
@@ -194,8 +210,9 @@ success.
    save-before-install semantics; process-crash fault injection remains.
 3. **In progress — event journal**: projection commits, torn-tail handling, and gap detection exist; add typed
    task/steering/approval/provider-attempt events and deterministic snapshot rebuild.
-4. **Completed transport foundation — multi-client stream**: socket backpressure, cursor/ACK/exact replay,
-   10,000-event duplicate/gap coverage, and explicit snapshot fallback exist.
+4. **Completed local transport foundation — multi-client stream**: socket backpressure, cursor/ACK/exact replay,
+   restart-safe redacted checkpoints, 10,000-event duplicate/gap coverage, and an authoritative Desktop snapshot
+   fence exist. Cloud relay delivery still needs an independent bounded cursor.
 5. **Completed control foundation — session lease**: one controller, takeover/revocation, epoch fencing, socket
    release, and legacy compatibility when unleased are covered by two-client integration tests.
 6. **Completed Agent foundation — durable tree**: stable child identity/path, mailbox, lifecycle commands,
@@ -203,10 +220,13 @@ success.
    next slice is hard tree-wide execution safety plus provider-native allowance admission, idempotent receipts,
    parent-turn delivery fencing, and direct CLI hosting. Hara must never derive cost or subscription exhaustion
    from transport token counters.
-7. **Next handoff slice — suspend/resume**: flush-before-suspend, pending-input disposition, successor readiness,
+7. **In progress — Mobile companion**: account/device pairing, encrypted relay protocol, explicit publication,
+   leases, command replay, and terminal sequencing exist in CLI. Complete the account/relay deployment and native
+   mobile client against the versioned contract before broadening publication beyond coding-agent sessions.
+8. **Next handoff slice — suspend/resume**: flush-before-suspend, pending-input disposition, successor readiness,
    and Desktop/mobile/terminal contention tests.
-8. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.
-9. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
+9. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.
+10. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
    root-controlled merge/rejection.
 
 No slice is complete until it has unit tests, an interruption/crash test, bounded logs, and a real CLI/Desktop

@@ -34,7 +34,7 @@ import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
 import { sameOpenedFileIdentity } from "../fs-identity.js";
 import { sleepSync } from "../sync-sleep.js";
 
-const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin", "tool-results", "plugin-receipts", "artifacts", "agent-teams"]);
+const PRIVATE_TREES = new Set(["sessions", "checkpoints", "index", "gateway", "cron", "weixin", "tool-results", "plugin-receipts", "artifacts", "agent-teams", "serve"]);
 const tightenedHomes = new Set<string>();
 const DEFAULT_MIGRATION_CAP = 50_000;
 

@@ -115,6 +115,7 @@ function childActivity(state: SubagentLifecycleEvent["state"]): WorkforceActivit
  * text or tool payloads, and rejects late events from a superseded turn. */
 export class WorkforceStateLedger {
   private readonly sessions = new Map<string, SessionWorkforce>();
+  private readonly latest = new Map<string, WorkforceStateEventV1>();
   private sequence = 0;
 
   constructor(private readonly streamId: string) {
@@ -144,7 +145,9 @@ export class WorkforceStateLedger {
       ...(event.state === "completed" || event.state === "blocked" ? { endedAt: event.at } : {}),
     });
     this.sessions.set(event.sessionId, current);
-    return this.snapshot(event.sessionId, current);
+    const snapshot = this.snapshot(event.sessionId, current);
+    this.latest.set(event.sessionId, snapshot);
+    return snapshot;
   }
 
   recordSubagent(
@@ -177,11 +180,19 @@ export class WorkforceStateLedger {
       updatedAt,
       ...(event.endedAt ? { endedAt: event.endedAt } : {}),
     });
-    return this.snapshot(sessionId, current);
+    const snapshot = this.snapshot(sessionId, current);
+    this.latest.set(sessionId, snapshot);
+    return snapshot;
   }
 
   forget(sessionId: string): void {
     this.sessions.delete(sessionId);
+    this.latest.delete(sessionId);
+  }
+
+  /** Current projections for reconnect snapshots. Reading never advances the event sequence. */
+  readAll(): WorkforceStateEventV1[] {
+    return [...this.latest.values()].map((snapshot) => structuredClone(snapshot));
   }
 
   private snapshot(sessionId: string, current: SessionWorkforce): WorkforceStateEventV1 {

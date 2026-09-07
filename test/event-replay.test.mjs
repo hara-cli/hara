@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ServeEventReplayBuffer } from "../dist/serve/event-replay.js";
 
 const notification = (frame) => JSON.parse(frame);
@@ -66,5 +69,56 @@ test("event replay requires a snapshot after a server restart or unretainable fr
   const restarted = replay.replay("old-serve", 1);
   assert.equal(restarted.snapshotRequired, true);
   assert.equal(restarted.resetReason, "stream_changed");
-  assert.throws(() => replay.replay("serve-c", 4), /ahead of the current stream/);
+  const ahead = replay.replay("serve-c", 4);
+  assert.equal(ahead.snapshotRequired, true);
+  assert.equal(ahead.resetReason, "cursor_ahead");
+});
+
+test("event replay restores a private redacted tail across Serve replacement", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-event-replay-"));
+  try {
+    const first = new ServeEventReplayBuffer("serve-first", {
+      maxEvents: 20,
+      maxBytes: 64 * 1024,
+      persistence: { home },
+    });
+    first.publish("event.task_state", { sessionId: "session-a", phase: "working" });
+    first.publish("event.notice", {
+      sessionId: "session-a",
+      text: "credential sk-1234567890abcdef must not survive",
+    });
+    assert.equal(first.checkpoint(true), 2);
+    assert.equal(first.durableSequence, 2);
+
+    const persisted = readFileSync(join(home, ".hara", "serve", "event-replay.json"), "utf8");
+    assert.equal(persisted.includes("sk-1234567890abcdef"), false);
+
+    const restarted = new ServeEventReplayBuffer("serve-second", {
+      maxEvents: 20,
+      maxBytes: 64 * 1024,
+      persistence: { home },
+    });
+    assert.equal(restarted.streamId, "serve-first", "restart adopts the durable stream identity");
+    assert.equal(restarted.currentSequence, 2);
+    assert.equal(restarted.durableSequence, 2);
+    const page = restarted.replay("serve-first", 0);
+    assert.equal(page.snapshotRequired, false);
+    assert.deepEqual(page.frames.map((frame) => notification(frame).params.deliveryCursor.sequence), [1, 2]);
+    assert.equal(page.frames[1].includes("sk-1234567890abcdef"), false);
+
+    restarted.publish("event.turn_end", { sessionId: "session-a", reply: "done" });
+    assert.equal(restarted.checkpoint(true), 3);
+    const third = new ServeEventReplayBuffer("serve-third", {
+      maxEvents: 20,
+      maxBytes: 64 * 1024,
+      persistence: { home },
+    });
+    assert.equal(third.streamId, "serve-first");
+    assert.deepEqual(
+      third.replay("serve-first", 2).frames.map((frame) => notification(frame).method),
+      ["event.turn_end"],
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

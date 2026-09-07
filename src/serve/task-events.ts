@@ -23,6 +23,7 @@ export interface TaskLifecycleActivity {
   approval?: {
     id: string;
     question: string;
+    allowAlways?: boolean;
   };
 }
 
@@ -85,6 +86,7 @@ export interface TaskLifecycleEvent {
   approval?: {
     id: string;
     question: string;
+    allowAlways?: boolean;
   };
 }
 
@@ -118,6 +120,7 @@ export function taskLifecycleEvent(
     ? {
         id: activity.approval.id,
         question: bounded(activity.approval.question, 4_000) ?? "Approval required",
+        ...(activity.approval.allowAlways === true ? { allowAlways: true } : {}),
       }
     : undefined;
   // Runtime phases may only refine an actively running task. Once durable state reaches a terminal or

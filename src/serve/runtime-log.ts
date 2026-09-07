@@ -22,6 +22,7 @@ export type ServeRuntimeEvent =
   | "provider.failed"
   | "provider.retry_scheduled"
   | "external.turn.failed"
+  | "event_replay.checkpoint_failed"
   | "serve.stopping"
   | "log.limit";
 

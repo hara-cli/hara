@@ -89,16 +89,20 @@ export type SessionCommandOutcome =
   | { kind: "error"; code: number; message: string }
   | { kind: "result_omitted"; message: string };
 
-/** A client-generated UUID binds one remote mutation to its first terminal outcome. Request bodies stay
- * out of this record; only their canonical SHA-256 is retained. Bounded receipts let Desktop/mobile retry
- * after a socket loss or Serve restart without starting the same model/tool work again. */
+/** A client-generated UUID binds one remote mutation to its started/terminal durability boundary. Request
+ * bodies stay out of this record; only their canonical SHA-256 is retained. A v2-capable Serve persists the
+ * started form before model/tool execution, then fills the terminal fields; old terminal-only records remain
+ * readable. Bounded receipts let Desktop/mobile fail closed across socket loss or Serve restart. */
 export interface SessionCommandReceipt {
   v: 1;
   commandId: string;
   method: SessionCommandMethod;
   requestHash: string;
-  completedAt: string;
-  outcome: SessionCommandOutcome;
+  /** Present on v2-capable writers before the command is admitted to any model/tool side effect. */
+  startedAt?: string;
+  /** Absent only for a write-ahead receipt whose terminal outcome still requires reconciliation. */
+  completedAt?: string;
+  outcome?: SessionCommandOutcome;
 }
 
 export const MAX_SESSION_COMMAND_RECEIPTS = 64;
@@ -1247,9 +1251,10 @@ function redactedSessionCopy(data: SessionData): SessionData {
       target.commandId = source.commandId;
       target.method = source.method;
       target.requestHash = source.requestHash;
-      target.completedAt = source.completedAt;
-      target.outcome.kind = source.outcome.kind;
-      if (source.outcome.kind === "error" && target.outcome.kind === "error") {
+      if (source.startedAt !== undefined) target.startedAt = source.startedAt;
+      if (source.completedAt !== undefined) target.completedAt = source.completedAt;
+      if (source.outcome && target.outcome) target.outcome.kind = source.outcome.kind;
+      if (source.outcome?.kind === "error" && target.outcome?.kind === "error") {
         target.outcome.code = source.outcome.code;
       }
     }
@@ -1689,7 +1694,14 @@ function isSessionCommandReceipt(value: unknown): value is SessionCommandReceipt
     )
     || typeof receipt.requestHash !== "string"
     || !/^[0-9a-f]{64}$/u.test(receipt.requestHash)
-    || !isTimestamp(receipt.completedAt)
+  ) return false;
+  const startedAtValid = receipt.startedAt === undefined || isTimestamp(receipt.startedAt);
+  if (!startedAtValid) return false;
+  if (receipt.completedAt === undefined && receipt.outcome === undefined) {
+    return isTimestamp(receipt.startedAt);
+  }
+  if (
+    !isTimestamp(receipt.completedAt)
     || !receipt.outcome
     || typeof receipt.outcome !== "object"
     || Array.isArray(receipt.outcome)

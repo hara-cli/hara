@@ -309,7 +309,9 @@ test("serve e2e: a reconnect replays and acknowledges one exact broadcast-event 
     const initialized = await first.call("initialize", { token: "tok" });
     assert.ok(initialized.result.capabilities.methods.includes("events.replay"));
     assert.ok(initialized.result.capabilities.methods.includes("events.ack"));
+    assert.ok(initialized.result.capabilities.methods.includes("events.snapshot"));
     assert.ok(initialized.result.capabilities.features.includes("events.cursor-replay.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("events.authoritative-snapshot.v1"));
     assert.equal(typeof initialized.result.eventStream.streamId, "string");
     assert.ok(initialized.result.eventStream.streamId.length > 0);
     assert.equal(initialized.result.eventStream.currentSequence, 0);
@@ -317,6 +319,15 @@ test("serve e2e: a reconnect replays and acknowledges one exact broadcast-event 
     const created = await first.call("session.create", {});
     await first.call("session.send", { sessionId: created.result.sessionId, text: "replay me" });
     await first.waitEvent("event.turn_end");
+    const snapshot = await first.call("events.snapshot", { sessionIds: [created.result.sessionId] });
+    assert.equal(snapshot.result.streamId, initialized.result.eventStream.streamId);
+    assert.ok(Number.isSafeInteger(snapshot.result.throughSequence));
+    assert.equal(snapshot.result.taskStates[0].sessionId, created.result.sessionId);
+    assert.equal(snapshot.result.taskStates[0].state, "completed");
+    assert.equal(snapshot.result.taskStates[0].phase, "restored");
+    assert.equal(snapshot.result.workforceStates[0].sessionId, created.result.sessionId);
+    assert.deepEqual(snapshot.result.externalTurns, []);
+    assert.deepEqual(snapshot.result.approvals, []);
     const live = first.events.filter((event) => event.params?.deliveryCursor);
     assert.ok(live.length > 4, "the turn publishes a useful control/status tail");
     assert.ok(live.every((event) => event.params.deliveryCursor.streamId === initialized.result.eventStream.streamId));
@@ -365,6 +376,64 @@ test("serve e2e: a reconnect replays and acknowledges one exact broadcast-event 
     first.close();
     second?.close();
     await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: an orderly Serve replacement replays the durable redacted event tail", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-event-restart-"));
+  const store = memStore();
+  const deps = { ...baseDeps(textProvider, store), serveStateHome: dir };
+  let firstServer = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    deps,
+  );
+  let first = await connect(firstServer.port);
+  let streamId;
+  let after;
+  let expected;
+  try {
+    const initialized = await first.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.features.includes("events.restart-replay.v1"));
+    streamId = initialized.result.eventStream.streamId;
+    const created = await first.call("session.create", {});
+    await first.call("session.send", { sessionId: created.result.sessionId, text: "persist replay" });
+    await first.waitEvent("event.turn_end");
+    const delivered = first.events.filter((event) => event.params?.deliveryCursor);
+    after = delivered[1].params.deliveryCursor.sequence;
+    expected = delivered.slice(2).map((event) => ({
+      method: event.method,
+      sequence: event.params.deliveryCursor.sequence,
+    }));
+    const acked = await first.call("events.ack", {
+      streamId,
+      sequence: delivered.at(-1).params.deliveryCursor.sequence,
+    });
+    assert.equal(acked.result.durableThrough, delivered.at(-1).params.deliveryCursor.sequence);
+  } finally {
+    first.close();
+    await firstServer.close();
+  }
+
+  firstServer = null;
+  first = null;
+  const restarted = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    deps,
+  );
+  const second = await connect(restarted.port);
+  try {
+    const initialized = await second.call("initialize", { token: "tok" });
+    assert.equal(initialized.result.eventStream.streamId, streamId);
+    const replayed = await second.call("events.replay", { streamId, after, limit: 1_000 });
+    assert.equal(replayed.result.snapshotRequired, false);
+    assert.deepEqual(
+      second.events.map((event) => ({ method: event.method, sequence: event.params.deliveryCursor.sequence })),
+      expected,
+    );
+  } finally {
+    second.close();
+    await restarted.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -640,7 +709,7 @@ const hangingCompactProvider = () => {
   };
 };
 
-test("serve discovery: private atomic replacement, symlink safety, and instance-owned cleanup", { timeout: 10000 }, async () => {
+test("serve discovery: private atomic replacement, symlink safety, and one live writer", { timeout: 10000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "hara-serve-home-"));
   const haraDir = join(home, ".hara");
   const discoveryPath = join(haraDir, "serve.json");
@@ -669,12 +738,22 @@ test("serve discovery: private atomic replacement, symlink safety, and instance-
     assert.equal(readFileSync(victimPath, "utf8"), "do not follow me", "symlink target was untouched");
     assert.ok(olderRecord.instanceId, "discovery is stamped with an instance nonce");
 
-    newer = await startServe({ host: "127.0.0.1", port: 0, token: "newer-token", cwd: home }, deps);
+    await assert.rejects(
+      startServe({ host: "127.0.0.1", port: 0, token: "newer-token", cwd: home }, deps),
+      /another Hara Serve instance is already running/,
+    );
+    assert.equal(
+      JSON.parse(readFileSync(discoveryPath, "utf8")).instanceId,
+      olderRecord.instanceId,
+      "a second live writer cannot replace discovery or share the restart journal",
+    );
     const newerRecord = JSON.parse(readFileSync(discoveryPath, "utf8"));
-    assert.notEqual(newerRecord.instanceId, olderRecord.instanceId);
+    assert.equal(newerRecord.instanceId, olderRecord.instanceId);
     await older.close();
     older = undefined;
-    assert.equal(JSON.parse(readFileSync(discoveryPath, "utf8")).instanceId, newerRecord.instanceId, "old close preserved newer discovery");
+    newer = await startServe({ host: "127.0.0.1", port: 0, token: "newer-token", cwd: home }, deps);
+    const replacementRecord = JSON.parse(readFileSync(discoveryPath, "utf8"));
+    assert.notEqual(replacementRecord.instanceId, olderRecord.instanceId);
     await newer.close();
     newer = undefined;
     assert.equal(existsSync(discoveryPath), false, "owning instance removes its discovery on close");
@@ -838,8 +917,11 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "composer.attachments.v1",
         "events.bounded-delivery.v1",
         "events.cursor-replay.v1",
+        "events.restart-replay.v1",
+        "events.authoritative-snapshot.v1",
         "models.capabilities.v1",
         "sessions.command-idempotency.v1",
+        "sessions.command-idempotency.durable.v2",
         "sessions.control-lease.v1",
         "sessions.readonly-history.v1",
         "sessions.cross-profile-fork.v1",
@@ -856,6 +938,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "external.sessions.native-resume.v1",
         "external.sessions.launch-options.v1",
         "external.sessions.command-idempotency.serve-lifetime.v1",
+        "external.sessions.command-idempotency.durable.v2",
         "external.sessions.terminal-mirror.v1",
         "external.sessions.terminal-stream.v2",
         "external.sessions.terminal-input-sequence.v1",
@@ -3066,6 +3149,7 @@ test("serve e2e: commandId replays one durable session result across reconnect a
   try {
     const initialized = await client.call("initialize", { token: "tok" });
     assert.ok(initialized.result.capabilities.features.includes("sessions.command-idempotency.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("sessions.command-idempotency.durable.v2"));
     assert.deepEqual(initialized.result.capabilities.limits, {
       sessionCommandReceipts: 64,
       sessionCommandReplayResults: 8,
@@ -3175,7 +3259,7 @@ test("serve e2e: commandId also persists a terminal provider error across restar
   }
 });
 
-test("serve e2e: an unsaved command receipt fails closed and blocks an immediate duplicate", { timeout: 20000 }, async () => {
+test("serve e2e: an unsaved write-ahead receipt starts no provider action", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-command-receipt-failure-"));
   const stored = memStore();
   const store = {
@@ -3203,14 +3287,133 @@ test("serve e2e: an unsaved command receipt fails closed and blocks an immediate
     const request = { sessionId, text: "run once", commandId: randomUUID() };
     const first = await client.call("session.submit", request);
     assert.equal(first.error.code, -32603);
-    assert.match(first.error.message, /receipt could not be saved/i);
+    assert.match(first.error.message, /receipt could not be saved.*no model or tool action was started/i);
     const duplicate = await client.call("session.submit", request);
     assert.equal(duplicate.error.code, -32603);
-    assert.match(duplicate.error.message, /receipt could not be saved/i);
-    assert.equal(providerCalls, 1, "uncertain persistence never permits an immediate duplicate action");
+    assert.match(duplicate.error.message, /receipt could not be saved.*no model or tool action was started/i);
+    assert.equal(providerCalls, 0, "the provider boundary stays behind the durable started receipt");
   } finally {
     client.close();
     await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: a failed terminal receipt is recovered by authoritative resume without replay", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-command-terminal-recovery-"));
+  const stored = memStore();
+  let rejectOneTerminalReceipt = true;
+  const store = {
+    ...stored,
+    save(meta, history, task) {
+      const latest = meta.commandReceipts?.at(-1);
+      if (rejectOneTerminalReceipt && latest?.outcome) {
+        rejectOneTerminalReceipt = false;
+        throw new Error("simulated terminal receipt storage failure");
+      }
+      stored.save(meta, history, task);
+    },
+  };
+  let providerCalls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      providerCalls += 1;
+      onText("completed exactly once");
+      return { text: "completed exactly once", toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const client = await connect(srv.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const sessionId = (await client.call("session.create", {})).result.sessionId;
+    const request = { sessionId, text: "run once", commandId: randomUUID() };
+    const first = await client.call("session.submit", request);
+    assert.equal(first.error.code, -32603);
+    assert.match(first.error.message, /idempotency receipt could not be saved/i);
+    const duplicate = await client.call("session.submit", request);
+    assert.deepEqual(duplicate.error, first.error);
+    assert.equal(providerCalls, 1);
+
+    const resumed = await client.call("session.resume", { sessionId });
+    assert.equal(resumed.error, undefined);
+    const recovered = await client.call("session.submit", request);
+    assert.equal(recovered.result.reply, "completed exactly once");
+    assert.equal(providerCalls, 1, "resume persists the known outcome and exact retry only replays it");
+  } finally {
+    client.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: a cold-started command blocks mutation until resume reconciles history", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-command-cold-window-"));
+  const store = memStore();
+  let providerCalls = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn({ onText }) {
+      providerCalls += 1;
+      onText(`provider-call-${providerCalls}`);
+      return { text: `provider-call-${providerCalls}`, toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  let firstServer = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  let firstClient = await connect(firstServer.port);
+  let sessionId;
+  try {
+    await firstClient.call("initialize", { token: "tok" });
+    sessionId = (await firstClient.call("session.create", {})).result.sessionId;
+    await firstClient.call("session.submit", { sessionId, text: "seed durable history" });
+  } finally {
+    firstClient.close();
+    await firstServer.close();
+  }
+
+  const uncertainCommandId = randomUUID();
+  const uncertainRequest = { sessionId, text: "possibly executed before crash", commandId: uncertainCommandId };
+  const saved = store.saved.get(sessionId);
+  store.saved.set(sessionId, {
+    ...saved,
+    meta: {
+      ...saved.meta,
+      commandReceipts: [{
+        v: 1,
+        commandId: uncertainCommandId,
+        method: "session.submit",
+        requestHash: sessionCommandRequestHash("session.submit", uncertainRequest),
+        startedAt: "2026-09-07T00:00:00.000Z",
+      }],
+    },
+  });
+
+  firstServer = null;
+  firstClient = null;
+  const restarted = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(provider, store));
+  const reconnected = await connect(restarted.port);
+  try {
+    await reconnected.call("initialize", { token: "tok" });
+    const resumed = await reconnected.call("session.resume", { sessionId });
+    assert.equal(resumed.error, undefined);
+    const oldRetry = await reconnected.call("session.submit", uncertainRequest);
+    assert.equal(oldRetry.error.code, -32005);
+    assert.match(oldRetry.error.message, /exact result is unavailable|authoritatively resumed/i);
+    assert.equal(providerCalls, 1, "a crash-window UUID never reruns from guesswork");
+
+    const next = await reconnected.call("session.submit", {
+      sessionId,
+      text: "new action after explicit inspection",
+      commandId: randomUUID(),
+    });
+    assert.equal(next.result.reply, "provider-call-2");
+    assert.equal(providerCalls, 2);
+  } finally {
+    reconnected.close();
+    await restarted.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -4302,9 +4505,22 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
     await c.call("initialize", { token: "tok" });
     const { result } = await c.call("session.create", {});
     // answer the approval as soon as it arrives (concurrently with the running send)
-    const approver = c.waitEvent("approval.request").then((ev) => {
-      assert.equal(ev.params.allowAlways, true, "ordinary project edits advertise the narrow remembered scope");
-      return c.call("approval.reply", { approvalId: ev.params.approvalId, allow: true });
+    const approver = c.waitEvent("approval.request").then(async (ev) => {
+      try {
+        assert.equal(ev.params.allowAlways, true, "ordinary project edits advertise the narrow remembered scope");
+        const snapshot = await c.call("events.snapshot", { sessionIds: [result.sessionId] });
+        assert.equal(snapshot.result.taskStates[0].state, "waiting");
+        assert.equal(snapshot.result.taskStates[0].phase, "approval");
+        assert.deepEqual(snapshot.result.taskStates[0].approval, {
+          id: ev.params.approvalId,
+          question: ev.params.question.replace(/\s+/g, " ").trim(),
+          allowAlways: true,
+        });
+      } finally {
+        // A failed assertion must not strand the provider on an unanswered approval and turn one
+        // useful failure into a misleading file-level timeout.
+        await c.call("approval.reply", { approvalId: ev.params.approvalId, allow: true });
+      }
     });
     const sent = await c.call("session.send", { sessionId: result.sessionId, text: "write it" });
     await approver;
