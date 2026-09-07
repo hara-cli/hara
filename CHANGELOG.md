@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.168.0 — 2026-09-07 — restart-safe execution across Desktop and Mobile
+
+- Persist a private write-ahead command receipt before every remote Hara, Codex, or Claude Code mutation.
+  If the process or connection disappears after execution but before its result is visible, Hara now blocks
+  blind replay, reconciles through the authoritative session, and reuses the same command ID without running
+  the model or tool action twice.
+- Carry a bounded, credential-redacted event tail across an orderly Serve replacement and add one authoritative
+  task, workforce, approval, and external-turn snapshot fence. Desktop applies the snapshot before newer events,
+  preserves queued input through reconnect, and enables automatic retry only when the Engine advertises the
+  durable v2 contract.
+- Add the opt-in Hara Mobile bridge foundation for explicitly published Personal coding sessions: device pairing,
+  signed and encrypted relay envelopes, expiring capabilities, control leases, turn fencing, and monotonic terminal
+  input. The native Mobile UI and production relay rollout remain separate delivery gates; provider keys, native
+  session IDs, private reasoning, and local paths stay on the user's computer.
+- Initialize every private Serve recovery store before binding its WebSocket listener. A malformed or unavailable
+  state path now fails without leaving an unadvertised local port behind.
+
 ## 0.167.0 — 2026-09-06 — resumable remote control and durable agent teams
 
 - Keep long-running work advancing through bounded provider retries, retry hints, task checkpoints and durable
