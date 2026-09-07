@@ -56,12 +56,17 @@
 //   external.sessions.remove {sessionId}            → {} (Hara Live only; closes the original terminal)
 //   external.sessions.terminal.attach {sessionId,mode,cols,rows,takeover?}
 //                                                   → {streamId,mode,cols,rows,nextInputSeq?}
+//   external.sessions.terminal.handoff-ready {streamId,handoffId,throughInputSeq}
+//                                                   → {accepted,handoffId,throughInputSeq}
 //   external.sessions.terminal.raw-input {streamId,text,inputSeq?}
 //                                                   → {} for legacy input, or
 //                                                     {accepted,duplicate,inputSeq,nextInputSeq}
 //                      inputSeq is monotonic within one private control stream. Matching retries are
 //                      acknowledged without another PTY write; gaps and same-sequence/different-text reuse
 //                      are rejected. Reattach creates a new stream and restarts the sequence at 1.
+//                      Feature-negotiated control takeover first asks the old controller to drain its input.
+//                      The old stream freezes only after it ACKs the exact throughInputSeq fence. A successor
+//                      launch failure cancels the handoff and restores input on the existing controller.
 //                                                        Personal Space only. Provider-native IDs, full paths,
 //                                                        provider cursors and credentials never cross Serve. A
 //                                                        source history is read-only until explicitly resumed in

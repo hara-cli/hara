@@ -386,7 +386,9 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-mirror.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-stream.v2"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-input-sequence.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-handoff.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime-remove.v1"));
+    assert.ok(initialized.result.capabilities.methods.includes("external.sessions.terminal.handoff-ready"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.create"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.resume"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.remove"));
@@ -631,6 +633,219 @@ test("Serve advertises a Personal-only external session interaction surface", as
   } finally {
     await personal?.close();
     await company?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("feature-aware terminal takeover drains input and restores the old controller when successor launch fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-serve-terminal-handoff-"));
+  const sessionId = "ext_runtime_0123456789abcdef01234567";
+  let streamStarts = 0;
+  let released = 0;
+  let received = "";
+  let failNextTakeover = true;
+  const externalSessions = {
+    async openTerminalStream(requestedSessionId, input) {
+      assert.equal(requestedSessionId, sessionId);
+      streamStarts += 1;
+      if (input.takeover && failNextTakeover) {
+        failNextTakeover = false;
+        throw new Error("injected successor launch failure");
+      }
+      return {
+        mode: input.mode,
+        input(text) { received += text; },
+        resize() {},
+        scroll() {},
+        async release() { released += 1; },
+      };
+    },
+    async close() {},
+  };
+  const server = await startServe(
+    { host: "127.0.0.1", port: 0, token: "personal-token", cwd: root },
+    deps("personal", externalSessions),
+  );
+  const owner = await connect(server.port);
+  const successor = await connect(server.port);
+  try {
+    await owner.call("initialize", {
+      token: "personal-token",
+      capabilities: { features: ["external.sessions.terminal-handoff.v1"] },
+    });
+    await successor.call("initialize", { token: "personal-token" });
+    const attached = await owner.call("external.sessions.terminal.attach", {
+      sessionId,
+      mode: "control",
+      cols: 80,
+      rows: 24,
+    });
+    await owner.call("external.sessions.terminal.raw-input", {
+      streamId: attached.result.streamId,
+      text: "a",
+      inputSeq: 1,
+    });
+
+    const failedTakeover = successor.call("external.sessions.terminal.attach", {
+      sessionId,
+      mode: "control",
+      cols: 90,
+      rows: 30,
+      takeover: true,
+    });
+    const firstRequest = await owner.waitFor("external.event.terminal.handoff_requested");
+    const wrongFence = await owner.call("external.sessions.terminal.handoff-ready", {
+      streamId: attached.result.streamId,
+      handoffId: firstRequest.params.handoffId,
+      throughInputSeq: 0,
+    });
+    assert.equal(wrongFence.error.code, -32005);
+    await owner.call("external.sessions.terminal.handoff-ready", {
+      streamId: attached.result.streamId,
+      handoffId: firstRequest.params.handoffId,
+      throughInputSeq: 1,
+    });
+    assert.ok((await failedTakeover).error);
+    await owner.waitFor("external.event.terminal.handoff_cancelled");
+    const resumedInput = await owner.call("external.sessions.terminal.raw-input", {
+      streamId: attached.result.streamId,
+      text: "b",
+      inputSeq: 2,
+    });
+    assert.equal(resumedInput.result.accepted, true, "failed successor launch unfreezes the original controller");
+    assert.equal(released, 0, "failed takeover never releases the working controller");
+
+    owner.events.length = 0;
+    const successfulTakeover = successor.call("external.sessions.terminal.attach", {
+      sessionId,
+      mode: "control",
+      cols: 90,
+      rows: 30,
+      takeover: true,
+    });
+    const secondRequest = await owner.waitFor("external.event.terminal.handoff_requested");
+    await owner.call("external.sessions.terminal.handoff-ready", {
+      streamId: attached.result.streamId,
+      handoffId: secondRequest.params.handoffId,
+      throughInputSeq: 2,
+    });
+    const transferred = await successfulTakeover;
+    assert.equal(transferred.result.mode, "control");
+    assert.equal(transferred.result.nextInputSeq, 1);
+    const closed = await owner.waitFor("external.event.terminal.closed");
+    assert.equal(closed.params.reason, "control_transferred");
+    assert.equal(received, "ab");
+    assert.equal(streamStarts, 3);
+    assert.equal(released, 1);
+  } finally {
+    owner.ws.close();
+    successor.ws.close();
+    await server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a terminal takeover cannot overwrite a controller that reattaches while the successor is launching", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-serve-terminal-handoff-race-"));
+  const sessionId = "ext_runtime_89abcdef0123456789abcdef";
+  let streamStarts = 0;
+  let signalTakeoverStarted;
+  let finishTakeoverLaunch;
+  const takeoverStarted = new Promise((resolve) => { signalTakeoverStarted = resolve; });
+  const takeoverLaunch = new Promise((resolve) => { finishTakeoverLaunch = resolve; });
+  const released = [];
+  const received = new Map();
+  const externalSessions = {
+    async openTerminalStream(requestedSessionId, input) {
+      assert.equal(requestedSessionId, sessionId);
+      streamStarts += 1;
+      const label = streamStarts === 1
+        ? "original"
+        : streamStarts === 2
+          ? "stale-successor"
+          : "replacement";
+      if (label === "stale-successor") {
+        signalTakeoverStarted();
+        await takeoverLaunch;
+      }
+      return {
+        mode: input.mode,
+        input(text) { received.set(label, `${received.get(label) ?? ""}${text}`); },
+        resize() {},
+        scroll() {},
+        async release() { released.push(label); },
+      };
+    },
+    async close() {},
+  };
+  const server = await startServe(
+    { host: "127.0.0.1", port: 0, token: "personal-token", cwd: root },
+    deps("personal", externalSessions),
+  );
+  const owner = await connect(server.port);
+  const successor = await connect(server.port);
+  try {
+    await owner.call("initialize", {
+      token: "personal-token",
+      capabilities: { features: ["external.sessions.terminal-handoff.v1"] },
+    });
+    await successor.call("initialize", { token: "personal-token" });
+    const original = await owner.call("external.sessions.terminal.attach", {
+      sessionId,
+      mode: "control",
+      cols: 80,
+      rows: 24,
+    });
+
+    const staleTakeover = successor.call("external.sessions.terminal.attach", {
+      sessionId,
+      mode: "control",
+      cols: 90,
+      rows: 30,
+      takeover: true,
+    });
+    const request = await owner.waitFor("external.event.terminal.handoff_requested");
+    const ready = await owner.call("external.sessions.terminal.handoff-ready", {
+      streamId: original.result.streamId,
+      handoffId: request.params.handoffId,
+      throughInputSeq: 0,
+    });
+    assert.equal(ready.result.accepted, true);
+    await takeoverStarted;
+
+    const replacement = await owner.call("external.sessions.terminal.attach", {
+      sessionId,
+      mode: "control",
+      cols: 100,
+      rows: 36,
+    });
+    assert.equal(replacement.result.mode, "control");
+    finishTakeoverLaunch();
+    const rejected = await staleTakeover;
+    assert.equal(rejected.error.code, -32002);
+    assert.match(rejected.error.message, /controller changed/);
+
+    const accepted = await owner.call("external.sessions.terminal.raw-input", {
+      streamId: replacement.result.streamId,
+      text: "kept",
+      inputSeq: 1,
+    });
+    assert.equal(accepted.result.accepted, true);
+    const obsolete = await owner.call("external.sessions.terminal.raw-input", {
+      streamId: original.result.streamId,
+      text: "lost",
+      inputSeq: 1,
+    });
+    assert.equal(obsolete.error.code, -32001);
+    assert.equal(received.get("replacement"), "kept");
+    assert.equal(received.has("stale-successor"), false);
+    assert.deepEqual(released.sort(), ["original", "stale-successor"]);
+    assert.equal(streamStarts, 3);
+  } finally {
+    finishTakeoverLaunch?.();
+    owner.ws.close();
+    successor.ws.close();
+    await server.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

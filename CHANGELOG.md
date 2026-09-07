@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.168.2 — 2026-09-07 — lossless terminal control handoff
+
+- Transfer one live Codex or Claude Code terminal between Desktop and Mobile without discarding accepted keyboard
+  input. A feature-aware controller stops new input, drains its serialized queue, and acknowledges the exact
+  monotonic input fence before Hara starts a successor stream.
+- Commit the new controller only after rechecking the original owner and successor socket atomically. Timeout,
+  launch failure, disconnect, or a racing reattach releases the uncommitted stream and restores the existing
+  controller instead of leaving a false waiting state or two writers.
+- Make the Mobile bridge request terminal takeover explicitly and participate in the same negotiated handoff.
+  Older clients retain their compatible takeover path, with a final ownership recheck before it can commit.
+
 ## 0.168.1 — 2026-09-07 — resumable automation questions and honest completion
 
 - Turn `ask_user` calls from persisted headless/gateway/cron sessions into durable paused questions instead of

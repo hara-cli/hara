@@ -18,6 +18,7 @@ type Publication = {
 
 type TerminalLease = {
   expiresAt: number;
+  handoffFrozen: boolean;
   inputSequence: number;
   leaseId: string;
   publicationId: string;
@@ -119,6 +120,7 @@ export class MobileCompanionRouter {
   private readonly leases = new Map<string, TerminalLease>();
   private readonly grants = new Map<string, unknown>();
   private readonly receipts = new Map<string, { fingerprint: string; receipt: unknown }>();
+  private readonly terminalInputTails = new Map<string, Promise<void>>();
   private readonly activeTurns = new Map<string, string>();
   private readonly runningSubmits = new Set<string>();
   private readonly approvals = new Map<string, { publicationId: string; question: string }>();
@@ -141,6 +143,32 @@ export class MobileCompanionRouter {
   private readonly clock: () => number;
 
   private notification(method: string, params: Record<string, unknown>): void {
+    if (
+      method === "external.event.terminal.handoff_requested"
+      && identifier(params.streamId)
+      && identifier(params.handoffId)
+    ) {
+      const lease = [...this.leases.values()].find((candidate) => candidate.streamId === params.streamId);
+      if (!lease) return;
+      lease.handoffFrozen = true;
+      const tail = this.terminalInputTails.get(lease.streamId) ?? Promise.resolve();
+      void tail.then(() => this.local.call("external.sessions.terminal.handoff-ready", {
+        handoffId: params.handoffId,
+        streamId: lease.streamId,
+        throughInputSeq: lease.inputSequence - 1,
+      })).catch(() => {
+        lease.handoffFrozen = false;
+      });
+      return;
+    }
+    if (
+      method === "external.event.terminal.handoff_cancelled"
+      && identifier(params.streamId)
+    ) {
+      const lease = [...this.leases.values()].find((candidate) => candidate.streamId === params.streamId);
+      if (lease) lease.handoffFrozen = false;
+      return;
+    }
     if (method === "external.event.turn_start" && identifier(params.sessionId) && identifier(params.turnId)) {
       this.activeTurns.set(params.sessionId, params.turnId);
       return;
@@ -308,6 +336,30 @@ export class MobileCompanionRouter {
     return lease;
   }
 
+  private async writeTerminalInput(lease: TerminalLease, text: string): Promise<void> {
+    const previous = this.terminalInputTails.get(lease.streamId) ?? Promise.resolve();
+    const operation = previous.then(async () => {
+      const response = record(await this.local.call("external.sessions.terminal.raw-input", {
+        inputSeq: lease.inputSequence,
+        streamId: lease.streamId,
+        text,
+      }));
+      if (!response || response.accepted !== true || !Number.isSafeInteger(response.nextInputSeq)) {
+        throw new Error("terminal input failed");
+      }
+      lease.inputSequence = Number(response.nextInputSeq);
+    });
+    const tail = operation.then(() => undefined, () => undefined);
+    this.terminalInputTails.set(lease.streamId, tail);
+    try {
+      await operation;
+    } finally {
+      if (this.terminalInputTails.get(lease.streamId) === tail) {
+        this.terminalInputTails.delete(lease.streamId);
+      }
+    }
+  }
+
   private async terminalControl(raw: unknown): Promise<unknown> {
     const body = record(raw);
     const publication = body ? await this.publication(body.publicationId) : null;
@@ -324,17 +376,21 @@ export class MobileCompanionRouter {
     if (existing) return existing;
     const previous = this.leases.get(publication.id);
     if (previous) {
+      await (this.terminalInputTails.get(previous.streamId) ?? Promise.resolve());
       await this.local.call("external.sessions.terminal.release", { streamId: previous.streamId }).catch(() => undefined);
+      this.terminalInputTails.delete(previous.streamId);
     }
     const attached = record(await this.local.call("external.sessions.terminal.attach", {
       cols: 88,
       mode: "control",
       rows: 28,
       sessionId: publication.sessionId,
+      takeover: true,
     }));
     if (!attached || !identifier(attached.streamId) || attached.mode !== "control") throw new Error("terminal control failed");
     const lease: TerminalLease = {
       expiresAt: Math.min(this.clock() + Number(body.requestedDurationMs), publication.expiresAt),
+      handoffFrozen: false,
       inputSequence: Number.isInteger(attached.nextInputSeq) ? Number(attached.nextInputSeq) : 1,
       leaseId: `lease_${randomUUID()}`,
       publicationId: publication.id,
@@ -432,18 +488,14 @@ export class MobileCompanionRouter {
       const bytes = payload ? canonicalBase64(payload.dataBase64) : null;
       if (!publication.capabilities.terminalControl || !lease || !bytes) {
         result = this.receipt(commandId, "failed", "CONTROL_LEASE_INVALID");
+      } else if (lease.handoffFrozen) {
+        result = this.receipt(commandId, "failed", "CONTROL_HANDOFF_PENDING");
       } else {
         const text = bytes.toString("utf8");
         if (!Buffer.from(text, "utf8").equals(bytes)) {
           result = this.receipt(commandId, "failed", "INPUT_INVALID");
         } else {
-          const response = record(await this.local.call("external.sessions.terminal.raw-input", {
-            inputSeq: lease.inputSequence,
-            streamId: lease.streamId,
-            text,
-          }));
-          if (!response || response.accepted !== true) throw new Error("terminal input failed");
-          lease.inputSequence = Number(response.nextInputSeq);
+          await this.writeTerminalInput(lease, text);
           result = this.receipt(commandId, "succeeded");
         }
       }
@@ -474,7 +526,9 @@ export class MobileCompanionRouter {
       if (!lease) {
         result = this.receipt(commandId, "failed", "CONTROL_LEASE_INVALID");
       } else {
+        await (this.terminalInputTails.get(lease.streamId) ?? Promise.resolve());
         await this.local.call("external.sessions.terminal.release", { streamId: lease.streamId });
+        this.terminalInputTails.delete(lease.streamId);
         this.leases.delete(publication.id);
         result = this.receipt(commandId, "succeeded");
       }
@@ -517,9 +571,12 @@ export class MobileCompanionRouter {
 
   async close(): Promise<void> {
     this.removeNotificationListener();
-    const releases = [...this.leases.values()].map((lease) =>
-      this.local.call("external.sessions.terminal.release", { streamId: lease.streamId }).catch(() => undefined));
+    const releases = [...this.leases.values()].map(async (lease) => {
+      await (this.terminalInputTails.get(lease.streamId) ?? Promise.resolve());
+      await this.local.call("external.sessions.terminal.release", { streamId: lease.streamId }).catch(() => undefined);
+    });
     this.leases.clear();
+    this.terminalInputTails.clear();
     await Promise.all(releases);
   }
 }

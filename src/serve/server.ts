@@ -1225,6 +1225,8 @@ export function sessionCommandRequestHash(
 }
 
 export const MAX_SERVE_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
+const EXTERNAL_TERMINAL_HANDOFF_FEATURE = "external.sessions.terminal-handoff.v1";
+const EXTERNAL_TERMINAL_HANDOFF_TIMEOUT_MS = 3_000;
 
 interface BoundedSocketWriter {
   readyState: number;
@@ -1719,6 +1721,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const port = (wss.address() as { port: number }).port;
 
   const authed = new Set<WebSocket>();
+  const clientFeatures = new Map<WebSocket, Set<string>>();
   const eventAcks = new Map<WebSocket, number>();
   interface OwnedExternalTerminalStream {
     streamId: string;
@@ -1728,9 +1731,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     /** Monotonic only within this private stream lease. A reconnect receives a new streamId and starts at 1. */
     lastInputSeq: number;
     inputDigests: Map<number, string>;
+    /** Set only after a feature-negotiated controller drains every accepted input and ACKs its fence. */
+    inputFrozen: boolean;
   }
   const externalTerminalStreams = new Map<WebSocket, Map<string, OwnedExternalTerminalStream>>();
   const externalTerminalControllers = new Map<string, { ws: WebSocket; streamId: string }>();
+  interface PendingExternalTerminalHandoff {
+    acknowledged: boolean;
+    handoffId: string;
+    sessionId: string;
+    controller: { ws: WebSocket; streamId: string };
+    finish: (ready: boolean) => void;
+    timer: ReturnType<typeof setTimeout> | null;
+  }
+  const pendingExternalTerminalHandoffs = new Map<string, PendingExternalTerminalHandoff>();
   const pendingApprovals = new Map<string, {
     finish: (v: boolean | "always") => void;
     allowAlways: boolean;
@@ -1873,6 +1887,25 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const notifySocket = (ws: WebSocket, method: string, params: Record<string, unknown>): boolean => {
     return sendBoundedSocketFrame(ws, rpcNotify(method, params));
   };
+  const cancelExternalTerminalHandoff = (
+    pending: PendingExternalTerminalHandoff,
+    notify = true,
+  ): void => {
+    if (pendingExternalTerminalHandoffs.get(pending.sessionId) !== pending) return;
+    pendingExternalTerminalHandoffs.delete(pending.sessionId);
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.timer = null;
+    const owned = externalTerminalStreams.get(pending.controller.ws)?.get(pending.controller.streamId);
+    if (owned) owned.inputFrozen = false;
+    if (notify) {
+      notifySocket(pending.controller.ws, "external.event.terminal.handoff_cancelled", {
+        handoffId: pending.handoffId,
+        sessionId: pending.sessionId,
+        streamId: pending.controller.streamId,
+      });
+    }
+    pending.finish(false);
+  };
   const releaseExternalTerminal = async (
     ws: WebSocket,
     streamId: string,
@@ -1881,6 +1914,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   ): Promise<void> => {
     const owned = externalTerminalStreams.get(ws)?.get(streamId);
     if (!owned) return;
+    const pending = pendingExternalTerminalHandoffs.get(owned.sessionId);
+    if (pending?.controller.ws === ws && pending.controller.streamId === streamId) {
+      cancelExternalTerminalHandoff(pending, false);
+    }
     externalTerminalStreams.get(ws)?.delete(streamId);
     if (externalTerminalStreams.get(ws)?.size === 0) externalTerminalStreams.delete(ws);
     const controller = externalTerminalControllers.get(owned.sessionId);
@@ -1893,6 +1930,81 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       streamId,
       reason,
     });
+  };
+  const prepareExternalTerminalHandoff = async (
+    controller: { ws: WebSocket; streamId: string },
+    sessionId: string,
+  ): Promise<false | null | {
+    handoffId: string;
+    cancel: () => void;
+    commit: (successor: { ws: WebSocket; streamId: string }) => boolean;
+  }> => {
+    if (!clientFeatures.get(controller.ws)?.has(EXTERNAL_TERMINAL_HANDOFF_FEATURE)) return null;
+    if (pendingExternalTerminalHandoffs.has(sessionId)) return false;
+    const owned = externalTerminalStreams.get(controller.ws)?.get(controller.streamId);
+    if (!owned || owned.mode !== "control" || owned.inputFrozen) return false;
+    const handoffId = `handoff_${randomUUID()}`;
+    let settle!: (ready: boolean) => void;
+    const ready = new Promise<boolean>((resolve) => { settle = resolve; });
+    let settled = false;
+    const pending: PendingExternalTerminalHandoff = {
+      acknowledged: false,
+      handoffId,
+      sessionId,
+      controller,
+      finish: (value) => {
+        if (settled) return;
+        settled = true;
+        settle(value);
+      },
+      timer: null,
+    };
+    pendingExternalTerminalHandoffs.set(sessionId, pending);
+    pending.timer = setTimeout(
+      () => cancelExternalTerminalHandoff(pending),
+      EXTERNAL_TERMINAL_HANDOFF_TIMEOUT_MS,
+    );
+    pending.timer.unref();
+    if (!notifySocket(controller.ws, "external.event.terminal.handoff_requested", {
+      handoffId,
+      sessionId,
+      streamId: controller.streamId,
+    })) {
+      cancelExternalTerminalHandoff(pending, false);
+      return false;
+    }
+    const acknowledged = await ready;
+    if (
+      !acknowledged
+      || pendingExternalTerminalHandoffs.get(sessionId) !== pending
+      || !pending.acknowledged
+    ) return false;
+    return {
+      handoffId,
+      cancel: () => cancelExternalTerminalHandoff(pending),
+      commit: (successor) => {
+        if (pendingExternalTerminalHandoffs.get(sessionId) !== pending || !pending.acknowledged) {
+          return false;
+        }
+        const currentController = externalTerminalControllers.get(sessionId);
+        const currentOwned = externalTerminalStreams.get(controller.ws)?.get(controller.streamId);
+        if (
+          currentController?.ws !== controller.ws
+          || currentController.streamId !== controller.streamId
+          || !currentOwned
+          || currentOwned.mode !== "control"
+          || !currentOwned.inputFrozen
+        ) {
+          cancelExternalTerminalHandoff(pending);
+          return false;
+        }
+        pendingExternalTerminalHandoffs.delete(sessionId);
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.timer = null;
+        externalTerminalControllers.set(sessionId, successor);
+        return true;
+      },
+    };
   };
   const releaseExternalTerminalsForSocket = async (ws: WebSocket): Promise<void> => {
     const ids = [...(externalTerminalStreams.get(ws)?.keys() ?? [])];
@@ -3462,6 +3574,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcError(id, ERR.UNAUTHORIZED, "bad token"));
           }
           authed.add(ws);
+          const declaredFeatures = p.capabilities
+            && typeof p.capabilities === "object"
+            && !Array.isArray(p.capabilities)
+            && Array.isArray(p.capabilities.features)
+            ? p.capabilities.features.filter((feature: unknown): feature is string => (
+                typeof feature === "string" && feature.length > 0 && feature.length <= 160
+              )).slice(0, 64)
+            : [];
+          clientFeatures.set(ws, new Set(declaredFeatures));
           runtimeLog("client.authenticated", { method: "initialize" });
           // capability negotiation (codex app-server pattern): the server ADVERTISES its method set so
           // clients feature-detect up front instead of probing for -32601 per call. `p.capabilities`
@@ -3476,7 +3597,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.submit", "external.sessions.steer", "external.sessions.interrupt", "external.sessions.remove",
             "external.sessions.terminal.snapshot", "external.sessions.terminal.input", "external.sessions.terminal.key",
             "external.sessions.terminal.attach", "external.sessions.terminal.raw-input", "external.sessions.terminal.resize",
-            "external.sessions.terminal.scroll", "external.sessions.terminal.release", "external.sessions.terminal.open-wezterm",
+            "external.sessions.terminal.scroll", "external.sessions.terminal.release", "external.sessions.terminal.handoff-ready", "external.sessions.terminal.open-wezterm",
             "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.test", "settings.vision.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.gateways.list",
@@ -3532,6 +3653,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.terminal-mirror.v1",
             "external.sessions.terminal-stream.v2",
             "external.sessions.terminal-input-sequence.v1",
+            EXTERNAL_TERMINAL_HANDOFF_FEATURE,
             "external.sessions.runtime-remove.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
@@ -3561,6 +3683,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
                 "external.event.command_committed", "external.event.command_failed",
                 "external.event.terminal.frame", "external.event.terminal.closed",
+                "external.event.terminal.handoff_requested", "external.event.terminal.handoff_cancelled",
               ],
               features,
               limits: {
@@ -4116,13 +4239,27 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const priorForSession = [...(socketStreams?.values() ?? [])]
               .find((candidate) => candidate.sessionId === p.sessionId);
             if (priorForSession) await releaseExternalTerminal(ws, priorForSession.streamId, "released", false);
+            let priorController: { ws: WebSocket; streamId: string } | undefined;
+            let handoff: {
+              handoffId: string;
+              cancel: () => void;
+              commit: (successor: { ws: WebSocket; streamId: string }) => boolean;
+            } | null = null;
             if (p.mode === "control") {
-              const priorController = externalTerminalControllers.get(p.sessionId);
+              priorController = externalTerminalControllers.get(p.sessionId);
               if (priorController && !p.takeover) {
                 return reply(rpcError(id, ERR.BUSY, "this terminal is controlled by another client; confirm takeover or observe it read-only"));
               }
               if (priorController) {
-                await releaseExternalTerminal(priorController.ws, priorController.streamId, "control_transferred");
+                const prepared = await prepareExternalTerminalHandoff(priorController, p.sessionId);
+                if (prepared === false) {
+                  return reply(rpcError(id, ERR.BUSY, "the current terminal controller could not finish a safe input handoff; retry or release it explicitly"));
+                }
+                handoff = prepared;
+                if (ws.readyState !== ws.OPEN) {
+                  handoff?.cancel();
+                  return;
+                }
               }
             }
             const streamId = `terminal_${randomUUID()}`;
@@ -4141,42 +4278,54 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 void releaseExternalTerminal(ws, streamId, "slow_client");
               }
             };
-            const stream = await externalSessions.openTerminalStream(p.sessionId, {
-              mode: p.mode,
-              cols: p.cols,
-              rows: p.rows,
-              ...(p.takeover ? { takeover: true } : {}),
-            }, {
-              frame: (frame) => {
-                if (ready) publishFrame(frame as unknown as Record<string, unknown>);
-                else {
-                  pendingBytes += frame.bytes.length;
-                  if (pendingFrames.length >= 32 || pendingBytes > 4 * 1024 * 1024) {
-                    closedBeforeReady = "slow_client";
+            let stream: ExternalTerminalStream;
+            try {
+              stream = await externalSessions.openTerminalStream(p.sessionId, {
+                mode: p.mode,
+                cols: p.cols,
+                rows: p.rows,
+                ...(p.takeover ? { takeover: true } : {}),
+              }, {
+                frame: (frame) => {
+                  if (ready) publishFrame(frame as unknown as Record<string, unknown>);
+                  else {
+                    pendingBytes += frame.bytes.length;
+                    if (pendingFrames.length >= 32 || pendingBytes > 4 * 1024 * 1024) {
+                      closedBeforeReady = "slow_client";
+                      return;
+                    }
+                    pendingFrames.push(frame as unknown as Record<string, unknown>);
+                  }
+                },
+                closed: (reason) => {
+                  if (!ready) {
+                    closedBeforeReady = reason;
                     return;
                   }
-                  pendingFrames.push(frame as unknown as Record<string, unknown>);
-                }
-              },
-              closed: (reason) => {
-                if (!ready) {
-                  closedBeforeReady = reason;
-                  return;
-                }
-                const current = externalTerminalStreams.get(ws)?.get(streamId);
-                if (!current) return;
-                externalTerminalStreams.get(ws)?.delete(streamId);
-                if (externalTerminalStreams.get(ws)?.size === 0) externalTerminalStreams.delete(ws);
-                const controller = externalTerminalControllers.get(p.sessionId);
-                if (controller?.ws === ws && controller.streamId === streamId) {
-                  externalTerminalControllers.delete(p.sessionId);
-                }
-                notifySocket(ws, "external.event.terminal.closed", { sessionId: p.sessionId, streamId, reason });
-              },
-            });
+                  const current = externalTerminalStreams.get(ws)?.get(streamId);
+                  if (!current) return;
+                  externalTerminalStreams.get(ws)?.delete(streamId);
+                  if (externalTerminalStreams.get(ws)?.size === 0) externalTerminalStreams.delete(ws);
+                  const controller = externalTerminalControllers.get(p.sessionId);
+                  if (controller?.ws === ws && controller.streamId === streamId) {
+                    externalTerminalControllers.delete(p.sessionId);
+                  }
+                  notifySocket(ws, "external.event.terminal.closed", { sessionId: p.sessionId, streamId, reason });
+                },
+              });
+            } catch (error) {
+              handoff?.cancel();
+              throw error;
+            }
             if (closedBeforeReady) {
               await stream.release().catch(() => {});
+              handoff?.cancel();
               throw new Error("Hara Live terminal stream closed while attaching");
+            }
+            if (ws.readyState !== ws.OPEN) {
+              await stream.release().catch(() => {});
+              handoff?.cancel();
+              return;
             }
             const owned: OwnedExternalTerminalStream = {
               streamId,
@@ -4185,11 +4334,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               stream,
               lastInputSeq: 0,
               inputDigests: new Map(),
+              inputFrozen: false,
             };
             const ownedBySocket = externalTerminalStreams.get(ws) ?? new Map<string, OwnedExternalTerminalStream>();
             ownedBySocket.set(streamId, owned);
             externalTerminalStreams.set(ws, ownedBySocket);
-            if (p.mode === "control") externalTerminalControllers.set(p.sessionId, { ws, streamId });
+            if (p.mode === "control") {
+              const successor = { ws, streamId };
+              const currentController = externalTerminalControllers.get(p.sessionId);
+              const controllerUnchanged = priorController
+                ? currentController?.ws === priorController.ws
+                  && currentController.streamId === priorController.streamId
+                : currentController === undefined;
+              const committed = handoff ? handoff.commit(successor) : controllerUnchanged;
+              if (!committed) {
+                ownedBySocket.delete(streamId);
+                if (ownedBySocket.size === 0) externalTerminalStreams.delete(ws);
+                await stream.release().catch(() => {});
+                handoff?.cancel();
+                return reply(rpcError(id, ERR.BUSY, "terminal controller changed before takeover could be committed; retry explicitly"));
+              }
+              if (!handoff) externalTerminalControllers.set(p.sessionId, successor);
+            }
+            if (priorController) {
+              await releaseExternalTerminal(priorController.ws, priorController.streamId, "control_transferred");
+            }
             reply(rpcResult(id!, {
               sessionId: p.sessionId,
               streamId,
@@ -4219,6 +4388,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const inputDigest = p.inputSeq === undefined
               ? undefined
               : createHash("sha256").update(p.text, "utf8").digest("hex");
+            if (owned.inputFrozen && (p.inputSeq === undefined || p.inputSeq > owned.lastInputSeq)) {
+              return reply(rpcError(id, ERR.CONFLICT, "terminal input is frozen for an acknowledged control handoff"));
+            }
             if (p.inputSeq !== undefined) {
               if (p.inputSeq <= owned.lastInputSeq) {
                 if (owned.inputDigests.get(p.inputSeq) !== inputDigest) {
@@ -4257,6 +4429,50 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               duplicate: false,
               inputSeq: p.inputSeq,
               nextInputSeq: owned.lastInputSeq + 1,
+            }));
+          }
+          case "external.sessions.terminal.handoff-ready": {
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            if (
+              typeof p.streamId !== "string"
+              || typeof p.handoffId !== "string"
+              || !Number.isSafeInteger(p.throughInputSeq)
+              || p.throughInputSeq < 0
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "streamId, handoffId, and a non-negative throughInputSeq are required"));
+            }
+            const owned = externalTerminalStreams.get(ws)?.get(p.streamId);
+            const pending = owned ? pendingExternalTerminalHandoffs.get(owned.sessionId) : undefined;
+            if (
+              !owned
+              || owned.mode !== "control"
+              || !pending
+              || pending.handoffId !== p.handoffId
+              || pending.controller.ws !== ws
+              || pending.controller.streamId !== p.streamId
+            ) {
+              return reply(rpcError(id, ERR.CONFLICT, "terminal handoff is no longer active"));
+            }
+            if (owned.lastInputSeq !== p.throughInputSeq) {
+              return reply(rpcError(id, ERR.CONFLICT, `terminal handoff input fence mismatch; accepted through ${owned.lastInputSeq}`));
+            }
+            owned.inputFrozen = true;
+            if (!pending.acknowledged) {
+              pending.acknowledged = true;
+              if (pending.timer) clearTimeout(pending.timer);
+              pending.timer = setTimeout(
+                () => cancelExternalTerminalHandoff(pending),
+                EXTERNAL_TERMINAL_HANDOFF_TIMEOUT_MS,
+              );
+              pending.timer.unref();
+            }
+            pending.finish(true);
+            return reply(rpcResult(id!, {
+              accepted: true,
+              handoffId: p.handoffId,
+              throughInputSeq: owned.lastInputSeq,
             }));
           }
           case "external.sessions.terminal.resize": {
@@ -6640,6 +6856,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     });
     ws.on("close", () => {
       authed.delete(ws);
+      clientFeatures.delete(ws);
       eventAcks.delete(ws);
       for (const released of controlLeases.releaseOwner(ws)) {
         if (!released.resourceId.startsWith("session:")) continue;

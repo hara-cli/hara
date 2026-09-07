@@ -111,7 +111,11 @@ export class LocalServeClient implements LocalCompanionRpc {
     });
     const client = new LocalServeClient(socket);
     await client.call("initialize", {
-      capabilities: { client: "hara-mobile-bridge", protocolVersion: 1 },
+      capabilities: {
+        client: "hara-mobile-bridge",
+        protocolVersion: 1,
+        features: ["external.sessions.terminal-handoff.v1"],
+      },
       token: discovery.token,
     }, 5_000);
     return client;

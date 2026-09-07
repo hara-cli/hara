@@ -29,6 +29,7 @@ providers behind that boundary, not competing user-facing control products.
 | Slow-client memory boundary | Implemented after 0.166.1 | All Serve notifications share a 4 MiB per-socket queue ceiling. A sleeping/stalled renderer is closed with an explicit reconnect-and-refresh reason instead of retaining unbounded terminal or task frames. |
 | Cursor/ACK/event replay | Restart-safe foundation completed after 0.167.0 | Broadcast events carry a stream UUID and monotonic sequence. A reconnecting client replays an exact bounded tail and ACKs its cursor. The redacted tail is checkpointed in private state and keeps its stream identity across an orderly Serve replacement. For a changed, expired, ahead, or oversized-frame cursor, `events.snapshot` supplies one authoritative fence for task, workforce, external-turn, and approval projections; Desktop applies it before buffered events newer than the fence. The tail remains bounded to 10,000 events and 8 MiB. |
 | Single-writer Agent control | Implemented after 0.166.1 | One Desktop/mobile socket can acquire a session control lease. Takeover rotates an opaque lease ID and monotonic epoch, revokes the old controller, and fails stale delayed writes closed. Observer clients stay read-only; old clients remain compatible only while no lease is active. |
+| Lossless terminal control handoff | Implemented after 0.168.1 | Feature-aware Desktop/mobile controllers stop accepting new input, drain their serialized queue, ACK the exact monotonic input fence, and remain frozen until a successor stream is ready. The server rechecks the old owner and commits the new controller atomically; timeout, launch failure, disconnect, or an intervening reattach cancels the transaction and restores the old controller. |
 | Rewind projection repair | Implemented after 0.166.1 | Rewinding history also invalidates future task/todo/reminder/repeat-guard state and tells every client to refresh history. It deliberately does not pretend that transcript rewind reverted files. |
 | Tool approvals and sandbox boundary | Implemented | Engine policy remains authoritative rather than trusting prose in the transcript. |
 | Background jobs and bounded output | Implemented | Long-running processes and large tool output do not have to block or flood the main model context. |
@@ -114,7 +115,8 @@ step exist. Hara should preserve its present rule that parallel children cannot 
 ### 2.4 Flush-before-suspend and explicit handoff
 
 Codex's turn suspension rechecks ownership under a lock, flushes pending output, closes the writer, and only then
-announces that control stopped. Hara needs the same protocol for Desktop/mobile/WezTerm handoff:
+announces that control stopped. Hara now applies the same ordering to provider-terminal control shared by Desktop
+and the Mobile bridge:
 
 ```text
 request handoff
@@ -126,8 +128,15 @@ request handoff
 ```
 
 Suspension must be rejected while unaccounted child processes or tool side effects remain. Accepted pending
-input must either be flushed with a receipt or explicitly returned to the mailbox; it cannot disappear during
-handoff. The client must never infer ownership from a stale UI label.
+input is serialized behind payload-bound `inputSeq` receipts. The old controller acknowledges only the exact
+accepted fence; a failed or unresolved input blocks that ACK. The successor terminal is started before the old
+stream is released, but it cannot become authoritative until one synchronous commit rechecks the pending handoff,
+old stream, and current controller. A racing reattach releases the uncommitted successor instead of overwriting
+the newer controller. Legacy clients retain their old takeover behavior but receive the same final owner recheck.
+
+The remaining work is broader runtime suspension rather than terminal ownership: apply an equivalent explicit
+disposition to queued Agent mailbox items, live tool output, and child-process completion when an entire Serve
+session is paused or migrated. The client must never infer ownership from a stale UI label.
 
 ### 2.5 Retry health feeding typed failover
 
@@ -234,8 +243,9 @@ success.
 8. **In progress — Mobile companion**: account/device pairing, encrypted relay protocol, explicit publication,
    leases, command replay, and terminal sequencing exist in CLI. Complete the account/relay deployment and native
    mobile client against the versioned contract before broadening publication beyond coding-agent sessions.
-9. **Next handoff slice — suspend/resume**: flush-before-suspend, pending-input disposition, successor readiness,
-   and Desktop/mobile/terminal contention tests.
+9. **Completed terminal handoff slice — suspend/resume**: feature negotiation, exact input-fence ACK, successor
+   readiness, rollback, atomic owner commit, and Desktop/mobile/terminal contention tests are implemented. Full
+   Serve-session migration still needs typed disposition for live tools, child processes, and mailbox items.
 10. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.
 11. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
    root-controlled merge/rejection.

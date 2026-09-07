@@ -942,6 +942,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "external.sessions.terminal-mirror.v1",
         "external.sessions.terminal-stream.v2",
         "external.sessions.terminal-input-sequence.v1",
+        "external.sessions.terminal-handoff.v1",
         "external.sessions.runtime-remove.v1",
         "spaces.tenant-boundary.v1",
       ],

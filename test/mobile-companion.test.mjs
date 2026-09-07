@@ -275,6 +275,11 @@ test("Router publishes bounded sessions and enforces terminal leases and command
   const grantResponse = await router.route(request("request-control", "terminal.control", grantRequest));
   assert.equal(grantResponse.ok, true);
   const grant = grantResponse.body;
+  assert.equal(
+    calls.find((entry) => entry.method === "external.sessions.terminal.attach")?.params.takeover,
+    true,
+    "a phone control grant is an explicit takeover rather than a silent second writer",
+  );
 
   const inputCommand = {
     commandId: "terminal-command-a",
@@ -290,6 +295,30 @@ test("Router publishes bounded sessions and enforces terminal leases and command
   assert.equal(first.body.status, "succeeded");
   assert.deepEqual(replay.body, first.body);
   assert.equal(calls.filter((entry) => entry.method === "external.sessions.terminal.raw-input").length, 1);
+
+  for (const listener of listeners) listener("external.event.terminal.handoff_requested", {
+    handoffId: "handoff-a",
+    sessionId: "ext_runtime_test-a",
+    streamId: "terminal-a",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const ready = calls.find((entry) => entry.method === "external.sessions.terminal.handoff-ready");
+  assert.equal(ready?.params.throughInputSeq, 1, "the phone ACKs only after its accepted input sequence drains");
+  const blockedDuringHandoff = await router.route(request("request-input-handoff", "command.execute", {
+    ...inputCommand,
+    commandId: "terminal-command-handoff",
+  }));
+  assert.equal(blockedDuringHandoff.body.errorCode, "CONTROL_HANDOFF_PENDING");
+  for (const listener of listeners) listener("external.event.terminal.handoff_cancelled", {
+    handoffId: "handoff-a",
+    sessionId: "ext_runtime_test-a",
+    streamId: "terminal-a",
+  });
+  const resumedAfterCancellation = await router.route(request("request-input-resumed", "command.execute", {
+    ...inputCommand,
+    commandId: "terminal-command-resumed",
+  }));
+  assert.equal(resumedAfterCancellation.body.status, "succeeded");
 
   const stale = await router.route(request("request-stale", "command.execute", {
     ...inputCommand,
