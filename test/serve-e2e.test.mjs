@@ -3735,6 +3735,90 @@ test("serve e2e: an active deadline returns a recoverable paused result instead 
   }
 });
 
+test("serve e2e: unchanged successful work pauses with structured progress instead of an RPC error", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-no-progress-paused-"));
+  writeFileSync(join(dir, "stable.txt"), "hara progress fixture stays unchanged\n");
+  const store = memStore();
+  let calls = 0;
+  const provider = {
+    id: "no-progress",
+    model: "no-progress",
+    async turn() {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "brief-no-progress",
+            name: "task_intake",
+            input: {
+              intent: "investigate",
+              goal: "inspect one stable command result",
+              acceptance: ["report the verified result"],
+              steps: ["inspect", "report"],
+            },
+          }],
+          stop: "tool_use",
+          usage: { input: 10, output: 5 },
+        };
+      }
+      return {
+        text: "",
+        toolUses: [{
+          id: `stable-command-${calls}`,
+          name: "read_file",
+          input: { path: "stable.txt" },
+        }],
+        stop: "tool_use",
+        usage: { input: 10, output: 5 },
+      };
+    },
+  };
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    baseDeps(provider, store),
+  );
+  const c = await connect(srv.port);
+  try {
+    await c.call("initialize", { token: "tok" });
+    const { result } = await c.call("session.create", {});
+    const sent = await c.call("session.send", { sessionId: result.sessionId, text: "inspect the result" });
+    assert.equal(sent.error, undefined);
+    assert.equal(sent.result.status, "paused");
+    assert.equal(sent.result.stopReason, "no_progress");
+    assert.match(sent.result.reply, /paused because.*no durable progress/i);
+    assert.equal(calls, 5, "task intake plus four unchanged successful calls reach the hard gate");
+
+    const progressStates = c.events.filter((event) =>
+      event.method === "event.task_state" && event.params.progress);
+    assert.ok(progressStates.length >= 4);
+    const stopped = progressStates.find((event) => event.params.progress.state === "stopped");
+    assert.equal(stopped.params.progress.trigger, "repeated_tool_call");
+    assert.equal(stopped.params.progress.repeatedCount, 4);
+    assert.equal(stopped.params.progress.tokens.total, 75, "run usage includes the accepted task-intake round");
+
+    const finalState = c.events.filter((event) => event.method === "event.task_state").at(-1);
+    assert.equal(finalState.params.state, "paused");
+    assert.equal(finalState.params.progress.state, "stopped", "the final paused projection keeps its metrics visible");
+    assert.equal(finalState.params.progress.repeatedCount, 4);
+    assert.match(finalState.params.checkpoint.blockReason, /no durable progress/i);
+    const saved = store.saved.get(result.sessionId);
+    assert.equal(saved.task.status, "paused");
+    assert.equal(saved.task.progress.state, "stopped", "the watchdog receipt is durable session state");
+    assert.equal(saved.task.progress.repeatedCount, 4);
+
+    const snapshot = await c.call("events.snapshot", { sessionIds: [result.sessionId] });
+    assert.equal(snapshot.result.taskStates[0].phase, "restored");
+    assert.equal(snapshot.result.taskStates[0].progress.state, "stopped");
+    assert.equal(snapshot.result.taskStates[0].progress.repeatedCount, 4,
+      "a reconnecting Desktop or Mobile client receives the paused counters without parsing prose");
+  } finally {
+    c.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: a fresh checkpoint crosses the cumulative task boundary automatically", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-task-round-budget-"));
   const store = memStore();
@@ -3776,7 +3860,14 @@ test("serve e2e: a fresh checkpoint crosses the cumulative task boundary automat
           toolUses: [{
             id: "round-100-checkpoint",
             name: "task_checkpoint",
-            input: { current_step: "verify the next strategy" },
+            input: {
+              current_step: "verify the next strategy",
+              facts: [{
+                key: "next_strategy_verified",
+                value: true,
+                evidence: "the bounded preflight completed with a distinct successful result",
+              }],
+            },
           }],
           stop: "tool_use",
           usage: { input: 1, output: 1 },

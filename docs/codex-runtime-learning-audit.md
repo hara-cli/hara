@@ -1,6 +1,6 @@
 # Codex runtime learning audit
 
-> Snapshot: 2026-09-07. Reference checkout:
+> Snapshot: 2026-09-08. Reference checkout:
 > `/Users/zhujianbo/work/projects/ai/codex` at locally inspected revision `8e6a44b428`.
 
 Hara should learn Codex's reliability mechanisms, not turn into an OpenAI-only clone. This audit compares the
@@ -20,6 +20,7 @@ providers behind that boundary, not competing user-facing control products.
 | Automatic context compaction | Implemented | Context watermark reporting and automatic summary replacement exist; manual user intervention is not required. |
 | Atomic compaction installation | Implemented | Each installed window has stable window/attempt identity, records observed versus estimated input accounting, and saves the complete replacement before changing live history. Failed persistence leaves the prior window untouched. |
 | Repeated-failure guard | Implemented in 0.166.1 | The second identical failure requires a strategy change; the third stops that exact loop. It no longer ends healthy work merely because 20 rounds passed. |
+| Engine-owned no-progress watchdog | Implemented after 0.168.2 | Successful calls are no longer assumed to be progress. Four repeated calls with substantially unchanged output stop, six same-evidence rounds stop, and unattended Serve/print/gateway/subagent work pauses after eight rounds without new checkpoint evidence or a newly completed todo. A 200k run-token ceiling accelerates the same pause; live steering starts a fresh unattended window. Desktop receives typed round/tool/token/todo counters and a stop reason instead of scraping terminal prose. |
 | Healthy long-task continuation | Implemented after 0.166.1 | A fresh durable checkpoint and new evidence can open another bounded tranche automatically; deadlines, no-progress detection, cumulative task limits, and the absolute 256-round ceiling remain hard stops. |
 | Verified user-decision retention | Implemented after 0.166.1; headless continuation completed after 0.168.0 | Successful in-process `ask_user` decisions are redacted, deduplicated, persisted outside the compactable transcript, and restored in future task prompts and forks. A persisted headless/gateway/cron question now closes as an addressable pause; the next same-conversation reply is durably retained before the original task and provider turn resume. |
 | Honest end-to-end completion | Hardened after 0.168.0 | Change tasks require a fresh engine-readable completion receipt against every accepted check. File writes, scaffolds, tests, and scheduler registration prove only their stage. Missing verification preserves a resumable checkpoint and suppresses success prose; unavoidable questions pause durably instead of ending the task. Model-authored credential enrollment through chat or shell-history commands is withheld in favor of trusted masked surfaces. |
@@ -195,12 +196,21 @@ health/circuit state. Failover selection only considers compatible, user-authori
 ### 2.9 Structured Agent progress and resumable tool items
 
 Mobile should not have to scrape terminal prose such as “searched files” or infer whether a tool is running.
-Promote model turns, reasoning/progress summaries, tool calls, approvals, diffs, todos, child-Agent activity, and
-terminal outcomes into versioned item lifecycle events. Each item needs stable identity and
-`started/completed/failed/cancelled` transitions. Hara now has an authoritative reconnect snapshot for task,
-workforce, active external turns, and approvals, plus a restart-safe event tail. Tool/diff/message items still do
-not form a complete durable, replay-derived trace, so Mobile must use bounded conversation/terminal snapshot APIs
-for those surfaces instead of inferring lifecycle from partial events.
+Hara now emits a credential-free `progress` snapshot on task lifecycle events with provider rounds, tool-call
+count, run-local input/output tokens, todo completion, unchanged-checkpoint age, similarity state, and a typed
+warning/stop trigger. The Engine—not the model—computes it from successful observation fingerprints plus durable
+task/todo state. Rewording a checkpoint, changing an offset/temp name, or alternating a 401/403 with a harmless
+read cannot erase the relevant streak. New facts, artifacts, capabilities, completion evidence, or completed
+todos reset it; changed explicit percentages and completion ratios also prevent a healthy poll from looking
+stale, while bare offsets do not. No prompt or raw tool result is retained in the watchdog. A no-progress stop becomes a visible,
+resumable task pause rather than an opaque RPC failure.
+
+The remaining work is to promote individual model turns, reasoning/progress summaries, tool calls, approvals,
+diffs, todos, child-Agent activity, and terminal outcomes into versioned item lifecycle events. Each item needs
+stable identity and `started/completed/failed/cancelled` transitions. Hara has an authoritative reconnect
+snapshot for task, workforce, active external turns, and approvals, plus a restart-safe event tail. Tool/diff/
+message items still do not form a complete durable, replay-derived trace, so Mobile must use bounded conversation/
+terminal snapshot APIs for those surfaces instead of inferring lifecycle from partial events.
 
 ### 2.10 Managed workspace isolation for future writing Agents
 
@@ -246,8 +256,11 @@ success.
 9. **Completed terminal handoff slice — suspend/resume**: feature negotiation, exact input-fence ACK, successor
    readiness, rollback, atomic owner commit, and Desktop/mobile/terminal contention tests are implemented. Full
    Serve-session migration still needs typed disposition for live tools, child processes, and mailbox items.
-10. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.
-11. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
+10. **Completed no-progress control slice**: output-similarity and exact-call guards, eight-round unattended
+    checkpoint/todo gate, run-local token ceiling, access-boundary coalescing, resumable stop state, and typed
+    Desktop telemetry are covered by unit and Serve integration tests. Full item-level replay remains separate.
+11. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.
+12. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
    root-controlled merge/rejection.
 
 No slice is complete until it has unit tests, an interruption/crash test, bounded logs, and a real CLI/Desktop

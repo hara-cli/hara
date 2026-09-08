@@ -24,7 +24,7 @@ import {
 import { GatewayQueueClosedError, GatewayQueueFullError, KeyedSerialQueue, canonicalGatewayPlatform, compactGatewayCodingOutput, gatewayAdmissionKey, gatewayCodingDisplayId, gatewayStatus, parseCommand, parseGatewayCodingCommand, resolveGatewayCodingSession, isAllowed, resolveAllowlist, cleanReply, shouldDownloadInboundMedia } from "../dist/gateway/serve.js";
 import { GatewayLoginManager } from "../dist/gateway/login.js";
 import { chatCodingSession, chatContext, chatCd, newChatSession, ownsChatSession, resolveOwnedSessionId, setChatCodingSession, setChatSession, setChatAgent, cwdTag, toggleVoice } from "../dist/gateway/sessions.js";
-import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs, startWeixinLoginSession } from "../dist/gateway/weixin.js";
+import { randomWechatUin, envelope, buildSendBody, extractText, guessChatType, parseWeixinMessage, isSessionExpired, apiAesKey, audioFileItem, imageInlineItem, parseAesKey, inboundMediaRefs, startWeixinLoginSession, weixinAdapter, weixinClientId } from "../dist/gateway/weixin.js";
 import { synthesize, ttsConfigFromEnv, ttsCleanText, ttsTimeoutMs } from "../dist/gateway/tts.js";
 import { deliverResult } from "../dist/cron/deliver.js";
 
@@ -1518,6 +1518,43 @@ test("weixin isSessionExpired: -14, or -2 + 'unknown error'; genuine -2 rate-lim
   assert.equal(isSessionExpired(-2, 0, "UNKNOWN ERROR"), true); // case-insensitive
   assert.equal(isSessionExpired(-2, 0, "freq limit"), false); // genuine rate limit
   assert.equal(isSessionExpired(0, 0, ""), false);
+});
+
+test("weixin outbound client ids are stable for effect retries and opaque", () => {
+  const first = weixinClientId("credential-scoped-effect");
+  assert.equal(first, weixinClientId("credential-scoped-effect"));
+  assert.notEqual(first, weixinClientId("another-effect"));
+  assert.match(first, /^hara-weixin-[a-f0-9]{32}$/);
+  assert.equal(first.includes("credential"), false);
+});
+
+test("weixin adapter forwards a stable effect id into the platform client_id", async () => {
+  const originalFetch = global.fetch;
+  const bodies = [];
+  try {
+    global.fetch = async (_url, init) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ ret: 0, errcode: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const adapter = weixinAdapter({
+      account_id: "bot-account",
+      token: "private-token",
+      base_url: "https://ilinkai.weixin.qq.com",
+      user_id: "owner",
+    });
+    await adapter.send("peer", "first", undefined, "same-effect");
+    await adapter.send("peer", "first", undefined, "same-effect");
+    await adapter.send("peer", "second", undefined, "different-effect");
+    assert.equal(bodies.length, 3);
+    assert.equal(bodies[0].msg.client_id, bodies[1].msg.client_id);
+    assert.notEqual(bodies[1].msg.client_id, bodies[2].msg.client_id);
+    assert.equal(bodies[0].msg.client_id.includes("same-effect"), false);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test("weixin apiAesKey: base64 of the hex string's ASCII bytes — NOT base64 of the raw key", () => {

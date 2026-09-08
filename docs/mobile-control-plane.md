@@ -34,6 +34,9 @@ the CLI against its publication, lease epoch, expiry, command ID, and active tur
   `claude-code`). Publications and capabilities expire with the Desktop credential.
 - Bounded session transcript and terminal snapshot reads. The current v1 phone UX should poll these snapshots;
   it must not infer durable state from a dropped notification.
+- Typed task progress snapshots expose round, tool-call, run-token, todo, checkpoint-age, and no-progress stop
+  state without exposing prompts or tool output. Mobile should render these metrics when available and remain
+  compatible with older Engines where `progress` is absent.
 - Short terminal-control leases (10 seconds to 5 minutes), one lease per publication, and a new bridge-wide
   epoch after restart.
 - Idempotent remote command receipts, payload collision rejection, expiry checks, `expectedTurnId` fencing for

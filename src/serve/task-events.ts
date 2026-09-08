@@ -1,5 +1,6 @@
 import type { TaskExecution, TaskExecutionStatus } from "../session/task.js";
 import type { Todo } from "../tools/todo.js";
+import type { RunProgressEvent } from "../agent/loop.js";
 
 export const TASK_LIFECYCLE_EVENT_VERSION = 1;
 
@@ -25,6 +26,7 @@ export interface TaskLifecycleActivity {
     question: string;
     allowAlways?: boolean;
   };
+  progress?: RunProgressEvent;
 }
 
 export interface TaskLifecycleCursor {
@@ -88,6 +90,8 @@ export interface TaskLifecycleEvent {
     question: string;
     allowAlways?: boolean;
   };
+  /** Credential-free Engine watchdog counters. Desktop/Mobile never infer progress from terminal prose. */
+  progress?: RunProgressEvent;
 }
 
 function bounded(value: string | undefined, max: number): string | undefined {
@@ -128,6 +132,7 @@ export function taskLifecycleEvent(
   const state = task.status === "running"
     ? (activity.state ?? task.status)
     : task.status;
+  const progress = activity.progress ?? task.progress;
   return {
     version: TASK_LIFECYCLE_EVENT_VERSION,
     streamId,
@@ -199,5 +204,6 @@ export function taskLifecycleEvent(
     },
     ...(detail ? { detail } : {}),
     ...(approval ? { approval } : {}),
+    ...(progress ? { progress: structuredClone(progress) } : {}),
   };
 }

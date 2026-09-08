@@ -20,7 +20,7 @@ import {
   setChatAgent,
   toggleVoice,
 } from "./sessions.js";
-import { plainChat } from "../cron/deliver.js";
+import { deliverResult, plainChat } from "../cron/deliver.js";
 import { synthesize } from "./tts.js";
 import { cleanupTransientMedia, pruneStaleMedia } from "./media.js";
 import { selfArgv } from "../cron/runner.js";
@@ -53,6 +53,12 @@ import {
   type GatewayRunOutcomeRecovery,
   type GatewayRunOutcomeState,
 } from "./runtime-state.js";
+import { serveGatewayOutboundRequests } from "./outbound-broker.js";
+import {
+  channelBridgeNameForSource,
+  channelBridgeWeixinTargets,
+  handleChannelBridgeCommand,
+} from "./channel-bridges.js";
 import { createExternalSessionRegistry } from "../external-sessions/registry.js";
 import type { ExternalSessionInfo, ExternalSessionSourceInfo } from "../external-sessions/types.js";
 import { HARA_RUNTIME_VERSION } from "../version.js";
@@ -1021,7 +1027,7 @@ export function defaultWorkspace(): string {
     "screen control is disabled in gateway runs.\n" +
     "- You often lack project context here. If a request concerns a specific project, say so and suggest `/cd <project>` " +
     "(or answer from what you can read) rather than guessing.\n";
-  const TEMPLATE =
+  const PRE_CHANNEL_TEMPLATE =
     "# hara chat workspace\n\n" +
     "Default working directory for `hara gateway`. Each message runs here with `--approval full-auto`. " +
     "A safe scratch — pass `--cwd <dir>` to point the gateway at a real project instead.\n\n" +
@@ -1035,11 +1041,28 @@ export function defaultWorkspace(): string {
     "capability is unavailable and offer an exported file that contains no account access data.\n" +
     "- You often lack project context here. If a request concerns a specific project, say so and suggest `/cd <project>` " +
     "(or answer from what you can read) rather than guessing.\n";
+  const TEMPLATE =
+    "# hara chat workspace\n\n" +
+    "Default working directory for `hara gateway`. Each message runs here with `--approval full-auto`. " +
+    "A safe scratch — pass `--cwd <dir>` to point the gateway at a real project instead.\n\n" +
+    "## How to work here\n\n" +
+    "- You are a chat-driven assistant on the user's machine. Deliver files/images with the `send_file` tool.\n" +
+    "- For Feishu/WeChat messaging, call Hara's eager `channel_message` tool. A connected gateway is the capability; " +
+    "do not look for a vendor CLI, copy connector credentials, or claim that the tool is unavailable before listing it. " +
+    "For other work platforms, check `skill` and configured skills first. Do NOT control desktop app windows; " +
+    "screen control is disabled in gateway runs.\n" +
+    "- Never ask a chat user to paste or send an API key, password, cookie, Authorization header, localStorage/sessionStorage " +
+    "value, or session token. Use a registered trusted provider/browser capability. If none is available, say that the " +
+    "capability is unavailable and offer an exported file that contains no account access data.\n" +
+    "- You often lack project context here. If a request concerns a specific project, say so and suggest `/cd <project>` " +
+    "(or answer from what you can read) rather than guessing.\n";
   if (!existsSync(agents)) writeFileSync(agents, TEMPLATE, { mode: 0o600 });
   else {
     try {
       const current = readFileSync(agents, "utf8");
-      if (current === LEGACY || current === PREVIOUS_TEMPLATE) writeFileSync(agents, TEMPLATE); // refresh unmodified old default
+      if (current === LEGACY || current === PREVIOUS_TEMPLATE || current === PRE_CHANNEL_TEMPLATE) {
+        writeFileSync(agents, TEMPLATE); // refresh only an unmodified old default
+      }
       chmodSync(agents, 0o600);
     } catch {
       /* unreadable — leave it alone */
@@ -1132,6 +1155,11 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
   ac.signal.addEventListener("abort", closeQueue, { once: true });
+  const outboundWorker = serveGatewayOutboundRequests(adapter, runtimeScope, ac.signal).catch((error) => {
+    if (!ac.signal.aborted) {
+      console.error(`hara gateway: connected-channel delivery worker stopped — ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
   console.error(`hara gateway: ${adapter.name} up · cwd=${cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
 
   let transportFailed = false;
@@ -1206,6 +1234,44 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     try {
     await (async () => {
     if (outcomeLoadError) throw outcomeLoadError;
+    const earlyCommand = existingRunOutcome ? null : parseCommand(m.text);
+    // Group bridge administration must run before ordinary flow matching because groups intentionally do not
+    // receive the full coding agent. It is idempotent and owner-gated; safe list output exposes no chat/peer ids.
+    if (earlyCommand?.cmd === "bridge" && platform === "feishu" && m.chatType === "group") {
+      const reply = handleChannelBridgeCommand(earlyCommand.arg, {
+        platform,
+        chatType: m.chatType,
+        chatId: m.chatId,
+        userId: m.userId,
+        userName: m.userName,
+        isOwner: Boolean(approvalUserId && String(m.userId) === approvalUserId),
+      });
+      await runMessageEffect("bridge-command-reply", 0, (key) => adapter.send(m.chatId, reply, ac.signal, key));
+      return;
+    }
+    // An enabled Feishu source fans out only to WeChat peers that opted in from their own authorized DMs.
+    // Keep the raw platform ids private, reuse inbound effect receipts across retries, and ignore Hara's own
+    // provenance marker in the unlikely event a platform echoes bot-authored messages back as inbound events.
+    if (
+      !existingRunOutcome
+      && platform === "feishu"
+      && m.chatType === "group"
+      && !m.text.startsWith("[来自 Hara 微信]")
+    ) {
+      const targets = channelBridgeWeixinTargets(platform, m.chatId);
+      const bridgeName = targets.length ? channelBridgeNameForSource(platform, m.chatId) : null;
+      for (const [targetIndex, target] of targets.entries()) {
+        await runMessageEffect("channel-bridge-weixin", targetIndex, async (key) => {
+          const error = await deliverResult(
+            target,
+            `【${bridgeName ?? "飞书群"} · 飞书】\n${plainChat(m.text)}`,
+            ac.signal,
+            key,
+          );
+          if (error) throw new Error("channel bridge WeChat delivery failed");
+        });
+      }
+    }
     // Flows (opt-in, ~/.hara/flows.json): rules that intercept a matching inbound message → agent task + deliver,
     // BEFORE the allowlist/DM-driver logic. A matched flow is authorized by its own presence in the user's config
     // (group senders won't be in the allowlist), so this must run first. dispatchFlows settles every claimed
@@ -1264,6 +1330,17 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     }
     const cmd = existingRunOutcome || preparedResult ? null : parseCommand(m.text);
     if (cmd) {
+      if (cmd.cmd === "bridge") {
+        const reply = handleChannelBridgeCommand(cmd.arg, {
+          platform,
+          chatType: m.chatType,
+          chatId: m.chatId,
+          userId: m.userId,
+          userName: m.userName,
+          isOwner: Boolean(approvalUserId && String(m.userId) === approvalUserId),
+        });
+        return sendMessage(m.chatId, reply);
+      }
       if (cmd.cmd === "remote") {
         if (!approvalUserId || String(m.userId) !== approvalUserId) {
           return sendMessage(m.chatId, "⛔ 本地终端转发仅允许已配置的网关所有者控制。");
@@ -1413,7 +1490,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
       if (cmd.cmd === "help")
         return sendMessage(
           m.chatId,
-          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/agents [search] — available agents\n/agent <name|project:name|main> — switch to that agent's independent thread\n/coding help — explicit Codex / Claude Code relay\n/remote send <text> — explicit legacy tmux relay\n/voice · /say <text> — speech · /send <path> — send a file\n/detach — clear legacy tmux binds\n/help\nanything else = run hara here",
+          "commands:\n/pwd · /cd <dir> — project\n/sessions · /new · /resume <id> — threads\n/agents [search] — available agents\n/agent <name|project:name|main> — switch to that agent's independent thread\n/bridge help — Feishu group ↔ subscribed WeChat delivery\n/coding help — explicit Codex / Claude Code relay\n/remote send <text> — explicit legacy tmux relay\n/voice · /say <text> — speech · /send <path> — send a file\n/detach — clear legacy tmux binds\n/help\nanything else = run hara here",
         );
       if (cmd.cmd === "agents") {
         const agents = await listGatewayAgents(cmd.arg, ctx.cwd, ctx.sessionId);
@@ -1697,6 +1774,7 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     closeQueue();
     await sessionRuns.waitForIdle();
     const handlersDrained = await inboundHandlers.drain();
+    await outboundWorker;
     await externalSessions.close().catch(() => {});
     ac.signal.removeEventListener("abort", closeQueue);
     process.off("SIGINT", stop);

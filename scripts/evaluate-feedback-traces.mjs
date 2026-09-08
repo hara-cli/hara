@@ -12,7 +12,13 @@ const defaultTraceDirectory = join(root, "evals", "feedback");
 const MAX_TRACE_BYTES = 256 * 1024;
 const MAX_EVENTS = 500;
 const TRACE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
-const OUTCOMES = new Set(["completed", "awaiting_user", "failed"]);
+const OUTCOMES = new Set(["completed", "awaiting_user", "paused", "failed"]);
+const PROGRESS_STOP_TRIGGERS = new Set([
+  "repeated_tool_call",
+  "similar_tool_evidence",
+  "unattended_without_checkpoint",
+  "unattended_token_budget",
+]);
 const EVENT_TYPES = new Set(["tool_result", "model_request", "approval", "user_intervention", "action_handoff"]);
 const HUMAN_DEPENDENCIES = new Set([
   "missing_secret",
@@ -293,6 +299,7 @@ export function evaluateFeedbackTrace(trace) {
   if (Object.hasOwn(expected, "forbiddenSentModels")) expectedKeys.push("forbiddenSentModels");
   if (Object.hasOwn(expected, "maxWrongUserDelegations")) expectedKeys.push("maxWrongUserDelegations");
   if (Object.hasOwn(expected, "minAgentOwnedActions")) expectedKeys.push("minAgentOwnedActions");
+  if (Object.hasOwn(expected, "requiredPauseTrigger")) expectedKeys.push("requiredPauseTrigger");
   pushExactKeys(errors, expected, expectedKeys, "expected");
   pushExactKeys(errors, observed, ["outcome", "rounds", "completion", "events"], "observed");
   pushError(errors, OUTCOMES.has(expected.outcome), "expected.outcome is invalid");
@@ -381,6 +388,24 @@ export function evaluateFeedbackTrace(trace) {
         if (completion.dependency.kind === "missing_secret" || completion.dependency.kind === "missing_authority") {
           pushError(errors, typeof completion.dependency.capability === "string" && completion.dependency.capability.length > 0, "authority/secret dependency requires a capability");
         }
+      }
+    }
+  } else if (observed.outcome === "paused") {
+    pushError(errors, plainObject(completion), "paused trace requires observed.completion");
+    if (plainObject(completion)) {
+      pushExactKeys(errors, completion, ["state", "evidence", "trigger"], "observed.completion");
+      pushError(errors, completion.state === "paused", "paused trace requires matching completion state");
+      pushError(errors, PROGRESS_STOP_TRIGGERS.has(completion.trigger), "paused trace requires a typed progress stop trigger");
+      pushError(
+        errors,
+        Array.isArray(completion.evidence)
+          && completion.evidence.length > 0
+          && completion.evidence.every((item) => typeof item === "string" && item.length > 0),
+        "paused trace requires observable pause evidence",
+      );
+      if (expected.requiredPauseTrigger !== undefined) {
+        pushError(errors, PROGRESS_STOP_TRIGGERS.has(expected.requiredPauseTrigger), "expected.requiredPauseTrigger is invalid");
+        pushError(errors, completion.trigger === expected.requiredPauseTrigger, "observed pause trigger does not match expected.requiredPauseTrigger");
       }
     }
   } else if (observed.outcome === "failed") {

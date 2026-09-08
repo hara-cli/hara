@@ -30,6 +30,28 @@ import {
 } from "../dist/session/task.js";
 import { loadSession, newSessionId, saveSession } from "../dist/session/store.js";
 
+function stoppedProgress() {
+  return {
+    state: "stopped",
+    trigger: "repeated_tool_call",
+    toolCalls: 4,
+    unattendedRounds: 4,
+    evidenceStaleRounds: 3,
+    noProgressRounds: 4,
+    checkpointStaleRounds: 4,
+    checkpointAdvanced: false,
+    similarity: 1,
+    repeatedTool: "read_file",
+    repeatedCount: 4,
+    tokens: { input: 40, output: 20, total: 60 },
+    todo: { done: 0, total: 1, unchangedRounds: 4, advanced: false },
+    rounds: 4,
+    maxRounds: 64,
+    cumulativeTaskRounds: 12,
+    taskRoundLimit: 100,
+  };
+}
+
 test("task execution keeps the original objective across turns and steering", () => {
   const first = newTurnInteraction();
   let task = createTaskExecution("implement the file boundary", first.turnId, "2026-07-15T00:00:00.000Z");
@@ -356,7 +378,7 @@ test("verified completion cannot coexist with a persisted blocker", () => {
   assert.match(rejected.reason, /cannot retain a blocker/);
 });
 
-test("lifecycle and strategy boundaries are resumable pauses while exact loop breakers remain blocked", () => {
+test("lifecycle, strategy, and engine loop boundaries are resumable pauses with a visible reason", () => {
   const interaction = newTurnInteraction();
   const task = createTaskExecution("finish the long task", interaction.turnId);
   const deadline = finishTaskExecution(task, { status: "halted", stopReason: "deadline", error: "deadline" });
@@ -374,7 +396,40 @@ test("lifecycle and strategy boundaries are resumable pauses while exact loop br
   assert.equal(strategyStall.status, "paused");
 
   const loop = finishTaskExecution(task, { status: "halted", stopReason: "repeat_loop", error: "loop" });
-  assert.equal(loop.status, "blocked");
+  assert.equal(loop.status, "paused");
+  assert.equal(loop.checkpoint.blockReason, "loop");
+  assert.match(loop.checkpoint.nextStep, /materially different strategy/i);
+
+  const progress = stoppedProgress();
+  const noProgress = finishTaskExecution(task, {
+    status: "halted",
+    stopReason: "no_progress",
+    error: "eight working rounds produced no durable checkpoint",
+    progress,
+  });
+  assert.equal(noProgress.status, "paused");
+  assert.match(noProgress.checkpoint.blockReason, /no durable checkpoint/i);
+  assert.deepEqual(noProgress.progress, progress, "the pause retains the engine-owned counters for reconnecting clients");
+  assert.notEqual(noProgress.progress, progress, "persisted progress is a defensive copy");
+  assert.equal(isTaskExecution(noProgress), true);
+
+  const resumed = continueTaskExecution(noProgress, newSteerInteraction(interaction.turnId));
+  assert.equal(resumed.ok, true);
+  assert.equal(resumed.task.progress, undefined, "a genuinely resumed tranche does not inherit a stale stop banner");
+  assert.equal(Object.hasOwn(resumed.task, "progress"), false);
+
+  const completedWithReceipt = finishTaskExecution(task, { status: "completed", progress }, []);
+  assert.equal(completedWithReceipt.status, "completed");
+  assert.equal(completedWithReceipt.progress, undefined, "completed tasks do not retain an obsolete watchdog receipt");
+
+  assert.equal(isTaskExecution({ ...noProgress, progress: { ...progress, state: "warning" } }), false,
+    "a stop trigger cannot masquerade as a warning");
+  assert.equal(isTaskExecution({ ...noProgress, progress: { ...progress, trigger: undefined } }), false,
+    "a stopped receipt must name its typed trigger");
+  assert.equal(isTaskExecution({ ...noProgress, progress: { ...progress, repeatedTool: "read_file --token secret" } }), false,
+    "persisted tool identity is restricted to a credential-free name");
+  assert.equal(isTaskExecution({ ...noProgress, progress: { ...progress, tokens: { ...progress.tokens, total: 61 } } }), false,
+    "token totals must remain internally consistent");
 });
 
 test("task rounds persist cumulatively and bounded continuation opens another 100-round tranche", () => {
@@ -588,11 +643,13 @@ test("session task state round-trips separately, redacts secrets, and legacy ses
     });
     assert.equal(decided.ok, true);
     task = decided.task;
+    task = { ...task, progress: stoppedProgress() };
     saveSession(meta, [{ role: "user", content: "continue" }], task);
     const loaded = loadSession(id);
     assert.ok(loaded.task, "new top-level task is restored");
     assert.equal(loaded.task.roundsUsed, 0, "cumulative round usage survives the redacted session copy");
     assert.equal(loaded.task.roundBudgetLimit, 100, "the bounded tranche survives the redacted session copy");
+    assert.deepEqual(loaded.task.progress, stoppedProgress(), "the credential-free progress receipt survives restart");
     assert.equal(loaded.history[0].content, "continue", "transcript remains independent");
     assert.ok(!loaded.task.objective.includes("super-secret-123456"), "task objective is redacted too");
     assert.ok(!JSON.stringify(loaded.task.brief).includes("super-secret-123456"), "interpreted task brief is redacted too");

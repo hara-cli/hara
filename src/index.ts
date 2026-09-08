@@ -360,6 +360,7 @@ import "./tools/todo.js"; // register todo_write (inline task checklist)
 import { clearTodos, disposeTodoScope, restoreTodos, onTodosChange } from "./tools/todo.js"; // scoped session todo persistence
 import "./tools/task.js"; // register task (project-level durable task pool)
 import "./tools/send.js"; // register send_file (self-gates on HARA_GATEWAY — pushes a file to the chat)
+import "./tools/channel-message.js"; // register credential-preserving Feishu/WeChat cross-channel delivery
 import "./tools/external_agent.js"; // register external_agent (delegate to claude-code / codex headless)
 import "./tools/ask_user.js"; // register ask_user (pause mid-turn to ask the user a structured question)
 import "./tools/cron.js"; // register cronjob (model-facing scheduler — "remind me every morning" just works)
@@ -6552,6 +6553,7 @@ program.action(async (opts) => {
         : {}),
       ...(headlessToolFilter ? { toolFilter: headlessToolFilter } : {}),
       hooks: headlessHooks,
+      unattended: true,
       stats,
       guardian: guardianOpt, // safety layer stays on in headless -p (fail-open; breaker aborts, never hangs)
       onProviderTurn: trackHeadlessOperation,

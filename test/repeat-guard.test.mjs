@@ -81,6 +81,20 @@ test("interleaved failures accumulate until a successful action resets the no-pr
   assert.equal(recordCall("bash", { command: "npm test" }, "Command failed: third"), "", "real progress resets the ledger");
 });
 
+test("an unrelated success cannot erase an authentication or authorization boundary", () => {
+  const firstInput = { command: "curl 'https://control.example/api/private?attempt=1'" };
+  const secondInput = { command: "curl 'https://control.example/api/private?attempt=2'" };
+  const failure = "Command failed: HTTP 401 Unauthorized";
+  const first = recordCall("bash", firstInput, failure);
+  assert.match(first, /access boundary.*one registered sign-in\/capability path/is);
+  assert.equal(recordCall("read_file", { path: "README.md" }, "project documentation"), "");
+  const second = recordCall("bash", secondInput, failure);
+  assert.match(second, /persisted across 2 attempts.*stop tool calls now/is);
+  const identity = failureIdentities("bash", secondInput, failure)[0];
+  assert.equal(identity.kind, "access_boundary");
+  assert.equal(identity.hardStopAfter, 2);
+});
+
 test("2nd identical failure warns; 1st doesn't; different args are a different call", () => {
   const args = { command: "git pull origin main" };
   assert.equal(recordCall("bash", args, "Command failed: exit code 128"), "", "first failure: no warning yet");

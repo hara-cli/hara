@@ -24,8 +24,323 @@ cache under the system temporary directory. The same 0.156.1 package dry-run the
 - Related Files: package.json, package-lock.json
 - Tags: npm, cache, permissions, release
 - Pattern-Key: release.npm_pack_uses_task_private_cache
-- Recurrence-Count: 3
-- Last-Seen: 2026-09-03
+- Recurrence-Count: 4
+- Last-Seen: 2026-09-04
+
+---
+
+## [ERR-20260907-SHELL-CANCEL-RACE] Focused cancellation suite observed an unexpected child exit code
+
+**Logged**: 2026-09-07T14:05:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+A focused parallel `node --test` run expected the sandbox foreground command to reject with the runtime's
+cancellation diagnostic, but the child exited first with code 71. The changed credential/task files do not
+touch the sandbox implementation, so this must be isolated and rerun before deciding whether it is a flaky
+test race or a product cancellation regression.
+
+### Error
+
+```text
+Expected /interrupted by agent run deadline or cancellation/; received Error: exit code 71
+```
+
+### Suggested Fix
+
+Run the single cancellation case independently, then the full suite. If reproducible, preserve the first
+authoritative cancellation reason when child exit and abort race instead of replacing it with the raw exit code.
+
+### Metadata
+
+- Reproducible: unknown
+- Related Files: src/sandbox.ts, test/agent-limits.test.mjs
+- Tags: cancellation, subprocess, race, test
+- Pattern-Key: runtime.preserve_cancellation_reason_across_child_exit_race
+
+### Resolution
+
+- **Resolved**: 2026-09-07T14:09:00+08:00
+- **Notes**: The direct `node --test` command ran inside the outer workspace sandbox. macOS therefore rejected
+  Hara's intentional nested `sandbox-exec` with `sandbox_apply: Operation not permitted` (exit 71) before the
+  test's 50 ms abort. This is a test-environment boundary, not a Hara cancellation race; run the full npm gate
+  outside the outer sandbox with the pinned Node toolchain.
+
+---
+
+## [ERR-20260906-AGENT-TEAM-REENTRANT-TEST] Agent lifecycle test callback retriggered itself
+
+**Logged**: 2026-09-06T17:31:27+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+A completion-boundary regression test invoked `followup` from `onChange` before setting its own reentry guard.
+Because `followup` synchronously publishes another state, the callback recursively queued messages until the
+instruction bound was reached and obscured the generation-handoff behavior the test was intended to verify.
+
+### Error
+
+```text
+Agent '/root/boundary' is already queued
+Agent instruction history is full
+```
+
+### Suggested Fix
+
+Set observer/test reentry guards before invoking any lifecycle operation that can synchronously publish another
+event. Keep lifecycle observers non-authoritative and verify the actual queued-generation handoff separately.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: test/agent-team.test.mjs, src/subagent/team.ts
+- Tags: agent-team, lifecycle, reentrancy, tests
+- Pattern-Key: tests.guard_reentrant_lifecycle_observers_before_actions
+
+### Resolution
+
+- **Resolved**: 2026-09-06T17:31:27+08:00
+- **Notes**: Guarded the callback before issuing the follow-up; the test now isolates the terminal-to-queued race.
+
+---
+
+## [ERR-20260906-SANDBOX-PERMISSION-TYPO] Full-test escalation used an invalid permission enum
+
+**Logged**: 2026-09-06T17:31:27+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The first full-test tool request misspelled `require_escalated`, so argument validation rejected the request
+before any command ran.
+
+### Error
+
+```text
+unknown variant `require_escalhema`
+```
+
+### Suggested Fix
+
+Use the exact managed-tool enum `require_escalated` for loopback integration tests.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: none
+- Tags: tooling, sandbox, typo
+- Pattern-Key: tooling.use_exact_sandbox_permission_enum
+
+### Resolution
+
+- **Resolved**: 2026-09-06T17:31:27+08:00
+- **Notes**: Retried with the valid enum; the complete test suite passed.
+
+---
+
+## [ERR-20260906-CODEX-MANUAL-DNS] Codex manual fetch was blocked by restricted DNS
+
+**Logged**: 2026-09-06T15:00:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: docs
+
+### Summary
+
+The official Codex manual helper could not resolve `developers.openai.com` from the restricted shell even
+though the product documentation was reachable through the approved web retrieval tool.
+
+### Error
+
+```text
+curl: (6) Could not resolve host: developers.openai.com
+```
+
+### Context
+
+- Operation: fetch the current broad Codex manual before a source-level feature audit.
+- Environment: restricted local shell network; official web retrieval remained available.
+
+### Suggested Fix
+
+Treat shell DNS failure as an environment limitation, not missing documentation. Use the approved official
+web retrieval path for public product claims and the locally checked-out Codex source for implementation
+semantics.
+
+### Metadata
+
+- Reproducible: yes in the restricted shell
+- Related Files: docs/codex-runtime-learning-audit.md
+- Tags: codex, docs, dns, sandbox
+- Pattern-Key: docs.use_approved_retrieval_when_shell_dns_is_restricted
+
+### Resolution
+
+- **Resolved**: 2026-09-06T15:00:00+08:00
+- **Notes**: Continued with the already-fetched official Remote documentation and local Codex source audit.
+
+---
+
+## [ERR-20260906-SHARED-WORKSPACE-PATCH-RACE] Atomic patch used stale shared-workspace context
+
+**Logged**: 2026-09-06T00:45:01+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tooling
+
+### Summary
+
+A multi-file `apply_patch` was rejected atomically because a stopped development window completed its final
+provider-retry edits in the shared worktree after inspection but before the patch was applied.
+
+### Error
+
+```text
+apply_patch verification failed: Failed to find expected lines in src/providers/openai.ts
+```
+
+### Suggested Fix
+
+After taking over a shared worktree, verify file modification times have stabilized and apply small,
+single-file patches against freshly read context. The rejected patch was atomic, so no partial edits landed.
+
+### Metadata
+
+- Reproducible: only during concurrent tail writes
+- Related Files: src/providers/openai.ts, src/providers/responses.ts, src/agent/loop.ts
+- See Also: existing apply-patch context mismatch entries in this file
+- Tags: tooling, shared-worktree, apply-patch, concurrency
+- Pattern-Key: editing.refresh_context_after_shared_worktree_handoff
+
+### Resolution
+
+- **Resolved**: 2026-09-06T00:45:01+08:00
+- **Notes**: Re-read the final files and resumed with isolated patches.
+
+---
+
+## [ERR-20260904-NPM-AUDIT-ENDPOINT-TIMEOUT] Official npm audit endpoint timed out during release gate
+
+**Logged**: 2026-09-04T10:32:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: dependency security
+
+### Summary
+
+The first production-dependency audit reached the official npm registry but the quick-audit endpoint returned
+no response before npm's network deadline. Builds, tests, and package inspection were unaffected.
+
+### Error
+
+```text
+npm warn audit network timeout at: https://registry.npmjs.org/-/npm/v1/security/audits/quick
+npm error audit endpoint returned an error
+```
+
+### Suggested Fix
+
+Keep the official registry and retry the same production-only audit with bounded extended fetch timeout and
+retry settings. Do not substitute a mirror or waive the release gate.
+
+### Metadata
+
+- Reproducible: intermittent
+- Related Files: package-lock.json
+- Tags: npm, audit, network, release
+
+### Resolution
+
+- **Resolved**: 2026-09-04T10:44:00+08:00
+- **Notes**: The same official endpoint completed with the bounded retry and reported zero vulnerabilities.
+
+---
+
+## [ERR-20260904-NPM-PACK-CACHE-SANDBOX] npm dry-run pack could not open the user cache in the sandbox
+
+**Logged**: 2026-09-04T10:24:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release tooling
+
+### Summary
+
+The release `npm pack --dry-run` build completed, but npm could not create its temporary cache entry while
+running inside the workspace sandbox. Its generic root-ownership suggestion was not acted on because changing
+the whole user cache was unnecessary and too broad.
+
+### Error
+
+```text
+npm error code EPERM
+npm error syscall open
+npm error path /Users/zhujianbo/.npm/_cacache/tmp/...
+```
+
+### Suggested Fix
+
+Rerun the exact bounded `npm pack --dry-run --json` gate outside the filesystem sandbox instead of mutating
+ownership of the user's npm cache.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: package.json, package-lock.json
+- Tags: npm, pack, cache, sandbox, release
+
+### Resolution
+
+- **Resolved**: 2026-09-04T10:25:00+08:00
+- **Notes**: Retried only the dry-run package gate through the approved release boundary.
+
+---
+
+## [ERR-20260903-GIT-BRANCH] Push targeted a nonexistent default branch
+
+**Logged**: 2026-09-03T01:16:54+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release
+
+### Summary
+
+`git push origin master` failed because this repository's active default branch is `main`.
+
+### Error
+
+```
+error: src refspec master does not match any
+```
+
+### Context
+
+- A deterministic release-test hardening commit had already succeeded locally.
+- The failed push did not alter the immutable `v0.164.1` tag or any remote ref.
+
+### Suggested Fix
+
+Resolve the active branch before pushing, or use `git push origin HEAD` when the current branch is the
+intended remote branch.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: .git/config
+- Tags: git, release, branch
+
+### Resolution
+
+- **Resolved**: 2026-09-03T01:16:54+08:00
+- **Commit/PR**: 7fee136
+- **Notes**: Pushed the current `main` branch with `git push origin HEAD`.
 
 ---
 
@@ -7461,9 +7776,8 @@ permitted 127.0.0.1`, causing many unrelated tests to fail with one environmenta
 
 ### Resolution
 
-Keep the tests strict and rerun the identical full suite in the approved loopback-capable release runner.
-That run passed all 1441 tests. Do not weaken localhost integration coverage to accommodate the outer
-sandbox.
+Keep the tests strict and rerun the identical suite in the approved loopback-capable release runner. Do not
+weaken localhost integration coverage to accommodate the outer sandbox.
 
 ### Metadata
 
@@ -7472,8 +7786,8 @@ sandbox.
 - Related Files: test/deepseek-factory.test.mjs, test/web.test.mjs, test/wecom-gateway.test.mjs, test/serve-agent-identity.test.mjs
 - Tags: tests, sandbox, loopback, websocket, http
 - Pattern-Key: tests.loopback_fixtures_require_release_runner
-- Recurrence-Count: 3
-- Last-Seen: 2026-09-02
+- Recurrence-Count: 5
+- Last-Seen: 2026-09-09
 
 ---
 
@@ -7491,8 +7805,8 @@ ownership of the whole workstation cache would have been unnecessarily broad.
 
 ### Resolution
 
-Use a task-specific private `NPM_CONFIG_CACHE` created under `/private/tmp` for packaging. The dry run then
-completed with the expected 0.152.2 manifest and integrity receipt.
+Use a task-specific private `NPM_CONFIG_CACHE` created under `/private/tmp` for packaging. This avoids
+mutating the workstation-wide cache and has been reused for subsequent release dry runs.
 
 ### Metadata
 
@@ -7501,7 +7815,82 @@ completed with the expected 0.152.2 manifest and integrity receipt.
 - Related Files: package.json, package-lock.json
 - Tags: npm, packaging, cache, permissions
 - Pattern-Key: release.use_private_npm_cache_when_shared_cache_is_unsafe
-- Recurrence-Count: 3
-- Last-Seen: 2026-08-29
+- Recurrence-Count: 4
+- Last-Seen: 2026-09-09
+
+---
+
+## [ERR-20260906-SESSION-JOURNAL-WATERMARK] Journal creation invalidated the session-directory watermark
+
+**Logged**: 2026-09-06T00:58:00+08:00
+**Priority**: medium
+**Status**: resolved
+**Area**: persistence
+
+### Summary
+
+The new projection journal was appended after the current-writer directory watermark had been advanced.
+Creating a session's first journal file changed the directory state, so the next CLI process performed an
+unnecessary legacy metadata sweep and rewrote the migration marker.
+
+### Error
+
+```text
+a durable migration marker prevents a new CLI process from sweeping transcripts again
+expected migration marker to remain unchanged
+```
+
+### Suggested Fix
+
+Complete every directory-changing artifact for a committed snapshot before advancing the trusted writer
+watermark. Keep the transcript authoritative and journal failure best effort.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src/session/store.ts, test/session.test.mjs
+- Tags: persistence, journal, migration, watermark, ordering
+- Pattern-Key: persistence.advance_directory_watermark_after_all_snapshot_artifacts
+
+### Resolution
+
+- **Resolved**: 2026-09-06T00:58:00+08:00
+- **Notes**: Moved journal append before the watermark update; isolated session and task suites passed 59/59.
+
+---
+
+## [ERR-20260906-EVENT-LIMIT-CONTRACT] Serve capability limit fixture omitted new replay bounds
+
+**Logged**: 2026-09-06T15:20:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: tests
+
+### Summary
+
+The WebSocket integration suite correctly failed after event replay added three advertised resource bounds,
+because one exact capability-contract fixture still expected the older limits object.
+
+### Error
+
+```text
+Expected values to be strictly deep-equal: actual included eventReplayEvents, eventReplayBytes, and eventReplayPage.
+```
+
+### Suggested Fix
+
+Keep exact capability assertions and update them whenever an additive negotiated resource limit is introduced.
+
+### Metadata
+
+- Reproducible: yes
+- Related Files: src/serve/server.ts, test/serve-e2e.test.mjs
+- Tags: serve, websocket, capabilities, replay
+- Pattern-Key: tests.update_exact_capability_contract_with_new_limits
+
+### Resolution
+
+- **Resolved**: 2026-09-06T15:20:00+08:00
+- **Notes**: Added the three bounded replay limits to the exact integration fixture.
 
 ---

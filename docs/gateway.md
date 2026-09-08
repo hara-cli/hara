@@ -52,7 +52,7 @@ model or consume tokens.
   `~/.hara/workspace`, so a full-auto chat bot never lands on a real repo by accident.
 - Each `(chat × directory)` is a stable, resumable session. In-chat slash commands:
   `/help` · `/pwd` · `/cd <dir>` · `/new` · `/sessions` · `/resume <id>` ·
-  `/agent <name|project:name|main>` · `/coding help` · `/remote send <text>` · `/voice` · `/say <text>` ·
+  `/agent <name|project:name|main>` · `/bridge help` · `/coding help` · `/remote send <text>` · `/voice` · `/say <text>` ·
   `/send <path>` · `/detach`.
   `/agent` uses the host's `hara agents` index. A bare name prefers an override in the current project;
   `project:name` pins the thread to that registered home and `/agent main` returns to the previous project/thread.
@@ -114,7 +114,38 @@ model or consume tokens.
 
 The full coding agent is a **direct-message driver only** and each authorized DM run uses
 `--approval full-auto`, so set `--cwd` deliberately. Group/room traffic never falls through to that driver; it is ignored
-unless an explicit flow rule matches it. Unknown chat shapes fail closed as group traffic.
+unless an explicit flow rule or channel bridge matches it. Unknown chat shapes fail closed as group traffic.
+
+## Feishu ↔ WeChat channel bridge
+
+Hara has a native cross-channel capability; installing a separate Feishu CLI is neither required nor a valid
+capability check. A WeChat-driven Hara turn can call the eager `channel_message` tool and address either an
+explicit `feishu:<chatId>` or a saved `bridge:<name>`. If the Feishu App credentials belong only to the live
+Feishu daemon, Hara writes a bounded private request to that exact credential-scoped process. The Feishu
+gateway sends through its already-authenticated adapter and returns a receipt. The App ID/Secret never enter
+the WeChat process, model context, tool result, or queue.
+
+To forward ordinary messages from one Feishu group to colleagues' Hara WeChat DMs:
+
+1. Keep both the Feishu and WeChat gateways running on the same Hara device/profile.
+2. In the source Feishu group, the configured gateway owner sends `/bridge on 公司通知`.
+3. Each colleague opts in from their own authorized Hara WeChat DM with `/bridge join 公司通知`. They may use
+   `/bridge join 公司通知 --as 张三` to save a human-readable colleague association when WeChat exposes only an opaque peer id.
+4. Later Feishu group messages are delivered to those subscribed WeChat peers. `/bridge leave 公司通知`
+   removes only the current person's subscription; `/bridge remove 公司通知 confirm` in the source group
+   removes the bridge and every subscription (owner only).
+
+`/bridge list` shows names and subscriber counts, never Feishu chat ids or WeChat peer ids. Merely messaging
+the bot or appearing in `HARA_GATEWAY_ALLOWED` is not subscription consent, so Hara never broadcasts to all
+known contacts. Source groups are exact, delivery effects are deduplicated per inbound message, and
+Hara-origin provenance messages are not bridged back, preventing loops. This first version forwards plain
+text and attachment markers; it does not download or duplicate group attachment bytes.
+
+Cross-process requests and receipts are owner-only (`0600`), capped at 512 items and 64 KiB per text, and
+pruned after 24 hours. A stable opaque idempotency key is reused after a target-gateway restart. If no target
+gateway is live, Hara says so; if more than one Feishu account is connected, it refuses to guess which company
+tenant should send. A `queued` tool result means the request exists but delivery was not confirmed and must
+not be reported as sent.
 
 ## Group automations (`~/.hara/flows.json`)
 
@@ -302,7 +333,7 @@ HARA_FEISHU_APP_ID=cli_… HARA_FEISHU_APP_SECRET=… HARA_GATEWAY_ALLOWED=<your
 ```
 
 Direct messages drive the full coding session. Group events and @mentions are surfaced only to matching flow
-rules; they never fall through to the full coding agent. The long-connection callback first writes each event
+rules and explicitly enabled `/bridge` subscriptions; they never fall through to the full coding agent. The long-connection callback first writes each event
 to a private bounded durable spool and returns within Feishu's three-second ACK window; four workers process it
 afterward. The spool survives restart, holds at most 128 events/2 MiB (128 KiB each), retries with exponential
 backoff at most five times, and emits one terminal alert when attempts are exhausted. A completed item is

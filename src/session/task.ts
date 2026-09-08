@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { RunOutcome } from "../agent/loop.js";
+import type { RunOutcome, RunProgressEvent } from "../agent/loop.js";
 import type { Todo } from "../tools/todo.js";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
 
@@ -190,6 +190,8 @@ export interface TaskExecution {
   steering?: TaskSteering[];
   /** Verified structured answers retained outside the model-controlled transcript window. */
   decisions?: TaskDecision[];
+  /** Last Engine-owned credential-free progress receipt, retained only for an unfinished task. */
+  progress?: RunProgressEvent;
 }
 
 function iso(at: Date | string = new Date()): string {
@@ -858,10 +860,11 @@ export function continueTaskExecution(
   const roundBudgetLimit = budget.used >= budget.limit
     ? nextTaskRoundBudgetLimit(budget.limit)
     : budget.limit;
+  const { progress: _previousProgress, ...taskWithoutProgress } = task;
   return {
     ok: true,
     task: {
-      ...task,
+      ...taskWithoutProgress,
       ...(task.checkpoint
         ? { checkpoint: { ...task.checkpoint, completion: undefined, updatedAt: now } }
         : {}),
@@ -1166,6 +1169,8 @@ export function finishTaskExecution(
           || outcome.stopReason === "task_round_budget"
           || outcome.stopReason === "max_rounds"
           || outcome.stopReason === "strategy_stall"
+          || outcome.stopReason === "no_progress"
+          || outcome.stopReason === "repeat_loop"
           || outcome.stopReason === "completion_verification"
         )
         ? "paused"
@@ -1187,11 +1192,24 @@ export function finishTaskExecution(
     capabilities: { ...prior.capabilities },
     updatedAt: now,
   };
+  const progressPause = outcome?.status === "halted"
+    && (outcome.stopReason === "no_progress" || outcome.stopReason === "repeat_loop");
   if (status === "completed") {
     delete checkpoint.currentStep;
     delete checkpoint.blockedStep;
     delete checkpoint.blockReason;
     delete checkpoint.nextStep;
+  } else if (progressPause) {
+    checkpoint.currentStep = boundedText(
+      current?.activeForm || current?.text || checkpoint.currentStep || "review the stalled strategy",
+      MAX_TASK_CHECKPOINT_STEP_CHARS,
+    );
+    checkpoint.blockedStep = checkpoint.currentStep;
+    checkpoint.blockReason = boundedText(
+      outcome.error ?? "Hara paused repeated tool work that was not producing durable progress",
+      MAX_TASK_CHECKPOINT_STEP_CHARS,
+    );
+    checkpoint.nextStep = "Resume only after selecting a materially different strategy or resolving the named boundary";
   } else if (current) {
     checkpoint.currentStep = boundedText(current.activeForm || current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
     checkpoint.nextStep ??= boundedText(current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
@@ -1221,7 +1239,18 @@ export function finishTaskExecution(
       );
     }
   }
-  return { ...task, status, lastOutcome, checkpoint, updatedAt: now, endedAt: now };
+  const { progress: _previousProgress, ...taskWithoutProgress } = task;
+  return {
+    ...taskWithoutProgress,
+    status,
+    lastOutcome,
+    checkpoint,
+    updatedAt: now,
+    endedAt: now,
+    ...(status !== "completed" && outcome?.progress
+      ? { progress: structuredClone(outcome.progress) }
+      : {}),
+  };
 }
 
 /** A process died while this task was running. Recovery is explicit and never claims success. */
@@ -1498,6 +1527,57 @@ function validTaskCheckpoint(value: unknown): value is TaskCheckpoint {
   return true;
 }
 
+function validTaskProgress(value: unknown): value is RunProgressEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const progress = value as Record<string, unknown>;
+  const integer = (item: unknown): item is number => Number.isSafeInteger(item) && (item as number) >= 0;
+  const tokens = progress.tokens as Record<string, unknown> | undefined;
+  const todo = progress.todo as Record<string, unknown> | undefined;
+  const triggerValid = progress.trigger === undefined || [
+    "repeated_tool_call",
+    "similar_tool_evidence",
+    "unattended_without_checkpoint",
+    "unattended_token_budget",
+  ].includes(progress.trigger as string);
+  return (
+    (progress.state === "working" || progress.state === "warning" || progress.state === "stopped")
+    && triggerValid
+    && ((progress.state === "stopped") === (progress.trigger !== undefined))
+    && integer(progress.toolCalls)
+    && integer(progress.unattendedRounds)
+    && integer(progress.evidenceStaleRounds)
+    && integer(progress.noProgressRounds)
+    && integer(progress.checkpointStaleRounds)
+    && typeof progress.checkpointAdvanced === "boolean"
+    && (progress.similarity === undefined
+      || (typeof progress.similarity === "number" && Number.isFinite(progress.similarity)
+        && progress.similarity >= 0 && progress.similarity <= 1))
+    && (progress.repeatedTool === undefined
+      || (typeof progress.repeatedTool === "string" && /^[A-Za-z0-9_.:-]{1,128}$/u.test(progress.repeatedTool)))
+    && (progress.repeatedCount === undefined || integer(progress.repeatedCount))
+    && Boolean(tokens)
+    && integer(tokens?.input)
+    && integer(tokens?.output)
+    && integer(tokens?.total)
+    && tokens?.total === (tokens?.input as number) + (tokens?.output as number)
+    && Boolean(todo)
+    && integer(todo?.done)
+    && integer(todo?.total)
+    && (todo?.done as number) <= (todo?.total as number)
+    && integer(todo?.unchangedRounds)
+    && typeof todo?.advanced === "boolean"
+    && integer(progress.rounds)
+    && integer(progress.maxRounds)
+    && (progress.maxRounds as number) > 0
+    && (progress.rounds as number) <= (progress.maxRounds as number)
+    && integer(progress.cumulativeTaskRounds)
+    && (progress.taskRoundLimit === undefined || (
+      integer(progress.taskRoundLimit)
+      && (progress.cumulativeTaskRounds as number) <= (progress.taskRoundLimit as number)
+    ))
+  );
+}
+
 export function isTaskExecution(value: unknown): value is TaskExecution {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const task = value as Record<string, unknown>;
@@ -1529,6 +1609,7 @@ export function isTaskExecution(value: unknown): value is TaskExecution {
     ) return false;
   }
   if (task.checkpoint !== undefined && !validTaskCheckpoint(task.checkpoint)) return false;
+  if (task.progress !== undefined && !validTaskProgress(task.progress)) return false;
   if (task.decisions !== undefined) {
     if (!Array.isArray(task.decisions) || task.decisions.length > MAX_TASK_DECISIONS) return false;
     const seenDecisionIds = new Set<string>();

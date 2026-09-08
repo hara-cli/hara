@@ -25,7 +25,7 @@ import { basename, isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { pruneStoredToolResults } from "../tools/result-limit.js";
 import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
-import { runAgent, type RunOpts } from "../agent/loop.js";
+import { runAgent, type RunOpts, type RunProgressEvent } from "../agent/loop.js";
 import {
   COMPACT_SYSTEM,
   autoCompactTokenCap,
@@ -2207,7 +2207,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     taskId: string;
     turnId: string;
     status?: "paused";
-    stopReason?: "deadline" | "task_round_budget" | "max_rounds" | "strategy_stall";
+    stopReason?: "deadline" | "task_round_budget" | "max_rounds" | "strategy_stall" | "no_progress" | "repeat_loop";
   }> => {
     const sessionId = s.meta.id;
     const runtimeStartedAt = Date.now();
@@ -2275,6 +2275,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     broadcast("event.turn_start", { sessionId, taskId: s.task.id, turnId: s.task.turnId });
     runtimeLog("turn.started", { sessionId });
     emitTaskState({ state: "running", phase: "starting" });
+    let lastRunProgress: RunProgressEvent | undefined;
     let historyStart = s.history.length;
     const before = { input: s.stats.input, output: s.stats.output };
     const sink: UiSink = {
@@ -2611,7 +2612,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           return [];
         },
         stats: s.stats,
+        // Serve powers Desktop/Mobile and may keep working after the operator leaves the screen. Pending
+        // steering resets its watchdog window, but silence must never permit a 50–110 round churn loop.
+        unattended: true,
         signal: turnAbort.signal,
+        onProgress: (progress) => {
+          lastRunProgress = progress;
+          emitTaskState({
+            state: "running",
+            phase: progress.state === "working" ? "tool" : "checkpoint",
+            detail: `Round ${progress.rounds}/${progress.maxRounds} · ${progress.tokens.total} tokens · todo ${progress.todo.done}/${progress.todo.total}`,
+            progress,
+          }, serializeTodos(sessionId));
+        },
+        onLimit: (event) => {
+          if (event.progress) lastRunProgress = event.progress;
+          emitTaskState({
+            state: "running",
+            phase: "stopping",
+            detail: event.message,
+            ...(event.progress ? { progress: event.progress } : {}),
+          }, serializeTodos(sessionId));
+        },
         onProviderTurn: (turn) => observeProviderTurn(s, turn),
         onProviderRetry: (event) => runtimeLog("provider.retry_scheduled", {
           sessionId: s.meta.id,
@@ -2636,7 +2658,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       s.meta.todos = serializeTodos(sessionId);
       s.task = finishTaskExecution(s.task, outcome, s.meta.todos, turnAbort.signal.aborted);
       hub.save(s);
-      emitTaskState({ phase: "finished" }, s.meta.todos);
+      emitTaskState({
+        phase: "finished",
+        ...(lastRunProgress ? { progress: lastRunProgress } : {}),
+      }, s.meta.todos);
       if (outcome.status !== "completed") {
         const usage = { input: s.stats.input - before.input, output: s.stats.output - before.output };
         // context watermark rides along with every turn end (codex thread/tokenUsage/updated pattern) —
@@ -2652,6 +2677,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           || outcome.stopReason === "task_round_budget"
           || outcome.stopReason === "max_rounds"
           || outcome.stopReason === "strategy_stall"
+          || outcome.stopReason === "no_progress"
+          || outcome.stopReason === "repeat_loop"
         )) {
           // A bounded lifecycle pause is a successful, recoverable checkpoint transition. The typed
           // task event already says `paused`; returning a normal RPC result keeps Desktop and other Serve

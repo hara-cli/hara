@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "id": "unattended-no-progress-hard-pause",
+  "traceKind": "sanitized-feedback",
+  "source": {
+    "channel": "hara-feedback",
+    "reference": "redacted-2026-09-unattended-no-progress"
+  },
+  "expected": {
+    "outcome": "paused",
+    "maxRounds": 8,
+    "maxToolCalls": 8,
+    "maxApprovals": 0,
+    "maxUserInterventions": 0,
+    "maxRepeatedFailureAttempts": 0,
+    "requiredStrategies": ["parameter-churn"],
+    "requiredTransitions": [],
+    "requiredPauseTrigger": "unattended_without_checkpoint"
+  },
+  "observed": {
+    "outcome": "paused",
+    "rounds": 8,
+    "completion": {
+      "state": "paused",
+      "evidence": ["eight unattended rounds produced no new checkpoint evidence or completed todo"],
+      "trigger": "unattended_without_checkpoint"
+    },
+    "events": [
+      { "type": "tool_result", "tool": "workspace_probe", "strategy": "parameter-churn", "outcome": "success" },
+      { "type": "tool_result", "tool": "workspace_probe", "strategy": "parameter-churn", "outcome": "success" },
+      { "type": "tool_result", "tool": "workspace_probe", "strategy": "parameter-churn", "outcome": "success" },
+      { "type": "tool_result", "tool": "workspace_probe", "strategy": "parameter-churn", "outcome": "success" },
+      { "type": "tool_result", "tool": "workspace_probe", "strategy": "parameter-churn", "outcome": "success" },
+      { "type": "tool_result", "tool": "workspace_probe", "strategy": "parameter-churn", "outcome": "success" },
+      { "type": "tool_result", "tool": "workspace_probe", "strategy": "parameter-churn", "outcome": "success" },
+      { "type": "tool_result", "tool": "workspace_probe", "strategy": "parameter-churn", "outcome": "success" }
+    ]
+  }
+}

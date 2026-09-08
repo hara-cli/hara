@@ -5,7 +5,7 @@
 // (iLink only uses crypto for media upload/download, which v1 doesn't do).
 import { homedir } from "node:os";
 import { randomBytes, randomUUID, createHash, createCipheriv, createDecipheriv } from "node:crypto";
-import { chunkText, type ChatAdapter, type InboundMsg } from "./telegram.js";
+import { chunkText, PerChatOutboundLane, type ChatAdapter, type InboundMsg } from "./telegram.js";
 import type { OutboundFilePayload } from "./outbound-files.js";
 import {
   INBOUND_MEDIA_MAX_BYTES,
@@ -665,8 +665,21 @@ export async function weixinLogin(timeoutSeconds = 480): Promise<WeixinCreds | n
   return null;
 }
 
-async function sendChunk(creds: WeixinCreds, tokenStore: TokenStore, peer: string, text: string): Promise<void> {
-  const clientId = `hara-weixin-${randomUUID().replace(/-/g, "")}`; // reused across the -14 retry for dedup
+export function weixinClientId(idempotencyKey?: string): string {
+  const suffix = idempotencyKey
+    ? createHash("sha256").update("hara-weixin-idempotency-v1\0").update(idempotencyKey).digest("hex").slice(0, 32)
+    : randomUUID().replace(/-/g, "");
+  return `hara-weixin-${suffix}`;
+}
+
+async function sendChunk(
+  creds: WeixinCreds,
+  tokenStore: TokenStore,
+  peer: string,
+  text: string,
+  idempotencyKey?: string,
+): Promise<void> {
+  const clientId = weixinClientId(idempotencyKey); // reused across retries/restarts when the caller has a stable effect id
   const post = (ctx: string | undefined): Promise<any> =>
     apiPost(creds.base_url, EP.sendMessage, buildSendBody(peer, text, ctx, clientId), creds.token, API_TIMEOUT_MS).catch((e) => ({ ret: 1, errmsg: String(e?.message ?? e) }));
   let resp = await post(tokenStore.get(peer));
@@ -852,6 +865,7 @@ export async function sendMediaFile(creds: WeixinCreds, tokenStore: TokenStore, 
 
 export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
   const tokenStore = new TokenStore(creds.account_id);
+  const outbound = new PerChatOutboundLane("weixin", creds.account_id);
   // Reuse parseWeixinMessage for text/voice-transcription, then download any image/file/voice media and append
   // a `[kind: localpath]` reference so hara can read the file. Handles media-only messages (no text) too.
   const buildInbound = async (
@@ -914,12 +928,21 @@ export function weixinAdapter(creds: WeixinCreds): ChatAdapter {
   };
   return {
     name: "weixin",
-    async send(chatId, text) {
+    async send(chatId, text, _signal, idempotencyKey) {
       const peer = String(chatId);
-      for (const part of chunkText(text || "(empty)")) await sendChunk(creds, tokenStore, peer, part);
+      await outbound.run(peer, async () => {
+        for (const [index, part] of chunkText(text || "(empty)").entries()) {
+          await sendChunk(creds, tokenStore, peer, part, idempotencyKey ? `${idempotencyKey}:${index}` : undefined);
+        }
+      });
     },
     async sendFile(chatId, file) {
-      if (!(await sendMediaFile(creds, tokenStore, String(chatId), file))) throw new Error(`weixin file delivery failed: ${file.safeName}`);
+      const peer = String(chatId);
+      await outbound.run(peer, async () => {
+        if (!(await sendMediaFile(creds, tokenStore, peer, file))) {
+          throw new Error(`weixin file delivery failed: ${file.safeName}`);
+        }
+      });
     },
     async start(onMessage, signal, shouldDownload, runtime) {
       let buf = loadCursor(creds.account_id);

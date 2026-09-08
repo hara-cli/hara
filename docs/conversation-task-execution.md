@@ -108,3 +108,40 @@ and loop guards.
 “Self-improvement” should likewise be evidence-driven: record recurring failures, add a regression, change a
 policy/prompt/runtime component, and measure it. Hara must not silently rewrite its own core prompt or grant
 itself broader permissions.
+
+## 5. Engine-owned progress and bounded pauses
+
+A successful tool receipt is not automatically progress. Hara maintains a run-local watchdog that stores only
+digests and bounded text shingles—never raw prompts, arguments, results, paths, or credentials—and compares both
+observable evidence and durable task state:
+
+```text
+tool round
+  -> compare successful evidence fingerprints
+  -> compare task facts/artifacts/capabilities/completion
+  -> compare newly completed todos
+  -> publish credential-free progress counters
+  -> continue | warn | pause
+```
+
+The fourth substantially unchanged repeat of the same successful call pauses the run. Six consecutive rounds
+of more than 80% similar successful evidence also pause it. For Serve/Desktop/Mobile, headless print, gateway,
+cron, and native subagent work, five rounds without a genuinely new checkpoint or completed todo raise one
+warning; eight pause the run. If the same unattended window consumes 200,000 input/output tokens without durable
+progress, it pauses after at least four stale rounds. A live user steer resets the unattended window.
+
+Only new observed evidence counts: a new fact value/evidence receipt, artifact, capability state, completion
+receipt, or newly completed todo. Rewriting `current_step`, resaving an identical fact, or changing command
+offsets/temp names does not reset the gate. Conversely, a genuine checkpoint clears evidence-similarity streaks,
+so long healthy work is not killed because `task_checkpoint` returned the same boilerplate receipt. Explicit
+status progress such as a changed percentage, completed/processed count, or `done/total` ratio remains new
+evidence even when the surrounding status prose is unchanged; bare offsets and line numbers do not.
+
+Authentication and authorization boundaries are state, not search problems. After the first 401/403 the Agent
+gets one bounded chance to use a supported sign-in/capability route. An unrelated successful read does not erase
+that boundary; a second access-boundary attempt pauses the task with the reason preserved.
+
+`no_progress` and repeated-loop outcomes are resumable `paused` task states. Serve emits the stop reason plus
+round, tool-call, token, todo, similarity, and checkpoint-age counters through `event.task_state.progress`.
+Desktop and Mobile should render this typed object and the persisted blocker/next step; they must not infer
+progress by parsing terminal prose.

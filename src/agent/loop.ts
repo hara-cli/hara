@@ -10,7 +10,6 @@ import {
   type ToolOperationTraits,
 } from "../tools/registry.js";
 import { limitToolResultBatch } from "../tools/result-limit.js";
-import { createHash } from "node:crypto";
 import { stdout } from "node:process";
 import { hostname as executionHostname } from "node:os";
 import { c, out } from "../ui.js";
@@ -34,12 +33,17 @@ import {
 import { classifyRisk, guardianVeto, guardianEnabled, newBreaker, recordBlock, type BreakerState } from "../security/guardian.js";
 import {
   failureIdentities,
-  keyOf,
   looksFailed,
   pythonSyntaxDiagnostic,
   pythonSyntaxRecoveryNote,
   recordCall,
 } from "./repeat-guard.js";
+import {
+  AgentProgressWatchdog,
+  UNATTENDED_PROGRESS_STOP_ROUNDS,
+  type ProgressObservation,
+  type ProgressState,
+} from "./progress-watchdog.js";
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration, MAX_AGENT_MAX_ROUNDS } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint } from "./failover.js";
@@ -206,6 +210,14 @@ change something (arguments / approach / tool) before trying again. After two fa
 approach, stop and re-plan from what you learned. Hand work to the user only when a current, observed blocker
 fits one of the engine's typed human dependencies; record it with task_checkpoint and state concisely what you
 tried and what the errors said. Repeating a failed action hoping for a different result is how sessions die.
+Treat a successful tool result that is substantially the same as earlier evidence as no progress too. Do not
+change offsets, temporary names, command fragments, or checkpoint wording merely to keep calling tools. In an
+unattended run, record a task_checkpoint with genuinely new observed evidence or advance a todo within five
+working rounds; Hara will pause the turn if eight rounds pass without either. On the first authentication,
+authorization, login, or visibility boundary, state the boundary honestly and use one bounded supported
+recovery path; do not probe variants for dozens of rounds. When several safe approaches are available and no
+external business fact is missing, choose the best one yourself and explain the choice instead of asking the
+user to decide between A/B/C options.
 Execution ownership is a product contract: when the accepted intent is change and the requested action is in
 scope, authorized, supported by an available tool, and risk-controlled by the existing approval gates, YOU
 must execute it and verify the result. Do not end with tutorials, commands, checklists, or “you can do this”
@@ -506,6 +518,11 @@ export interface RunOpts {
   /** Continue a healthy, checkpointed task into another bounded round tranche. Defaults on for main tasks;
    * repeat/no-progress guards, the active deadline, and the absolute 256-round ceiling remain hard stops. */
   autoContinue?: boolean;
+  /** No live operator is expected to steer this run. Enables the stricter checkpoint/todo/token watchdog
+   * used by gateway, cron, print, and background Agent execution. */
+  unattended?: boolean;
+  /** Per-tool-round credential-free progress telemetry for Desktop/Mobile. */
+  onProgress?: (event: RunProgressEvent) => void;
   /** One-shot observer for a hard lifecycle stop. Messages contain metadata only, never prompts/tool args. */
   onLimit?: (event: RunLimitEvent) => void;
   /** Observe each provider Promise's physical lifetime. The agent loop races cancellation against providers
@@ -538,9 +555,18 @@ export interface RunOutcome {
   status: "completed" | "error" | "empty" | "halted";
   error?: string;
   stopReason?: RunStopReason;
+  /** Present for Engine-owned progress/repeat pauses so task snapshots can restore the safe metrics. */
+  progress?: RunProgressEvent;
 }
 
-export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "strategy_stall" | "task_round_budget" | "completion_verification";
+export type RunStopReason = "deadline" | "max_rounds" | "repeat_loop" | "no_progress" | "strategy_stall" | "task_round_budget" | "completion_verification";
+
+export interface RunProgressEvent extends ProgressState {
+  rounds: number;
+  maxRounds: number;
+  cumulativeTaskRounds: number;
+  taskRoundLimit?: number;
+}
 
 export interface RunLimitEvent {
   kind: RunStopReason;
@@ -549,24 +575,11 @@ export interface RunLimitEvent {
   rounds: number;
   timeoutMs: number;
   maxRounds: number;
+  progress?: RunProgressEvent;
 }
 
 const RUN_STOPPED = Symbol("agent-run-stopped");
 const REPEATED_FAILURE_LIMIT = 3;
-const NO_PROGRESS_NUDGE_ROUNDS = 2;
-const NO_PROGRESS_STOP_ROUNDS = 6;
-const NO_CHECKPOINT_NUDGE_ROUNDS = 8;
-const MAX_PROGRESS_OBSERVATIONS = 512;
-
-/** Keep successful-call observations opaque and run-local. Tool arguments/results can contain project data;
- *  only their digest is retained for loop detection, never logged or persisted. */
-function successfulObservationKey(name: string, input: unknown, content: string): string {
-  return createHash("sha256")
-    .update(keyOf(name, input))
-    .update("\0")
-    .update(content)
-    .digest("hex");
-}
 
 function recoverableMalformedToolCall(error: string | undefined): boolean {
   return /(?:Tool call dropped — .*arguments were incomplete|Responses generation was incomplete)/iu.test(error ?? "");
@@ -594,6 +607,7 @@ interface RunLifecycle {
   limitAnnounced: boolean;
   disposed: boolean;
   failedCalls: Map<string, number>;
+  failedCallKinds: Map<string, ReturnType<typeof failureIdentities>[number]["kind"]>;
   pythonSyntaxRecovery?: {
     file: string;
     label: string;
@@ -823,6 +837,7 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
     limitAnnounced: false,
     disposed: false,
     failedCalls: new Map<string, number>(),
+    failedCallKinds: new Map(),
     taskRoundsUsed: taskBudget?.used ?? 0,
     taskRoundsCommitted: 0,
     ...(taskBudget ? {
@@ -845,9 +860,25 @@ function hardStop(
   opts: RunOpts,
   life: RunLifecycle,
   kind: RunStopReason,
-  detail?: { label?: string; count?: number; mode?: "failure" | "no_progress" },
+  detail?: {
+    label?: string;
+    count?: number;
+    mode?: "failure" | "no_progress";
+    progress?: RunProgressEvent;
+  },
 ): RunOutcome {
   const elapsedMs = runActiveElapsedMs(life);
+  const progress = detail?.progress;
+  const progressFacts = progress
+    ? [
+        `round ${progress.rounds}/${progress.maxRounds}`,
+        `${progress.toolCalls} tool call(s)`,
+        `${progress.tokens.total} token(s) in this run`,
+        progress.todo.total > 0
+          ? `todo ${progress.todo.done}/${progress.todo.total} done (${progress.todo.unchangedRounds} unchanged round(s))`
+          : "no active todo progress",
+      ].join("; ")
+    : "";
   const message = kind === "deadline"
     ? `⏸ agent run paused: active-execution deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). Waiting for your answers did not consume this budget. No further model or tool calls will start in this turn. Session-backed work keeps its task and checklist checkpoint; type \`/continue\` to resume in a fresh bounded turn. Only for intentionally long single turns, use \`hara config set runTimeoutMs 45m\` (maximum 2h).`
     : kind === "task_round_budget"
@@ -856,16 +887,29 @@ function hardStop(
       ? `⏸ agent paused at the ${life.maxRounds}-round safety boundary after ${formatAgentDuration(elapsedMs)}. Hara stopped before spending more tokens because the current strategy did not converge. Completed file changes and the latest task checkpoint remain in this conversation. Review the current artifact, then use \`/continue\` for one bounded, materially different strategy; raising the round limit is not the first recovery step.`
       : kind === "strategy_stall"
         ? `⏸ agent paused early after ${detail?.count ?? 20} consecutive working round(s) without a durable task checkpoint. Hara preserved completed changes and stopped before the general round limit. Review the current artifact and acceptance checks, then use \`/continue\` with one bounded, materially different strategy.`
-      : detail?.mode === "no_progress"
-        ? `⛔ agent run stopped early: ${detail.label ?? "the same tool/evidence cycle"} produced no new evidence for ${detail.count ?? NO_PROGRESS_STOP_ROUNDS} consecutive round(s). Hara stopped before the general round limit to prevent a model loop and unnecessary token use. Review the last verified checkpoint, then retry with a materially different strategy.`
+      : kind === "no_progress" || detail?.mode === "no_progress"
+        ? `⏸ agent paused because ${detail?.label ?? "the current tool strategy"} made no durable progress. Hara stopped further model and tool calls before more tokens were spent (${progressFacts || `${detail?.count ?? 0} unchanged round(s)`}). Completed changes remain saved. Review the visible stop reason, then use \`/continue\` only with a materially different strategy or after resolving the named boundary.`
       : `⛔ agent run stopped: the same failing ${detail?.label ?? "tool call"} repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
-  const event: RunLimitEvent = { kind, message, elapsedMs, rounds: life.rounds, timeoutMs: life.timeoutMs, maxRounds: life.maxRounds };
+  const event: RunLimitEvent = {
+    kind,
+    message,
+    elapsedMs,
+    rounds: life.rounds,
+    timeoutMs: life.timeoutMs,
+    maxRounds: life.maxRounds,
+    ...(progress ? { progress } : {}),
+  };
   if (!life.limitAnnounced) {
     life.limitAnnounced = true;
     showRunNotice(opts, message, true);
     try { opts.onLimit?.(event); } catch { /* observers cannot weaken the hard stop */ }
   }
-  return { status: "halted", error: message, stopReason: kind };
+  return {
+    status: "halted",
+    error: message,
+    stopReason: kind,
+    ...(progress ? { progress } : {}),
+  };
 }
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
@@ -1202,18 +1246,20 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   // nobody to hit Esc (e.g. screenshots it can't read). Once per run, when the agent keeps repeating one
   // non-read tool or acting blind, we inject a reflection nudge so it steps back instead of spinning.
   const guard = !!process.env.HARA_GATEWAY;
+  const unattendedRun = opts.unattended === true || guard || process.env.HARA_CRON === "1";
   const toolCounts = new Map<string, number>();
   let blindShots = 0;
   let nudged = false;
-  // Max-rounds is a last-resort lifetime boundary. This guard catches the more specific production
-  // failure where tools keep reporting success but the exact observations do not change (for example,
-  // rewriting/running the same OCR or MCP helper until Desktop reaches 64 rounds). A digest-only bounded
-  // set prevents project data from becoming diagnostic state.
-  const successfulObservations = new Map<string, true>();
-  let noProgressRounds = 0;
-  let noProgressNudged = false;
-  let workRoundsWithoutCheckpoint = 0;
-  let checkpointNudged = false;
+  // The engine owns this ledger rather than trusting reminder prose. It retains only digests/shingles and
+  // credential-free counters, while treating same-evidence checkpoints/todo rewrites as no progress.
+  const progressWatchdog = new AgentProgressWatchdog({
+    unattended: unattendedRun,
+    task: intakeTask,
+    todos: currentTodos(ctx.todoScope),
+    usage: opts.stats,
+  });
+  let lastProgressState: RunProgressEvent | undefined;
+  let progressNudged = false;
   let lastDurableCheckpointRound = 0;
 
   /** A hard numeric boundary is allowed to roll forward only when the model has recently written a real
@@ -1232,7 +1278,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       && lastDurableCheckpointRound > 0
       && checkpointAge >= 0
       && checkpointAge <= Math.max(16, Math.ceil(life.roundTrancheSize / 4))
-      && noProgressRounds === 0;
+      && (lastProgressState?.evidenceStaleRounds ?? 0) === 0;
   };
 
   /** Persist the exact rounds already consumed before opening another tranche. A crash after this boundary
@@ -1271,6 +1317,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   // unfinished items exist. Main loop only — quiet (sub-agent) runs share the global list and must not nag.
   let todoIdleRounds = 0;
   for (;;) {
+    let userIntervenedThisRound = false;
     // A cancellation that already happened is authoritative: do not start pending-input work, a provider
     // request, or any later tool round merely to give it an already-aborted signal.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return stoppedOutcome();
@@ -1350,6 +1397,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         return interactionFailure("pending-input channel", error);
       }
       if (pending === RUN_STOPPED) return stoppedOutcome();
+      userIntervenedThisRound = pending.length > 0;
       for (const m of pending) history.push(m);
       // pendingInput may have durably accepted steering into the owner's immutable task snapshot. Refresh
       // before composing the system or applying a later brief so that state is never overwritten.
@@ -1970,11 +2018,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         for (const { identity, count } of counts) {
           life.failedCalls.delete(identity.key);
           life.failedCalls.set(identity.key, count);
+          life.failedCallKinds.set(identity.key, identity.kind);
         }
         while (life.failedCalls.size > 64) {
           const oldest = life.failedCalls.keys().next().value as string | undefined;
           if (oldest === undefined) break;
           life.failedCalls.delete(oldest);
+          life.failedCallKinds.delete(oldest);
         }
         const stopped = counts.find(({ identity, count }) => count >= identity.hardStopAfter);
         if (stopped && !repeatHalt) {
@@ -1999,9 +2049,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             "Repair using this exact text with materially different edit arguments, then validate syntax before execution."
           );
         }
-        // Any successful action is progress (in particular edit/exec calls that may have fixed the
-        // underlying cause), so a later retry starts a fresh failure streak.
-        life.failedCalls.clear();
+        // Preserve authorization/authentication boundaries across unrelated successful reads. A harmless
+        // probe cannot grant authority, while all other failure families retain the normal success reset.
+        for (const key of life.failedCalls.keys()) {
+          if (life.failedCallKinds.get(key) === "access_boundary") continue;
+          life.failedCalls.delete(key);
+          life.failedCallKinds.delete(key);
+        }
       }
       return note;
     };
@@ -2391,7 +2445,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
 
     // Execute: read-only tools run concurrently; edit/exec run alone, in order.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
-    const successfulRoundObservations: string[] = [];
+    const successfulRoundObservations: ProgressObservation[] = [];
     const runOne = async (idx: number, p: Plan): Promise<void> => {
       if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
       if (unansweredUserQuestion || credentialQuestionBlocked) {
@@ -2492,14 +2546,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         // completed action as not run. Non-cooperative pending tools still lose to the hard stop immediately.
         let settled: { ok: true; value: string } | { ok: false; error: unknown } | undefined;
         if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
-        const executionToolCtx: ToolContext =
-          p.tool === askUserTool && askWithRunCancellation
+        const executionToolCtx: ToolContext = {
+          ...toolCtx,
+          toolCallId: p.tu.id,
+          ...(p.tool === askUserTool && askWithRunCancellation
             ? {
-                ...toolCtx,
-                ask: (question, options, signal) =>
+                ask: (question: string, options?: string[], signal?: AbortSignal) =>
                   waitForHuman(opts, life, () => askWithRunCancellation(question, options, signal)),
               }
-            : toolCtx;
+            : {}),
+        };
         const observedTool = p.tool!.run(p.tu.input, executionToolCtx).then(
           (value) => { settled = { ok: true, value }; return value; },
           (error) => { settled = { ok: false, error }; throw error; },
@@ -2542,7 +2598,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           completionReceiptRetries = 0;
         }
         if (!resultLooksFailed) {
-          successfulRoundObservations.push(successfulObservationKey(p.tu.name, p.tu.input, res));
+          successfulRoundObservations.push({ name: p.tu.name, input: p.tu.input, content: res });
         }
         // append any not-yet-seen subdirectory AGENTS.md/CLAUDE.md this call touched (monorepo-local conventions)
         // + the repeat-guard's anti-spinning note when this exact call keeps failing (repeat-guard.ts)
@@ -2662,14 +2718,6 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     if (decisionRetentionError) {
       return interactionFailure("user-decision retention", decisionRetentionError);
     }
-    if (repeatHalt) return hardStop(opts, life, "repeat_loop", repeatHalt);
-
-    // Exact observation hashes catch literal repeats, but a model can still churn by changing one shell
-    // fragment, offset, or temporary filename on every nominally successful round. Persistent tasks already
-    // provide a typed checkpoint tool. Require one periodically instead of pretending every unique command
-    // is outcome progress. Unlike the old 20-round hard pause, the checkpoint is advisory: a provider that
-    // is still producing new evidence may continue to the general run/task budget, matching Codex's
-    // model-visible recovery loop instead of being stopped before it can obey the nudge.
     const successfulTaskCheckpoint = r.toolUses.some((toolUse, index) => {
       const result = results[index];
       return toolUse.name === "task_checkpoint"
@@ -2677,81 +2725,81 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         && result.isError !== true
         && !looksFailed(result.content, toolUse.name);
     });
-    const substantiveWorkRound = r.toolUses.some((toolUse) => ![
+    const progressTrackedRound = r.toolUses.some((toolUse) => ![
       "task_intake",
-      "task_checkpoint",
-      "todo_write",
       "ask_user",
     ].includes(toolUse.name));
-    if (opts.taskIntake && successfulTaskCheckpoint) {
+    const progressDecision = progressWatchdog.recordRound({
+      observations: successfulRoundObservations,
+      toolCalls: r.toolUses.length,
+      substantive: progressTrackedRound,
+      userIntervened: userIntervenedThisRound,
+      task: intakeTask,
+      todos: currentTodos(ctx.todoScope),
+      usage: opts.stats,
+    });
+    const progressEvent: RunProgressEvent = {
+      ...progressDecision.state,
+      rounds: life.rounds,
+      maxRounds: life.maxRounds,
+      cumulativeTaskRounds: life.taskRoundsUsed + life.rounds,
+      ...(life.taskRoundLimit !== undefined ? { taskRoundLimit: life.taskRoundLimit } : {}),
+    };
+    lastProgressState = progressEvent;
+    try { opts.onProgress?.(progressEvent); } catch { /* observers cannot weaken the watchdog */ }
+
+    // A checkpoint advances automatic continuation only when the engine observed new fact/artifact/
+    // capability/completion evidence (or a newly completed todo). Rewording the same checkpoint no longer
+    // launders an unchanged tool loop into a healthy tranche.
+    if (opts.taskIntake && successfulTaskCheckpoint && progressEvent.checkpointStaleRounds === 0) {
       lastDurableCheckpointRound = life.rounds;
-      workRoundsWithoutCheckpoint = 0;
-      checkpointNudged = false;
-    } else if (opts.taskIntake && substantiveWorkRound) {
-      workRoundsWithoutCheckpoint += 1;
-      if (workRoundsWithoutCheckpoint >= NO_CHECKPOINT_NUDGE_ROUNDS && !checkpointNudged) {
-        checkpointNudged = true;
-        if (!opts.quiet) {
-          history.push({
-            role: "user",
-            content: wrapReminders([
-              "Strategy checkpoint required: several working rounds have passed without a durable outcome checkpoint. Stop expanding or rewriting command fragments. Inspect the current artifact and original acceptance checks now; record task_checkpoint with concrete facts/artifacts/current step, then choose one bounded next strategy. If the task is already done, verify it and record completion instead of doing more work.",
-            ]),
-          });
-          showRunNotice(
-            opts,
-            "✻ strategy checkpoint: many working rounds have passed without a durable outcome checkpoint; asking the Agent to inspect and re-plan…",
-          );
-        }
-      }
     }
 
-    // Engine-owned bookkeeping is deliberately outside the evidence-cycle guard. In particular, a
-    // strategy nudge followed by the requested task_checkpoint must not itself count as another stale
-    // evidence round and trigger a second nudge that asks for yet another checkpoint.
-    if (successfulTaskCheckpoint) {
-      noProgressRounds = 0;
-      noProgressNudged = false;
-    } else if (substantiveWorkRound) {
-      const roundHasNewEvidence = successfulRoundObservations.some((key) => !successfulObservations.has(key));
-      for (const key of successfulRoundObservations) {
-        successfulObservations.delete(key);
-        successfulObservations.set(key, true);
-      }
-      while (successfulObservations.size > MAX_PROGRESS_OBSERVATIONS) {
-        const oldest = successfulObservations.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        successfulObservations.delete(oldest);
-      }
-      if (roundHasNewEvidence) {
-        noProgressRounds = 0;
-        noProgressNudged = false;
-      } else {
-        noProgressRounds += 1;
-        if (noProgressRounds >= NO_PROGRESS_STOP_ROUNDS) {
-          return hardStop(opts, life, "repeat_loop", {
-            label: "the repeated successful tool/evidence cycle",
-            count: noProgressRounds,
-            mode: "no_progress",
-          });
-        }
-        if (noProgressRounds >= NO_PROGRESS_NUDGE_ROUNDS && !noProgressNudged) {
-          noProgressNudged = true;
-          // Quiet sub-agents deliberately receive no injected reminders and never drain the main loop's
-          // reminder channel. Their hard stop still applies below if unchanged evidence continues.
-          if (!opts.quiet) {
-            history.push({
-              role: "user",
-              content: wrapReminders([
-                "No-progress correction: recent tool rounds completed but reproduced observations already seen in this run. Stop repeating the same OCR, file, command, MCP, or UI cycle. Re-check the original acceptance criteria and take a materially different bounded step, record a typed blocker with evidence, or finish with a verified checkpoint.",
-              ]),
-            });
-            showRunNotice(
-              opts,
-              "✻ no-progress guard: unchanged successful tool evidence repeated; asking the Agent to change strategy…",
-            );
-          }
-        }
+    const repeatedFailure = repeatHalt as { label: string; count: number } | null;
+    if (repeatedFailure) {
+      return hardStop(opts, life, "repeat_loop", {
+        label: repeatedFailure.label,
+        count: repeatedFailure.count,
+        progress: progressEvent,
+      });
+    }
+    if (progressDecision.stop) {
+      const labels: Record<NonNullable<ProgressState["trigger"]>, string> = {
+        repeated_tool_call: `the same successful ${progressEvent.repeatedTool ?? "tool"} call kept returning substantially unchanged evidence`,
+        similar_tool_evidence: "recent successful tool rounds kept returning more than 80% similar evidence",
+        unattended_without_checkpoint: `an unattended run reached ${progressEvent.checkpointStaleRounds} working rounds without a new verified checkpoint or completed todo`,
+        unattended_token_budget: `an unattended run spent ${progressEvent.tokens.total} tokens without a new verified checkpoint or completed todo`,
+      };
+      return hardStop(opts, life, "no_progress", {
+        label: progressEvent.trigger ? labels[progressEvent.trigger] : "the current strategy",
+        count: progressEvent.noProgressRounds,
+        mode: "no_progress",
+        progress: progressEvent,
+      });
+    }
+    if (!progressDecision.warn) progressNudged = false;
+    if (progressDecision.warn && !progressNudged) {
+      progressNudged = true;
+      // Quiet/background children still receive the deterministic hard stop, but never steal or inject
+      // the main conversation's reminder stream.
+      if (!opts.quiet) {
+        history.push({
+          role: "user",
+          content: wrapReminders([
+            `No-progress checkpoint: round ${progressEvent.rounds}, ${progressEvent.toolCalls} tool call(s), ` +
+            `${progressEvent.tokens.total} run token(s), todo ${progressEvent.todo.done}/${progressEvent.todo.total}. ` +
+            "Recent evidence or durable task state is not advancing. Stop changing offsets, temporary names, " +
+            "command fragments, or checkpoint wording. Inspect the original acceptance checks now; either " +
+            "record genuinely new verified evidence/finish a todo, state a typed human-only blocker, or stop. " +
+            `In an unattended run Hara pauses at ${UNATTENDED_PROGRESS_STOP_ROUNDS} stale working rounds.`,
+          ]),
+        });
+        showRunNotice(
+          opts,
+          `✻ no-progress warning: round ${progressEvent.rounds}, ${progressEvent.toolCalls} tool call(s), ` +
+          `${progressEvent.tokens.total} token(s), todo ${progressEvent.todo.done}/${progressEvent.todo.total}; ` +
+          "the Agent must produce a real checkpoint or change strategy.",
+        );
       }
     }
 
@@ -2763,11 +2811,11 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       if (fanout >= SYNTHESIS_MIN_AGENTS) pushReminder(synthesisReminder(fanout), ctx.todoScope);
     }
 
-    // Todo attention-refresh: a round that touched the checklist resets the clock; rounds that leave
-    // unfinished items untouched accumulate, and at TODO_STALE_ROUNDS the model gets a system-reminder
-    // re-showing the authoritative list (then the counter re-arms — at most one nag per N rounds).
+    // Todo attention-refresh: only completing a previously unfinished item resets the clock. Rewriting
+    // the same list is not progress; otherwise a looping model could suppress both the reminder and the
+    // unattended watchdog with cosmetic todo_write calls. At most one reminder is queued per N stale rounds.
     if (!opts.quiet) {
-      if (r.toolUses.some((tu) => tu.name === "todo_write")) {
+      if (progressEvent.todo.advanced) {
         todoIdleRounds = 0;
       } else if (currentTodos(ctx.todoScope).some((t) => t.status !== "done")) {
         todoIdleRounds++;

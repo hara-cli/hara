@@ -173,3 +173,40 @@ Template, and Policy. Start with a local spreadsheet pack before adding cloud of
 
 **另一个通用缺口**：FlowRule 的 `do` 是必填 agent prompt，**没有「匹配即产出固定 JSON、不跑 LLM」的静态模式**。
 有了它才能做真正零 token 的关键词分流（现在关键词只能省 prompt 长度，省不掉那次调用）。
+
+---
+
+## [FR-20260909-FEISHU-WECHAT-BRIDGE] Native cross-channel Feishu and WeChat delivery
+
+**Logged**: 2026-09-09T00:00:00+08:00
+**Priority**: high
+**Status**: implemented_unreleased
+**Area**: gateway
+
+### Requested Capability
+
+Let an authorized Hara conversation in WeChat send through the already-connected Feishu gateway, and let
+ordinary messages from an explicitly enabled Feishu group reach colleagues who opted in from their bound
+WeChat DMs. Do not depend on a separately installed Feishu CLI.
+
+### Root Cause
+
+Connector readiness and Agent-callable capability were separate. The Feishu gateway correctly kept its App
+Secret inside its own process, while a WeChat-launched Hara child had neither those environment variables nor
+an outbound tool. It therefore mistook a connected connector for a missing local integration.
+
+### Implementation
+
+- Added the eager `channel_message` tool and registered it in both the CLI and Serve tool aggregates.
+- Added a private request/receipt broker so the credential-owning target gateway performs the send.
+- Added owner-created Feishu source aliases plus per-person WeChat `/bridge join` and `/bridge leave` consent.
+- Added bounded storage, account ambiguity rejection, opaque idempotency, FIFO WeChat delivery, loop
+  prevention, and tests that ensure ids/credentials are absent from user-visible results.
+
+### Metadata
+
+- Frequency: first_time
+- Related Features: Feishu gateway, WeChat gateway, channel_message, group bridge
+- Related Files: src/gateway/outbound-broker.ts, src/gateway/channel-bridges.ts, src/gateway/serve.ts,
+  src/tools/channel-message.ts
+- Requested By: user

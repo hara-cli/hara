@@ -46,6 +46,9 @@ export interface ToolContext {
   /** Engine-owned execution identity for evidence deduplication. Tools may use it for opaque provenance;
    * models never provide or override it. */
   taskId?: string;
+  /** Engine-owned identity of this concrete model tool call. Side-effecting tools may bind an idempotency
+   * receipt to it so a replay of the same call is suppressed without suppressing a later intentional call. */
+  toolCallId?: string;
   /** One-run cancellation boundary. Built-in tools must stop owned subprocesses/work promptly when fired. */
   signal?: AbortSignal;
   /** Isolate the in-memory todo_write checklist for concurrent agent runs (serve sessions/sub-agents). */

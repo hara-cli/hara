@@ -694,12 +694,11 @@ interface InspectedGatewayRuntimeCandidate {
   live: boolean;
 }
 
-/** Aggregate all credential-scoped instances of one platform without exposing their scope hashes or ids. */
-export async function inspectGatewayRuntime(
+async function collectGatewayRuntimeCandidates(
   platformValue: string,
-  runtimeScopes: readonly string[] = [],
-  options: Pick<GatewayRuntimeOptions, "home" | "pidAlive" | "processIdentity"> = {},
-): Promise<GatewayRuntimeInspection> {
+  runtimeScopes: readonly string[],
+  options: Pick<GatewayRuntimeOptions, "home" | "pidAlive" | "processIdentity">,
+): Promise<{ candidates: InspectedGatewayRuntimeCandidate[]; unreadable: boolean }> {
   const platform = checkedPlatform(platformValue);
   const dir = stateDirectory(options.home ?? homedir());
   const scopes = new Set(runtimeScopes.map(checkedPlatform));
@@ -742,6 +741,30 @@ export async function inspectGatewayRuntime(
       live: Boolean(lease && leaseOwnerAlive(lease.record, pidAlive, processIdentity)),
     });
   }
+  return { candidates, unreadable };
+}
+
+/** Resolve only verified live credential-scoped workers. Scope hashes are internal routing handles; no
+ * credential material is returned or copied into the requesting process. */
+export async function liveGatewayRuntimeScopes(
+  platformValue: string,
+  options: Pick<GatewayRuntimeOptions, "home" | "pidAlive" | "processIdentity"> = {},
+): Promise<string[]> {
+  const { candidates } = await collectGatewayRuntimeCandidates(platformValue, [], options);
+  return candidates
+    .filter((candidate) => candidate.live && candidate.lease)
+    .sort((left, right) => (right.lease?.record.startedAt ?? 0) - (left.lease?.record.startedAt ?? 0))
+    .map((candidate) => candidate.scope);
+}
+
+/** Aggregate all credential-scoped instances of one platform without exposing their scope hashes or ids. */
+export async function inspectGatewayRuntime(
+  platformValue: string,
+  runtimeScopes: readonly string[] = [],
+  options: Pick<GatewayRuntimeOptions, "home" | "pidAlive" | "processIdentity"> = {},
+): Promise<GatewayRuntimeInspection> {
+  const platform = checkedPlatform(platformValue);
+  const { candidates, unreadable } = await collectGatewayRuntimeCandidates(platform, runtimeScopes, options);
 
   const live = candidates
     .filter((candidate) => candidate.live && candidate.lease)

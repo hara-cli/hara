@@ -3,6 +3,28 @@ import assert from "node:assert/strict";
 import { applyTaskCheckpoint, createTaskExecution } from "../dist/session/task.js";
 import { taskLifecycleEvent, TASK_LIFECYCLE_EVENT_VERSION } from "../dist/serve/task-events.js";
 
+function progressFixture(overrides = {}) {
+  return {
+    state: "warning",
+    toolCalls: 11,
+    unattendedRounds: 5,
+    evidenceStaleRounds: 2,
+    noProgressRounds: 5,
+    checkpointStaleRounds: 5,
+    checkpointAdvanced: false,
+    similarity: 0.91,
+    repeatedTool: "bash",
+    repeatedCount: 2,
+    tokens: { input: 120000, output: 40000, total: 160000 },
+    todo: { done: 1, total: 4, unchangedRounds: 5, advanced: false },
+    rounds: 5,
+    maxRounds: 64,
+    cumulativeTaskRounds: 17,
+    taskRoundLimit: 100,
+    ...overrides,
+  };
+}
+
 test("task lifecycle event separates durable running status from a temporary approval wait", () => {
   const task = createTaskExecution("ship the verified fix", "turn-1", "2026-07-19T12:00:00.000Z");
   const event = taskLifecycleEvent(
@@ -57,6 +79,43 @@ test("task lifecycle event defaults its runtime state to the durable task status
   assert.equal(event.taskStatus, "completed");
   assert.equal(event.lastOutcome, "completed");
   assert.deepEqual(event.checkpoint, { done: 0, total: 0 });
+});
+
+test("task lifecycle event carries credential-free engine progress without parsing terminal prose", () => {
+  const task = createTaskExecution("finish bounded work", "turn-progress", "2026-09-08T01:00:00.000Z");
+  const progress = progressFixture();
+  const event = taskLifecycleEvent(
+    "session-progress",
+    task,
+    [],
+    { state: "running", phase: "tool", progress },
+    { streamId: "serve-progress", sequence: 1 },
+    "2026-09-08T01:01:00.000Z",
+  );
+  assert.deepEqual(event.progress, progress);
+  progress.todo.done = 99;
+  assert.equal(event.progress.todo.done, 1, "the event owns a defensive progress snapshot");
+});
+
+test("restored lifecycle snapshots fall back to the task's persisted progress receipt", () => {
+  const progress = progressFixture({ state: "stopped", trigger: "repeated_tool_call", repeatedCount: 4 });
+  const task = {
+    ...createTaskExecution("resume with a different strategy", "turn-restored-progress", "2026-09-08T01:00:00.000Z"),
+    status: "paused",
+    lastOutcome: "halted",
+    progress,
+  };
+  const event = taskLifecycleEvent(
+    "session-restored-progress",
+    task,
+    [],
+    { phase: "restored" },
+    { streamId: "serve-progress", sequence: 2 },
+    "2026-09-08T01:02:00.000Z",
+  );
+  assert.deepEqual(event.progress, progress);
+  progress.tokens.total = 999999;
+  assert.equal(event.progress.tokens.total, 160000, "restored projections also own a defensive snapshot");
 });
 
 test("task lifecycle event projects the same persisted blocker, facts, capabilities, and artifacts used on resume", () => {

@@ -168,7 +168,7 @@ export async function deliverResult(
           const { loadWeixinCreds, weixinAdapter } = await import("../gateway/weixin.js");
           const creds = loadWeixinCreds();
           if (!creds) return "hara weixin not logged in (~/.hara/weixin/creds.json missing)";
-          await weixinAdapter(creds).send(t.to, text, deliverySignal);
+          await weixinAdapter(creds).send(t.to, text, deliverySignal, idempotencyKey);
           return null;
         }
         // feishu

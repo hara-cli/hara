@@ -44,7 +44,23 @@ const mkProvider = (roundsToolUses) => {
     model: "fake-model",
     async turn() {
       const tus = roundsToolUses[i++];
-      if (tus) return { text: "", toolUses: tus.map((name, k) => ({ id: `t${i}_${k}`, name, input: name === "todo_write" ? { todos: [{ text: "step", status: "in_progress" }] } : {} })), stop: "tool_use" };
+      if (tus) return {
+        text: "",
+        toolUses: tus.map((entry, k) => {
+          const name = typeof entry === "string" ? entry : entry.name;
+          const explicitInput = typeof entry === "string" ? undefined : entry.input;
+          return {
+            id: `t${i}_${k}`,
+            name,
+            input: explicitInput ?? (name === "todo_write"
+              ? { todos: [{ text: "step", status: "in_progress" }] }
+              : name === "noop"
+                ? { step: i }
+                : {}),
+          };
+        }),
+        stop: "tool_use",
+      };
       return { text: "done", toolUses: [], stop: "end" };
     },
   };
@@ -52,9 +68,11 @@ const mkProvider = (roundsToolUses) => {
 const noop = {
   name: "noop",
   description: "does nothing",
-  input_schema: { type: "object", properties: {} },
+  input_schema: { type: "object", properties: { step: { type: "integer" } } },
   kind: "read",
-  run: async () => "ok",
+  // The changing short receipt keeps reminder tests focused on reminder timing. Repeating one identical
+  // successful observation is now correctly stopped by the separate no-progress watchdog after four calls.
+  run: async (input) => `ok-${input.step ?? 0}`,
 };
 const base = (history, provider, extra = {}) => ({
   provider,
@@ -91,14 +109,20 @@ test("loop: todo staleness fires after TODO_STALE_ROUNDS untouched rounds (unfin
   clearTodos();
 });
 
-test("loop: a todo_write round resets the staleness clock (no nag)", async () => {
+test("loop: completing a todo resets the staleness clock (no nag)", async () => {
   drainReminders();
   clearTodos();
   await getTool("todo_write").run({ todos: [{ text: "t", status: "in_progress" }] }, { cwd: process.cwd() });
-  // rounds: N-1 noops, then a todo_write (reset), then N-1 noops → never reaches N untouched.
+  // rounds: N-1 noops, then a genuinely completed todo (reset), then N-1 noops → never reaches N untouched.
   const rounds = [
     ...Array.from({ length: TODO_STALE_ROUNDS - 1 }, () => ["noop"]),
-    ["todo_write"],
+    [{
+      name: "todo_write",
+      input: { todos: [
+        { text: "t", status: "done" },
+        { text: "next", status: "in_progress" },
+      ] },
+    }],
     ...Array.from({ length: TODO_STALE_ROUNDS - 1 }, () => ["noop"]),
   ];
   const provider = mkProvider(rounds);
@@ -107,6 +131,26 @@ test("loop: a todo_write round resets the staleness clock (no nag)", async () =>
   assert.ok(
     !history.some((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("todo list has not been updated")),
     "no staleness nag when the checklist keeps being touched",
+  );
+  clearTodos();
+});
+
+test("loop: rewriting the same unfinished todo cannot reset the staleness clock", async () => {
+  drainReminders();
+  clearTodos();
+  const unchanged = [{ text: "t", status: "in_progress" }];
+  await getTool("todo_write").run({ todos: unchanged }, { cwd: process.cwd() });
+  const rounds = [
+    ...Array.from({ length: TODO_STALE_ROUNDS - 1 }, () => ["noop"]),
+    [{ name: "todo_write", input: { todos: unchanged } }],
+    ["noop"],
+  ];
+  const provider = mkProvider(rounds);
+  const history = [{ role: "user", content: "work" }];
+  await runAgent(history, base(history, provider));
+  assert.ok(
+    history.some((message) => typeof message.content === "string" && message.content.includes("todo list has not been updated")),
+    "an unchanged todo rewrite does not manufacture progress",
   );
   clearTodos();
 });

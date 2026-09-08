@@ -135,6 +135,7 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
       toolFilter,
       hooks: false,
       quiet: true,
+      unattended: true,
       signal: request.signal,
       timeoutMs: Math.min(request.timeoutMs, 8 * 60_000),
       maxRounds: Math.min(request.maxRounds, 24),

@@ -10,9 +10,18 @@
 // sessions in one process, so streaks are keyed by the same run scope as todo/reminder state.
 const DEFAULT_SCOPE = "default";
 const MAX_FAILURE_IDENTITIES_PER_SCOPE = 64;
-const seenByScope = new Map<string, Map<string, { fails: number }>>();
+const seenByScope = new Map<string, Map<string, { fails: number; kind: FailureIdentity["kind"] }>>();
 const HOME_WORKSPACE_BOUNDARY_KEY = "root-cause:home-workspace-boundary";
 const EMPTY_RECALL_KEY = "root-cause:empty-memory-or-session-recall";
+
+function accessBoundarySignal(content: string): "HTTP 401" | "HTTP 403" | "authentication required" | undefined {
+  const status = /\b(?:HTTP(?:\/\d(?:\.\d)?)?\s+|status(?:Code)?\s*[:=]\s*)(401|403)\b/iu.exec(content)?.[1];
+  if (status === "401" || status === "403") return `HTTP ${status}`;
+  if (/\b(?:unauthorized|authentication required|not authenticated|login required|sign in required)\b/iu.test(content)) {
+    return "authentication required";
+  }
+  return undefined;
+}
 
 function stableFailureSignal(content: string): string | undefined {
   const pythonSyntax = pythonSyntaxDiagnostic(content);
@@ -124,9 +133,9 @@ function commandStrategyAnchor(input: unknown): string | undefined {
   return parts.length ? [...new Set(parts)].join("+") : undefined;
 }
 
-function scopedSeen(scope?: string): Map<string, { fails: number }> {
+function scopedSeen(scope?: string): Map<string, { fails: number; kind: FailureIdentity["kind"] }> {
   const key = scope?.trim() || DEFAULT_SCOPE;
-  const seen = seenByScope.get(key) ?? new Map<string, { fails: number }>();
+  const seen = seenByScope.get(key) ?? new Map<string, { fails: number; kind: FailureIdentity["kind"] }>();
   seenByScope.set(key, seen);
   return seen;
 }
@@ -200,7 +209,7 @@ export interface FailureIdentity {
   semantic: boolean;
   /** No-progress failures allowed before the run-level breaker stops another model round. */
   hardStopAfter: number;
-  kind: "exact" | "home_boundary" | "empty_recall" | "strategy";
+  kind: "exact" | "home_boundary" | "empty_recall" | "access_boundary" | "strategy";
 }
 
 /** All no-progress failure identities. Exact calls warn on the second attempt and stop on the third;
@@ -213,6 +222,19 @@ export function failureIdentities(
   isError = false,
 ): FailureIdentity[] {
   const failed = isError || looksFailed(content, name);
+  const accessBoundary = failed ? accessBoundarySignal(content) : undefined;
+  if (accessBoundary) {
+    const anchor = commandStrategyAnchor(input) ?? webFetchStrategyAnchor(name, input) ?? name;
+    return [{
+      key: `root-cause:access-boundary:${anchor}:${accessBoundary}`,
+      label: `${anchor} access boundary (${accessBoundary})`,
+      semantic: true,
+      // The first boundary gets one model round to use a supported login/capability route or report it.
+      // A second variant cannot discover authority by probing and must stop before a long 401/403 loop.
+      hardStopAfter: 2,
+      kind: "access_boundary",
+    }];
+  }
   if (failed && isHomeWorkspaceBoundaryFailure(content)) {
     return [{
       key: HOME_WORKSPACE_BOUNDARY_KEY,
@@ -279,11 +301,14 @@ export function recordCall(name: string, input: unknown, content: string, isErro
   const identities = failureIdentities(name, input, content, isError);
   const seen = scopedSeen(scope);
   if (!failed) {
-    seen.clear(); // any success is progress; a later failure starts a fresh no-progress streak
+    // A successful unrelated read cannot grant credentials or visibility. Preserve access boundaries so
+    // alternating a 401/403 with harmless successful probes still receives one recovery attempt at most.
+    // All ordinary failure streaks keep their historical "success resets" behavior.
+    for (const [key, streak] of seen) if (streak.kind !== "access_boundary") seen.delete(key);
     return "";
   }
   const next = identities.map((identity) => {
-    const streak = { fails: (seen.get(identity.key)?.fails ?? 0) + 1 };
+    const streak = { fails: (seen.get(identity.key)?.fails ?? 0) + 1, kind: identity.kind };
     // Refresh insertion order so the fixed-size ledger drops the least recently observed identity.
     seen.delete(identity.key);
     seen.set(identity.key, streak);
@@ -296,7 +321,9 @@ export function recordCall(name: string, input: unknown, content: string, isErro
   }
   const exact = next.find(({ identity }) => identity.kind === "exact");
   const semantic = next.find(({ identity }) => identity.kind !== "exact");
-  const selected = semantic?.identity.kind === "home_boundary" || semantic?.identity.kind === "empty_recall"
+  const selected = semantic?.identity.kind === "home_boundary"
+    || semantic?.identity.kind === "empty_recall"
+    || semantic?.identity.kind === "access_boundary"
     ? semantic
     : exact && exact.streak.fails >= exact.identity.hardStopAfter
       ? exact
@@ -330,6 +357,19 @@ export function recordCall(name: string, input: unknown, content: string, isErro
       `\n\n⟳ hara: ${s.fails} memory/session searches returned no matches without intervening progress — stop recall calls now. ` +
       "Recall tools are disabled for the rest of this turn. Tell the user the prior history was not found, " +
       "then ask for the missing detail or whether to recreate it."
+    );
+  }
+  if (identity.kind === "access_boundary") {
+    if (s.fails < identity.hardStopAfter) {
+      return (
+        `\n\n⟳ hara: ${identity.label} was observed. Do not keep changing endpoints, offsets, or shell syntax: ` +
+        "authority cannot be discovered by repeated tool calls. Use one registered sign-in/capability path if available; " +
+        "otherwise state the boundary now and retain a typed missing-secret or missing-authority checkpoint."
+      );
+    }
+    return (
+      `\n\n⟳ hara: ${identity.label} persisted across ${s.fails} attempts — stop tool calls now. ` +
+      "The user must see the access boundary and the exact supported recovery action before this task resumes."
     );
   }
   if (identity.kind === "strategy") {

@@ -407,13 +407,14 @@ test("unchanged successful tool evidence stops before the general round limit", 
       async run() { tools += 1; return "Helper already contains the requested content."; },
     }],
   }));
-  assert.equal(turns, 7, "the guard allows bounded rethink rounds, then stops the unchanged cycle");
-  assert.equal(tools, 7);
+  assert.equal(turns, 4, "the fourth unchanged successful call is the hard boundary");
+  assert.equal(tools, 4);
   assert.equal(outcome.status, "halted");
-  assert.equal(outcome.stopReason, "repeat_loop");
-  assert.match(outcome.error, /produced no new evidence for 6 consecutive round\(s\)/);
+  assert.equal(outcome.stopReason, "no_progress");
+  assert.match(outcome.error, /same successful rewrite_helper call.*no durable progress/i);
+  assert.match(outcome.error, /4 tool call\(s\)/);
   assert.doesNotMatch(outcome.error, /increase.*maxAgentRounds/i);
-  assert.ok(notices.some((message) => /no-progress guard/.test(message)));
+  assert.ok(notices.some((message) => /no-progress warning/.test(message)));
 });
 
 test("changing successful observations are progress and do not trip the no-progress guard", async () => {
@@ -446,7 +447,7 @@ test("changing successful observations are progress and do not trip the no-progr
   assert.equal(tools, 6);
 });
 
-test("a requested task checkpoint resets stale-evidence accounting instead of feeding its own loop", async () => {
+test("rewriting an unchanged task checkpoint cannot hide a stable evidence loop", async () => {
   const created = createTaskExecution("inspect one stable artifact", "checkpoint-no-progress");
   const accepted = applyTaskBrief(created, {
     intent: "investigate",
@@ -494,11 +495,13 @@ test("a requested task checkpoint resets stale-evidence accounting instead of fe
       async run() { return "artifact unchanged"; },
     }],
   }));
-  assert.equal(outcome.status, "completed", outcome.error);
-  assert.equal(turns, 9);
+  assert.equal(outcome.status, "halted");
+  assert.equal(outcome.stopReason, "no_progress");
+  assert.equal(turns, 6);
+  assert.match(outcome.error, /stable_probe.*unchanged evidence/i);
 });
 
-test("changing command fragments get a strategy nudge but may continue to a verified checkpoint", async () => {
+test("changing command fragments without durable state pause within eight unattended rounds", async () => {
   let turns = 0;
   let tools = 0;
   const createdTask = createTaskExecution("finish one generated integration script", "strategy-stall-turn");
@@ -547,6 +550,7 @@ test("changing command fragments get a strategy nudge but may continue to a veri
     ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
     maxRounds: 64,
     timeoutMs: "10s",
+    unattended: true,
     taskIntake: {
       task,
       current: () => task,
@@ -568,11 +572,12 @@ test("changing command fragments get a strategy nudge but may continue to a veri
       },
     }],
   }));
-  assert.equal(turns, 23, "the model can act on a visible nudge after the former 20-round pause boundary");
-  assert.equal(tools, 21);
-  assert.equal(outcome.status, "completed", outcome.error);
-  assert.equal(task.checkpoint.completion.state, "verified");
-  assert.ok(notices.some((message) => /strategy checkpoint/i.test(message)));
+  assert.ok(turns >= 5 && turns <= 8, `expected a bounded 5–8 round pause, received ${turns}`);
+  assert.equal(tools, turns);
+  assert.equal(outcome.status, "halted");
+  assert.equal(outcome.stopReason, "no_progress");
+  assert.equal(task.checkpoint.completion, undefined);
+  assert.ok(notices.some((message) => /no-progress warning/i.test(message)));
 });
 
 test("a malformed tool call gets one bounded retry on the same model", async () => {
@@ -768,6 +773,56 @@ test("three changed command variants with one stable API failure trip the strate
   assert.equal(turns, 3);
   assert.equal(outcome.stopReason, "repeat_loop");
   assert.match(outcome.error, /curl\+open\.feishu\.cn.*API error 1061002.*repeated 3 times/is);
+});
+
+test("one harmless success cannot hide a repeated access boundary", async () => {
+  let turns = 0;
+  let calls = 0;
+  const progress = [];
+  const provider = {
+    id: "access-boundary",
+    model: "access-boundary",
+    async turn() {
+      turns += 1;
+      if (turns === 2) {
+        return { text: "", toolUses: [{ id: "harmless", name: "harmless_read", input: {} }], stop: "tool_use" };
+      }
+      return {
+        text: "",
+        toolUses: [{ id: `private-${turns}`, name: "private_probe", input: { variant: turns } }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "inspect the private endpoint" }], base(provider, {
+    maxRounds: 20,
+    timeoutMs: "10s",
+    quiet: true,
+    onProgress: (event) => progress.push(event),
+    extraTools: [
+      {
+        name: "private_probe",
+        description: "private endpoint fixture",
+        input_schema: { type: "object", properties: { variant: { type: "number" } }, required: ["variant"] },
+        kind: "read",
+        async run() { calls += 1; return "Error: HTTP 401 Unauthorized"; },
+      },
+      {
+        name: "harmless_read",
+        description: "unrelated successful read",
+        input_schema: { type: "object", properties: {} },
+        kind: "read",
+        async run() { calls += 1; return "README is available"; },
+      },
+    ],
+  }));
+  assert.equal(turns, 3);
+  assert.equal(calls, 3);
+  assert.equal(outcome.status, "halted");
+  assert.equal(outcome.stopReason, "repeat_loop");
+  assert.match(outcome.error, /private_probe access boundary \(HTTP 401\).*repeated 2 times/is);
+  assert.equal(progress.length, 3);
+  assert.equal(progress.at(-1).rounds, 3);
 });
 
 test("the first tool blocked by the Home boundary returns feedback and allows the model to adjust", async () => {
@@ -2254,4 +2309,34 @@ test("runShell cancellation terminates the owned foreground command", { skip: pr
   controller.abort();
   await rejected;
   assert.ok(Date.now() - started < 2_000, "abort does not wait for the command's own timeout");
+});
+
+test("tools receive the engine-owned identity of their concrete model call", async () => {
+  let observedCallId;
+  let turns = 0;
+  const provider = {
+    id: "tool-call-identity-fixture",
+    model: "tool-call-identity-fixture",
+    async turn() {
+      turns += 1;
+      return turns === 1
+        ? { text: "", toolUses: [{ id: "provider-call-42", name: "call_identity_probe", input: {} }], stop: "tool_use" }
+        : { text: "done", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "check the call identity" }], base(provider, {
+    quiet: true,
+    extraTools: [{
+      name: "call_identity_probe",
+      description: "test-only engine identity probe",
+      input_schema: { type: "object", properties: {} },
+      kind: "read",
+      async run(_input, context) {
+        observedCallId = context.toolCallId;
+        return "observed";
+      },
+    }],
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.equal(observedCallId, "provider-call-42");
 });
