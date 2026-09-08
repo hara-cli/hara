@@ -7933,3 +7933,43 @@ Keep exact capability assertions and update them whenever an additive negotiated
 - **Notes**: Added the three bounded replay limits to the exact integration fixture.
 
 ---
+
+## [ERR-20260909-DOCKER-SOCKS-SUBSCRIPTION] Local Docker proxy blocked the public image runtime probe
+
+**Logged**: 2026-09-09T01:53:51+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release-verification
+
+### Summary
+
+The public `0.169.0` GHCR tag resolved and began downloading, but the local Docker Desktop daemon stopped
+the pull because its configured SOCKS proxy requires a Docker Business subscription.
+
+### Error
+
+```text
+error pulling image configuration: download failed after attempts=6:
+Using feature requires a Business Subscription: a SOCKS proxy
+```
+
+### Suggested Fix
+
+Do not alter a developer's Docker proxy configuration during a release check. When the cloud image job has
+already executed successfully, verify the public OCI index directly with `docker buildx imagetools inspect`
+and report the local runtime limitation separately.
+
+### Metadata
+
+- Reproducible: yes with the current local Docker proxy configuration
+- Related Files: .github/workflows/release.yml
+- Tags: docker, ghcr, socks, proxy, release-verification
+- Pattern-Key: release.verify_oci_index_when_local_docker_proxy_blocks_pull
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-09T01:53:51+08:00
+- **Notes**: The public OCI index returned amd64 and arm64 manifests; the release image job had already passed.
+
+---
