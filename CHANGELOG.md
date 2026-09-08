@@ -5,6 +5,20 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.169.0 — 2026-09-09 — native Feishu/WeChat delivery and bounded unattended progress
+
+- Add Hara-native cross-channel delivery so an authorized WeChat conversation can send through the already
+  connected Feishu gateway without installing a vendor CLI or copying its App Secret. A private credential-scoped
+  broker, platform idempotency receipts, exact account selection, and per-chat FIFO delivery prevent tenant
+  guessing, duplicate sends, and reordered WeChat chunks across retries or restarts.
+- Add explicit Feishu-group → WeChat-DM bridges. A gateway owner enables an exact source group with `/bridge on`,
+  each authorized colleague opts in from their own WeChat DM, identifiers stay private, removal requires
+  confirmation, and provenance plus durable per-message receipts prevent loops and duplicate broadcasts.
+- Add an Engine-owned no-progress watchdog for unattended CLI, gateway, cron, Serve, and native Agent work.
+  Repeated successful calls with unchanged evidence, long checkpoint/todo stagnation, access-boundary probing,
+  and excessive run-local tokens now produce a typed resumable pause. Desktop and Mobile receive credential-free
+  round, tool, token, todo, similarity, and stop-state counters instead of inferring progress from terminal prose.
+
 ## 0.168.2 — 2026-09-07 — lossless terminal control handoff
 
 - Transfer one live Codex or Claude Code terminal between Desktop and Mobile without discarding accepted keyboard

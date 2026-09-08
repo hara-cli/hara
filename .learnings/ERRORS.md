@@ -29,6 +29,45 @@ cache under the system temporary directory. The same 0.156.1 package dry-run the
 
 ---
 
+## [ERR-20260909-GIT-FETCH-SANDBOX] Release fetch required the approved network boundary
+
+**Logged**: 2026-09-09T01:31:27+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: release
+
+### Summary
+
+The pre-release `git fetch origin main --tags` could not open the repository's SSH transport from the
+restricted workspace network, although the remote and credentials were valid.
+
+### Error
+
+```text
+ssh: connect to host <redacted> port 22: Operation not permitted
+fatal: Could not read from remote repository.
+```
+
+### Suggested Fix
+
+Retry only the read-only fetch through the approved outbound network boundary, then compare `origin/main`
+with `HEAD` before pushing or tagging. Do not change the Git remote or credentials for a sandbox denial.
+
+### Metadata
+
+- Reproducible: yes, in the restricted workspace network
+- Related Files: .git/config
+- Tags: git, release, ssh, sandbox
+- Pattern-Key: release.git_fetch_requires_approved_network_boundary
+- Recurrence-Count: 1
+
+### Resolution
+
+- **Resolved**: 2026-09-09T01:31:27+08:00
+- **Notes**: The approved fetch succeeded; `origin/main` remained the expected release base.
+
+---
+
 ## [ERR-20260907-SHELL-CANCEL-RACE] Focused cancellation suite observed an unexpected child exit code
 
 **Logged**: 2026-09-07T14:05:00+08:00
