@@ -837,6 +837,21 @@ export function subagentToolFilter(role: Role | undefined, isReadonly: (n: strin
   return (n) => isReadonly(n) && (roleFilter ? roleFilter(n) : true);
 }
 
+/** Explicit writable children still execute full-auto, so their authority is intentionally narrower than
+ * a normal role: provider-neutral read tools plus Hara's symlink-safe text edit primitives inside a bound
+ * worktree. A role may narrow this surface and readOnly roles can never be widened by spawn input. */
+export function isolatedSubagentToolFilter(
+  role: Role | undefined,
+  isReadonly: (name: string) => boolean,
+  isIsolatedWritable: (name: string) => boolean,
+): (name: string) => boolean {
+  const roleAllows = (name: string): boolean =>
+    (!role?.allowTools || role.allowTools.includes(name))
+    && (!role?.denyTools || !role.denyTools.includes(name));
+  return (name) => roleAllows(name)
+    && (isReadonly(name) || (role?.readOnly !== true && isIsolatedWritable(name)));
+}
+
 /** Apply a role's declared tool policy to a normal (approval-gated) run. Undefined means unrestricted. */
 export function roleToolFilter(role: Role | undefined): ((name: string) => boolean) | undefined {
   if (!role) return undefined;
@@ -850,6 +865,7 @@ export function roleToolFilter(role: Role | undefined): ((name: string) => boole
       // These mutate only the engine-owned private mailbox/tree and every descendant remains constrained
       // by subagentToolFilter's read-only boundary. They do not grant filesystem or process mutation.
       "spawn_agent", "send_message", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent",
+      "inspect_agent_diff",
     ]);
     return (name) => safe.has(name) && declared(name);
   }

@@ -20,7 +20,9 @@ function json(value: unknown): string {
 registerTool({
   name: "spawn_agent",
   description:
-    "Start a durable READ-ONLY child Agent in the background and return its stable id/path immediately. "
+    "Start a durable child Agent in the background and return its stable id/path immediately. It is READ-ONLY by default. "
+    + "Use workspace:'isolated-write' only for an implementation task: Hara gives that child a private Git worktree, "
+    + "allows only bounded native file edits, and requires inspect_agent_diff + apply_agent_diff before source files change. "
     + "Use a short lowercase task_name unique under the current Agent. Use list_agents/wait_agent for progress; "
     + "use send_message for in-flight guidance and followup_task for another generation.",
   input_schema: {
@@ -33,6 +35,11 @@ registerTool({
       },
       message: { type: "string", description: "bounded self-contained assignment" },
       role: { type: "string", description: "optional Hara specialist role id" },
+      workspace: {
+        type: "string",
+        enum: ["read-only", "isolated-write"],
+        description: "default read-only; isolated-write creates an Agent-owned Git worktree",
+      },
     },
     required: ["task_name", "message"],
   },
@@ -50,7 +57,90 @@ registerTool({
         taskName: input.task_name,
         message: input.message,
         ...(typeof input.role === "string" ? { role: input.role } : {}),
+        ...(typeof input.workspace === "string" ? { workspace: input.workspace } : {}),
       }));
+    } catch (error) {
+      return boundedError(error);
+    }
+  },
+});
+
+registerTool({
+  name: "inspect_agent_diff",
+  description:
+    "Read the current owned Diff from a settled isolated-write Agent. Returns exact base commit, changed paths, "
+    + "patch hash, and reviewable patch text. Inspection never changes the user's source checkout.",
+  input_schema: {
+    type: "object",
+    properties: {
+      target: { type: "string", description: "stable Agent id, full path, or unambiguous task name" },
+    },
+    required: ["target"],
+  },
+  kind: "read",
+  concurrencySafe: false,
+  classify: stateOperation,
+  async run(input, ctx) {
+    const team = unavailable(ctx);
+    if (typeof team === "string") return team;
+    if (typeof input.target !== "string") return "Error: inspect_agent_diff needs target.";
+    try {
+      return json(await team.inspectDiff(input.target));
+    } catch (error) {
+      return boundedError(error);
+    }
+  },
+});
+
+registerTool({
+  name: "apply_agent_diff",
+  description:
+    "Explicitly apply a previously inspected Agent-owned Diff to the source checkout. Hara refuses if the "
+    + "Diff, source HEAD, ownership, or any changed source path no longer matches; it never auto-merges conflicts.",
+  input_schema: {
+    type: "object",
+    properties: {
+      target: { type: "string", description: "stable Agent id, full path, or unambiguous task name" },
+    },
+    required: ["target"],
+  },
+  kind: "edit",
+  concurrencySafe: false,
+  requiresProjectWorkspace: true,
+  classify: () => ({ effect: "edit", concurrencySafe: false, requiresExplicitApproval: true }),
+  async run(input, ctx) {
+    const team = unavailable(ctx);
+    if (typeof team === "string") return team;
+    if (typeof input.target !== "string") return "Error: apply_agent_diff needs target.";
+    try {
+      return json(await team.applyDiff(input.target));
+    } catch (error) {
+      return boundedError(error);
+    }
+  },
+});
+
+registerTool({
+  name: "reject_agent_diff",
+  description:
+    "Explicitly reject an unresolved Agent-owned Diff. The source checkout remains unchanged and the durable "
+    + "Agent record is marked rejected; start a new Agent for another implementation attempt.",
+  input_schema: {
+    type: "object",
+    properties: {
+      target: { type: "string", description: "stable Agent id, full path, or unambiguous task name" },
+    },
+    required: ["target"],
+  },
+  kind: "edit",
+  concurrencySafe: false,
+  classify: () => ({ effect: "edit", concurrencySafe: false, destructive: true }),
+  async run(input, ctx) {
+    const team = unavailable(ctx);
+    if (typeof team === "string") return team;
+    if (typeof input.target !== "string") return "Error: reject_agent_diff needs target.";
+    try {
+      return json(await team.rejectDiff(input.target));
     } catch (error) {
       return boundedError(error);
     }

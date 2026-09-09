@@ -528,6 +528,11 @@ several things at once (each can take a `role`). A provider-neutral root runtime
 structured completion/cancellation/error state, and a bounded queue; the native provider keeps each child
 on an isolated checklist and read-only tool floor. Concurrency defaults to 8 (`HARA_MAX_CONCURRENCY`), and
 delegated token totals count toward usage without changing the parent conversation's context gauge.
+Persistent Serve/Desktop sessions also expose a durable Agent tree with idempotent mailboxes and whole-tree
+ceilings derived conservatively from the current saved connection's model capability. A child is still read-only
+unless `spawn_agent` explicitly requests `workspace: isolated-write`; that mode edits a private detached Git
+worktree and returns one owned Diff. `apply_agent_diff` always requires fresh human approval, rejects a moved base
+or overlapping source edits, and never auto-merges; `reject_agent_diff` leaves the source checkout unchanged.
 
 OpenClaw and Hermes identities work in place too. Hara reads the installed OpenClaw Agent registry,
 maps each workspace's `IDENTITY.md` (plus safe local avatar) into the public Agent directory, and keeps

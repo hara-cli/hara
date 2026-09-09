@@ -117,6 +117,9 @@ const DURABLE_AGENT_TEAM_TOOLS = new Set([
   "resume_agent",
   "list_agents",
   "wait_agent",
+  "inspect_agent_diff",
+  "apply_agent_diff",
+  "reject_agent_diff",
 ]);
 
 /** Stall watchdog ceiling: a model attempt that streams NOTHING for this long is treated as a dead /
@@ -2454,7 +2457,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
       // Screen control and opaque host extensions are gated on EVERY action — a prior "don't ask again"
       // and even full-auto must never silently turn them into a side channel.
-      const alwaysGate = approvalKind === "computer" || tool.trustBoundary === "external";
+      const alwaysGate = operation.requiresExplicitApproval === true
+        || approvalKind === "computer"
+        || tool.trustBoundary === "external";
       const organizationApprovalRequired = Boolean(
         organizationPolicy?.requireApprovalForWrites
         && approvalKind !== "read",

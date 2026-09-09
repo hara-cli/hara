@@ -28,6 +28,7 @@ import {
   type RegularFileSnapshot,
 } from "../fs-read.js";
 import { sensitiveFileError } from "../security/sensitive-files.js";
+import { assertWorkspaceWriteBoundary } from "../context/workspace-scope.js";
 
 interface Change {
   path: string;
@@ -276,6 +277,7 @@ registerTool({
         let writeBoundary: AtomicWriteBoundary;
         try {
           writeBoundary = bindAtomicParentEntryPath(p, "patch");
+          assertWorkspaceWriteBoundary(writeBoundary.target, ctx.writeBoundary);
           pathInfo = await lstat(writeBoundary.target);
           if (pathInfo.isSymbolicLink()) beforeLinkTarget = await readlink(writeBoundary.target);
           const target = resolveVerifiedModelPath(writeBoundary.target, "patch");
@@ -301,6 +303,7 @@ registerTool({
         let writeBoundary: AtomicWriteBoundary | undefined;
         try {
           writeBoundary = bindAtomicWritePath(p, "patch");
+          assertWorkspaceWriteBoundary(writeBoundary.target, ctx.writeBoundary);
           await lstat(writeBoundary.target);
           return `Error: ${tag} create ${ch.path}: path already exists (use type:update to replace it). Nothing written.`;
         } catch (error: any) {
@@ -314,6 +317,7 @@ registerTool({
         let writeBoundary: AtomicWriteBoundary;
         try {
           writeBoundary = bindAtomicWritePath(p, "patch");
+          assertWorkspaceWriteBoundary(writeBoundary.target, ctx.writeBoundary);
           before = await readVerifiedRegularFileSnapshot(writeBoundary.target, undefined, "patch");
         } catch (error: any) {
           return `Error: ${tag} update ${ch.path}: cannot read (${error?.message ?? "unknown error"}; use type:create for a new file). Nothing written.`;

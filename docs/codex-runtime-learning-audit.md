@@ -35,10 +35,10 @@ providers behind that boundary, not competing user-facing control products.
 | Tool approvals and sandbox boundary | Implemented and replay-auditable after 0.169.0 | Engine policy remains authoritative rather than trusting prose in the transcript. Registered requests and terminal outcomes now have content-free task/turn-bound journal items; approval text and tool payloads remain only on the live protected surface. |
 | Background jobs and bounded output | Implemented | Long-running processes and large tool output do not have to block or flood the main model context. |
 | Deferred tool discovery | Implemented | Optional web, desktop, scheduler, external-agent, and MCP schemas stay out of the base prompt until provider-neutral `tool_search` activates an allowed capability. |
-| Durable read-only Agent teams | Hardened after 0.169.0 | Persistent Serve sessions own stable nested Agent IDs/paths, parent/root turn provenance, a redacted payload-bound idempotent mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. Whole-tree and per-Agent generations, rounds, tools, active time, and actual transport tokens are durably bounded from the active model's conservative context capability; subscription allowance remains provider-authoritative. The original `agent` tool remains the faster one-shot path. |
+| Durable Agent teams and isolated writing | Hardened after 0.169.0 | Persistent Serve sessions own stable nested Agent IDs/paths, parent/root turn provenance, a redacted payload-bound idempotent mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. Children are read-only by default; an explicit `isolated-write` child receives a private Git worktree and one owned, bounded Diff that requires fresh human approval to apply. Whole-tree and per-Agent generations, rounds, tools, active time, and actual transport tokens are durably bounded from the active saved connection's model capability; subscription allowance remains provider-authoritative. The original `agent` tool remains the faster one-shot path. |
 | Provider-independent runtime | Stronger Hara requirement | Hara keeps Anthropic/OpenAI-compatible/subscription/enterprise connections behind one engine contract. |
 | External Codex app-server adapter | Implemented | Hara can preserve the provider's native execution path without leaking its native session ID into UI clients. |
-| Hara Mobile companion bridge | Foundation implemented after 0.167.0 | CLI owns account login, Desktop device registration, explicit phone pairing, signed end-to-end encrypted relay envelopes, bounded publication of Personal coding-agent sessions, expiring control leases, idempotent remote commands, and sequenced terminal input. The mobile app and cloud account/relay deployment remain separate delivery work; the phone never receives provider credentials or native session IDs. |
+| Hara Mobile companion bridge | Restart-safe foundation implemented after 0.169.0 | CLI owns account login, Desktop device registration, explicit phone pairing, signed end-to-end encrypted relay envelopes, bounded publication of Personal coding-agent sessions, expiring control leases, idempotent remote commands, sequenced terminal input, persisted publications/outcomes, and a Relay-owned delivery cursor. The mobile app and production Account/Relay deployment remain separate delivery work; the phone never receives provider credentials or native session IDs. |
 
 These are not placeholders. They are current runtime contracts documented in
 `conversation-task-execution.md` and covered by engine tests/evals.
@@ -98,8 +98,10 @@ rounds, tool starts, transport tokens, and active time across every descendant; 
 model/tool boundary. Context-derived admission uses the current saved connection's model capability, while plan
 allowance, coefficients, reset windows, and overage remain separate provider/Control-authoritative facts.
 
-Remaining Agent work is to expose the same durable host to direct non-Serve CLI sessions, add richer Desktop/mobile
-presentation, and enable writing only behind the managed worktree/owned-diff/manual-merge contract in section 2.10.
+Writable children now use the managed worktree/owned-Diff/manual-merge contract in section 2.10. The child still
+inherits the current session's saved connection, account, model-capability policy, and organization authorization;
+workspace mode never selects or broadens a provider. Remaining Agent work is to expose the same durable host to
+direct non-Serve CLI sessions and add richer Desktop/mobile presentation.
 
 The direct headless task path now also preserves an unanswered structured question and its bounded options as a
 durable pause, normalizes a numbered remote reply to the retained option, and records it in the verified decision
@@ -107,8 +109,8 @@ ledger before model execution. Structured-output retries stop at that pause inst
 gateway/cron failure mode where a task either died at `ask_user` or forgot the answer after compaction; it does not
 turn missing credentials into chat input, and credential enrollment remains restricted to a trusted masked surface.
 
-Writable children should remain disabled until managed worktree isolation, diff ownership, and an explicit merge
-step exist. Hara should preserve its present rule that parallel children cannot mutate the same working tree.
+Writable children remain opt-in and never mutate the source checkout during execution. Read-only remains the
+default; only the root can inspect/reject an owned Diff, and applying it always crosses a fresh human approval gate.
 
 ### 2.4 Flush-before-suspend and explicit handoff
 
@@ -132,9 +134,11 @@ stream is released, but it cannot become authoritative until one synchronous com
 old stream, and current controller. A racing reattach releases the uncommitted successor instead of overwriting
 the newer controller. Legacy clients retain their old takeover behavior but receive the same final owner recheck.
 
-The remaining work is broader runtime suspension rather than terminal ownership: apply an equivalent explicit
-disposition to queued Agent mailbox items, live tool output, and child-process completion when an entire Serve
-session is paused or migrated. The client must never infer ownership from a stale UI label.
+The broader Serve suspension path now uses the same rule: it freezes new submissions and follow-up generations,
+interrupts the current provider turn, drains observed provider/tool/Agent work within a hard deadline, and only
+then persists a paused or token-bound migrating checkpoint and releases the writer. Queued mailbox data stays with
+the durable tree for resume; a non-cooperative live effect makes suspension fail closed. The client must never infer
+ownership from a stale UI label.
 
 ### 2.5 Retry health feeding typed failover
 
@@ -166,10 +170,11 @@ and rejects a second live writer. ACK traffic coalesces checkpoints; shutdown fo
 the old writer acknowledges replacement. Desktop combines replay with `events.snapshot`, buffers frames arriving
 during the snapshot, discards frames covered by its fence, then drains the newer suffix in order.
 
-Remaining work is narrower: an abrupt process/host loss can still lose the small interval after the last
-coalesced checkpoint, so the authoritative snapshot remains mandatory; a future cloud relay needs its own
-bounded delivery/ACK cursor rather than treating a local Serve cursor as globally durable. Raw PTY byte streams
-must continue to use terminal snapshots and must never enter this retained event database.
+An abrupt process/host loss can still lose the small interval after the last coalesced local checkpoint, so the
+authoritative snapshot remains mandatory. The Mobile protocol and self-hosted Relay now have a separate bounded,
+per-device delivery/ACK cursor and never pretend the local Serve cursor is cloud-global. Production deployment and
+public-path fault testing are still required. Raw PTY byte streams continue to use terminal snapshots and never
+enter either retained event database.
 
 ### 2.7 Idempotent remote commands
 
@@ -190,9 +195,9 @@ an authoritative non-live state. Desktop persists only the UUID and a salted pay
 the exact logical action after renderer restart without storing prompt text. `expectedTurnId` keeps delayed
 steer/interrupt input on the intended turn.
 
-Remaining: bind approval replies and legacy terminal helper methods to command identity and persist the mobile
-bridge's publication/receipt projection across bridge restart. Agent mailbox/follow-up delivery now uses
-payload-bound command identity and turn fencing.
+The mobile bridge now persists bounded publication and command-receipt projections across restart, and Agent
+mailbox/follow-up delivery uses payload-bound command identity and turn fencing. Remaining: bind approval replies
+and legacy terminal helper methods to command identity.
 
 ### 2.8 Typed provider capabilities and circuit health
 
@@ -227,13 +232,18 @@ text, tool payloads, path names, diff bodies, and PTY bytes out of that journal;
 conversation/terminal snapshot APIs when actual content is required. Remaining item work is safe todo/artifact
 identity and UI projection, not reconstructing private content from lifecycle metadata.
 
-### 2.10 Managed workspace isolation for future writing Agents
+### 2.10 Managed workspace isolation for writing Agents
 
-Codex exposes repository-aware managed worktrees. Hara does not need that architecture for today's read-only
-fan-out, but it becomes a prerequisite before specialists can edit in parallel. The Hara implementation should
-create a bounded workspace per child, record its base revision and owned diff, run verification there, then ask
-the root Agent to accept or reject the patch. Never merge automatically merely because the child reported
-success.
+Persistent Serve/Desktop sessions now support that contract. An explicit `isolated-write` child receives a
+Hara-owned detached Git worktree at the exact source `HEAD`; ordinary children remain read-only. The child can use
+only bounded file edit tools inside its canonical workspace. Hara disables hooks, rejects active executable Git
+filters, symlink/submodule changes, `.gitattributes` mutation, unsafe paths, patches above 2 MiB, and more than 256
+changed paths. It records a content-free owner/workspace/base/hash receipt and keeps the patch body private.
+
+The root can inspect or reject the Diff. Apply re-captures the exact bytes, verifies owner and hash, requires the
+source `HEAD` to remain at the base, rejects overlapping source changes, runs `git apply --check`, and always asks
+for one fresh human approval—even in full-auto. There is no automatic merge. Crash-after-apply is reconciled with
+a reverse check, and permanent session removal/rewind cleans up the Hara-owned worktrees.
 
 ## 3. What Hara should not copy
 
@@ -254,33 +264,35 @@ success.
    sequence/generation gap detection, typed task/provider/message/tool/diff/Agent/mailbox/steering/control,
    compaction and approval lifecycles, deterministic reduction, and bounded Serve paging are implemented. The
    private session snapshot remains authoritative for content by design.
-4. **Completed local transport foundation — multi-client stream**: socket backpressure, cursor/ACK/exact replay,
+4. **Completed local and Relay transport foundation — multi-client stream**: socket backpressure, cursor/ACK/exact replay,
    restart-safe redacted checkpoints, 10,000-event duplicate/gap coverage, and an authoritative Desktop snapshot
-   fence exist. Cloud relay delivery still needs an independent bounded cursor.
+   fence exist. Relay delivery uses its own persisted bounded per-device stream/cursor; production rollout and
+   public-path fault testing remain.
 5. **Completed control foundation — session lease**: one controller, takeover/revocation, epoch fencing, socket
    release, and legacy compatibility when unleased are covered by two-client integration tests.
-6. **Completed Agent safety slice — durable tree**: stable child identity/path, payload-bound idempotent mailbox,
+6. **Completed Agent safety slice — durable tree and owned writing**: stable child identity/path, payload-bound idempotent mailbox,
    root/parent-turn fencing, lifecycle commands, nested recovery, safe state projection, and persistent whole-tree
-   generations/rounds/tools/active-time/token ceilings are implemented. Direct CLI hosting and managed writable
-   worktrees remain; Hara never derives cost or subscription exhaustion from transport token counters.
+   generations/rounds/tools/active-time/token ceilings are implemented. Opt-in writable children use isolated
+   worktrees, owned Diffs, and human-approved conflict-safe apply. Direct CLI hosting remains; Hara never derives
+   cost or subscription exhaustion from transport token counters.
 7. **Completed headless interaction slice — questions and completion**: persisted `ask_user` pauses, exact-task
    answer continuation, decision retention, credential-safe handoff, and fail-closed completion receipts are covered
    by unit and spawned-CLI integration tests. A full masked integration-secret editor remains a Desktop/Mobile UI
    delivery item rather than a reason to accept credentials through chat.
 8. **In progress — Mobile companion**: account/device pairing, encrypted relay protocol, explicit publication,
-   leases, command replay, and terminal sequencing exist in CLI. Complete the account/relay deployment and native
-   mobile client against the versioned contract before broadening publication beyond coding-agent sessions.
-9. **Completed terminal handoff slice — suspend/resume**: feature negotiation, exact input-fence ACK, successor
-   readiness, rollback, atomic owner commit, and Desktop/mobile/terminal contention tests are implemented. Full
-   Serve-session migration still needs typed disposition for live tools, child processes, and mailbox items.
+   leases, durable command replay, terminal sequencing, and Relay cursor recovery exist. Complete the production
+   Account/Relay deployment and native mobile client against the versioned contract before broadening publication.
+9. **Completed terminal and Serve handoff slice — suspend/resume/migrate**: feature negotiation, exact input-fence
+   ACK, successor readiness, rollback, atomic owner commit, bounded provider/tool/Agent drain, durable pause, and
+   token-bound cross-process migration are implemented with contention and recovery tests.
 10. **Completed no-progress control slice**: output-similarity and exact-call guards, eight-round unattended
     checkpoint/todo gate, run-local token ceiling, access-boundary coalescing, resumable stop state, typed Desktop
     telemetry, and content-free item lifecycle replay are covered by unit and Serve integration tests.
 11. **Completed connection safety foundation**: exact-route circuit health, typed compatibility, quota/region
     classification, account-aware authentication fallback, and no-replay-after-activity are covered by unit and
     Serve/settings tests. Ordered multi-connection user policy and durable health-event replay remain incremental.
-12. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
-   root-controlled merge/rejection.
+12. **Completed writable Agent boundary — managed worktrees**: isolated changes, owned Diffs, strict verification,
+   explicit rejection, and one-time human-approved root apply without automatic merge.
 
 No slice is complete until it has unit tests, an interruption/crash test, bounded logs, and a real CLI/Desktop
 integration check. These changes should ship incrementally after 0.166.1 rather than as a runtime rewrite.

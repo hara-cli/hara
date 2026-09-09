@@ -180,6 +180,7 @@ import {
   type AgentMailboxLifecycleEvent,
   type AgentTeamController,
 } from "../subagent/team.js";
+import { AgentWorktreeManager } from "../subagent/worktree.js";
 import { readModelContextFileSync } from "../fs-read.js";
 import { optionalPosixOpenFlag } from "../fs-open-flags.js";
 import { tightenPrivateDescriptorMode } from "../fs-permissions.js";
@@ -421,6 +422,12 @@ export interface ServeDeps {
         timeoutMs: number;
       };
       reportProgress: (metrics: AgentTeamExecutionMetrics) => boolean;
+      workspace?: Readonly<{
+        mode: "isolated-write";
+        cwd: string;
+        sourceCwd: string;
+        writeBoundary: string;
+      }>;
     },
   ) => Promise<SubagentResult>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
@@ -2145,6 +2152,72 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   const agentTeamFor = (session: ServeSession): DurableAgentTeam => {
     const existing = agentTeams.get(session.meta.id);
     if (existing) return existing;
+    const workspaceRuntimeStates = new Map<string, RunRuntimeItemEvent["state"]>();
+    for (const item of replaySessionJournal(hub.readJournal(session.meta.id).events).runtimeItems) {
+      if (item.kind === "diff" && item.name === "agent_worktree_diff") {
+        workspaceRuntimeStates.set(item.itemId, item.state);
+      }
+    }
+    const workspaceState = (
+      agent: ReturnType<DurableAgentTeam["list"]>[number],
+    ): RunRuntimeItemEvent["state"] | undefined => {
+      const workspace = agent.workspace;
+      if (!workspace) return undefined;
+      switch (workspace.state) {
+        case "pending": return "queued";
+        case "ready": return workspace.capturedAt && workspace.patchBytes === 0 ? "completed" : "started";
+        case "changes": return "paused";
+        case "applying": return "resumed";
+        case "applied": return "completed";
+        case "rejected": return "cancelled";
+        case "error": return "failed";
+      }
+    };
+    const workspaceTransitionPath = (
+      from: RunRuntimeItemEvent["state"] | undefined,
+      to: RunRuntimeItemEvent["state"],
+    ): RunRuntimeItemEvent["state"][] => {
+      if (from === to) return [];
+      const terminal = new Set<RunRuntimeItemEvent["state"]>(["completed", "failed", "cancelled", "denied"]);
+      if (from && terminal.has(from)) return [];
+      const start = from === undefined ? ["queued", "started"] as RunRuntimeItemEvent["state"][] : [from];
+      const edges = new Map<RunRuntimeItemEvent["state"], RunRuntimeItemEvent["state"][]>([
+        ["queued", ["started", "completed", "failed", "cancelled"]],
+        ["started", ["paused", "completed", "failed", "cancelled"]],
+        ["paused", ["resumed", "failed", "cancelled"]],
+        ["resumed", ["paused", "completed", "failed", "cancelled"]],
+      ]);
+      const queue = start.map((state) => ({ state, path: [state] }));
+      const seen = new Set<RunRuntimeItemEvent["state"]>();
+      while (queue.length) {
+        const current = queue.shift()!;
+        if (seen.has(current.state)) continue;
+        seen.add(current.state);
+        if (current.state === to) return from === undefined ? current.path : current.path.slice(1);
+        for (const next of edges.get(current.state) ?? []) queue.push({ state: next, path: [...current.path, next] });
+      }
+      return [];
+    };
+    const publishWorkspaceState = (agent: ReturnType<DurableAgentTeam["list"]>[number]): void => {
+      const desired = workspaceState(agent);
+      const taskId = session.task?.id;
+      const turnId = agent.rootTurnId ?? session.task?.turnId;
+      if (!desired || !taskId || !turnId) return;
+      const itemId = `agent-worktree:${agent.id}:${agent.generation}`;
+      const previous = workspaceRuntimeStates.get(itemId);
+      for (const state of workspaceTransitionPath(previous, desired)) {
+        publishRuntimeItem(session, {
+          itemId,
+          kind: "diff",
+          state,
+          parentItemId: `agent:${agent.id}:${agent.generation}`,
+          name: "agent_worktree_diff",
+          effect: "edit",
+          generation: agent.generation,
+        }, { taskId, turnId });
+        workspaceRuntimeStates.set(itemId, state);
+      }
+    };
     const team = new DurableAgentTeam({
       sessionId: session.meta.id,
       store: agentTeamStore,
@@ -2165,6 +2238,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           maxTokensPerAgent: Math.max(32_000, Math.min(500_000, Math.floor(modelWindow / 2))),
         };
       },
+      worktreeManager: () => new AgentWorktreeManager(
+        session.meta.cwd,
+        deps.agentTeamHome ?? deps.discoveryHome ?? homedir(),
+        session.meta.id,
+      ),
       executor: async (request) => {
         sessionSpaceBinding(session.meta);
         const taskId = session.task?.id;
@@ -2203,6 +2281,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               pendingInput: request.pendingInput,
               executionBudget: request.budget,
               reportProgress: request.reportProgress,
+              ...(request.workspace ? { workspace: request.workspace } : {}),
             },
           );
           sessionSpaceBinding(session.meta);
@@ -2213,6 +2292,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             ...(result.error ? { error: result.error } : {}),
             ...(result.usage ? { usage: result.usage } : {}),
             ...(result.metrics ? { metrics: result.metrics } : {}),
+          };
+        }
+        if (request.workspace) {
+          return {
+            status: "error",
+            text: "",
+            error: "This Hara embedder does not support isolated writable Agent worktrees.",
           };
         }
         const text = await deps.spawnSubagent(
@@ -2234,6 +2320,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       },
       onChange: (agent) => {
         broadcast("event.agent_state", { sessionId: session.meta.id, agent });
+        publishWorkspaceState(agent);
       },
       onMailbox: (event: AgentMailboxLifecycleEvent) => {
         const taskId = session.task?.id;

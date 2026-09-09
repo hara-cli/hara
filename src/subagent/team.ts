@@ -8,6 +8,11 @@ import {
 } from "../security/private-state.js";
 import { redactSensitiveText } from "../security/secrets.js";
 import { validSessionId } from "../session/store.js";
+import type {
+  AgentWorktreeBinding,
+  AgentWorktreeDiff,
+  AgentWorktreeManager,
+} from "./worktree.js";
 
 const TEAM_VERSION = 1 as const;
 const MAX_TEAM_FILE_BYTES = 2 * 1024 * 1024;
@@ -24,6 +29,48 @@ const MAX_WAIT_MS = 5 * 60_000;
 const TASK_NAME = /^[a-z][a-z0-9_-]{0,47}$/;
 const AGENT_PATH = /^\/root(?:\/[a-z][a-z0-9_-]{0,47}){1,4}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const COMMIT = /^[0-9a-f]{40,64}$/u;
+const WORKSPACE_ID = /^aw_[a-f0-9]{40}$/u;
+const PATCH_HASH = /^[a-f0-9]{64}$/u;
+const MAX_DIFF_PATHS = 256;
+
+export type AgentWorkspaceMode = "read-only" | "isolated-write";
+export type AgentWorkspaceState = "pending" | "ready" | "changes" | "applying" | "applied" | "rejected" | "error";
+
+interface AgentTeamWorkspaceRecord {
+  mode: "isolated-write";
+  state: AgentWorkspaceState;
+  workspaceId?: string;
+  baseCommit?: string;
+  changedPaths?: string[];
+  patchBytes?: number;
+  patchSha256?: string;
+  capturedAt?: string;
+  reviewedAt?: string;
+  appliedAt?: string;
+  rejectedAt?: string;
+  error?: string;
+}
+
+export interface AgentTeamWorkspaceView {
+  mode: "isolated-write";
+  state: AgentWorkspaceState;
+  workspaceId?: string;
+  baseCommit?: string;
+  changedPaths?: string[];
+  patchBytes?: number;
+  patchSha256?: string;
+  capturedAt?: string;
+  reviewedAt?: string;
+  appliedAt?: string;
+  rejectedAt?: string;
+}
+
+export interface AgentTeamDiffView extends AgentTeamWorkspaceView {
+  agentId: string;
+  agentPath: string;
+  patch: string;
+}
 
 export type AgentTeamStatus =
   | "queued"
@@ -151,6 +198,7 @@ interface AgentTeamRecord {
   error?: string;
   usage?: AgentTeamUsage;
   executionBudget?: AgentTeamExecutionBudget;
+  workspace?: AgentTeamWorkspaceRecord;
 }
 
 interface AgentTeamSnapshot {
@@ -181,6 +229,7 @@ export interface AgentTeamAgentView {
   usage?: AgentTeamUsage;
   pendingMessages: number;
   hasResult: boolean;
+  workspace?: AgentTeamWorkspaceView;
 }
 
 export interface AgentTeamWaitResult {
@@ -212,17 +261,26 @@ export interface AgentTeamExecutionRequest {
   budget: Pick<AgentTeamExecutionBudget, "maxProviderRounds" | "maxToolCalls" | "maxTokens" | "timeoutMs">;
   /** Absolute generation counters. False means the shared tree ceiling was reached; no new work may start. */
   reportProgress: (metrics: AgentTeamExecutionMetrics) => boolean;
+  workspace?: Readonly<{
+    mode: "isolated-write";
+    cwd: string;
+    sourceCwd: string;
+    writeBoundary: string;
+  }>;
 }
 
 export interface AgentTeamController {
   readonly path: string;
-  spawn(input: { taskName: string; message: string; role?: string }): Promise<AgentTeamAgentView>;
+  spawn(input: { taskName: string; message: string; role?: string; workspace?: AgentWorkspaceMode }): Promise<AgentTeamAgentView>;
   sendMessage(target: string, message: string, commandId?: string): Promise<AgentTeamAgentView>;
   followup(target: string, message: string, commandId?: string): Promise<AgentTeamAgentView>;
   interrupt(target: string): Promise<AgentTeamAgentView>;
   resume(target: string): Promise<AgentTeamAgentView>;
   list(): AgentTeamAgentView[];
   wait(target: string, timeoutMs?: number): Promise<AgentTeamWaitResult>;
+  inspectDiff(target: string): Promise<AgentTeamDiffView>;
+  applyDiff(target: string): Promise<AgentTeamWorkspaceView>;
+  rejectDiff(target: string): Promise<AgentTeamWorkspaceView>;
 }
 
 export interface DurableAgentTeamOptions {
@@ -236,6 +294,8 @@ export interface DurableAgentTeamOptions {
   currentRootTurnId?: () => string | undefined;
   /** Resolved only when a new parent turn adopts the tree, so model/connection changes affect new work. */
   limits?: Partial<AgentTeamLimits> | (() => Partial<AgentTeamLimits>);
+  /** Lazily constructed because ordinary/read-only sessions need not be Git repositories. */
+  worktreeManager?: AgentWorktreeManager | (() => AgentWorktreeManager);
 }
 
 function iso(): string {
@@ -345,6 +405,64 @@ function parseExecutionBudget(value: unknown, generation: number): AgentTeamExec
     toolCalls: Number(value.toolCalls),
     inputTokens: Number(value.inputTokens),
     outputTokens: Number(value.outputTokens),
+  };
+}
+
+function parseWorkspace(value: unknown): AgentTeamWorkspaceRecord | undefined {
+  if (value === undefined) return undefined;
+  if (!plainObject(value) || value.mode !== "isolated-write") {
+    throw new Error("agent workspace is invalid");
+  }
+  if (!["pending", "ready", "changes", "applying", "applied", "rejected", "error"].includes(String(value.state))) {
+    throw new Error("agent workspace state is invalid");
+  }
+  if (value.workspaceId !== undefined && !WORKSPACE_ID.test(String(value.workspaceId))) {
+    throw new Error("agent workspace id is invalid");
+  }
+  if (value.baseCommit !== undefined && !COMMIT.test(String(value.baseCommit))) {
+    throw new Error("agent workspace base commit is invalid");
+  }
+  if ((value.workspaceId === undefined) !== (value.baseCommit === undefined)) {
+    throw new Error("agent workspace ownership is incomplete");
+  }
+  if (
+    value.changedPaths !== undefined
+    && (!Array.isArray(value.changedPaths)
+      || value.changedPaths.length > MAX_DIFF_PATHS
+      || value.changedPaths.some((path) => !safeStoredString(path, 4_096) || !path))
+  ) throw new Error("agent workspace changed paths are invalid");
+  if (value.patchBytes !== undefined && !finiteCount(value.patchBytes, 2 * 1024 * 1024)) {
+    throw new Error("agent workspace patch size is invalid");
+  }
+  if (value.patchSha256 !== undefined && !PATCH_HASH.test(String(value.patchSha256))) {
+    throw new Error("agent workspace patch hash is invalid");
+  }
+  for (const field of ["capturedAt", "reviewedAt", "appliedAt", "rejectedAt"] as const) {
+    if (value[field] !== undefined && !validIso(value[field])) {
+      throw new Error("agent workspace timestamp is invalid");
+    }
+  }
+  if (value.error !== undefined && !safeStoredString(value.error, 1_000)) {
+    throw new Error("agent workspace error is invalid");
+  }
+  if (
+    (value.patchBytes === undefined) !== (value.patchSha256 === undefined)
+    || (value.patchBytes === undefined) !== (value.changedPaths === undefined)
+    || (value.patchBytes === undefined) !== (value.capturedAt === undefined)
+  ) throw new Error("agent workspace Diff receipt is incomplete");
+  return {
+    mode: "isolated-write",
+    state: value.state as AgentWorkspaceState,
+    ...(value.workspaceId !== undefined ? { workspaceId: String(value.workspaceId) } : {}),
+    ...(value.baseCommit !== undefined ? { baseCommit: String(value.baseCommit) } : {}),
+    ...(value.changedPaths !== undefined ? { changedPaths: [...value.changedPaths] as string[] } : {}),
+    ...(value.patchBytes !== undefined ? { patchBytes: Number(value.patchBytes) } : {}),
+    ...(value.patchSha256 !== undefined ? { patchSha256: String(value.patchSha256) } : {}),
+    ...(value.capturedAt !== undefined ? { capturedAt: String(value.capturedAt) } : {}),
+    ...(value.reviewedAt !== undefined ? { reviewedAt: String(value.reviewedAt) } : {}),
+    ...(value.appliedAt !== undefined ? { appliedAt: String(value.appliedAt) } : {}),
+    ...(value.rejectedAt !== undefined ? { rejectedAt: String(value.rejectedAt) } : {}),
+    ...(value.error !== undefined ? { error: String(value.error) } : {}),
   };
 }
 
@@ -507,6 +625,7 @@ function parseRecord(value: unknown): AgentTeamRecord {
   }
   if (value.usage !== undefined && !validUsage(value.usage)) throw new Error("agent team usage is invalid");
   const executionBudget = parseExecutionBudget(value.executionBudget, Number(value.generation));
+  const workspace = parseWorkspace(value.workspace);
   return {
     id: String(value.id),
     path: value.path,
@@ -536,6 +655,7 @@ function parseRecord(value: unknown): AgentTeamRecord {
       },
     } : {}),
     ...(executionBudget ? { executionBudget } : {}),
+    ...(workspace ? { workspace } : {}),
   };
 }
 
@@ -642,6 +762,22 @@ export class AgentTeamStore {
   }
 }
 
+function workspaceViewOf(workspace: AgentTeamWorkspaceRecord): AgentTeamWorkspaceView {
+  return {
+    mode: workspace.mode,
+    state: workspace.state,
+    ...(workspace.workspaceId ? { workspaceId: workspace.workspaceId } : {}),
+    ...(workspace.baseCommit ? { baseCommit: workspace.baseCommit } : {}),
+    ...(workspace.changedPaths ? { changedPaths: [...workspace.changedPaths] } : {}),
+    ...(workspace.patchBytes !== undefined ? { patchBytes: workspace.patchBytes } : {}),
+    ...(workspace.patchSha256 ? { patchSha256: workspace.patchSha256 } : {}),
+    ...(workspace.capturedAt ? { capturedAt: workspace.capturedAt } : {}),
+    ...(workspace.reviewedAt ? { reviewedAt: workspace.reviewedAt } : {}),
+    ...(workspace.appliedAt ? { appliedAt: workspace.appliedAt } : {}),
+    ...(workspace.rejectedAt ? { rejectedAt: workspace.rejectedAt } : {}),
+  };
+}
+
 function viewOf(record: AgentTeamRecord): AgentTeamAgentView {
   return {
     id: record.id,
@@ -662,6 +798,7 @@ function viewOf(record: AgentTeamRecord): AgentTeamAgentView {
     ...(record.usage ? { usage: { ...record.usage } } : {}),
     pendingMessages: record.mailbox.filter((message) => message.state === "pending").length,
     hasResult: Boolean(record.result),
+    ...(record.workspace ? { workspace: workspaceViewOf(record.workspace) } : {}),
   };
 }
 
@@ -689,8 +826,8 @@ interface ActiveAgentRun {
   promise: Promise<void>;
 }
 
-/** Durable Codex-style Agent tree. Children are still read-only; stable identities, mailbox state and
- * terminal results survive host restarts without pretending an abandoned process is still live. */
+/** Durable Codex-style Agent tree. Children are read-only unless an explicit isolated-write workspace is
+ * requested; stable identities, mailbox state, owned Diffs, and terminal results survive host restarts. */
 export class DurableAgentTeam {
   private snapshot?: AgentTeamSnapshot;
   private readonly active = new Map<string, ActiveAgentRun>();
@@ -698,9 +835,18 @@ export class DurableAgentTeam {
    * to start on the old owner. The host discards this team after the drain and reconstructs it on resume. */
   private draining = false;
   private closed = false;
+  private resolvedWorktreeManager?: AgentWorktreeManager;
 
   constructor(private readonly options: DurableAgentTeamOptions) {
     if (!validSessionId(options.sessionId)) throw new Error("invalid Agent team session id");
+  }
+
+  private worktreeManager(): AgentWorktreeManager {
+    if (this.resolvedWorktreeManager) return this.resolvedWorktreeManager;
+    const configured = this.options.worktreeManager;
+    if (!configured) throw new Error("isolated writable Agent worktrees are unavailable in this session");
+    this.resolvedWorktreeManager = typeof configured === "function" ? configured() : configured;
+    return this.resolvedWorktreeManager;
   }
 
   private configuredLimits(): AgentTeamLimits {
@@ -1006,6 +1152,18 @@ export class DurableAgentTeam {
       },
       list: () => this.list(),
       wait: (target, timeoutMs) => this.wait(target, timeoutMs),
+      inspectDiff: (target) => {
+        this.assertControllerFence(path, provenance);
+        return this.inspectDiff(target, provenance);
+      },
+      applyDiff: (target) => {
+        this.assertControllerFence(path, provenance);
+        return this.applyDiff(target, provenance);
+      },
+      rejectDiff: (target) => {
+        this.assertControllerFence(path, provenance);
+        return this.rejectDiff(target, provenance);
+      },
     };
   }
 
@@ -1056,7 +1214,7 @@ export class DurableAgentTeam {
 
   private async spawn(
     parentPath: string,
-    input: { taskName: string; message: string; role?: string },
+    input: { taskName: string; message: string; role?: string; workspace?: AgentWorkspaceMode },
     provenance: { parentTurnId?: string; rootTurnId?: string },
   ): Promise<AgentTeamAgentView> {
     if (this.closed) throw new Error("Agent team is closed");
@@ -1069,6 +1227,11 @@ export class DurableAgentTeam {
     }
     const message = safeText(input.message, MAX_ASSIGNMENT_CHARS, "message");
     const role = safeRole(input.role);
+    const workspace = input.workspace ?? "read-only";
+    if (workspace !== "read-only" && workspace !== "isolated-write") {
+      throw new Error("Agent workspace must be 'read-only' or 'isolated-write'");
+    }
+    if (workspace === "isolated-write") this.worktreeManager();
     const path = parentPath + "/" + taskName;
     if (!AGENT_PATH.test(path) || pathDepth(path) > MAX_AGENT_DEPTH) {
       throw new Error("Agent tree depth exceeds the maximum of " + String(MAX_AGENT_DEPTH));
@@ -1095,6 +1258,9 @@ export class DurableAgentTeam {
         assignment: message,
         instructions: [message],
         mailbox: [],
+        ...(workspace === "isolated-write"
+          ? { workspace: { mode: "isolated-write", state: "pending" } as AgentTeamWorkspaceRecord }
+          : {}),
         createdAt: now,
         updatedAt: now,
         queuedAt: now,
@@ -1147,6 +1313,13 @@ export class DurableAgentTeam {
       // record, not the earlier cache snapshot, or a follow-up arriving on that boundary can remain queued
       // forever after the generation's final pending-mailbox check has already run.
       startAfterCommit = kind === "followup" && terminal(record.status);
+      if (
+        startAfterCommit
+        && record.workspace
+        && (record.workspace.state === "applied" || record.workspace.state === "rejected")
+      ) {
+        throw new Error("Agent Diff is already resolved; spawn a new Agent for additional isolated changes");
+      }
       if (record.instructions.length >= MAX_INSTRUCTIONS) throw new Error("Agent instruction history is full");
       if (record.mailbox.length >= MAX_MAILBOX_MESSAGES) throw new Error("Agent mailbox is full");
       const total = record.instructions.reduce((sum, item) => sum + item.length, 0) + content.length;
@@ -1185,6 +1358,17 @@ export class DurableAgentTeam {
       record.queuedAt = iso();
       delete record.startedAt;
       delete record.endedAt;
+      if (record.workspace) {
+        record.workspace.state = "ready";
+        delete record.workspace.changedPaths;
+        delete record.workspace.patchBytes;
+        delete record.workspace.patchSha256;
+        delete record.workspace.capturedAt;
+        delete record.workspace.reviewedAt;
+        delete record.workspace.appliedAt;
+        delete record.workspace.rejectedAt;
+        delete record.workspace.error;
+      }
       this.reserveExecutionBudget(record, draft, record.rootTurnId);
     });
     this.launch(id, true);
@@ -1254,11 +1438,36 @@ export class DurableAgentTeam {
       this.publishMailbox(working, message, "started");
       this.publishMailbox(working, message, "completed");
     }
-    let result: AgentTeamExecutionResult;
+    let result: AgentTeamExecutionResult | undefined;
     let treeLimitReached = false;
+    let workspaceBinding: AgentWorktreeBinding | undefined;
     const executionBudget = working.executionBudget;
     if (!executionBudget) throw new Error("Agent generation has no reserved execution budget");
-    try {
+    if (working.workspace) {
+      try {
+        const manager = this.worktreeManager();
+        if (working.workspace.workspaceId) manager.assertWorkspaceId(id, working.workspace.workspaceId);
+        workspaceBinding = manager.prepare(id, working.workspace.baseCommit);
+        this.change(id, (record) => {
+          if (record.generation !== generation || !record.workspace) return;
+          record.workspace.workspaceId = workspaceBinding!.workspaceId;
+          record.workspace.baseCommit = workspaceBinding!.baseCommit;
+          if (record.workspace.state === "pending" || record.workspace.state === "error") {
+            record.workspace.state = "ready";
+          }
+          delete record.workspace.error;
+        });
+      } catch (error) {
+        const safe = redactSensitiveText(error instanceof Error ? error.message : String(error)).text.slice(0, 1_000);
+        this.change(id, (record) => {
+          if (!record.workspace) return;
+          record.workspace.state = "error";
+          record.workspace.error = safe || "Agent worktree preparation failed";
+        });
+        result = { status: "error", text: "", error: safe || "Agent worktree preparation failed" };
+      }
+    }
+    if (!result) try {
       const observed = Promise.resolve(this.options.executor({
         id,
         path: working.path,
@@ -1286,6 +1495,14 @@ export class DurableAgentTeam {
           }
           return withinLimit;
         },
+        ...(workspaceBinding ? {
+          workspace: {
+            mode: "isolated-write",
+            cwd: workspaceBinding.cwd,
+            sourceCwd: this.worktreeManager().sourceCwd,
+            writeBoundary: workspaceBinding.path,
+          },
+        } : {}),
       }));
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<AgentTeamExecutionResult>((resolve) => {
@@ -1314,6 +1531,23 @@ export class DurableAgentTeam {
           .slice(0, MAX_RESULT_CHARS),
       };
     }
+    if (workspaceBinding) {
+      try {
+        const diff = this.worktreeManager().capture(id, workspaceBinding.baseCommit);
+        this.recordWorkspaceDiff(id, generation, diff);
+      } catch (error) {
+        const safe = redactSensitiveText(error instanceof Error ? error.message : String(error)).text.slice(0, 1_000);
+        this.change(id, (record) => {
+          if (record.generation !== generation || !record.workspace) return;
+          record.workspace.state = "error";
+          record.workspace.error = safe || "Agent Diff capture failed";
+        });
+        if (result.status === "completed") {
+          result = { ...result, status: "error", text: "", error: safe || "Agent Diff capture failed" };
+        }
+      }
+    }
+    if (!result) throw new Error("Agent generation ended without a result");
     if (result.metrics) {
       treeLimitReached = !this.reportGenerationProgress(id, generation, result.metrics) || treeLimitReached;
     } else if (result.usage) {
@@ -1377,6 +1611,134 @@ export class DurableAgentTeam {
       this.publishMailbox(updated, message, "completed");
     }
     return deliveries;
+  }
+
+  private recordWorkspaceDiff(
+    id: string,
+    generation: number,
+    diff: AgentWorktreeDiff,
+    reviewed = false,
+  ): AgentTeamRecord {
+    return this.change(id, (record) => {
+      if (record.generation !== generation || !record.workspace) return;
+      if (diff.ownerAgentId !== record.id) throw new Error("Agent Diff owner changed during capture");
+      this.worktreeManager().assertWorkspaceId(record.id, diff.workspaceId);
+      record.workspace = {
+        mode: "isolated-write",
+        state: diff.patchBytes > 0 ? "changes" : "ready",
+        workspaceId: diff.workspaceId,
+        baseCommit: diff.baseCommit,
+        changedPaths: [...diff.changedPaths],
+        patchBytes: diff.patchBytes,
+        patchSha256: diff.patchSha256,
+        capturedAt: iso(),
+        ...(reviewed ? { reviewedAt: iso() } : {}),
+      };
+    });
+  }
+
+  private async inspectDiff(
+    target: string,
+    provenance: { rootTurnId?: string } = {},
+  ): Promise<AgentTeamDiffView> {
+    const selected = this.resolve(target);
+    this.assertTargetTurn(selected, provenance);
+    if (!terminal(selected.status)) throw new Error("Agent Diff can be inspected only after its generation settles");
+    if (!selected.workspace?.workspaceId || !selected.workspace.baseCommit) {
+      throw new Error("Agent has no isolated writable workspace");
+    }
+    this.worktreeManager().assertWorkspaceId(selected.id, selected.workspace.workspaceId);
+    const diff = this.worktreeManager().capture(selected.id, selected.workspace.baseCommit);
+    const resolved = selected.workspace.state === "applied" || selected.workspace.state === "rejected";
+    if (
+      resolved
+      && selected.workspace.patchSha256
+      && selected.workspace.patchSha256 !== diff.patchSha256
+    ) {
+      throw new Error("resolved Agent worktree changed afterward; its old Diff will not be silently replaced");
+    }
+    const updated = resolved
+      ? selected
+      : this.recordWorkspaceDiff(selected.id, selected.generation, diff, true);
+    if (!updated.workspace) throw new Error("Agent workspace disappeared during Diff inspection");
+    return {
+      ...workspaceViewOf(updated.workspace),
+      agentId: selected.id,
+      agentPath: selected.path,
+      patch: diff.patch,
+    };
+  }
+
+  private async applyDiff(
+    target: string,
+    provenance: { rootTurnId?: string } = {},
+  ): Promise<AgentTeamWorkspaceView> {
+    const selected = this.resolve(target);
+    this.assertTargetTurn(selected, provenance);
+    if (!terminal(selected.status)) throw new Error("Agent Diff cannot be applied while its Agent is active");
+    const workspace = selected.workspace;
+    if (
+      !workspace
+      || (workspace.state !== "changes" && workspace.state !== "applying")
+      || !workspace.workspaceId
+      || !workspace.baseCommit
+      || !workspace.patchSha256
+    ) throw new Error("Agent has no reviewed, unresolved Diff to apply");
+    if (!workspace.reviewedAt) {
+      throw new Error("Inspect the current Agent Diff before requesting its application");
+    }
+    this.worktreeManager().assertWorkspaceId(selected.id, workspace.workspaceId);
+    if (workspace.state === "changes") {
+      this.change(selected.id, (record) => {
+        if (!record.workspace || record.workspace.patchSha256 !== workspace.patchSha256) {
+          throw new Error("Agent Diff changed before apply intent was saved");
+        }
+        record.workspace.state = "applying";
+        delete record.workspace.error;
+      });
+    }
+    try {
+      this.worktreeManager().apply(selected.id, workspace.baseCommit, workspace.patchSha256);
+    } catch (error) {
+      const safe = redactSensitiveText(error instanceof Error ? error.message : String(error)).text.slice(0, 1_000);
+      this.change(selected.id, (record) => {
+        if (!record.workspace || record.workspace.patchSha256 !== workspace.patchSha256) return;
+        record.workspace.state = "changes";
+        record.workspace.error = safe || "Agent Diff application failed";
+        delete record.workspace.reviewedAt;
+      });
+      throw error;
+    }
+    const updated = this.change(selected.id, (record) => {
+      if (!record.workspace || record.workspace.patchSha256 !== workspace.patchSha256) {
+        throw new Error("Agent Diff changed during apply");
+      }
+      record.workspace.state = "applied";
+      record.workspace.appliedAt = iso();
+      delete record.workspace.error;
+    });
+    return workspaceViewOf(updated.workspace!);
+  }
+
+  private async rejectDiff(
+    target: string,
+    provenance: { rootTurnId?: string } = {},
+  ): Promise<AgentTeamWorkspaceView> {
+    const selected = this.resolve(target);
+    this.assertTargetTurn(selected, provenance);
+    if (!terminal(selected.status)) throw new Error("Agent Diff cannot be rejected while its Agent is active");
+    if (!selected.workspace || selected.workspace.state !== "changes") {
+      throw new Error("Agent has no unresolved Diff to reject");
+    }
+    const updated = this.change(selected.id, (record) => {
+      if (!record.workspace || record.workspace.state !== "changes") {
+        throw new Error("Agent Diff changed during rejection");
+      }
+      record.workspace.state = "rejected";
+      record.workspace.rejectedAt = iso();
+      delete record.workspace.error;
+    });
+    return workspaceViewOf(updated.workspace!);
   }
 
   private launchPendingFollowup(id: string): void {
@@ -1499,7 +1861,14 @@ export class DurableAgentTeam {
 
   removeStoredState(): boolean {
     if (this.active.size) throw new Error("cannot remove an Agent team while children are active");
+    this.ensureLoaded();
+    const isolated = this.snapshot!.agents.filter((record) => record.workspace?.mode === "isolated-write");
+    if (isolated.length) {
+      const manager = this.worktreeManager();
+      for (const record of isolated) manager.remove(record.id, record.workspace?.workspaceId);
+    }
+    const removed = this.options.store.remove(this.options.sessionId);
     this.snapshot = undefined;
-    return this.options.store.remove(this.options.sessionId);
+    return removed;
   }
 }

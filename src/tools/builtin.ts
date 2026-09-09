@@ -31,6 +31,7 @@ import { isReadOnlyCommand, splitCompound } from "../security/permissions.js";
 import { loadConfig } from "../config.js";
 import { commandHasPackageRegistry, normalizePackageRegistry, packageRegistryEnv } from "../package-registry.js";
 import { mediaTypeFor } from "../images.js";
+import { assertWorkspaceWriteBoundary } from "../context/workspace-scope.js";
 import {
   hostsInCommand,
   isNetworkGitOp,
@@ -311,6 +312,7 @@ registerTool({
     let boundary: AtomicWriteBoundary | undefined;
     try {
       boundary = bindAtomicWritePath(p, "write");
+      assertWorkspaceWriteBoundary(boundary.target, ctx.writeBoundary);
       prevSnapshot = await readVerifiedRegularFileSnapshot(boundary.target, undefined, "write");
     } catch (error: any) {
       if (error?.code !== "ENOENT" || !boundary) return `Error: cannot inspect ${input.path}: ${error?.message ?? error?.code}. No changes written.`;

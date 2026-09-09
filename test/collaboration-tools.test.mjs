@@ -48,6 +48,24 @@ const fakeTeam = (calls) => ({
     calls.push(["wait", target, timeoutMs]);
     return { agent: { ...baseAgent, status: "completed", hasResult: true }, settled: true, result: "done" };
   },
+  async inspectDiff(target) {
+    calls.push(["inspect-diff", target]);
+    return {
+      agentId: baseAgent.id,
+      agentPath: baseAgent.path,
+      mode: "isolated-write",
+      state: "changes",
+      patch: "diff --git a/a b/a\n",
+    };
+  },
+  async applyDiff(target) {
+    calls.push(["apply-diff", target]);
+    return { mode: "isolated-write", state: "applied" };
+  },
+  async rejectDiff(target) {
+    calls.push(["reject-diff", target]);
+    return { mode: "isolated-write", state: "rejected" };
+  },
 });
 
 test("collaboration tools use a scoped durable team and classify mailbox mutation as serial state", async () => {
@@ -68,6 +86,18 @@ test("collaboration tools use a scoped durable team and classify mailbox mutatio
   assert.equal(waited.result, "done");
   assert.deepEqual(calls[0], ["spawn", { taskName: "audit", message: "inspect" }]);
   assert.deepEqual(calls.at(-1), ["wait", created.id, 25]);
+
+  const inspected = JSON.parse(await getTool("inspect_agent_diff").run({ target: created.id }, ctx));
+  assert.match(inspected.patch, /diff --git/u);
+  const applied = JSON.parse(await getTool("apply_agent_diff").run({ target: created.id }, ctx));
+  assert.equal(applied.state, "applied");
+  assert.deepEqual(toolOperationTraits(getTool("apply_agent_diff"), { target: created.id }, ctx), {
+    effect: "edit",
+    concurrencySafe: false,
+    requiresExplicitApproval: true,
+  });
+  const rejected = JSON.parse(await getTool("reject_agent_diff").run({ target: created.id }, ctx));
+  assert.equal(rejected.state, "rejected");
 });
 
 test("collaboration tools fail clearly outside a persistent Agent-team context", async () => {
@@ -102,7 +132,10 @@ test("durable collaboration schemas are advertised only when the host supplies a
     confirm: async () => true,
     quiet: true,
   });
-  for (const tool of ["spawn_agent", "send_message", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent"]) {
+  for (const tool of [
+    "spawn_agent", "send_message", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent",
+    "inspect_agent_diff", "apply_agent_diff", "reject_agent_diff",
+  ]) {
     assert.equal(seen[0].includes(tool), false, `${tool} stays out of a direct-run prompt`);
     assert.equal(seen[1].includes(tool), true, `${tool} is visible in a persistent Agent-team run`);
   }

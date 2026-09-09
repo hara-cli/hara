@@ -61,9 +61,12 @@ export interface ToolContext {
   restrictToolsForSkill?: (skillId: string, allowedTools: readonly string[]) => SkillToolPolicyActivation;
   /** spawn a sub-agent for a sub-task (set by the REPL/-p; absent inside sub-agents) */
   spawn?: (task: string, role?: string, signal?: AbortSignal) => Promise<string>;
-  /** Durable read-only Agent tree owned by a persistent session. It is scoped to the current Agent path,
-   * so nested children can collaborate without receiving access to another session's mailbox. */
+  /** Durable Agent tree owned by a persistent session. It is read-only by default and scoped to the current
+   * Agent path, so nested children cannot receive another session's mailbox or Diff authority. */
   agentTeam?: AgentTeamController;
+  /** Canonical managed worktree root for an explicitly writable child Agent. Coding tools revalidate their
+   * bound target against it after symlink resolution; ordinary/root runs omit it. */
+  writeBoundary?: string;
   /** UI sink (set in TUI mode) — tools route diffs/output here instead of stdout */
   ui?: UiSink;
   /** Ask the user a structured question mid-turn and await their answer (drives the `ask_user` tool).
@@ -98,6 +101,9 @@ export interface ToolOperationTraits {
   /** Optional approval boundary when it is stricter than the operation's data effect. For example,
    * isolated browser rendering remains a read but still requires explicit computer-use consent. */
   approvalKind?: "read" | "edit" | "exec" | "computer";
+  /** Require a fresh human decision even when the session is full-auto. Use for explicit ownership
+   * transfers such as accepting a child Agent Diff; this grant is intentionally never remembered. */
+  requiresExplicitApproval?: boolean;
   /** Metadata for future audit/permission UIs; never weakens the ordinary approval/guardian boundary. */
   destructive?: boolean;
 }
@@ -210,6 +216,7 @@ export function toolOperationTraits(tool: Tool, input: unknown, ctx: ToolContext
       ...(classified.approvalKind && TOOL_APPROVAL_KINDS.has(classified.approvalKind)
         ? { approvalKind: classified.approvalKind }
         : {}),
+      ...(classified.requiresExplicitApproval === true ? { requiresExplicitApproval: true } : {}),
       ...(classified.destructive === true ? { destructive: true } : {}),
     };
   } catch {

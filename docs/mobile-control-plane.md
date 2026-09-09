@@ -41,6 +41,9 @@ the CLI against its publication, lease epoch, expiry, command ID, and active tur
   epoch after restart.
 - Idempotent remote command receipts, payload collision rejection, expiry checks, `expectedTurnId` fencing for
   steer/interrupt, and monotonic payload-bound `inputSeq` values for PTY input.
+- Private, bounded publication and command-outcome checkpoints survive bridge restart. Relay delivery has an
+  independent per-device stream/cursor: reconnect re-acknowledges the local checkpoint and requests only the
+  missing suffix, while gaps, changed streams, and conflicting replays fail closed.
 - Approval, interrupt, submit/steer, terminal input, resize, and release are capability-gated separately.
 
 The CLI entry points are:
@@ -81,10 +84,6 @@ protocol rather than copy NayiApp account or networking assumptions.
   `relay.hara.nanhara.tech`; add rate limits, abuse controls, encrypted backups, key rotation, and restore drills.
 - Implement the React Native pairing, session list, conversation, approval, and terminal screens against the
   protocol above.
-- Add relay-side request/response delivery receipts and a bounded reconnect cursor. Local Serve's event cursor
-  is not a cloud-global cursor.
-- Persist the bridge's publication and command-receipt projection so a bridge restart retains outcome knowledge;
-  until then a new epoch invalidates old mutations and the phone must refresh.
 - Extend publication to ordinary Hara sessions only after their task/workforce/approval snapshot and controller
   lease are exposed through the same redacted contract. Do not tunnel the full local Serve API to Mobile.
 - Add end-to-end tests for Desktop online/offline transitions, phone backgrounding, lease contention, lost ACKs,

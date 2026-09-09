@@ -10,6 +10,7 @@ import {
   loadRoles,
   rolesDigest,
   scaffoldRoles,
+  isolatedSubagentToolFilter,
   subagentToolFilter,
   roleToolFilter,
 } from "../dist/org/roles.js";
@@ -36,6 +37,23 @@ test("subagentToolFilter: a write-granting role can NOT give a fan-out sub-agent
   assert.equal(denyRole("read_file"), true);
   assert.equal(denyRole("grep"), false, "denied even though read");
   assert.equal(denyRole("edit_file"), false, "still never write/exec");
+});
+
+test("isolated writable subagents get only native edits, while role policy can only narrow", () => {
+  const readonly = (name) => ["read_file", "grep", "inspect_agent_diff"].includes(name);
+  const writable = (name) => ["write_file", "edit_file", "apply_patch"].includes(name);
+  const defaultFilter = isolatedSubagentToolFilter(undefined, readonly, writable);
+  assert.equal(defaultFilter("read_file"), true);
+  assert.equal(defaultFilter("edit_file"), true);
+  for (const tool of ["bash", "python", "job", "apply_agent_diff", "computer", "external_agent"]) {
+    assert.equal(defaultFilter(tool), false, `${tool} is outside the isolated child boundary`);
+  }
+  const reviewer = isolatedSubagentToolFilter({ readOnly: true, allowTools: ["read_file", "edit_file"] }, readonly, writable);
+  assert.equal(reviewer("read_file"), true);
+  assert.equal(reviewer("edit_file"), false, "readOnly role cannot be widened by workspace mode");
+  const narrowed = isolatedSubagentToolFilter({ allowTools: ["read_file", "write_file"] }, readonly, writable);
+  assert.equal(narrowed("write_file"), true);
+  assert.equal(narrowed("edit_file"), false);
 });
 
 function freshRepo() {
@@ -120,7 +138,7 @@ test("reviewer/readOnly roles cannot smuggle writes through an allowed bash tool
 
 test("readOnly roles may coordinate durable descendants only when their declared policy allows it", () => {
   const defaultFilter = roleToolFilter({ id: "reviewer", description: "", owns: [], rejects: [], readOnly: true, system: "review" });
-  for (const tool of ["spawn_agent", "send_message", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent"]) {
+  for (const tool of ["spawn_agent", "send_message", "followup_task", "interrupt_agent", "resume_agent", "list_agents", "wait_agent", "inspect_agent_diff"]) {
     assert.equal(defaultFilter(tool), true, `${tool} is a read-only Agent-team coordination primitive`);
   }
   const narrowed = roleToolFilter({

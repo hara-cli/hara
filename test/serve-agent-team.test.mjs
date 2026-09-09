@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import WebSocket from "ws";
 import { startServe } from "../dist/serve/server.js";
 
@@ -27,6 +28,7 @@ function connect(port) {
     const ws = new WebSocket("ws://127.0.0.1:" + String(port));
     const pending = new Map();
     const events = [];
+    const eventWaiters = [];
     let nextId = 1;
     ws.on("message", (raw) => {
       const message = JSON.parse(String(raw));
@@ -35,6 +37,12 @@ function connect(port) {
         pending.delete(message.id);
       } else if (message.method) {
         events.push(message);
+        for (let index = eventWaiters.length - 1; index >= 0; index--) {
+          if (eventWaiters[index].method !== message.method) continue;
+          const [waiter] = eventWaiters.splice(index, 1);
+          clearTimeout(waiter.timer);
+          waiter.resolve(message);
+        }
       }
     });
     ws.on("open", () => resolve({
@@ -45,6 +53,22 @@ function connect(port) {
           const id = nextId++;
           pending.set(id, done);
           ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+        });
+      },
+      waitEvent(method, timeoutMs = 5_000) {
+        const existing = events.find((event) => event.method === method);
+        if (existing) return Promise.resolve(existing);
+        return new Promise((done, fail) => {
+          const waiter = {
+            method,
+            resolve: done,
+            timer: setTimeout(() => {
+              const index = eventWaiters.indexOf(waiter);
+              if (index >= 0) eventWaiters.splice(index, 1);
+              fail(new Error(`timed out waiting for ${method}`));
+            }, timeoutMs),
+          };
+          eventWaiters.push(waiter);
         });
       },
     }));
@@ -63,9 +87,15 @@ const rootProvider = () => {
         return {
           text: "",
           toolUses: [{
-            id: "spawn-1",
-            name: "spawn_agent",
-            input: { task_name: "research", message: "Inspect the durable runtime" },
+            id: "brief-1",
+            name: "task_intake",
+            input: {
+              intent: "change",
+              goal: "apply the reviewed isolated Agent Diff",
+              constraints: ["preserve unrelated source changes"],
+              acceptance: ["owned.txt contains the child implementation"],
+              steps: ["spawn the isolated Agent", "wait and review", "apply the owned Diff", "verify"],
+            },
           }],
           stop: "tool_use",
           usage: { input: 1, output: 1 },
@@ -75,9 +105,66 @@ const rootProvider = () => {
         return {
           text: "",
           toolUses: [{
+            id: "spawn-1",
+            name: "spawn_agent",
+            input: {
+              task_name: "research",
+              message: "Implement the durable runtime fixture",
+              workspace: "isolated-write",
+            },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (round === 3) {
+        return {
+          text: "",
+          toolUses: [{
             id: "wait-1",
             name: "wait_agent",
             input: { target: "/root/research", timeout_ms: 1_000 },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (round === 4) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "inspect-1",
+            name: "inspect_agent_diff",
+            input: { target: "/root/research" },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (round === 5) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "apply-1",
+            name: "apply_agent_diff",
+            input: { target: "/root/research" },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      if (round === 6) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "receipt-1",
+            name: "task_checkpoint",
+            input: {
+              completion: {
+                state: "verified",
+                evidence: ["the owned Agent Diff passed strict apply checks and was applied"],
+              },
+            },
           }],
           stop: "tool_use",
           usage: { input: 1, output: 1 },
@@ -114,6 +201,9 @@ const deps = (provider, store, home, spawned) => ({
     durable,
   ) => {
     spawned.push({ task, durable });
+    if (durable.workspace) {
+      writeFileSync(join(durable.workspace.cwd, "owned.txt"), "child implementation\n");
+    }
     const now = new Date().toISOString();
     return {
       id: durable.id,
@@ -173,14 +263,28 @@ const deps = (provider, store, home, spawned) => ({
 });
 
 test("Serve exposes a durable Agent tree and restores it after reconnect", { timeout: 20_000 }, async () => {
-  const home = mkdtempSync(join(tmpdir(), "hara-serve-agent-team-"));
+  const root = mkdtempSync(join(tmpdir(), "hara-serve-agent-team-"));
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  mkdirSync(home);
+  mkdirSync(repo);
+  const runGit = (...args) => {
+    const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr || `git ${args[0]} failed`);
+  };
+  runGit("init", "-q");
+  runGit("config", "user.email", "test@example.test");
+  runGit("config", "user.name", "Hara Test");
+  writeFileSync(join(repo, "owned.txt"), "source\n");
+  runGit("add", "owned.txt");
+  runGit("commit", "-qm", "base");
   const store = memStore();
   const spawned = [];
   let server;
   let client;
   try {
     server = await startServe(
-      { host: "127.0.0.1", port: 0, token: "tok", cwd: home },
+      { host: "127.0.0.1", port: 0, token: "tok", cwd: repo },
       deps(rootProvider(), store, home, spawned),
     );
     client = await connect(server.port);
@@ -191,11 +295,21 @@ test("Serve exposes a durable Agent tree and restores it after reconnect", { tim
 
     const created = await client.call("session.create");
     const sessionId = created.result.sessionId;
-    const sent = await client.call("session.send", { sessionId, text: "delegate an inspection" });
-    assert.equal(sent.error, undefined);
+    const sending = client.call("session.send", { sessionId, text: "implement and apply the isolated fixture change" });
+    const approval = await client.waitEvent("approval.request");
+    assert.match(approval.params.question, /apply_agent_diff/u);
+    await client.call("approval.reply", { approvalId: approval.params.approvalId, allow: true });
+    const sent = await sending;
+    assert.equal(sent.error, undefined, JSON.stringify(sent));
     assert.equal(spawned.length, 1);
     assert.equal(spawned[0].durable.id.length, 36);
     assert.equal(spawned[0].durable.agentTeam.path, "/root/research");
+    assert.equal(spawned[0].durable.workspace.mode, "isolated-write");
+    assert.equal(
+      readFileSync(join(repo, "owned.txt"), "utf8"),
+      "child implementation\n",
+      JSON.stringify({ sent, events: client.events }),
+    );
 
     const listed = await client.call("session.agents.list", { sessionId });
     assert.equal(listed.result.agents.length, 1);
@@ -208,8 +322,16 @@ test("Serve exposes a durable Agent tree and restores it after reconnect", { tim
       "unknown models use the conservative 200k context fallback and a two-window tree cap");
     assert.equal(listed.result.budget.limits.maxTokensPerAgent, 100_000);
     assert.equal(listed.result.budget.inputTokens + listed.result.budget.outputTokens, 6);
-    assert.doesNotMatch(JSON.stringify(listed.result), /child conclusion|Inspect the durable runtime/);
+    assert.doesNotMatch(JSON.stringify(listed.result), /child conclusion|Implement the durable runtime fixture/);
     assert.ok(client.events.some((event) => event.method === "event.agent_state"));
+    const diffItems = client.events
+      .filter((event) => event.method === "event.runtime_item"
+        && event.params.kind === "diff"
+        && event.params.name === "agent_worktree_diff")
+      .map((event) => event.params);
+    assert.deepEqual(diffItems.map((item) => item.state), ["queued", "started", "paused", "resumed", "completed"]);
+    assert.ok(diffItems.every((item) => item.name === "agent_worktree_diff" && item.effect === "edit"));
+    assert.doesNotMatch(JSON.stringify(diffItems), /owned\.txt|child implementation/);
 
     const stateFile = join(home, ".hara", "agent-teams", sessionId + ".json");
     assert.equal(existsSync(stateFile), true);
@@ -219,7 +341,7 @@ test("Serve exposes a durable Agent tree and restores it after reconnect", { tim
     client.ws.close();
     await server.close();
     server = await startServe(
-      { host: "127.0.0.1", port: 0, token: "tok", cwd: home },
+      { host: "127.0.0.1", port: 0, token: "tok", cwd: repo },
       deps(rootProvider(), store, home, spawned),
     );
     client = await connect(server.port);
@@ -236,6 +358,6 @@ test("Serve exposes a durable Agent tree and restores it after reconnect", { tim
   } finally {
     client?.ws.close();
     await server?.close();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   }
 });

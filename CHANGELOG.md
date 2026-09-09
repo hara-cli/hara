@@ -7,6 +7,20 @@ All notable changes to `@nanhara/hara`.
 
 ## Unreleased — typed runtime, compaction, and approval journal replay
 
+- Add managed writable child Agents for persistent Serve/Desktop sessions. Each child edits a private detached
+  Git worktree at the source revision, owns one bounded binary Diff, and cannot use shell, external extensions,
+  hooks, symlinks, submodules, executable content filters, or paths outside that workspace. Applying the reviewed
+  Diff is a one-time human approval even in full-auto; moved source revisions and overlapping local changes fail
+  closed instead of being overwritten or auto-merged. Permanent session removal also removes Hara-owned worktrees.
+- Add durable Serve pause and token-bound migration checkpoints. Hara freezes admission, interrupts and drains the
+  exact provider/tool/Agent tree, persists the disposition before releasing the writer, and resumes only after
+  route and checkpoint identity are revalidated. Pause, migration, and owned Agent-Diff transitions are replayable
+  without storing prompts, paths, patch bodies, terminal bytes, or credentials.
+- Persist Mobile publication and command outcomes plus a Relay-owned, per-device delivery stream/cursor. A
+  reconnect re-acknowledges its private checkpoint, requests the bounded missing suffix, rejects stream changes
+  and gaps, and advances only after the response is durably accepted, so a bridge or Relay restart cannot silently
+  duplicate a remote mutation. Production Account/Relay deployment and real-device public-path acceptance remain
+  release gates, not assumptions inferred from local tests.
 - Track health and circuit state per exact saved connection, credential generation, and model route. Authentication,
   quota, regional availability, rate-limit, overload, timeout, and transient failures now have distinct bounded
   thresholds and one half-open recovery probe; Settings exposes only credential-free capability and health snapshots.

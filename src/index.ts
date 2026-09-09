@@ -2620,6 +2620,7 @@ const READONLY_TOOLS = new Set([
   "resume_agent",
   "list_agents",
   "wait_agent",
+  "inspect_agent_diff",
 ]);
 const REVIEW_SYSTEM =
   "You are a senior code reviewer. Review the safe Git status metadata the user provides for: correctness bugs, security " +
@@ -2938,6 +2939,12 @@ async function runSubagentResult(
       timeoutMs: number;
     };
     reportProgress: (metrics: AgentTeamExecutionMetrics) => boolean;
+    workspace?: Readonly<{
+      mode: "isolated-write";
+      cwd: string;
+      sourceCwd: string;
+      writeBoundary: string;
+    }>;
   },
 ): Promise<SubagentResult> {
   const executionProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
@@ -2974,6 +2981,7 @@ async function runSubagentResult(
             + message.content,
         }));
       },
+      ...(durable.workspace ? { workspace: durable.workspace } : {}),
     } : {}),
     ...(observers ? {
       observers: {

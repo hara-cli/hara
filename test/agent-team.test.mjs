@@ -1,17 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AgentTeamStore,
   DurableAgentTeam,
 } from "../dist/subagent/team.js";
+import { AgentWorktreeManager } from "../dist/subagent/worktree.js";
 
 const deferred = () => {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
   return { promise, resolve };
+};
+
+const runGit = (cwd, ...args) => {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || `git ${args[0]} failed`);
 };
 
 const fixture = (executor, options = {}) => {
@@ -420,5 +427,79 @@ test("nested Agents receive a scoped controller and the durable tree enforces ma
     );
   } finally {
     state.cleanup();
+  }
+});
+
+test("writable Agent generations stay isolated until their owned Diff is manually applied or rejected", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-agent-team-worktree-"));
+  const home = join(root, "home");
+  const repo = join(root, "repo");
+  mkdirSync(home);
+  mkdirSync(repo);
+  runGit(repo, "init", "-q");
+  runGit(repo, "config", "user.email", "test@example.test");
+  runGit(repo, "config", "user.name", "Hara Test");
+  writeFileSync(join(repo, "owned.txt"), "source\n");
+  runGit(repo, "add", "owned.txt");
+  runGit(repo, "commit", "-qm", "base");
+  const sessionId = "worktree-team-session";
+  const worktreeManager = new AgentWorktreeManager(repo, home, sessionId);
+  const team = new DurableAgentTeam({
+    sessionId,
+    store: new AgentTeamStore(home),
+    worktreeManager,
+    executor: async (request) => {
+      assert.equal(request.workspace?.mode, "isolated-write");
+      assert.notEqual(request.workspace?.cwd, repo);
+      writeFileSync(join(request.workspace.cwd, "owned.txt"), "child\n");
+      return { status: "completed", text: "implementation ready" };
+    },
+  });
+  try {
+    const controller = team.controller();
+    const created = await controller.spawn({
+      taskName: "implement",
+      message: "change owned.txt",
+      workspace: "isolated-write",
+    });
+    const settled = await controller.wait(created.id, 5_000);
+    assert.equal(settled.agent.status, "completed");
+    assert.equal(settled.agent.workspace.state, "changes");
+    assert.equal(readFileSync(join(repo, "owned.txt"), "utf8"), "source\n");
+
+    const reviewed = await controller.inspectDiff(created.id);
+    assert.equal(reviewed.agentId, created.id);
+    assert.match(reviewed.patch, /child/u);
+    const appliedPath = worktreeManager.prepare(created.id).path;
+    assert.equal(existsSync(appliedPath), true);
+    const applied = await controller.applyDiff(created.id);
+    assert.equal(applied.state, "applied");
+    assert.equal(readFileSync(join(repo, "owned.txt"), "utf8"), "child\n");
+    await assert.rejects(
+      controller.followup(created.id, "make another change"),
+      /Diff is already resolved/i,
+    );
+
+    const rejectedAgent = await controller.spawn({
+      taskName: "rejectable",
+      message: "change owned.txt in another workspace",
+      workspace: "isolated-write",
+    });
+    await controller.wait(rejectedAgent.id, 5_000);
+    await assert.rejects(
+      controller.applyDiff(rejectedAgent.id),
+      /Inspect the current Agent Diff/i,
+    );
+    const rejected = await controller.rejectDiff(rejectedAgent.id);
+    assert.equal(rejected.state, "rejected");
+    assert.equal(readFileSync(join(repo, "owned.txt"), "utf8"), "child\n");
+    const rejectedPath = worktreeManager.prepare(rejectedAgent.id).path;
+    assert.equal(existsSync(rejectedPath), true);
+    assert.equal(team.removeStoredState(), true);
+    assert.equal(existsSync(appliedPath), false);
+    assert.equal(existsSync(rejectedPath), false);
+  } finally {
+    team.close();
+    rmSync(root, { force: true, recursive: true });
   }
 });

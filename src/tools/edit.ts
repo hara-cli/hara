@@ -8,6 +8,7 @@ import { atomicWriteText, bindAtomicWritePath } from "../fs-write.js";
 import { invalidateFileCandidates } from "../context/mentions.js";
 import { readVerifiedRegularFileSnapshot } from "../fs-read.js";
 import { sensitiveFileError } from "../security/sensitive-files.js";
+import { assertWorkspaceWriteBoundary } from "../context/workspace-scope.js";
 
 registerTool({
   name: "edit_file",
@@ -56,6 +57,7 @@ registerTool({
     let boundary;
     try {
       boundary = bindAtomicWritePath(p, "edit");
+      assertWorkspaceWriteBoundary(boundary.target, ctx.writeBoundary);
       snapshot = await readVerifiedRegularFileSnapshot(boundary.target, undefined, "edit");
     } catch (error: any) {
       const near = await nearestPathsAsync(ctx.cwd, input.path, 3, { timeoutMs: 1_000, signal: ctx.signal });

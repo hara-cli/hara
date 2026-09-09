@@ -8,6 +8,7 @@ import { memoryDigest } from "../memory/store.js";
 import { loadActiveGlobalRoles, loadActiveRoles, resolveAgent } from "../org/projects.js";
 import {
   loadOrganizationExecutionPolicy,
+  isolatedSubagentToolFilter,
   subagentToolFilter,
   type Role,
 } from "../org/roles.js";
@@ -50,6 +51,12 @@ export interface NativeSubagentRequest extends SubagentRequest {
     maxTokens: number;
     timeoutMs: number;
   };
+  workspace?: Readonly<{
+    mode: "isolated-write";
+    cwd: string;
+    sourceCwd: string;
+    writeBoundary: string;
+  }>;
   reportProgress?: (metrics: AgentTeamExecutionMetrics) => boolean;
   isReadonlyTool: (name: string) => boolean;
   /** Revalidates the parent conversation's immutable audience around lazy role/provider work. */
@@ -82,17 +89,19 @@ function aggregateUsage(
 
 async function executeNative(request: NativeSubagentRequest): Promise<SubagentSettlement> {
   request.assertAudience?.();
-  const roles = loadActiveRoles(request.cwd, request.profileId);
+  const policyCwd = request.workspace?.sourceCwd ?? request.cwd;
+  const executionCwd = request.workspace?.cwd ?? request.cwd;
+  const roles = loadActiveRoles(policyCwd, request.profileId);
   const roleRef = request.role?.trim();
   if (request.role !== undefined && !roleRef) return roleError("role cannot be blank");
   let role: Role | undefined;
   if (roleRef?.includes(":")) {
-    const hit = resolveAgent(roleRef, request.cwd, request.profileId);
+    const hit = resolveAgent(roleRef, policyCwd, request.profileId);
     if (hit && "ambiguous" in hit) {
       return roleError(`role '${roleRef}' is ambiguous; use one of: ${hit.ambiguous.map((entry) => `${entry.project}:${entry.name}`).join(", ")}.`);
     }
-    if (hit?.project && resolve(hit.home) !== resolve(request.cwd)) {
-      return roleError(`role '${roleRef}' belongs to ${hit.home}; nested read-only agents stay in their parent home (${request.cwd}).`);
+    if (hit?.project && resolve(hit.home) !== resolve(policyCwd)) {
+      return roleError(`role '${roleRef}' belongs to ${hit.home}; nested Agents stay in their parent source home (${policyCwd}).`);
     }
     if (hit && !("ambiguous" in hit)) {
       role = hit.project
@@ -105,7 +114,7 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
   request.assertAudience?.();
   const builtinSystem = !role && roleRef === "explore" ? EXPLORE_SYSTEM : undefined;
   if (roleRef && !role && !builtinSystem) {
-    return roleError(`no role '${roleRef}' is available in ${request.cwd}. Use a local role id, global:<name>, or role "explore".`);
+    return roleError(`no role '${roleRef}' is available in ${policyCwd}. Use a local role id, global:<name>, or role "explore".`);
   }
 
   const requestedModel = effectiveRoleModel(role?.model, request.baseProvider.model);
@@ -116,7 +125,13 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
     ? ((await request.resolveProvider(requestedModel, request.profileId)) ?? request.baseProvider)
     : request.baseProvider;
   request.assertAudience?.();
-  const toolFilter = subagentToolFilter(role, request.isReadonlyTool);
+  const isolatedWritableTools = new Set(["write_file", "edit_file", "apply_patch"]);
+  const toolFilter = request.workspace
+    ? isolatedSubagentToolFilter(role, request.isReadonlyTool, (name) => isolatedWritableTools.has(name))
+    : subagentToolFilter(role, request.isReadonlyTool);
+  const workspaceSystem = request.workspace
+    ? "You may edit only the managed isolated Git worktree exposed as your cwd. Use write_file, edit_file, or apply_patch; shell/script execution is unavailable. Never claim the user's source checkout changed: your result is an owned Diff that a parent must inspect and manually apply."
+    : undefined;
   const history: NeutralMsg[] = [{ role: "user", content: request.task }];
   const todoScope = `subagent:${randomUUID()}`;
   const localStats: SubagentUsage = { input: 0, output: 0, lastInput: 0 };
@@ -145,8 +160,9 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
     outcome = await runAgent(history, {
       provider,
       ctx: {
-        cwd: request.cwd,
-        sandbox: request.sandbox,
+        cwd: executionCwd,
+        sandbox: request.workspace ? "workspace-write" : request.sandbox,
+        ...(request.workspace ? { writeBoundary: request.workspace.writeBoundary } : {}),
         todoScope,
         profileId: request.profileId,
         spaceId: request.spaceId,
@@ -156,9 +172,9 @@ async function executeNative(request: NativeSubagentRequest): Promise<SubagentSe
       approvalChannel: false,
       confirm: async () => true,
       projectContext: request.projectContext,
-      memory: memoryDigest(request.cwd, request.spaceId),
+      memory: memoryDigest(policyCwd, request.spaceId),
       stats: localStats,
-      systemOverride: role?.system ?? builtinSystem,
+      systemOverride: [role?.system ?? builtinSystem, workspaceSystem].filter(Boolean).join("\n\n") || undefined,
       organizationPolicyVersion: rolePolicyVersion,
       toolFilter,
       hooks: false,

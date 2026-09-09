@@ -14,6 +14,28 @@ export function canonicalWorkspacePath(path: string): string {
   }
 }
 
+/** True only when a bound/canonicalized target is the workspace itself or one of its descendants. Callers
+ * must pass the target returned by the filesystem write binder, not the model's lexical input, so an
+ * in-workspace symlink cannot redirect an isolated Agent's edit into the user's source checkout. */
+export function workspaceContainsPath(workspace: string, target: string): boolean {
+  const root = canonicalWorkspacePath(workspace);
+  const candidate = resolve(target);
+  const rel = relative(root, candidate);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+export function assertWorkspaceWriteBoundary(target: string, workspace?: string): void {
+  if (!workspace) return;
+  if (!workspaceContainsPath(workspace, target)) {
+    throw new Error(`isolated Agent write escaped its managed workspace: '${target}'`);
+  }
+  const rel = relative(canonicalWorkspacePath(workspace), resolve(target));
+  const segments = rel.split(sep);
+  if (segments.some((segment) => segment === ".git" || segment === ".gitattributes" || segment === ".gitmodules")) {
+    throw new Error("isolated Agent writes may not modify Git control files");
+  }
+}
+
 /** The user's home directory is a control/personal-data scope, not an implicit project workspace. */
 export function isHomeWorkspace(cwd: string, home = effectiveHomeDir()): boolean {
   return canonicalWorkspacePath(cwd) === canonicalWorkspacePath(home);
