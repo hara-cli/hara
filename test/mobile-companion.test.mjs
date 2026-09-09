@@ -199,6 +199,126 @@ test("Relay bridge rejects a paired mobile identity whose public key changed", a
   );
 });
 
+test("Relay bridge replays its independent cloud cursor and ACKs only after its response is durable", async () => {
+  const desktop = generateDeviceKey();
+  const mobile = generateDeviceKey();
+  const now = 2_000_000_000;
+  const state = {
+    accessToken: "a".repeat(64),
+    accessTokenExpiresAt: now + 600_000,
+    account: { displayName: "Test User", id: "account-a", region: "cn" },
+    desktop: {
+      credential: "b".repeat(64),
+      credentialExpiresAt: now + 600_000,
+      id: "desktop-a",
+      key: desktop,
+      platform: "macos",
+    },
+    pairedMobileDevices: [{
+      id: "mobile-a",
+      publicKeySpki: mobile.publicKeySpki,
+      publicKeyThumbprint: publicKeyThumbprint(mobile.publicKeySpki),
+    }],
+    schemaVersion: 1,
+  };
+  const persisted = [];
+  const routed = [];
+  const bridge = new MobileRelayBridge(
+    "wss://relay.example.test/v1/connect",
+    state,
+    {
+      close: async () => {},
+      route: async (value) => {
+        routed.push(value.requestId);
+        return { body: [], ok: true, protocolVersion: 1, requestId: value.requestId, type: "companion.response" };
+      },
+    },
+    () => now,
+    (next) => persisted.push(next),
+  );
+  const sent = [];
+  bridge.socket = {
+    readyState: 1,
+    send(value) { sent.push(JSON.parse(value)); },
+  };
+  const relayDevice = (key, kind, id, platform) => ({
+    credentialExpiresAt: now + 600_000,
+    credentialVersion: 1,
+    id,
+    kind,
+    platform,
+    publicKeySpki: key.publicKeySpki,
+    publicKeyThumbprint: publicKeyThumbprint(key.publicKeySpki),
+  });
+  await bridge.receive(Buffer.from(JSON.stringify({
+    deliveryStream: {
+      acknowledgedThrough: 0,
+      currentSequence: 1,
+      retainedFromSequence: 1,
+      streamId: "relay-desktop-a",
+    },
+    device: relayDevice(desktop, "desktop", "desktop-a", "macos"),
+    peers: [relayDevice(mobile, "mobile", "mobile-a", "ios")],
+    protocolVersion: 1,
+    serverTime: now,
+    type: "relay.ready",
+  })), false);
+  assert.deepEqual(sent.at(-1).cursor, { sequence: 0, streamId: "relay-desktop-a" });
+
+  const plaintext = JSON.stringify({
+    body: {},
+    method: "sessions.list",
+    protocolVersion: 1,
+    requestId: "request-replayed-a",
+    type: "companion.request",
+  });
+  const sealed = encryptForPeer(
+    mobile.privateKeyPem,
+    desktop.publicKeySpki,
+    encryptionContext("account-a", "mobile-a", "desktop-a"),
+    plaintext,
+  );
+  const fields = {
+    accountId: "account-a",
+    ciphertext: sealed.ciphertext,
+    expiresAt: now + 30_000,
+    messageId: "message-replayed-a",
+    nonce: sealed.nonce,
+    senderDeviceId: "mobile-a",
+    targetDeviceId: "desktop-a",
+  };
+  const handling = bridge.receive(Buffer.from(JSON.stringify({
+    ciphertext: fields.ciphertext,
+    deliveryCursor: { sequence: 1, streamId: "relay-desktop-a" },
+    expiresAt: fields.expiresAt,
+    messageId: fields.messageId,
+    nonce: fields.nonce,
+    protocolVersion: 1,
+    sender: relayDevice(mobile, "mobile", "mobile-a", "ios"),
+    signature: signPayload(mobile.privateKeyPem, relayEnvelopePayload(fields)),
+    targetDeviceId: fields.targetDeviceId,
+    type: "relay.envelope",
+  })), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  const responseForward = sent.find((message) => message.type === "relay.forward");
+  assert.ok(responseForward, "bridge first forwards the encrypted companion response");
+  assert.equal(sent.some((message) => message.type === "relay.ack"), false, "request is not ACKed before response durability");
+  await bridge.receive(Buffer.from(JSON.stringify({
+    messageId: responseForward.messageId,
+    protocolVersion: 1,
+    status: "target_offline",
+    type: "relay.receipt",
+  })), false);
+  await handling;
+  assert.deepEqual(routed, ["request-replayed-a"]);
+  assert.deepEqual(persisted.at(-1), { sequence: 1, streamId: "relay-desktop-a" });
+  assert.deepEqual(sent.at(-1), {
+    cursor: { sequence: 1, streamId: "relay-desktop-a" },
+    protocolVersion: 1,
+    type: "relay.ack",
+  });
+});
+
 test("Router publishes bounded sessions and enforces terminal leases and command replay", async () => {
   const calls = [];
   const listeners = new Set();
@@ -327,6 +447,91 @@ test("Router publishes bounded sessions and enforces terminal leases and command
   }));
   assert.equal(stale.body.errorCode, "STALE_EPOCH");
   await router.close();
+});
+
+test("Router persists content-free command receipts and suppresses terminal input after restart", async () => {
+  const calls = [];
+  const local = {
+    async call(method, params = {}) {
+      calls.push({ method, params });
+      if (method === "external.sessions.list") {
+        return {
+          sources: [{
+            id: "runtime",
+            capabilities: {
+              interrupt: true,
+              read: true,
+              submit: true,
+              terminalInput: true,
+              terminalView: true,
+            },
+          }],
+          sessions: [{
+            id: "ext_runtime_restart-a",
+            sourceId: "runtime",
+            title: "Restart-safe terminal",
+            workspaceName: "hara",
+            state: "waiting",
+            updatedAt: "2026-09-06T12:00:00.000Z",
+          }],
+        };
+      }
+      if (method === "external.sessions.terminal.attach") {
+        return { mode: "control", nextInputSeq: 1, streamId: "terminal-restart-a" };
+      }
+      if (method === "external.sessions.terminal.raw-input") {
+        return { accepted: true, duplicate: false, inputSeq: params.inputSeq, nextInputSeq: params.inputSeq + 1 };
+      }
+      return {};
+    },
+    async close() {},
+    onNotification() { return () => {}; },
+  };
+  let now = 2_000_000_000;
+  let persisted = [];
+  const firstRouter = new MobileCompanionRouter(local, "desktop-a", now + 600_000, {
+    clock: () => now,
+    persistCommandReceipts: (receipts) => { persisted = structuredClone(receipts); },
+  });
+  const firstList = await firstRouter.route(request("request-restart-list-a", "sessions.list"));
+  const publication = firstList.body[0];
+  const grant = (await firstRouter.route(request("request-restart-control", "terminal.control", {
+    commandId: "control-command-restart-a",
+    expiresAt: now + 30_000,
+    leaseEpoch: firstRouter.leaseEpoch,
+    publicationId: publication.publicationId,
+    requestedDurationMs: 60_000,
+    schemaVersion: 1,
+  }))).body;
+  const input = {
+    commandId: "terminal-command-restart-a",
+    expiresAt: now + 30_000,
+    kind: "terminal_input",
+    leaseEpoch: firstRouter.leaseEpoch,
+    payload: { dataBase64: Buffer.from("printf private-value\\r").toString("base64"), leaseId: grant.leaseId },
+    publicationId: publication.publicationId,
+    schemaVersion: 1,
+  };
+  const first = await firstRouter.route(request("request-restart-input-a", "command.execute", input));
+  assert.equal(first.body.status, "succeeded");
+  assert.equal(persisted.length, 1);
+  assert.doesNotMatch(JSON.stringify(persisted), /private-value|cHJpbnRm/u);
+  await firstRouter.close();
+
+  now += 1;
+  const restarted = new MobileCompanionRouter(local, "desktop-a", now + 600_000, {
+    clock: () => now,
+    commandReceipts: persisted,
+  });
+  await restarted.route(request("request-restart-list-b", "sessions.list"));
+  const replay = await restarted.route(request("request-restart-input-b", "command.execute", input));
+  assert.deepEqual(replay.body, first.body);
+  assert.equal(
+    calls.filter((entry) => entry.method === "external.sessions.terminal.raw-input").length,
+    1,
+    "Relay redelivery after Desktop restart must not type the command twice",
+  );
+  await restarted.close();
 });
 
 test("Companion request parser rejects extra fields and unknown methods", () => {

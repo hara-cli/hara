@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import type { LocalCompanionRpc } from "./local-serve-client.js";
+import type { MobileCommandReceipt } from "./state.js";
 
 const MAX_SESSIONS = 100;
 const MAX_MESSAGE_TEXT = 32_768;
+const MAX_COMMAND_RECEIPTS = 64;
 
 type CapabilityName = "read" | "submit" | "approve" | "interrupt" | "terminalObserve" | "terminalControl";
 type PublishedCapabilities = Record<CapabilityName, boolean>;
@@ -24,6 +26,8 @@ type TerminalLease = {
   publicationId: string;
   streamId: string;
 };
+
+type CommandReceiptBody = MobileCommandReceipt["receipt"];
 
 type CompanionRequest = Readonly<{
   body: unknown;
@@ -119,7 +123,7 @@ export class MobileCompanionRouter {
   private readonly publications = new Map<string, Publication>();
   private readonly leases = new Map<string, TerminalLease>();
   private readonly grants = new Map<string, unknown>();
-  private readonly receipts = new Map<string, { fingerprint: string; receipt: unknown }>();
+  private readonly receipts = new Map<string, MobileCommandReceipt>();
   private readonly terminalInputTails = new Map<string, Promise<void>>();
   private readonly activeTurns = new Map<string, string>();
   private readonly runningSubmits = new Set<string>();
@@ -130,17 +134,26 @@ export class MobileCompanionRouter {
     private readonly local: LocalCompanionRpc,
     private readonly desktopDeviceId: string,
     private readonly publicationExpiresAt: number,
-    options: Readonly<{ clock?: () => number }> = {},
+    options: Readonly<{
+      clock?: () => number;
+      commandReceipts?: readonly MobileCommandReceipt[];
+      persistCommandReceipts?: (receipts: readonly MobileCommandReceipt[]) => void;
+    }> = {},
   ) {
     if (!identifier(desktopDeviceId) || !safeInteger(publicationExpiresAt)) {
       throw new TypeError("mobile companion router identity is invalid");
     }
     this.clock = options.clock ?? Date.now;
+    this.persistCommandReceipts = options.persistCommandReceipts;
     this.leaseEpoch = this.clock();
+    for (const entry of options.commandReceipts ?? []) {
+      if (entry.expiresAt > this.clock()) this.receipts.set(entry.commandId, entry);
+    }
     this.removeNotificationListener = local.onNotification((method, params) => this.notification(method, params));
   }
 
   private readonly clock: () => number;
+  private readonly persistCommandReceipts?: (receipts: readonly MobileCommandReceipt[]) => void;
 
   private notification(method: string, params: Record<string, unknown>): void {
     if (
@@ -326,8 +339,19 @@ export class MobileCompanionRouter {
       && body.publicationId === publication.id;
   }
 
-  private receipt(commandId: string, status: "accepted" | "succeeded" | "failed", errorCode: string | null = null) {
+  private receipt(commandId: string, status: "accepted" | "succeeded" | "failed", errorCode: string | null = null): CommandReceiptBody {
     return { commandId, errorCode, schemaVersion: 1, status };
+  }
+
+  private saveReceipt(commandId: string, expiresAt: number, fingerprint: string, receipt: CommandReceiptBody): void {
+    const observedAt = this.clock();
+    for (const [id, entry] of this.receipts) {
+      if (entry.expiresAt <= observedAt) this.receipts.delete(id);
+    }
+    this.receipts.delete(commandId);
+    this.receipts.set(commandId, { commandId, expiresAt, fingerprint, receipt, recordedAt: observedAt });
+    while (this.receipts.size > MAX_COMMAND_RECEIPTS) this.receipts.delete(this.receipts.keys().next().value!);
+    this.persistCommandReceipts?.([...this.receipts.values()]);
   }
 
   private activeLease(publication: Publication, leaseId: unknown): TerminalLease | null {
@@ -535,8 +559,9 @@ export class MobileCompanionRouter {
     } else {
       result = this.receipt(commandId, "failed", "CAPABILITY_DENIED");
     }
-    this.receipts.set(commandId, { fingerprint, receipt: result });
-    if (this.receipts.size > 256) this.receipts.delete(this.receipts.keys().next().value!);
+    if (safeInteger(body.expiresAt) && body.expiresAt > this.clock()) {
+      this.saveReceipt(commandId, body.expiresAt, fingerprint, result as CommandReceiptBody);
+    }
     return result;
   }
 

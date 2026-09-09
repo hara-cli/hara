@@ -23,6 +23,19 @@ export type PairedMobileDevice = Readonly<{
   publicKeyThumbprint: string;
 }>;
 
+export type MobileCommandReceipt = Readonly<{
+  commandId: string;
+  expiresAt: number;
+  fingerprint: string;
+  receipt: Readonly<{
+    commandId: string;
+    errorCode: string | null;
+    schemaVersion: 1;
+    status: "accepted" | "succeeded" | "failed";
+  }>;
+  recordedAt: number;
+}>;
+
 export type MobileCompanionState = Readonly<{
   accessToken: string;
   accessTokenExpiresAt: number;
@@ -38,7 +51,16 @@ export type MobileCompanionState = Readonly<{
     key: DeviceKeyMaterial;
     platform: "macos" | "windows" | "linux";
   }>;
+  /** Bounded, content-free command outcomes let Relay redelivery reproduce an acknowledgement without
+   * executing terminal input or another side effect twice. Prompts and model/session output never live here. */
+  commandReceipts?: readonly MobileCommandReceipt[];
   pairedMobileDevices: readonly PairedMobileDevice[];
+  /** Cloud Relay delivery progress for this exact Desktop device. It is intentionally unrelated to
+   * Hara Serve's local event cursor and contains no message/session payload. */
+  relayCursor?: Readonly<{
+    sequence: number;
+    streamId: string;
+  }>;
   schemaVersion: 1;
 }>;
 
@@ -47,6 +69,32 @@ const bounded = (value: unknown, maximum: number): value is string =>
 const identifier = (value: unknown): value is string => bounded(value, 160) && value.trim() === value && !/\s/u.test(value);
 const credential = (value: unknown): value is string => bounded(value, 12_000) && /^[A-Za-z0-9._~-]+$/u.test(value);
 const timestamp = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+const relayCursor = (value: unknown): boolean => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const cursor = value as Record<string, unknown>;
+  return identifier(cursor.streamId)
+    && typeof cursor.sequence === "number"
+    && Number.isSafeInteger(cursor.sequence)
+    && cursor.sequence >= 0;
+};
+
+function commandReceipt(value: unknown): value is MobileCommandReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  const receipt = entry.receipt as Record<string, unknown> | undefined;
+  return Object.keys(entry).every((key) => ["commandId", "expiresAt", "fingerprint", "receipt", "recordedAt"].includes(key))
+    && identifier(entry.commandId)
+    && timestamp(entry.expiresAt)
+    && typeof entry.fingerprint === "string"
+    && /^[a-f0-9]{64}$/u.test(entry.fingerprint)
+    && timestamp(entry.recordedAt)
+    && !!receipt
+    && Object.keys(receipt).every((key) => ["commandId", "errorCode", "schemaVersion", "status"].includes(key))
+    && receipt.commandId === entry.commandId
+    && receipt.schemaVersion === 1
+    && ["accepted", "succeeded", "failed"].includes(String(receipt.status))
+    && (receipt.errorCode === null || (bounded(receipt.errorCode, 96) && /^[A-Z0-9_]+$/u.test(receipt.errorCode)));
+}
 
 function pairedMobileDevice(value: unknown): value is PairedMobileDevice {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -95,6 +143,12 @@ export function parseMobileState(value: unknown): MobileCompanionState | null {
     || root.pairedMobileDevices.length > 20
     || !root.pairedMobileDevices.every(pairedMobileDevice)
     || new Set(root.pairedMobileDevices.map((device) => (device as PairedMobileDevice).id)).size !== root.pairedMobileDevices.length
+    || (root.commandReceipts !== undefined
+      && (!Array.isArray(root.commandReceipts)
+        || root.commandReceipts.length > 64
+        || !root.commandReceipts.every(commandReceipt)
+        || new Set(root.commandReceipts.map((entry) => (entry as MobileCommandReceipt).commandId)).size !== root.commandReceipts.length))
+    || (root.relayCursor !== undefined && !relayCursor(root.relayCursor))
   ) return null;
   try {
     assertDeviceKey({

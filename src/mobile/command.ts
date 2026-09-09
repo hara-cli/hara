@@ -86,6 +86,16 @@ async function login(options: MobileCommandOptions): Promise<void> {
       previous?.account.id === signedIn.account.id && previous.desktop.id === desktop.deviceId
         ? previous.pairedMobileDevices
         : [],
+    ...(previous?.account.id === signedIn.account.id
+      && previous.desktop.id === desktop.deviceId
+      && previous.commandReceipts
+      ? { commandReceipts: previous.commandReceipts }
+      : {}),
+    ...(previous?.account.id === signedIn.account.id
+      && previous.desktop.id === desktop.deviceId
+      && previous.relayCursor
+      ? { relayCursor: previous.relayCursor }
+      : {}),
     schemaVersion: 1,
   };
   saveMobileState(state);
@@ -180,12 +190,29 @@ async function connect(): Promise<void> {
   if (stored.pairedMobileDevices.length === 0) throw new Error("请先运行 `hara mobile pair`");
   const state = await refreshedState(stored);
   const local = await LocalServeClient.connect();
+  let currentState = state;
   const router = new MobileCompanionRouter(
     local,
     state.desktop.id,
     state.desktop.credentialExpiresAt,
+    {
+      commandReceipts: state.commandReceipts,
+      persistCommandReceipts: (commandReceipts) => {
+        currentState = { ...currentState, commandReceipts };
+        saveMobileState(currentState);
+      },
+    },
   );
-  const bridge = new MobileRelayBridge(RELAY_URL, state, router);
+  const bridge = new MobileRelayBridge(
+    RELAY_URL,
+    state,
+    router,
+    Date.now,
+    (relayCursor) => {
+      currentState = { ...currentState, relayCursor };
+      saveMobileState(currentState);
+    },
+  );
   const stop = async (): Promise<void> => {
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
