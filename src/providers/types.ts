@@ -1,5 +1,9 @@
 /** Provider-neutral conversation + provider interface (multi-provider core). */
 import type { OrganizationExecutionPolicy } from "../org/roles.js";
+import type {
+  ProviderConnectionDescriptor,
+  ProviderConnectionHealthSnapshot,
+} from "./connection-health.js";
 
 export type ToolUse = { id: string; name: string; input: any };
 export type ToolResult = { id: string; name: string; content: string; isError?: boolean };
@@ -138,6 +142,11 @@ export interface ProviderExecutionSnapshot {
 export interface Provider {
   id: string;
   model: string;
+  /** Redacted runtime identity and capability snapshot for this exact account/model route. The internal
+   * health key is never returned by settings APIs or written to a session transcript. */
+  connection?: ProviderConnectionDescriptor;
+  /** Process-local view used by route selection. It contains no endpoint, credential, or error body. */
+  connectionHealth?: () => ProviderConnectionHealthSnapshot;
   /** Optional preflight for providers bound to a mutable external authorization boundary. Agent loops
    * call this before composing every model round so a freshly tightened organization policy can change
    * the advertised tool surface and approval floor before any prompt leaves the machine. Direct callers

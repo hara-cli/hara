@@ -204,6 +204,11 @@ import {
   type ProviderTargetOverride,
 } from "./providers/target.js";
 import { createProviderForTarget } from "./providers/factory.js";
+import {
+  providerConnectionCircuits,
+  providerConnectionDescriptor,
+  withProviderConnectionCircuit,
+} from "./providers/connection-health.js";
 import { resolvePlatform } from "./providers/registry.js";
 import { boundedProviderTurn } from "./providers/bounded-turn.js";
 import { levelsFor, normalizeEffort } from "./tui/model-picker.js";
@@ -477,8 +482,11 @@ async function buildProvider(
         ?? (runtimeProfileBindings.get(cfg) === ap.id ? cfg.reasoningEffort : undefined)
         ?? gatewayDefaultReasoningEffort(ap, model);
     const rawProvider = await createProviderForTarget(target, reasoningEffort);
-    const built = rawProvider
+    const policyBound = rawProvider
       ? bindOrganizationProvider(rawProvider, { ...ap }, () => profileByIdForConfig(cfg, ap.id))
+      : null;
+    const built = policyBound
+      ? withProviderConnectionCircuit(policyBound, providerConnectionDescriptor(ap.id, target))
       : null;
     if (!targetOverride && built) {
       cfg.provider = target.provider;
@@ -500,7 +508,7 @@ async function buildProvider(
     ? undefined
     : reasoningEffortOverride ?? connectionReasoningEffort;
   const rawProvider = await createProviderForTarget(target, reasoningEffort);
-  let built = rawProvider;
+  let policyBound = rawProvider;
   if (rawProvider && expectedSpaceId !== PERSONAL_ID) {
     const enrollment = organizationEnrollmentForSpace(cfg, expectedSpaceId);
     if (!enrollment) {
@@ -509,13 +517,16 @@ async function buildProvider(
     const policy = await ensureOrganizationExecutionPolicy(cfg, ap, expectedSpaceId);
     if (!policy) throw new Error("organization execution policy is unavailable; refusing personal-key inference");
     assertOrganizationModelAllowed(policy, target.model);
-    built = bindOrganizationProvider(
+    policyBound = bindOrganizationProvider(
       rawProvider,
       { ...enrollment },
       () => profileByIdForConfig(cfg, enrollment.id),
       { requirePersonalModelConnections: true },
     );
   }
+  const built = policyBound
+    ? withProviderConnectionCircuit(policyBound, providerConnectionDescriptor(ap.id, target))
+    : null;
   // The rest of the active run (status, vision classification, role defaults, resume) must see the resolved
   // identity route rather than the always-populated Personal/global fields. Explicit overrides stay isolated.
   if (!targetOverride && built) {
@@ -897,6 +908,7 @@ function personalProviderConnectionsSnapshot(
       const reasoningEffort = savedEffort
         ? normalizeEffort(reasoningStyle, target.model, savedEffort as NonNullable<HaraConfig["reasoningEffort"]>)
         : undefined;
+      const descriptor = providerConnectionDescriptor(candidate.id, target);
       return {
         id: candidate.id,
         label: candidate.label || (candidate.id === PERSONAL_ID ? entry.label : candidate.id),
@@ -911,6 +923,8 @@ function personalProviderConnectionsSnapshot(
         legacyPersonal: candidate.id === PERSONAL_ID,
         removable: true,
         accounting: entry.accounting,
+        capabilities: descriptor.capabilities,
+        health: providerConnectionCircuits.snapshot(descriptor.runtimeKey),
         ...(reasoningEffort ? { reasoningEffort } : {}),
         effortLevels,
         ...(target.apiKey ? { keyHint: maskKey(target.apiKey) } : {}),
@@ -1176,6 +1190,14 @@ function providerSettingsSnapshot(targetCwd: string) {
     const model = process.env.HARA_MODEL || effectiveModel(profile) || live.model;
     const effortLevels = gatewayReasoningEffortLevels(profile, model);
     const reasoningEffort = gatewayDefaultReasoningEffort(profile, model);
+    const target = {
+      provider: "hara-gateway" as const,
+      apiKey: profile.deviceToken,
+      baseURL: profile.baseURL || (profile.gatewayUrl ? `${profile.gatewayUrl.replace(/\/+$/, "")}/v1` : undefined),
+      model,
+      ...(live.proxy ? { proxy: live.proxy } : {}),
+    };
+    const descriptor = providerConnectionDescriptor(profile.id, target);
     return {
       current: {
         provider: "hara-gateway",
@@ -1190,6 +1212,8 @@ function providerSettingsSnapshot(targetCwd: string) {
         profileSource: resolution.source,
         editable: false,
         accounting: entry.accounting,
+        capabilities: descriptor.capabilities,
+        health: providerConnectionCircuits.snapshot(descriptor.runtimeKey),
         effortLevels,
         ...(reasoningEffort ? { reasoningEffort } : {}),
         ...(profile.tokenExpiresAt ? { tokenExpiresAt: profile.tokenExpiresAt, tokenExpired } : {}),
@@ -1225,6 +1249,7 @@ function providerSettingsSnapshot(targetCwd: string) {
   const reasoningEffort = savedReasoningEffort
     ? normalizeEffort(reasoningStyle, model, savedReasoningEffort)
     : undefined;
+  const descriptor = providerConnectionDescriptor(profile.id, target);
 
   return {
     current: {
@@ -1240,6 +1265,8 @@ function providerSettingsSnapshot(targetCwd: string) {
       profileSource: resolution.source,
       editable: !environmentOverride,
       accounting: entry.accounting,
+      capabilities: descriptor.capabilities,
+      health: providerConnectionCircuits.snapshot(descriptor.runtimeKey),
       ...(reasoningEffort ? { reasoningEffort } : {}),
       effortLevels,
       ...(environmentOverride ? { environmentOverride: true } : {}),

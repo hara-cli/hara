@@ -55,6 +55,10 @@ import type {
   UserAttachmentView,
 } from "../providers/types.js";
 import type { ProviderAccountingDescriptor } from "../providers/accounting.js";
+import type {
+  ProviderConnectionHealthSnapshot,
+  ProviderModelCapabilities,
+} from "../providers/connection-health.js";
 import type { GatewayStatus } from "../gateway/serve.js";
 import type { GatewayLoginSnapshot } from "../gateway/login.js";
 import type { UiSink } from "../tools/registry.js";
@@ -712,6 +716,8 @@ export interface ProviderSettingsState {
     profileSource: "flag" | "env" | "pin" | "default" | "fallback";
     editable: boolean;
     accounting: ProviderAccountingDescriptor;
+    capabilities: ProviderModelCapabilities;
+    health: ProviderConnectionHealthSnapshot;
     environmentOverride?: boolean;
     reasoningEffort?: string;
     effortLevels?: string[];
@@ -773,6 +779,8 @@ export interface ProviderConnectionSummary {
   removable: boolean;
   /** Usage belongs to this account/connection even when another row uses the same provider. */
   accounting: ProviderAccountingDescriptor;
+  capabilities: ProviderModelCapabilities;
+  health: ProviderConnectionHealthSnapshot;
   keyHint?: string;
   createdAt?: string;
   reasoningEffort?: string;

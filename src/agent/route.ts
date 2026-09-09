@@ -49,6 +49,7 @@ export function routingProvider(primary: Provider, alt: Provider): Provider {
   const selected = (history: NeutralMsg[]): Provider =>
     isTrivialTurn(lastUserText(history)) ? alt : primary;
   return {
+    ...primary,
     id: primary.id,
     model: primary.model, // reported model = primary; routing is transparent
     async prepareTurn(history: NeutralMsg[], signal?: AbortSignal) {

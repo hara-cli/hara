@@ -15,6 +15,7 @@ test("provider retry coordinator retries an empty transient failure with bounded
   let clock = 1_000;
   const delays = [];
   const events = [];
+  let activity = 0;
   const provider = {
     id: "fixture",
     model: "fixture-model",
@@ -34,7 +35,10 @@ test("provider retry coordinator retries an empty transient failure with bounded
       return true;
     },
   });
-  const result = await retrying.turn(args({ onRetry: (event) => events.push(event) }));
+  const result = await retrying.turn(args({
+    onRetry: (event) => events.push(event),
+    onActivity: () => { activity += 1; },
+  }));
   assert.equal(result.text, "done");
   assert.equal(calls, 3);
   assert.deepEqual(delays, [100, 200]);
@@ -42,6 +46,7 @@ test("provider retry coordinator retries an empty transient failure with bounded
     { attempt: 1, nextAttempt: 2, kind: "overloaded" },
     { attempt: 2, nextAttempt: 3, kind: "overloaded" },
   ]);
+  assert.equal(activity, 0, "a transport retry decision is not provider stream activity");
 });
 
 test("provider retry coordinator honors Retry-After but refuses a delay beyond the elapsed ceiling", async () => {

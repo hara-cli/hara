@@ -127,6 +127,47 @@ test("provider errors close any partially assembled tool-use round without execu
   });
 });
 
+test("application failover never replays a turn after provider stream activity", async () => {
+  for (const mode of ["activity", "text"]) {
+    let fallbackCalls = 0;
+    const history = [{ role: "user", content: `stream ${mode}` }];
+    const outcome = await runAgent(history, {
+      provider: {
+        id: "primary",
+        model: "primary-model",
+        async turn(args) {
+          if (mode === "activity") args.onActivity?.();
+          else args.onText("partial");
+          return {
+            text: mode === "text" ? "partial" : "",
+            toolUses: [],
+            stop: "error",
+            errorMsg: "503 service unavailable",
+            errorMetadata: { status: 503 },
+          };
+        },
+      },
+      fallback: {
+        provider: {
+          id: "backup",
+          model: "backup-model",
+          async turn() {
+            fallbackCalls += 1;
+            return { text: "duplicated", toolUses: [], stop: "end" };
+          },
+        },
+      },
+      ctx: { cwd: process.cwd() },
+      approval: "full-auto",
+      confirm: async () => true,
+      quiet: true,
+    });
+    assert.equal(outcome.status, "error");
+    assert.equal(fallbackCalls, 0, `${mode} made the turn permanently non-replayable`);
+    assert.equal(history.some((message) => message.role === "assistant" && message.text === "duplicated"), false);
+  }
+});
+
 test("watchdog: a real user interrupt stays an interrupt (no timeout rewrite, no fallback)", async () => {
   process.env.HARA_STALL_TIMEOUT = "60000"; // far away — only the user aborts
   const ctrl = new AbortController();

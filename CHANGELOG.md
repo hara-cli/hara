@@ -7,6 +7,14 @@ All notable changes to `@nanhara/hara`.
 
 ## Unreleased — typed runtime, compaction, and approval journal replay
 
+- Track health and circuit state per exact saved connection, credential generation, and model route. Authentication,
+  quota, regional availability, rate-limit, overload, timeout, and transient failures now have distinct bounded
+  thresholds and one half-open recovery probe; Settings exposes only credential-free capability and health snapshots.
+- Gate fallback by the current turn's image, tool, and known context requirements, organization authorization, account
+  boundary, and circuit health. Hara never replays a turn after provider stream activity, visible text, reasoning,
+  output tokens, or tool use, and an authentication failure can move only to a different account/endpoint generation.
+  Provider-reported usage and allowance remain authoritative: delayed subscription reports are not treated as a
+  real-time exhaustion signal, and unknown accounting stays unknown instead of being estimated as money or quota.
 - Extend each private session journal with credential-free task lifecycle and replay-safe provider retry
   records. The deterministic reducer now recovers the latest task phase/progress counters and the ordered
   task/turn-bound retry decisions across interleaved projection commits. Stale-turn and diagnostic-write

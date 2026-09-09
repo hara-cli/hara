@@ -147,12 +147,22 @@ session is paused or migrated. The client must never infer ownership from a stal
 Hara's provider factory now installs one central, replay-safe retry coordinator for rate limits, overload,
 timeouts, and transient transport failures. It caps attempts and elapsed time independently, respects bounded
 `Retry-After`, cancels backoff, emits credential-free metadata, and refuses replay after any observable activity.
-The remaining Codex lesson is to connect that classified health to route selection:
+The next connection-aware slice is also implemented. The final policy-bound provider is decorated with a
+process-local circuit keyed by saved connection, credential/endpoint generation, and model. Authentication,
+quota exhaustion, regional unavailability, rate limits, overload, timeouts, and transient failures have distinct
+thresholds; an opened circuit admits only one half-open probe and closes on success. Public Settings snapshots
+contain capability and health metadata but never the runtime key, endpoint material, or credentials.
 
-- maintain a bounded circuit state per concrete connection, not only per provider family;
-- distinguish quota exhaustion, authentication, regional outage, overload, and transient transport health;
-- reset health through successful probes and half-open attempts;
-- let typed capability/policy matching select an authorized fallback without replaying visible work.
+Fallback is now gated by the exact turn's image, tool, and known-context requirements, organization authorization,
+fallback circuit health, and replay safety. Authentication can move only across an account/endpoint generation;
+no error can trigger app-level fallback after provider activity, reasoning, text, output tokens, or tool use. This
+is intentionally more conservative than guessing. Subscription reports such as Ark Agent Plan's delayed usage
+detail are display/accounting inputs, not real-time routing signals; automatic switching uses only the current
+request's explicit typed error or a fresh authoritative adapter result.
+
+Remaining: persist credential-free circuit transitions in the runtime journal, support a user-authorized ordered
+set of compatible saved connections rather than only one configured fallback, and add provider-specific live
+allowance adapters where a documented account-scoped endpoint actually exists.
 
 ### 2.6 Durable event replay across Serve replacement
 
@@ -192,9 +202,18 @@ Agent mailbox/follow-up delivery.
 
 ### 2.8 Typed provider capabilities and circuit health
 
-Connection failover cannot be a string-only `fallbackModel`. Each connection should publish a typed capability
-record: input modalities, tools, context, reasoning controls, data region, enterprise policy, quota source, and
-health/circuit state. Failover selection only considers compatible, user-authorized connections.
+Connection failover is no longer a string-only `fallbackModel` decision. Each concrete connection publishes a
+credential-free capability record for wire protocol, image input, tool calling, reasoning, known context window,
+data region, accounting source, and process-local circuit health. The current model set is handled conservatively:
+for example `glm-5.3-flash`, `MiniMax-M3`, `Kimi-K3`, `Kimi-K2.7-Code`, and the documented Doubao multimodal route
+may accept images, while DeepSeek image input is restricted to its explicit Vision model rather than inferred from
+the provider family. A live account model catalog or Control policy remains authoritative over static product docs.
+
+The compatibility gate uses only capabilities needed by the current turn. Unknown image, tool, or context support
+does not qualify for automatic fallback; ordinary explicit text selection remains available. Enterprise policy and
+saved-connection authorization are checked separately from model capability, so a technically compatible model is
+not automatically an allowed route. Provider accounting never fabricates monetary or subscription consumption
+from transport tokens when the provider has no current authoritative usage interface.
 
 ### 2.9 Structured Agent progress and resumable tool items
 
@@ -267,7 +286,9 @@ success.
 10. **Completed no-progress control slice**: output-similarity and exact-call guards, eight-round unattended
     checkpoint/todo gate, run-local token ceiling, access-boundary coalescing, resumable stop state, and typed
     Desktop telemetry are covered by unit and Serve integration tests. Full item-level replay remains separate.
-11. **Then — connection failover**: typed compatibility, circuit health, quota state, and explicit user policy.
+11. **Completed connection safety foundation**: exact-route circuit health, typed compatibility, quota/region
+    classification, account-aware authentication fallback, and no-replay-after-activity are covered by unit and
+    Serve/settings tests. Ordered multi-connection user policy and durable health-event replay remain incremental.
 12. **Before writable parallel Agents — managed worktrees**: isolated changes, owned diffs, verification, and
    root-controlled merge/rejection.
 

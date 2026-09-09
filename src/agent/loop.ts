@@ -55,6 +55,11 @@ import { recordTouch } from "./touched.js";
 import { resolve as resolvePath } from "node:path";
 import { redactSensitiveText, requestsCredentialDisclosure } from "../security/secrets.js";
 import { safeProviderErrorMessage } from "../providers/errors.js";
+import {
+  providerCompatibility,
+  providerTurnRequirements,
+  sameProviderAccount,
+} from "../providers/connection-health.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { prepareHistoryForModel } from "./context-budget.js";
 import { rolesDigest } from "../org/roles.js";
@@ -1516,6 +1521,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     if (runSignal.aborted) attempt.abort();
     else runSignal.addEventListener("abort", onRunAbort, { once: true });
     let lastEvent = Date.now();
+    let observableProviderActivity = false;
     let stalled = false;
     const stallTimer = setInterval(() => {
       if (Date.now() - lastEvent > STALL_MS) {
@@ -1563,6 +1569,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       // reasoning model thinking for a long while before its first `content` token can't be false-timed-out.
       onActivity: () => {
         if (attempt.signal.aborted) return;
+        observableProviderActivity = true;
         lastEvent = Date.now();
       },
       onRetry: (event) => {
@@ -1576,6 +1583,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       },
       onText: (d) => {
         if (attempt.signal.aborted) return;
+        if (d) observableProviderActivity = true;
         alive();
         const visible = assistantText.push(d);
         if (suppressUnverifiedActionProse || guardAutomatedProse) deferredActionProse += visible;
@@ -1583,6 +1591,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       },
       onReasoning: () => {
         if (attempt.signal.aborted) return;
+        observableProviderActivity = true;
         alive();
         if (opts.quiet || !sink || reasoningActivityNotified) return;
         reasoningActivityNotified = true;
@@ -1708,7 +1717,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
         continue;
       }
-      const kind = classifyError(r.errorMsg ?? "", r.errorMetadata?.status);
+      const kind = classifyError(r.errorMsg ?? "", r.errorMetadata?.status, r.errorMetadata?.code);
       if (kind === "context_overflow" && !contextOverflowRetried) {
         contextOverflowRetried = true;
         contextBudgetScale = 0.5;
@@ -1720,12 +1729,29 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
         continue;
       }
-      if (failoverAction(kind, { hasFallback: !!opts.fallback?.provider, triedFallback }) === "fallback") {
+      const fallbackProvider = opts.fallback?.provider;
+      const replaySafe = !observableProviderActivity
+        && r.text.length === 0
+        && r.toolUses.length === 0
+        && (r.usage?.output ?? 0) === 0;
+      const compatibility = fallbackProvider
+        ? providerCompatibility(
+            fallbackProvider,
+            providerTurnRequirements(prepared.history, specs, activeProvider, kind),
+          )
+        : { ok: false as const, reason: "tool_calling" as const };
+      if (failoverAction(kind, {
+        hasFallback: !!fallbackProvider,
+        triedFallback,
+        replaySafe,
+        compatible: compatibility.ok,
+        differentConnection: Boolean(fallbackProvider && !sameProviderAccount(activeProvider, fallbackProvider)),
+      }) === "fallback") {
         triedFallback = true;
         history.pop(); // drop the errored (partial/empty) assistant turn before retrying
         try {
           if (organizationPolicy) {
-            assertOrganizationModelAllowed(organizationPolicy, opts.fallback!.provider!.model);
+            assertOrganizationModelAllowed(organizationPolicy, fallbackProvider!.model);
           }
         } catch (error) {
           return {
@@ -1733,7 +1759,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             error: `Organization policy blocked fallback model: ${error instanceof Error ? error.message : String(error)}`,
           };
         }
-        activeProvider = opts.fallback!.provider!;
+        activeProvider = fallbackProvider!;
         if (!opts.quiet) {
           const note = `✻ ${kind} → falling back to ${activeProvider.model}…`;
           if (sink) sink.notice(note);

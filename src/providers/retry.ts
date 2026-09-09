@@ -199,9 +199,9 @@ export function withProviderRetry(
           ...(result.errorMetadata?.status !== undefined ? { status: result.errorMetadata.status } : {}),
         };
         args.onRetry?.(event);
-        // A retry decision is transport progress and keeps an outer silence watchdog from racing a valid
-        // provider-directed wait. It does not relax replay safety for the next independent attempt.
-        args.onActivity?.();
+        // `onRetry` is transport progress and keeps the outer silence watchdog alive. It must not call
+        // `onActivity`: that callback means actual provider stream activity and permanently closes the
+        // replay/failover boundary for this turn.
         if (!(await sleep(delayMs, args.signal))) {
           return { text: "", toolUses: [], stop: "error", errorMsg: "interrupted" };
         }
