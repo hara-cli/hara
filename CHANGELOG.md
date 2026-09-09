@@ -5,7 +5,7 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
-## Unreleased — typed runtime, compaction, and approval journal replay
+## 0.170.0 — 2026-09-10 — deterministic runtime recovery and governed writable agents
 
 - Add managed writable child Agents for persistent Serve/Desktop sessions. Each child edits a private detached
   Git worktree at the source revision, owns one bounded binary Diff, and cannot use shell, external extensions,
@@ -19,8 +19,9 @@ All notable changes to `@nanhara/hara`.
 - Persist Mobile publication and command outcomes plus a Relay-owned, per-device delivery stream/cursor. A
   reconnect re-acknowledges its private checkpoint, requests the bounded missing suffix, rejects stream changes
   and gaps, and advances only after the response is durably accepted, so a bridge or Relay restart cannot silently
-  duplicate a remote mutation. Production Account/Relay deployment and real-device public-path acceptance remain
-  release gates, not assumptions inferred from local tests.
+  duplicate a remote mutation. Public Account/Relay health, capability discovery, and unauthenticated WSS rejection
+  are verified; an authenticated two-device offline/restart/replay/ACK run remains a real-device acceptance gate,
+  not a success inferred from component tests.
 - Track health and circuit state per exact saved connection, credential generation, and model route. Authentication,
   quota, regional availability, rate-limit, overload, timeout, and transient failures now have distinct bounded
   thresholds and one half-open recovery probe; Settings exposes only credential-free capability and health snapshots.
@@ -51,6 +52,8 @@ All notable changes to `@nanhara/hara`.
   denied, timed out, or interrupted) against the owning task and turn. Replay isolates missing, duplicate,
   and mismatched transitions without retaining the question, tool arguments, workspace path, or credentials;
   journal failures remain diagnostic and cannot block the live approval gate.
+- Advance the pinned Hono runtime to 4.13.7 after the official release audit reported three newly disclosed
+  advisories affecting versions through 4.13.4; the final production dependency audit is clean.
 
 ## 0.169.0 — 2026-09-09 — native Feishu/WeChat delivery and bounded unattended progress
 
