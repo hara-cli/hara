@@ -1,7 +1,7 @@
 // hara serve session hub — the in-memory registry of live sessions behind the WS server. Persistence is
 // the SAME ~/.hara/sessions store the CLI uses, so a serve session and `hara resume <id>` are the same
 // thing (the single-writer lock keeps them from racing). The store is injected so tests run hermetically.
-import type { NeutralMsg, Provider } from "../providers/types.js";
+import type { NeutralMsg, Provider, ProviderRetryEvent } from "../providers/types.js";
 import type { ApprovalMode } from "../config.js";
 import {
   type SessionMeta,
@@ -19,6 +19,14 @@ import {
   deriveTitle,
   sanitizeSessionTitle,
   sessionMetadataMatchesOptions,
+  recordSessionApprovalState,
+  recordSessionCompactionState,
+  recordSessionProviderRetry,
+  recordSessionTaskState,
+  type SessionApprovalStateInput,
+  type SessionCompactionStateInput,
+  type SessionProviderRetryInput,
+  type SessionTaskLifecycleInput,
 } from "../session/store.js";
 import { forkTaskExecution, recoverTaskExecution, type TaskExecution } from "../session/task.js";
 
@@ -29,6 +37,12 @@ export interface SessionStore {
   /** Optional bounded metadata path. Real persistence provides it; small injected test stores may fall
    * back to an in-memory page without changing their transcript semantics. */
   listPage?(options?: SessionMetadataPageOptions): SessionMetadataPage;
+  /** Optional typed append-only runtime journal. Small injected stores may omit it without changing the
+   * authoritative session snapshot contract. */
+  recordTaskState?(event: SessionTaskLifecycleInput): boolean;
+  recordProviderRetry?(event: SessionProviderRetryInput): boolean;
+  recordCompactionState?(event: SessionCompactionStateInput): boolean;
+  recordApprovalState?(event: SessionApprovalStateInput): boolean;
   acquire(id: string): { ok: boolean; pid?: number };
   release(id: string): void;
   /** permanent removal (codex thread/delete); false = missing or held by a live other process */
@@ -41,6 +55,10 @@ export const realStore: SessionStore = {
   save: saveSession,
   list: listSessions,
   listPage: listSessionMetadataPage,
+  recordTaskState: recordSessionTaskState,
+  recordProviderRetry: recordSessionProviderRetry,
+  recordCompactionState: recordSessionCompactionState,
+  recordApprovalState: recordSessionApprovalState,
   acquire: acquireSessionLock,
   release: releaseSessionLock,
   delete: deleteSession,
@@ -395,6 +413,71 @@ export class SessionHub {
     if (s.durable === false && history.length === 0 && !task) return;
     this.store.save(s.meta, history, task);
     s.durable = true;
+  }
+
+  /** Runtime journal writes are diagnostic projections, not authoritative state mutations. They never
+   * create a journal for an unsaved draft and never make a successful turn fail when diagnostics are
+   * unavailable. */
+  recordTaskState(event: SessionTaskLifecycleInput): boolean {
+    const live = this.sessions.get(event.sessionId);
+    if (
+      !live?.task
+      || live.durable === false
+      || live.task.id !== event.taskId
+      || live.task.turnId !== event.turnId
+    ) return false;
+    try {
+      return this.store.recordTaskState?.(event) ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  recordProviderRetry(sessionId: string, event: ProviderRetryEvent): boolean {
+    const live = this.sessions.get(sessionId);
+    if (!live?.task || live.durable === false) return false;
+    try {
+      return this.store.recordProviderRetry?.({
+        sessionId,
+        taskId: live.task.id,
+        turnId: live.task.turnId,
+        retry: event,
+      }) ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  recordCompactionState(event: SessionCompactionStateInput): boolean {
+    const live = this.sessions.get(event.sessionId);
+    if (!live || live.durable === false) return false;
+    const currentWindow = live.meta.compaction;
+    const ownsTransition = event.state === "installed"
+      ? currentWindow?.attemptId === event.attemptId && currentWindow.windowId === event.windowId
+      : currentWindow
+        ? currentWindow.windowId === event.previousWindowId && currentWindow.windowId !== event.windowId
+        : event.previousWindowId === undefined;
+    if (!ownsTransition) return false;
+    try {
+      return this.store.recordCompactionState?.(event) ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  recordApprovalState(event: SessionApprovalStateInput): boolean {
+    const live = this.sessions.get(event.sessionId);
+    if (
+      !live?.task
+      || live.durable === false
+      || live.task.id !== event.taskId
+      || live.task.turnId !== event.turnId
+    ) return false;
+    try {
+      return this.store.recordApprovalState?.(event) ?? false;
+    } catch {
+      return false;
+    }
   }
 
   /** Atomically replace the live projection only after its complete candidate snapshot is durable. This is

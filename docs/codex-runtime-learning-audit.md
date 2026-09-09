@@ -1,6 +1,6 @@
 # Codex runtime learning audit
 
-> Snapshot: 2026-09-08. Reference checkout:
+> Snapshot: 2026-09-09. Reference checkout:
 > `/Users/zhujianbo/work/projects/ai/codex` at locally inspected revision `8e6a44b428`.
 
 Hara should learn Codex's reliability mechanisms, not turn into an OpenAI-only clone. This audit compares the
@@ -25,14 +25,14 @@ providers behind that boundary, not competing user-facing control products.
 | Verified user-decision retention | Implemented after 0.166.1; headless continuation completed after 0.168.0 | Successful in-process `ask_user` decisions are redacted, deduplicated, persisted outside the compactable transcript, and restored in future task prompts and forks. A persisted headless/gateway/cron question now closes as an addressable pause; the next same-conversation reply is durably retained before the original task and provider turn resume. |
 | Honest end-to-end completion | Hardened after 0.168.0 | Change tasks require a fresh engine-readable completion receipt against every accepted check. File writes, scaffolds, tests, and scheduler registration prove only their stage. Missing verification preserves a resumable checkpoint and suppresses success prose; unavoidable questions pause durably instead of ending the task. Model-authored credential enrollment through chat or shell-history commands is withheld in favor of trusted masked surfaces. |
 | Replay-safe provider retry | Implemented after 0.166.1 | One provider-neutral coordinator classifies empty pre-output failures, honors bounded `Retry-After`, backs off cancellably, and never replays after stream activity, output, or a tool call. SDK-local automatic retries are disabled. |
-| Projection commit journal | Foundation implemented after 0.166.1 | Every durable snapshot appends a credential-free generation/hash record. Readers isolate malformed lines, ignore a torn final line, and report chain gaps. This detects projection loss but is not yet a typed event-source for every task action. |
+| Projection commit journal | Typed runtime slice in progress after 0.169.0 | Every durable snapshot appends a credential-free generation/hash record. Serve interleaves bounded `task.state`, task/turn-bound `provider.retry_scheduled`, and content-free approval request/resolution items; CLI and Serve also record compaction start/install/failure transitions with paired attempt/window identity. The deterministic reducer recovers task progress, retry decisions, approvals, and compaction outcomes—including an installed snapshot whose final event was lost. Stale-turn or diagnostic-write failures cannot affect execution. Steering, control-lease, provider-terminal, and complete item lifecycles remain. |
 | Remote mutation deduplication | Implemented after 0.166.1; write-ahead restart hardening completed after 0.167.0 | `session.submit/send/steer/interrupt` accept a client UUID, persist a prompt-free started receipt before model/tool execution, share concurrent work, save the first terminal result before ACK, replay across Serve restarts, and reject same-ID/different-payload reuse. A crash-window or failed terminal save blocks later mutation until an explicit authoritative resume reconciles task/history state. Provider-owned Codex/Claude submit, steer, and interrupt use the same contract in a private ledger, publish committed/failed receipts, and reconcile through provider read/resume. Desktop retains only opaque retry IDs plus salted payload fingerprints and fences delayed steer/interrupt by turn ID. Controlled terminal streams reject duplicate, conflicting, and out-of-order `inputSeq` values before the PTY write. |
 | Slow-client memory boundary | Implemented after 0.166.1 | All Serve notifications share a 4 MiB per-socket queue ceiling. A sleeping/stalled renderer is closed with an explicit reconnect-and-refresh reason instead of retaining unbounded terminal or task frames. |
 | Cursor/ACK/event replay | Restart-safe foundation completed after 0.167.0 | Broadcast events carry a stream UUID and monotonic sequence. A reconnecting client replays an exact bounded tail and ACKs its cursor. The redacted tail is checkpointed in private state and keeps its stream identity across an orderly Serve replacement. For a changed, expired, ahead, or oversized-frame cursor, `events.snapshot` supplies one authoritative fence for task, workforce, external-turn, and approval projections; Desktop applies it before buffered events newer than the fence. The tail remains bounded to 10,000 events and 8 MiB. |
 | Single-writer Agent control | Implemented after 0.166.1 | One Desktop/mobile socket can acquire a session control lease. Takeover rotates an opaque lease ID and monotonic epoch, revokes the old controller, and fails stale delayed writes closed. Observer clients stay read-only; old clients remain compatible only while no lease is active. |
 | Lossless terminal control handoff | Implemented after 0.168.1 | Feature-aware Desktop/mobile controllers stop accepting new input, drain their serialized queue, ACK the exact monotonic input fence, and remain frozen until a successor stream is ready. The server rechecks the old owner and commits the new controller atomically; timeout, launch failure, disconnect, or an intervening reattach cancels the transaction and restores the old controller. |
 | Rewind projection repair | Implemented after 0.166.1 | Rewinding history also invalidates future task/todo/reminder/repeat-guard state and tells every client to refresh history. It deliberately does not pretend that transcript rewind reverted files. |
-| Tool approvals and sandbox boundary | Implemented | Engine policy remains authoritative rather than trusting prose in the transcript. |
+| Tool approvals and sandbox boundary | Implemented and replay-auditable after 0.169.0 | Engine policy remains authoritative rather than trusting prose in the transcript. Registered requests and terminal outcomes now have content-free task/turn-bound journal items; approval text and tool payloads remain only on the live protected surface. |
 | Background jobs and bounded output | Implemented | Long-running processes and large tool output do not have to block or flood the main model context. |
 | Deferred tool discovery | Implemented | Optional web, desktop, scheduler, external-agent, and MCP schemas stay out of the base prompt until provider-neutral `tool_search` activates an allowed capability. |
 | Durable read-only Agent teams | Foundation implemented after 0.166.1 | Persistent Serve sessions now own stable nested Agent IDs/paths, parent/root turn provenance, a redacted durable mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. The original `agent` tool remains the faster one-shot path. |
@@ -48,15 +48,16 @@ These are not placeholders. They are current runtime contracts documented in
 ### 2.1 Append-only rollout log and deterministic replay
 
 Codex persists typed rollout items and reconstructs state through deterministic processing. Hara now has a
-bounded append-only **projection commit journal**, but the complete JSON snapshot is still the authoritative
-recovery unit. Extend the foundation into typed events for:
+bounded append-only **projection commit journal**. Its typed slices record credential-free task
+lifecycle/progress, provider retry decisions, compaction transactions, and approval request/resolution
+boundaries in the same sequence, and
+deterministically reduce them across interleaved snapshot commits. The complete JSON snapshot is still the
+authoritative recovery unit. Extend the foundation into typed events for:
 
-- task lifecycle and brief revisions;
+- durable task/brief revisions beyond the safe runtime phase and progress projection;
 - steering acceptance, delivery, promotion, and consumption;
-- approvals and their terminal result;
-- compaction installation;
 - control-lease acquisition/release;
-- provider attempts and failover decisions.
+- provider attempt terminal outcomes and failover decisions beyond the persisted retry schedule.
 
 The current snapshot should then become a rebuildable projection. Typed events need an event ID, schema version,
 task/turn identity, monotonic sequence, timestamp, and redacted payload. Startup must replay them into the same
@@ -71,11 +72,13 @@ estimate, assign stable window identity, and install replacement history as a co
 1. assigns `windowId`, `previousWindowId`, and `attemptId` before summarization;
 2. retains the source transcript until the replacement is validated and durably saved;
 3. distinguishes provider-observed input usage from estimated tokens;
-4. installs summary + preserved tail atomically, or keeps the previous live window unchanged.
+4. installs summary + preserved tail atomically, or keeps the previous live window unchanged;
+5. writes content-free start/install/failure transitions for CLI and Serve and treats the paired projection
+   commit as authoritative evidence when a crash loses the explicit installed item.
 
-The remaining hardening is explicit fault injection at process-crash points before the request, after the
-response, and between transcript rename and secondary journal/index writes, plus one reminder/fallback policy per
-window. Full typed replay will eventually make recovery deterministic rather than merely detectable.
+The deterministic reducer now handles the commit-to-terminal crash window. Remaining hardening is real
+process-level fault injection before the request, after the response, and between transcript rename and
+secondary journal/index writes, plus one reminder/fallback policy per window.
 
 ### 2.3 Durable Agent tree, mailbox, and cold resume
 
@@ -205,8 +208,10 @@ todos reset it; changed explicit percentages and completion ratios also prevent 
 stale, while bare offsets do not. No prompt or raw tool result is retained in the watchdog. A no-progress stop becomes a visible,
 resumable task pause rather than an opaque RPC failure.
 
-The remaining work is to promote individual model turns, reasoning/progress summaries, tool calls, approvals,
-diffs, todos, child-Agent activity, and terminal outcomes into versioned item lifecycle events. Each item needs
+The remaining work is to promote individual model turns, reasoning/progress summaries, tool calls, diffs,
+todos, child-Agent activity, and terminal outcomes into versioned item lifecycle events. Approval request and
+resolution boundaries already have stable task/turn-bound items, while their private question text remains outside
+the journal. Each remaining item needs
 stable identity and `started/completed/failed/cancelled` transitions. Hara has an authoritative reconnect
 snapshot for task, workforce, active external turns, and approvals, plus a restart-safe event tail. Tool/diff/
 message items still do not form a complete durable, replay-derived trace, so Mobile must use bounded conversation/
@@ -232,10 +237,13 @@ success.
 ## 4. Delivery order and gates
 
 1. **Completed foundation — retry core**: central classification/backoff/cancellation with deterministic tests.
-2. **Completed foundation — compaction transaction**: stable window IDs, observed/estimated accounting, and
-   save-before-install semantics; process-crash fault injection remains.
-3. **In progress — event journal**: projection commits, torn-tail handling, and gap detection exist; add typed
-   task/steering/approval/provider-attempt events and deterministic snapshot rebuild.
+2. **Completed foundation — compaction transaction**: stable window IDs, observed/estimated accounting,
+   save-before-install semantics, typed terminal outcomes, and commit-backed crash-window recovery exist;
+   real process-crash fault injection remains.
+3. **In progress — event journal**: projection commits, torn-tail handling, sequence/generation gap detection,
+   typed task runtime state, typed provider retry schedules, compaction and approval transactions, and deterministic
+   reduction of that safe projection exist. Add durable brief/steering/provider-outcome items and deterministic
+   full snapshot rebuild.
 4. **Completed local transport foundation — multi-client stream**: socket backpressure, cursor/ACK/exact replay,
    restart-safe redacted checkpoints, 10,000-event duplicate/gap coverage, and an authoritative Desktop snapshot
    fence exist. Cloud relay delivery still needs an independent bounded cursor.

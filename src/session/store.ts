@@ -27,6 +27,7 @@ import {
   MAX_ASSISTANT_CONTINUATION_CHARS,
   MAX_ASSISTANT_CONTINUATION_ITEMS,
   type NeutralMsg,
+  type ProviderRetryEvent,
 } from "../providers/types.js";
 import { redactSensitiveText, redactSensitiveValue } from "../security/secrets.js";
 import { readVerifiedRegularFileSnapshotSync } from "../fs-read.js";
@@ -219,10 +220,221 @@ export interface SessionProjectionEvent {
   taskTurnId?: string;
   taskStatus?: TaskExecution["status"];
   compactionWindowId?: string;
+  /** Paired with compactionWindowId so a committed replacement can close an interrupted journal attempt. */
+  compactionAttemptId?: string;
+}
+
+export type SessionTaskLifecyclePhase =
+  | "restored"
+  | "starting"
+  | "thinking"
+  | "responding"
+  | "tool"
+  | "approval"
+  | "checkpoint"
+  | "steering"
+  | "stopping"
+  | "finished";
+
+/** Credential-free subset of Engine progress that is useful after a restart. Raw tool names, evidence,
+ * prompts, and provider output stay outside the journal. */
+export interface SessionTaskProgressProjection {
+  state: "working" | "warning" | "stopped";
+  trigger?: "repeated_tool_call" | "similar_tool_evidence" | "unattended_without_checkpoint" | "unattended_token_budget";
+  rounds: number;
+  maxRounds: number;
+  cumulativeTaskRounds: number;
+  taskRoundLimit?: number;
+  toolCalls: number;
+  noProgressRounds: number;
+  checkpointStaleRounds: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  todosDone: number;
+  todosTotal: number;
+}
+
+/** Durable runtime lifecycle item modelled after Codex rollout events. It deliberately omits the task
+ * objective, checkpoint prose, approval question, and tool arguments: those remain in the encrypted/local
+ * authoritative snapshot and must not be duplicated into an append-only diagnostic stream. */
+export interface SessionTaskStateEvent {
+  v: 1;
+  type: "task.state";
+  eventId: string;
+  sessionId: string;
+  sequence: number;
+  at: string;
+  taskId: string;
+  turnId: string;
+  state: TaskExecution["status"] | "waiting";
+  taskStatus: TaskExecution["status"];
+  phase: SessionTaskLifecyclePhase;
+  updatedAt: string;
+  lastOutcome?: TaskExecution["lastOutcome"];
+  progress?: SessionTaskProgressProjection;
+}
+
+/** One replay-safe transport retry decision. Provider and model labels are bounded and redacted before
+ * persistence; request bodies, endpoints, headers, error text, and credentials are never journaled. */
+export interface SessionProviderRetryEvent {
+  v: 1;
+  type: "provider.retry_scheduled";
+  eventId: string;
+  sessionId: string;
+  sequence: number;
+  at: string;
+  taskId: string;
+  turnId: string;
+  provider: string;
+  model: string;
+  attempt: number;
+  nextAttempt: number;
+  kind: ProviderRetryEvent["kind"];
+  delayMs: number;
+  elapsedMs: number;
+  status?: number;
+}
+
+export interface SessionProviderRetryInput {
+  sessionId: string;
+  taskId: string;
+  turnId: string;
+  retry: ProviderRetryEvent;
+  at?: string;
+}
+
+export type SessionCompactionFailureReason =
+  | "provider_error"
+  | "empty_summary"
+  | "interrupted"
+  | "timeout"
+  | "persistence"
+  | "internal";
+
+interface SessionCompactionStateEventBase {
+  v: 1;
+  type: "compaction.state";
+  eventId: string;
+  sessionId: string;
+  sequence: number;
+  at: string;
+  attemptId: string;
+  windowId: string;
+  previousWindowId?: string;
+  sourceMessages: number;
+}
+
+/** A compaction attempt is intentionally content-free. The checkpoint, source transcript, provider error,
+ * restored files, and working notes stay exclusively in the authoritative private session snapshot. */
+export type SessionCompactionStateEvent = SessionCompactionStateEventBase & (
+  | { state: "started" }
+  | {
+      state: "installed";
+      installedAt: string;
+      replacementMessages: number;
+      sourceInputTokens: number;
+      inputAccounting: SessionCompactionWindow["inputAccounting"];
+    }
+  | { state: "failed"; reason: SessionCompactionFailureReason }
+);
+
+interface SessionCompactionStateInputBase {
+  sessionId: string;
+  attemptId: string;
+  windowId: string;
+  previousWindowId?: string;
+  sourceMessages: number;
+  at?: string;
+}
+
+export type SessionCompactionStateInput = SessionCompactionStateInputBase & (
+  | { state: "started" }
+  | {
+      state: "installed";
+      installedAt: string;
+      replacementMessages: number;
+      sourceInputTokens: number;
+      inputAccounting: SessionCompactionWindow["inputAccounting"];
+    }
+  | { state: "failed"; reason: SessionCompactionFailureReason }
+);
+
+export type SessionApprovalOutcome =
+  | "allowed"
+  | "allowed_always"
+  | "denied"
+  | "timed_out"
+  | "interrupted";
+
+interface SessionApprovalStateEventBase {
+  v: 1;
+  type: "approval.state";
+  eventId: string;
+  sessionId: string;
+  sequence: number;
+  at: string;
+  approvalId: string;
+  taskId: string;
+  turnId: string;
+  allowAlways: boolean;
+}
+
+/** Approval questions and tool inputs may contain private code or paths, so only the stable identity and
+ * decision boundary enter the append-only journal. */
+export type SessionApprovalStateEvent = SessionApprovalStateEventBase & (
+  | { state: "requested" }
+  | { state: "resolved"; outcome: SessionApprovalOutcome }
+);
+
+interface SessionApprovalStateInputBase {
+  sessionId: string;
+  approvalId: string;
+  taskId: string;
+  turnId: string;
+  allowAlways: boolean;
+  at?: string;
+}
+
+export type SessionApprovalStateInput = SessionApprovalStateInputBase & (
+  | { state: "requested" }
+  | { state: "resolved"; outcome: SessionApprovalOutcome }
+);
+
+export type SessionJournalEvent =
+  | SessionProjectionEvent
+  | SessionTaskStateEvent
+  | SessionProviderRetryEvent
+  | SessionCompactionStateEvent
+  | SessionApprovalStateEvent;
+
+export interface SessionTaskLifecycleInput {
+  sessionId: string;
+  taskId: string;
+  turnId: string;
+  state: TaskExecution["status"] | "waiting";
+  taskStatus: TaskExecution["status"];
+  phase: SessionTaskLifecyclePhase;
+  at: string;
+  updatedAt: string;
+  lastOutcome?: TaskExecution["lastOutcome"];
+  progress?: {
+    state: "working" | "warning" | "stopped";
+    trigger?: SessionTaskProgressProjection["trigger"];
+    rounds: number;
+    maxRounds: number;
+    cumulativeTaskRounds: number;
+    taskRoundLimit?: number;
+    toolCalls: number;
+    noProgressRounds: number;
+    checkpointStaleRounds: number;
+    tokens: { input: number; output: number; total: number };
+    todo: { done: number; total: number };
+  };
 }
 
 export interface SessionJournalRead {
-  events: SessionProjectionEvent[];
+  events: SessionJournalEvent[];
   /** A partial final write is ignored instead of making the complete prefix unreadable. */
   truncatedTail: boolean;
   /** Complete malformed lines are isolated; valid later records remain inspectable. */
@@ -230,13 +442,67 @@ export interface SessionJournalRead {
 }
 
 export interface SessionJournalReplay {
+  /** Latest committed authoritative snapshot. Kept for compatibility with the original projection journal. */
   last?: SessionProjectionEvent;
+  lastEvent?: SessionJournalEvent;
+  latestTaskState?: SessionTaskStateEvent;
+  providerRetries: SessionProviderRetryEvent[];
+  compactionAttempts: SessionCompactionAttemptReplay[];
+  latestCompaction?: SessionCompactionAttemptReplay;
+  compactionIssues: Array<{
+    sequence: number;
+    attemptId: string;
+    kind: "missing_start" | "identity_mismatch" | "duplicate_start" | "duplicate_terminal" | "missing_projection" | "terminal_conflict";
+  }>;
+  approvals: SessionApprovalReplay[];
+  latestApproval?: SessionApprovalReplay;
+  approvalIssues: Array<{
+    sequence: number;
+    approvalId: string;
+    kind: "missing_request" | "identity_mismatch" | "duplicate_request" | "duplicate_resolution";
+  }>;
   gaps: Array<{
     sequence: number;
     expectedSequence: number;
-    expectedPreviousGeneration: string;
+    expectedPreviousGeneration?: string;
     actualPreviousGeneration?: string;
   }>;
+}
+
+/** Deterministic, content-free reconstruction of one compaction transaction. A matching projection commit
+ * is authoritative installation evidence even if the process stopped before appending the installed item. */
+export interface SessionCompactionAttemptReplay {
+  attemptId: string;
+  windowId: string;
+  previousWindowId?: string;
+  /** Absent only when the start item was unavailable and installation was recovered from a projection. */
+  sourceMessages?: number;
+  state: "started" | "installed" | "failed";
+  startedAt?: string;
+  updatedAt: string;
+  terminalSequence?: number;
+  failureReason?: SessionCompactionFailureReason;
+  installedAt?: string;
+  replacementMessages?: number;
+  sourceInputTokens?: number;
+  inputAccounting?: SessionCompactionWindow["inputAccounting"];
+  /** The first authoritative snapshot commit that carried this exact attempt/window pair. */
+  commitSequence?: number;
+  storageGeneration?: string;
+  /** True only when the commit closed an attempt before its explicit installed item was appended. */
+  inferredInstalled?: boolean;
+}
+
+export interface SessionApprovalReplay {
+  approvalId: string;
+  taskId: string;
+  turnId: string;
+  allowAlways: boolean;
+  state: "requested" | "resolved";
+  requestedAt?: string;
+  updatedAt: string;
+  resolutionSequence?: number;
+  outcome?: SessionApprovalOutcome;
 }
 
 export interface SessionMetadataPageOptions {
@@ -1328,7 +1594,186 @@ function isSessionProjectionEvent(value: unknown, sessionId?: string): value is 
     && (event.compactionWindowId === undefined || (
       typeof event.compactionWindowId === "string"
       && SESSION_STORAGE_GENERATION.test(event.compactionWindowId)
+    ))
+    && (event.compactionAttemptId === undefined || (
+      event.compactionWindowId !== undefined
+      && typeof event.compactionAttemptId === "string"
+      && SESSION_STORAGE_GENERATION.test(event.compactionAttemptId)
+      && event.compactionAttemptId !== event.compactionWindowId
     ));
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isSessionTaskProgressProjection(value: unknown): value is SessionTaskProgressProjection {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const progress = value as Partial<Record<keyof SessionTaskProgressProjection, unknown>>;
+  return (progress.state === "working" || progress.state === "warning" || progress.state === "stopped")
+    && (progress.trigger === undefined || [
+      "repeated_tool_call",
+      "similar_tool_evidence",
+      "unattended_without_checkpoint",
+      "unattended_token_budget",
+    ].includes(progress.trigger as string))
+    && ((progress.state === "stopped") === (progress.trigger !== undefined))
+    && isNonNegativeSafeInteger(progress.rounds)
+    && isNonNegativeSafeInteger(progress.maxRounds)
+    && Number(progress.maxRounds) > 0
+    && Number(progress.rounds) <= Number(progress.maxRounds)
+    && isNonNegativeSafeInteger(progress.cumulativeTaskRounds)
+    && (progress.taskRoundLimit === undefined || (
+      isNonNegativeSafeInteger(progress.taskRoundLimit)
+      && Number(progress.taskRoundLimit) > 0
+      && Number(progress.cumulativeTaskRounds) <= Number(progress.taskRoundLimit)
+    ))
+    && isNonNegativeSafeInteger(progress.toolCalls)
+    && isNonNegativeSafeInteger(progress.noProgressRounds)
+    && isNonNegativeSafeInteger(progress.checkpointStaleRounds)
+    && isNonNegativeSafeInteger(progress.inputTokens)
+    && isNonNegativeSafeInteger(progress.outputTokens)
+    && isNonNegativeSafeInteger(progress.totalTokens)
+    && Number(progress.totalTokens) === Number(progress.inputTokens) + Number(progress.outputTokens)
+    && isNonNegativeSafeInteger(progress.todosDone)
+    && isNonNegativeSafeInteger(progress.todosTotal)
+    && Number(progress.todosDone) <= Number(progress.todosTotal);
+}
+
+function isSessionTaskStateEvent(value: unknown, sessionId?: string): value is SessionTaskStateEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Partial<Record<keyof SessionTaskStateEvent, unknown>>;
+  return event.v === 1
+    && event.type === "task.state"
+    && typeof event.eventId === "string"
+    && SESSION_STORAGE_GENERATION.test(event.eventId)
+    && validSessionId(event.sessionId)
+    && (sessionId === undefined || event.sessionId === sessionId)
+    && Number.isSafeInteger(event.sequence)
+    && Number(event.sequence) >= 1
+    && isTimestamp(event.at)
+    && validSessionId(event.taskId)
+    && validSessionId(event.turnId)
+    && (event.state === "running" || event.state === "paused" || event.state === "completed" || event.state === "blocked" || event.state === "waiting")
+    && (event.taskStatus === "running" || event.taskStatus === "paused" || event.taskStatus === "completed" || event.taskStatus === "blocked")
+    && ["restored", "starting", "thinking", "responding", "tool", "approval", "checkpoint", "steering", "stopping", "finished"].includes(event.phase as string)
+    && isTimestamp(event.updatedAt)
+    && (event.lastOutcome === undefined || ["completed", "error", "empty", "halted", "interrupted"].includes(event.lastOutcome as string))
+    && (event.progress === undefined || isSessionTaskProgressProjection(event.progress));
+}
+
+function isSessionProviderRetryEvent(value: unknown, sessionId?: string): value is SessionProviderRetryEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Partial<Record<keyof SessionProviderRetryEvent, unknown>>;
+  return event.v === 1
+    && event.type === "provider.retry_scheduled"
+    && typeof event.eventId === "string"
+    && SESSION_STORAGE_GENERATION.test(event.eventId)
+    && validSessionId(event.sessionId)
+    && (sessionId === undefined || event.sessionId === sessionId)
+    && Number.isSafeInteger(event.sequence)
+    && Number(event.sequence) >= 1
+    && isTimestamp(event.at)
+    && validSessionId(event.taskId)
+    && validSessionId(event.turnId)
+    && typeof event.provider === "string"
+    && event.provider.length > 0
+    && event.provider.length <= 256
+    && typeof event.model === "string"
+    && event.model.length > 0
+    && event.model.length <= 512
+    && Number.isSafeInteger(event.attempt)
+    && Number(event.attempt) >= 1
+    && Number.isSafeInteger(event.nextAttempt)
+    && Number(event.nextAttempt) === Number(event.attempt) + 1
+    && (event.kind === "rate_limit" || event.kind === "overloaded" || event.kind === "timeout" || event.kind === "transient")
+    && isNonNegativeSafeInteger(event.delayMs)
+    && isNonNegativeSafeInteger(event.elapsedMs)
+    && (event.status === undefined || (
+      Number.isSafeInteger(event.status)
+      && Number(event.status) >= 0
+      && Number(event.status) <= 999
+    ));
+}
+
+function isSessionCompactionStateEvent(value: unknown, sessionId?: string): value is SessionCompactionStateEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Partial<Record<keyof SessionCompactionStateEventBase | "state" | "installedAt" | "replacementMessages" | "sourceInputTokens" | "inputAccounting" | "reason", unknown>>;
+  if (
+    event.v !== 1
+    || event.type !== "compaction.state"
+    || typeof event.eventId !== "string"
+    || !SESSION_STORAGE_GENERATION.test(event.eventId)
+    || !validSessionId(event.sessionId)
+    || (sessionId !== undefined && event.sessionId !== sessionId)
+    || !Number.isSafeInteger(event.sequence)
+    || Number(event.sequence) < 1
+    || !isTimestamp(event.at)
+    || typeof event.attemptId !== "string"
+    || !SESSION_STORAGE_GENERATION.test(event.attemptId)
+    || typeof event.windowId !== "string"
+    || !SESSION_STORAGE_GENERATION.test(event.windowId)
+    || event.attemptId === event.windowId
+    || (event.previousWindowId !== undefined && (
+      typeof event.previousWindowId !== "string"
+      || !SESSION_STORAGE_GENERATION.test(event.previousWindowId)
+      || event.previousWindowId === event.windowId
+    ))
+    || !Number.isSafeInteger(event.sourceMessages)
+    || Number(event.sourceMessages) < 2
+  ) return false;
+  if (event.state === "started") return true;
+  if (event.state === "failed") {
+    return event.reason === "provider_error"
+      || event.reason === "empty_summary"
+      || event.reason === "interrupted"
+      || event.reason === "timeout"
+      || event.reason === "persistence"
+      || event.reason === "internal";
+  }
+  return event.state === "installed"
+    && isTimestamp(event.installedAt)
+    && Number.isSafeInteger(event.replacementMessages)
+    && Number(event.replacementMessages) >= 1
+    && isNonNegativeSafeInteger(event.sourceInputTokens)
+    && (event.inputAccounting === "provider" || event.inputAccounting === "estimated");
+}
+
+function isSessionApprovalStateEvent(value: unknown, sessionId?: string): value is SessionApprovalStateEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Partial<Record<keyof SessionApprovalStateEventBase | "state" | "outcome", unknown>>;
+  if (
+    event.v !== 1
+    || event.type !== "approval.state"
+    || typeof event.eventId !== "string"
+    || !SESSION_STORAGE_GENERATION.test(event.eventId)
+    || !validSessionId(event.sessionId)
+    || (sessionId !== undefined && event.sessionId !== sessionId)
+    || !Number.isSafeInteger(event.sequence)
+    || Number(event.sequence) < 1
+    || !isTimestamp(event.at)
+    || typeof event.approvalId !== "string"
+    || !SESSION_STORAGE_GENERATION.test(event.approvalId)
+    || !validSessionId(event.taskId)
+    || !validSessionId(event.turnId)
+    || typeof event.allowAlways !== "boolean"
+  ) return false;
+  if (event.state === "requested") return true;
+  return event.state === "resolved" && (
+    event.outcome === "allowed"
+    || (event.outcome === "allowed_always" && event.allowAlways === true)
+    || event.outcome === "denied"
+    || event.outcome === "timed_out"
+    || event.outcome === "interrupted"
+  );
+}
+
+function isSessionJournalEvent(value: unknown, sessionId?: string): value is SessionJournalEvent {
+  return isSessionProjectionEvent(value, sessionId)
+    || isSessionTaskStateEvent(value, sessionId)
+    || isSessionProviderRetryEvent(value, sessionId)
+    || isSessionCompactionStateEvent(value, sessionId)
+    || isSessionApprovalStateEvent(value, sessionId);
 }
 
 /** Read an append-only projection journal. Invalid complete records are counted and skipped; a torn final
@@ -1346,7 +1791,7 @@ export function readSessionJournal(id: string): SessionJournalRead {
     const truncatedTail = raw.length > 0 && !raw.endsWith("\n");
     const lines = raw.split("\n");
     if (truncatedTail) lines.pop();
-    const events: SessionProjectionEvent[] = [];
+    const events: SessionJournalEvent[] = [];
     let invalidRecords = 0;
     for (const line of lines) {
       if (!line) continue;
@@ -1356,7 +1801,7 @@ export function readSessionJournal(id: string): SessionJournalRead {
       }
       try {
         const parsed: unknown = JSON.parse(line);
-        if (isSessionProjectionEvent(parsed, id)) events.push(parsed);
+        if (isSessionJournalEvent(parsed, id)) events.push(parsed);
         else invalidRecords += 1;
       } catch {
         invalidRecords += 1;
@@ -1370,28 +1815,235 @@ export function readSessionJournal(id: string): SessionJournalRead {
 
 /** Deterministically verify the commit chain in file order. A gap never guesses or rewrites state; the
  * authoritative transcript remains usable and the missing generation is visible to diagnostics. */
-export function replaySessionJournal(events: readonly SessionProjectionEvent[]): SessionJournalReplay {
+export function replaySessionJournal(events: readonly SessionJournalEvent[]): SessionJournalReplay {
   let last: SessionProjectionEvent | undefined;
+  let lastEvent: SessionJournalEvent | undefined;
+  let latestTaskState: SessionTaskStateEvent | undefined;
+  const providerRetries: SessionProviderRetryEvent[] = [];
+  const compactionAttempts: SessionCompactionAttemptReplay[] = [];
+  const compactionById = new Map<string, SessionCompactionAttemptReplay>();
+  const compactionCommits = new Map<string, SessionProjectionEvent>();
+  const compactionIssues: SessionJournalReplay["compactionIssues"] = [];
+  const approvals: SessionApprovalReplay[] = [];
+  const approvalById = new Map<string, SessionApprovalReplay>();
+  const approvalIssues: SessionJournalReplay["approvalIssues"] = [];
   const gaps: SessionJournalReplay["gaps"] = [];
   for (const event of events) {
-    if (!isSessionProjectionEvent(event)) continue;
-    if (
-      last
-      && (
-        event.sequence !== last.sequence + 1
-        || event.previousGeneration !== last.storageGeneration
-      )
-    ) {
+    if (!isSessionJournalEvent(event)) continue;
+    const expectedSequence = lastEvent ? lastEvent.sequence + 1 : 1;
+    const sequenceGap = event.sequence !== expectedSequence;
+    const generationGap = isSessionProjectionEvent(event)
+      && last !== undefined
+      && event.previousGeneration !== last.storageGeneration;
+    if (sequenceGap || generationGap) {
       gaps.push({
         sequence: event.sequence,
-        expectedSequence: last.sequence + 1,
-        expectedPreviousGeneration: last.storageGeneration,
-        ...(event.previousGeneration ? { actualPreviousGeneration: event.previousGeneration } : {}),
+        expectedSequence,
+        ...(isSessionProjectionEvent(event) && last
+          ? {
+              expectedPreviousGeneration: last.storageGeneration,
+              ...(event.previousGeneration ? { actualPreviousGeneration: event.previousGeneration } : {}),
+            }
+          : {}),
       });
     }
-    last = event;
+    lastEvent = event;
+    if (isSessionProjectionEvent(event)) {
+      last = event;
+      if (event.compactionWindowId && event.compactionAttemptId) {
+        const commitKey = `${event.compactionAttemptId}:${event.compactionWindowId}`;
+        if (!compactionCommits.has(commitKey)) compactionCommits.set(commitKey, event);
+        const attempt = compactionById.get(event.compactionAttemptId);
+        if (!attempt) {
+          const recovered: SessionCompactionAttemptReplay = {
+            attemptId: event.compactionAttemptId,
+            windowId: event.compactionWindowId,
+            state: "installed",
+            updatedAt: event.at,
+            commitSequence: event.sequence,
+            storageGeneration: event.storageGeneration,
+            inferredInstalled: true,
+          };
+          compactionById.set(event.compactionAttemptId, recovered);
+          compactionAttempts.push(recovered);
+          compactionIssues.push({ sequence: event.sequence, attemptId: event.compactionAttemptId, kind: "missing_start" });
+        } else if (attempt.windowId === event.compactionWindowId) {
+          if (attempt.state === "failed") {
+            compactionIssues.push({ sequence: event.sequence, attemptId: attempt.attemptId, kind: "terminal_conflict" });
+          } else {
+            attempt.commitSequence ??= event.sequence;
+            attempt.storageGeneration ??= event.storageGeneration;
+            if (attempt.state === "started") {
+              attempt.state = "installed";
+              attempt.updatedAt = event.at;
+              attempt.inferredInstalled = true;
+            }
+          }
+        }
+      }
+    }
+    else if (isSessionTaskStateEvent(event)) latestTaskState = event;
+    else if (isSessionProviderRetryEvent(event)) providerRetries.push(event);
+    else if (isSessionCompactionStateEvent(event)) {
+      const current = compactionById.get(event.attemptId);
+      const projectionOnly = current?.inferredInstalled === true
+        && current.startedAt === undefined
+        && current.terminalSequence === undefined;
+      const identityMatches = current
+        && current.windowId === event.windowId
+        && (projectionOnly || (
+          current.previousWindowId === event.previousWindowId
+          && current.sourceMessages === event.sourceMessages
+        ));
+      if (event.state === "started") {
+        if (current) {
+          compactionIssues.push({ sequence: event.sequence, attemptId: event.attemptId, kind: "duplicate_start" });
+          continue;
+        }
+        const attempt: SessionCompactionAttemptReplay = {
+          attemptId: event.attemptId,
+          windowId: event.windowId,
+          ...(event.previousWindowId ? { previousWindowId: event.previousWindowId } : {}),
+          sourceMessages: event.sourceMessages,
+          state: "started",
+          startedAt: event.at,
+          updatedAt: event.at,
+        };
+        compactionById.set(event.attemptId, attempt);
+        compactionAttempts.push(attempt);
+        continue;
+      }
+      if (!current) {
+        const attempt: SessionCompactionAttemptReplay = {
+          attemptId: event.attemptId,
+          windowId: event.windowId,
+          ...(event.previousWindowId ? { previousWindowId: event.previousWindowId } : {}),
+          sourceMessages: event.sourceMessages,
+          state: event.state,
+          updatedAt: event.at,
+          terminalSequence: event.sequence,
+          ...(event.state === "failed"
+            ? { failureReason: event.reason }
+            : {
+                installedAt: event.installedAt,
+                replacementMessages: event.replacementMessages,
+                sourceInputTokens: event.sourceInputTokens,
+                inputAccounting: event.inputAccounting,
+              }),
+        };
+        compactionById.set(event.attemptId, attempt);
+        compactionAttempts.push(attempt);
+        compactionIssues.push({ sequence: event.sequence, attemptId: event.attemptId, kind: "missing_start" });
+        if (event.state === "installed") {
+          const commit = compactionCommits.get(`${event.attemptId}:${event.windowId}`);
+          if (commit) {
+            attempt.commitSequence = commit.sequence;
+            attempt.storageGeneration = commit.storageGeneration;
+          } else {
+            compactionIssues.push({ sequence: event.sequence, attemptId: event.attemptId, kind: "missing_projection" });
+          }
+        }
+        continue;
+      }
+      if (!identityMatches) {
+        compactionIssues.push({ sequence: event.sequence, attemptId: event.attemptId, kind: "identity_mismatch" });
+        continue;
+      }
+      if (event.state === "failed") {
+        if (current.state !== "started") {
+          compactionIssues.push({ sequence: event.sequence, attemptId: event.attemptId, kind: "terminal_conflict" });
+          continue;
+        }
+        current.state = "failed";
+        current.updatedAt = event.at;
+        current.terminalSequence = event.sequence;
+        current.failureReason = event.reason;
+        continue;
+      }
+      if (current.terminalSequence !== undefined || current.state === "failed") {
+        compactionIssues.push({ sequence: event.sequence, attemptId: event.attemptId, kind: "duplicate_terminal" });
+        continue;
+      }
+      current.state = "installed";
+      current.previousWindowId = event.previousWindowId;
+      current.sourceMessages = event.sourceMessages;
+      current.updatedAt = event.at;
+      current.terminalSequence = event.sequence;
+      current.installedAt = event.installedAt;
+      current.replacementMessages = event.replacementMessages;
+      current.sourceInputTokens = event.sourceInputTokens;
+      current.inputAccounting = event.inputAccounting;
+      current.inferredInstalled = undefined;
+      if (current.commitSequence === undefined) {
+        compactionIssues.push({ sequence: event.sequence, attemptId: event.attemptId, kind: "missing_projection" });
+      }
+    } else {
+      const current = approvalById.get(event.approvalId);
+      const identityMatches = current
+        && current.taskId === event.taskId
+        && current.turnId === event.turnId
+        && current.allowAlways === event.allowAlways;
+      if (event.state === "requested") {
+        if (current) {
+          approvalIssues.push({ sequence: event.sequence, approvalId: event.approvalId, kind: "duplicate_request" });
+          continue;
+        }
+        const approval: SessionApprovalReplay = {
+          approvalId: event.approvalId,
+          taskId: event.taskId,
+          turnId: event.turnId,
+          allowAlways: event.allowAlways,
+          state: "requested",
+          requestedAt: event.at,
+          updatedAt: event.at,
+        };
+        approvalById.set(event.approvalId, approval);
+        approvals.push(approval);
+        continue;
+      }
+      if (!current) {
+        const approval: SessionApprovalReplay = {
+          approvalId: event.approvalId,
+          taskId: event.taskId,
+          turnId: event.turnId,
+          allowAlways: event.allowAlways,
+          state: "resolved",
+          updatedAt: event.at,
+          resolutionSequence: event.sequence,
+          outcome: event.outcome,
+        };
+        approvalById.set(event.approvalId, approval);
+        approvals.push(approval);
+        approvalIssues.push({ sequence: event.sequence, approvalId: event.approvalId, kind: "missing_request" });
+        continue;
+      }
+      if (!identityMatches) {
+        approvalIssues.push({ sequence: event.sequence, approvalId: event.approvalId, kind: "identity_mismatch" });
+        continue;
+      }
+      if (current.state === "resolved") {
+        approvalIssues.push({ sequence: event.sequence, approvalId: event.approvalId, kind: "duplicate_resolution" });
+        continue;
+      }
+      current.state = "resolved";
+      current.updatedAt = event.at;
+      current.resolutionSequence = event.sequence;
+      current.outcome = event.outcome;
+    }
   }
-  return { ...(last ? { last } : {}), gaps };
+  return {
+    ...(last ? { last } : {}),
+    ...(lastEvent ? { lastEvent } : {}),
+    ...(latestTaskState ? { latestTaskState } : {}),
+    providerRetries,
+    compactionAttempts,
+    ...(compactionAttempts.length > 0 ? { latestCompaction: compactionAttempts.at(-1) } : {}),
+    compactionIssues,
+    approvals,
+    ...(approvals.length > 0 ? { latestApproval: approvals.at(-1) } : {}),
+    approvalIssues,
+    gaps,
+  };
 }
 
 function journalTail(path: string): { sequence: number; needsBoundary: boolean } {
@@ -1419,7 +2071,7 @@ function journalTail(path: string): { sequence: number; needsBoundary: boolean }
       if (!line) continue;
       try {
         const parsed: unknown = JSON.parse(line);
-        if (isSessionProjectionEvent(parsed)) return { sequence: parsed.sequence, needsBoundary };
+        if (isSessionJournalEvent(parsed)) return { sequence: parsed.sequence, needsBoundary };
       } catch {
         // Preserve corrupt bytes and continue to the most recent complete valid record.
       }
@@ -1432,21 +2084,26 @@ function journalTail(path: string): { sequence: number; needsBoundary: boolean }
   }
 }
 
-function appendSessionProjectionEvent(
+function appendSessionJournalEvent(
   id: string,
-  event: Omit<SessionProjectionEvent, "v" | "type" | "eventId" | "sessionId" | "sequence">,
+  create: (base: Pick<SessionJournalEvent, "v" | "eventId" | "sessionId" | "sequence">) => SessionJournalEvent,
 ): boolean {
   const path = sessionJournalFile(id);
   const tail = journalTail(path);
-  const record: SessionProjectionEvent = {
-    v: 1,
-    type: "projection.committed",
-    eventId: randomUUID(),
-    sessionId: id,
-    sequence: tail.sequence + 1,
-    ...event,
-  };
-  const line = `${JSON.stringify(record)}\n`;
+  let line: string;
+  try {
+    const record = create({
+      v: 1,
+      eventId: randomUUID(),
+      sessionId: id,
+      sequence: tail.sequence + 1,
+    });
+    if (!isSessionJournalEvent(record, id)) return false;
+    line = `${JSON.stringify(record)}\n`;
+  } catch {
+    // Runtime journaling is diagnostic. A malformed telemetry object must never fail the active task.
+    return false;
+  }
   const boundary = tail.needsBoundary ? "\n" : "";
   if (Buffer.byteLength(line, "utf8") > MAX_SESSION_JOURNAL_LINE_BYTES) return false;
   let fd: number | undefined;
@@ -1471,6 +2128,168 @@ function appendSessionProjectionEvent(
     return false;
   } finally {
     if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function appendSessionProjectionEvent(
+  id: string,
+  event: Omit<SessionProjectionEvent, "v" | "type" | "eventId" | "sessionId" | "sequence">,
+): boolean {
+  return appendSessionJournalEvent(id, (base) => ({
+    ...base,
+    type: "projection.committed",
+    ...event,
+  }));
+}
+
+function safeJournalIdentity(value: string, max: number): string {
+  const bounded = value.slice(0, 4_096);
+  const redacted = redactSensitiveText(bounded).text
+    .replace(/[\u0000-\u001f\u007f]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, max);
+  return redacted || "unknown";
+}
+
+/** Append one safe task lifecycle record after the session has a durable transcript. This is best-effort
+ * observability: an unavailable journal never turns a successfully saved task into a client error. */
+export function recordSessionTaskState(event: SessionTaskLifecycleInput): boolean {
+  try {
+    if (!validSessionId(event.sessionId) || !sessionFileExists(event.sessionId)) return false;
+    const progress = event.progress
+      ? {
+          state: event.progress.state,
+          ...(event.progress.trigger ? { trigger: event.progress.trigger } : {}),
+          rounds: event.progress.rounds,
+          maxRounds: event.progress.maxRounds,
+          cumulativeTaskRounds: event.progress.cumulativeTaskRounds,
+          ...(event.progress.taskRoundLimit !== undefined ? { taskRoundLimit: event.progress.taskRoundLimit } : {}),
+          toolCalls: event.progress.toolCalls,
+          noProgressRounds: event.progress.noProgressRounds,
+          checkpointStaleRounds: event.progress.checkpointStaleRounds,
+          inputTokens: event.progress.tokens.input,
+          outputTokens: event.progress.tokens.output,
+          totalTokens: event.progress.tokens.total,
+          todosDone: event.progress.todo.done,
+          todosTotal: event.progress.todo.total,
+        } satisfies SessionTaskProgressProjection
+      : undefined;
+    return appendSessionJournalEvent(event.sessionId, (base) => ({
+      ...base,
+      type: "task.state",
+      at: event.at,
+      taskId: event.taskId,
+      turnId: event.turnId,
+      state: event.state,
+      taskStatus: event.taskStatus,
+      phase: event.phase,
+      updatedAt: event.updatedAt,
+      ...(event.lastOutcome ? { lastOutcome: event.lastOutcome } : {}),
+      ...(progress ? { progress } : {}),
+    }));
+  } catch {
+    return false;
+  }
+}
+
+/** Persist the retry decision before the coordinator sleeps and starts the next provider attempt. */
+export function recordSessionProviderRetry(
+  input: SessionProviderRetryInput,
+): boolean {
+  try {
+    const at = input.at ?? new Date().toISOString();
+    if (
+      !validSessionId(input.sessionId)
+      || !validSessionId(input.taskId)
+      || !validSessionId(input.turnId)
+      || !sessionFileExists(input.sessionId)
+      || !isTimestamp(at)
+    ) return false;
+    return appendSessionJournalEvent(input.sessionId, (base) => ({
+      ...base,
+      type: "provider.retry_scheduled",
+      at,
+      taskId: input.taskId,
+      turnId: input.turnId,
+      provider: safeJournalIdentity(input.retry.provider, 256),
+      model: safeJournalIdentity(input.retry.model, 512),
+      attempt: input.retry.attempt,
+      nextAttempt: input.retry.nextAttempt,
+      kind: input.retry.kind,
+      delayMs: input.retry.delayMs,
+      elapsedMs: input.retry.elapsedMs,
+      ...(input.retry.status !== undefined ? { status: input.retry.status } : {}),
+    }));
+  } catch {
+    return false;
+  }
+}
+
+/** Append one content-free compaction transition. Callers write started before the provider boundary,
+ * installed only after the replacement snapshot commits, and failed without retaining provider text. */
+export function recordSessionCompactionState(input: SessionCompactionStateInput): boolean {
+  try {
+    const at = input.at ?? new Date().toISOString();
+    if (
+      !validSessionId(input.sessionId)
+      || !sessionFileExists(input.sessionId)
+      || !isTimestamp(at)
+    ) return false;
+    return appendSessionJournalEvent(input.sessionId, (base) => {
+      const common: SessionCompactionStateEventBase = {
+        ...base,
+        type: "compaction.state",
+        at,
+        attemptId: input.attemptId,
+        windowId: input.windowId,
+        ...(input.previousWindowId ? { previousWindowId: input.previousWindowId } : {}),
+        sourceMessages: input.sourceMessages,
+      };
+      if (input.state === "failed") return { ...common, state: "failed", reason: input.reason };
+      if (input.state === "installed") {
+        return {
+          ...common,
+          state: "installed",
+          installedAt: input.installedAt,
+          replacementMessages: input.replacementMessages,
+          sourceInputTokens: input.sourceInputTokens,
+          inputAccounting: input.inputAccounting,
+        };
+      }
+      return { ...common, state: "started" };
+    });
+  } catch {
+    return false;
+  }
+}
+
+/** Append a content-free approval request or terminal disposition. This is diagnostic durability only;
+ * Engine policy and the live approval gate remain authoritative. */
+export function recordSessionApprovalState(input: SessionApprovalStateInput): boolean {
+  try {
+    const at = input.at ?? new Date().toISOString();
+    if (
+      !validSessionId(input.sessionId)
+      || !sessionFileExists(input.sessionId)
+      || !isTimestamp(at)
+    ) return false;
+    return appendSessionJournalEvent(input.sessionId, (base) => {
+      const common: SessionApprovalStateEventBase = {
+        ...base,
+        type: "approval.state",
+        at,
+        approvalId: input.approvalId,
+        taskId: input.taskId,
+        turnId: input.turnId,
+        allowAlways: input.allowAlways,
+      };
+      return input.state === "resolved"
+        ? { ...common, state: "resolved", outcome: input.outcome }
+        : { ...common, state: "requested" };
+    });
+  } catch {
+    return false;
   }
 }
 
@@ -1593,7 +2412,10 @@ function persistSessionSnapshot(
         taskTurnId: safe.task.turnId,
         taskStatus: safe.task.status,
       } : {}),
-      ...(safe.meta.compaction?.windowId ? { compactionWindowId: safe.meta.compaction.windowId } : {}),
+      ...(safe.meta.compaction?.windowId ? {
+        compactionWindowId: safe.meta.compaction.windowId,
+        compactionAttemptId: safe.meta.compaction.attemptId,
+      } : {}),
     });
     if (knownDirectoryState) writeCurrentWriterDirectoryMarker();
   } catch (error) {
@@ -1668,6 +2490,8 @@ function isSessionCompactionWindow(value: unknown): value is SessionCompactionWi
     ))
     && typeof window.attemptId === "string"
     && SESSION_STORAGE_GENERATION.test(window.attemptId)
+    && window.attemptId !== window.windowId
+    && window.previousWindowId !== window.windowId
     && isTimestamp(window.installedAt)
     && Number.isSafeInteger(window.sourceMessages)
     && Number(window.sourceMessages) >= 2

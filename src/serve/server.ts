@@ -123,6 +123,8 @@ import {
   type SessionCommandMethod,
   type SessionCommandOutcome,
   type SessionCommandReceipt,
+  type SessionApprovalOutcome,
+  type SessionCompactionFailureReason,
   type SessionMeta,
 } from "../session/store.js";
 import {
@@ -1746,7 +1748,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   }
   const pendingExternalTerminalHandoffs = new Map<string, PendingExternalTerminalHandoff>();
   const pendingApprovals = new Map<string, {
-    finish: (v: boolean | "always") => void;
+    finish: (v: boolean | "always", outcome?: SessionApprovalOutcome) => void;
     allowAlways: boolean;
     scope: "session" | "external";
     sessionId: string;
@@ -2022,7 +2024,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const approvalId = randomUUID();
     let settled = false;
     let timer: ReturnType<typeof setTimeout>;
-    const finish = (value: boolean | "always"): void => {
+    const finish = (value: boolean | "always", _outcome?: SessionApprovalOutcome): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -2051,6 +2053,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     // Commit the cursor immediately before the synchronous broadcast. Dedupe paths never consume one,
     // while every published event has a unique position in this server-wide stream.
     taskEventSequence = event.sequence;
+    // Persist only the credential-free lifecycle projection. The journal deliberately excludes objective,
+    // checkpoint prose, approval questions, and tool details even though the live renderer event carries them.
+    hub.recordTaskState(event);
     broadcast("event.task_state", { ...event });
     // Project every published task transition into the visual workforce stream. Task updates originate
     // from both the regular turn sink and a few lifecycle helpers, so keeping this beside the canonical
@@ -2313,14 +2318,29 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       new Promise((resolve) => {
         const approvalId = randomUUID();
         const allowAlways = options.allowAlways === true;
+        const taskIdentity = s.task ? { taskId: s.task.id, turnId: s.task.turnId } : undefined;
         let settled = false;
+        let requestRegistered = false;
         let timer: ReturnType<typeof setTimeout>;
-        const finish = (v: boolean | "always"): void => {
+        const finish = (
+          v: boolean | "always",
+          outcome: SessionApprovalOutcome = v === "always" ? "allowed_always" : v ? "allowed" : "denied",
+        ): void => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
           pendingApprovals.delete(approvalId);
           signal.removeEventListener("abort", onAbort);
+          if (requestRegistered && taskIdentity) {
+            hub.recordApprovalState({
+              sessionId,
+              approvalId,
+              ...taskIdentity,
+              allowAlways,
+              state: "resolved",
+              outcome,
+            });
+          }
           if (!signal.aborted && s.task?.status === "running") {
             emitTaskState({
               state: "running",
@@ -2330,14 +2350,24 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }
           resolve(v);
         };
-        const onAbort = (): void => finish(false);
-        timer = setTimeout(() => finish(false), APPROVAL_TIMEOUT_MS); // unanswered → deny, turn continues
+        const onAbort = (): void => finish(false, "interrupted");
+        timer = setTimeout(() => finish(false, "timed_out"), APPROVAL_TIMEOUT_MS); // unanswered → deny, turn continues
         pendingApprovals.set(approvalId, { finish, allowAlways, scope: "session", sessionId, question: q });
         if (signal.aborted) finish(false);
         else {
           // `signal` composes the owning turn cancellation with runAgent's lifecycle cancellation. Listening
           // only to turnAbort would leave the approval map and Desktop prompt stale after an internal stop.
           signal.addEventListener("abort", onAbort, { once: true });
+          requestRegistered = true;
+          if (taskIdentity) {
+            hub.recordApprovalState({
+              sessionId,
+              approvalId,
+              ...taskIdentity,
+              allowAlways,
+              state: "requested",
+            });
+          }
           emitTaskState({
             state: "waiting",
             phase: "approval",
@@ -2635,17 +2665,22 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }, serializeTodos(sessionId));
         },
         onProviderTurn: (turn) => observeProviderTurn(s, turn),
-        onProviderRetry: (event) => runtimeLog("provider.retry_scheduled", {
-          sessionId: s.meta.id,
-          provider: event.provider,
-          model: event.model,
-          retryKind: event.kind,
-          attempt: event.attempt,
-          nextAttempt: event.nextAttempt,
-          delayMs: event.delayMs,
-          elapsedMs: event.elapsedMs,
-          ...(event.status !== undefined ? { status: event.status } : {}),
-        }),
+        onProviderRetry: (event) => {
+          // Record the retry decision before its coordinator sleeps. The next attempt can therefore be
+          // explained after a Serve restart without retaining the failed request or provider error text.
+          hub.recordProviderRetry(s.meta.id, event);
+          runtimeLog("provider.retry_scheduled", {
+            sessionId: s.meta.id,
+            provider: event.provider,
+            model: event.model,
+            retryKind: event.kind,
+            attempt: event.attempt,
+            nextAttempt: event.nextAttempt,
+            delayMs: event.delayMs,
+            elapsedMs: event.elapsedMs,
+            ...(event.status !== undefined ? { status: event.status } : {}),
+          });
+        },
         onToolRun: (toolRun, tool) => observeToolRun(s, toolRun, tool),
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
@@ -3485,77 +3520,105 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     const timeoutMs = Math.max(1, Math.min(deps.compactTimeoutMs ?? COMPACT_TIMEOUT_MS, COMPACT_TIMEOUT_MS));
     const attemptId = randomUUID();
     const windowId = randomUUID();
+    const previousWindowId = s.meta.compaction?.windowId;
     const sourceMessages = s.history.length;
     const estimatedSourceInput = Math.ceil(historyChars(s.history) / 4);
     const recent = recentHistoryForCompaction(s.history);
-    const r = await new Promise<Awaited<ReturnType<Provider["turn"]>>>((resolve, reject) => {
-      let settled = false;
-      let timedOut = false;
-      const finish = (fn: () => void): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        controller.signal.removeEventListener("abort", onAbort);
-        fn();
-      };
-      const onAbort = (): void => finish(() => reject(new Error(timedOut ? "compaction timed out" : "compaction interrupted")));
-      const timer = setTimeout(() => {
-        timedOut = true;
-        controller.abort(); // cooperative providers stop their own network/body work too
-        onAbort(); // AbortController dispatch is synchronous, but keep this idempotent fallback explicit
-      }, timeoutMs);
-      timer.unref();
-      controller.signal.addEventListener("abort", onAbort, { once: true });
-      if (controller.signal.aborted) return onAbort();
-      // Promise.resolve protects this boundary even if a non-conforming provider throws synchronously.
-      const providerTurn = Promise.resolve().then(() => {
-        // The abort can fire after scheduling this microtask but before it runs. Gate the provider call at
-        // the actual invocation boundary so an interrupted/expired compact cannot start a late request.
-        if (controller.signal.aborted) throw new Error(timedOut ? "compaction timed out" : "compaction interrupted");
-        return s.provider.turn({
-          system: COMPACT_SYSTEM,
-          history: [...compactionSourceHistory(s.history), { role: "user", content: "Create the bounded execution checkpoint now." }],
-          tools: [],
-          onText: () => {},
-          signal: controller.signal,
+    const lifecycleBase = {
+      sessionId: s.meta.id,
+      attemptId,
+      windowId,
+      ...(previousWindowId ? { previousWindowId } : {}),
+      sourceMessages,
+    };
+    hub.recordCompactionState({ ...lifecycleBase, state: "started" });
+    let timedOut = false;
+    let stage: "provider" | "prepare" | "persistence" = "provider";
+    let terminalRecorded = false;
+    const recordFailure = (reason: SessionCompactionFailureReason): void => {
+      if (terminalRecorded) return;
+      terminalRecorded = true;
+      hub.recordCompactionState({ ...lifecycleBase, state: "failed", reason });
+    };
+    try {
+      const r = await new Promise<Awaited<ReturnType<Provider["turn"]>>>((resolve, reject) => {
+        let settled = false;
+        const finish = (fn: () => void): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          controller.signal.removeEventListener("abort", onAbort);
+          fn();
+        };
+        const onAbort = (): void => finish(() => reject(new Error(timedOut ? "compaction timed out" : "compaction interrupted")));
+        const timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort(); // cooperative providers stop their own network/body work too
+          onAbort(); // AbortController dispatch is synchronous, but keep this idempotent fallback explicit
+        }, timeoutMs);
+        timer.unref();
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        if (controller.signal.aborted) return onAbort();
+        // Promise.resolve protects this boundary even if a non-conforming provider throws synchronously.
+        const providerTurn = Promise.resolve().then(() => {
+          // The abort can fire after scheduling this microtask but before it runs. Gate the provider call at
+          // the actual invocation boundary so an interrupted/expired compact cannot start a late request.
+          if (controller.signal.aborted) throw new Error(timedOut ? "compaction timed out" : "compaction interrupted");
+          return s.provider.turn({
+            system: COMPACT_SYSTEM,
+            history: [...compactionSourceHistory(s.history), { role: "user", content: "Create the bounded execution checkpoint now." }],
+            tools: [],
+            onText: () => {},
+            signal: controller.signal,
+          });
         });
+        observeProviderTurn(s, providerTurn);
+        void providerTurn.then(
+          (result) => finish(() => resolve(result)),
+          (error) => finish(() => reject(error)),
+        );
       });
-      observeProviderTurn(s, providerTurn);
-      void providerTurn.then(
-        (result) => finish(() => resolve(result)),
-        (error) => finish(() => reject(error)),
-      );
-    });
-    // Count a physically completed summarizer request even when it returned an error and the original
-    // history remains in place. Keep lastInput unchanged until replacement succeeds.
-    s.stats.input += r.usage?.input ?? 0;
-    s.stats.output += r.usage?.output ?? 0;
-    if (controller.signal.aborted || r.stop === "error") return null;
-    const rawSummary = r.text.trim();
-    if (!rawSummary) return null;
-    const summary = normalizeCompactionSummary(rawSummary);
-    const workingSet = workingSetFromSummary(summary);
-    const touched = recentTouched(20, s.meta.id).filter((file) => {
-      const rel = relative(s.meta.cwd, file);
-      return !!rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-    }).slice(0, 5);
-    const restore = buildFileRestore(touched, (f) => {
-      if (controller.signal.aborted) return null;
-      try {
-        return readModelContextFileSync(f, 32 * 1024);
-      } catch {
+      // Count a physically completed summarizer request even when it returned an error and the original
+      // history remains in place. Keep lastInput unchanged until replacement succeeds.
+      s.stats.input += r.usage?.input ?? 0;
+      s.stats.output += r.usage?.output ?? 0;
+      if (controller.signal.aborted) {
+        recordFailure(timedOut ? "timeout" : "interrupted");
         return null;
       }
-    });
-    if (controller.signal.aborted) return null;
-    const compacted = compactedConversationHistory(summary, recent, restore);
-    const providerInput = r.usage?.input;
-    const candidateMeta = {
-      ...s.meta,
-      workingSet,
-      compaction: {
+      if (r.stop === "error") {
+        recordFailure("provider_error");
+        return null;
+      }
+      const rawSummary = r.text.trim();
+      if (!rawSummary) {
+        recordFailure("empty_summary");
+        return null;
+      }
+      stage = "prepare";
+      const summary = normalizeCompactionSummary(rawSummary);
+      const workingSet = workingSetFromSummary(summary);
+      const touched = recentTouched(20, s.meta.id).filter((file) => {
+        const rel = relative(s.meta.cwd, file);
+        return !!rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+      }).slice(0, 5);
+      const restore = buildFileRestore(touched, (f) => {
+        if (controller.signal.aborted) return null;
+        try {
+          return readModelContextFileSync(f, 32 * 1024);
+        } catch {
+          return null;
+        }
+      });
+      if (controller.signal.aborted) {
+        recordFailure(timedOut ? "timeout" : "interrupted");
+        return null;
+      }
+      const compacted = compactedConversationHistory(summary, recent, restore);
+      const providerInput = r.usage?.input;
+      const compaction = {
         windowId,
-        ...(s.meta.compaction?.windowId ? { previousWindowId: s.meta.compaction.windowId } : {}),
+        ...(previousWindowId ? { previousWindowId } : {}),
         attemptId,
         installedAt: new Date().toISOString(),
         sourceMessages,
@@ -3566,13 +3629,28 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         inputAccounting: Number.isSafeInteger(providerInput) && providerInput! > 0
           ? "provider" as const
           : "estimated" as const,
-      },
-    };
-    // Persist the complete replacement before installing it into the live session. If storage rejects the
-    // candidate, callers keep both the original history and its previous context watermark.
-    hub.replaceSnapshot(s, candidateMeta, compacted, s.task);
-    s.stats.lastInput = compactedHistoryTokenEstimate(compacted);
-    return summary;
+      };
+      const candidateMeta = { ...s.meta, workingSet, compaction };
+      // Persist the complete replacement before installing it into the live session. If storage rejects the
+      // candidate, callers keep both the original history and its previous context watermark.
+      stage = "persistence";
+      hub.replaceSnapshot(s, candidateMeta, compacted, s.task);
+      terminalRecorded = true;
+      hub.recordCompactionState({ ...lifecycleBase, state: "installed", ...compaction });
+      s.stats.lastInput = compactedHistoryTokenEstimate(compacted);
+      return summary;
+    } catch (error) {
+      recordFailure(timedOut
+        ? "timeout"
+        : controller.signal.aborted
+          ? "interrupted"
+          : stage === "provider"
+            ? "provider_error"
+            : stage === "persistence"
+              ? "persistence"
+              : "internal");
+      throw error;
+    }
   };
 
   wss.on("connection", (ws: WebSocket) => {
@@ -5222,7 +5300,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const approval = pendingApprovals.get(p.approvalId);
             if (approval) {
               if (approval.scope === "session") authorizeSessionMutation(ws, approval.sessionId, p);
-              approval.finish(p.always === true && approval.allowAlways ? "always" : p.allow === true);
+              const value = p.always === true && approval.allowAlways ? "always" : p.allow === true;
+              approval.finish(value, value === "always" ? "allowed_always" : value ? "allowed" : "denied");
             }
             return reply(rpcResult(id!, {})); // idempotent — a late/duplicate reply is a no-op
           }
@@ -6897,7 +6976,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       void releaseExternalTerminalsForSocket(ws);
       if (authed.size === 0) {
         // nobody left to answer — deny pending approvals now instead of stalling turns for the timeout
-        for (const approval of pendingApprovals.values()) approval.finish(false);
+        for (const approval of pendingApprovals.values()) approval.finish(false, "interrupted");
         pendingApprovals.clear();
       }
     });
@@ -6917,7 +6996,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         }
       });
 
-      for (const approval of pendingApprovals.values()) approval.finish(false);
+      for (const approval of pendingApprovals.values()) approval.finish(false, "interrupted");
       pendingApprovals.clear();
       await Promise.all([...externalTerminalStreams.keys()].map((client) => releaseExternalTerminalsForSocket(client)));
       const ownedAutomationRuns = [...automationRuns.entries()];

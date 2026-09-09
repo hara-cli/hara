@@ -29,9 +29,14 @@ import {
   MAX_SESSION_FILE_BYTES,
   MAX_SESSION_JSON_DEPTH,
   readSessionJournal,
+  recordSessionApprovalState,
+  recordSessionCompactionState,
+  recordSessionProviderRetry,
+  recordSessionTaskState,
   replaySessionJournal,
 } from "../dist/session/store.js";
 import { SessionHub } from "../dist/serve/sessions.js";
+import { createTaskExecution } from "../dist/session/task.js";
 
 test("session id is a full UUID", () => {
   const id = newSessionId();
@@ -109,7 +114,13 @@ test("session persistence validates and retains stable compaction window identit
 });
 
 test("session persistence retains a write-ahead command receipt without prompt content", () => {
-  const project = mkdtempSync(join(tmpdir(), "hara-session-command-started-"));
+  const home = mkdtempSync(join(tmpdir(), "hara-session-command-started-home-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const project = join(home, "project");
+  mkdirSync(project, { recursive: true });
   const id = newSessionId();
   const at = "2026-09-07T00:00:00.000Z";
   try {
@@ -140,7 +151,11 @@ test("session persistence retains a write-ahead command receipt without prompt c
     assert.doesNotMatch(readFileSync(join(homedir(), ".hara", "sessions", `${id}.json`), "utf8"), /possibly executed|run once/);
   } finally {
     deleteSession(id);
-    rmSync(project, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -239,6 +254,424 @@ test("session projection journal is append-only, chained, and ignores a torn fin
     assert.equal(repaired.invalidRecords, 1, "the preserved torn bytes are isolated from later records");
     assert.equal(repaired.truncatedTail, false);
     assert.equal(replaySessionJournal(repaired.events).gaps.length, 0);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session journal replays typed task state and provider retries without persisting private payloads", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-runtime-journal-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const id = "runtime-journal-fixture";
+    const meta = {
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "runtime journal",
+      createdAt: "2026-09-09T00:00:00.000Z",
+      updatedAt: "2026-09-09T00:00:00.000Z",
+    };
+    saveSession(meta, [{ role: "user", content: "private task text stays in the transcript" }]);
+    assert.equal(recordSessionTaskState({
+      sessionId: id,
+      taskId: "task-runtime-1",
+      turnId: "turn-runtime-1",
+      state: "waiting",
+      taskStatus: "running",
+      phase: "approval",
+      at: "2026-09-09T00:00:01.000Z",
+      updatedAt: "2026-09-09T00:00:00.500Z",
+      progress: {
+        state: "stopped",
+        trigger: "unattended_without_checkpoint",
+        rounds: 8,
+        maxRounds: 64,
+        cumulativeTaskRounds: 18,
+        taskRoundLimit: 100,
+        toolCalls: 12,
+        noProgressRounds: 8,
+        checkpointStaleRounds: 8,
+        tokens: { input: 12_000, output: 3_000, total: 15_000 },
+        todo: { done: 1, total: 3 },
+      },
+    }), true);
+    const fakeSecret = "sk-runtimejournal1234567890";
+    assert.equal(recordSessionProviderRetry({
+      sessionId: id,
+      taskId: "task-runtime-1",
+      turnId: "turn-runtime-1",
+      at: "2026-09-09T00:00:02.000Z",
+      retry: {
+        provider: "openai",
+        model: `model-${fakeSecret}`,
+        attempt: 1,
+        nextAttempt: 2,
+        kind: "rate_limit",
+        delayMs: 1_500,
+        elapsedMs: 250,
+        status: 429,
+      },
+    }), true);
+    saveSession(meta, [
+      { role: "user", content: "private task text stays in the transcript" },
+      { role: "assistant", text: "done", toolUses: [] },
+    ]);
+
+    const journal = readSessionJournal(id);
+    assert.deepEqual(journal.events.map((event) => event.type), [
+      "projection.committed",
+      "task.state",
+      "provider.retry_scheduled",
+      "projection.committed",
+    ]);
+    assert.deepEqual(journal.events.map((event) => event.sequence), [1, 2, 3, 4]);
+    const replay = replaySessionJournal(journal.events);
+    assert.equal(replay.gaps.length, 0);
+    assert.equal(replay.last.storageGeneration, loadSession(id).storageGeneration);
+    assert.equal(replay.lastEvent.type, "projection.committed");
+    assert.deepEqual(replay.latestTaskState.progress, {
+      state: "stopped",
+      trigger: "unattended_without_checkpoint",
+      rounds: 8,
+      maxRounds: 64,
+      cumulativeTaskRounds: 18,
+      taskRoundLimit: 100,
+      toolCalls: 12,
+      noProgressRounds: 8,
+      checkpointStaleRounds: 8,
+      inputTokens: 12_000,
+      outputTokens: 3_000,
+      totalTokens: 15_000,
+      todosDone: 1,
+      todosTotal: 3,
+    });
+    assert.deepEqual(replay.providerRetries.map((event) => ({
+      taskId: event.taskId,
+      turnId: event.turnId,
+      attempt: event.attempt,
+      nextAttempt: event.nextAttempt,
+      kind: event.kind,
+      status: event.status,
+    })), [{
+      taskId: "task-runtime-1",
+      turnId: "turn-runtime-1",
+      attempt: 1,
+      nextAttempt: 2,
+      kind: "rate_limit",
+      status: 429,
+    }]);
+    const rawJournal = readFileSync(join(home, ".hara", "sessions", `${id}.journal`), "utf8");
+    assert.equal(rawJournal.includes(fakeSecret), false, "model labels are redacted before append");
+    assert.equal(rawJournal.includes("private task text"), false, "task and transcript prose stay out of the journal");
+
+    const impossibleProgress = structuredClone(journal.events);
+    impossibleProgress[1].progress.todosDone = impossibleProgress[1].progress.todosTotal + 1;
+    const isolatedCorruption = replaySessionJournal(impossibleProgress);
+    assert.equal(isolatedCorruption.latestTaskState, undefined, "impossible progress is isolated from replay");
+    assert.equal(isolatedCorruption.providerRetries.length, 1, "a later valid typed item remains inspectable");
+    assert.ok(isolatedCorruption.gaps.length > 0, "skipping an invalid item leaves an explicit sequence gap");
+
+    const skippedTypedEvent = structuredClone(journal.events);
+    skippedTypedEvent[2].sequence += 1;
+    assert.deepEqual(replaySessionJournal(skippedTypedEvent).gaps.map((gap) => ({
+      sequence: gap.sequence,
+      expectedSequence: gap.expectedSequence,
+    })), [
+      { sequence: 4, expectedSequence: 3 },
+      { sequence: 4, expectedSequence: 5 },
+    ]);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session journal reconstructs compaction start, commit, install, failure, and crash-window recovery", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-compaction-journal-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const id = "compaction-journal-fixture";
+    const createdAt = "2026-09-09T01:00:00.000Z";
+    const baseMeta = {
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "compaction journal",
+      createdAt,
+      updatedAt: createdAt,
+    };
+    const privateSource = "private checkpoint content sk-compactionjournal1234567890";
+    saveSession(baseMeta, [
+      { role: "user", content: privateSource },
+      { role: "assistant", text: "private response", toolUses: [] },
+    ]);
+
+    const first = {
+      sessionId: id,
+      attemptId: "11111111-1111-4111-8111-111111111111",
+      windowId: "22222222-2222-4222-8222-222222222222",
+      sourceMessages: 2,
+    };
+    assert.equal(recordSessionCompactionState({
+      ...first,
+      state: "started",
+      at: "2026-09-09T01:00:01.000Z",
+    }), true);
+    const firstWindow = {
+      windowId: first.windowId,
+      attemptId: first.attemptId,
+      installedAt: "2026-09-09T01:00:02.000Z",
+      sourceMessages: 2,
+      replacementMessages: 1,
+      sourceInputTokens: 123,
+      inputAccounting: "provider",
+    };
+    saveSession({ ...baseMeta, compaction: firstWindow }, [{ role: "user", content: "private compacted checkpoint" }]);
+    assert.equal(recordSessionCompactionState({
+      ...first,
+      state: "installed",
+      installedAt: firstWindow.installedAt,
+      replacementMessages: 1,
+      sourceInputTokens: 123,
+      inputAccounting: "provider",
+      at: "2026-09-09T01:00:03.000Z",
+    }), true);
+
+    const failed = {
+      sessionId: id,
+      attemptId: "33333333-3333-4333-8333-333333333333",
+      windowId: "44444444-4444-4444-8444-444444444444",
+      previousWindowId: first.windowId,
+      sourceMessages: 2,
+    };
+    assert.equal(recordSessionCompactionState({ ...failed, state: "started", at: "2026-09-09T01:00:04.000Z" }), true);
+    assert.equal(recordSessionCompactionState({
+      ...failed,
+      state: "failed",
+      reason: "provider_error",
+      at: "2026-09-09T01:00:05.000Z",
+    }), true);
+
+    const completed = replaySessionJournal(readSessionJournal(id).events);
+    assert.equal(completed.gaps.length, 0);
+    assert.equal(completed.compactionIssues.length, 0);
+    assert.deepEqual(completed.compactionAttempts.map((attempt) => ({
+      attemptId: attempt.attemptId,
+      state: attempt.state,
+      commitSequence: attempt.commitSequence,
+      terminalSequence: attempt.terminalSequence,
+      failureReason: attempt.failureReason,
+      inferredInstalled: attempt.inferredInstalled,
+    })), [
+      {
+        attemptId: first.attemptId,
+        state: "installed",
+        commitSequence: 3,
+        terminalSequence: 4,
+        failureReason: undefined,
+        inferredInstalled: undefined,
+      },
+      {
+        attemptId: failed.attemptId,
+        state: "failed",
+        commitSequence: undefined,
+        terminalSequence: 6,
+        failureReason: "provider_error",
+        inferredInstalled: undefined,
+      },
+    ]);
+    assert.equal(completed.latestCompaction.attemptId, failed.attemptId);
+
+    // Simulate process loss after the replacement snapshot commit but before the explicit terminal item.
+    const recovered = {
+      sessionId: id,
+      attemptId: "55555555-5555-4555-8555-555555555555",
+      windowId: "66666666-6666-4666-8666-666666666666",
+      previousWindowId: first.windowId,
+      sourceMessages: 2,
+    };
+    assert.equal(recordSessionCompactionState({ ...recovered, state: "started", at: "2026-09-09T01:00:06.000Z" }), true);
+    saveSession({
+      ...baseMeta,
+      compaction: {
+        windowId: recovered.windowId,
+        previousWindowId: recovered.previousWindowId,
+        attemptId: recovered.attemptId,
+        installedAt: "2026-09-09T01:00:07.000Z",
+        sourceMessages: 2,
+        replacementMessages: 1,
+        sourceInputTokens: 200,
+        inputAccounting: "estimated",
+      },
+    }, [{ role: "user", content: "second private checkpoint" }]);
+    const crashRecovered = replaySessionJournal(readSessionJournal(id).events);
+    assert.deepEqual({
+      attemptId: crashRecovered.latestCompaction.attemptId,
+      state: crashRecovered.latestCompaction.state,
+      commitSequence: crashRecovered.latestCompaction.commitSequence,
+      terminalSequence: crashRecovered.latestCompaction.terminalSequence,
+      inferredInstalled: crashRecovered.latestCompaction.inferredInstalled,
+    }, {
+      attemptId: recovered.attemptId,
+      state: "installed",
+      commitSequence: 8,
+      terminalSequence: undefined,
+      inferredInstalled: true,
+    });
+    assert.equal(crashRecovered.compactionIssues.length, 0);
+    const withoutStart = readSessionJournal(id).events.filter((event) => !(
+      event.type === "compaction.state"
+      && event.attemptId === recovered.attemptId
+      && event.state === "started"
+    ));
+    const projectionOnly = replaySessionJournal(withoutStart);
+    assert.equal(projectionOnly.latestCompaction.attemptId, recovered.attemptId);
+    assert.equal(projectionOnly.latestCompaction.state, "installed");
+    assert.equal(projectionOnly.latestCompaction.inferredInstalled, true);
+    assert.equal(projectionOnly.latestCompaction.sourceMessages, undefined);
+    assert.ok(projectionOnly.compactionIssues.some((issue) => (
+      issue.attemptId === recovered.attemptId && issue.kind === "missing_start"
+    )), "a missed start append stays visible while the committed installation remains recoverable");
+    const rawJournal = readFileSync(join(home, ".hara", "sessions", `${id}.journal`), "utf8");
+    assert.equal(rawJournal.includes(privateSource), false);
+    assert.equal(rawJournal.includes("private checkpoint"), false);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session journal replays approval outcomes without retaining questions or tool payloads", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-approval-journal-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const id = "approval-journal-fixture";
+    const at = "2026-09-09T02:00:00.000Z";
+    saveSession({
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "approval journal",
+      createdAt: at,
+      updatedAt: at,
+    }, [{ role: "user", content: "private approval question and tool arguments" }]);
+    const first = {
+      sessionId: id,
+      approvalId: "aaaaaaaa-1111-4111-8111-111111111111",
+      taskId: "task-approval-1",
+      turnId: "turn-approval-1",
+      allowAlways: true,
+    };
+    assert.equal(recordSessionApprovalState({ ...first, state: "requested", at: "2026-09-09T02:00:01.000Z" }), true);
+    assert.equal(recordSessionApprovalState({
+      ...first,
+      state: "resolved",
+      outcome: "allowed_always",
+      at: "2026-09-09T02:00:02.000Z",
+    }), true);
+    const second = {
+      sessionId: id,
+      approvalId: "bbbbbbbb-2222-4222-8222-222222222222",
+      taskId: "task-approval-1",
+      turnId: "turn-approval-1",
+      allowAlways: false,
+    };
+    assert.equal(recordSessionApprovalState({
+      ...second,
+      state: "resolved",
+      outcome: "allowed_always",
+      at: "2026-09-09T02:00:02.500Z",
+    }), false, "an approval cannot remember a broader scope that was never offered");
+    assert.equal(recordSessionApprovalState({ ...second, state: "requested", at: "2026-09-09T02:00:03.000Z" }), true);
+    assert.equal(recordSessionApprovalState({
+      ...second,
+      state: "resolved",
+      outcome: "interrupted",
+      at: "2026-09-09T02:00:04.000Z",
+    }), true);
+
+    const journal = readSessionJournal(id);
+    assert.deepEqual(journal.events.map((event) => event.type), [
+      "projection.committed",
+      "approval.state",
+      "approval.state",
+      "approval.state",
+      "approval.state",
+    ]);
+    const replay = replaySessionJournal(journal.events);
+    assert.equal(replay.gaps.length, 0);
+    assert.equal(replay.approvalIssues.length, 0);
+    assert.deepEqual(replay.approvals.map((approval) => ({
+      approvalId: approval.approvalId,
+      state: approval.state,
+      outcome: approval.outcome,
+      resolutionSequence: approval.resolutionSequence,
+    })), [
+      { approvalId: first.approvalId, state: "resolved", outcome: "allowed_always", resolutionSequence: 3 },
+      { approvalId: second.approvalId, state: "resolved", outcome: "interrupted", resolutionSequence: 5 },
+    ]);
+    assert.equal(replay.latestApproval.approvalId, second.approvalId);
+    const rawJournal = readFileSync(join(home, ".hara", "sessions", `${id}.journal`), "utf8");
+    assert.equal(rawJournal.includes("private approval question"), false);
+    assert.equal(rawJournal.includes("tool arguments"), false);
+
+    const mismatched = structuredClone(journal.events);
+    mismatched[2].turnId = "another-turn";
+    const isolated = replaySessionJournal(mismatched);
+    assert.equal(isolated.approvals[0].state, "requested");
+    assert.ok(isolated.approvalIssues.some((issue) => issue.kind === "identity_mismatch"));
+
+    const orphanedResolution = {
+      ...structuredClone(journal.events[4]),
+      eventId: "dddddddd-4444-4444-8444-444444444444",
+      approvalId: "eeeeeeee-5555-4555-8555-555555555555",
+      sequence: 6,
+      at: "2026-09-09T02:00:05.000Z",
+      outcome: "timed_out",
+    };
+    const duplicateResolution = {
+      ...structuredClone(orphanedResolution),
+      eventId: "ffffffff-6666-4666-8666-666666666666",
+      sequence: 7,
+      at: "2026-09-09T02:00:06.000Z",
+    };
+    const anomalies = replaySessionJournal([...journal.events, orphanedResolution, duplicateResolution]);
+    assert.equal(anomalies.gaps.length, 0);
+    assert.equal(anomalies.latestApproval.approvalId, orphanedResolution.approvalId);
+    assert.equal(anomalies.latestApproval.outcome, "timed_out");
+    assert.deepEqual(anomalies.approvalIssues.map((issue) => issue.kind), [
+      "missing_request",
+      "duplicate_resolution",
+    ]);
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -1965,6 +2398,132 @@ test("SessionHub persists a draft on its first content and can delete an abandon
   assert.equal(hub.get(abandoned.meta.id), undefined);
   assert.ok(!hub.listPage({ cwd: "/tmp/draft" }).sessions.some((meta) => meta.id === abandoned.meta.id));
   assert.ok(released.includes(abandoned.meta.id));
+});
+
+test("SessionHub journals runtime projections only after a draft becomes durable", () => {
+  const saved = new Map();
+  const taskEvents = [];
+  const retryEvents = [];
+  const compactionEvents = [];
+  const approvalEvents = [];
+  let rejectJournal = false;
+  const store = {
+    acquire: () => ({ ok: true }),
+    release: () => {},
+    load: (id) => saved.get(id) ?? null,
+    save: (meta, history, task) => saved.set(meta.id, structuredClone({ meta, history, ...(task ? { task } : {}) })),
+    list: () => [],
+    delete: (id) => saved.delete(id),
+    recordTaskState(event) {
+      if (rejectJournal) throw new Error("simulated diagnostic write failure");
+      taskEvents.push(structuredClone(event));
+      return true;
+    },
+    recordProviderRetry(event) {
+      if (rejectJournal) throw new Error("simulated diagnostic write failure");
+      retryEvents.push(structuredClone(event));
+      return true;
+    },
+    recordCompactionState(event) {
+      if (rejectJournal) throw new Error("simulated diagnostic write failure");
+      compactionEvents.push(structuredClone(event));
+      return true;
+    },
+    recordApprovalState(event) {
+      if (rejectJournal) throw new Error("simulated diagnostic write failure");
+      approvalEvents.push(structuredClone(event));
+      return true;
+    },
+  };
+  const provider = { id: "fake", model: "fake-1", async turn() { throw new Error("unused"); } };
+  const hub = new SessionHub(store);
+  const draft = hub.create({
+    cwd: "/tmp/runtime-journal-draft",
+    provider,
+    providerId: provider.id,
+    model: provider.model,
+    approval: "suggest",
+  });
+  draft.task = createTaskExecution(
+    "journal this active task",
+    "turn-runtime",
+    "2026-09-09T00:00:00.000Z",
+  );
+  const taskState = {
+    sessionId: draft.meta.id,
+    taskId: draft.task.id,
+    turnId: draft.task.turnId,
+    state: "running",
+    taskStatus: "running",
+    phase: "thinking",
+    at: "2026-09-09T00:00:01.000Z",
+    updatedAt: "2026-09-09T00:00:00.000Z",
+  };
+  const retry = {
+    provider: "fixture",
+    model: "fixture-model",
+    attempt: 1,
+    nextAttempt: 2,
+    kind: "transient",
+    delayMs: 250,
+    elapsedMs: 30,
+  };
+  const compaction = {
+    sessionId: draft.meta.id,
+    attemptId: "77777777-7777-4777-8777-777777777777",
+    windowId: "88888888-8888-4888-8888-888888888888",
+    sourceMessages: 2,
+    state: "started",
+  };
+  const approval = {
+    sessionId: draft.meta.id,
+    approvalId: "cccccccc-3333-4333-8333-333333333333",
+    taskId: draft.task.id,
+    turnId: draft.task.turnId,
+    allowAlways: true,
+    state: "requested",
+  };
+
+  assert.equal(hub.recordTaskState(taskState), false);
+  assert.equal(hub.recordProviderRetry(draft.meta.id, retry), false);
+  assert.equal(hub.recordCompactionState(compaction), false);
+  assert.equal(hub.recordApprovalState(approval), false);
+  assert.deepEqual(taskEvents, []);
+  assert.deepEqual(retryEvents, []);
+  assert.deepEqual(compactionEvents, []);
+  assert.deepEqual(approvalEvents, []);
+
+  draft.history.push({ role: "user", content: "make this session durable" });
+  hub.save(draft);
+  assert.equal(hub.recordTaskState(taskState), true);
+  assert.equal(hub.recordProviderRetry(draft.meta.id, retry), true);
+  assert.equal(hub.recordCompactionState(compaction), true);
+  assert.equal(hub.recordApprovalState(approval), true);
+  assert.deepEqual(taskEvents, [taskState]);
+  assert.deepEqual(retryEvents, [{
+    sessionId: draft.meta.id,
+    taskId: draft.task.id,
+    turnId: draft.task.turnId,
+    retry,
+  }]);
+  assert.deepEqual(compactionEvents, [compaction]);
+  assert.deepEqual(approvalEvents, [approval]);
+
+  assert.equal(hub.recordTaskState({ ...taskState, turnId: "stale-turn" }), false);
+  assert.equal(taskEvents.length, 1, "a stale turn cannot enter the active task journal");
+  rejectJournal = true;
+  assert.equal(hub.recordTaskState(taskState), false);
+  assert.equal(hub.recordProviderRetry(draft.meta.id, retry), false);
+  assert.equal(hub.recordCompactionState({
+    ...compaction,
+    attemptId: "99999999-9999-4999-8999-999999999999",
+    windowId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  }), false);
+  assert.equal(hub.recordApprovalState({ ...approval, state: "resolved", outcome: "allowed" }), false);
+  assert.equal(taskEvents.length, 1, "diagnostic failures never escape into the active task");
+  assert.equal(retryEvents.length, 1, "diagnostic failures never escape into provider retry");
+  assert.equal(compactionEvents.length, 1, "diagnostic failures never escape into compaction");
+  assert.equal(approvalEvents.length, 1, "diagnostic failures never escape into approval handling");
 });
 
 test("SessionHub pages live drafts before durable history without persisting the drafts", () => {

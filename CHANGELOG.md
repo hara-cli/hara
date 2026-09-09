@@ -5,6 +5,22 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## Unreleased — typed runtime, compaction, and approval journal replay
+
+- Extend each private session journal with credential-free task lifecycle and replay-safe provider retry
+  records. The deterministic reducer now recovers the latest task phase/progress counters and the ordered
+  task/turn-bound retry decisions across interleaved projection commits. Stale-turn and diagnostic-write
+  failures cannot interrupt active work, while prompts, approval text, tool arguments, endpoints, provider
+  errors, and credentials remain outside the append-only stream.
+- Journal every CLI and Serve compaction attempt as a content-free started, installed, or failed transaction
+  with stable attempt/window identity. The replacement snapshot remains authoritative: its commit closes the
+  attempt after a crash even if the final installed event was not appended, while a provider, timeout,
+  interruption, preparation, or persistence failure leaves the previous context window in place.
+- Journal each registered Serve approval request and its terminal outcome (`allowed`, remembered allow,
+  denied, timed out, or interrupted) against the owning task and turn. Replay isolates missing, duplicate,
+  and mismatched transitions without retaining the question, tool arguments, workspace path, or credentials;
+  journal failures remain diagnostic and cannot block the live approval gate.
+
 ## 0.169.0 — 2026-09-09 — native Feishu/WeChat delivery and bounded unattended progress
 
 - Add Hara-native cross-channel delivery so an authorized WeChat conversation can send through the already

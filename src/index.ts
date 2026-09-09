@@ -261,6 +261,7 @@ import {
   validSessionId,
   sessionFileExists,
   saveSession,
+  recordSessionCompactionState,
   loadSession,
   acquireSessionLock,
   reclaimOrphanedSessionLocks,
@@ -275,6 +276,7 @@ import {
   automatedTitle,
   slugify,
   sanitizeSessionTitle,
+  type SessionCompactionFailureReason,
   type SessionMeta,
   type SessionData,
 } from "./session/store.js";
@@ -2738,44 +2740,72 @@ async function compactConversation(
   if (history.length < 2 || signal?.aborted) return null;
   const attemptId = randomUUID();
   const windowId = randomUUID();
+  const previousWindowId = meta.compaction?.windowId;
   const sourceMessages = history.length;
   const estimatedSourceInput = compactedHistoryTokenEstimate(history);
   const recent = recentHistoryForCompaction(history);
-  const r = await boundedProviderTurn(provider, {
-    system: COMPACT_SYSTEM,
-    history: [...compactionSourceHistory(history), { role: "user", content: "Create the bounded execution checkpoint now." }],
-    tools: [],
-    onText: () => {},
-  }, { timeoutMs: 60_000, label: "conversation compaction", signal, onProviderTurn });
-  // A provider may report billable usage with an error/aborted result. Account for the physical request
-  // exactly once even when the original history must remain authoritative.
-  stats.input += r.usage?.input ?? 0;
-  stats.output += r.usage?.output ?? 0;
-  if (signal?.aborted || r.stop === "error") return null;
-  const rawSummary = r.text.trim();
-  if (!rawSummary) return null;
-  const summary = normalizeCompactionSummary(rawSummary);
-  const workingSet = workingSetFromSummary(summary);
-  // TW5-style file restore: the summary alone loses the working set's ACTUAL content — re-attach the
-  // most recently touched files (current on-disk state, byte-capped) so work continues without re-reads.
-  const restore = buildFileRestore(recentTouched(5), (p) => {
-    if (signal?.aborted) return null;
-    try {
-      return readModelContextFileSync(p, 32 * 1024);
-    } catch {
+  const lifecycleBase = {
+    sessionId: meta.id,
+    attemptId,
+    windowId,
+    ...(previousWindowId ? { previousWindowId } : {}),
+    sourceMessages,
+  };
+  recordSessionCompactionState({ ...lifecycleBase, state: "started" });
+  let stage: "provider" | "prepare" | "persistence" = "provider";
+  let terminalRecorded = false;
+  const recordFailure = (reason: SessionCompactionFailureReason): void => {
+    if (terminalRecorded) return;
+    terminalRecorded = true;
+    recordSessionCompactionState({ ...lifecycleBase, state: "failed", reason });
+  };
+  try {
+    const r = await boundedProviderTurn(provider, {
+      system: COMPACT_SYSTEM,
+      history: [...compactionSourceHistory(history), { role: "user", content: "Create the bounded execution checkpoint now." }],
+      tools: [],
+      onText: () => {},
+    }, { timeoutMs: 60_000, label: "conversation compaction", signal, onProviderTurn });
+    // A provider may report billable usage with an error/aborted result. Account for the physical request
+    // exactly once even when the original history must remain authoritative.
+    stats.input += r.usage?.input ?? 0;
+    stats.output += r.usage?.output ?? 0;
+    if (signal?.aborted) {
+      recordFailure("interrupted");
       return null;
     }
-  });
-  // Cancellation during the file snapshot must leave the original conversation untouched.
-  if (signal?.aborted) return null;
-  const compacted = compactedConversationHistory(summary, recent, restore);
-  const providerInput = r.usage?.input;
-  const candidateMeta: SessionMeta = {
-    ...meta,
-    workingSet,
-    compaction: {
+    if (r.stop === "error") {
+      recordFailure(/timed out/iu.test(r.errorMsg ?? "") ? "timeout" : "provider_error");
+      return null;
+    }
+    const rawSummary = r.text.trim();
+    if (!rawSummary) {
+      recordFailure("empty_summary");
+      return null;
+    }
+    stage = "prepare";
+    const summary = normalizeCompactionSummary(rawSummary);
+    const workingSet = workingSetFromSummary(summary);
+    // TW5-style file restore: the summary alone loses the working set's ACTUAL content — re-attach the
+    // most recently touched files (current on-disk state, byte-capped) so work continues without re-reads.
+    const restore = buildFileRestore(recentTouched(5), (p) => {
+      if (signal?.aborted) return null;
+      try {
+        return readModelContextFileSync(p, 32 * 1024);
+      } catch {
+        return null;
+      }
+    });
+    // Cancellation during the file snapshot must leave the original conversation untouched.
+    if (signal?.aborted) {
+      recordFailure("interrupted");
+      return null;
+    }
+    const compacted = compactedConversationHistory(summary, recent, restore);
+    const providerInput = r.usage?.input;
+    const compaction = {
       windowId,
-      ...(meta.compaction?.windowId ? { previousWindowId: meta.compaction.windowId } : {}),
+      ...(previousWindowId ? { previousWindowId } : {}),
       attemptId,
       installedAt: new Date().toISOString(),
       sourceMessages,
@@ -2784,17 +2814,24 @@ async function compactConversation(
         ? providerInput!
         : estimatedSourceInput,
       inputAccounting: Number.isSafeInteger(providerInput) && providerInput! > 0
-        ? "provider"
-        : "estimated",
-    },
-  };
-  // The candidate snapshot becomes durable before it replaces the live projection. A failed save therefore
-  // leaves the original conversation, working set, and context watermark usable in this process.
-  saveSession(candidateMeta, compacted, task);
-  Object.assign(meta, candidateMeta);
-  history.splice(0, history.length, ...compacted);
-  stats.lastInput = compactedHistoryTokenEstimate(compacted); // reflect replacement, not the large summarizer request
-  return summary;
+        ? "provider" as const
+        : "estimated" as const,
+    };
+    const candidateMeta: SessionMeta = { ...meta, workingSet, compaction };
+    // The candidate snapshot becomes durable before it replaces the live projection. A failed save therefore
+    // leaves the original conversation, working set, and context watermark usable in this process.
+    stage = "persistence";
+    saveSession(candidateMeta, compacted, task);
+    Object.assign(meta, candidateMeta);
+    history.splice(0, history.length, ...compacted);
+    terminalRecorded = true;
+    recordSessionCompactionState({ ...lifecycleBase, state: "installed", ...compaction });
+    stats.lastInput = compactedHistoryTokenEstimate(compacted); // reflect replacement, not the large summarizer request
+    return summary;
+  } catch (error) {
+    recordFailure(stage === "provider" ? "provider_error" : stage === "persistence" ? "persistence" : "internal");
+    throw error;
+  }
 }
 
 /** Auto-compact (à la Claude Code) when the last turn filled the context past the threshold, so the NEXT turn

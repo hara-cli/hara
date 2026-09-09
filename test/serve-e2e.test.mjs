@@ -4291,6 +4291,11 @@ test("serve e2e: compaction has a hard timeout and close retains its lock until 
 test("serve automatically compacts a completed Desktop turn without replacing its reply", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-auto-compact-"));
   const store = memStore();
+  const compactionEvents = [];
+  store.recordCompactionState = (event) => {
+    compactionEvents.push(structuredClone(event));
+    return true;
+  };
   let calls = 0;
   const provider = {
     id: "fake",
@@ -4327,6 +4332,11 @@ test("serve automatically compacts a completed Desktop turn without replacing it
     assert.equal(calls, 3, "the second completed turn triggered exactly one bounded compaction call");
     assert.equal(second.result.usage.input, 90, "internal compaction usage remains visible in turn accounting");
     assert.ok(store.saved.get(sid).history[0].content.startsWith("Execution checkpoint"));
+    assert.deepEqual(compactionEvents.map((event) => event.state), ["started", "installed"]);
+    assert.equal(compactionEvents[0].attemptId, compactionEvents[1].attemptId);
+    assert.equal(compactionEvents[0].windowId, compactionEvents[1].windowId);
+    assert.equal(compactionEvents[1].replacementMessages, store.saved.get(sid).history.length);
+    assert.equal(compactionEvents[1].inputAccounting, "provider");
     const notices = c.events.filter((event) => event.method === "event.notice").map((event) => event.params.text);
     assert.ok(notices.some((text) => text.includes("Auto-compacting conversation")));
     assert.ok(notices.some((text) => text.includes("auto-compacted")));
@@ -4338,6 +4348,10 @@ test("serve automatically compacts a completed Desktop turn without replacing it
     assert.equal(calls, 5, "the failed summarizer is attempted once without recursively retrying");
     assert.equal(third.result.usage.input, 85, "a provider-reported failed summarizer request is still accounted");
     assert.ok(store.saved.get(sid).history.some((message) => message.content === "three"));
+    assert.deepEqual(compactionEvents.map((event) => event.state), ["started", "installed", "started", "failed"]);
+    assert.equal(compactionEvents[2].attemptId, compactionEvents[3].attemptId);
+    assert.notEqual(compactionEvents[2].attemptId, compactionEvents[0].attemptId);
+    assert.equal(compactionEvents[3].reason, "provider_error");
     assert.ok(
       c.events
         .filter((event) => event.method === "event.notice")
@@ -4591,6 +4605,11 @@ test("serve e2e: inspect_image gives an agent-discovered workspace image to the 
 test("serve e2e: approval round-trip — suggest mode write_file waits for approval.reply, then completes", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-"));
   const store = memStore();
+  const approvalEvents = [];
+  store.recordApprovalState = (event) => {
+    approvalEvents.push(structuredClone(event));
+    return true;
+  };
   const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(toolProvider(), store, "suggest"));
   const c = await connect(srv.port);
   try {
@@ -4640,6 +4659,38 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
     assert.ok(
       lifecycle.every((event, index) => index === 0 || event.sequence > lifecycle[index - 1].sequence),
       "approval transitions retain strict event ordering",
+    );
+    assert.deepEqual(
+      approvalEvents.map((event) => ({
+        sessionId: event.sessionId,
+        approvalId: event.approvalId,
+        taskId: event.taskId,
+        turnId: event.turnId,
+        allowAlways: event.allowAlways,
+        state: event.state,
+        outcome: event.outcome,
+      })),
+      [
+        {
+          sessionId: result.sessionId,
+          approvalId: waiting.params.approval.id,
+          taskId: approvalEvents[0]?.taskId,
+          turnId: approvalEvents[0]?.turnId,
+          allowAlways: true,
+          state: "requested",
+          outcome: undefined,
+        },
+        {
+          sessionId: result.sessionId,
+          approvalId: waiting.params.approval.id,
+          taskId: approvalEvents[0]?.taskId,
+          turnId: approvalEvents[0]?.turnId,
+          allowAlways: true,
+          state: "resolved",
+          outcome: "allowed",
+        },
+      ],
+      "the durable approval journal pairs the registered request with its explicit outcome",
     );
     assert.equal(readFileSync(join(dir, "approved.txt"), "utf8"), "hi", "the approved tool actually ran");
   } finally {
@@ -4764,6 +4815,11 @@ test("serve e2e: denied approval blocks the tool", { timeout: 20000 }, async () 
 test("serve e2e: interrupt settles a pending approval immediately and leaves valid history", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-interrupt-approval-"));
   const store = memStore();
+  const approvalEvents = [];
+  store.recordApprovalState = (event) => {
+    approvalEvents.push(structuredClone(event));
+    return true;
+  };
   const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(toolProvider(), store, "suggest"));
   const c = await connect(srv.port);
   let sending;
@@ -4790,6 +4846,32 @@ test("serve e2e: interrupt settles a pending approval immediately and leaves val
     assert.deepEqual(saved.history.slice(-2).map((message) => message.role), ["assistant", "tool"]);
     assert.equal(saved.history.at(-1).results[0].id, "t1");
     assert.equal(saved.history.at(-1).results[0].isError, true);
+    assert.deepEqual(
+      approvalEvents.map((event) => ({
+        approvalId: event.approvalId,
+        taskId: event.taskId,
+        turnId: event.turnId,
+        state: event.state,
+        outcome: event.outcome,
+      })),
+      [
+        {
+          approvalId: approval.params.approvalId,
+          taskId: approvalEvents[0]?.taskId,
+          turnId: approvalEvents[0]?.turnId,
+          state: "requested",
+          outcome: undefined,
+        },
+        {
+          approvalId: approval.params.approvalId,
+          taskId: approvalEvents[0]?.taskId,
+          turnId: approvalEvents[0]?.turnId,
+          state: "resolved",
+          outcome: "interrupted",
+        },
+      ],
+      "interrupt closes the exact pending approval instead of leaving it apparently actionable",
+    );
     // A reply racing in after cancellation is idempotent and cannot revive the old call.
     assert.deepEqual((await c.call("approval.reply", { approvalId: approval.params.approvalId, allow: true })).result, {});
 
