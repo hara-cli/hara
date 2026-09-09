@@ -32,6 +32,7 @@ import {
   recordSessionApprovalState,
   recordSessionCompactionState,
   recordSessionProviderRetry,
+  recordSessionRuntimeItem,
   recordSessionTaskState,
   replaySessionJournal,
 } from "../dist/session/store.js";
@@ -391,6 +392,101 @@ test("session journal replays typed task state and provider retries without pers
       { sequence: 4, expectedSequence: 3 },
       { sequence: 4, expectedSequence: 5 },
     ]);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session journal deterministically replays provider, message, tool, diff, and Agent item lifecycles", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-item-journal-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const project = join(home, "project");
+    mkdirSync(project, { recursive: true });
+    const sessionId = "item-journal-fixture";
+    const taskId = "task-item-1";
+    const turnId = "turn-item-1";
+    saveSession({
+      id: sessionId,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "item journal",
+      createdAt: "2026-09-10T00:00:00.000Z",
+      updatedAt: "2026-09-10T00:00:00.000Z",
+    }, [{ role: "user", content: "private prompt must stay out of the journal" }]);
+
+    const providerId = "provider-attempt-1";
+    const messageId = "assistant-message-1";
+    const toolId = "tool-call-1";
+    const diffId = "diff-tool-call-1";
+    const agentId = "agent-child-1";
+    const common = { sessionId, taskId, turnId };
+    const transitions = [
+      { ...common, itemId: providerId, kind: "provider", state: "started", provider: "volcengine-agent-plan", model: "glm-5.3-flash" },
+      { ...common, itemId: messageId, kind: "message", state: "started", parentItemId: providerId, role: "assistant" },
+      { ...common, itemId: providerId, kind: "provider", state: "streaming", provider: "volcengine-agent-plan", model: "glm-5.3-flash" },
+      { ...common, itemId: messageId, kind: "message", state: "streaming", parentItemId: providerId, role: "assistant" },
+      { ...common, itemId: messageId, kind: "message", state: "completed", parentItemId: providerId, role: "assistant" },
+      { ...common, itemId: providerId, kind: "provider", state: "completed", provider: "volcengine-agent-plan", model: "glm-5.3-flash", inputTokens: 120, outputTokens: 30 },
+      { ...common, itemId: toolId, kind: "tool", state: "queued", parentItemId: messageId, role: "tool", name: "edit_file", effect: "edit" },
+      { ...common, itemId: diffId, kind: "diff", state: "queued", parentItemId: toolId, effect: "edit" },
+      { ...common, itemId: toolId, kind: "tool", state: "started", parentItemId: messageId, role: "tool", name: "edit_file", effect: "edit" },
+      { ...common, itemId: toolId, kind: "tool", state: "completed", parentItemId: messageId, role: "tool", name: "edit_file", effect: "edit" },
+      { ...common, itemId: diffId, kind: "diff", state: "completed", parentItemId: toolId, effect: "edit" },
+      { ...common, itemId: agentId, kind: "agent", state: "queued", parentItemId: toolId, role: "agent", generation: 1 },
+      { ...common, itemId: agentId, kind: "agent", state: "started", parentItemId: toolId, role: "agent", generation: 1 },
+      { ...common, itemId: agentId, kind: "agent", state: "completed", parentItemId: toolId, role: "agent", generation: 1 },
+    ];
+    for (const [index, transition] of transitions.entries()) {
+      assert.equal(recordSessionRuntimeItem({
+        ...transition,
+        at: new Date(Date.parse("2026-09-10T00:00:01.000Z") + index * 1_000).toISOString(),
+      }), true);
+    }
+
+    const journal = readSessionJournal(sessionId);
+    const replay = replaySessionJournal(journal.events);
+    assert.equal(replay.gaps.length, 0);
+    assert.equal(replay.runtimeItemIssues.length, 0);
+    assert.deepEqual(replay.runtimeItems.map((item) => ({
+      id: item.itemId,
+      kind: item.kind,
+      state: item.state,
+      parent: item.parentItemId,
+    })), [
+      { id: providerId, kind: "provider", state: "completed", parent: undefined },
+      { id: messageId, kind: "message", state: "completed", parent: providerId },
+      { id: toolId, kind: "tool", state: "completed", parent: messageId },
+      { id: diffId, kind: "diff", state: "completed", parent: toolId },
+      { id: agentId, kind: "agent", state: "completed", parent: toolId },
+    ]);
+    const provider = replay.runtimeItems[0];
+    assert.deepEqual({ input: provider.inputTokens, output: provider.outputTokens }, { input: 120, output: 30 });
+    assert.deepEqual(replaySessionJournal(journal.events).runtimeItems, replay.runtimeItems,
+      "the same ordered journal always reduces to the same lifecycle projection");
+
+    const raw = readFileSync(join(home, ".hara", "sessions", `${sessionId}.journal`), "utf8");
+    assert.equal(raw.includes("private prompt"), false);
+    assert.equal(raw.includes("sk-itemjournal1234567890"), false);
+
+    const last = journal.events.at(-1);
+    const duplicateTerminal = { ...structuredClone(last), eventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", sequence: last.sequence + 1 };
+    const mismatch = {
+      ...structuredClone(last),
+      eventId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      sequence: last.sequence + 2,
+      kind: "tool",
+    };
+    const anomalous = replaySessionJournal([...journal.events, duplicateTerminal, mismatch]);
+    assert.deepEqual(anomalous.runtimeItemIssues.map((issue) => issue.kind), ["duplicate_terminal", "identity_mismatch"]);
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
@@ -2404,6 +2500,7 @@ test("SessionHub journals runtime projections only after a draft becomes durable
   const saved = new Map();
   const taskEvents = [];
   const retryEvents = [];
+  const runtimeItemEvents = [];
   const compactionEvents = [];
   const approvalEvents = [];
   let rejectJournal = false;
@@ -2422,6 +2519,11 @@ test("SessionHub journals runtime projections only after a draft becomes durable
     recordProviderRetry(event) {
       if (rejectJournal) throw new Error("simulated diagnostic write failure");
       retryEvents.push(structuredClone(event));
+      return true;
+    },
+    recordRuntimeItem(event) {
+      if (rejectJournal) throw new Error("simulated diagnostic write failure");
+      runtimeItemEvents.push(structuredClone(event));
       return true;
     },
     recordCompactionState(event) {
@@ -2475,6 +2577,16 @@ test("SessionHub journals runtime projections only after a draft becomes durable
     sourceMessages: 2,
     state: "started",
   };
+  const runtimeItem = {
+    sessionId: draft.meta.id,
+    taskId: draft.task.id,
+    turnId: draft.task.turnId,
+    itemId: "provider-runtime-item",
+    kind: "provider",
+    state: "started",
+    provider: "fixture",
+    model: "fixture-model",
+  };
   const approval = {
     sessionId: draft.meta.id,
     approvalId: "cccccccc-3333-4333-8333-333333333333",
@@ -2486,10 +2598,12 @@ test("SessionHub journals runtime projections only after a draft becomes durable
 
   assert.equal(hub.recordTaskState(taskState), false);
   assert.equal(hub.recordProviderRetry(draft.meta.id, retry), false);
+  assert.equal(hub.recordRuntimeItem(runtimeItem), false);
   assert.equal(hub.recordCompactionState(compaction), false);
   assert.equal(hub.recordApprovalState(approval), false);
   assert.deepEqual(taskEvents, []);
   assert.deepEqual(retryEvents, []);
+  assert.deepEqual(runtimeItemEvents, []);
   assert.deepEqual(compactionEvents, []);
   assert.deepEqual(approvalEvents, []);
 
@@ -2497,6 +2611,7 @@ test("SessionHub journals runtime projections only after a draft becomes durable
   hub.save(draft);
   assert.equal(hub.recordTaskState(taskState), true);
   assert.equal(hub.recordProviderRetry(draft.meta.id, retry), true);
+  assert.equal(hub.recordRuntimeItem(runtimeItem), true);
   assert.equal(hub.recordCompactionState(compaction), true);
   assert.equal(hub.recordApprovalState(approval), true);
   assert.deepEqual(taskEvents, [taskState]);
@@ -2506,14 +2621,17 @@ test("SessionHub journals runtime projections only after a draft becomes durable
     turnId: draft.task.turnId,
     retry,
   }]);
+  assert.deepEqual(runtimeItemEvents, [runtimeItem]);
   assert.deepEqual(compactionEvents, [compaction]);
   assert.deepEqual(approvalEvents, [approval]);
 
   assert.equal(hub.recordTaskState({ ...taskState, turnId: "stale-turn" }), false);
+  assert.equal(hub.recordRuntimeItem({ ...runtimeItem, turnId: "stale-turn" }), false);
   assert.equal(taskEvents.length, 1, "a stale turn cannot enter the active task journal");
   rejectJournal = true;
   assert.equal(hub.recordTaskState(taskState), false);
   assert.equal(hub.recordProviderRetry(draft.meta.id, retry), false);
+  assert.equal(hub.recordRuntimeItem(runtimeItem), false);
   assert.equal(hub.recordCompactionState({
     ...compaction,
     attemptId: "99999999-9999-4999-8999-999999999999",
@@ -2522,6 +2640,7 @@ test("SessionHub journals runtime projections only after a draft becomes durable
   assert.equal(hub.recordApprovalState({ ...approval, state: "resolved", outcome: "allowed" }), false);
   assert.equal(taskEvents.length, 1, "diagnostic failures never escape into the active task");
   assert.equal(retryEvents.length, 1, "diagnostic failures never escape into provider retry");
+  assert.equal(runtimeItemEvents.length, 1, "diagnostic failures never escape into runtime item handling");
   assert.equal(compactionEvents.length, 1, "diagnostic failures never escape into compaction");
   assert.equal(approvalEvents.length, 1, "diagnostic failures never escape into approval handling");
 });

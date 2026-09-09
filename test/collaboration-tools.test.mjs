@@ -24,12 +24,12 @@ const fakeTeam = (calls) => ({
     calls.push(["spawn", input]);
     return baseAgent;
   },
-  async sendMessage(target, message) {
-    calls.push(["message", target, message]);
+  async sendMessage(target, message, commandId) {
+    calls.push(["message", target, message, commandId]);
     return { ...baseAgent, pendingMessages: 1 };
   },
-  async followup(target, message) {
-    calls.push(["followup", target, message]);
+  async followup(target, message, commandId) {
+    calls.push(["followup", target, message, commandId]);
     return { ...baseAgent, generation: 2 };
   },
   async interrupt(target) {
@@ -52,7 +52,7 @@ const fakeTeam = (calls) => ({
 
 test("collaboration tools use a scoped durable team and classify mailbox mutation as serial state", async () => {
   const calls = [];
-  const ctx = { cwd: process.cwd(), agentTeam: fakeTeam(calls) };
+  const ctx = { cwd: process.cwd(), agentTeam: fakeTeam(calls), toolCallId: "provider-call-1" };
   const spawn = getTool("spawn_agent");
   assert.ok(spawn);
   assert.deepEqual(toolOperationTraits(spawn, {}, ctx), { effect: "state", concurrencySafe: false });
@@ -62,6 +62,7 @@ test("collaboration tools use a scoped durable team and classify mailbox mutatio
   const message = getTool("send_message");
   const queued = JSON.parse(await message.run({ target: created.id, message: "new context" }, ctx));
   assert.equal(queued.pendingMessages, 1);
+  assert.deepEqual(calls[1], ["message", created.id, "new context", "provider-call-1"]);
 
   const waited = JSON.parse(await getTool("wait_agent").run({ target: created.id, timeout_ms: 25 }, ctx));
   assert.equal(waited.result, "done");

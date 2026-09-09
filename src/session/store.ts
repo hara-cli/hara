@@ -401,12 +401,80 @@ export type SessionApprovalStateInput = SessionApprovalStateInputBase & (
   | { state: "resolved"; outcome: SessionApprovalOutcome }
 );
 
+export type SessionRuntimeItemKind =
+  | "provider"
+  | "message"
+  | "tool"
+  | "diff"
+  | "agent"
+  | "mailbox"
+  | "steering"
+  | "control";
+
+export type SessionRuntimeItemState =
+  | "queued"
+  | "started"
+  | "streaming"
+  | "paused"
+  | "resumed"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "denied";
+
+export type SessionRuntimeErrorKind =
+  | "context_overflow"
+  | "quota_exhausted"
+  | "region_unavailable"
+  | "rate_limit"
+  | "overloaded"
+  | "auth"
+  | "timeout"
+  | "transient"
+  | "circuit_open"
+  | "interrupted"
+  | "unknown";
+
+/** One content-free lifecycle transition for an observable runtime item. Stable identity and bounded
+ * classifications are retained; prompts, tool arguments/results, paths, diff bodies, provider errors,
+ * reasoning, and credentials are deliberately excluded. */
+export interface SessionRuntimeItemEvent {
+  v: 1;
+  type: "runtime.item";
+  eventId: string;
+  sessionId: string;
+  sequence: number;
+  at: string;
+  /** Control ownership can exist before a task is created. Every other item is fenced to one task/turn. */
+  taskId?: string;
+  turnId?: string;
+  itemId: string;
+  kind: SessionRuntimeItemKind;
+  state: SessionRuntimeItemState;
+  parentItemId?: string;
+  role?: "user" | "assistant" | "tool" | "agent";
+  name?: string;
+  effect?: "read" | "state" | "interactive" | "probe" | "edit" | "exec" | "computer";
+  provider?: string;
+  model?: string;
+  errorKind?: SessionRuntimeErrorKind;
+  generation?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+export type SessionRuntimeItemInput = Omit<
+  SessionRuntimeItemEvent,
+  "v" | "type" | "eventId" | "sequence" | "at"
+> & { at?: string };
+
 export type SessionJournalEvent =
   | SessionProjectionEvent
   | SessionTaskStateEvent
   | SessionProviderRetryEvent
   | SessionCompactionStateEvent
-  | SessionApprovalStateEvent;
+  | SessionApprovalStateEvent
+  | SessionRuntimeItemEvent;
 
 export interface SessionTaskLifecycleInput {
   sessionId: string;
@@ -461,6 +529,12 @@ export interface SessionJournalReplay {
     approvalId: string;
     kind: "missing_request" | "identity_mismatch" | "duplicate_request" | "duplicate_resolution";
   }>;
+  runtimeItems: SessionRuntimeItemReplay[];
+  runtimeItemIssues: Array<{
+    sequence: number;
+    itemId: string;
+    kind: "missing_start" | "identity_mismatch" | "duplicate_start" | "duplicate_terminal" | "invalid_transition";
+  }>;
   gaps: Array<{
     sequence: number;
     expectedSequence: number;
@@ -503,6 +577,30 @@ export interface SessionApprovalReplay {
   updatedAt: string;
   resolutionSequence?: number;
   outcome?: SessionApprovalOutcome;
+}
+
+export interface SessionRuntimeItemReplay {
+  taskId?: string;
+  turnId?: string;
+  itemId: string;
+  kind: SessionRuntimeItemKind;
+  state: SessionRuntimeItemState;
+  parentItemId?: string;
+  role?: SessionRuntimeItemEvent["role"];
+  name?: string;
+  effect?: SessionRuntimeItemEvent["effect"];
+  provider?: string;
+  model?: string;
+  errorKind?: SessionRuntimeErrorKind;
+  generation?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  queuedAt?: string;
+  startedAt?: string;
+  updatedAt: string;
+  terminalAt?: string;
+  firstSequence: number;
+  lastSequence: number;
 }
 
 export interface SessionMetadataPageOptions {
@@ -1768,12 +1866,54 @@ function isSessionApprovalStateEvent(value: unknown, sessionId?: string): value 
   );
 }
 
+function isBoundedJournalLabel(value: unknown, max: number): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= max
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function isSessionRuntimeItemEvent(value: unknown, sessionId?: string): value is SessionRuntimeItemEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = value as Partial<Record<keyof SessionRuntimeItemEvent, unknown>>;
+  return event.v === 1
+    && event.type === "runtime.item"
+    && typeof event.eventId === "string"
+    && SESSION_STORAGE_GENERATION.test(event.eventId)
+    && validSessionId(event.sessionId)
+    && (sessionId === undefined || event.sessionId === sessionId)
+    && Number.isSafeInteger(event.sequence)
+    && Number(event.sequence) >= 1
+    && isTimestamp(event.at)
+    && (event.kind === "control"
+      ? ((event.taskId === undefined && event.turnId === undefined)
+        || (validSessionId(event.taskId) && validSessionId(event.turnId)))
+      : (validSessionId(event.taskId) && validSessionId(event.turnId)))
+    && isBoundedJournalLabel(event.itemId, 256)
+    && ["provider", "message", "tool", "diff", "agent", "mailbox", "steering", "control"].includes(event.kind as string)
+    && ["queued", "started", "streaming", "paused", "resumed", "completed", "failed", "cancelled", "denied"].includes(event.state as string)
+    && (event.parentItemId === undefined || isBoundedJournalLabel(event.parentItemId, 256))
+    && (event.role === undefined || ["user", "assistant", "tool", "agent"].includes(event.role as string))
+    && (event.name === undefined || isBoundedJournalLabel(event.name, 256))
+    && (event.effect === undefined || ["read", "state", "interactive", "probe", "edit", "exec", "computer"].includes(event.effect as string))
+    && (event.provider === undefined || isBoundedJournalLabel(event.provider, 256))
+    && (event.model === undefined || isBoundedJournalLabel(event.model, 512))
+    && (event.errorKind === undefined || [
+      "context_overflow", "quota_exhausted", "region_unavailable", "rate_limit", "overloaded", "auth",
+      "timeout", "transient", "circuit_open", "interrupted", "unknown",
+    ].includes(event.errorKind as string))
+    && (event.generation === undefined || (Number.isSafeInteger(event.generation) && Number(event.generation) >= 1))
+    && (event.inputTokens === undefined || isNonNegativeSafeInteger(event.inputTokens))
+    && (event.outputTokens === undefined || isNonNegativeSafeInteger(event.outputTokens));
+}
+
 function isSessionJournalEvent(value: unknown, sessionId?: string): value is SessionJournalEvent {
   return isSessionProjectionEvent(value, sessionId)
     || isSessionTaskStateEvent(value, sessionId)
     || isSessionProviderRetryEvent(value, sessionId)
     || isSessionCompactionStateEvent(value, sessionId)
-    || isSessionApprovalStateEvent(value, sessionId);
+    || isSessionApprovalStateEvent(value, sessionId)
+    || isSessionRuntimeItemEvent(value, sessionId);
 }
 
 /** Read an append-only projection journal. Invalid complete records are counted and skipped; a torn final
@@ -1827,6 +1967,9 @@ export function replaySessionJournal(events: readonly SessionJournalEvent[]): Se
   const approvals: SessionApprovalReplay[] = [];
   const approvalById = new Map<string, SessionApprovalReplay>();
   const approvalIssues: SessionJournalReplay["approvalIssues"] = [];
+  const runtimeItems: SessionRuntimeItemReplay[] = [];
+  const runtimeItemById = new Map<string, SessionRuntimeItemReplay>();
+  const runtimeItemIssues: SessionJournalReplay["runtimeItemIssues"] = [];
   const gaps: SessionJournalReplay["gaps"] = [];
   for (const event of events) {
     if (!isSessionJournalEvent(event)) continue;
@@ -1884,6 +2027,92 @@ export function replaySessionJournal(events: readonly SessionJournalEvent[]): Se
     }
     else if (isSessionTaskStateEvent(event)) latestTaskState = event;
     else if (isSessionProviderRetryEvent(event)) providerRetries.push(event);
+    else if (isSessionRuntimeItemEvent(event)) {
+      const current = runtimeItemById.get(event.itemId);
+      const terminal = (state: SessionRuntimeItemState): boolean =>
+        state === "completed" || state === "failed" || state === "cancelled" || state === "denied";
+      const optionalMatches = (left: unknown, right: unknown): boolean =>
+        left === undefined || right === undefined || left === right;
+      const identityMatches = current
+        && current.taskId === event.taskId
+        && current.turnId === event.turnId
+        && current.kind === event.kind
+        && optionalMatches(current.parentItemId, event.parentItemId)
+        && optionalMatches(current.role, event.role)
+        && optionalMatches(current.name, event.name)
+        && optionalMatches(current.effect, event.effect)
+        && optionalMatches(current.provider, event.provider)
+        && optionalMatches(current.model, event.model)
+        && optionalMatches(current.generation, event.generation);
+      if (!current) {
+        const replay: SessionRuntimeItemReplay = {
+          ...(event.taskId ? { taskId: event.taskId } : {}),
+          ...(event.turnId ? { turnId: event.turnId } : {}),
+          itemId: event.itemId,
+          kind: event.kind,
+          state: event.state,
+          ...(event.parentItemId ? { parentItemId: event.parentItemId } : {}),
+          ...(event.role ? { role: event.role } : {}),
+          ...(event.name ? { name: event.name } : {}),
+          ...(event.effect ? { effect: event.effect } : {}),
+          ...(event.provider ? { provider: event.provider } : {}),
+          ...(event.model ? { model: event.model } : {}),
+          ...(event.errorKind ? { errorKind: event.errorKind } : {}),
+          ...(event.generation !== undefined ? { generation: event.generation } : {}),
+          ...(event.inputTokens !== undefined ? { inputTokens: event.inputTokens } : {}),
+          ...(event.outputTokens !== undefined ? { outputTokens: event.outputTokens } : {}),
+          ...(event.state === "queued" ? { queuedAt: event.at } : {}),
+          ...(event.state === "started" ? { startedAt: event.at } : {}),
+          ...(terminal(event.state) ? { terminalAt: event.at } : {}),
+          updatedAt: event.at,
+          firstSequence: event.sequence,
+          lastSequence: event.sequence,
+        };
+        runtimeItemById.set(event.itemId, replay);
+        runtimeItems.push(replay);
+        if (event.state !== "queued" && event.state !== "started") {
+          runtimeItemIssues.push({ sequence: event.sequence, itemId: event.itemId, kind: "missing_start" });
+        }
+        continue;
+      }
+      if (!identityMatches) {
+        runtimeItemIssues.push({ sequence: event.sequence, itemId: event.itemId, kind: "identity_mismatch" });
+        continue;
+      }
+      if (terminal(current.state)) {
+        runtimeItemIssues.push({ sequence: event.sequence, itemId: event.itemId, kind: "duplicate_terminal" });
+        continue;
+      }
+      if (event.state === "queued" || (event.state === "started" && current.state !== "queued")) {
+        runtimeItemIssues.push({ sequence: event.sequence, itemId: event.itemId, kind: "duplicate_start" });
+        continue;
+      }
+      const validTransition =
+        (current.state === "queued" && ["started", "completed", "failed", "cancelled", "denied"].includes(event.state))
+        || (current.state === "started" && ["streaming", "paused", "completed", "failed", "cancelled", "denied"].includes(event.state))
+        || (current.state === "streaming" && ["paused", "completed", "failed", "cancelled"].includes(event.state))
+        || (current.state === "paused" && ["resumed", "failed", "cancelled"].includes(event.state))
+        || (current.state === "resumed" && ["streaming", "paused", "completed", "failed", "cancelled"].includes(event.state));
+      if (!validTransition) {
+        runtimeItemIssues.push({ sequence: event.sequence, itemId: event.itemId, kind: "invalid_transition" });
+        continue;
+      }
+      current.state = event.state;
+      current.updatedAt = event.at;
+      current.lastSequence = event.sequence;
+      if (event.parentItemId !== undefined) current.parentItemId ??= event.parentItemId;
+      if (event.role !== undefined) current.role ??= event.role;
+      if (event.name !== undefined) current.name ??= event.name;
+      if (event.effect !== undefined) current.effect ??= event.effect;
+      if (event.provider !== undefined) current.provider ??= event.provider;
+      if (event.model !== undefined) current.model ??= event.model;
+      if (event.generation !== undefined) current.generation ??= event.generation;
+      if (event.state === "started") current.startedAt = event.at;
+      if (event.errorKind) current.errorKind = event.errorKind;
+      if (event.inputTokens !== undefined) current.inputTokens = event.inputTokens;
+      if (event.outputTokens !== undefined) current.outputTokens = event.outputTokens;
+      if (terminal(event.state)) current.terminalAt = event.at;
+    }
     else if (isSessionCompactionStateEvent(event)) {
       const current = compactionById.get(event.attemptId);
       const projectionOnly = current?.inferredInstalled === true
@@ -2042,6 +2271,8 @@ export function replaySessionJournal(events: readonly SessionJournalEvent[]): Se
     approvals,
     ...(approvals.length > 0 ? { latestApproval: approvals.at(-1) } : {}),
     approvalIssues,
+    runtimeItems,
+    runtimeItemIssues,
     gaps,
   };
 }
@@ -2288,6 +2519,45 @@ export function recordSessionApprovalState(input: SessionApprovalStateInput): bo
         ? { ...common, state: "resolved", outcome: input.outcome }
         : { ...common, state: "requested" };
     });
+  } catch {
+    return false;
+  }
+}
+
+/** Append one runtime item transition after the session snapshot exists. This is a diagnostic projection:
+ * failure never changes model/tool execution, and every label is bounded and credential-redacted here. */
+export function recordSessionRuntimeItem(input: SessionRuntimeItemInput): boolean {
+  try {
+    const at = input.at ?? new Date().toISOString();
+    if (
+      !validSessionId(input.sessionId)
+      || (input.kind === "control"
+        ? !((input.taskId === undefined && input.turnId === undefined)
+          || (validSessionId(input.taskId) && validSessionId(input.turnId)))
+        : !(validSessionId(input.taskId) && validSessionId(input.turnId)))
+      || !sessionFileExists(input.sessionId)
+      || !isTimestamp(at)
+    ) return false;
+    return appendSessionJournalEvent(input.sessionId, (base) => ({
+      ...base,
+      type: "runtime.item",
+      at,
+      ...(input.taskId ? { taskId: input.taskId } : {}),
+      ...(input.turnId ? { turnId: input.turnId } : {}),
+      itemId: safeJournalIdentity(input.itemId, 256),
+      kind: input.kind,
+      state: input.state,
+      ...(input.parentItemId ? { parentItemId: safeJournalIdentity(input.parentItemId, 256) } : {}),
+      ...(input.role ? { role: input.role } : {}),
+      ...(input.name ? { name: safeJournalIdentity(input.name, 256) } : {}),
+      ...(input.effect ? { effect: input.effect } : {}),
+      ...(input.provider ? { provider: safeJournalIdentity(input.provider, 256) } : {}),
+      ...(input.model ? { model: safeJournalIdentity(input.model, 512) } : {}),
+      ...(input.errorKind ? { errorKind: input.errorKind } : {}),
+      ...(input.generation !== undefined ? { generation: input.generation } : {}),
+      ...(input.inputTokens !== undefined ? { inputTokens: input.inputTokens } : {}),
+      ...(input.outputTokens !== undefined ? { outputTokens: input.outputTokens } : {}),
+    }));
   } catch {
     return false;
   }

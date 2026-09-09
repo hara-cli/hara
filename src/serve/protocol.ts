@@ -74,10 +74,18 @@
 //   session.create    {cwd?,approval?,agentRef?} → {sessionId,title,cwd,model,profileId,spaceId,
 //                                                   approval,updatedAt,source,agentRef?}
 //   agents.list       {cwd?,sessionId?}          → {agents,offices,currentOfficeId}
+//   session.agents.list {sessionId}              → {sessionId,agents,budget}; budget is the model-context-
+//                                                   aware shared generations/rounds/tools/token/deadline fence.
 //   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    approval only migrates legacy sessions with no saved choice.
 //   session.history   {sessionId}                → {sessionId,model,profileId,approval?,history:[{role,text}],readOnly:true}
 //                                                    Provider-independent local replay for unavailable routes.
+//   session.runtime.replay {sessionId,afterSequence?,limit?}
+//                                                   → {sessionId,currentSequence,throughSequence,hasMore,
+//                                                       events:[content-free runtime.item],integrity}
+//                      Paginates the durable provider/message/tool/diff/Agent/mailbox/steering/control
+//                      lifecycle by journal sequence. It is independent of the short Serve broadcast tail,
+//                      so Desktop/Mobile can deterministically rebuild a task after restart or migration.
 //   session.fork      {sessionId,targetProfileId?,targetModel?,transferHistory?}
 //                                                   → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    Cross-route copies require transferHistory:true.
@@ -198,6 +206,9 @@
 //   approval.request {approvalId,question,allowAlways}
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events.
+//   event.runtime_item {taskId,turnId,itemId,kind,state,parentItemId?,role?,name?,effect?,provider?,model?,
+//                       errorKind?,generation?,inputTokens?,outputTokens?,at}
+//                     credential-free replay item; prompts, reasoning, arguments/results, paths and diff bodies omitted.
 // Provider reasoning content is intentionally never sent to persistent clients.
 
 export const PROTOCOL_VERSION = 1;

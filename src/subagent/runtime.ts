@@ -8,6 +8,13 @@ export interface SubagentUsage {
   lastInput?: number;
 }
 
+export interface SubagentExecutionMetrics {
+  providerRounds: number;
+  toolCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface SubagentRequest {
   /** Optional engine-owned stable identity. Model/user input must never choose this directly. */
   id?: string;
@@ -23,6 +30,7 @@ export interface SubagentSettlement {
   error?: string;
   stopReason?: string;
   usage?: SubagentUsage;
+  metrics?: SubagentExecutionMetrics;
 }
 
 export interface SubagentResult extends SubagentSettlement {

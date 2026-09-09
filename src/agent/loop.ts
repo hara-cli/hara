@@ -12,6 +12,7 @@ import {
 import { limitToolResultBatch } from "../tools/result-limit.js";
 import { stdout } from "node:process";
 import { hostname as executionHostname } from "node:os";
+import { randomUUID } from "node:crypto";
 import { c, out } from "../ui.js";
 import { activity } from "../activity.js";
 import { makeRenderer } from "../md.js";
@@ -46,7 +47,7 @@ import {
 } from "./progress-watchdog.js";
 import { agentMaxRounds, agentRunTimeoutMs, formatAgentDuration, MAX_AGENT_MAX_ROUNDS } from "./limits.js";
 import { subdirHint } from "../context/subdir-hints.js";
-import { classifyError, failoverAction, errorHint } from "./failover.js";
+import { classifyError, failoverAction, errorHint, type ErrKind } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
 import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
 import { setTurnPhase } from "./phase.js";
@@ -537,6 +538,9 @@ export interface RunOpts {
   /** Credential-free transport retry telemetry. Persistent hosts may journal/log this without request
    * bodies, prompts, URLs, or authorization material. */
   onProviderRetry?: (event: ProviderRetryEvent) => void;
+  /** Content-free lifecycle events for deterministic host replay. No prompt, reasoning, tool input/result,
+   * path, diff body, endpoint, provider error text, or credential is included. */
+  onRuntimeItem?: (event: RunRuntimeItemEvent) => void;
   /** Observe each tool Promise's physical lifetime. A lifecycle deadline stops logical progress immediately,
    * while persistent hosts retain the session lease until a non-cooperative tool actually settles. */
   onToolRun?: (run: Promise<unknown>, tool: { name: string; kind: Tool["kind"] }) => void;
@@ -554,6 +558,31 @@ export interface RunOpts {
    *  `provider` is the cheap model used for the veto (fail-open if absent/glitchy). Normal (low-risk) tools
    *  never touch it — zero added latency. Absent → guardian off. */
   guardian?: { provider?: Provider | null; enabled?: boolean };
+}
+
+export interface RunRuntimeItemEvent {
+  at: string;
+  itemId: string;
+  kind: "provider" | "message" | "tool" | "diff" | "agent" | "mailbox" | "steering" | "control";
+  state: "queued" | "started" | "streaming" | "paused" | "resumed" | "completed" | "failed" | "cancelled" | "denied";
+  parentItemId?: string;
+  role?: "user" | "assistant" | "tool" | "agent";
+  name?: string;
+  effect?: ToolOperationTraits["effect"];
+  provider?: string;
+  model?: string;
+  errorKind?: ErrKind;
+  generation?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+function emitRuntimeItem(opts: RunOpts, event: Omit<RunRuntimeItemEvent, "at"> & { at?: string }): void {
+  try {
+    opts.onRuntimeItem?.({ ...event, at: event.at ?? new Date().toISOString() });
+  } catch {
+    // Item journaling is observability only and can never change provider or tool execution.
+  }
 }
 
 export interface RunOutcome {
@@ -1478,6 +1507,33 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     const tty = stdout.isTTY && !opts.quiet && !sink;
     const md = tty && process.env.HARA_MD !== "0" ? makeRenderer(out) : null;
     const assistantText = new AssistantTextSanitizer();
+    const providerItem = {
+      itemId: randomUUID(),
+      kind: "provider" as const,
+      provider: activeProvider.id,
+      model: activeProvider.model,
+      ...(activeProvider.connection?.connectionId ? { name: activeProvider.connection.connectionId } : {}),
+    };
+    const assistantMessageItem = {
+      itemId: randomUUID(),
+      kind: "message" as const,
+      parentItemId: providerItem.itemId,
+      role: "assistant" as const,
+    };
+    emitRuntimeItem(opts, { ...providerItem, state: "started" });
+    emitRuntimeItem(opts, { ...assistantMessageItem, state: "started" });
+    let providerItemStreaming = false;
+    let assistantMessageStreaming = false;
+    const markProviderStreaming = (): void => {
+      if (providerItemStreaming) return;
+      providerItemStreaming = true;
+      emitRuntimeItem(opts, { ...providerItem, state: "streaming" });
+    };
+    const markAssistantMessageStreaming = (): void => {
+      if (assistantMessageStreaming) return;
+      assistantMessageStreaming = true;
+      emitRuntimeItem(opts, { ...assistantMessageItem, state: "streaming" });
+    };
     let deferredActionProse = "";
     // "working Ns" spinner until the first answer token arrives (or the turn ends). Provider reasoning
     // is deliberately an internal execution signal: it keeps the stall watchdog alive and may update a
@@ -1570,6 +1626,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       onActivity: () => {
         if (attempt.signal.aborted) return;
         observableProviderActivity = true;
+        markProviderStreaming();
         lastEvent = Date.now();
       },
       onRetry: (event) => {
@@ -1584,6 +1641,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       onText: (d) => {
         if (attempt.signal.aborted) return;
         if (d) observableProviderActivity = true;
+        if (d) {
+          markProviderStreaming();
+          markAssistantMessageStreaming();
+        }
         alive();
         const visible = assistantText.push(d);
         if (suppressUnverifiedActionProse || guardAutomatedProse) deferredActionProse += visible;
@@ -1592,6 +1653,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       onReasoning: () => {
         if (attempt.signal.aborted) return;
         observableProviderActivity = true;
+        markProviderStreaming();
         alive();
         if (opts.quiet || !sink || reasoningActivityNotified) return;
         reasoningActivityNotified = true;
@@ -1646,6 +1708,30 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // streaming it. Sanitize the authoritative persisted value independently so neither route can retain a
     // provider's leaked <think>/<thinking> block in session history or a later model request.
     r = { ...r, text: sanitizeAssistantText(r.text) };
+    const providerErrorKind = r.stop === "error"
+      ? classifyError(r.errorMsg ?? "", r.errorMetadata?.status, r.errorMetadata?.code)
+      : undefined;
+    const providerTerminalState = runSignal.aborted
+      ? "cancelled"
+      : r.stop === "error"
+        ? "failed"
+        : "completed";
+    emitRuntimeItem(opts, {
+      ...providerItem,
+      state: providerTerminalState,
+      ...(providerErrorKind ? { errorKind: providerErrorKind } : {}),
+      ...(r.usage?.input !== undefined ? { inputTokens: r.usage.input } : {}),
+      ...(r.usage?.output !== undefined ? { outputTokens: r.usage.output } : {}),
+    });
+    emitRuntimeItem(opts, {
+      ...assistantMessageItem,
+      state: runSignal.aborted
+        ? "cancelled"
+        : r.stop === "error" || (!r.text.trim() && r.toolUses.length === 0)
+          ? "failed"
+          : "completed",
+      ...(providerErrorKind ? { errorKind: providerErrorKind } : {}),
+    });
     if (r.usage && opts.stats) {
       opts.stats.input += r.usage.input;
       opts.stats.output += r.usage.output;
@@ -1717,7 +1803,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
         continue;
       }
-      const kind = classifyError(r.errorMsg ?? "", r.errorMetadata?.status, r.errorMetadata?.code);
+      const kind = providerErrorKind ?? "unknown";
       if (kind === "context_overflow" && !contextOverflowRetried) {
         contextOverflowRetried = true;
         contextBudgetScale = 0.5;
@@ -1771,6 +1857,17 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       if (r.toolUses.length) {
         // A provider can fail after partially assembling tool calls. The assistant turn is already persisted;
         // close every call explicitly so the next request is valid, while never executing partial work.
+        for (const toolUse of r.toolUses) {
+          const item = {
+            itemId: randomUUID(),
+            kind: "tool" as const,
+            parentItemId: assistantMessageItem.itemId,
+            role: "tool" as const,
+            name: toolUse.name,
+          };
+          emitRuntimeItem(opts, { ...item, state: "queued" });
+          emitRuntimeItem(opts, { ...item, state: "cancelled", errorKind: kind });
+        }
         history.push({
           role: "tool",
           results: r.toolUses.map((toolUse) => ({
@@ -1903,6 +2000,53 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // while planning, approving, or executing, so finalize the round with real results for work that already
     // completed and explicit interruption errors for everything else before persisting the session.
     const results: ToolResult[] = new Array(r.toolUses.length);
+    const toolRuntimeItems = r.toolUses.map((toolUse) => ({
+      itemId: randomUUID(),
+      kind: "tool" as const,
+      parentItemId: assistantMessageItem.itemId,
+      role: "tool" as const,
+      name: toolUse.name,
+    }));
+    const terminalToolRuntimeItems = new Set<number>();
+    const toolRuntimeEffects: Array<ToolOperationTraits["effect"] | undefined> = new Array(r.toolUses.length);
+    const diffRuntimeItems = new Map<number, {
+      itemId: string;
+      kind: "diff";
+      parentItemId: string;
+      effect: "edit";
+    }>();
+    for (const item of toolRuntimeItems) emitRuntimeItem(opts, { ...item, state: "queued" });
+    const finishToolRuntimeItem = (
+      index: number,
+      state: "completed" | "failed" | "cancelled" | "denied",
+    ): void => {
+      if (terminalToolRuntimeItems.has(index)) return;
+      terminalToolRuntimeItems.add(index);
+      const operation = toolRuntimeEffects[index];
+      emitRuntimeItem(opts, {
+        ...toolRuntimeItems[index],
+        state,
+        ...(operation ? { effect: operation } : {}),
+      });
+      const diff = diffRuntimeItems.get(index);
+      if (diff) emitRuntimeItem(opts, { ...diff, state: state === "completed" ? "completed" : state });
+    };
+    const closeToolRuntimeItems = (
+      pendingState: "failed" | "cancelled" | "denied",
+    ): void => {
+      for (let index = 0; index < toolRuntimeItems.length; index++) {
+        if (terminalToolRuntimeItems.has(index)) continue;
+        const result = results[index];
+        finishToolRuntimeItem(
+          index,
+          result
+            ? result.isError === true || looksFailed(result.content, result.name)
+              ? "failed"
+              : "completed"
+            : pendingState,
+        );
+      }
+    };
     const isPendingHeadlessQuestion = (toolUse: (typeof r.toolUses)[number]): boolean => {
       if (toolUse.name !== "ask_user") return false;
       if (askUserRequestsCredential(toolUse.input)) return false;
@@ -1926,6 +2070,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             isError: true,
           })),
         });
+        closeToolRuntimeItems("denied");
         return { status: "error", error: HEADLESS_USER_INPUT_REQUIRED };
       }
       const pendingAsk = r.toolUses.find(isPendingHeadlessQuestion)!;
@@ -1955,6 +2100,9 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           isError: toolUse.id !== pendingAsk.id,
         })),
       });
+      for (let index = 0; index < r.toolUses.length; index++) {
+        finishToolRuntimeItem(index, r.toolUses[index].id === pendingAsk.id ? "completed" : "denied");
+      }
       const waiting = applyTaskCheckpoint(intakeTask, {
         blocked_step: "answer the pending user question",
         block_reason: safeQuestion,
@@ -2001,6 +2149,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           isError: true,
         })),
       });
+      closeToolRuntimeItems("cancelled");
       return stoppedOutcome();
     };
     const finalizeInteractionError = (label: string, error: unknown): RunOutcome => {
@@ -2015,6 +2164,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
           isError: true,
         })),
       });
+      closeToolRuntimeItems("failed");
       return outcome;
     };
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
@@ -2469,6 +2619,20 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
     }
 
+    for (let index = 0; index < plans.length; index++) {
+      const effect = plans[index]?.operation?.effect;
+      toolRuntimeEffects[index] = effect;
+      if (effect !== "edit") continue;
+      const item = {
+        itemId: randomUUID(),
+        kind: "diff" as const,
+        parentItemId: toolRuntimeItems[index].itemId,
+        effect: "edit" as const,
+      };
+      diffRuntimeItems.set(index, item);
+      emitRuntimeItem(opts, { ...item, state: "queued" });
+    }
+
     // Execute: read-only tools run concurrently; edit/exec run alone, in order.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
     const successfulRoundObservations: ProgressObservation[] = [];
@@ -2582,6 +2746,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
               }
             : {}),
         };
+        emitRuntimeItem(opts, {
+          ...toolRuntimeItems[idx],
+          state: "started",
+          ...(p.operation?.effect ? { effect: p.operation.effect } : {}),
+        });
+        const diffRuntimeItem = diffRuntimeItems.get(idx);
+        if (diffRuntimeItem) emitRuntimeItem(opts, { ...diffRuntimeItem, state: "started" });
         const observedTool = p.tool!.run(p.tu.input, executionToolCtx).then(
           (value) => { settled = { ok: true, value }; return value; },
           (error) => { settled = { ok: false, error }; throw error; },
@@ -2705,6 +2876,18 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     const boundedContents = limitToolResultBatch(results.map((result) => result.content));
     for (let i = 0; i < results.length; i++) results[i].content = boundedContents[i];
     history.push({ role: "tool", results });
+    for (let index = 0; index < results.length; index++) {
+      const plan = plans[index];
+      const result = results[index];
+      finishToolRuntimeItem(
+        index,
+        plan?.denied !== undefined
+          ? "denied"
+          : result.isError === true || looksFailed(result.content, result.name)
+            ? "failed"
+            : "completed",
+      );
+    }
     if (taskStateDirty && intakeTask) {
       try {
         // The tool-use/result pair is now protocol-complete. Persist here—never inside the tool—so a crash

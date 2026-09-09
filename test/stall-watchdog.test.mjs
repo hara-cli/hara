@@ -168,6 +168,64 @@ test("application failover never replays a turn after provider stream activity",
   }
 });
 
+test("runtime item observer emits content-free provider, message, tool, and diff lifecycles", async () => {
+  const events = [];
+  let turns = 0;
+  const tool = {
+    name: "runtime_edit",
+    description: "test-only edit",
+    input_schema: { type: "object", properties: { secret: { type: "string" } }, required: ["secret"] },
+    kind: "edit",
+    async run() { return "updated a private fixture"; },
+  };
+  const history = [{ role: "user", content: "private user prompt" }];
+  const outcome = await runAgent(history, {
+    provider: {
+      id: "fixture-provider",
+      model: "fixture-model",
+      async turn(args) {
+        turns += 1;
+        args.onActivity?.();
+        if (turns === 1) {
+          return {
+            text: "",
+            toolUses: [{ id: "provider-tool-id", name: tool.name, input: { secret: "sk-runtimeobserver1234567890" } }],
+            stop: "tool_use",
+            usage: { input: 20, output: 5 },
+          };
+        }
+        args.onText("done");
+        return { text: "done", toolUses: [], stop: "end", usage: { input: 10, output: 2 } };
+      },
+    },
+    ctx: { cwd: process.cwd() },
+    approval: "full-auto",
+    confirm: async () => true,
+    quiet: true,
+    extraTools: [tool],
+    onRuntimeItem: (event) => events.push(structuredClone(event)),
+  });
+  assert.equal(outcome.status, "completed");
+  assert.equal(turns, 2);
+  const byKind = (kind) => events.filter((event) => event.kind === kind);
+  assert.deepEqual(byKind("provider").map((event) => event.state), [
+    "started", "streaming", "completed", "started", "streaming", "completed",
+  ]);
+  assert.deepEqual(byKind("message").map((event) => event.state), [
+    "started", "completed", "started", "streaming", "completed",
+  ]);
+  assert.deepEqual(byKind("tool").map((event) => event.state), ["queued", "started", "completed"]);
+  assert.deepEqual(byKind("diff").map((event) => event.state), ["queued", "started", "completed"]);
+  assert.deepEqual(byKind("provider").filter((event) => event.state === "completed").map((event) => [
+    event.inputTokens,
+    event.outputTokens,
+  ]), [[20, 5], [10, 2]]);
+  const encoded = JSON.stringify(events);
+  assert.equal(encoded.includes("private user prompt"), false);
+  assert.equal(encoded.includes("sk-runtimeobserver1234567890"), false);
+  assert.equal(encoded.includes("updated a private fixture"), false);
+});
+
 test("watchdog: a real user interrupt stays an interrupt (no timeout rewrite, no fallback)", async () => {
   process.env.HARA_STALL_TIMEOUT = "60000"; // far away — only the user aborts
   const ctrl = new AbortController();

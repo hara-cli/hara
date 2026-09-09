@@ -14,11 +14,11 @@ const deferred = () => {
   return { promise, resolve };
 };
 
-const fixture = (executor) => {
+const fixture = (executor, options = {}) => {
   const home = mkdtempSync(join(tmpdir(), "hara-agent-team-"));
   const sessionId = "fixture-session";
   const store = new AgentTeamStore(home);
-  const team = new DurableAgentTeam({ sessionId, store, executor });
+  const team = new DurableAgentTeam({ sessionId, store, executor, ...options });
   return {
     home,
     sessionId,
@@ -30,6 +30,132 @@ const fixture = (executor) => {
     },
   };
 };
+
+test("Agent mailbox commands are idempotent and fenced to the parent turn", async () => {
+  let rootTurnId = "root-turn-a";
+  let created;
+  const state = fixture(async (request) => {
+    await new Promise((resolve) => {
+      if (request.signal.aborted) return resolve();
+      request.signal.addEventListener("abort", resolve, { once: true });
+    });
+    return { status: "cancelled", text: "" };
+  }, { currentRootTurnId: () => rootTurnId });
+  try {
+    const firstTurn = state.team.controller("/root", {
+      parentTurnId: rootTurnId,
+      rootTurnId,
+    });
+    created = await firstTurn.spawn({ taskName: "mailbox", message: "inspect" });
+    await firstTurn.sendMessage(created.id, "same evidence", "provider-tool-call-1");
+    await firstTurn.sendMessage(created.id, "same evidence", "provider-tool-call-1");
+    assert.equal(state.team.list()[0].pendingMessages, 1, "an exact retry cannot enqueue twice");
+    await assert.rejects(
+      firstTurn.sendMessage(created.id, "different evidence", "provider-tool-call-1"),
+      /already used with a different request/i,
+    );
+
+    rootTurnId = "root-turn-b";
+    await assert.rejects(
+      async () => firstTurn.followup(created.id, "late message", "provider-tool-call-2"),
+      /previous parent turn/i,
+    );
+    const secondTurn = state.team.controller("/root", {
+      parentTurnId: rootTurnId,
+      rootTurnId,
+    });
+    await assert.rejects(
+      async () => secondTurn.sendMessage(created.id, "cross-turn message", "provider-tool-call-3"),
+      /different parent turn/i,
+    );
+  } finally {
+    state.team.close();
+    if (created) await state.team.controller().wait(created.id, 1_000);
+    rmSync(state.home, { recursive: true, force: true });
+  }
+});
+
+test("the whole Agent tree reserves and enforces generations, rounds, tools, tokens, and deadline", async () => {
+  const observedBudgets = [];
+  const state = fixture(async (request) => {
+    observedBudgets.push(request.budget);
+    const within = request.reportProgress({
+      providerRounds: 1,
+      toolCalls: 1,
+      inputTokens: 300,
+      outputTokens: 100,
+    });
+    assert.equal(within, true);
+    return {
+      status: "completed",
+      text: "bounded",
+      usage: { input: 300, output: 100 },
+      metrics: { providerRounds: 1, toolCalls: 1, inputTokens: 300, outputTokens: 100 },
+    };
+  }, {
+    limits: {
+      maxGenerations: 2,
+      maxProviderRounds: 2,
+      maxToolCalls: 2,
+      maxTokens: 1_000,
+      maxActiveMs: 5_000,
+      maxRoundsPerAgent: 1,
+      maxToolsPerAgent: 1,
+      maxTokensPerAgent: 500,
+    },
+  });
+  try {
+    const controller = state.team.controller();
+    const first = await controller.spawn({ taskName: "budgeted", message: "first" });
+    await controller.wait(first.id, 1_000);
+    await controller.followup(first.id, "second");
+    await controller.wait(first.id, 1_000);
+    await assert.rejects(async () => controller.followup(first.id, "third"), /generation limit/i);
+    assert.equal(observedBudgets.length, 2);
+    assert.ok(observedBudgets.every((budget) => budget.maxProviderRounds === 1));
+    const budget = state.team.budget();
+    assert.equal(budget.generationsStarted, 2);
+    assert.equal(budget.providerRounds, 2);
+    assert.equal(budget.toolCalls, 2);
+    assert.equal(budget.inputTokens + budget.outputTokens, 800);
+    assert.equal(budget.exhausted, true);
+    assert.deepEqual(budget.activeReservations, { providerRounds: 0, toolCalls: 0, tokens: 0 });
+  } finally {
+    state.cleanup();
+  }
+});
+
+test("a generation crossing its reserved token slice is stopped before another model boundary", async () => {
+  const state = fixture(async (request) => {
+    assert.equal(request.reportProgress({
+      providerRounds: 1,
+      toolCalls: 0,
+      inputTokens: 900,
+      outputTokens: 200,
+    }), false);
+    return {
+      status: "completed",
+      text: "must not be accepted as complete",
+      metrics: { providerRounds: 1, toolCalls: 0, inputTokens: 900, outputTokens: 200 },
+    };
+  }, {
+    limits: {
+      maxTokens: 1_000,
+      maxTokensPerAgent: 1_000,
+    },
+  });
+  try {
+    const controller = state.team.controller();
+    const created = await controller.spawn({ taskName: "token_cap", message: "bounded" });
+    const settled = await controller.wait(created.id, 1_000);
+    assert.notEqual(settled.agent.status, "completed");
+    assert.match(settled.error, /tree execution budget/i);
+    assert.equal(state.team.budget().inputTokens + state.team.budget().outputTokens, 1_100,
+      "actual provider usage remains truthful even when one response crosses the ceiling");
+  } finally {
+    state.cleanup();
+  }
+});
 
 test("durable Agent team persists stable metadata, redacts prompts, and returns terminal output only from wait", async () => {
   const gate = deferred();
@@ -87,6 +213,7 @@ test("durable Agent team persists stable metadata, redacts prompts, and returns 
 test("working Agents drain durable mailbox once and idle followups reuse identity with a new generation", async () => {
   const firstGate = deferred();
   const calls = [];
+  const mailboxEvents = [];
   const state = fixture(async (request) => {
     calls.push(request);
     if (request.generation === 1) await firstGate.promise;
@@ -99,7 +226,7 @@ test("working Agents drain durable mailbox once and idle followups reuse identit
         (message) => message.content,
       ).join(","),
     };
-  });
+  }, { onMailbox: (event) => mailboxEvents.push(event) });
   try {
     const controller = state.team.controller();
     const created = await controller.spawn({ taskName: "research", message: "initial" });
@@ -108,6 +235,8 @@ test("working Agents drain durable mailbox once and idle followups reuse identit
     const first = await controller.wait(created.id, 1_000);
     assert.equal(first.agent.generation, 1);
     assert.equal(first.result, "generation-1:new evidence");
+    assert.deepEqual(mailboxEvents.slice(0, 3).map((event) => event.state), ["queued", "started", "completed"]);
+    assert.ok(mailboxEvents.slice(0, 3).every((event) => event.id === mailboxEvents[0].id));
 
     const followed = await controller.followup(created.id, "check one more path");
     assert.equal(followed.id, created.id);

@@ -80,7 +80,7 @@ registerTool({
       return "Error: send_message needs target and message.";
     }
     try {
-      return json(await team.sendMessage(input.target, input.message));
+      return json(await team.sendMessage(input.target, input.message, ctx.toolCallId));
     } catch (error) {
       return boundedError(error);
     }
@@ -110,7 +110,7 @@ registerTool({
       return "Error: followup_task needs target and message.";
     }
     try {
-      return json(await team.followup(input.target, input.message));
+      return json(await team.followup(input.target, input.message, ctx.toolCallId));
     } catch (error) {
       return boundedError(error);
     }

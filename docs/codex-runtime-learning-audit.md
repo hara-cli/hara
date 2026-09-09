@@ -1,6 +1,6 @@
 # Codex runtime learning audit
 
-> Snapshot: 2026-09-09. Reference checkout:
+> Snapshot: 2026-09-10. Reference checkout:
 > `/Users/zhujianbo/work/projects/ai/codex` at locally inspected revision `8e6a44b428`.
 
 Hara should learn Codex's reliability mechanisms, not turn into an OpenAI-only clone. This audit compares the
@@ -25,7 +25,7 @@ providers behind that boundary, not competing user-facing control products.
 | Verified user-decision retention | Implemented after 0.166.1; headless continuation completed after 0.168.0 | Successful in-process `ask_user` decisions are redacted, deduplicated, persisted outside the compactable transcript, and restored in future task prompts and forks. A persisted headless/gateway/cron question now closes as an addressable pause; the next same-conversation reply is durably retained before the original task and provider turn resume. |
 | Honest end-to-end completion | Hardened after 0.168.0 | Change tasks require a fresh engine-readable completion receipt against every accepted check. File writes, scaffolds, tests, and scheduler registration prove only their stage. Missing verification preserves a resumable checkpoint and suppresses success prose; unavoidable questions pause durably instead of ending the task. Model-authored credential enrollment through chat or shell-history commands is withheld in favor of trusted masked surfaces. |
 | Replay-safe provider retry | Implemented after 0.166.1 | One provider-neutral coordinator classifies empty pre-output failures, honors bounded `Retry-After`, backs off cancellably, and never replays after stream activity, output, or a tool call. SDK-local automatic retries are disabled. |
-| Projection commit journal | Typed runtime slice in progress after 0.169.0 | Every durable snapshot appends a credential-free generation/hash record. Serve interleaves bounded `task.state`, task/turn-bound `provider.retry_scheduled`, and content-free approval request/resolution items; CLI and Serve also record compaction start/install/failure transitions with paired attempt/window identity. The deterministic reducer recovers task progress, retry decisions, approvals, and compaction outcomes—including an installed snapshot whose final event was lost. Stale-turn or diagnostic-write failures cannot affect execution. Steering, control-lease, provider-terminal, and complete item lifecycles remain. |
+| Typed runtime journal | Implemented after 0.169.0 | Every durable snapshot appends a credential-free generation/hash record. CLI and Serve interleave bounded task, provider, message, tool, diff, Agent, mailbox, steering, control, approval, and compaction lifecycles with stable item identity. The deterministic reducer recovers their ordered safe projection and diagnoses torn tails, gaps, and invalid transitions. `session.runtime.replay` pages that projection without prompts, reasoning text, tool payloads, paths, diff bodies, raw provider errors, or credentials. |
 | Remote mutation deduplication | Implemented after 0.166.1; write-ahead restart hardening completed after 0.167.0 | `session.submit/send/steer/interrupt` accept a client UUID, persist a prompt-free started receipt before model/tool execution, share concurrent work, save the first terminal result before ACK, replay across Serve restarts, and reject same-ID/different-payload reuse. A crash-window or failed terminal save blocks later mutation until an explicit authoritative resume reconciles task/history state. Provider-owned Codex/Claude submit, steer, and interrupt use the same contract in a private ledger, publish committed/failed receipts, and reconcile through provider read/resume. Desktop retains only opaque retry IDs plus salted payload fingerprints and fences delayed steer/interrupt by turn ID. Controlled terminal streams reject duplicate, conflicting, and out-of-order `inputSeq` values before the PTY write. |
 | Slow-client memory boundary | Implemented after 0.166.1 | All Serve notifications share a 4 MiB per-socket queue ceiling. A sleeping/stalled renderer is closed with an explicit reconnect-and-refresh reason instead of retaining unbounded terminal or task frames. |
 | Cursor/ACK/event replay | Restart-safe foundation completed after 0.167.0 | Broadcast events carry a stream UUID and monotonic sequence. A reconnecting client replays an exact bounded tail and ACKs its cursor. The redacted tail is checkpointed in private state and keeps its stream identity across an orderly Serve replacement. For a changed, expired, ahead, or oversized-frame cursor, `events.snapshot` supplies one authoritative fence for task, workforce, external-turn, and approval projections; Desktop applies it before buffered events newer than the fence. The tail remains bounded to 10,000 events and 8 MiB. |
@@ -35,7 +35,7 @@ providers behind that boundary, not competing user-facing control products.
 | Tool approvals and sandbox boundary | Implemented and replay-auditable after 0.169.0 | Engine policy remains authoritative rather than trusting prose in the transcript. Registered requests and terminal outcomes now have content-free task/turn-bound journal items; approval text and tool payloads remain only on the live protected surface. |
 | Background jobs and bounded output | Implemented | Long-running processes and large tool output do not have to block or flood the main model context. |
 | Deferred tool discovery | Implemented | Optional web, desktop, scheduler, external-agent, and MCP schemas stay out of the base prompt until provider-neutral `tool_search` activates an allowed capability. |
-| Durable read-only Agent teams | Foundation implemented after 0.166.1 | Persistent Serve sessions now own stable nested Agent IDs/paths, parent/root turn provenance, a redacted durable mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. The original `agent` tool remains the faster one-shot path. |
+| Durable read-only Agent teams | Hardened after 0.169.0 | Persistent Serve sessions own stable nested Agent IDs/paths, parent/root turn provenance, a redacted payload-bound idempotent mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. Whole-tree and per-Agent generations, rounds, tools, active time, and actual transport tokens are durably bounded from the active model's conservative context capability; subscription allowance remains provider-authoritative. The original `agent` tool remains the faster one-shot path. |
 | Provider-independent runtime | Stronger Hara requirement | Hara keeps Anthropic/OpenAI-compatible/subscription/enterprise connections behind one engine contract. |
 | External Codex app-server adapter | Implemented | Hara can preserve the provider's native execution path without leaking its native session ID into UI clients. |
 | Hara Mobile companion bridge | Foundation implemented after 0.167.0 | CLI owns account login, Desktop device registration, explicit phone pairing, signed end-to-end encrypted relay envelopes, bounded publication of Personal coding-agent sessions, expiring control leases, idempotent remote commands, and sequenced terminal input. The mobile app and cloud account/relay deployment remain separate delivery work; the phone never receives provider credentials or native session IDs. |
@@ -47,22 +47,17 @@ These are not placeholders. They are current runtime contracts documented in
 
 ### 2.1 Append-only rollout log and deterministic replay
 
-Codex persists typed rollout items and reconstructs state through deterministic processing. Hara now has a
-bounded append-only **projection commit journal**. Its typed slices record credential-free task
-lifecycle/progress, provider retry decisions, compaction transactions, and approval request/resolution
-boundaries in the same sequence, and
-deterministically reduce them across interleaved snapshot commits. The complete JSON snapshot is still the
-authoritative recovery unit. Extend the foundation into typed events for:
+Codex persists typed rollout items and reconstructs state through deterministic processing. Hara now applies the
+same provider-neutral contract through a bounded append-only runtime journal. Stable item IDs, schema version,
+task/turn identity, monotonic sequence, timestamps, redacted metadata, generation chaining, torn-tail isolation,
+append bounds, secure file handling, and gap/transition diagnostics cover task, provider, message, tool, diff,
+Agent, mailbox, steering, control, approval, and compaction lifecycles. The complete private session snapshot is
+still the authoritative content store; the journal is the deterministic, content-free execution projection.
 
-- durable task/brief revisions beyond the safe runtime phase and progress projection;
-- steering acceptance, delivery, promotion, and consumption;
-- control-lease acquisition/release;
-- provider attempt terminal outcomes and failover decisions beyond the persisted retry schedule.
-
-The current snapshot should then become a rebuildable projection. Typed events need an event ID, schema version,
-task/turn identity, monotonic sequence, timestamp, and redacted payload. Startup must replay them into the same
-projection in property tests. Torn-tail isolation, append bounds, secure file handling, generation chaining, and
-gap diagnostics already exist in the projection journal and should be reused rather than replaced.
+Serve pages that projection through `session.runtime.replay` and reports integrity diagnostics instead of hiding a
+gap. Prompts, assistant/reasoning text, tool inputs/results, workspace paths, diff bodies, provider error bodies,
+endpoints, and credentials never enter this stream. Remaining work is process-level property/fault injection and
+promoting safe todo/artifact identities; it is no longer a missing tool/diff/message lifecycle foundation.
 
 ### 2.2 Atomic compaction windows
 
@@ -95,17 +90,16 @@ Agent metadata is exposed through `session.agents.list` and replayable `event.ag
 messages, results, credentials, and provider payloads remain outside the public projection. The original `agent`
 tool remains available as the lower-overhead one-shot path.
 
-The remaining Agent hardening is narrower:
+Mailbox messages and follow-up retries now carry a payload hash plus stable command identity. An exact retry is a
+no-op, conflicting reuse fails closed, and both target generation and parent/root turn are rechecked before any
+delivery or launch. A newer root turn interrupts older active children instead of allowing their completion to
+silently target the new turn. The durable root budget reserves and then reconciles actual generations, provider
+rounds, tool starts, transport tokens, and active time across every descendant; crossing a limit blocks the next
+model/tool boundary. Context-derived admission uses the current saved connection's model capability, while plan
+allowance, coefficients, reset windows, and overage remain separate provider/Control-authoritative facts.
 
-- enforce provider-neutral tree safety ceilings for concurrency, active time, and rounds; subscription allowance
-  must remain a separate provider/Control-native decision because units, coefficients, windows, and overage rules
-  differ by provider and plan;
-- add payload-bound idempotent command receipts for mailbox delivery and follow-up retries;
-- fence automatic child completion delivery to its intended parent turn, so it cannot silently target a newer
-  turn;
-- expose the durable host to direct non-Serve CLI sessions; the persistent implementation currently belongs to
-  Serve/Desktop sessions;
-- add richer Desktop/mobile presentation and control for the existing safe Agent state projection.
+Remaining Agent work is to expose the same durable host to direct non-Serve CLI sessions, add richer Desktop/mobile
+presentation, and enable writing only behind the managed worktree/owned-diff/manual-merge contract in section 2.10.
 
 The direct headless task path now also preserves an unanswered structured question and its bounded options as a
 durable pause, normalizes a numbered remote reply to the retained option, and records it in the verified decision
@@ -196,9 +190,9 @@ an authoritative non-live state. Desktop persists only the UUID and a salted pay
 the exact logical action after renderer restart without storing prompt text. `expectedTurnId` keeps delayed
 steer/interrupt input on the intended turn.
 
-Remaining: bind approval replies and legacy terminal helper methods to command identity, persist the mobile
-bridge's publication/receipt projection across bridge restart, and use the same durable receipt contract for
-Agent mailbox/follow-up delivery.
+Remaining: bind approval replies and legacy terminal helper methods to command identity and persist the mobile
+bridge's publication/receipt projection across bridge restart. Agent mailbox/follow-up delivery now uses
+payload-bound command identity and turn fencing.
 
 ### 2.8 Typed provider capabilities and circuit health
 
@@ -227,14 +221,11 @@ todos reset it; changed explicit percentages and completion ratios also prevent 
 stale, while bare offsets do not. No prompt or raw tool result is retained in the watchdog. A no-progress stop becomes a visible,
 resumable task pause rather than an opaque RPC failure.
 
-The remaining work is to promote individual model turns, reasoning/progress summaries, tool calls, diffs,
-todos, child-Agent activity, and terminal outcomes into versioned item lifecycle events. Approval request and
-resolution boundaries already have stable task/turn-bound items, while their private question text remains outside
-the journal. Each remaining item needs
-stable identity and `started/completed/failed/cancelled` transitions. Hara has an authoritative reconnect
-snapshot for task, workforce, active external turns, and approvals, plus a restart-safe event tail. Tool/diff/
-message items still do not form a complete durable, replay-derived trace, so Mobile must use bounded conversation/
-terminal snapshot APIs for those surfaces instead of inferring lifecycle from partial events.
+Provider attempts, messages, tools, diffs, Agent generations, mailbox deliveries, steering, and control now have
+stable content-free lifecycle items and deterministic replay. Hara still intentionally keeps reasoning/progress
+text, tool payloads, path names, diff bodies, and PTY bytes out of that journal; Mobile uses the bounded
+conversation/terminal snapshot APIs when actual content is required. Remaining item work is safe todo/artifact
+identity and UI projection, not reconstructing private content from lifecycle metadata.
 
 ### 2.10 Managed workspace isolation for future writing Agents
 
@@ -259,20 +250,19 @@ success.
 2. **Completed foundation — compaction transaction**: stable window IDs, observed/estimated accounting,
    save-before-install semantics, typed terminal outcomes, and commit-backed crash-window recovery exist;
    real process-crash fault injection remains.
-3. **In progress — event journal**: projection commits, torn-tail handling, sequence/generation gap detection,
-   typed task runtime state, typed provider retry schedules, compaction and approval transactions, and deterministic
-   reduction of that safe projection exist. Add durable brief/steering/provider-outcome items and deterministic
-   full snapshot rebuild.
+3. **Completed safe execution trace — event journal**: projection commits, torn-tail handling,
+   sequence/generation gap detection, typed task/provider/message/tool/diff/Agent/mailbox/steering/control,
+   compaction and approval lifecycles, deterministic reduction, and bounded Serve paging are implemented. The
+   private session snapshot remains authoritative for content by design.
 4. **Completed local transport foundation — multi-client stream**: socket backpressure, cursor/ACK/exact replay,
    restart-safe redacted checkpoints, 10,000-event duplicate/gap coverage, and an authoritative Desktop snapshot
    fence exist. Cloud relay delivery still needs an independent bounded cursor.
 5. **Completed control foundation — session lease**: one controller, takeover/revocation, epoch fencing, socket
    release, and legacy compatibility when unleased are covered by two-client integration tests.
-6. **Completed Agent foundation — durable tree**: stable child identity/path, mailbox, lifecycle commands,
-   nested descendant recovery, safe state projection, and shared concurrency/accounting are implemented. The
-   next slice is hard tree-wide execution safety plus provider-native allowance admission, idempotent receipts,
-   parent-turn delivery fencing, and direct CLI hosting. Hara must never derive cost or subscription exhaustion
-   from transport token counters.
+6. **Completed Agent safety slice — durable tree**: stable child identity/path, payload-bound idempotent mailbox,
+   root/parent-turn fencing, lifecycle commands, nested recovery, safe state projection, and persistent whole-tree
+   generations/rounds/tools/active-time/token ceilings are implemented. Direct CLI hosting and managed writable
+   worktrees remain; Hara never derives cost or subscription exhaustion from transport token counters.
 7. **Completed headless interaction slice — questions and completion**: persisted `ask_user` pauses, exact-task
    answer continuation, decision retention, credential-safe handoff, and fail-closed completion receipts are covered
    by unit and spawned-CLI integration tests. A full masked integration-secret editor remains a Desktop/Mobile UI
@@ -284,8 +274,8 @@ success.
    readiness, rollback, atomic owner commit, and Desktop/mobile/terminal contention tests are implemented. Full
    Serve-session migration still needs typed disposition for live tools, child processes, and mailbox items.
 10. **Completed no-progress control slice**: output-similarity and exact-call guards, eight-round unattended
-    checkpoint/todo gate, run-local token ceiling, access-boundary coalescing, resumable stop state, and typed
-    Desktop telemetry are covered by unit and Serve integration tests. Full item-level replay remains separate.
+    checkpoint/todo gate, run-local token ceiling, access-boundary coalescing, resumable stop state, typed Desktop
+    telemetry, and content-free item lifecycle replay are covered by unit and Serve integration tests.
 11. **Completed connection safety foundation**: exact-route circuit health, typed compatibility, quota/region
     classification, account-aware authentication fallback, and no-replay-after-activity are covered by unit and
     Serve/settings tests. Ordered multi-connection user policy and durable health-event replay remain incremental.

@@ -54,7 +54,7 @@ import {
   type ApprovalMode,
   type ProviderId,
 } from "./config.js";
-import { runAgent, type RunOpts, type RunOutcome } from "./agent/loop.js";
+import { runAgent, type RunOpts, type RunOutcome, type RunRuntimeItemEvent } from "./agent/loop.js";
 import {
   formatAgentDuration,
   parseAgentRunTimeoutMs,
@@ -194,7 +194,11 @@ import {
   type SubagentLifecycleObserver,
   type SubagentResult,
 } from "./subagent/runtime.js";
-import type { AgentMailboxDelivery, AgentTeamController } from "./subagent/team.js";
+import type {
+  AgentMailboxDelivery,
+  AgentTeamController,
+  AgentTeamExecutionMetrics,
+} from "./subagent/team.js";
 import {
   overrideProviderTarget,
   profileByIdForConfig,
@@ -267,6 +271,7 @@ import {
   sessionFileExists,
   saveSession,
   recordSessionCompactionState,
+  recordSessionRuntimeItem,
   loadSession,
   acquireSessionLock,
   reclaimOrphanedSessionLocks,
@@ -2926,6 +2931,13 @@ async function runSubagentResult(
     id: string;
     agentTeam: AgentTeamController;
     pendingInput: () => Promise<AgentMailboxDelivery[]>;
+    executionBudget: {
+      maxProviderRounds: number;
+      maxToolCalls: number;
+      maxTokens: number;
+      timeoutMs: number;
+    };
+    reportProgress: (metrics: AgentTeamExecutionMetrics) => boolean;
   },
 ): Promise<SubagentResult> {
   const executionProfileId = boundProfileId ?? runtimeProfileBindings.get(cfg);
@@ -2951,6 +2963,8 @@ async function runSubagentResult(
     maxRounds: cfg.maxAgentRounds,
     ...(durable ? {
       agentTeam: durable.agentTeam,
+      executionBudget: durable.executionBudget,
+      reportProgress: durable.reportProgress,
       pendingInput: async (): Promise<NeutralMsg[]> => {
         const messages = await durable.pendingInput();
         return messages.map((message): NeutralMsg => ({
@@ -6621,6 +6635,19 @@ program.action(async (opts) => {
       stats,
       guardian: guardianOpt, // safety layer stays on in headless -p (fail-open; breaker aborts, never hangs)
       onProviderTurn: trackHeadlessOperation,
+      ...(meta
+        ? {
+            onRuntimeItem: (event: RunRuntimeItemEvent): void => {
+              if (!task) return;
+              recordSessionRuntimeItem({
+                sessionId: meta!.id,
+                taskId: task.id,
+                turnId: task.turnId,
+                ...event,
+              });
+            },
+          }
+        : {}),
       onToolRun: trackHeadlessOperation,
       ...agentRunLimits(cfg),
       ...(schemaObj
@@ -6997,6 +7024,19 @@ program.action(async (opts) => {
         },
       }
     : undefined;
+  const runtimeJournalForRun = (): { onRuntimeItem?: (event: RunRuntimeItemEvent) => void } => task
+    ? {
+        onRuntimeItem: (event): void => {
+          if (!task) return;
+          recordSessionRuntimeItem({
+            sessionId: meta.id,
+            taskId: task.id,
+            turnId: task.turnId,
+            ...event,
+          });
+        },
+      }
+    : {};
   let requestedWorkspaceSwitch: string | null = null;
   let requestedSessionSwitch: { id: string; cwd: string; kind: "resume" | "workspace-transfer"; historyCount?: number } | null = null;
   const queueWorkspaceSwitch = (target: string): string => {
@@ -8147,7 +8187,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot }, approval: __skApproval, approvalChannel: true, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot }, approval: __skApproval, approvalChannel: true, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -8247,6 +8287,7 @@ program.action(async (opts) => {
             executionContext,
             skillPolicies: turnSkillPolicies,
             taskIntake: taskIntakeForRun(),
+            ...runtimeJournalForRun(),
             stats,
             signal: h.signal,
             pendingInput,
@@ -8304,6 +8345,7 @@ program.action(async (opts) => {
               executionContext,
               skillPolicies: turnSkillPolicies,
               taskIntake: taskIntakeForRun(),
+              ...runtimeJournalForRun(),
               stats,
               signal: h.signal,
               pendingInput,
@@ -8353,6 +8395,7 @@ program.action(async (opts) => {
           executionContext,
           skillPolicies: turnSkillPolicies,
           taskIntake: taskIntakeForRun(),
+          ...runtimeJournalForRun(),
           stats,
           signal: h.signal,
           pendingInput,
@@ -8451,7 +8494,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -8518,7 +8561,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }

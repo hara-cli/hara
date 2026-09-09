@@ -22,10 +22,14 @@ import {
   recordSessionApprovalState,
   recordSessionCompactionState,
   recordSessionProviderRetry,
+  recordSessionRuntimeItem,
   recordSessionTaskState,
+  readSessionJournal,
   type SessionApprovalStateInput,
   type SessionCompactionStateInput,
   type SessionProviderRetryInput,
+  type SessionRuntimeItemInput,
+  type SessionJournalRead,
   type SessionTaskLifecycleInput,
 } from "../session/store.js";
 import { forkTaskExecution, recoverTaskExecution, type TaskExecution } from "../session/task.js";
@@ -41,8 +45,11 @@ export interface SessionStore {
    * authoritative session snapshot contract. */
   recordTaskState?(event: SessionTaskLifecycleInput): boolean;
   recordProviderRetry?(event: SessionProviderRetryInput): boolean;
+  recordRuntimeItem?(event: SessionRuntimeItemInput): boolean;
   recordCompactionState?(event: SessionCompactionStateInput): boolean;
   recordApprovalState?(event: SessionApprovalStateInput): boolean;
+  /** Optional local deterministic journal reader. It is content-free and never attaches a provider. */
+  readJournal?(id: string): SessionJournalRead;
   acquire(id: string): { ok: boolean; pid?: number };
   release(id: string): void;
   /** permanent removal (codex thread/delete); false = missing or held by a live other process */
@@ -57,8 +64,10 @@ export const realStore: SessionStore = {
   listPage: listSessionMetadataPage,
   recordTaskState: recordSessionTaskState,
   recordProviderRetry: recordSessionProviderRetry,
+  recordRuntimeItem: recordSessionRuntimeItem,
   recordCompactionState: recordSessionCompactionState,
   recordApprovalState: recordSessionApprovalState,
+  readJournal: readSessionJournal,
   acquire: acquireSessionLock,
   release: releaseSessionLock,
   delete: deleteSession,
@@ -277,6 +286,12 @@ export class SessionHub {
     return source ? structuredClone(source) : null;
   }
 
+  /** Read the content-free event chain without attaching or locking the session. The caller must first
+   * authorize the session itself; injected stores that do not journal return an empty deterministic view. */
+  readJournal(id: string): SessionJournalRead {
+    return this.store.readJournal?.(id) ?? { events: [], truncatedTail: false, invalidRecords: 0 };
+  }
+
   list(cwd?: string): SessionMeta[] {
     const options = cwd ? { cwd } : {};
     const drafts = this.liveDrafts(options);
@@ -443,6 +458,26 @@ export class SessionHub {
         turnId: live.task.turnId,
         retry: event,
       }) ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  recordRuntimeItem(event: SessionRuntimeItemInput): boolean {
+    const live = this.sessions.get(event.sessionId);
+    if (!live || live.durable === false) return false;
+    if (event.kind !== "control" && (
+      !live.task
+      || live.task.id !== event.taskId
+      || live.task.turnId !== event.turnId
+    )) return false;
+    if (event.kind === "control" && (event.taskId !== undefined || event.turnId !== undefined) && (
+      !live.task
+      || live.task.id !== event.taskId
+      || live.task.turnId !== event.turnId
+    )) return false;
+    try {
+      return this.store.recordRuntimeItem?.(event) ?? false;
     } catch {
       return false;
     }

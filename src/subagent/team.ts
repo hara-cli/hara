@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   bindPrivateHaraStateFile,
   readPrivateStateFileSnapshotSync,
@@ -40,6 +40,65 @@ export interface AgentTeamUsage {
   lastInput?: number;
 }
 
+export interface AgentTeamExecutionMetrics {
+  providerRounds: number;
+  toolCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface AgentTeamLimits {
+  maxGenerations: number;
+  maxProviderRounds: number;
+  maxToolCalls: number;
+  maxTokens: number;
+  maxActiveMs: number;
+  maxRoundsPerAgent: number;
+  maxToolsPerAgent: number;
+  maxTokensPerAgent: number;
+}
+
+export const DEFAULT_AGENT_TEAM_LIMITS: AgentTeamLimits = {
+  maxGenerations: 128,
+  maxProviderRounds: 192,
+  maxToolCalls: 768,
+  maxTokens: 800_000,
+  maxActiveMs: 30 * 60_000,
+  maxRoundsPerAgent: 24,
+  maxToolsPerAgent: 96,
+  maxTokensPerAgent: 200_000,
+};
+
+interface AgentTeamExecutionBudget extends AgentTeamExecutionMetrics {
+  generation: number;
+  maxProviderRounds: number;
+  maxToolCalls: number;
+  maxTokens: number;
+  timeoutMs: number;
+}
+
+export interface AgentTeamBudgetView extends AgentTeamExecutionMetrics {
+  rootTurnId?: string;
+  startedAt: string;
+  deadlineAt: string;
+  generationsStarted: number;
+  limits: AgentTeamLimits;
+  activeReservations: {
+    providerRounds: number;
+    toolCalls: number;
+    tokens: number;
+  };
+  exhausted: boolean;
+}
+
+interface AgentTeamBudget extends AgentTeamExecutionMetrics {
+  rootTurnId?: string;
+  startedAt: string;
+  deadlineAt: string;
+  generationsStarted: number;
+  limits: AgentTeamLimits;
+}
+
 export interface AgentMailboxDelivery {
   id: string;
   sourcePath: string;
@@ -47,7 +106,22 @@ export interface AgentMailboxDelivery {
   kind: "message" | "followup";
 }
 
+export interface AgentMailboxLifecycleEvent {
+  id: string;
+  targetId: string;
+  generation: number;
+  kind: "message" | "followup";
+  state: "queued" | "started" | "completed";
+  at: string;
+  rootTurnId?: string;
+}
+
 interface AgentMailboxMessage extends AgentMailboxDelivery {
+  /** Engine-owned tool call identity plus payload hash make retried mailbox mutations exactly-once. */
+  commandId?: string;
+  requestHash?: string;
+  parentTurnId?: string;
+  rootTurnId?: string;
   createdAt: string;
   state: "pending" | "delivered";
   acceptedGeneration: number;
@@ -76,6 +150,7 @@ interface AgentTeamRecord {
   result?: string;
   error?: string;
   usage?: AgentTeamUsage;
+  executionBudget?: AgentTeamExecutionBudget;
 }
 
 interface AgentTeamSnapshot {
@@ -84,6 +159,7 @@ interface AgentTeamSnapshot {
   revision: number;
   updatedAt: string;
   agents: AgentTeamRecord[];
+  budget?: AgentTeamBudget;
 }
 
 export interface AgentTeamAgentView {
@@ -120,6 +196,7 @@ export interface AgentTeamExecutionResult {
   model?: string;
   error?: string;
   usage?: AgentTeamUsage;
+  metrics?: AgentTeamExecutionMetrics;
 }
 
 export interface AgentTeamExecutionRequest {
@@ -132,13 +209,16 @@ export interface AgentTeamExecutionRequest {
   signal: AbortSignal;
   controller: AgentTeamController;
   pendingInput: () => Promise<AgentMailboxDelivery[]>;
+  budget: Pick<AgentTeamExecutionBudget, "maxProviderRounds" | "maxToolCalls" | "maxTokens" | "timeoutMs">;
+  /** Absolute generation counters. False means the shared tree ceiling was reached; no new work may start. */
+  reportProgress: (metrics: AgentTeamExecutionMetrics) => boolean;
 }
 
 export interface AgentTeamController {
   readonly path: string;
   spawn(input: { taskName: string; message: string; role?: string }): Promise<AgentTeamAgentView>;
-  sendMessage(target: string, message: string): Promise<AgentTeamAgentView>;
-  followup(target: string, message: string): Promise<AgentTeamAgentView>;
+  sendMessage(target: string, message: string, commandId?: string): Promise<AgentTeamAgentView>;
+  followup(target: string, message: string, commandId?: string): Promise<AgentTeamAgentView>;
   interrupt(target: string): Promise<AgentTeamAgentView>;
   resume(target: string): Promise<AgentTeamAgentView>;
   list(): AgentTeamAgentView[];
@@ -151,6 +231,11 @@ export interface DurableAgentTeamOptions {
   executor: (request: AgentTeamExecutionRequest) => Promise<AgentTeamExecutionResult>;
   onChange?: (agent: AgentTeamAgentView) => void;
   onRun?: (run: Promise<void>, agent: AgentTeamAgentView) => void;
+  onMailbox?: (event: AgentMailboxLifecycleEvent) => void;
+  /** Authoritative root turn. A controller captured by an earlier parent turn cannot mutate the new tree. */
+  currentRootTurnId?: () => string | undefined;
+  /** Resolved only when a new parent turn adopts the tree, so model/connection changes affect new work. */
+  limits?: Partial<AgentTeamLimits> | (() => Partial<AgentTeamLimits>);
 }
 
 function iso(): string {
@@ -171,6 +256,17 @@ function safeStoredString(value: unknown, max: number): value is string {
 
 function validProvenanceId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 220 && !/[\0\r\n]/u.test(value);
+}
+
+function mailboxRequestHash(input: {
+  sourcePath: string;
+  targetId: string;
+  message: string;
+  kind: "message" | "followup";
+  parentTurnId?: string;
+  rootTurnId?: string;
+}): string {
+  return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
 function safeText(value: unknown, max: number, field: string): string {
@@ -196,6 +292,86 @@ function validUsage(value: unknown): value is AgentTeamUsage {
   if (!Number.isFinite(value.input) || Number(value.input) < 0) return false;
   if (!Number.isFinite(value.output) || Number(value.output) < 0) return false;
   return value.lastInput === undefined || (Number.isFinite(value.lastInput) && Number(value.lastInput) >= 0);
+}
+
+function finiteCount(value: unknown, maximum = Number.MAX_SAFE_INTEGER): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= maximum;
+}
+
+function validMetrics(value: unknown): value is AgentTeamExecutionMetrics {
+  return plainObject(value)
+    && finiteCount(value.providerRounds, 1_000_000)
+    && finiteCount(value.toolCalls, 10_000_000)
+    && finiteCount(value.inputTokens, 1_000_000_000_000)
+    && finiteCount(value.outputTokens, 1_000_000_000_000);
+}
+
+function normalizeTeamLimits(input: Partial<AgentTeamLimits> = {}): AgentTeamLimits {
+  const bounded = (value: unknown, fallback: number, minimum: number, maximum: number): number =>
+    Number.isSafeInteger(value) ? Math.min(maximum, Math.max(minimum, Number(value))) : fallback;
+  const limits: AgentTeamLimits = {
+    maxGenerations: bounded(input.maxGenerations, DEFAULT_AGENT_TEAM_LIMITS.maxGenerations, 1, 4_096),
+    maxProviderRounds: bounded(input.maxProviderRounds, DEFAULT_AGENT_TEAM_LIMITS.maxProviderRounds, 1, 1_000_000),
+    maxToolCalls: bounded(input.maxToolCalls, DEFAULT_AGENT_TEAM_LIMITS.maxToolCalls, 1, 10_000_000),
+    maxTokens: bounded(input.maxTokens, DEFAULT_AGENT_TEAM_LIMITS.maxTokens, 1_000, 1_000_000_000_000),
+    maxActiveMs: bounded(input.maxActiveMs, DEFAULT_AGENT_TEAM_LIMITS.maxActiveMs, 1_000, 24 * 60 * 60_000),
+    maxRoundsPerAgent: bounded(input.maxRoundsPerAgent, DEFAULT_AGENT_TEAM_LIMITS.maxRoundsPerAgent, 1, 1_000),
+    maxToolsPerAgent: bounded(input.maxToolsPerAgent, DEFAULT_AGENT_TEAM_LIMITS.maxToolsPerAgent, 1, 100_000),
+    maxTokensPerAgent: bounded(input.maxTokensPerAgent, DEFAULT_AGENT_TEAM_LIMITS.maxTokensPerAgent, 1_000, 1_000_000_000),
+  };
+  limits.maxRoundsPerAgent = Math.min(limits.maxRoundsPerAgent, limits.maxProviderRounds);
+  limits.maxToolsPerAgent = Math.min(limits.maxToolsPerAgent, limits.maxToolCalls);
+  limits.maxTokensPerAgent = Math.min(limits.maxTokensPerAgent, limits.maxTokens);
+  return limits;
+}
+
+function parseExecutionBudget(value: unknown, generation: number): AgentTeamExecutionBudget | undefined {
+  if (value === undefined) return undefined;
+  if (!plainObject(value) || !validMetrics(value) || value.generation !== generation) {
+    throw new Error("agent execution budget is invalid");
+  }
+  for (const field of ["maxProviderRounds", "maxToolCalls", "maxTokens", "timeoutMs"] as const) {
+    if (!finiteCount(value[field]) || Number(value[field]) < 1) {
+      throw new Error("agent execution budget limit is invalid");
+    }
+  }
+  return {
+    generation,
+    maxProviderRounds: Number(value.maxProviderRounds),
+    maxToolCalls: Number(value.maxToolCalls),
+    maxTokens: Number(value.maxTokens),
+    timeoutMs: Number(value.timeoutMs),
+    providerRounds: Number(value.providerRounds),
+    toolCalls: Number(value.toolCalls),
+    inputTokens: Number(value.inputTokens),
+    outputTokens: Number(value.outputTokens),
+  };
+}
+
+function parseBudget(value: unknown): AgentTeamBudget | undefined {
+  if (value === undefined) return undefined;
+  if (!plainObject(value) || !validMetrics(value)) throw new Error("agent team budget is invalid");
+  if (value.rootTurnId !== undefined && !validProvenanceId(value.rootTurnId)) {
+    throw new Error("agent team budget root turn is invalid");
+  }
+  if (!validIso(value.startedAt) || !validIso(value.deadlineAt)) {
+    throw new Error("agent team budget time boundary is invalid");
+  }
+  if (!finiteCount(value.generationsStarted, 4_096) || !plainObject(value.limits)) {
+    throw new Error("agent team budget generation count is invalid");
+  }
+  const limits = normalizeTeamLimits(value.limits as Partial<AgentTeamLimits>);
+  return {
+    ...(value.rootTurnId !== undefined ? { rootTurnId: String(value.rootTurnId) } : {}),
+    startedAt: String(value.startedAt),
+    deadlineAt: String(value.deadlineAt),
+    generationsStarted: Number(value.generationsStarted),
+    providerRounds: Number(value.providerRounds),
+    toolCalls: Number(value.toolCalls),
+    inputTokens: Number(value.inputTokens),
+    outputTokens: Number(value.outputTokens),
+    limits,
+  };
 }
 
 function pathDepth(path: string): number {
@@ -231,6 +407,20 @@ function parseMailbox(value: unknown): AgentMailboxMessage[] {
     if (!validSourcePath(entry.sourcePath)) throw new Error("agent team mailbox source is invalid");
     if (!safeStoredString(entry.content, MAX_MESSAGE_CHARS)) throw new Error("agent team mailbox content is invalid");
     if (entry.kind !== "message" && entry.kind !== "followup") throw new Error("agent team mailbox kind is invalid");
+    if ((entry.commandId === undefined) !== (entry.requestHash === undefined)) {
+      throw new Error("agent team mailbox idempotency receipt is incomplete");
+    }
+    if (entry.commandId !== undefined && !validProvenanceId(entry.commandId)) {
+      throw new Error("agent team mailbox command id is invalid");
+    }
+    if (entry.requestHash !== undefined && !/^[0-9a-f]{64}$/u.test(String(entry.requestHash))) {
+      throw new Error("agent team mailbox request hash is invalid");
+    }
+    for (const field of ["parentTurnId", "rootTurnId"] as const) {
+      if (entry[field] !== undefined && !validProvenanceId(entry[field])) {
+        throw new Error("agent team mailbox " + field + " is invalid");
+      }
+    }
     if (!validIso(entry.createdAt)) throw new Error("agent team mailbox timestamp is invalid");
     if (entry.state !== "pending" && entry.state !== "delivered") throw new Error("agent team mailbox state is invalid");
     if (!Number.isSafeInteger(entry.acceptedGeneration) || Number(entry.acceptedGeneration) < 1) {
@@ -245,6 +435,10 @@ function parseMailbox(value: unknown): AgentMailboxMessage[] {
       sourcePath: entry.sourcePath,
       content: entry.content,
       kind: entry.kind,
+      ...(entry.commandId !== undefined ? { commandId: String(entry.commandId) } : {}),
+      ...(entry.requestHash !== undefined ? { requestHash: String(entry.requestHash) } : {}),
+      ...(entry.parentTurnId !== undefined ? { parentTurnId: String(entry.parentTurnId) } : {}),
+      ...(entry.rootTurnId !== undefined ? { rootTurnId: String(entry.rootTurnId) } : {}),
       createdAt: entry.createdAt,
       state: entry.state,
       acceptedGeneration: Number(entry.acceptedGeneration),
@@ -312,6 +506,7 @@ function parseRecord(value: unknown): AgentTeamRecord {
     }
   }
   if (value.usage !== undefined && !validUsage(value.usage)) throw new Error("agent team usage is invalid");
+  const executionBudget = parseExecutionBudget(value.executionBudget, Number(value.generation));
   return {
     id: String(value.id),
     path: value.path,
@@ -340,6 +535,7 @@ function parseRecord(value: unknown): AgentTeamRecord {
         ...(value.usage.lastInput !== undefined ? { lastInput: Number(value.usage.lastInput) } : {}),
       },
     } : {}),
+    ...(executionBudget ? { executionBudget } : {}),
   };
 }
 
@@ -376,6 +572,7 @@ function parseSnapshot(text: string, sessionId: string): AgentTeamSnapshot {
     revision: Number(value.revision),
     updatedAt: value.updatedAt,
     agents,
+    ...(value.budget !== undefined ? { budget: parseBudget(value.budget)! } : {}),
   };
 }
 
@@ -503,6 +700,179 @@ export class DurableAgentTeam {
     if (!validSessionId(options.sessionId)) throw new Error("invalid Agent team session id");
   }
 
+  private configuredLimits(): AgentTeamLimits {
+    const configured = typeof this.options.limits === "function"
+      ? this.options.limits()
+      : this.options.limits;
+    return normalizeTeamLimits(configured);
+  }
+
+  private newBudget(rootTurnId?: string): AgentTeamBudget {
+    const limits = this.configuredLimits();
+    const started = Date.now();
+    return {
+      ...(rootTurnId ? { rootTurnId } : {}),
+      startedAt: new Date(started).toISOString(),
+      deadlineAt: new Date(started + limits.maxActiveMs).toISOString(),
+      generationsStarted: 0,
+      providerRounds: 0,
+      toolCalls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      limits,
+    };
+  }
+
+  private adoptRootTurn(rootTurnId: string): void {
+    this.ensureLoaded();
+    if (this.snapshot!.budget?.rootTurnId === rootTurnId) return;
+    const interrupted: string[] = [];
+    this.snapshot = this.options.store.update(this.options.sessionId, (draft) => {
+      const now = iso();
+      for (const record of draft.agents) {
+        if (
+          record.rootTurnId !== rootTurnId
+          && (record.status === "queued" || record.status === "working" || record.status === "stopping")
+        ) {
+          record.status = "stopping";
+          record.updatedAt = now;
+          interrupted.push(record.id);
+        }
+      }
+      draft.budget = this.newBudget(rootTurnId);
+    });
+    for (const id of interrupted) {
+      const record = this.snapshot.agents.find((candidate) => candidate.id === id);
+      if (record) this.publish(record);
+      this.active.get(id)?.controller.abort(new Error("Agent parent turn changed"));
+    }
+  }
+
+  private activeReservations(
+    snapshot: AgentTeamSnapshot,
+    rootTurnId = snapshot.budget?.rootTurnId,
+    excludeId?: string,
+  ): { providerRounds: number; toolCalls: number; tokens: number } {
+    const reserved = { providerRounds: 0, toolCalls: 0, tokens: 0 };
+    for (const record of snapshot.agents) {
+      if (record.id === excludeId || record.rootTurnId !== rootTurnId) continue;
+      if (record.status !== "queued" && record.status !== "working" && record.status !== "stopping") continue;
+      const execution = record.executionBudget;
+      if (!execution || execution.generation !== record.generation) continue;
+      reserved.providerRounds += Math.max(0, execution.maxProviderRounds - execution.providerRounds);
+      reserved.toolCalls += Math.max(0, execution.maxToolCalls - execution.toolCalls);
+      reserved.tokens += Math.max(
+        0,
+        execution.maxTokens - execution.inputTokens - execution.outputTokens,
+      );
+    }
+    return reserved;
+  }
+
+  private reserveExecutionBudget(
+    record: AgentTeamRecord,
+    snapshot: AgentTeamSnapshot,
+    rootTurnId?: string,
+  ): void {
+    if (!snapshot.budget || snapshot.budget.rootTurnId !== rootTurnId) {
+      snapshot.budget = this.newBudget(rootTurnId);
+    }
+    const budget = snapshot.budget;
+    const now = Date.now();
+    if (now >= Date.parse(budget.deadlineAt)) throw new Error("Agent tree active-execution deadline was reached");
+    if (budget.generationsStarted >= budget.limits.maxGenerations) {
+      throw new Error("Agent tree generation limit reached (" + String(budget.limits.maxGenerations) + ")");
+    }
+    const reserved = this.activeReservations(snapshot, rootTurnId, record.id);
+    const availableRounds = budget.limits.maxProviderRounds - budget.providerRounds - reserved.providerRounds;
+    const availableTools = budget.limits.maxToolCalls - budget.toolCalls - reserved.toolCalls;
+    const usedTokens = budget.inputTokens + budget.outputTokens;
+    const availableTokens = budget.limits.maxTokens - usedTokens - reserved.tokens;
+    if (availableRounds < 1) throw new Error("Agent tree provider-round limit reached");
+    if (availableTools < 1) throw new Error("Agent tree tool-call limit reached");
+    if (availableTokens < 1) throw new Error("Agent tree token limit reached");
+    record.executionBudget = {
+      generation: record.generation,
+      maxProviderRounds: Math.min(budget.limits.maxRoundsPerAgent, availableRounds),
+      maxToolCalls: Math.min(budget.limits.maxToolsPerAgent, availableTools),
+      maxTokens: Math.min(budget.limits.maxTokensPerAgent, availableTokens),
+      timeoutMs: Math.max(1, Math.min(budget.limits.maxActiveMs, Date.parse(budget.deadlineAt) - now)),
+      providerRounds: 0,
+      toolCalls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+    };
+    budget.generationsStarted += 1;
+  }
+
+  private reportGenerationProgress(
+    id: string,
+    generation: number,
+    metrics: AgentTeamExecutionMetrics,
+  ): boolean {
+    if (!validMetrics(metrics)) return false;
+    this.ensureLoaded();
+    let withinLimit = false;
+    this.snapshot = this.options.store.update(this.options.sessionId, (draft) => {
+      const record = draft.agents.find((candidate) => candidate.id === id);
+      const execution = record?.executionBudget;
+      const budget = draft.budget;
+      if (!record || record.generation !== generation || !execution || execution.generation !== generation || !budget) {
+        return;
+      }
+      if (record.rootTurnId !== budget.rootTurnId) return;
+      if (
+        metrics.providerRounds < execution.providerRounds
+        || metrics.toolCalls < execution.toolCalls
+        || metrics.inputTokens < execution.inputTokens
+        || metrics.outputTokens < execution.outputTokens
+      ) return;
+      budget.providerRounds += metrics.providerRounds - execution.providerRounds;
+      budget.toolCalls += metrics.toolCalls - execution.toolCalls;
+      budget.inputTokens += metrics.inputTokens - execution.inputTokens;
+      budget.outputTokens += metrics.outputTokens - execution.outputTokens;
+      execution.providerRounds = metrics.providerRounds;
+      execution.toolCalls = metrics.toolCalls;
+      execution.inputTokens = metrics.inputTokens;
+      execution.outputTokens = metrics.outputTokens;
+      record.updatedAt = iso();
+      withinLimit = metrics.providerRounds <= execution.maxProviderRounds
+        && metrics.toolCalls <= execution.maxToolCalls
+        && metrics.inputTokens + metrics.outputTokens <= execution.maxTokens
+        && budget.providerRounds <= budget.limits.maxProviderRounds
+        && budget.toolCalls <= budget.limits.maxToolCalls
+        && budget.inputTokens + budget.outputTokens <= budget.limits.maxTokens
+        && Date.now() < Date.parse(budget.deadlineAt);
+    });
+    const record = this.snapshot.agents.find((candidate) => candidate.id === id);
+    if (record) this.publish(record);
+    return withinLimit;
+  }
+
+  budget(): AgentTeamBudgetView | undefined {
+    this.ensureLoaded();
+    const budget = this.snapshot!.budget;
+    if (!budget) return undefined;
+    const reservations = this.activeReservations(this.snapshot!);
+    return {
+      ...(budget.rootTurnId ? { rootTurnId: budget.rootTurnId } : {}),
+      startedAt: budget.startedAt,
+      deadlineAt: budget.deadlineAt,
+      generationsStarted: budget.generationsStarted,
+      providerRounds: budget.providerRounds,
+      toolCalls: budget.toolCalls,
+      inputTokens: budget.inputTokens,
+      outputTokens: budget.outputTokens,
+      limits: { ...budget.limits },
+      activeReservations: reservations,
+      exhausted: Date.now() >= Date.parse(budget.deadlineAt)
+        || budget.generationsStarted >= budget.limits.maxGenerations
+        || budget.providerRounds >= budget.limits.maxProviderRounds
+        || budget.toolCalls >= budget.limits.maxToolCalls
+        || budget.inputTokens + budget.outputTokens >= budget.limits.maxTokens,
+    };
+  }
+
   private ensureLoaded(): void {
     if (this.snapshot) return;
     const loaded = this.options.store.load(this.options.sessionId);
@@ -534,6 +904,26 @@ export class DurableAgentTeam {
       this.options.onChange?.(viewOf(record));
     } catch {
       // Observability can never change Agent admission or persistence.
+    }
+  }
+
+  private publishMailbox(
+    record: AgentTeamRecord,
+    message: AgentMailboxMessage,
+    state: AgentMailboxLifecycleEvent["state"],
+  ): void {
+    try {
+      this.options.onMailbox?.({
+        id: message.id,
+        targetId: record.id,
+        generation: message.deliveredGeneration ?? message.acceptedGeneration,
+        kind: message.kind,
+        state,
+        at: state === "queued" ? message.createdAt : iso(),
+        ...(message.rootTurnId ? { rootTurnId: message.rootTurnId } : {}),
+      });
+    } catch {
+      // Mailbox observability cannot change a committed delivery.
     }
   }
 
@@ -586,16 +976,74 @@ export class DurableAgentTeam {
     if (provenance.rootTurnId !== undefined && !validProvenanceId(provenance.rootTurnId)) {
       throw new Error("invalid root Agent turn provenance");
     }
+    if (path === "/root" && provenance.rootTurnId !== undefined) {
+      this.adoptRootTurn(provenance.rootTurnId);
+    }
     return {
       path,
-      spawn: (input) => this.spawn(path, input, provenance),
-      sendMessage: (target, message) => this.message(path, target, message, "message"),
-      followup: (target, message) => this.message(path, target, message, "followup"),
-      interrupt: (target) => this.interrupt(target),
-      resume: (target) => this.resume(target),
+      spawn: (input) => {
+        this.assertControllerFence(path, provenance);
+        return this.spawn(path, input, provenance);
+      },
+      sendMessage: (target, message, commandId) => {
+        this.assertControllerFence(path, provenance);
+        return this.message(path, target, message, "message", provenance, commandId);
+      },
+      followup: (target, message, commandId) => {
+        this.assertControllerFence(path, provenance);
+        return this.message(path, target, message, "followup", provenance, commandId);
+      },
+      interrupt: (target) => {
+        this.assertControllerFence(path, provenance);
+        return this.interrupt(target, provenance);
+      },
+      resume: (target) => {
+        this.assertControllerFence(path, provenance);
+        return this.resume(target, provenance);
+      },
       list: () => this.list(),
       wait: (target, timeoutMs) => this.wait(target, timeoutMs),
     };
+  }
+
+  private assertControllerFence(
+    sourcePath: string,
+    provenance: { parentTurnId?: string; rootTurnId?: string },
+  ): void {
+    const authoritativeRootTurnId = this.options.currentRootTurnId?.();
+    if (
+      provenance.rootTurnId !== undefined
+      && authoritativeRootTurnId !== undefined
+      && provenance.rootTurnId !== authoritativeRootTurnId
+    ) {
+      throw new Error("Agent controller belongs to a previous parent turn; refresh the Agent tree before mutating it");
+    }
+    if (sourcePath === "/root" || provenance.parentTurnId === undefined) return;
+    const source = this.resolve(sourcePath);
+    const currentParentTurnId = `${source.id}:${source.generation}`;
+    if (provenance.parentTurnId !== currentParentTurnId) {
+      throw new Error("Agent controller generation is stale; its mailbox authority has ended");
+    }
+    if (
+      provenance.rootTurnId !== undefined
+      && source.rootTurnId !== undefined
+      && provenance.rootTurnId !== source.rootTurnId
+    ) {
+      throw new Error("Agent controller cannot cross a parent-turn boundary");
+    }
+  }
+
+  private assertTargetTurn(
+    record: AgentTeamRecord,
+    provenance: { rootTurnId?: string },
+  ): void {
+    if (
+      provenance.rootTurnId !== undefined
+      && record.rootTurnId !== undefined
+      && provenance.rootTurnId !== record.rootTurnId
+    ) {
+      throw new Error("Agent belongs to a different parent turn and cannot receive this command");
+    }
   }
 
   list(): AgentTeamAgentView[] {
@@ -630,7 +1078,7 @@ export class DurableAgentTeam {
       }
       const now = iso();
       createdId = randomUUID();
-      draft.agents.push({
+      const record: AgentTeamRecord = {
         id: createdId,
         path,
         name: taskName,
@@ -646,7 +1094,9 @@ export class DurableAgentTeam {
         createdAt: now,
         updatedAt: now,
         queuedAt: now,
-      });
+      };
+      draft.agents.push(record);
+      this.reserveExecutionBudget(record, draft, provenance.rootTurnId);
     });
     const committed = this.current(createdId);
     this.publish(committed);
@@ -659,12 +1109,35 @@ export class DurableAgentTeam {
     target: string,
     message: string,
     kind: "message" | "followup",
+    provenance: { parentTurnId?: string; rootTurnId?: string },
+    commandId?: string,
   ): Promise<AgentTeamAgentView> {
     if (this.closed) throw new Error("Agent team is closed");
     const content = safeText(message, MAX_MESSAGE_CHARS, "message");
     const selected = this.resolve(target);
+    this.assertTargetTurn(selected, provenance);
+    const stableCommandId = commandId?.trim() || randomUUID();
+    if (!validProvenanceId(stableCommandId)) throw new Error("Agent mailbox command id is invalid");
+    const requestHash = mailboxRequestHash({
+      sourcePath,
+      targetId: selected.id,
+      message: content,
+      kind,
+      ...(provenance.parentTurnId ? { parentTurnId: provenance.parentTurnId } : {}),
+      ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
+    });
     let startAfterCommit = false;
-    const updated = this.change(selected.id, (record) => {
+    let duplicate = false;
+    const updated = this.change(selected.id, (record, draft) => {
+      const prior = draft.agents.flatMap((agent) => agent.mailbox)
+        .find((entry) => entry.commandId === stableCommandId);
+      if (prior) {
+        if (prior.requestHash !== requestHash) {
+          throw new Error("Agent mailbox command id was already used with a different request");
+        }
+        duplicate = true;
+        return;
+      }
       // The child can finish between target resolution and this locked update. Decide from the committed
       // record, not the earlier cache snapshot, or a follow-up arriving on that boundary can remain queued
       // forever after the generation's final pending-mailbox check has already run.
@@ -681,11 +1154,18 @@ export class DurableAgentTeam {
         sourcePath,
         content,
         kind,
+        commandId: stableCommandId,
+        requestHash,
+        ...(provenance.parentTurnId ? { parentTurnId: provenance.parentTurnId } : {}),
+        ...(provenance.rootTurnId ? { rootTurnId: provenance.rootTurnId } : {}),
         createdAt: iso(),
         state: "pending",
         acceptedGeneration: record.generation,
       });
     });
+    if (duplicate) return viewOf(updated);
+    const accepted = updated.mailbox.find((entry) => entry.commandId === stableCommandId);
+    if (accepted) this.publishMailbox(updated, accepted, "queued");
     if (startAfterCommit) {
       return viewOf(this.startNextGeneration(updated.id));
     }
@@ -693,13 +1173,14 @@ export class DurableAgentTeam {
   }
 
   private startNextGeneration(id: string): AgentTeamRecord {
-    const queued = this.change(id, (record) => {
+    const queued = this.change(id, (record, draft) => {
       if (!terminal(record.status)) throw new Error("Agent '" + record.path + "' is already " + record.status);
       record.generation += 1;
       record.status = "queued";
       record.queuedAt = iso();
       delete record.startedAt;
       delete record.endedAt;
+      this.reserveExecutionBudget(record, draft, record.rootTurnId);
     });
     this.launch(id, true);
     return this.current(queued.id);
@@ -741,6 +1222,7 @@ export class DurableAgentTeam {
     controller: AbortController,
     consumePendingAtStart: boolean,
   ): Promise<void> {
+    const deliveredAtStart: string[] = [];
     const working = this.change(id, (record) => {
       if (record.generation !== generation || record.status !== "queued") {
         throw new Error("Agent '" + record.path + "' generation changed before launch");
@@ -757,12 +1239,22 @@ export class DurableAgentTeam {
           if (message.state !== "pending") continue;
           message.state = "delivered";
           message.deliveredGeneration = generation;
+          deliveredAtStart.push(message.id);
         }
       }
     });
+    for (const messageId of deliveredAtStart) {
+      const message = working.mailbox.find((entry) => entry.id === messageId);
+      if (!message) continue;
+      this.publishMailbox(working, message, "started");
+      this.publishMailbox(working, message, "completed");
+    }
     let result: AgentTeamExecutionResult;
+    let treeLimitReached = false;
+    const executionBudget = working.executionBudget;
+    if (!executionBudget) throw new Error("Agent generation has no reserved execution budget");
     try {
-      result = await this.options.executor({
+      const observed = Promise.resolve(this.options.executor({
         id,
         path: working.path,
         parentPath: working.parentPath,
@@ -775,7 +1267,40 @@ export class DurableAgentTeam {
           ...(working.rootTurnId ? { rootTurnId: working.rootTurnId } : {}),
         }),
         pendingInput: () => this.drainMailbox(id, generation),
+        budget: {
+          maxProviderRounds: executionBudget.maxProviderRounds,
+          maxToolCalls: executionBudget.maxToolCalls,
+          maxTokens: executionBudget.maxTokens,
+          timeoutMs: executionBudget.timeoutMs,
+        },
+        reportProgress: (metrics) => {
+          const withinLimit = this.reportGenerationProgress(id, generation, metrics);
+          if (!withinLimit) {
+            treeLimitReached = true;
+            controller.abort(new Error("Agent tree execution budget reached"));
+          }
+          return withinLimit;
+        },
+      }));
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<AgentTeamExecutionResult>((resolve) => {
+        deadlineTimer = setTimeout(() => {
+          treeLimitReached = true;
+          controller.abort(new Error("Agent tree active-execution deadline reached"));
+          resolve({
+            status: "halted",
+            text: "",
+            error: "Agent tree active-execution deadline reached.",
+          });
+        }, executionBudget.timeoutMs);
+        deadlineTimer.unref?.();
       });
+      try {
+        result = await Promise.race([observed, deadline]);
+      } finally {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        void observed.catch(() => {});
+      }
     } catch (error) {
       result = {
         status: controller.signal.aborted ? "cancelled" : "error",
@@ -784,13 +1309,26 @@ export class DurableAgentTeam {
           .slice(0, MAX_RESULT_CHARS),
       };
     }
+    if (result.metrics) {
+      treeLimitReached = !this.reportGenerationProgress(id, generation, result.metrics) || treeLimitReached;
+    } else if (result.usage) {
+      const current = this.current(id).executionBudget;
+      if (current) {
+        treeLimitReached = !this.reportGenerationProgress(id, generation, {
+          providerRounds: current.providerRounds,
+          toolCalls: current.toolCalls,
+          inputTokens: Math.max(current.inputTokens, Math.floor(result.usage.input)),
+          outputTokens: Math.max(current.outputTokens, Math.floor(result.usage.output)),
+        }) || treeLimitReached;
+      }
+    }
     this.change(id, (record) => {
       if (record.generation !== generation) return;
       const cancelled =
         controller.signal.aborted
         || record.status === "stopping"
         || result.status === "cancelled";
-      record.status = cancelled ? "cancelled" : result.status === "completed" ? "completed" : "failed";
+      record.status = cancelled ? "cancelled" : result.status === "completed" && !treeLimitReached ? "completed" : "failed";
       record.endedAt = iso();
       const model = safeResultText(result.model, 512);
       if (model) record.model = model;
@@ -799,7 +1337,10 @@ export class DurableAgentTeam {
       const error = safeResultText(result.error, MAX_RESULT_CHARS);
       if (output) record.result = output;
       else delete record.result;
-      if (cancelled) record.error = "Agent was interrupted before completion.";
+      if (cancelled) record.error = treeLimitReached
+        ? "Agent tree execution budget was reached before completion."
+        : "Agent was interrupted before completion.";
+      else if (treeLimitReached) record.error = "Agent tree execution budget was reached before completion.";
       else if (error) record.error = error;
       else if (result.status !== "completed") record.error = "Agent ended with status " + result.status + ".";
       else delete record.error;
@@ -808,12 +1349,14 @@ export class DurableAgentTeam {
 
   private async drainMailbox(id: string, generation: number): Promise<AgentMailboxDelivery[]> {
     const deliveries: AgentMailboxDelivery[] = [];
-    this.change(id, (record) => {
+    const deliveredIds: string[] = [];
+    const updated = this.change(id, (record) => {
       if (record.generation !== generation || record.status !== "working") return;
       for (const message of record.mailbox) {
         if (message.state !== "pending") continue;
         message.state = "delivered";
         message.deliveredGeneration = generation;
+        deliveredIds.push(message.id);
         deliveries.push({
           id: message.id,
           sourcePath: message.sourcePath,
@@ -822,6 +1365,12 @@ export class DurableAgentTeam {
         });
       }
     });
+    for (const messageId of deliveredIds) {
+      const message = updated.mailbox.find((entry) => entry.id === messageId);
+      if (!message) continue;
+      this.publishMailbox(updated, message, "started");
+      this.publishMailbox(updated, message, "completed");
+    }
     return deliveries;
   }
 
@@ -837,8 +1386,9 @@ export class DurableAgentTeam {
     this.startNextGeneration(id);
   }
 
-  private async interrupt(target: string): Promise<AgentTeamAgentView> {
+  private async interrupt(target: string, provenance: { rootTurnId?: string } = {}): Promise<AgentTeamAgentView> {
     const selected = this.resolve(target);
+    this.assertTargetTurn(selected, provenance);
     if (terminal(selected.status)) return viewOf(selected);
     const updated = this.change(selected.id, (record) => {
       if (record.status === "queued" || record.status === "working") record.status = "stopping";
@@ -847,9 +1397,10 @@ export class DurableAgentTeam {
     return viewOf(updated);
   }
 
-  private async resume(target: string): Promise<AgentTeamAgentView> {
+  private async resume(target: string, provenance: { rootTurnId?: string } = {}): Promise<AgentTeamAgentView> {
     if (this.closed) throw new Error("Agent team is closed");
     const selected = this.resolve(target);
+    this.assertTargetTurn(selected, provenance);
     if (selected.status !== "interrupted") {
       throw new Error(
         "Agent '" + selected.path + "' is " + selected.status

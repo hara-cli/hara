@@ -163,6 +163,7 @@ function connect(port) {
 
 const memStore = () => {
   const files = new Map();
+  const journal = [];
   return {
     saved: files,
     load: (id) => files.get(id) ?? null,
@@ -175,6 +176,23 @@ const memStore = () => {
     acquire: () => ({ ok: true }),
     release: () => {},
     delete: (id) => files.delete(id),
+    recordRuntimeItem: (input) => {
+      const { at = new Date().toISOString(), ...item } = input;
+      journal.push({
+        v: 1,
+        type: "runtime.item",
+        eventId: randomUUID(),
+        sequence: journal.filter((event) => event.sessionId === item.sessionId).length + 1,
+        at,
+        ...structuredClone(item),
+      });
+      return true;
+    },
+    readJournal: (id) => ({
+      events: journal.filter((event) => event.sessionId === id).map((event) => structuredClone(event)),
+      truncatedTail: false,
+      invalidRecords: 0,
+    }),
   };
 };
 
@@ -310,8 +328,10 @@ test("serve e2e: a reconnect replays and acknowledges one exact broadcast-event 
     assert.ok(initialized.result.capabilities.methods.includes("events.replay"));
     assert.ok(initialized.result.capabilities.methods.includes("events.ack"));
     assert.ok(initialized.result.capabilities.methods.includes("events.snapshot"));
+    assert.ok(initialized.result.capabilities.methods.includes("session.runtime.replay"));
     assert.ok(initialized.result.capabilities.features.includes("events.cursor-replay.v1"));
     assert.ok(initialized.result.capabilities.features.includes("events.authoritative-snapshot.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("sessions.runtime-journal-replay.v1"));
     assert.equal(typeof initialized.result.eventStream.streamId, "string");
     assert.ok(initialized.result.eventStream.streamId.length > 0);
     assert.equal(initialized.result.eventStream.currentSequence, 0);
@@ -328,6 +348,26 @@ test("serve e2e: a reconnect replays and acknowledges one exact broadcast-event 
     assert.equal(snapshot.result.workforceStates[0].sessionId, created.result.sessionId);
     assert.deepEqual(snapshot.result.externalTurns, []);
     assert.deepEqual(snapshot.result.approvals, []);
+    const runtimeFirst = await first.call("session.runtime.replay", {
+      sessionId: created.result.sessionId,
+      afterSequence: 0,
+      limit: 2,
+    });
+    assert.equal(runtimeFirst.result.events.length, 2);
+    assert.equal(runtimeFirst.result.hasMore, true);
+    assert.ok(runtimeFirst.result.events.every((event) => event.type === "runtime.item"));
+    const runtimeRest = await first.call("session.runtime.replay", {
+      sessionId: created.result.sessionId,
+      afterSequence: runtimeFirst.result.throughSequence,
+      limit: 256,
+    });
+    assert.equal(runtimeRest.result.hasMore, false);
+    assert.equal(runtimeRest.result.throughSequence, runtimeRest.result.currentSequence);
+    const runtimeEvents = [...runtimeFirst.result.events, ...runtimeRest.result.events];
+    assert.ok(runtimeEvents.some((event) => event.kind === "message" && event.role === "user"));
+    assert.ok(runtimeEvents.some((event) => event.kind === "provider"));
+    assert.ok(runtimeEvents.some((event) => event.kind === "message" && event.role === "assistant"));
+    assert.equal(JSON.stringify(runtimeEvents).includes("replay me"), false, "runtime replay never returns prompt text");
     const live = first.events.filter((event) => event.params?.deliveryCursor);
     assert.ok(live.length > 4, "the turn publishes a useful control/status tail");
     assert.ok(live.every((event) => event.params.deliveryCursor.streamId === initialized.result.eventStream.streamId));
@@ -909,6 +949,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(init.result.capabilities.methods.includes("session.steer"), "expected-turn steering advertised");
     assert.ok(init.result.capabilities.methods.includes("session.submit"), "atomic turn-input routing advertised");
     assert.ok(init.result.capabilities.events.includes("event.task_state"), "typed task lifecycle event advertised");
+    assert.ok(init.result.capabilities.events.includes("event.runtime_item"), "replayable runtime item lifecycle advertised");
     assert.ok(init.result.capabilities.events.includes("event.workforce_state"), "typed workforce snapshot event advertised");
     assert.ok(init.result.capabilities.events.includes("event.surface"), "typed visual surface event advertised");
     assert.deepEqual(
@@ -919,6 +960,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "events.cursor-replay.v1",
         "events.restart-replay.v1",
         "events.authoritative-snapshot.v1",
+        "sessions.runtime-journal-replay.v1",
         "models.capabilities.v1",
         "sessions.command-idempotency.v1",
         "sessions.command-idempotency.durable.v2",
@@ -931,6 +973,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "agent.public-profile-edit.v1",
         "agent.blueprint-provenance.v1",
         "agents.durable-team.v1",
+        "agents.tree-budget.v1",
         "external.sessions.metadata.v1",
         "external.sessions.interaction.v1",
         "external.sessions.live-control.v1",
@@ -1145,6 +1188,12 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(workforceStates.every((state) => state.mode === "snapshot" && state.actors[0]?.kind === "root"));
     assert.ok(workforceStates.every((state, index) => index === 0 || state.sequence > workforceStates[index - 1].sequence));
     assert.doesNotMatch(JSON.stringify(workforceStates), /hi there|private chain of thought/);
+    const runtimeItems = c.events.filter((e) => e.method === "event.runtime_item").map((e) => e.params);
+    assert.ok(runtimeItems.some((item) => item.kind === "provider" && item.state === "started"));
+    assert.ok(runtimeItems.some((item) => item.kind === "provider" && item.state === "completed"));
+    assert.ok(runtimeItems.some((item) => item.kind === "message" && item.state === "completed"));
+    assert.ok(runtimeItems.every((item) => item.sessionId === sid && item.taskId && item.turnId));
+    assert.doesNotMatch(JSON.stringify(runtimeItems), /hi there|private chain of thought/);
 
     // persisted through the (injected) store + listed
     assert.ok(store.saved.get(sid), "session persisted after the turn");
@@ -3160,6 +3209,7 @@ test("serve e2e: commandId replays one durable session result across reconnect a
       eventReplayEvents: 10_000,
       eventReplayBytes: 8 * 1024 * 1024,
       eventReplayPage: 1_000,
+      sessionRuntimeReplayPage: 256,
       controlLeaseResources: 4_096,
     });
     sessionId = (await client.call("session.create", {})).result.sessionId;

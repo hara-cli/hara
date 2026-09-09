@@ -20,6 +20,15 @@ All notable changes to `@nanhara/hara`.
   task/turn-bound retry decisions across interleaved projection commits. Stale-turn and diagnostic-write
   failures cannot interrupt active work, while prompts, approval text, tool arguments, endpoints, provider
   errors, and credentials remain outside the append-only stream.
+- Add stable provider-attempt, message, tool, diff, Agent, mailbox, steering, and control lifecycle items to the
+  same journal. Serve exposes a bounded `session.runtime.replay` page with sequence/integrity diagnostics, so a
+  reconnecting Desktop or Mobile client can deterministically rebuild the safe execution trace without receiving
+  prompts, reasoning text, tool payloads, file paths, diff bodies, provider errors, or credentials.
+- Make durable Agent mailbox mutation payload-bound and idempotent, fence every child and delivery to its parent
+  and root turn, and persist provider-neutral whole-tree ceilings for generations, rounds, tools, active time, and
+  transport tokens. Actual model usage remains observable even when one indivisible response crosses its reserved
+  slice; no later model or tool boundary can start after exhaustion. Limits derive conservatively from the active
+  account model's context window and never pretend that transport tokens are subscription billing units.
 - Journal every CLI and Serve compaction attempt as a content-free started, installed, or failed transaction
   with stable attempt/window identity. The replacement snapshot remains authoritative: its commit closes the
   attempt after a crash even if the final installed event was not appended, while a provider, timeout,

@@ -204,6 +204,10 @@ test("Serve exposes a durable Agent tree and restores it after reconnect", { tim
     assert.equal(listed.result.agents[0].hasResult, true);
     assert.equal(typeof listed.result.agents[0].rootTurnId, "string");
     assert.equal(listed.result.agents[0].parentTurnId, listed.result.agents[0].rootTurnId);
+    assert.equal(listed.result.budget.limits.maxTokens, 400_000,
+      "unknown models use the conservative 200k context fallback and a two-window tree cap");
+    assert.equal(listed.result.budget.limits.maxTokensPerAgent, 100_000);
+    assert.equal(listed.result.budget.inputTokens + listed.result.budget.outputTokens, 6);
     assert.doesNotMatch(JSON.stringify(listed.result), /child conclusion|Inspect the durable runtime/);
     assert.ok(client.events.some((event) => event.method === "event.agent_state"));
 

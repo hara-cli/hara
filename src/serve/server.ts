@@ -25,7 +25,7 @@ import { basename, isAbsolute, join, relative, sep } from "node:path";
 import "../tools/all.js"; // register the full built-in toolset — serve must work as a standalone entry
 import { pruneStoredToolResults } from "../tools/result-limit.js";
 import { createServeRuntimeLogger, serveRuntimeFailureCategory } from "./runtime-log.js";
-import { runAgent, type RunOpts, type RunProgressEvent } from "../agent/loop.js";
+import { runAgent, type RunOpts, type RunProgressEvent, type RunRuntimeItemEvent } from "../agent/loop.js";
 import {
   COMPACT_SYSTEM,
   autoCompactTokenCap,
@@ -124,6 +124,7 @@ import {
   MAX_SESSION_COMMAND_REPLAY_RESULTS,
   MAX_SESSION_COMMAND_RESULT_BYTES,
   sanitizeSessionTitle,
+  replaySessionJournal,
   type SessionCommandMethod,
   type SessionCommandOutcome,
   type SessionCommandReceipt,
@@ -165,11 +166,17 @@ import {
   DEFAULT_CONTROL_LEASE_RESOURCES,
   type ControlLeaseToken,
 } from "./control-lease.js";
-import type { SubagentLifecycleObserver, SubagentResult } from "../subagent/runtime.js";
+import type {
+  SubagentLifecycleEvent,
+  SubagentLifecycleObserver,
+  SubagentResult,
+} from "../subagent/runtime.js";
 import {
   AgentTeamStore,
   DurableAgentTeam,
+  type AgentTeamExecutionMetrics,
   type AgentMailboxDelivery,
+  type AgentMailboxLifecycleEvent,
   type AgentTeamController,
 } from "../subagent/team.js";
 import { readModelContextFileSync } from "../fs-read.js";
@@ -406,6 +413,13 @@ export interface ServeDeps {
       id: string;
       agentTeam: AgentTeamController;
       pendingInput: () => Promise<AgentMailboxDelivery[]>;
+      executionBudget: {
+        maxProviderRounds: number;
+        maxToolCalls: number;
+        maxTokens: number;
+        timeoutMs: number;
+      };
+      reportProgress: (metrics: AgentTeamExecutionMetrics) => boolean;
     },
   ) => Promise<SubagentResult>;
   guardian?: { provider?: Provider | null; enabled?: boolean };
@@ -1235,6 +1249,7 @@ export function sessionCommandRequestHash(
 }
 
 export const MAX_SERVE_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
+export const MAX_SESSION_RUNTIME_REPLAY_PAGE = 256;
 const EXTERNAL_TERMINAL_HANDOFF_FEATURE = "external.sessions.terminal-handoff.v1";
 const EXTERNAL_TERMINAL_HANDOFF_TIMEOUT_MS = 3_000;
 
@@ -2082,12 +2097,67 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     publishTaskState(event);
   };
 
+  const publishRuntimeItem = (
+    session: ServeSession,
+    event: Omit<RunRuntimeItemEvent, "at"> & { at?: string },
+    identity?: { taskId: string; turnId: string },
+  ): void => {
+    const taskId = identity?.taskId ?? session.task?.id;
+    const turnId = identity?.turnId ?? session.task?.turnId;
+    if ((!taskId || !turnId) && event.kind !== "control") return;
+    const item = {
+      sessionId: session.meta.id,
+      ...(taskId && turnId ? { taskId, turnId } : {}),
+      ...event,
+      at: event.at ?? new Date().toISOString(),
+    };
+    hub.recordRuntimeItem(item);
+    broadcast("event.runtime_item", item);
+  };
+
+  const publishSubagentRuntimeItem = (
+    session: ServeSession,
+    identity: { taskId: string; turnId: string },
+    event: SubagentLifecycleEvent,
+    generation?: number,
+  ): void => {
+    const state = event.state === "working"
+      ? "started"
+      : event.state;
+    publishRuntimeItem(session, {
+      at: event.endedAt ?? event.startedAt ?? event.queuedAt,
+      itemId: generation === undefined ? `agent:${event.id}` : `agent:${event.id}:${generation}`,
+      kind: "agent",
+      state,
+      role: "agent",
+      provider: event.providerId,
+      ...(generation !== undefined ? { generation } : {}),
+    }, identity);
+  };
+
   const agentTeamFor = (session: ServeSession): DurableAgentTeam => {
     const existing = agentTeams.get(session.meta.id);
     if (existing) return existing;
     const team = new DurableAgentTeam({
       sessionId: session.meta.id,
       store: agentTeamStore,
+      currentRootTurnId: () => session.task?.turnId,
+      limits: () => {
+        const perRun = deps.runLimits?.(session.meta.cwd) ?? { timeoutMs: 8 * 60_000, maxRounds: 24 };
+        const modelWindow = session.provider.connection?.capabilities.contextWindowTokens
+          ?? contextWindow(session.provider.model);
+        const perAgentRounds = Math.max(1, Math.min(24, perRun.maxRounds));
+        return {
+          maxGenerations: 128,
+          maxProviderRounds: Math.max(perAgentRounds, Math.min(384, perAgentRounds * 8)),
+          maxToolCalls: Math.max(96, Math.min(3_072, perAgentRounds * 64)),
+          maxTokens: Math.max(200_000, Math.min(4_000_000, modelWindow * 2)),
+          maxActiveMs: Math.max(perRun.timeoutMs, Math.min(2 * 60 * 60_000, perRun.timeoutMs * 4)),
+          maxRoundsPerAgent: perAgentRounds,
+          maxToolsPerAgent: Math.max(16, Math.min(256, perAgentRounds * 8)),
+          maxTokensPerAgent: Math.max(32_000, Math.min(500_000, Math.floor(modelWindow / 2))),
+        };
+      },
       executor: async (request) => {
         sessionSpaceBinding(session.meta);
         const taskId = session.task?.id;
@@ -2098,6 +2168,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             observeToolRun(session, toolRun, tool),
           onSubagentLifecycle: (event: Parameters<NonNullable<SubagentLifecycleObserver>>[0]) => {
             if (!taskId || !turnId) return;
+            publishSubagentRuntimeItem(session, { taskId, turnId }, event, request.generation);
             const snapshot = workforceLedger.recordSubagent(
               session.meta.id,
               taskId,
@@ -2123,6 +2194,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               id: request.id,
               agentTeam: request.controller,
               pendingInput: request.pendingInput,
+              executionBudget: request.budget,
+              reportProgress: request.reportProgress,
             },
           );
           sessionSpaceBinding(session.meta);
@@ -2132,6 +2205,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             ...(result.model ? { model: result.model } : {}),
             ...(result.error ? { error: result.error } : {}),
             ...(result.usage ? { usage: result.usage } : {}),
+            ...(result.metrics ? { metrics: result.metrics } : {}),
           };
         }
         const text = await deps.spawnSubagent(
@@ -2153,6 +2227,20 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       },
       onChange: (agent) => {
         broadcast("event.agent_state", { sessionId: session.meta.id, agent });
+      },
+      onMailbox: (event: AgentMailboxLifecycleEvent) => {
+        const taskId = session.task?.id;
+        const turnId = event.rootTurnId ?? session.task?.turnId;
+        if (!taskId || !turnId) return;
+        publishRuntimeItem(session, {
+          at: event.at,
+          itemId: `mailbox:${event.id}`,
+          kind: "mailbox",
+          state: event.state,
+          role: "agent",
+          name: event.kind,
+          generation: event.generation,
+        }, { taskId, turnId });
       },
       onRun: (run) => {
         observeToolRun(session, run, { name: "agent_team" });
@@ -2203,6 +2291,37 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     hub.saveSnapshot(s, [...s.history, ...messages], consumed.task);
     s.task = consumed.task;
     s.history.push(...messages);
+    for (const entry of consumed.entries) {
+      const identity = { taskId: consumed.task.id, turnId: entry.turnId };
+      const steeringItemId = `steering:${entry.id}`;
+      const messageItemId = `message:user:${entry.id}`;
+      publishRuntimeItem(s, {
+        itemId: steeringItemId,
+        kind: "steering",
+        state: "started",
+        role: "user",
+      }, identity);
+      publishRuntimeItem(s, {
+        itemId: messageItemId,
+        parentItemId: steeringItemId,
+        kind: "message",
+        state: "started",
+        role: "user",
+      }, identity);
+      publishRuntimeItem(s, {
+        itemId: messageItemId,
+        parentItemId: steeringItemId,
+        kind: "message",
+        state: "completed",
+        role: "user",
+      }, identity);
+      publishRuntimeItem(s, {
+        itemId: steeringItemId,
+        kind: "steering",
+        state: "completed",
+        role: "user",
+      }, identity);
+    }
     return messages;
   };
 
@@ -2254,6 +2373,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       }
       executionContext = taskExecutionContext(s.task, interaction, s.meta.todos ?? []);
       hub.save(s); // crash-safe running identity before provider/tool side effects
+      const userMessageItemId = `message:user:${interaction.turnId}`;
+      publishRuntimeItem(s, {
+        itemId: userMessageItemId,
+        kind: "message",
+        state: "started",
+        role: "user",
+      });
+      publishRuntimeItem(s, {
+        itemId: userMessageItemId,
+        kind: "message",
+        state: "completed",
+        role: "user",
+      });
     } catch (error) {
       // Initialization happens before the main turn try/finally. Release the session here as well so a
       // transient snapshot/config error cannot wedge it in a permanently busy, non-interruptible state.
@@ -2559,6 +2691,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 onToolRun: (toolRun, tool) => observeToolRun(s, toolRun, tool),
                 onSubagentLifecycle: (event) => {
                   if (!taskId || !turnId) return;
+                  publishSubagentRuntimeItem(s, { taskId, turnId }, event);
                   const snapshot = workforceLedger.recordSubagent(s.meta.id, taskId, turnId, event);
                   if (snapshot) broadcast("event.workforce_state", { ...snapshot });
                 },
@@ -2689,6 +2822,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             ...(event.status !== undefined ? { status: event.status } : {}),
           });
         },
+        onRuntimeItem: (event) => publishRuntimeItem(s, event),
         onToolRun: (toolRun, tool) => observeToolRun(s, toolRun, tool),
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
@@ -2888,6 +3022,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     reason: "acquired" | "takeover" | "released" | "disconnected" | "session_removed",
   ): void => {
     broadcast("event.control_state", { scope: "session", sessionId, state, epoch, reason });
+    const session = hub.get(sessionId);
+    if (!session) return;
+    publishRuntimeItem(session, {
+      itemId: `control:${epoch}`,
+      kind: "control",
+      state: state === "controlled"
+        ? "started"
+        : reason === "released" ? "completed" : "cancelled",
+      name: "session_control",
+    });
   };
 
   interface InFlightSessionCommand {
@@ -3493,6 +3637,24 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       }
       s.task = recorded.task;
       hub.save(s); // executable inbox entry is durable before ACK
+      const acceptedSteering = s.task.steering?.at(-1);
+      if (acceptedSteering?.deliveryState === "pending") {
+        const identity = { taskId: s.task.id, turnId: acceptedSteering.turnId };
+        const steeringItemId = `steering:${acceptedSteering.id}`;
+        publishRuntimeItem(s, {
+          itemId: steeringItemId,
+          kind: "steering",
+          state: "queued",
+          role: "user",
+        }, identity);
+        publishRuntimeItem(s, {
+          itemId: `message:user:${acceptedSteering.id}`,
+          parentItemId: steeringItemId,
+          kind: "message",
+          state: "queued",
+          role: "user",
+        }, identity);
+      }
       broadcastTaskState(s, { state: "running", phase: "steering", detail: "Steering accepted" });
       return { submission: "steered", taskId: s.task.id, turnId: s.task.turnId };
     }
@@ -3703,7 +3865,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           const methods = [
             "server.shutdown",
             "events.replay", "events.ack", "events.snapshot",
-            "session.list", "session.create", "session.resume", "session.history", "session.agents.list", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
+            "session.list", "session.create", "session.resume", "session.history", "session.runtime.replay", "session.agents.list", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
@@ -3743,6 +3905,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "events.cursor-replay.v1",
             "events.restart-replay.v1",
             "events.authoritative-snapshot.v1",
+            "sessions.runtime-journal-replay.v1",
             "models.capabilities.v1",
             "sessions.command-idempotency.v1",
             "sessions.command-idempotency.durable.v2",
@@ -3755,6 +3918,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "agent.public-profile-edit.v1",
             "agent.blueprint-provenance.v1",
             "agents.durable-team.v1",
+            "agents.tree-budget.v1",
             "external.sessions.metadata.v1",
             "external.sessions.interaction.v1",
             "external.sessions.live-control.v1",
@@ -3790,7 +3954,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             capabilities: {
               methods,
               events: [
-                "event.task_state", "event.workforce_state", "event.agent_state", "event.surface", "event.session_changed",
+                "event.task_state", "event.runtime_item", "event.workforce_state", "event.agent_state", "event.surface", "event.session_changed",
                 "event.control_state", "event.control_revoked",
                 "external.event.turn_start", "external.event.text", "external.event.tool",
                 "external.event.notice", "external.event.turn_end", "external.approval.request",
@@ -3808,6 +3972,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 eventReplayEvents: DEFAULT_EVENT_REPLAY_MAX_EVENTS,
                 eventReplayBytes: DEFAULT_EVENT_REPLAY_MAX_BYTES,
                 eventReplayPage: MAX_EVENT_REPLAY_PAGE,
+                sessionRuntimeReplayPage: MAX_SESSION_RUNTIME_REPLAY_PAGE,
                 controlLeaseResources: DEFAULT_CONTROL_LEASE_RESOURCES,
               },
             },
@@ -3931,6 +4096,54 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               duplicate: p.sequence <= previous,
             }));
           }
+          case "session.runtime.replay": {
+            if (typeof p.sessionId !== "string" || !p.sessionId || p.sessionId.length > 256) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId is required"));
+            }
+            if (p.afterSequence !== undefined && (
+              !Number.isSafeInteger(p.afterSequence) || p.afterSequence < 0
+            )) {
+              return reply(rpcError(id, ERR.PARAMS, "afterSequence must be a non-negative safe integer"));
+            }
+            if (p.limit !== undefined && (
+              !Number.isSafeInteger(p.limit) || p.limit < 1 || p.limit > MAX_SESSION_RUNTIME_REPLAY_PAGE
+            )) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                `limit must be an integer from 1 to ${MAX_SESSION_RUNTIME_REPLAY_PAGE}`,
+              ));
+            }
+            if (!hub.read(p.sessionId)) {
+              return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            }
+            const journal = hub.readJournal(p.sessionId);
+            const projection = replaySessionJournal(journal.events);
+            const afterSequence = p.afterSequence ?? 0;
+            const limit = p.limit ?? 100;
+            const candidates = journal.events.filter((event) => (
+              event.type === "runtime.item" && event.sequence > afterSequence
+            ));
+            const events = candidates.slice(0, limit);
+            const currentSequence = projection.lastEvent?.sequence ?? 0;
+            const hasMore = candidates.length > events.length;
+            const throughSequence = hasMore
+              ? (events.at(-1)?.sequence ?? afterSequence)
+              : currentSequence;
+            return reply(rpcResult(id!, {
+              sessionId: p.sessionId,
+              currentSequence,
+              throughSequence,
+              hasMore,
+              events,
+              integrity: {
+                truncatedTail: journal.truncatedTail,
+                invalidRecords: journal.invalidRecords,
+                gaps: projection.gaps,
+                runtimeItemIssues: projection.runtimeItemIssues,
+              },
+            }));
+          }
           case "session.control.acquire": {
             if (typeof p.sessionId !== "string" || !p.sessionId) {
               return reply(rpcError(id, ERR.PARAMS, "sessionId is required"));
@@ -3948,6 +4161,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               throw leaseFailure(error);
             }
             if (acquisition.previousOwner) {
+              const session = hub.get(p.sessionId);
+              if (session) {
+                publishRuntimeItem(session, {
+                  itemId: `control:${Math.max(1, acquisition.lease.epoch - 1)}`,
+                  kind: "control",
+                  state: "cancelled",
+                  name: "session_control",
+                });
+              }
               notifySocket(acquisition.previousOwner, "event.control_revoked", {
                 scope: "session",
                 sessionId: p.sessionId,
@@ -4060,6 +4282,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcResult(id!, {
               sessionId: session.meta.id,
               agents: agentTeamFor(session).list(),
+              budget: agentTeamFor(session).budget(),
             }));
           }
           case "external.sources.list": {
