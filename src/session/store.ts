@@ -79,6 +79,24 @@ export interface SessionCompactionWindow {
   inputAccounting: "provider" | "estimated";
 }
 
+/** Durable handoff checkpoint for one Serve-owned conversation. The raw migration token is returned once
+ * to the authenticated local client and never persisted; only its SHA-256 verifier crosses a restart.
+ * Prompt/output content and provider credentials are intentionally absent. */
+export interface SessionServeSuspension {
+  v: 1;
+  state: "paused" | "migrating";
+  suspensionId: string;
+  itemId: string;
+  pausedAt: string;
+  sourceInstanceId: string;
+  taskId?: string;
+  turnId?: string;
+  /** Present exactly while state=migrating. */
+  migrationTokenSha256?: string;
+  /** A lost migration response cannot lock the source forever. */
+  expiresAt?: string;
+}
+
 export type SessionCommandMethod =
   | "session.submit"
   | "session.send"
@@ -188,6 +206,9 @@ export interface SessionMeta {
   /** Last atomically installed context window. The transcript remains authoritative; this identity lets
    * reconnecting clients and future event replay distinguish a real replacement from a repeated notice. */
   compaction?: SessionCompactionWindow;
+  /** Explicit Serve pause/migration state. A persisted migration checkpoint is the only authority that
+   * permits another Serve process to take over this conversation. */
+  serveSuspension?: SessionServeSuspension;
   /** Recent mutation receipts are part of the authoritative transcript projection, but are intentionally
    * omitted from the lightweight metadata sidecar and every session-list response. */
   commandReceipts?: SessionCommandReceipt[];
@@ -1606,6 +1627,9 @@ function redactedSessionCopy(data: SessionData): SessionData {
   if (data.meta.gatewayOwner !== undefined) safe.meta.gatewayOwner = data.meta.gatewayOwner;
   if (data.meta.agentRef !== undefined) safe.meta.agentRef = data.meta.agentRef;
   if (data.meta.compaction !== undefined) safe.meta.compaction = { ...data.meta.compaction };
+  if (data.meta.serveSuspension !== undefined) {
+    safe.meta.serveSuspension = { ...data.meta.serveSuspension };
+  }
   if (data.meta.commandReceipts && safe.meta.commandReceipts) {
     for (let index = 0; index < data.meta.commandReceipts.length; index++) {
       const source = data.meta.commandReceipts[index];
@@ -2773,6 +2797,41 @@ function isSessionCompactionWindow(value: unknown): value is SessionCompactionWi
   );
 }
 
+const SESSION_SUSPENSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function isSessionServeSuspension(value: unknown): value is SessionServeSuspension {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const suspension = value as Partial<Record<keyof SessionServeSuspension, unknown>>;
+  const taskIdentityValid = (
+    (suspension.taskId === undefined && suspension.turnId === undefined)
+    || (
+      typeof suspension.taskId === "string"
+      && validSessionId(suspension.taskId)
+      && typeof suspension.turnId === "string"
+      && validSessionId(suspension.turnId)
+    )
+  );
+  const migrationFieldsValid = suspension.state === "migrating"
+    ? (
+        typeof suspension.migrationTokenSha256 === "string"
+        && /^[0-9a-f]{64}$/u.test(suspension.migrationTokenSha256)
+        && isTimestamp(suspension.expiresAt)
+        && Date.parse(suspension.expiresAt) > Date.parse(suspension.pausedAt as string)
+      )
+    : suspension.migrationTokenSha256 === undefined && suspension.expiresAt === undefined;
+  return suspension.v === 1
+    && (suspension.state === "paused" || suspension.state === "migrating")
+    && typeof suspension.suspensionId === "string"
+    && SESSION_SUSPENSION_UUID.test(suspension.suspensionId)
+    && typeof suspension.itemId === "string"
+    && suspension.itemId === `serve-${suspension.state}:${suspension.suspensionId}`
+    && isTimestamp(suspension.pausedAt)
+    && typeof suspension.sourceInstanceId === "string"
+    && SESSION_SUSPENSION_UUID.test(suspension.sourceInstanceId)
+    && taskIdentityValid
+    && migrationFieldsValid;
+}
+
 function isSessionCommandReceipt(value: unknown): value is SessionCommandReceipt {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const receipt = value as Partial<Record<keyof SessionCommandReceipt, unknown>>;
@@ -2944,6 +3003,7 @@ function isSessionMeta(value: unknown): value is SessionMeta {
     (meta.archived === undefined || typeof meta.archived === "boolean") &&
     (meta.gatewayOwner === undefined || typeof meta.gatewayOwner === "string") &&
     (meta.compaction === undefined || isSessionCompactionWindow(meta.compaction)) &&
+    (meta.serveSuspension === undefined || isSessionServeSuspension(meta.serveSuspension)) &&
     (meta.commandReceipts === undefined || (
       Array.isArray(meta.commandReceipts)
       && meta.commandReceipts.length <= MAX_SESSION_COMMAND_RECEIPTS

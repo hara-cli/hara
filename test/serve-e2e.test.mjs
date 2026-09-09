@@ -196,6 +196,61 @@ const memStore = () => {
   };
 };
 
+/** Two Serve instances need distinct lock owners even though this fixture runs them in one process. */
+const sharedLockingMemStores = () => {
+  const files = new Map();
+  const locks = new Map();
+  const journal = [];
+  const forOwner = (owner, pid) => ({
+    saved: files,
+    load: (id) => files.has(id) ? structuredClone(files.get(id)) : null,
+    save: (meta, history, task) => files.set(meta.id, {
+      meta: structuredClone(meta),
+      history: structuredClone(history),
+      ...(task ? { task: structuredClone(task) } : {}),
+    }),
+    list: () => [...files.values()].map((data) => structuredClone(data.meta)),
+    acquire: (id) => {
+      const held = locks.get(id);
+      if (held && held.owner !== owner) return { ok: false, pid: held.pid };
+      locks.set(id, { owner, pid });
+      return { ok: true };
+    },
+    release: (id) => {
+      if (locks.get(id)?.owner === owner) locks.delete(id);
+    },
+    delete: (id) => {
+      if (locks.get(id)?.owner !== owner) return false;
+      locks.delete(id);
+      return files.delete(id);
+    },
+    recordRuntimeItem: (input) => {
+      const { at = new Date().toISOString(), ...item } = input;
+      journal.push({
+        v: 1,
+        type: "runtime.item",
+        eventId: randomUUID(),
+        sequence: journal.filter((event) => event.sessionId === item.sessionId).length + 1,
+        at,
+        ...structuredClone(item),
+      });
+      return true;
+    },
+    readJournal: (id) => ({
+      events: journal.filter((event) => event.sessionId === id).map((event) => structuredClone(event)),
+      truncatedTail: false,
+      invalidRecords: 0,
+    }),
+  });
+  return {
+    source: forOwner("source", 41001),
+    target: forOwner("target", 41002),
+    files,
+    locks,
+    journal,
+  };
+};
+
 /** Fake provider: emits private reasoning, streams "hel"+"lo", and ends. */
 const textProvider = {
   id: "fake",
@@ -312,6 +367,147 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
     }],
   }),
   quietDiscovery: true,
+});
+
+test("serve e2e: pause drains an active model turn, fences input, and resumes one lifecycle", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-pause-"));
+  const store = memStore();
+  let providerRound = 0;
+  let markBlocked;
+  const blocked = new Promise((resolve) => { markBlocked = resolve; });
+  const provider = {
+    id: "fake",
+    model: "fake-1",
+    async turn(args) {
+      if (providerRound++ === 0) {
+        return {
+          text: "",
+          toolUses: [{
+            id: "pause-brief",
+            name: "task_intake",
+            input: {
+              intent: "change",
+              goal: "wait until the session is paused",
+              constraints: ["do not perform side effects"],
+              acceptance: ["the turn reaches a cooperative cancellation boundary"],
+              steps: ["wait for cancellation"],
+            },
+          }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      markBlocked();
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(new Error("provider observed pause cancellation"));
+        args.signal?.addEventListener("abort", onAbort, { once: true });
+        if (args.signal?.aborted) onAbort();
+      });
+    },
+  };
+  const srv = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    { ...baseDeps(provider, store), suspendTimeoutMs: 1_000 },
+  );
+  const client = await connect(srv.port);
+  try {
+    const initialized = await client.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.methods.includes("session.pause"));
+    assert.ok(initialized.result.capabilities.features.includes("sessions.pause-migrate.v1"));
+    const created = await client.call("session.create", {});
+    const sessionId = created.result.sessionId;
+    const running = client.call("session.send", { sessionId, text: "keep working until paused" });
+    await blocked;
+    const paused = await client.call("session.pause", { sessionId });
+    assert.equal(paused.result.state, "paused");
+    assert.ok(Number.isSafeInteger(paused.result.runtimeCursor));
+    const interrupted = await running;
+    assert.ok(interrupted.error, "the original command observes the deliberate cancellation");
+    assert.equal(store.saved.get(sessionId).meta.serveSuspension.state, "paused");
+
+    const fenced = await client.call("session.submit", { sessionId, text: "must not start yet" });
+    assert.deepEqual(fenced.result, {
+      submission: "not_submitted",
+      reason: "session_paused",
+      detail: "this session is paused; call session.resume before sending input",
+    });
+    const resumed = await client.call("session.resume", { sessionId });
+    assert.equal(resumed.result.sessionId, sessionId);
+    assert.equal(store.saved.get(sessionId).meta.serveSuspension, undefined);
+    const replay = await client.call("session.runtime.replay", { sessionId, limit: 256 });
+    const item = replay.result.events.filter((event) => event.itemId === `serve-paused:${paused.result.suspensionId}`);
+    assert.deepEqual(item.map((event) => event.state), ["started", "paused", "resumed", "completed"]);
+    assert.equal(JSON.stringify(item).includes("keep working until paused"), false);
+  } finally {
+    client.close();
+    await srv.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: a migration token transfers one quiescent session lock and continues its journal", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-migrate-"));
+  const shared = sharedLockingMemStores();
+  const sourceServer = await startServe(
+    { host: "127.0.0.1", port: 0, token: "source-token", cwd: dir },
+    baseDeps(textProvider, shared.source),
+  );
+  const targetServer = await startServe(
+    { host: "127.0.0.1", port: 0, token: "target-token", cwd: dir },
+    baseDeps(textProvider, shared.target),
+  );
+  const source = await connect(sourceServer.port);
+  const target = await connect(targetServer.port);
+  try {
+    await source.call("initialize", { token: "source-token" });
+    await target.call("initialize", { token: "target-token" });
+    const created = await source.call("session.create", {});
+    const sessionId = created.result.sessionId;
+    await source.call("session.send", { sessionId, text: "persist before migration" });
+
+    const prepared = await source.call("session.migration.prepare", { sessionId, ttlMs: 30_000 });
+    assert.equal(prepared.result.state, "migrating");
+    assert.equal(typeof prepared.result.migrationToken, "string");
+    assert.equal(shared.locks.has(sessionId), false, "the source releases ownership only after checkpointing");
+    const storedDuringHandoff = JSON.stringify(shared.files.get(sessionId));
+    assert.equal(storedDuringHandoff.includes(prepared.result.migrationToken), false, "the raw handoff token is never persisted");
+    assert.match(shared.files.get(sessionId).meta.serveSuspension.migrationTokenSha256, /^[0-9a-f]{64}$/);
+
+    const ordinary = await source.call("session.resume", { sessionId });
+    assert.equal(ordinary.error.code, -32004, "ordinary resume cannot bypass an unexpired migration checkpoint");
+    const wrong = await target.call("session.migration.resume", {
+      sessionId,
+      suspensionId: prepared.result.suspensionId,
+      migrationToken: "wrong-token",
+    });
+    assert.equal(wrong.error.code, -32001);
+    assert.equal(shared.locks.has(sessionId), false, "a rejected target gives the writer lock back");
+
+    const migrated = await target.call("session.migration.resume", {
+      sessionId,
+      suspensionId: prepared.result.suspensionId,
+      migrationToken: prepared.result.migrationToken,
+    });
+    assert.equal(migrated.result.sessionId, sessionId);
+    assert.equal(migrated.result.migration.sourceInstanceId, prepared.result.sourceInstanceId);
+    assert.notEqual(migrated.result.migration.targetInstanceId, prepared.result.sourceInstanceId);
+    assert.equal(shared.files.get(sessionId).meta.serveSuspension, undefined);
+    assert.equal(shared.locks.get(sessionId).owner, "target");
+
+    const replay = await target.call("session.runtime.replay", { sessionId, limit: 256 });
+    const itemId = `serve-migrating:${prepared.result.suspensionId}`;
+    assert.deepEqual(
+      replay.result.events.filter((event) => event.itemId === itemId).map((event) => event.state),
+      ["started", "paused", "resumed", "completed"],
+    );
+    assert.equal(migrated.result.migration.runtimeCursor, replay.result.currentSequence);
+  } finally {
+    source.close();
+    target.close();
+    await sourceServer.close();
+    await targetServer.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("serve e2e: a reconnect replays and acknowledges one exact broadcast-event tail", { timeout: 20000 }, async () => {
@@ -961,6 +1157,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "events.restart-replay.v1",
         "events.authoritative-snapshot.v1",
         "sessions.runtime-journal-replay.v1",
+        "sessions.pause-migrate.v1",
         "models.capabilities.v1",
         "sessions.command-idempotency.v1",
         "sessions.command-idempotency.durable.v2",

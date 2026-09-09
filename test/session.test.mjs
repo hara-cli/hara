@@ -114,6 +114,65 @@ test("session persistence validates and retains stable compaction window identit
   }
 });
 
+test("session persistence retains only a bounded Serve migration verifier", () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-session-serve-migration-home-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const project = join(home, "project");
+  mkdirSync(project, { recursive: true });
+  const id = newSessionId();
+  const pausedAt = "2026-09-10T00:00:00.000Z";
+  const suspensionId = "11111111-1111-4111-8111-111111111111";
+  const verifier = "a".repeat(64);
+  try {
+    saveSession({
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "migration fixture",
+      createdAt: pausedAt,
+      updatedAt: pausedAt,
+      serveSuspension: {
+        v: 1,
+        state: "migrating",
+        suspensionId,
+        itemId: `serve-migrating:${suspensionId}`,
+        pausedAt,
+        sourceInstanceId: "22222222-2222-4222-8222-222222222222",
+        taskId: "33333333-3333-4333-8333-333333333333",
+        turnId: "44444444-4444-4444-8444-444444444444",
+        migrationTokenSha256: verifier,
+        expiresAt: "2026-09-10T00:02:00.000Z",
+      },
+    }, [{ role: "user", content: "private migration history" }]);
+    assert.deepEqual(loadSession(id)?.meta.serveSuspension, {
+      v: 1,
+      state: "migrating",
+      suspensionId,
+      itemId: `serve-migrating:${suspensionId}`,
+      pausedAt,
+      sourceInstanceId: "22222222-2222-4222-8222-222222222222",
+      taskId: "33333333-3333-4333-8333-333333333333",
+      turnId: "44444444-4444-4444-8444-444444444444",
+      migrationTokenSha256: verifier,
+      expiresAt: "2026-09-10T00:02:00.000Z",
+    });
+    const transcript = readFileSync(join(home, ".hara", "sessions", `${id}.json`), "utf8");
+    assert.match(transcript, new RegExp(verifier));
+    assert.doesNotMatch(transcript, /migrationToken"|raw-migration-token/);
+  } finally {
+    deleteSession(id);
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("session persistence retains a write-ahead command receipt without prompt content", () => {
   const home = mkdtempSync(join(tmpdir(), "hara-session-command-started-home-"));
   const previousHome = process.env.HOME;

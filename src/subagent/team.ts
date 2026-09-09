@@ -694,6 +694,9 @@ interface ActiveAgentRun {
 export class DurableAgentTeam {
   private snapshot?: AgentTeamSnapshot;
   private readonly active = new Map<string, ActiveAgentRun>();
+  /** A Serve pause/migration drains the existing tree without permitting a queued follow-up generation
+   * to start on the old owner. The host discards this team after the drain and reconstructs it on resume. */
+  private draining = false;
   private closed = false;
 
   constructor(private readonly options: DurableAgentTeamOptions) {
@@ -1057,6 +1060,7 @@ export class DurableAgentTeam {
     provenance: { parentTurnId?: string; rootTurnId?: string },
   ): Promise<AgentTeamAgentView> {
     if (this.closed) throw new Error("Agent team is closed");
+    if (this.draining) throw new Error("Agent team is paused for a Serve handoff");
     const taskName = typeof input.taskName === "string" ? input.taskName.trim() : "";
     if (!TASK_NAME.test(taskName)) {
       throw new Error(
@@ -1113,6 +1117,7 @@ export class DurableAgentTeam {
     commandId?: string,
   ): Promise<AgentTeamAgentView> {
     if (this.closed) throw new Error("Agent team is closed");
+    if (this.draining) throw new Error("Agent team is paused for a Serve handoff");
     const content = safeText(message, MAX_MESSAGE_CHARS, "message");
     const selected = this.resolve(target);
     this.assertTargetTurn(selected, provenance);
@@ -1187,7 +1192,7 @@ export class DurableAgentTeam {
   }
 
   private launch(id: string, consumePendingAtStart: boolean): void {
-    if (this.closed || this.active.has(id)) return;
+    if (this.closed || this.draining || this.active.has(id)) return;
     const before = this.current(id);
     const generation = before.generation;
     const task = executionPrompt(before);
@@ -1198,7 +1203,7 @@ export class DurableAgentTeam {
       .finally(() => {
         const owned = this.active.get(id);
         if (owned?.generation === generation) this.active.delete(id);
-        if (!this.closed) {
+        if (!this.closed && !this.draining) {
           // A follow-up can commit the next queued generation after executeGeneration publishes the old
           // terminal state but before this finally block releases the active slot. launch() deliberately
           // refuses overlapping generations, so pick that queued generation up here once ownership clears.
@@ -1399,6 +1404,7 @@ export class DurableAgentTeam {
 
   private async resume(target: string, provenance: { rootTurnId?: string } = {}): Promise<AgentTeamAgentView> {
     if (this.closed) throw new Error("Agent team is closed");
+    if (this.draining) throw new Error("Agent team is paused for a Serve handoff");
     const selected = this.resolve(target);
     this.assertTargetTurn(selected, provenance);
     if (selected.status !== "interrupted") {
@@ -1436,8 +1442,45 @@ export class DurableAgentTeam {
     };
   }
 
+  isQuiescent(): boolean {
+    return this.active.size === 0;
+  }
+
+  /** Stop every live descendant and wait for its executor Promise to settle. A timeout is reported as
+   * false and the tree remains draining, so the old Serve owner can never launch another generation while
+   * a migration is unresolved. */
+  async interruptAllAndWait(timeoutMs = 10_000): Promise<boolean> {
+    this.draining = true;
+    this.ensureLoaded();
+    const runs = [...this.active.entries()];
+    for (const [id, active] of runs) {
+      try {
+        this.change(id, (record) => {
+          if (
+            record.generation === active.generation
+            && (record.status === "queued" || record.status === "working")
+          ) record.status = "stopping";
+        });
+      } finally {
+        active.controller.abort(new Error("Hara Serve is pausing this Agent tree"));
+      }
+    }
+    if (runs.length === 0) return true;
+    const boundedTimeout = Math.max(0, Math.min(MAX_WAIT_MS, Math.floor(timeoutMs)));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(runs.map(([, active]) => active.promise)),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, boundedTimeout);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    return this.active.size === 0;
+  }
+
   close(): void {
     if (this.closed) return;
+    this.draining = true;
     this.closed = true;
     this.ensureLoaded();
     for (const [id, active] of this.active) {

@@ -311,6 +311,45 @@ test("interrupt cooperatively cancels a live Agent without losing its stable rec
   }
 });
 
+test("Serve handoff drains descendants without launching a queued follow-up generation", async () => {
+  const releaseAfterAbort = deferred();
+  let sawAbort;
+  const aborted = new Promise((resolve) => { sawAbort = resolve; });
+  const state = fixture(async (request) => {
+    await new Promise((resolve) => {
+      const onAbort = () => {
+        sawAbort();
+        resolve();
+      };
+      request.signal.addEventListener("abort", onAbort, { once: true });
+      if (request.signal.aborted) onAbort();
+    });
+    await releaseAfterAbort.promise;
+    return { status: "cancelled", text: "" };
+  });
+  try {
+    const controller = state.team.controller();
+    const created = await controller.spawn({ taskName: "handoff", message: "wait" });
+    await controller.followup(created.id, "must stay queued during handoff", "handoff-followup");
+    const timedOut = state.team.interruptAllAndWait(10);
+    await aborted;
+    assert.equal(await timedOut, false);
+    assert.equal(state.team.isQuiescent(), false);
+    await assert.rejects(
+      controller.spawn({ taskName: "late", message: "must not start" }),
+      /paused for a Serve handoff/,
+    );
+    releaseAfterAbort.resolve();
+    const settled = await controller.wait(created.id, 1_000);
+    assert.equal(settled.agent.status, "cancelled");
+    assert.equal(settled.agent.generation, 1, "the queued follow-up does not become a new generation");
+    assert.equal(await state.team.interruptAllAndWait(1_000), true);
+    assert.equal(state.team.isQuiescent(), true);
+  } finally {
+    state.cleanup();
+  }
+});
+
 test("cold recovery marks abandoned work interrupted and resume keeps identity", async () => {
   const home = mkdtempSync(join(tmpdir(), "hara-agent-cold-"));
   const store = new AgentTeamStore(home);

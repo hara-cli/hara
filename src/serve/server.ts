@@ -131,6 +131,7 @@ import {
   type SessionApprovalOutcome,
   type SessionCompactionFailureReason,
   type SessionMeta,
+  type SessionServeSuspension,
 } from "../session/store.js";
 import {
   parseFrame,
@@ -437,6 +438,8 @@ export interface ServeDeps {
   /** Hermetic tests may inject a receipt ledger to exercise fail-closed persistence boundaries. */
   remoteCommandLedger?: RemoteCommandLedger;
   compactTimeoutMs?: number; // tests/embedders: bound a provider that ignores cancellation
+  /** Bound the cooperative provider/tool/Agent drain before pause or process migration fails closed. */
+  suspendTimeoutMs?: number;
   /** Optional hermetic/session-provider override. Production uses official local adapters and never parses
    * private transcript files in the renderer or protocol layer. */
   externalSessions?: ExternalSessionService;
@@ -931,6 +934,10 @@ export interface ServeHandle {
 
 const APPROVAL_TIMEOUT_MS = 300_000; // an unanswered approval denies after 5 min (never hangs a turn)
 const COMPACT_TIMEOUT_MS = 60_000;
+const SESSION_SUSPEND_TIMEOUT_MS = 10_000;
+const SESSION_MIGRATION_TTL_MS = 2 * 60_000;
+const MIN_SESSION_MIGRATION_TTL_MS = 15_000;
+const MAX_SESSION_MIGRATION_TTL_MS = 10 * 60_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 const SOCKET_CLOSE_GRACE_MS = 250;
 const DISCOVERY_LOCK_WAIT_MS = 2_000;
@@ -2250,6 +2257,179 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     return team;
   };
 
+  const runtimeJournalCursor = (sessionId: string): number => {
+    const replay = replaySessionJournal(hub.readJournal(sessionId).events);
+    return replay.lastEvent?.sequence ?? 0;
+  };
+  const migrationTokenHash = (token: string): string => createHash("sha256")
+    .update("hara-serve-migration-v1\0")
+    .update(token)
+    .digest("hex");
+  const migrationTokenMatches = (token: string, expectedHex: string): boolean => {
+    if (!token || token.length > 1_024 || !/^[0-9a-f]{64}$/u.test(expectedHex)) return false;
+    const actual = Buffer.from(migrationTokenHash(token), "hex");
+    const expected = Buffer.from(expectedHex, "hex");
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  };
+  const migrationExpired = (suspension: SessionServeSuspension, at = Date.now()): boolean => {
+    if (suspension.state !== "migrating") return false;
+    const expiresAt = suspension.expiresAt ? Date.parse(suspension.expiresAt) : Number.NaN;
+    return !Number.isFinite(expiresAt) || expiresAt <= at;
+  };
+  const publicSuspension = (suspension?: SessionServeSuspension): {
+    state: "paused" | "migrating";
+    suspensionId: string;
+    pausedAt: string;
+    expiresAt?: string;
+  } | undefined => suspension ? ({
+    state: suspension.state,
+    suspensionId: suspension.suspensionId,
+    pausedAt: suspension.pausedAt,
+    ...(suspension.expiresAt ? { expiresAt: suspension.expiresAt } : {}),
+  }) : undefined;
+  const suspensionIdentity = (
+    suspension: SessionServeSuspension,
+  ): { taskId: string; turnId: string } | undefined => (
+    suspension.taskId && suspension.turnId
+      ? { taskId: suspension.taskId, turnId: suspension.turnId }
+      : undefined
+  );
+  const publishSuspensionItem = (
+    session: ServeSession,
+    suspension: SessionServeSuspension,
+    state: "started" | "paused" | "resumed" | "completed" | "failed" | "cancelled",
+    errorKind?: "timeout" | "interrupted" | "unknown",
+  ): void => {
+    publishRuntimeItem(session, {
+      itemId: suspension.itemId,
+      kind: "control",
+      state,
+      name: suspension.state === "migrating" ? "serve_migration" : "serve_pause",
+      ...(errorKind ? { errorKind } : {}),
+    }, suspensionIdentity(suspension));
+  };
+  const sessionIsQuiescent = (session: ServeSession, team?: DurableAgentTeam): boolean => (
+    session.abort === null
+    && !session.busy
+    && session.pendingProviderTurns === 0
+    && session.pendingToolRuns === 0
+    && (team?.isQuiescent() ?? true)
+  );
+  const keepSessionFencedUntilQuiet = (session: ServeSession, team?: DurableAgentTeam): void => {
+    const timer = setInterval(() => {
+      if (hub.get(session.meta.id) !== session || !sessionIsQuiescent(session, team)) return;
+      clearInterval(timer);
+      team?.close();
+      if (team && agentTeams.get(session.meta.id) === team) agentTeams.delete(session.meta.id);
+      session.configuring = false;
+      broadcast("event.session_changed", {
+        sessionId: session.meta.id,
+        change: "suspension_drain_finished",
+        retryRequired: true,
+      });
+    }, 50);
+    timer.unref();
+  };
+  const suspendSession = async (
+    session: ServeSession,
+    state: "paused" | "migrating",
+    ttlMs = SESSION_MIGRATION_TTL_MS,
+  ): Promise<{ suspension: SessionServeSuspension; migrationToken?: string }> => {
+    if (session.configuring) {
+      throw new SessionCommandRpcError(ERR.BUSY, "session is already changing configuration");
+    }
+    if (session.meta.serveSuspension) {
+      throw new SessionCommandRpcError(
+        ERR.CONFLICT,
+        session.meta.serveSuspension.state === "paused"
+          ? "session is already paused; resume it before starting another handoff"
+          : "session already has a pending migration",
+      );
+    }
+    session.configuring = true;
+    const taskIdentity = session.task
+      ? { taskId: session.task.id, turnId: session.task.turnId }
+      : undefined;
+    const suspensionId = randomUUID();
+    const migrationToken = state === "migrating" ? randomBytes(32).toString("base64url") : undefined;
+    const pausedAt = new Date().toISOString();
+    const boundedTtlMs = Math.max(
+      MIN_SESSION_MIGRATION_TTL_MS,
+      Math.min(MAX_SESSION_MIGRATION_TTL_MS, Math.floor(ttlMs)),
+    );
+    const suspension: SessionServeSuspension = {
+      v: 1,
+      state,
+      suspensionId,
+      itemId: `serve-${state}:${suspensionId}`,
+      pausedAt,
+      sourceInstanceId: instanceId,
+      ...(taskIdentity ?? {}),
+      ...(migrationToken ? {
+        migrationTokenSha256: migrationTokenHash(migrationToken),
+        expiresAt: new Date(Date.parse(pausedAt) + boundedTtlMs).toISOString(),
+      } : {}),
+    };
+    try {
+      // A failed pre-cancel flush leaves the original turn untouched and still owned by this process.
+      hub.save(session);
+    } catch (error) {
+      session.configuring = false;
+      throw error;
+    }
+    publishSuspensionItem(session, suspension, "started");
+    for (const approval of [...pendingApprovals.values()]) {
+      if (approval.scope === "session" && approval.sessionId === session.meta.id) {
+        approval.finish(false, "interrupted");
+      }
+    }
+    const team = agentTeams.get(session.meta.id);
+    const suspendTimeoutMs = Math.max(10, Math.min(60_000, Math.floor(
+      deps.suspendTimeoutMs ?? SESSION_SUSPEND_TIMEOUT_MS,
+    )));
+    if (team) void team.interruptAllAndWait(suspendTimeoutMs).catch(() => false);
+    if (session.abort) {
+      runtimeLog("turn.interrupted", { sessionId: session.meta.id, category: "cancelled" });
+      session.abort.abort(new Error(state === "migrating" ? "Hara Serve session is migrating" : "Hara Serve session is paused"));
+    }
+    const deadline = Date.now() + suspendTimeoutMs;
+    while (!sessionIsQuiescent(session, team) && Date.now() < deadline) {
+      await pause(Math.min(25, Math.max(1, deadline - Date.now())));
+    }
+    if (!sessionIsQuiescent(session, team)) {
+      publishSuspensionItem(session, suspension, "failed", "timeout");
+      // Keep the route fenced while a non-cooperative model/tool/child physically owns it. A small
+      // unref'ed monitor reopens the idle session once the last Promise settles; the client then retries.
+      keepSessionFencedUntilQuiet(session, team);
+      throw new SessionCommandRpcError(
+        ERR.BUSY,
+        "session cancellation is still draining a provider, tool, or child Agent; retry the pause/migration after event.session_changed",
+      );
+    }
+    team?.close();
+    if (team && agentTeams.get(session.meta.id) === team) agentTeams.delete(session.meta.id);
+    const previousSuspension = session.meta.serveSuspension;
+    session.meta.serveSuspension = suspension;
+    try {
+      hub.save(session);
+    } catch (error) {
+      if (previousSuspension) session.meta.serveSuspension = previousSuspension;
+      else delete session.meta.serveSuspension;
+      session.configuring = false;
+      publishSuspensionItem(session, suspension, "failed", "unknown");
+      throw error;
+    }
+    publishSuspensionItem(session, suspension, "paused");
+    if (state === "paused") session.configuring = false;
+    broadcast("event.session_changed", {
+      sessionId: session.meta.id,
+      change: state === "migrating" ? "migration_prepared" : "paused",
+      historyRefreshRequired: false,
+      suspensionId,
+    });
+    return { suspension, ...(migrationToken ? { migrationToken } : {}) };
+  };
+
   // Discovery file — the desktop shell reads this to find the running server (like a pid/port file).
   const discoveryDir = join(deps.discoveryHome ?? homedir(), ".hara");
   const artifactHome = deps.artifactHome ?? homedir();
@@ -3510,6 +3690,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
     },
     deferStartedResult = false,
   ): Promise<SubmitDecision> => {
+    if (s.meta.serveSuspension) {
+      return {
+        submission: "not_submitted",
+        reason: "session_paused",
+        detail: s.meta.serveSuspension.state === "migrating"
+          ? "this session is waiting for its migration token to be resumed"
+          : "this session is paused; call session.resume before sending input",
+      };
+    }
     if (
       s.meta.agentRef
       && (s.meta.spaceId ?? failClosedSpaceId(s.meta.profileId)) === "personal"
@@ -3865,7 +4054,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           const methods = [
             "server.shutdown",
             "events.replay", "events.ack", "events.snapshot",
-            "session.list", "session.create", "session.resume", "session.history", "session.runtime.replay", "session.agents.list", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
+            "session.list", "session.create", "session.resume", "session.pause", "session.migration.prepare", "session.migration.resume", "session.history", "session.runtime.replay", "session.agents.list", "session.submit", "session.send", "session.steer", "session.interrupt", "session.control.acquire", "session.control.release", "session.set-model", "session.set-approval",
             "session.rename", "session.archive", "session.compact", "session.rewind", "session.context", "session.delete", "session.fork",
             "approval.reply", "plugins.list", "plugins.set", "skills.list", "models.list", "agents.list", "agents.create", "agents.update-profile", "agents.archive", "files.search", "project.panels",
             "external.sources.list", "external.sessions.list", "external.sessions.create", "external.sessions.read", "external.sessions.resume", "external.sessions.fork",
@@ -3906,6 +4095,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "events.restart-replay.v1",
             "events.authoritative-snapshot.v1",
             "sessions.runtime-journal-replay.v1",
+            "sessions.pause-migrate.v1",
             "models.capabilities.v1",
             "sessions.command-idempotency.v1",
             "sessions.command-idempotency.durable.v2",
@@ -4262,6 +4452,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 jobId: m.jobId,
                 archived: m.archived ?? false,
                 agentRef: m.agentRef,
+                suspension: publicSuspension(m.serveSuspension),
               })),
               page: {
                 hasMore: page.hasMore,
@@ -5258,6 +5449,67 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               agentRef: s.meta.agentRef,
             }));
           }
+          case "session.pause": {
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            const s = hub.get(p.sessionId);
+            if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            authorizeSessionMutation(ws, p.sessionId, p);
+            if (s.meta.serveSuspension?.state === "paused") {
+              return reply(rpcResult(id!, {
+                sessionId: s.meta.id,
+                state: "paused",
+                suspensionId: s.meta.serveSuspension.suspensionId,
+                pausedAt: s.meta.serveSuspension.pausedAt,
+                runtimeCursor: runtimeJournalCursor(s.meta.id),
+              }));
+            }
+            const paused = await suspendSession(s, "paused");
+            return reply(rpcResult(id!, {
+              sessionId: s.meta.id,
+              state: "paused",
+              suspensionId: paused.suspension.suspensionId,
+              pausedAt: paused.suspension.pausedAt,
+              runtimeCursor: runtimeJournalCursor(s.meta.id),
+            }));
+          }
+          case "session.migration.prepare": {
+            if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
+            if (p.ttlMs !== undefined && (!Number.isSafeInteger(p.ttlMs) || p.ttlMs < MIN_SESSION_MIGRATION_TTL_MS || p.ttlMs > MAX_SESSION_MIGRATION_TTL_MS)) {
+              return reply(rpcError(
+                id,
+                ERR.PARAMS,
+                `ttlMs must be an integer from ${MIN_SESSION_MIGRATION_TTL_MS} to ${MAX_SESSION_MIGRATION_TTL_MS}`,
+              ));
+            }
+            const s = hub.get(p.sessionId);
+            if (!s) return reply(rpcError(id, ERR.NO_SESSION, `no live session ${p.sessionId}`));
+            authorizeSessionMutation(ws, p.sessionId, p);
+            const prepared = await suspendSession(s, "migrating", p.ttlMs ?? SESSION_MIGRATION_TTL_MS);
+            s.configuring = false;
+            if (!hub.detach(s.meta.id)) {
+              delete s.meta.serveSuspension;
+              hub.save(s);
+              publishSuspensionItem(s, prepared.suspension, "cancelled", "unknown");
+              return reply(rpcError(id, ERR.INTERNAL, "session became active before its writer lock could be released; retry migration"));
+            }
+            const released = controlLeases.release(
+              sessionControlResource(p.sessionId),
+              ws,
+              controlLeaseFromParams(p),
+            );
+            if (released.released) {
+              publishSessionControlState(p.sessionId, "released", released.epoch, "released");
+            }
+            return reply(rpcResult(id!, {
+              sessionId: p.sessionId,
+              state: "migrating",
+              suspensionId: prepared.suspension.suspensionId,
+              migrationToken: prepared.migrationToken,
+              expiresAt: prepared.suspension.expiresAt,
+              sourceInstanceId: prepared.suspension.sourceInstanceId,
+              runtimeCursor: runtimeJournalCursor(p.sessionId),
+            }));
+          }
           case "session.resume": {
             if (typeof p.sessionId !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId required"));
             if (p.approval !== undefined && !isApprovalMode(p.approval)) {
@@ -5266,6 +5518,14 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const live = hub.get(p.sessionId);
             if (live?.busy || live?.configuring) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry resume shortly"));
             const priorMeta = hub.peekMeta(p.sessionId);
+            const priorSuspension = live?.meta.serveSuspension ?? priorMeta?.serveSuspension;
+            if (priorSuspension?.state === "migrating" && !migrationExpired(priorSuspension)) {
+              return reply(rpcError(
+                id,
+                ERR.LOCKED,
+                "session has an unexpired migration checkpoint; resume it with session.migration.resume and the migration token",
+              ));
+            }
             const defaultRoute = priorMeta?.profileId ? undefined : runtimeInfo(priorMeta?.cwd);
             let boundProfileId = priorMeta?.profileId ?? defaultRoute?.profileId ?? "personal";
             let boundSpaceId = defaultRoute?.spaceId ?? failClosedSpaceId(boundProfileId);
@@ -5313,19 +5573,49 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             r.session.configuring = true;
             let refreshed = false;
+            let refreshFailure: unknown;
             try {
               refreshed = await refreshSessionProvider(r.session);
             } catch (error) {
-              hub.detach(r.session.meta.id);
-              return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+              refreshFailure = error;
             } finally {
               r.session.configuring = false;
+            }
+            if (refreshFailure) {
+              hub.detach(r.session.meta.id);
+              return reply(rpcError(id, ERR.UNAUTHORIZED, refreshFailure instanceof Error ? refreshFailure.message : String(refreshFailure)));
             }
             if (!refreshed) {
               hub.detach(r.session.meta.id);
               return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${r.session.meta.model}'`));
             }
-            if (migratedProfileBinding || migratedSpaceBinding || migratedRuntimeDefaults || migratedApproval) hub.save(r.session);
+            const suspension = r.session.meta.serveSuspension;
+            if (suspension?.state === "migrating" && !migrationExpired(suspension)) {
+              hub.detach(r.session.meta.id);
+              return reply(rpcError(
+                id,
+                ERR.LOCKED,
+                "session migration changed while resume was starting; use session.migration.resume",
+              ));
+            }
+            if (suspension) delete r.session.meta.serveSuspension;
+            if (migratedProfileBinding || migratedSpaceBinding || migratedRuntimeDefaults || migratedApproval || suspension) {
+              hub.save(r.session);
+            }
+            if (suspension) {
+              if (suspension.state === "migrating") {
+                publishSuspensionItem(r.session, suspension, "cancelled", "timeout");
+              } else {
+                publishSuspensionItem(r.session, suspension, "resumed");
+                publishSuspensionItem(r.session, suspension, "completed");
+              }
+              broadcast("event.session_changed", {
+                sessionId: r.session.meta.id,
+                change: suspension.state === "migrating" ? "migration_expired" : "resumed",
+                historyRefreshRequired: false,
+                suspensionId: suspension.suspensionId,
+              });
+            }
             try {
               reconcileSessionCommandReceipts(r.session);
             } catch {
@@ -5368,6 +5658,144 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               } : undefined,
             }));
           }
+          case "session.migration.resume": {
+            if (typeof p.sessionId !== "string" || typeof p.migrationToken !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId + migrationToken required"));
+            }
+            if (
+              p.suspensionId !== undefined
+              && (typeof p.suspensionId !== "string" || !validSessionCommandId(p.suspensionId))
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "suspensionId must be a UUID when supplied"));
+            }
+            if (p.approval !== undefined && !isApprovalMode(p.approval)) {
+              return reply(rpcError(id, ERR.PARAMS, "approval must be suggest, auto-edit, or full-auto"));
+            }
+            const live = hub.get(p.sessionId);
+            if (live?.busy || live?.configuring) {
+              return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry migration resume shortly"));
+            }
+            const priorMeta = hub.peekMeta(p.sessionId);
+            const priorSuspension = priorMeta?.serveSuspension;
+            if (!priorMeta) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            if (priorSuspension?.state !== "migrating") {
+              return reply(rpcError(id, ERR.CONFLICT, "session has no pending migration checkpoint"));
+            }
+            if (migrationExpired(priorSuspension)) {
+              return reply(rpcError(id, ERR.CONFLICT, "session migration expired; use session.resume to recover it locally"));
+            }
+            if (p.suspensionId !== undefined && p.suspensionId !== priorSuspension.suspensionId) {
+              return reply(rpcError(id, ERR.CONFLICT, "migration checkpoint changed; refresh before retrying"));
+            }
+            let boundProfileId = priorMeta.profileId ?? runtimeInfo(priorMeta.cwd).profileId ?? "personal";
+            let boundSpaceId = failClosedSpaceId(boundProfileId);
+            try {
+              const binding = sessionSpaceBinding(priorMeta);
+              boundProfileId = binding.profileId;
+              boundSpaceId = binding.spaceId;
+            } catch (error) {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, error instanceof Error ? error.message : String(error)));
+            }
+            const provider = deps.buildProviderFor
+              ? await deps.buildProviderFor(priorMeta.model, priorMeta.effort, priorMeta.cwd, boundProfileId, boundSpaceId)
+              : await deps.buildSessionProvider(priorMeta.cwd, boundProfileId, boundSpaceId);
+            if (closing) return;
+            if (!provider) return reply(rpcError(id, ERR.INTERNAL, "provider not authenticated for the migrating session route"));
+            const resumed = hub.resume(p.sessionId, {
+              provider,
+              approval: deps.approval,
+              ...(isApprovalMode(p.approval) ? { legacyApproval: p.approval } : {}),
+              projectContext: undefined,
+            });
+            if ("missing" in resumed) return reply(rpcError(id, ERR.NO_SESSION, `no session ${p.sessionId}`));
+            if ("lockedBy" in resumed) return reply(rpcError(id, ERR.LOCKED, `session held by live pid ${resumed.lockedBy}`));
+            if ("busy" in resumed) return reply(rpcError(id, ERR.BUSY, "session is running or changing configuration — retry migration resume shortly"));
+            const session = resumed.session;
+            const suspension = session.meta.serveSuspension;
+            const invalidCheckpoint = suspension?.state !== "migrating"
+              || migrationExpired(suspension)
+              || (p.suspensionId !== undefined && suspension.suspensionId !== p.suspensionId);
+            if (invalidCheckpoint) {
+              hub.detach(session.meta.id);
+              return reply(rpcError(id, ERR.CONFLICT, "migration checkpoint changed after the target acquired its lock"));
+            }
+            if (!migrationTokenMatches(p.migrationToken, suspension.migrationTokenSha256!)) {
+              hub.detach(session.meta.id);
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "invalid migration token"));
+            }
+            if (
+              (session.meta.profileId && session.meta.profileId !== boundProfileId)
+              || (session.meta.spaceId && session.meta.spaceId !== boundSpaceId)
+            ) {
+              hub.detach(session.meta.id);
+              return reply(rpcError(id, ERR.CONFLICT, "session route changed while migration resume was starting"));
+            }
+            session.meta.profileId = boundProfileId;
+            session.meta.spaceId = boundSpaceId;
+            session.configuring = true;
+            let refreshed = false;
+            let refreshFailure: unknown;
+            try {
+              refreshed = await refreshSessionProvider(session);
+            } catch (error) {
+              refreshFailure = error;
+            } finally {
+              session.configuring = false;
+            }
+            if (refreshFailure) {
+              hub.detach(session.meta.id);
+              return reply(rpcError(id, ERR.UNAUTHORIZED, refreshFailure instanceof Error ? refreshFailure.message : String(refreshFailure)));
+            }
+            if (!refreshed) {
+              hub.detach(session.meta.id);
+              return reply(rpcError(id, ERR.INTERNAL, `provider not authenticated for pinned model '${session.meta.model}'`));
+            }
+            try {
+              reconcileSessionCommandReceipts(session);
+              delete session.meta.serveSuspension;
+              hub.save(session);
+            } catch {
+              // Restore the exact checkpoint in memory before releasing the lock; the durable snapshot
+              // still carries it when either write failed.
+              session.meta.serveSuspension = suspension;
+              hub.detach(session.meta.id);
+              return reply(rpcError(id, ERR.INTERNAL, "migration resume could not commit its authoritative checkpoint; retry with the same token"));
+            }
+            session.projectContext = loadAgentContext(session.meta.cwd) || undefined;
+            publishSuspensionItem(session, suspension, "resumed");
+            publishSuspensionItem(session, suspension, "completed");
+            broadcast("event.session_changed", {
+              sessionId: session.meta.id,
+              change: "migrated",
+              historyRefreshRequired: true,
+              suspensionId: suspension.suspensionId,
+              sourceInstanceId: suspension.sourceInstanceId,
+              targetInstanceId: instanceId,
+            });
+            broadcastTaskState(session, { phase: "restored" });
+            return reply(rpcResult(id!, {
+              sessionId: session.meta.id,
+              model: session.meta.model,
+              profileId: session.meta.profileId,
+              spaceId: session.meta.spaceId,
+              approval: session.approval,
+              agentRef: session.meta.agentRef,
+              history: historyForClient(session.history),
+              task: session.task ? {
+                id: session.task.id,
+                objective: session.task.objective,
+                status: session.task.status,
+                turnId: session.task.turnId,
+                updatedAt: session.task.updatedAt,
+              } : undefined,
+              migration: {
+                suspensionId: suspension.suspensionId,
+                sourceInstanceId: suspension.sourceInstanceId,
+                targetInstanceId: instanceId,
+                runtimeCursor: runtimeJournalCursor(session.meta.id),
+              },
+            }));
+          }
           case "session.history": {
             // Provider-independent local replay. A revoked organization/model must stop future inference,
             // not prevent the owner from reading history already stored on this machine.
@@ -5383,6 +5811,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               spaceId: snapshot.meta.spaceId,
               approval: snapshot.meta.approval,
               agentRef: snapshot.meta.agentRef,
+              suspension: publicSuspension(snapshot.meta.serveSuspension),
               history: historyForClient(snapshot.history),
               readOnly: true,
             }));

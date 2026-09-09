@@ -78,6 +78,18 @@
 //                                                   aware shared generations/rounds/tools/token/deadline fence.
 //   session.resume    {sessionId,approval?}      → {sessionId,model,profileId,approval,history:[{role,text}]}
 //                                                    approval only migrates legacy sessions with no saved choice.
+//   session.pause     {sessionId,controlLease?}  → {sessionId,state:"paused",suspensionId,runtimeCursor}
+//                      Flushes the authoritative snapshot before cancellation, drains the root turn, tools,
+//                      provider calls and child Agents, then persists a content-free pause checkpoint.
+//   session.migration.prepare {sessionId,ttlMs?,controlLease?}
+//                                                   → {sessionId,state:"migrating",suspensionId,
+//                                                       migrationToken,expiresAt,runtimeCursor}
+//                      Releases the source writer lock only after every producer is quiescent. The raw token
+//                      is returned once; persistence contains only its SHA-256 verifier.
+//   session.migration.resume {sessionId,migrationToken,suspensionId?}
+//                                                   → normal session.resume result plus migration metadata.
+//                      The target acquires the session lock, revalidates the exact unexpired checkpoint and
+//                      provider/Space route, commits the resumed state, then permits new input.
 //   session.history   {sessionId}                → {sessionId,model,profileId,approval?,history:[{role,text}],readOnly:true}
 //                                                    Provider-independent local replay for unavailable routes.
 //   session.runtime.replay {sessionId,afterSequence?,limit?}
@@ -219,6 +231,7 @@ export type SessionSubmitMode = "start_or_steer" | "start_if_idle" | "steer";
 
 export type SessionNotSubmittedReason =
   | "not_idle"
+  | "session_paused"
   | "no_active_turn"
   | "expected_turn_mismatch"
   | "configuration_mismatch"
