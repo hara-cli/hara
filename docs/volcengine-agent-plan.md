@@ -45,6 +45,37 @@ conversation models remain available. In the connection-bound vision-first setti
 it has confirmed accept image input; `auto` is never offered as a fixed image preprocessor because its routed
 model can change between requests.
 
+### Current Hara catalog and routing facts
+
+The current built-in Agent Plan catalog is below. A successful live `/models` response for the saved key remains
+authoritative; this table is the bounded fallback used when discovery is unavailable. Every row is an Agent/Coding
+conversation model and supports Hara's Responses tool contract. Media-only ids discovered from the same endpoint
+are filtered out and cannot inherit that tool capability merely because they share the endpoint.
+
+| model id | image input used by automatic fallback | known context window |
+|---|---|---:|
+| `auto` | unconfirmed (dynamic router) | unconfirmed |
+| `doubao-seed-evolving` | unconfirmed | 1,024,000 |
+| `doubao-seed-2.1-turbo` | supported | 256,000 |
+| `doubao-seed-2.0-lite` | unconfirmed | 256,000 |
+| `doubao-seed-2.0-mini` | unconfirmed | 256,000 |
+| `glm-5.3-flash` | supported | 1,024,000 |
+| `glm-5.3` | not advertised | 1,024,000 |
+| `deepseek-v4-pro` | not advertised | 1,024,000 |
+| `deepseek-v4-flash` | not advertised | 1,024,000 |
+| `minimax-m3` | supported | 1,000,000 |
+| `kimi-k2.7-code` | supported | 256,000 |
+| `kimi-k3` | supported | 1,024,000 |
+| `ark-code-latest` | unconfirmed (moving alias) | unconfirmed |
+| `glm-latest` | unconfirmed (moving alias) | unconfirmed |
+
+“Unconfirmed” fails closed for image or context-sensitive automatic fallback; it does not mean the provider will
+necessarily reject a direct request. A user's explicit current-model choice may still call such a route. Hara
+does not infer a provider, endpoint, account, or Key from any model id: every fallback entry is an existing saved
+connection, re-resolved with its own current model and credential immediately before the turn. A future model id
+returned only by live discovery remains directly selectable, but its tool capability is also unconfirmed until a
+new Hara capability table or an authoritative provider capability field identifies it.
+
 ## Codex CLI or Codex mode in ChatGPT Desktop
 
 Install current Codex, then put this provider in `~/.codex/config.toml` (Windows:

@@ -59,6 +59,53 @@ test("model capabilities preserve current multimodal and text-only boundaries", 
   });
   assert.equal(minimax.imageInput, "supported");
   assert.equal(minimax.contextWindowTokens, 1_000_000);
+
+  const currentArkModels = new Map([
+    ["auto", ["unknown", undefined]],
+    ["doubao-seed-evolving", ["unknown", 1_024_000]],
+    ["doubao-seed-2.1-turbo", ["supported", 256_000]],
+    ["doubao-seed-2.0-lite", ["unknown", 256_000]],
+    ["doubao-seed-2.0-mini", ["unknown", 256_000]],
+    ["glm-5.3-flash", ["supported", 1_024_000]],
+    ["glm-5.3", ["unsupported", 1_024_000]],
+    ["deepseek-v4-pro", ["unsupported", 1_024_000]],
+    ["deepseek-v4-flash", ["unsupported", 1_024_000]],
+    ["minimax-m3", ["supported", 1_000_000]],
+    ["kimi-k2.7-code", ["supported", 256_000]],
+    ["kimi-k3", ["supported", 1_024_000]],
+    ["ark-code-latest", ["unknown", undefined]],
+    ["glm-latest", ["unknown", undefined]],
+  ]);
+  for (const [model, [imageInput, contextWindowTokens]] of currentArkModels) {
+    const capabilities = providerModelCapabilities({
+      provider: "volcengine-agent-plan",
+      baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+      model,
+    });
+    assert.equal(capabilities.imageInput, imageInput, `${model} image capability`);
+    assert.equal(capabilities.contextWindowTokens, contextWindowTokens, `${model} context window`);
+    assert.equal(capabilities.toolCalling, "supported", `${model} uses the Agent Plan tool endpoint`);
+  }
+
+  const arkMediaModel = providerModelCapabilities({
+    provider: "volcengine-agent-plan",
+    baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+    model: "doubao-seedream-5.0-lite",
+  });
+  assert.equal(
+    arkMediaModel.toolCalling,
+    "unsupported",
+    "a manually entered media model must not inherit the Agent Plan conversation-tool contract",
+  );
+  assert.equal(
+    providerModelCapabilities({
+      provider: "volcengine-agent-plan",
+      baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+      model: "future-model-returned-by-live-discovery",
+    }).toolCalling,
+    "unknown",
+    "a newly discovered model stays directly selectable without inheriting unverified tool capability",
+  );
 });
 
 test("a circuit is isolated by exact credential/model route and recovers through one half-open probe", () => {
@@ -90,8 +137,10 @@ test("a circuit is isolated by exact credential/model route and recovers through
 test("auth health is account-aware while model health remains model-scoped", () => {
   const one = connected("account-a", { model: "glm-5.3-flash" });
   const sameAccountModel = connected("account-a", { model: "kimi-k3" });
+  const duplicateSavedConnection = connected("renamed-account-a", { model: "deepseek-v4-pro" });
   const otherAccount = connected("account-b", { apiKey: "fixture-key-b", model: "kimi-k3" });
   assert.equal(sameProviderAccount(one, sameAccountModel), true);
+  assert.equal(sameProviderAccount(one, duplicateSavedConnection), true, "a duplicate label cannot disguise the same credential and endpoint as another account");
   assert.equal(sameProviderAccount(one, otherAccount), false);
 });
 
@@ -120,6 +169,13 @@ test("automatic fallback is rejected when input, tools, context, or health are i
   assert.deepEqual(
     providerCompatibility(unknown, { imageInput: false, toolCalling: true }),
     { ok: false, reason: "tool_calling" },
+  );
+  const unresolvedContextRequirement = providerTurnRequirements([], [], unknown, "context_overflow");
+  assert.equal(unresolvedContextRequirement.contextWindowComparisonUnavailable, true);
+  assert.deepEqual(
+    providerCompatibility(textOnly, unresolvedContextRequirement),
+    { ok: false, reason: "context_window" },
+    "context failover stays disabled when the failed model's actual window is unknown",
   );
   assert.deepEqual(
     providerCompatibility(textOnly, { imageInput: false, toolCalling: false, minimumContextWindowTokens: 1_024_001 }),

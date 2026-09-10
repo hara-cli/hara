@@ -285,6 +285,8 @@ export interface ServeDeps {
   providerId: string;
   model: string;
   buildSessionProvider: (cwd?: string, profileId?: string, spaceId?: string) => Promise<Provider | null>; // fresh live config/credential route
+  /** Fresh user-authorized fallbacks for this exact session audience. The builder must never cross Spaces. */
+  buildFallbackProviders?: (primary: Provider, cwd?: string, profileId?: string, spaceId?: string) => Promise<Provider[]>;
   /** provider for a specific model/effort — powers per-session model switching (composer picker) */
   /** `null` means provider/model automatic; `undefined` means inherit the current connection default. */
   buildProviderFor?: (model: string, effort?: string | null, cwd?: string, profileId?: string, spaceId?: string) => Promise<Provider | null>;
@@ -317,6 +319,8 @@ export interface ServeDeps {
   testProviderConnection?: (id: string, cwd?: string) => Promise<ProviderSettingsTestResult>;
   useProviderConnection?: (id: string, cwd?: string) => ProviderSettingsState;
   removeProviderConnection?: (id: string, cwd?: string) => ProviderSettingsState;
+  /** Save a bounded, user-authorized order of existing Personal connections for compatible failover. */
+  saveProviderFailover?: (connectionIds: string[], cwd?: string) => ProviderSettingsState;
   /** Explicitly remove the project profile pin governing cwd. Existing sessions retain their stored
    * profile; the returned snapshots describe only the route used by future sessions. */
   unpinProjectProfile?: (cwd?: string) => ProjectProfileUnpinResult;
@@ -750,6 +754,8 @@ export interface ProviderSettingsState {
   };
   providers: ProviderSettingsCatalogEntry[];
   connections?: ProviderConnectionSummary[];
+  fallbackConnectionIds?: string[];
+  fallbackConnectionIdsEditable?: boolean;
   switchLocked?: boolean;
   vision?: VisionSettingsState;
 }
@@ -2844,6 +2850,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         ? await deps.buildGuardian(s.meta.cwd, s.meta.profileId, s.meta.spaceId)
         : deps.guardian;
       sessionSpaceBinding(s.meta);
+      let turnFallbackProviders: Provider[] = [];
+      if (deps.buildFallbackProviders) {
+        try {
+          turnFallbackProviders = await deps.buildFallbackProviders(
+            s.provider,
+            s.meta.cwd,
+            s.meta.profileId,
+            s.meta.spaceId,
+          );
+          sessionSpaceBinding(s.meta);
+        } catch (error) {
+          runtimeLog("provider.fallback_unavailable", {
+            sessionId: s.meta.id,
+            category: serveRuntimeFailureCategory(error),
+          });
+        }
+      }
       restoreTodos(s.meta.todos, sessionId);
       stopTodoEvents = onTodosChange((todos) => {
         // Keep the session snapshot current while the turn runs. Steering and task-intake checkpoints can
@@ -3091,6 +3114,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         },
         onRuntimeItem: (event) => publishRuntimeItem(s, event),
         onToolRun: (toolRun, tool) => observeToolRun(s, toolRun, tool),
+        ...(turnFallbackProviders.length ? { fallback: { providers: turnFallbackProviders } } : {}),
         guardian: turnGuardian,
         ...(deps.runLimits?.(s.meta.cwd) ?? {}),
         });
@@ -4151,7 +4175,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.terminal.scroll", "external.sessions.terminal.release", "external.sessions.terminal.handoff-ready", "external.sessions.terminal.open-wezterm",
             "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.test", "settings.vision.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
-            "settings.providers.connections.remove", "settings.gateways.list",
+            "settings.providers.connections.remove", "settings.providers.failover.save", "settings.gateways.list",
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
             "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
             "settings.organizations.remove", "settings.organizations.check",
@@ -6483,6 +6507,23 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             }
             if (!deps.removeProviderConnection) return reply(rpcError(id, ERR.METHOD, "named provider connection removal is not supported by this server"));
             return reply(rpcResult(id!, redactSensitiveValue(deps.removeProviderConnection(p.id, targetCwd)).value));
+          }
+          case "settings.providers.failover.save": {
+            if (!deps.saveProviderFailover) {
+              return reply(rpcError(id, ERR.METHOD, "saved-connection failover is not supported by this server"));
+            }
+            if (
+              !Array.isArray(p.connectionIds)
+              || p.connectionIds.length > 4
+              || p.connectionIds.some((value: unknown) => typeof value !== "string")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "connectionIds must be an array of at most four saved connection ids"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(
+              id!,
+              redactSensitiveValue(deps.saveProviderFailover(p.connectionIds, targetCwd)).value,
+            ));
           }
           case "settings.profiles.unpin": {
             if (!deps.unpinProjectProfile) return reply(rpcError(id, ERR.METHOD, "project profile recovery not supported by this server"));

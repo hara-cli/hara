@@ -369,6 +369,64 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
   quietDiscovery: true,
 });
 
+test("serve e2e: a Personal turn resolves and uses its ordered saved-connection fallback chain", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-provider-fallback-"));
+  let primaryTurns = 0;
+  let fallbackTurns = 0;
+  let fallbackBuild;
+  const primary = {
+    id: "primary-provider",
+    model: "primary-model",
+    async turn() {
+      primaryTurns += 1;
+      return {
+        text: "",
+        toolUses: [],
+        stop: "error",
+        errorMsg: "service unavailable",
+        errorMetadata: { status: 503 },
+        usage: { input: 1, output: 0 },
+      };
+    },
+  };
+  const fallback = {
+    id: "fallback-provider",
+    model: "fallback-model",
+    async turn({ onText }) {
+      fallbackTurns += 1;
+      onText("fallback reply");
+      return { text: "fallback reply", toolUses: [], stop: "end", usage: { input: 2, output: 2 } };
+    },
+  };
+  const deps = {
+    ...baseDeps(primary, memStore()),
+    buildFallbackProviders: async (...args) => {
+      fallbackBuild = args;
+      return [fallback];
+    },
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(server.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const created = await client.call("session.create", { cwd: dir });
+    const sent = await client.call("session.send", {
+      sessionId: created.result.sessionId,
+      text: "what is the current status?",
+    });
+    assert.equal(sent.result.reply, "fallback reply");
+    assert.equal(primaryTurns, 1);
+    assert.equal(fallbackTurns, 1);
+    assert.equal(fallbackBuild[0], primary, "Serve supplies the exact pinned primary provider");
+    assert.equal(fallbackBuild[1], dir);
+    assert.equal(fallbackBuild[3], "personal", "the builder receives the session Space boundary");
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: pause drains an active model turn, fences input, and resumes one lifecycle", { timeout: 20000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-pause-"));
   const store = memStore();
@@ -2771,12 +2829,15 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       legacyPersonal: true,
       removable: false,
     }],
+    fallbackConnectionIds: [],
+    fallbackConnectionIdsEditable: true,
     switchLocked: false,
   };
   let savedInput;
   let savedVisionInput;
   let testedVisionInput;
   let createdConnectionInput;
+  let savedFallbackConnectionIds;
   let enrolledOrganizationInput;
   let unpinnedCwd;
   let closeGatewayLoginsCalled = false;
@@ -2871,6 +2932,10 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       current: { ...state.current, profileId: id },
     }),
     removeProviderConnection: () => ({ ...state, connections: state.connections }),
+    saveProviderFailover: (connectionIds) => {
+      savedFallbackConnectionIds = [...connectionIds];
+      return { ...state, fallbackConnectionIds: [...connectionIds] };
+    },
     gatewayStatuses: async () => [{
       platform: "weixin",
       label: "WeChat",
@@ -2930,6 +2995,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       "settings.providers.connections.test",
       "settings.providers.connections.use",
       "settings.providers.connections.remove",
+      "settings.providers.failover.save",
     ]) assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
     assert.ok(init.result.capabilities.methods.includes("settings.gateways.list"));
     for (const method of [
@@ -2992,6 +3058,15 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       (await c.call("settings.providers.connections.test", { id: "qwen-personal" })).result,
       { ok: true, models: ["qwen-personal-model"] },
     );
+    const fallbackSaved = await c.call("settings.providers.failover.save", {
+      connectionIds: ["qwen-personal", "personal"],
+    });
+    assert.deepEqual(savedFallbackConnectionIds, ["qwen-personal", "personal"]);
+    assert.deepEqual(fallbackSaved.result.fallbackConnectionIds, ["qwen-personal", "personal"]);
+    const tooManyFallbacks = await c.call("settings.providers.failover.save", {
+      connectionIds: ["a", "b", "c", "d", "e"],
+    });
+    assert.equal(tooManyFallbacks.error.code, -32602);
     assert.equal(
       (await c.call("settings.providers.connections.use", { id: "qwen-personal" })).result.current.profileId,
       "qwen-personal",

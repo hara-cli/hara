@@ -6,6 +6,10 @@ import { providerAccounting, type ProviderAccountingDescriptor } from "./account
 import { resolvePlatform, type WireApi } from "./registry.js";
 import type { ProviderTarget } from "./target.js";
 import type { NeutralMsg, Provider, ToolSpec, TurnArgs, TurnResult } from "./types.js";
+import {
+  isKnownVolcengineAgentPlanModel,
+  isVolcengineAgentPlanInteractiveModel,
+} from "./volcengine.js";
 
 export type CapabilitySupport = "supported" | "unsupported" | "unknown";
 export type ProviderCircuitState = "closed" | "open" | "half_open";
@@ -71,7 +75,7 @@ function hasKnownContextWindow(model: string): boolean {
   return /(?:haiku|opus|sonnet|fable|claude-4|(?:^|-)1m(?:-|$))/.test(id)
     || /^qwen3\.(?:8-(?:max|flash)|7-(?:max|plus|flash)|6-(?:plus|flash))(?:-|$)/.test(id)
     || /^(?:qwen3-max-2026-01-23|qwen3-coder-(?:next|plus)|kimi-k2\.5)(?:-|$)/.test(id)
-    || /^glm-(?:5(?:\.3)?|4\.7)(?:-|$)|^glm-latest(?:-|$)/.test(id)
+    || /^glm-(?:5(?:\.3)?|4\.7)(?:-|$)/.test(id)
     || /^deepseek-v4-(?:flash|pro)(?:-|$)|^kimi-k3(?:-|$)/.test(id)
     || /^doubao-seed-(?:evolving|2\.(?:0-(?:mini|lite)|1-turbo))(?:-|$)/.test(id)
     || /^kimi-k2\.7-code(?:-|$)|^minimax-m(?:3|2\.5)(?:-|$)/.test(id)
@@ -80,7 +84,15 @@ function hasKnownContextWindow(model: string): boolean {
 
 function knownToolCalling(provider: string, model: string): CapabilitySupport {
   const id = bareModel(model);
+  // Ark's Agent Plan route is itself a Codex/Responses tool endpoint. Its `auto` and
+  // `ark-code-latest` routers do not expose one fixed model family, but they still support the
+  // function-calling contract Hara uses. Keep image/context unknown for those routers because the
+  // selected backing model can change; only the endpoint-level tool capability is stable.
   if (provider === "hara-gateway") return "supported";
+  if (provider === "volcengine-agent-plan") {
+    if (!isVolcengineAgentPlanInteractiveModel(model)) return "unsupported";
+    return isKnownVolcengineAgentPlanModel(model) ? "supported" : "unknown";
+  }
   if (
     provider === "anthropic"
     || /^(?:claude|gpt-|o[134](?:-|$)|qwen|qwq|glm|deepseek|minimax|kimi|moonshot|doubao|gemini|grok|llama|mistral|mixtral|codestral)/.test(id)
@@ -126,7 +138,6 @@ export function providerConnectionDescriptor(
   target: ProviderTarget,
 ): ProviderConnectionDescriptor {
   const accountMaterial = JSON.stringify({
-    connectionId: boundedIdentity(connectionId),
     provider: target.provider,
     baseURL: target.baseURL ?? "",
     credential: target.apiKey ?? "",
@@ -258,6 +269,9 @@ export interface ProviderTurnRequirements {
   imageInput: boolean;
   toolCalling: boolean;
   minimumContextWindowTokens?: number;
+  /** A context-overflow route cannot prove that another model is larger when the failed model's window
+   * is dynamic or undocumented. This deliberately blocks automatic switching instead of guessing. */
+  contextWindowComparisonUnavailable?: boolean;
 }
 
 export function providerTurnRequirements(
@@ -266,11 +280,14 @@ export function providerTurnRequirements(
   failedProvider?: Provider,
   kind?: ErrKind,
 ): ProviderTurnRequirements {
+  const failedContextWindow = failedProvider?.connection?.capabilities.contextWindowTokens;
   return {
     imageInput: hasImages(history),
     toolCalling: tools.length > 0,
-    ...(kind === "context_overflow" && failedProvider?.connection?.capabilities.contextWindowTokens
-      ? { minimumContextWindowTokens: failedProvider.connection.capabilities.contextWindowTokens + 1 }
+    ...(kind === "context_overflow"
+      ? failedContextWindow
+        ? { minimumContextWindowTokens: failedContextWindow + 1 }
+        : { contextWindowComparisonUnavailable: true }
       : {}),
   };
 }
@@ -291,6 +308,9 @@ export function providerCompatibility(
   }
   if (requirements.toolCalling && capabilities?.toolCalling !== "supported") {
     return { ok: false, reason: "tool_calling" };
+  }
+  if (requirements.contextWindowComparisonUnavailable) {
+    return { ok: false, reason: "context_window" };
   }
   if (
     requirements.minimumContextWindowTokens !== undefined

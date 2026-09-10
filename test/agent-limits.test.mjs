@@ -634,6 +634,69 @@ test("persistent malformed tool calls stop after the single same-model retry", a
   assert.match(outcome.error, /malformed tool-call arguments/);
 });
 
+test("malformed tool recovery never replays after provider stream activity", async () => {
+  let turns = 0;
+  const provider = {
+    id: "malformed-after-activity",
+    model: "malformed-after-activity",
+    async turn(args) {
+      turns += 1;
+      args.onActivity?.();
+      return {
+        text: "",
+        toolUses: [],
+        stop: "error",
+        errorMsg: "Tool call dropped — the model emitted malformed tool-call arguments, so its arguments were incomplete.",
+      };
+    },
+  };
+  const history = [{ role: "user", content: "do not replay visible work" }];
+  const outcome = await runAgent(history, base(provider, {
+    maxRounds: 10,
+    timeoutMs: "10s",
+    quiet: true,
+  }));
+  assert.equal(outcome.status, "error");
+  assert.equal(turns, 1);
+  assert.equal(history.some((message) => message.role === "user" && /Provider protocol recovery/.test(message.content)), false);
+});
+
+test("context recovery and fallback never replay after provider stream activity", async () => {
+  let primaryTurns = 0;
+  let fallbackTurns = 0;
+  const primary = {
+    id: "context-after-activity",
+    model: "context-after-activity",
+    async turn(args) {
+      primaryTurns += 1;
+      args.onActivity?.();
+      return {
+        text: "",
+        toolUses: [],
+        stop: "error",
+        errorMsg: "maximum context length exceeded",
+      };
+    },
+  };
+  const fallback = {
+    id: "context-backup",
+    model: "context-backup",
+    async turn() {
+      fallbackTurns += 1;
+      return { text: "must not replay", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "do not replay visible work" }], base(primary, {
+    maxRounds: 10,
+    timeoutMs: "10s",
+    quiet: true,
+    fallback: { provider: fallback },
+  }));
+  assert.equal(outcome.status, "error");
+  assert.equal(primaryTurns, 1);
+  assert.equal(fallbackTurns, 0);
+});
+
 test("two retries of an identical failed tool call trip the repeat-loop circuit breaker after one recovery round", async () => {
   let turns = 0;
   const provider = {
@@ -2250,6 +2313,128 @@ test("synchronous/rejected provider failures become explicit outcomes and retain
     assert.equal(fallbackTurns, 1);
     assert.equal(history.at(-1).text, "recovered");
   }
+});
+
+test("ordered saved-connection failover skips incompatible models and continues across safe failures", async () => {
+  const calls = [];
+  const accounting = {
+    authority: "provider",
+    mode: "provider-defined",
+    usageReadMethod: "provider-console",
+    haraMayInferBillingFromTransportTokens: false,
+    failoverPolicy: "authoritative-exhaustion-only",
+  };
+  const provider = (id, model, accountRuntimeKey, toolCalling, turn) => ({
+    id,
+    model,
+    connection: {
+      connectionId: id,
+      provider: id,
+      model,
+      runtimeKey: `${accountRuntimeKey}:${model}`,
+      accountRuntimeKey,
+      capabilities: {
+        wireApi: "chat",
+        imageInput: "unsupported",
+        toolCalling,
+        reasoning: "supported",
+        region: "global",
+        accounting,
+      },
+    },
+    async turn(args) {
+      calls.push(id);
+      return turn(args);
+    },
+  });
+  const primary = provider("primary", "primary-model", "primary-account", "supported", async () => ({
+    text: "",
+    toolUses: [],
+    stop: "error",
+    errorMsg: "429 rate limit",
+  }));
+  const incompatible = provider("no-tools", "no-tools-model", "no-tools-account", "unsupported", async () => ({
+    text: "must not run",
+    toolUses: [],
+    stop: "end",
+  }));
+  const overloaded = provider("backup-one", "backup-one-model", "backup-one-account", "supported", async () => ({
+    text: "",
+    toolUses: [],
+    stop: "error",
+    errorMsg: "service overloaded",
+  }));
+  const recovered = provider("backup-two", "backup-two-model", "backup-two-account", "supported", async () => ({
+    text: "recovered in order",
+    toolUses: [],
+    stop: "end",
+  }));
+  const history = [{ role: "user", content: "what is the current status?" }];
+  const outcome = await runAgent(history, base(primary, {
+    quiet: true,
+    fallback: { providers: [incompatible, overloaded, recovered] },
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.deepEqual(calls, ["primary", "backup-one", "backup-two"]);
+  assert.equal(history.at(-1).text, "recovered in order");
+});
+
+test("auth failover never reuses the rejected account and can select a later saved account", async () => {
+  const calls = [];
+  const descriptor = (connectionId, runtimeKey, accountRuntimeKey) => ({
+    connectionId,
+    provider: "openai",
+    model: connectionId,
+    runtimeKey,
+    accountRuntimeKey,
+    capabilities: {
+      wireApi: "chat",
+      imageInput: "unsupported",
+      toolCalling: "supported",
+      reasoning: "supported",
+      region: "global",
+      accounting: {
+        authority: "provider",
+        mode: "provider-defined",
+        usageReadMethod: "provider-console",
+        haraMayInferBillingFromTransportTokens: false,
+        failoverPolicy: "authoritative-exhaustion-only",
+      },
+    },
+  });
+  const primary = {
+    id: "openai",
+    model: "primary",
+    connection: descriptor("primary", "primary:model", "same-account"),
+    async turn() {
+      calls.push("primary");
+      return { text: "", toolUses: [], stop: "error", errorMsg: "Invalid API key" };
+    },
+  };
+  const sameAccount = {
+    id: "openai",
+    model: "other-model",
+    connection: descriptor("same", "same:model", "same-account"),
+    async turn() {
+      calls.push("same-account");
+      return { text: "wrong", toolUses: [], stop: "end" };
+    },
+  };
+  const separateAccount = {
+    id: "openai",
+    model: "backup",
+    connection: descriptor("backup", "backup:model", "separate-account"),
+    async turn() {
+      calls.push("separate-account");
+      return { text: "authorized account recovered", toolUses: [], stop: "end" };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "what is the current status?" }], base(primary, {
+    quiet: true,
+    fallback: { providers: [sameAccount, separateAccount] },
+  }));
+  assert.equal(outcome.status, "completed");
+  assert.deepEqual(calls, ["primary", "separate-account"]);
 });
 
 test("multiple ask_user calls in one model round are serialized and every tool_use is closed", async () => {

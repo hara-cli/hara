@@ -38,6 +38,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
       fallbackApiKey: "fallback-key",
       fallbackModel: "fallback-model",
       fallbackBaseURL: "https://fallback.example/v1",
+      fallbackConnectionIds: ["deepseek-work", "minimax-personal"],
       visionApiKey: "vision-key",
       visionModel: "vision-model",
       visionBaseURL: "https://vision.example/v1",
@@ -73,6 +74,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
     HARA_FALLBACK_MODEL: process.env.HARA_FALLBACK_MODEL,
     HARA_FALLBACK_PROVIDER: process.env.HARA_FALLBACK_PROVIDER,
     HARA_FALLBACK_BASE_URL: process.env.HARA_FALLBACK_BASE_URL,
+    HARA_FALLBACK_CONNECTIONS: process.env.HARA_FALLBACK_CONNECTIONS,
     HARA_VISION_API_KEY: process.env.HARA_VISION_API_KEY,
     HARA_VISION_MODEL: process.env.HARA_VISION_MODEL,
     HARA_VISION_BASE_URL: process.env.HARA_VISION_BASE_URL,
@@ -98,6 +100,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
     process.env.HARA_FALLBACK_MODEL = " ";
     process.env.HARA_FALLBACK_PROVIDER = "";
     process.env.HARA_FALLBACK_BASE_URL = " ";
+    process.env.HARA_FALLBACK_CONNECTIONS = " ";
     process.env.HARA_VISION_API_KEY = "";
     process.env.HARA_VISION_MODEL = " ";
     process.env.HARA_VISION_BASE_URL = "";
@@ -118,6 +121,7 @@ test("loadConfig: blank env/project routing values do not hide global credential
     assert.equal(cfg.fallbackModel, "fallback-model");
     assert.equal(cfg.fallbackProvider, "deepseek");
     assert.equal(cfg.fallbackBaseURL, "https://fallback.example/v1");
+    assert.deepEqual(cfg.fallbackConnectionIds, ["deepseek-work", "minimax-personal"]);
     assert.equal(cfg.visionApiKey, "vision-key");
     assert.equal(cfg.visionModel, "vision-model");
     assert.equal(cfg.visionBaseURL, "https://vision.example/v1");

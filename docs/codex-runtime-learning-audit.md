@@ -158,9 +158,9 @@ is intentionally more conservative than guessing. Subscription reports such as A
 detail are display/accounting inputs, not real-time routing signals; automatic switching uses only the current
 request's explicit typed error or a fresh authoritative adapter result.
 
-Remaining: persist credential-free circuit transitions in the runtime journal, support a user-authorized ordered
-set of compatible saved connections rather than only one configured fallback, and add provider-specific live
-allowance adapters where a documented account-scoped endpoint actually exists.
+Remaining: persist credential-free circuit transitions in the runtime journal and add provider-specific live
+allowance adapters only where a documented account-scoped endpoint actually exists. Ordered, user-authorized
+saved-connection fallback is implemented; provider-native subscription accounting remains authoritative.
 
 ### 2.6 Durable event replay across Serve replacement
 
@@ -213,6 +213,14 @@ does not qualify for automatic fallback; ordinary explicit text selection remain
 saved-connection authorization are checked separately from model capability, so a technically compatible model is
 not automatically an allowed route. Provider accounting never fabricates monetary or subscription consumption
 from transport tokens when the provider has no current authoritative usage interface.
+
+Personal users now authorize and order up to four existing saved model connections, from Desktop Settings or
+`hara profile fallback`. Interactive CLI and persistent Serve/Desktop/Mobile turns resolve each candidate afresh
+through its own profile, endpoint and credential, then skip unavailable, duplicate-route, open-circuit or
+turn-incompatible models. A chain can advance across several replay-safe failures; authentication or exhausted
+allowance never moves to a second label/model backed by the same credential and endpoint. Organization sessions
+stay inside their locked company Space and never consume this Personal chain. The legacy single-model fields
+remain read-compatible but are no longer the recommended control surface.
 
 ### 2.9 Structured Agent progress and resumable tool items
 

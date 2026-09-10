@@ -20,6 +20,7 @@ export type ServeRuntimeEvent =
   | "provider.started"
   | "provider.completed"
   | "provider.failed"
+  | "provider.fallback_unavailable"
   | "provider.retry_scheduled"
   | "external.turn.failed"
   | "event_replay.checkpoint_failed"

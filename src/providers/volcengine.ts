@@ -31,6 +31,14 @@ export const VOLCENGINE_AGENT_PLAN_MODELS = Object.freeze([
   "glm-latest",
 ]);
 
+/** Exact built-in model knowledge used by safety-sensitive routing. Live discovery may expose newer
+ * conversation ids for an explicit user choice, but discovery alone does not prove their tool/image/context
+ * capabilities, so an unknown id must not silently inherit this release's Agent Plan capability matrix. */
+export function isKnownVolcengineAgentPlanModel(model: string): boolean {
+  const id = model.trim().toLowerCase().split("/").at(-1) ?? model.trim().toLowerCase();
+  return VOLCENGINE_AGENT_PLAN_MODELS.some((candidate) => candidate.toLowerCase() === id);
+}
+
 export function isOfficialVolcengineAgentPlanEndpoint(baseURL: string | undefined): boolean {
   if (!baseURL) return false;
   try {

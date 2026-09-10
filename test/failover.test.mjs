@@ -23,7 +23,7 @@ test("classifyError: maps message/status to a kind (incl. DashScope/GLM Chinese 
   assert.equal(classifyError("weird"), "unknown");
 });
 
-test("failoverAction: fall back on recoverable kinds (fallback present + untried); never auth/interrupted; one-shot", () => {
+test("failoverAction: account-scoped failures need another account and interruption never switches", () => {
   const ready = { hasFallback: true, triedFallback: false };
   for (const k of ["overloaded", "rate_limit", "timeout", "transient", "context_overflow", "unknown"]) {
     assert.equal(failoverAction(k, ready), "fallback", k);
@@ -34,14 +34,15 @@ test("failoverAction: fall back on recoverable kinds (fallback present + untried
   assert.equal(failoverAction("overloaded", { hasFallback: false, triedFallback: false }), "fail"); // none configured
   assert.equal(failoverAction("overloaded", { hasFallback: true, triedFallback: false, replaySafe: false }), "fail");
   assert.equal(failoverAction("overloaded", { hasFallback: true, triedFallback: false, compatible: false }), "fail");
-  assert.equal(failoverAction("auth", { hasFallback: true, triedFallback: false, differentConnection: true }), "fallback");
-  assert.equal(failoverAction("quota_exhausted", ready), "fallback");
+  assert.equal(failoverAction("auth", { hasFallback: true, triedFallback: false, differentAccount: true }), "fallback");
+  assert.equal(failoverAction("quota_exhausted", ready), "fail");
+  assert.equal(failoverAction("quota_exhausted", { ...ready, differentAccount: true }), "fallback");
   assert.equal(failoverAction("region_unavailable", ready), "fallback");
   assert.equal(failoverAction("circuit_open", ready), "fallback");
 });
 
 test("errorHint: actionable hints for common kinds", () => {
   assert.match(errorHint("auth"), /key|auth/);
-  assert.match(errorHint("overloaded"), /fallbackModel/);
+  assert.match(errorHint("overloaded"), /saved model connection/);
   assert.equal(errorHint("unknown"), "");
 });

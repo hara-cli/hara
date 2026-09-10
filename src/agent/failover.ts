@@ -1,6 +1,7 @@
 // App-level failover — what to do when a provider turn ENDS in an error after the central replay-safe
-// transport retry policy has finished. runAgent first retries context overflow once with a tighter bounded
-// snapshot; this module then decides whether a remaining error gets one fallback-model try.
+// transport retry policy has finished. When the attempt is still replay-safe, runAgent first retries context
+// overflow once with a tighter bounded snapshot; this module then decides whether a remaining error may
+// advance to another authorized connection.
 
 export type ErrKind =
   | "context_overflow"
@@ -62,16 +63,19 @@ export interface FailoverState {
   replaySafe?: boolean;
   /** Capability/health policy for the exact fallback connection. */
   compatible?: boolean;
-  /** Auth failures may move only to another credential/endpoint/model generation. */
+  /** Account-scoped failures may move only to another underlying provider account. */
+  differentAccount?: boolean;
+  /** @deprecated Compatibility alias for direct embedders compiled against 0.170. */
   differentConnection?: boolean;
 }
 
-/** Decide the recovery for an errored turn: retry once on the fallback model, or fail. Never auto-recovers
- *  `auth` (a config problem) or `interrupted` (the user). Context-overflow IS fallback-able — a
- *  larger-context fallback model may fit (and preemptive auto-compaction already prevents most overflows). */
+/** Decide the recovery for an errored turn: advance to another authorized route or fail. Authentication and
+ * exhausted allowance are account-scoped, so another label/model on the same key cannot recover them. A user
+ * interruption never switches. Context overflow may use a known larger-context model after bounded compaction. */
 export function failoverAction(kind: ErrKind, s: FailoverState): "fallback" | "fail" {
   if (kind === "interrupted" || s.replaySafe === false || s.compatible === false) return "fail";
-  if (kind === "auth" && s.differentConnection !== true) return "fail";
+  const differentAccount = s.differentAccount ?? s.differentConnection;
+  if ((kind === "auth" || kind === "quota_exhausted") && differentAccount !== true) return "fail";
   if (kind === "auth" && s.hasFallback && !s.triedFallback) return "fallback";
   if (s.hasFallback && !s.triedFallback && FALLBACKABLE.has(kind)) return "fallback";
   return "fail";
@@ -83,7 +87,7 @@ export function errorHint(kind: ErrKind): string {
     case "auth":
       return " — the configured credential was rejected or expired; update ~/.hara/config.json, the active profile, or its environment variable, then retry. Do not paste the key into chat";
     case "rate_limit":
-      return " — rate-limited; wait a moment, or set `fallbackModel` to auto-switch";
+      return " — rate-limited; wait a moment, or authorize another saved model connection for automatic fallback";
     case "quota_exhausted":
       return " — the provider reported this account allowance or balance is exhausted; select another authorized connection or wait for its reset";
     case "region_unavailable":
@@ -91,7 +95,7 @@ export function errorHint(kind: ErrKind): string {
     case "circuit_open":
       return " — this exact connection is temporarily isolated after repeated failures; retry after its health probe or choose another connection";
     case "overloaded":
-      return " — provider overloaded; set `fallbackModel` to auto-switch on errors";
+      return " — provider overloaded; authorize another saved model connection for automatic fallback";
     case "context_overflow":
       return " — context still too long after bounded retry; use `/compact` or `/new`";
     case "timeout":

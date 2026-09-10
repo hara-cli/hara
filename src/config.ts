@@ -121,6 +121,9 @@ export interface HaraConfig {
   fallbackProvider: ProviderId | undefined;
   fallbackBaseURL: string | undefined;
   fallbackApiKey: string | undefined;
+  /** User-authorized saved Personal connections, in deterministic failover order. Each entry resolves its
+   * own provider, endpoint, credential, model, capability record, and circuit; company Spaces ignore it. */
+  fallbackConnectionIds: string[];
   /** Thinking/reasoning effort dial (provider-mapped):
    *   - unset    → each provider's default (anthropic = adaptive, openai = unset, etc.)
    *   - "off"    → no extended thinking; on adaptive-only Anthropic models we just omit `thinking`
@@ -294,7 +297,8 @@ export function providerCatalog(): ProviderCatalogEntry[] {
   }));
 }
 
-export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionSource", "visionProvider", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "autoContinue", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "reasoningEffort"] as const;
+export const CONFIG_KEYS = ["provider", "apiKey", "model", "baseURL", "approval", "sandbox", "theme", "evolve", "assetCapture", "computerUse", "computerApps", "visionModel", "visionSource", "visionProvider", "visionBaseURL", "visionApiKey", "embedProvider", "embedModel", "embedBaseURL", "embedApiKey", "routeModel", "routeBaseURL", "routeApiKey", "guardian", "notify", "runTimeoutMs", "maxAgentRounds", "autoContinue", "vimMode", "autoCompact", "fileCheckpoints", "updateCheck", "proxy", "packageRegistry", "fallbackModel", "fallbackProvider", "fallbackBaseURL", "fallbackApiKey", "fallbackConnectionIds", "reasoningEffort"] as const;
+export const MAX_FALLBACK_CONNECTIONS = 4;
 export const REASONING_EFFORTS: NonNullable<HaraConfig["reasoningEffort"]>[] = [
   "off",
   "minimal",
@@ -421,7 +425,7 @@ export function readRawConfig(): Record<string, any> {
 
 const ROUTING_CONFIG_KEYS = new Set([
   "provider", "apiKey", "model", "baseURL",
-  "fallbackProvider", "fallbackApiKey", "fallbackModel", "fallbackBaseURL",
+  "fallbackProvider", "fallbackApiKey", "fallbackModel", "fallbackBaseURL", "fallbackConnectionIds",
   "visionApiKey", "visionModel", "visionSource", "visionProvider", "visionBaseURL",
   "embedProvider", "embedApiKey", "embedModel", "embedBaseURL",
   "routeApiKey", "routeModel", "routeBaseURL",
@@ -868,6 +872,15 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
   const fallbackProvider = isProviderId(requestedFallbackProvider) ? requestedFallbackProvider : undefined;
   const fallbackBaseURL = nonBlankEnv(process.env.HARA_FALLBACK_BASE_URL) ?? merged.fallbackBaseURL;
   const fallbackApiKey = nonBlankEnv(process.env.HARA_FALLBACK_API_KEY) ?? merged.fallbackApiKey;
+  const fallbackConnectionSource = nonBlankEnv(process.env.HARA_FALLBACK_CONNECTIONS)
+    ? process.env.HARA_FALLBACK_CONNECTIONS!.split(",")
+    : merged.fallbackConnectionIds;
+  const fallbackConnectionIds = [...new Set(
+    (Array.isArray(fallbackConnectionSource) ? fallbackConnectionSource : [])
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter((value) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)),
+  )].slice(0, MAX_FALLBACK_CONNECTIONS);
   const reasoningRaw = process.env.HARA_REASONING_EFFORT ?? merged.reasoningEffort;
   const reasoningEffort = reasoningRaw && REASONING_EFFORTS.includes(
     reasoningRaw as NonNullable<HaraConfig["reasoningEffort"]>,
@@ -875,7 +888,7 @@ export function loadConfig(opts: { overlay?: string; cwd?: string } = {}): HaraC
     ? (reasoningRaw as NonNullable<HaraConfig["reasoningEffort"]>)
     : undefined;
 
-  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionSource, visionProvider, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, autoContinue, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, reasoningEffort, mcpServers, cwd: effectiveCwd };
+  return { provider, apiKey, model, baseURL, approval, sandbox, theme, evolve, assetCapture, computerUse, computerApps, visionModel, visionSource, visionProvider, visionBaseURL, visionApiKey, modelVision, embedProvider, embedModel, embedBaseURL, embedApiKey, routeModel, routeBaseURL, routeApiKey, guardian, hooks, notify, runTimeoutMs, maxAgentRounds, autoContinue, vimMode, autoCompact, fileCheckpoints, updateCheck, proxy, packageRegistry, fallbackModel, fallbackProvider, fallbackBaseURL, fallbackApiKey, fallbackConnectionIds, reasoningEffort, mcpServers, cwd: effectiveCwd };
 }
 
 export function providerEnvKey(provider: ProviderId): string {

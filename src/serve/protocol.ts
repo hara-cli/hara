@@ -154,6 +154,13 @@
 //   settings.providers.list {}                    → redacted provider catalog + current profile state
 //   settings.providers.test {provider,model,…}     → {ok,models,error?} (credential is ephemeral)
 //   settings.providers.save {provider,model,…}     → redacted state (credential is never returned)
+//   settings.providers.connections.create/test/use/remove
+//                                                   → exact saved Personal account/model routes
+//   settings.providers.failover.save {connectionIds:[…],cwd?}
+//                                                   → redacted state with a user-authorized order of at
+//                                                     most four saved connections. Every turn re-resolves
+//                                                     each route's own endpoint, credential, model,
+//                                                     capabilities and circuit; company Spaces never use it.
 //   settings.gateways.list {}                      → {gateways:[redacted configuration/runtime health]}
 //   settings.gateways.login.start {platform:"weixin"} → {login:{id,phase,qrPayload?,qrRevision,…}}
 //   settings.gateways.login.status {platform:"weixin",id?} → {login:{id,phase,qrPayload?,…}}

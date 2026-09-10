@@ -49,6 +49,7 @@ import {
   APPROVAL_MODES,
   SANDBOX_MODES,
   COMPUTER_USE_MODES,
+  MAX_FALLBACK_CONNECTIONS,
   REASONING_EFFORTS,
   type HaraConfig,
   type ApprovalMode,
@@ -205,12 +206,14 @@ import {
   profileForConfig,
   resolveByokProviderTarget,
   resolveGatewayModel,
+  type ProviderTarget,
   type ProviderTargetOverride,
 } from "./providers/target.js";
 import { createProviderForTarget } from "./providers/factory.js";
 import {
   providerConnectionCircuits,
   providerConnectionDescriptor,
+  sameProviderConnection,
   withProviderConnectionCircuit,
 } from "./providers/connection-health.js";
 import { resolvePlatform } from "./providers/registry.js";
@@ -773,6 +776,123 @@ async function buildGuardian(
   return { provider: gp, enabled: true };
 }
 
+const warnedFallbackRoutes = new Set<string>();
+
+function warnFallbackRouteOnce(key: string, message: string): void {
+  if (warnedFallbackRoutes.has(key)) return;
+  warnedFallbackRoutes.add(key);
+  process.stderr.write(`hara: ${message}\n`);
+}
+
+/** Resolve a saved BYOK connection without ambient HARA_PROVIDER/HARA_MODEL/HARA_BASE_URL routing.
+ * A connection created with --no-key-prompt may still use its provider-specific credential variable;
+ * that is the documented credential source for this exact provider, not a route-wide override. */
+function resolveSavedByokConnectionTarget(cfg: HaraConfig, profile: Profile): ProviderTarget {
+  const target = resolveByokProviderTarget(cfg, profile, false, {});
+  if (target.apiKey || providerIsLocal(target.provider)) return target;
+  const credentialEnvKey = providerEnvKey(target.provider);
+  const providerCredential = credentialEnvKey ? process.env[credentialEnvKey]?.trim() : undefined;
+  return providerCredential ? { ...target, apiKey: providerCredential } : target;
+}
+
+/** Build only routes the user explicitly authorized. Saved Personal connections resolve their own
+ * provider/model/endpoint/credential; a company session never crosses into Personal. The legacy single
+ * fallbackModel remains a final compatibility entry and is subject to the same capability gate at turn time. */
+async function buildCompatibleFallbackProviders(
+  cfg: HaraConfig,
+  primary: Provider,
+  profile: Profile,
+  expectedSpaceId = spaceIdForProfile(profile),
+): Promise<Provider[]> {
+  const providers: Provider[] = [];
+  const runtimeKeys = new Set<string>();
+  const add = (candidate: Provider | null): void => {
+    if (!candidate || sameProviderConnection(primary, candidate)) return;
+    const runtimeKey = candidate.connection?.runtimeKey ?? `${candidate.id}\u0000${candidate.model}`;
+    if (runtimeKeys.has(runtimeKey)) return;
+    runtimeKeys.add(runtimeKey);
+    providers.push(candidate);
+  };
+
+  if (expectedSpaceId === PERSONAL_ID) {
+    for (const connectionId of cfg.fallbackConnectionIds.slice(0, MAX_FALLBACK_CONNECTIONS)) {
+      const candidateProfile = profileByIdForConfig(cfg, connectionId);
+      if (!candidateProfile || candidateProfile.kind !== "byok") {
+        warnFallbackRouteOnce(
+          `missing:${connectionId}`,
+          `saved fallback connection '${connectionId}' is unavailable; it was skipped.`,
+        );
+        continue;
+      }
+      try {
+        assertProfileAudience(cfg, candidateProfile.id, expectedSpaceId);
+        const target = resolveSavedByokConnectionTarget(cfg, candidateProfile);
+        const candidate = await buildProvider(
+          cfg,
+          {
+            provider: target.provider,
+            apiKey: target.apiKey,
+            baseURL: target.baseURL,
+            model: target.model,
+          },
+          candidateProfile.id,
+          expectedSpaceId,
+        );
+        assertProfileAudience(cfg, candidateProfile.id, expectedSpaceId);
+        add(candidate);
+      } catch {
+        warnFallbackRouteOnce(
+          `invalid:${connectionId}`,
+          `saved fallback connection '${connectionId}' could not be built and was skipped; verify it in Models & connections.`,
+        );
+      }
+    }
+  }
+
+  // Legacy model/provider fields are Personal configuration. Organization sessions can gain fallback only
+  // through a future Control-authorized route; local legacy fields must never widen a company Space.
+  if (expectedSpaceId === PERSONAL_ID && cfg.fallbackModel && cfg.fallbackModel !== primary.model) {
+    const fp = cfg.fallbackProvider;
+    const cross = !!fp && fp !== primary.id;
+    const family = (model: string): string => model.toLowerCase().split(/[-.:/]/)[0];
+    const fallbackEnvKey = fp ? providerEnvKey(fp) : "";
+    const crossKey = cfg.fallbackApiKey ?? (fallbackEnvKey ? process.env[fallbackEnvKey] : undefined);
+    if (fp === "hara-gateway") {
+      warnFallbackRouteOnce(
+        "legacy:gateway",
+        "fallbackProvider cannot be hara-gateway; select an enrolled gateway profile instead. Legacy fallback disabled.",
+      );
+    } else if (cross && providerRequiresApiKey(fp!) && !crossKey) {
+      warnFallbackRouteOnce(
+        `legacy:key:${fp}`,
+        `fallbackProvider '${fp}' needs its own key. Prefer authorizing its saved model connection; legacy fallback disabled.`,
+      );
+    } else if (!fp && !cfg.fallbackBaseURL && family(cfg.fallbackModel) !== family(primary.model)) {
+      warnFallbackRouteOnce(
+        `legacy:vendor:${cfg.fallbackModel}`,
+        `fallbackModel '${cfg.fallbackModel}' looks like another vendor and has no saved connection or explicit provider. Legacy fallback disabled.`,
+      );
+    } else {
+      try {
+        add(await buildProvider(cfg, {
+          ...(fp ? { provider: fp } : {}),
+          model: cfg.fallbackModel,
+          ...(cfg.fallbackBaseURL ? { baseURL: cfg.fallbackBaseURL } : {}),
+          ...(cross ? { apiKey: crossKey } : cfg.fallbackApiKey ? { apiKey: cfg.fallbackApiKey } : {}),
+        }, profile.id, expectedSpaceId));
+        assertProfileAudience(cfg, profile.id, expectedSpaceId);
+      } catch {
+        warnFallbackRouteOnce(
+          `legacy:build:${fp ?? primary.id}:${cfg.fallbackModel}`,
+          "the legacy fallback route could not be built and was skipped.",
+        );
+      }
+    }
+  }
+
+  return providers.slice(0, MAX_FALLBACK_CONNECTIONS);
+}
+
 function authHint(cfg: HaraConfig, boundProfile?: Profile | null): string {
   const ap = boundProfile ?? profileForConfig(cfg).profile;
   if (ap.kind === "gateway") {
@@ -897,7 +1017,7 @@ function personalProviderConnectionsSnapshot(
     .map((candidate) => {
       // A card describes one persisted route. Provider ID is deliberately not a uniqueness key: two
       // accounts at the same endpoint remain separate because their profile IDs and credentials differ.
-      const target = resolveByokProviderTarget(live, candidate, false, {});
+      const target = resolveSavedByokConnectionTarget(live, candidate);
       const entry = catalog.find((item) => item.id === target.provider)!;
       const keyConfigured = providerIsLocal(target.provider)
         || (target.provider === "qwen-oauth" ? loadQwenToken() !== null : !!target.apiKey);
@@ -1021,7 +1141,7 @@ function visionSettingsSnapshot(live: HaraConfig, profile: Profile) {
   const source = route.source;
   const currentTarget = profile.kind === "gateway"
     ? { provider: "hara-gateway" as const, model: profile.model || profile.defaultModel || live.model }
-    : resolveByokProviderTarget(live, profile, false, {});
+    : resolveSavedByokConnectionTarget(live, profile);
   const provider = visionProviderForRoute(live, route, currentTarget.provider);
   const providerEntry = providerSettingsCatalog().find((candidate) => candidate.id === provider);
   const availableModels = [...new Set([
@@ -1112,7 +1232,7 @@ async function saveVisionSettings(
   }
   const currentTarget = profile.kind === "gateway"
     ? { provider: "hara-gateway" as const }
-    : resolveByokProviderTarget(live, profile, false, {});
+    : resolveSavedByokConnectionTarget(live, profile);
   let provider: ProviderId | undefined;
   let baseURL: string | undefined;
   let apiKey: string | undefined;
@@ -1146,7 +1266,7 @@ async function saveVisionSettings(
   if (profile.kind !== "gateway") {
     const providerEntry = providerSettingsCatalog().find((candidate) => candidate.id === capabilityProvider)!;
     const currentPersonalTarget = source === "current"
-      ? resolveByokProviderTarget(live, profile, false, {})
+      ? resolveSavedByokConnectionTarget(live, profile)
       : undefined;
     const candidate = source === "custom"
       ? {
@@ -1187,6 +1307,8 @@ function providerSettingsSnapshot(targetCwd: string) {
   const { profile, resolution } = profileForConfig(live);
   const catalog = providerSettingsCatalog();
   const connections = personalProviderConnectionsSnapshot(live, resolution, catalog);
+  const availableConnectionIds = new Set(connections.filter((connection) => connection.authenticated).map((connection) => connection.id));
+  const fallbackConnectionIds = live.fallbackConnectionIds.filter((id) => availableConnectionIds.has(id));
   const switchLocked = resolution.source === "flag" || resolution.source === "env" || resolution.source === "pin";
 
   if (profile.kind === "gateway") {
@@ -1225,6 +1347,8 @@ function providerSettingsSnapshot(targetCwd: string) {
       },
       providers: catalog,
       connections,
+      fallbackConnectionIds,
+      fallbackConnectionIdsEditable: !process.env.HARA_FALLBACK_CONNECTIONS?.trim(),
       switchLocked,
       vision: visionSettingsSnapshot(live, profile),
     };
@@ -1278,9 +1402,48 @@ function providerSettingsSnapshot(targetCwd: string) {
     },
     providers: catalog,
     connections,
+    fallbackConnectionIds,
+    fallbackConnectionIdsEditable: !process.env.HARA_FALLBACK_CONNECTIONS?.trim(),
     switchLocked,
     vision: visionSettingsSnapshot(live, profile),
   };
+}
+
+function saveFallbackConnectionOrder(inputIds: readonly string[], targetCwd: string) {
+  if (process.env.HARA_FALLBACK_CONNECTIONS?.trim()) {
+    throw new Error("automatic fallback connections are overridden by HARA_FALLBACK_CONNECTIONS; remove the environment override before editing System Settings");
+  }
+  if (inputIds.length > MAX_FALLBACK_CONNECTIONS) {
+    throw new Error(`automatic fallback supports at most ${MAX_FALLBACK_CONNECTIONS} saved connections`);
+  }
+  const ids = [...new Set(inputIds.map((value) => value.trim()))];
+  if (ids.length !== inputIds.length || ids.some((id) => !isValidProfileId(id))) {
+    throw new Error("fallback connection ids must be unique valid saved connection ids");
+  }
+  const snapshot = providerSettingsSnapshot(targetCwd);
+  const available = new Map(
+    (snapshot.connections ?? [])
+      .filter((connection) => connection.authenticated)
+      .map((connection) => [connection.id, connection] as const),
+  );
+  const missing = ids.find((id) => !available.has(id));
+  if (missing) {
+    throw new Error(`fallback connection '${missing}' is missing or not authenticated; verify that saved connection first`);
+  }
+  updateRawConfig((config) => {
+    if (ids.length) config.fallbackConnectionIds = ids;
+    else delete config.fallbackConnectionIds;
+  });
+  return providerSettingsSnapshot(targetCwd);
+}
+
+function removeFallbackConnectionReference(id: string): void {
+  updateRawConfig((config) => {
+    if (!Array.isArray(config.fallbackConnectionIds)) return;
+    const next = config.fallbackConnectionIds.filter((value: unknown) => value !== id);
+    if (next.length) config.fallbackConnectionIds = next;
+    else delete config.fallbackConnectionIds;
+  });
 }
 
 function cleanNamedProviderConnectionId(value: string): string {
@@ -1397,6 +1560,7 @@ function removeNamedProviderConnection(inputId: string, targetCwd: string) {
       throw new Error(`the Personal credential is supplied by ${process.env.HARA_API_KEY?.trim() ? "HARA_API_KEY" : credentialEnvKey}; remove that environment variable before clearing the connection`);
     }
     clearPersonalProviderConfig();
+    removeFallbackConnectionReference(PERSONAL_ID);
     syncStoredPersonalProfile();
     return providerSettingsSnapshot(targetCwd);
   }
@@ -1412,6 +1576,7 @@ function removeNamedProviderConnection(inputId: string, targetCwd: string) {
   }
   const removed = removeProfile(id);
   if (!removed.ok) throw new Error(removed.reason);
+  removeFallbackConnectionReference(id);
   return providerSettingsSnapshot(targetCwd);
 }
 
@@ -1792,7 +1957,7 @@ async function testVisionSettingsCandidate(
           : {}),
       };
     }
-    const target = resolveByokProviderTarget(live, profile, false, {});
+    const target = resolveSavedByokConnectionTarget(live, profile);
     const providerEntry = providerSettingsCatalog().find((candidate) => candidate.id === target.provider);
     const result = await testProviderSettingsCandidate({
       provider: target.provider,
@@ -1852,7 +2017,7 @@ async function testNamedProviderConnection(inputId: string, targetCwd: string) {
   if (!profile || profile.kind !== "byok") throw new Error("personal connection was not found");
   // Test the persisted identity itself. Ambient one-shot HARA_* routing must not silently test another
   // endpoint or key, especially when two saved connections use the same provider.
-  const target = resolveByokProviderTarget(live, profileByIdForConfig(live, profile.id) ?? profile, false, {});
+  const target = resolveSavedByokConnectionTarget(live, profileByIdForConfig(live, profile.id) ?? profile);
   return testProviderSettingsCandidate({
     provider: target.provider,
     model: target.model,
@@ -3747,6 +3912,38 @@ profileCmd
   .description("alias of `hara whoami` — print the active identity profile (with source)")
   .action(printWhoami);
 
+profileCmd
+  .command("fallback [connectionIds...]")
+  .description("show or set the ordered saved Personal connections authorized for compatible automatic fallback")
+  .option("--clear", "remove every saved fallback authorization")
+  .action((connectionIds: string[] | undefined, opts: { clear?: boolean }) => {
+    const ids = connectionIds ?? [];
+    if (opts.clear && ids.length) {
+      out(c.red("Use either connection ids or --clear, not both.\n"));
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const snapshot = opts.clear || ids.length
+        ? saveFallbackConnectionOrder(opts.clear ? [] : ids, process.cwd())
+        : providerSettingsSnapshot(process.cwd());
+      const configured = snapshot.fallbackConnectionIds ?? [];
+      if (!configured.length) {
+        out(c.dim("(no saved Personal connection is authorized for automatic fallback)\n"));
+        return;
+      }
+      const connections = new Map((snapshot.connections ?? []).map((connection) => [connection.id, connection] as const));
+      for (const [index, id] of configured.entries()) {
+        const connection = connections.get(id);
+        out(`${index + 1}. ${c.bold(id)}${connection ? c.dim(` · ${connection.provider} · ${connection.model}`) : ""}\n`);
+      }
+      out(c.dim("Hara checks this exact order only after a replay-safe typed failure; model capabilities and circuit health must match the turn.\n"));
+    } catch (error) {
+      out(c.red(`fallback connections were not changed: ${error instanceof Error ? error.message : String(error)}\n`));
+      process.exitCode = 1;
+    }
+  });
+
 // ── `profile list` (alias `ls`) ────────────────────────────────────────────────
 // Layout: profiles grouped by kind (PERSONAL above ORG), one line per profile, columns
 // aligned across the whole table (so id/model/routing visually stack). Active row is
@@ -4281,6 +4478,18 @@ program
             expectedSpaceId,
           );
         },
+        buildFallbackProviders: async (primary, targetCwd, profileId, spaceId) => {
+          const live = loadConfig({ cwd: targetCwd ?? cwd });
+          const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
+          if (!profile) {
+            throw new Error(`session profile '${profileId}' is no longer available; fallback is disabled`);
+          }
+          const expectedSpaceId = spaceId ?? spaceIdForProfile(profile);
+          assertProfileAudience(live, profile.id, expectedSpaceId);
+          const providers = await buildCompatibleFallbackProviders(live, primary, profile, expectedSpaceId);
+          assertProfileAudience(live, profile.id, expectedSpaceId);
+          return providers;
+        },
         buildProviderFor: async (model, effort, targetCwd, profileId, spaceId) => {
           const live = loadConfig({ cwd: targetCwd ?? cwd });
           const profile = profileId ? profileByIdForConfig(live, profileId) : profileForConfig(live).profile;
@@ -4514,6 +4723,10 @@ program
         ),
         removeProviderConnection: (inputId, targetCwd) => removeNamedProviderConnection(
           inputId,
+          targetCwd ?? cwd,
+        ),
+        saveProviderFailover: (connectionIds, targetCwd) => saveFallbackConnectionOrder(
+          connectionIds,
           targetCwd ?? cwd,
         ),
         saveProviderSettings: async (input, targetCwd) => {
@@ -6028,7 +6241,7 @@ program.action(async (opts) => {
   // These objects can make independent model/control-plane requests. They are intentionally constructed
   // only after the session lock establishes the authoritative profile; pre-lock copies could retain a
   // credential or managed role from whichever connection happened to be active during startup.
-  let fbOpt: { provider: Provider } | undefined;
+  let fbOpt: { providers: Provider[] } | undefined;
   let guardianOpt: Awaited<ReturnType<typeof buildGuardian>>;
   const bindAuxiliaryRuntime = async (
     primary: Provider,
@@ -6043,38 +6256,20 @@ program.action(async (opts) => {
       await ensureOrganizationExecutionPolicy(cfg, profile, expectedSpaceId ?? spaceIdForProfile(profile));
       assertAudience();
     }
-    // Fallback provider, built correctly for CROSS-PROVIDER failover. Passing profile.id is essential:
-    // every fallback request of a persisted session stays inside the same identity boundary.
-    let fallbackProv: Provider | null = null;
-    if (cfg.fallbackModel && cfg.fallbackModel !== primary.model) {
-      const fp = cfg.fallbackProvider;
-      const cross = !!fp && fp !== primary.id;
-      const family = (model: string): string => model.toLowerCase().split(/[-.:/]/)[0];
-      const fallbackEnvKey = fp ? providerEnvKey(fp) : "";
-      const crossKey = cfg.fallbackApiKey ?? (fallbackEnvKey ? process.env[fallbackEnvKey] : undefined);
-      if (fp === "hara-gateway") {
-        process.stderr.write("hara: fallbackProvider cannot be hara-gateway; select an enrolled gateway profile instead. Fallback disabled.\n");
-      } else if (cross && providerRequiresApiKey(fp!) && !crossKey) {
-        process.stderr.write(`hara: fallbackProvider '${fp}' needs its own key — set fallbackApiKey. Fallback disabled.\n`);
-      } else if (!fp && !cfg.fallbackBaseURL && family(cfg.fallbackModel) !== family(primary.model)) {
-        process.stderr.write(`hara: fallbackModel '${cfg.fallbackModel}' looks like a different vendor than '${primary.model}', but no fallbackProvider/fallbackBaseURL is set — it would hit the PRIMARY endpoint (likely 400). Set fallbackProvider (+ fallbackApiKey). Fallback disabled.\n`);
-      } else {
-        fallbackProv = await buildProvider(cfg, {
-          ...(fp ? { provider: fp } : {}),
-          model: cfg.fallbackModel,
-          ...(cfg.fallbackBaseURL ? { baseURL: cfg.fallbackBaseURL } : {}),
-          ...(cross ? { apiKey: crossKey } : cfg.fallbackApiKey ? { apiKey: cfg.fallbackApiKey } : {}),
-        }, profile.id);
-        assertAudience();
-      }
-    }
+    const fallbackProviders = await buildCompatibleFallbackProviders(
+      cfg,
+      primary,
+      profile,
+      expectedSpaceId ?? spaceIdForProfile(profile),
+    );
+    assertAudience();
     const nextGuardian = await buildGuardian(cfg, primary, profile.id);
     assertAudience();
     if (profile.kind === "gateway" || primary.id === "hara-gateway") {
       const boundEnrollment = enrollmentFromProfile(profile);
       if (boundEnrollment) void heartbeatEnrollment(boundEnrollment, undefined, { profileId: profile.id });
     }
-    fbOpt = fallbackProv ? { provider: fallbackProv } : undefined;
+    fbOpt = fallbackProviders.length ? { providers: fallbackProviders } : undefined;
     guardianOpt = nextGuardian;
   };
   /** The engine owns local-file validation; this selector owns provider identity. An explicitly configured

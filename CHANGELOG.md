@@ -5,6 +5,23 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.171.0 — 2026-09-10 — exact-account fallback and model-aware recovery
+
+- Let Personal users authorize and order up to four saved model connections for automatic fallback from
+  Desktop or `hara profile fallback`. Every candidate retains its own provider, endpoint, credential, current
+  model, region, capability record, accounting authority, and circuit state; company Spaces never inherit a
+  Personal route, and deleting a connection also removes its fallback authorization.
+- Match each recovery candidate against the actual turn. Image input, tool calling, and known context-window
+  requirements must be explicitly supported, an open circuit is skipped, and new live-discovered model IDs
+  remain available for manual selection without gaining guessed capabilities. The current Ark Agent Plan
+  conversation catalog is classified model by model while media, speech, and embedding IDs stay hidden.
+- Treat provider + endpoint + credential as the underlying account identity. Authentication or authoritative
+  allowance exhaustion may switch only to another account; saving the same Key under another label or model
+  cannot masquerade as quota redundancy, and provider-native subscription/PAYG accounting remains authoritative.
+- Put malformed-tool, context-overflow, and cross-connection recovery behind one replay-safety boundary. Any
+  provider stream activity, visible text, tool call, or billed output prevents replay, while replay-safe typed
+  failures may advance through the bounded user-selected order with credential-free retry diagnostics.
+
 ## 0.170.0 — 2026-09-10 — deterministic runtime recovery and governed writable agents
 
 - Add managed writable child Agents for persistent Serve/Desktop sessions. Each child edits a private detached

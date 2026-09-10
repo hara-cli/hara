@@ -73,6 +73,17 @@ reroutes, or a model another entry beats on every axis) are hidden from the pick
 configured always stays listed, and `/model <id>` still accepts any id the key is entitled to.
 
 ## Optional
+- **Compatible automatic fallback**: save each provider account as its own Personal connection, then run
+  `hara profile fallback <connection-id> [more-connection-ids…]` or order the connections in Desktop Settings.
+  Hara resolves every entry with that connection's own provider, endpoint, credential, selected model and circuit;
+  it never sends a model to the primary account by guessing from the model name. A fallback is attempted only after
+  a replay-safe typed failure and only when the current input's image/tool/known-context requirements match. A
+  context-overflow switch is disabled when the failed route's actual context window is unconfirmed. `auto`
+  and other dynamic routers keep image/context capability unconfirmed, while the current Agent Plan models retain
+  their documented exact capabilities. Authentication and exhausted allowance also require a genuinely different
+  provider account, not another label or model backed by the same credential. Use `hara profile fallback --clear`
+  to disable the chain. Company Spaces do not use Personal or legacy fallback settings, and provider/Control usage
+  remains authoritative.
 - **Image routing**: `visionModel` enables an explicit vision-first route for every image; the conversation
   model receives description text only. `visionBaseURL` / `visionApiKey` optionally select a separate
   Personal/BYOK endpoint and credential. Company routes ignore those overrides and require the exact

@@ -269,6 +269,82 @@ test("openai-compatible profile add requires an explicit endpoint", { timeout: 2
   }
 });
 
+test("profile fallback stores an explicit ordered list of authenticated saved accounts", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-profile-fallback-cli-"));
+  const home = join(root, "home");
+  const project = join(root, "project");
+  const haraHome = join(home, ".hara");
+  try {
+    mkdirSync(haraHome, { recursive: true });
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, "package.json"), "{}\n");
+    writeFileSync(join(haraHome, "config.json"), JSON.stringify({
+      provider: "ollama",
+      model: "qwen3",
+      guardian: "off",
+      updateCheck: false,
+    }), { mode: 0o600 });
+    writeFileSync(join(haraHome, "profiles.json"), `${JSON.stringify({
+      active: "minimax-one",
+      profiles: [
+        { id: "personal", kind: "byok", label: "Personal", provider: "ollama" },
+        {
+          id: "minimax-one",
+          kind: "byok",
+          label: "MiniMax one",
+          provider: "minimax-token-plan",
+          baseURL: "https://api.minimaxi.com/anthropic",
+          apiKey: "fixture-minimax-key",
+          defaultModel: "MiniMax-M3",
+        },
+        {
+          id: "ark-two",
+          kind: "byok",
+          label: "Ark two",
+          provider: "volcengine-agent-plan",
+          baseURL: "https://ark.cn-beijing.volces.com/api/plan/v3",
+          apiKey: "fixture-ark-key",
+          defaultModel: "glm-5.3-flash",
+        },
+        {
+          id: "deepseek-env",
+          kind: "byok",
+          label: "DeepSeek environment account",
+          provider: "deepseek",
+          baseURL: "https://api.deepseek.com",
+          defaultModel: "deepseek-v4-pro",
+        },
+      ],
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    const saved = await runCli(
+      ["profile", "fallback", "ark-two", "minimax-one", "deepseek-env"],
+      project,
+      home,
+      { DEEPSEEK_API_KEY: "fixture-deepseek-environment-key", HARA_MODEL: "ambient-model-must-not-leak" },
+    );
+    assert.equal(saved.code, 0, saved.stderr || saved.stdout);
+    assert.match(saved.stdout, /1\. ark-two · volcengine-agent-plan · glm-5\.3-flash/);
+    assert.match(saved.stdout, /2\. minimax-one · minimax-token-plan · MiniMax-M3/);
+    assert.match(saved.stdout, /3\. deepseek-env · deepseek · deepseek-v4-pro/);
+    assert.doesNotMatch(saved.stdout, /ambient-model-must-not-leak/);
+    assert.deepEqual(
+      JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8")).fallbackConnectionIds,
+      ["ark-two", "minimax-one", "deepseek-env"],
+    );
+
+    const listed = await runCli(["profile", "fallback"], project, home);
+    assert.equal(listed.code, 0, listed.stderr || listed.stdout);
+    assert.match(listed.stdout, /model capabilities and circuit health must match/);
+
+    const cleared = await runCli(["profile", "fallback", "--clear"], project, home);
+    assert.equal(cleared.code, 0, cleared.stderr || cleared.stdout);
+    assert.equal("fallbackConnectionIds" in JSON.parse(readFileSync(join(haraHome, "config.json"), "utf8")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 async function gatewayFixture(label, roles = []) {
   const requests = [];
   const server = createServer((req, res) => {

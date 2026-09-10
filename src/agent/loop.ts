@@ -60,6 +60,7 @@ import {
   providerCompatibility,
   providerTurnRequirements,
   sameProviderAccount,
+  sameProviderConnection,
 } from "../providers/connection-health.js";
 import { redactToolSubprocessOutput } from "../security/subprocess-env.js";
 import { prepareHistoryForModel } from "./context-budget.js";
@@ -553,9 +554,9 @@ export interface RunOpts {
    *  inject them before the next model call — so an addition/clarification reaches the model mid-task
    *  (codex-style) instead of waiting for the turn to end. Returns image-resolved user messages, or []. */
   pendingInput?: () => Promise<NeutralMsg[]>;
-  /** App-level failover (wired only at the main chat entry): retry an errored, recoverable turn once on a
-   *  fallback-model `provider` (overload / rate-limit / timeout / context-overflow → a different model). */
-  fallback?: { provider?: Provider };
+  /** User-authorized app-level failover routes in deterministic order. `provider` remains accepted for
+   * direct embedders; production CLI/Serve use `providers` and capability-check every exact connection. */
+  fallback?: { provider?: Provider; providers?: readonly Provider[] };
   /** Guardian (internal safety layer): a deterministic HIGH-RISK classifier + a conservative cheap-model
    *  veto + a hard circuit-breaker, layered on top of permission rules / PreToolUse hooks / approval gate.
    *  `provider` is the cheap model used for the veto (fail-open if absent/glitchy). Normal (low-risk) tools
@@ -1210,6 +1211,48 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     organizationAllowsTool(name) && (runExtraToolNames.has(name) || runtimeToolAllowed(name));
   const permRules = loadPermissionRules(ctx.cwd); // command-level allow/ask/deny policy for the bash tool
   let activeProvider = provider; // may switch to a fallback model on a recoverable error (app-failover)
+  const fallbackProviders = [
+    ...(opts.fallback?.providers ?? []),
+    ...(opts.fallback?.provider ? [opts.fallback.provider] : []),
+  ].filter((candidate, index, all) => {
+    const key = candidate.connection?.runtimeKey ?? `${candidate.id}\u0000${candidate.model}`;
+    return all.findIndex((item) => (
+      item.connection?.runtimeKey ?? `${item.id}\u0000${item.model}`
+    ) === key) === index;
+  }).slice(0, 4);
+  const attemptedFallbackRoutes = new Set<string>();
+  const fallbackRouteKey = (candidate: Provider): string =>
+    candidate.connection?.runtimeKey ?? `${candidate.id}\u0000${candidate.model}`;
+  const selectFallbackProvider = (
+    kind: ErrKind,
+    requirements: ReturnType<typeof providerTurnRequirements>,
+    replaySafe: boolean,
+  ): Provider | undefined => {
+    for (const candidate of fallbackProviders) {
+      const routeKey = fallbackRouteKey(candidate);
+      if (attemptedFallbackRoutes.has(routeKey) || sameProviderConnection(activeProvider, candidate)) continue;
+      const compatibility = providerCompatibility(candidate, requirements);
+      const allowed = failoverAction(kind, {
+        hasFallback: true,
+        triedFallback: false,
+        replaySafe,
+        compatible: compatibility.ok,
+        differentAccount: !sameProviderAccount(activeProvider, candidate),
+      }) === "fallback";
+      if (!allowed) continue;
+      if (organizationPolicy) {
+        try {
+          assertOrganizationModelAllowed(organizationPolicy, candidate.model);
+        } catch {
+          attemptedFallbackRoutes.add(routeKey);
+          continue;
+        }
+      }
+      attemptedFallbackRoutes.add(routeKey);
+      return candidate;
+    }
+    return undefined;
+  };
   const refreshOrganizationAuthorization = async (): Promise<void> => {
     if (!companyExecution) return;
     if (!activeProvider.prepareTurn) {
@@ -1235,7 +1278,6 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     organizationPolicyVersion ??= organizationPolicy.version;
     assertOrganizationModelAllowed(organizationPolicy, activeProvider.model);
   };
-  let triedFallback = false;
   let contextOverflowRetried = false;
   let malformedToolCallRetried = false;
   let contextBudgetScale = 1;
@@ -1790,7 +1832,14 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     });
 
     if (r.stop === "error") {
-      if (recoverableMalformedToolCall(r.errorMsg) && !malformedToolCallRetried) {
+      // Retrying the same route is still a replay. Once the provider emitted any stream activity,
+      // visible text, tool call, or billed output, Hara cannot prove that the remote side had no
+      // observable/irreversible effect. Keep every recovery branch behind the same replay boundary.
+      const replaySafe = !observableProviderActivity
+        && r.text.length === 0
+        && r.toolUses.length === 0
+        && (r.usage?.output ?? 0) === 0;
+      if (recoverableMalformedToolCall(r.errorMsg) && !malformedToolCallRetried && replaySafe) {
         malformedToolCallRetried = true;
         history.pop(); // no partial tool call was executed; discard the invalid assistant protocol row
         history.push({
@@ -1807,7 +1856,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         continue;
       }
       const kind = providerErrorKind ?? "unknown";
-      if (kind === "context_overflow" && !contextOverflowRetried) {
+      if (kind === "context_overflow" && !contextOverflowRetried && replaySafe) {
         contextOverflowRetried = true;
         contextBudgetScale = 0.5;
         history.pop(); // drop the errored (partial/empty) assistant turn before a tighter normalized retry
@@ -1818,43 +1867,20 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         }
         continue;
       }
-      const fallbackProvider = opts.fallback?.provider;
-      const replaySafe = !observableProviderActivity
-        && r.text.length === 0
-        && r.toolUses.length === 0
-        && (r.usage?.output ?? 0) === 0;
-      const compatibility = fallbackProvider
-        ? providerCompatibility(
-            fallbackProvider,
-            providerTurnRequirements(prepared.history, specs, activeProvider, kind),
-          )
-        : { ok: false as const, reason: "tool_calling" as const };
-      if (failoverAction(kind, {
-        hasFallback: !!fallbackProvider,
-        triedFallback,
+      const fallbackProvider = selectFallbackProvider(
+        kind,
+        providerTurnRequirements(prepared.history, specs, activeProvider, kind),
         replaySafe,
-        compatible: compatibility.ok,
-        differentConnection: Boolean(fallbackProvider && !sameProviderAccount(activeProvider, fallbackProvider)),
-      }) === "fallback") {
-        triedFallback = true;
+      );
+      if (fallbackProvider) {
         history.pop(); // drop the errored (partial/empty) assistant turn before retrying
-        try {
-          if (organizationPolicy) {
-            assertOrganizationModelAllowed(organizationPolicy, fallbackProvider!.model);
-          }
-        } catch (error) {
-          return {
-            status: "error",
-            error: `Organization policy blocked fallback model: ${error instanceof Error ? error.message : String(error)}`,
-          };
-        }
-        activeProvider = fallbackProvider!;
+        activeProvider = fallbackProvider;
         if (!opts.quiet) {
           const note = `✻ ${kind} → falling back to ${activeProvider.model}…`;
           if (sink) sink.notice(note);
           else out(c.dim(`${note}\n`));
         }
-        continue; // retry once on the fallback model (guarded by triedFallback)
+        continue;
       }
       const msg = kind === "interrupted" ? "(interrupted)" : `[${activeProvider.id} error] ${r.errorMsg ?? "unknown"}${errorHint(kind)}`;
       if (r.toolUses.length) {
@@ -1974,11 +2000,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       }
       if (actionOwnershipRetries < 1) {
         actionOwnershipRetries += 1;
-        const switched = !triedFallback && !!opts.fallback?.provider;
-        if (switched) {
-          triedFallback = true;
-          activeProvider = opts.fallback!.provider!;
-        }
+        const ownershipFallback = selectFallbackProvider(
+          "unknown",
+          providerTurnRequirements(prepared.history, specs, activeProvider, "unknown"),
+          true,
+        );
+        const switched = Boolean(ownershipFallback);
+        if (ownershipFallback) activeProvider = ownershipFallback;
         const note = switched
           ? "✻ action ownership guard: advice was not accepted as execution; continuing with the fallback model…"
           : "✻ action ownership guard: advice was not accepted as execution; continuing the task…";
