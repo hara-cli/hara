@@ -47,7 +47,62 @@ const chromeSkill = [
   "",
 ].join("\n");
 
+const browserManifest = {
+  name: "browser",
+  version: "0.2.0",
+  description:
+    "Reliable web automation for hara via the Playwright MCP — acts on the DOM/accessibility tree (selectors, auto-wait), not pixels. navigate / click / type / fill / snapshot.",
+  skills: ["skills"],
+  mcpServers: {
+    browser: {
+      command: "npx",
+      args: ["-y", "@playwright/mcp@0.0.80"],
+      description:
+        "Isolated structured browser: navigate, inspect accessibility snapshots, click, type, upload, and verify web pages.",
+    },
+  },
+};
+
+const browserSkill = [
+  "---",
+  "name: web-automation",
+  "description: Operate web pages reliably — navigate, click, fill forms, log in, extract — via the Playwright MCP. Acts on the DOM/accessibility tree by selector/role (deterministic, auto-waiting), NOT screenshots or pixel coordinates. Far more reliable than desktop screen control.",
+  "when_to_use: when the user wants to do anything on a website — open a page, click, fill/submit a form, log in, scrape data, automate a web flow.",
+  "---",
+  "",
+  "# Web automation (Playwright MCP)",
+  "",
+  "Reliable browser tools are available as `mcp__browser__*` (navigate, snapshot, click, type, fill_form,",
+  "select_option, evaluate, …). They act on the page's **accessibility tree by element ref/role/text** — not",
+  "screenshots or pixel coordinates — so they're deterministic and auto-wait for elements. This is the reliable",
+  "counterpart to the fragile desktop `computer` tool: prefer it for anything on the web.",
+  "",
+  "## Workflow",
+  "1. `browser_navigate` to the URL.",
+  "2. `browser_snapshot` — read the accessibility tree (elements + their `ref`s). This is your \"eyes\": use the",
+  "   refs to act precisely. Prefer it over a screenshot.",
+  "3. Act by ref/role/text: `browser_click`, `browser_type`, `browser_fill_form`, `browser_select_option`.",
+  "4. `browser_snapshot` again to verify before the next step.",
+  "",
+  "## Notes",
+  "- The reviewed package is pinned by Hara. Its first connection may download the isolated Chromium runtime;",
+  "  Hara reports startup progress and does not treat the download as proof that a page action succeeded.",
+  "- The Playwright MCP uses its **own** browser (no existing logins). For tasks needing the running Chrome",
+  "  profile, use Hara's `chrome` plugin instead. Its `chrome-devtools-mcp --autoConnect` route requires Chrome",
+  "  144+, remote debugging enabled at `chrome://inspect/#remote-debugging`, and explicit approval in Chrome.",
+  "  Install it from the signed Hara package with `hara plugin add bundled:chrome`, then disable this isolated",
+  "  plugin with `hara plugin disable browser` so the two browser routes are not ambiguous.",
+  "  Do not copy cookies, localStorage, Authorization headers, or session tokens into chat as a workaround.",
+  "- **Confirm before irreversible actions** — purchases, posting, sending messages, deleting. Verify the page/state",
+  "  with a snapshot first.",
+  "",
+].join("\n");
+
 const BUNDLED_PLUGIN_FILES: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
+  browser: Object.freeze({
+    ".hara-plugin/plugin.json": `${JSON.stringify(browserManifest, null, 2)}\n`,
+    "skills/web/SKILL.md": browserSkill,
+  }),
   chrome: Object.freeze({
     ".hara-plugin/plugin.json": `${JSON.stringify(chromeManifest, null, 2)}\n`,
     "skills/chrome/SKILL.md": chromeSkill,

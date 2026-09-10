@@ -50,6 +50,7 @@ import { subdirHint } from "../context/subdir-hints.js";
 import { classifyError, failoverAction, errorHint, type ErrKind } from "./failover.js";
 import { currentTodos, renderTodos, type Todo } from "../tools/todo.js";
 import { drainReminders, wrapReminders, pushReminder, todoStaleReminder, TODO_STALE_ROUNDS, synthesisReminder, SYNTHESIS_MIN_AGENTS } from "./reminders.js";
+import { coreDeferredToolsForHistory } from "./core-capabilities.js";
 import { setTurnPhase } from "./phase.js";
 import { AssistantTextSanitizer, sanitizeAssistantText } from "./assistant-text.js";
 import { recordTouch } from "./touched.js";
@@ -172,7 +173,9 @@ commands. When the user asks to show or open an existing folder in their system 
 open_directory directly; never shell out to open, explorer, or xdg-open. For website UI, SPA, visual, or
 interaction testing, call open_browser directly so the real system browser executes the page; do not start
 with task_intake and do not treat web_fetch text as visual proof. Use web_fetch for document/API text retrieval
-only. If one web_fetch attempt returns an SPA shell or unusable headless render, do not retry it with parameter
+only. When mcp_connect advertises the reviewed browser server, prefer that structured route for navigation,
+accessibility snapshots, forms, uploads, and action verification; connect it only when the task needs web
+interaction. If one web_fetch attempt returns an SPA shell or unusable headless render, do not retry it with parameter
 variations: switch to open_browser, then use computer screenshot/find/click when configured. Prefer small,
 verifiable steps; edit existing files with edit_file rather than rewriting
 them whole. Batch INDEPENDENT tool calls in a single response — especially reads (read_file / grep /
@@ -1052,7 +1055,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             required_capabilities: {
               type: "array",
               items: { type: "string" },
-              description: "Only non-core capabilities whose availability materially changes the approach, such as vision_model or computer_control.",
+              description: "Only non-core capabilities whose availability materially changes the approach, such as a vision_model or an organization-specific connector.",
             },
           },
           required: ["intent", "goal", "constraints", "acceptance", "steps"],
@@ -1502,6 +1505,10 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         };
       }
     }
+    // Computer Use is a core capability, so concrete browser/desktop interaction requests receive its
+    // schema on the first useful round. This only changes discovery: the same tool filters, allowlist,
+    // configuration tier, and explicit Computer Use confirmation remain authoritative.
+    toolCtx.activateTools?.(coreDeferredToolsForHistory(history));
     const visibleSpecs = toolSpecs({ activatedDeferred: activatedDeferredTools })
       .filter((tool) => skillToolAllowed(activeSkillToolPolicy, tool.name));
     const baseSpecs = visibleSpecs.filter((tool) => runtimeToolAllowed(tool.name));

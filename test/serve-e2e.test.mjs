@@ -23,6 +23,7 @@ import { addJob, cronDir, findJob, loadJobs, removeJob, saveJobs } from "../dist
 import { createTaskExecution, finishTaskExecution } from "../dist/session/task.js";
 import { INTERJECT_PREFIX } from "../dist/agent/reminders.js";
 import { orgRolesDir } from "../dist/org/roles.js";
+import { registerTool } from "../dist/tools/registry.js";
 
 test("serve client history hides internal steering triage wrappers", () => {
   const history = historyForClient([
@@ -367,6 +368,133 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
     }],
   }),
   quietDiscovery: true,
+});
+
+test("serve e2e: Desktop negotiates and edits core Computer Use policy", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-computer-settings-"));
+  let saved;
+  const state = {
+    mode: "click",
+    apps: ["Chrome"],
+    modeEditable: true,
+    appsEditable: true,
+    platform: process.platform,
+    backend: "fixture backend",
+    browser: { installed: false, enabled: false },
+  };
+  const deps = {
+    ...baseDeps(textProvider, memStore()),
+    computerSettings: () => state,
+    saveComputerSettings: (input, cwd) => {
+      saved = { input, cwd };
+      return { ...state, mode: input.mode, apps: input.apps };
+    },
+    installCoreBrowser: () => ({
+      plugin: { name: "browser", version: "0.2.0", description: "structured browser", enabled: true },
+      restartRequired: true,
+    }),
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(server.port);
+  try {
+    const initialized = await client.call("initialize", { token: "tok" });
+    for (const method of [
+      "settings.computer.get",
+      "settings.computer.save",
+      "settings.computer.browser.install",
+    ]) assert.ok(initialized.result.capabilities.methods.includes(method), `${method} advertised`);
+    assert.ok(initialized.result.capabilities.features.includes("computer-use.core.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("browser.structured-core.v1"));
+
+    assert.deepEqual((await client.call("settings.computer.get", {})).result, state);
+    const updated = await client.call("settings.computer.save", { mode: "full", apps: ["Chrome", "Edge"] });
+    assert.deepEqual(saved, { input: { mode: "full", apps: ["Chrome", "Edge"] }, cwd: dir });
+    assert.equal(updated.result.mode, "full");
+    assert.deepEqual(updated.result.apps, ["Chrome", "Edge"]);
+    assert.equal((await client.call("settings.computer.save", { mode: "full", apps: "Chrome" })).error.code, -32602);
+
+    const installed = await client.call("settings.computer.browser.install", {});
+    assert.equal(installed.result.plugin.name, "browser");
+    assert.equal(installed.result.restartRequired, true);
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve e2e: Computer Use receives screenshot understanding and grounding in Desktop sessions", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-computer-vision-"));
+  const toolName = "serve_fixture_screenshot_bridge";
+  registerTool({
+    name: toolName,
+    description: "Exercise the Desktop screenshot bridge.",
+    input_schema: { type: "object", properties: {} },
+    kind: "read",
+    async run(_input, ctx) {
+      assert.equal(typeof ctx.describeImage, "function");
+      assert.equal(typeof ctx.locate, "function");
+      const description = await ctx.describeImage("/fixture/screen.png", "login button", ctx.signal);
+      const location = await ctx.locate("/fixture/screen.png", "login button", ctx.signal);
+      return JSON.stringify({ description, location });
+    },
+  });
+
+  let round = 0;
+  const provider = {
+    id: "fake",
+    model: "fake-vision-1",
+    async turn({ history }) {
+      if (round++ === 0) {
+        return {
+          text: "",
+          toolUses: [{ id: "screen-bridge", name: toolName, input: {} }],
+          stop: "tool_use",
+          usage: { input: 1, output: 1 },
+        };
+      }
+      const content = history.at(-1)?.results?.[0]?.content ?? "missing";
+      return { text: content, toolUses: [], stop: "end", usage: { input: 1, output: 1 } };
+    },
+  };
+  const calls = [];
+  const deps = {
+    ...baseDeps(provider, memStore()),
+    describeScreenshot: async (primary, path, opts) => {
+      calls.push({ kind: "describe", primary, path, opts });
+      return "a login button is visible";
+    },
+    locateScreenshot: async (primary, path, target, opts) => {
+      calls.push({ kind: "locate", primary, path, target, opts });
+      return { x: 0.25, y: 0.75 };
+    },
+  };
+  const server = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
+  const client = await connect(server.port);
+  try {
+    await client.call("initialize", { token: "tok" });
+    const sessionId = (await client.call("session.create", { cwd: dir })).result.sessionId;
+    const sent = await client.call("session.send", { sessionId, text: "inspect the screen" });
+    assert.deepEqual(JSON.parse(sent.result.reply), {
+      description: "a login button is visible",
+      location: { x: 0.25, y: 0.75 },
+    });
+    assert.deepEqual(calls.map((call) => call.kind), ["describe", "locate"]);
+    for (const call of calls) {
+      assert.equal(call.primary, provider);
+      assert.equal(call.path, "/fixture/screen.png");
+      assert.equal(call.opts.cwd, dir);
+      assert.equal(call.opts.model, "fake-vision-1");
+      assert.equal(call.opts.profileId, "personal");
+      assert.equal(call.opts.spaceId, "personal");
+      assert.equal(call.opts.hint, "login button");
+      assert.ok(call.opts.signal instanceof AbortSignal);
+    }
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("serve e2e: a Personal turn resolves and uses its ordered saved-connection fallback chain", { timeout: 10000 }, async () => {
@@ -1756,6 +1884,19 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       deliverMode: "on-error",
     });
     assert.equal(missingDeliver.error.code, -32602);
+    const promptOwnedDelivery = await c.call("automation.add", {
+      name: "prompt-owned delivery",
+      schedule: "every 5m",
+      task: "整理日报并发送到飞书群",
+      mode: "print",
+    });
+    assert.equal(promptOwnedDelivery.error.code, -32602);
+    assert.match(promptOwnedDelivery.error.message, /no structured deliver is configured.*结果发送到/);
+    assert.equal(
+      (await c.call("automation.list", {})).result.jobs.some((job) => job.name === "prompt-owned delivery"),
+      false,
+      "an agent prompt cannot persist a delivery route while Desktop is configured to save locally",
+    );
     const invalidDeliverMode = await c.call("automation.add", {
       name: "bad delivery mode",
       schedule: "every 5m",
@@ -1782,6 +1923,21 @@ test("serve e2e: auth gate → create → send streams text events and returns t
       tz: "Asia/Shanghai",
     });
     timezoneAutomationId = zonedAutomation.result.id;
+    const promptOwnedDeliveryUpdate = await c.call("automation.update", {
+      id: timezoneAutomationId,
+      name: "Shanghai morning",
+      schedule: "0 9 * * *",
+      task: "整理日报并发送到飞书群",
+      mode: "print",
+      tz: "Asia/Shanghai",
+    });
+    assert.equal(promptOwnedDeliveryUpdate.error.code, -32602);
+    assert.match(promptOwnedDeliveryUpdate.error.message, /no structured deliver is configured.*结果发送到/);
+    assert.equal(
+      (await c.call("automation.list", {})).result.jobs.find((job) => job.id === timezoneAutomationId).task,
+      "prepare brief",
+      "a rejected edit leaves the persisted task unchanged",
+    );
     const renamedZonedAutomation = await c.call("automation.update", {
       id: timezoneAutomationId,
       name: "Shanghai morning renamed",

@@ -63,6 +63,7 @@ import type { GatewayStatus } from "../gateway/serve.js";
 import type { GatewayLoginSnapshot } from "../gateway/login.js";
 import type { UiSink } from "../tools/registry.js";
 import { APPROVAL_MODES, type ApprovalMode } from "../config.js";
+import type { ComputerSettingsInput, ComputerSettingsState } from "../computer-settings.js";
 import type { SandboxMode } from "../sandbox.js";
 import { loadAgentContext } from "../context/agents-md.js";
 import {
@@ -279,6 +280,15 @@ import {
   type ExternalTerminalStream,
 } from "../external-sessions/types.js";
 
+export interface ServeScreenshotContext {
+  cwd: string;
+  model: string;
+  profileId: string;
+  spaceId: string;
+  hint?: string;
+  signal?: AbortSignal;
+}
+
 /** What the CLI entry injects (built in index.ts, where config/providers/guardian already live). */
 export interface ServeDeps {
   version: string;
@@ -308,9 +318,23 @@ export interface ServeDeps {
       hint?: string;
     },
   ) => Promise<{ images?: ImageAttachment[]; description?: string; viaModel?: string }>;
+  /** Screenshot understanding for the core Computer Use tool. These callbacks are separate from user
+   * attachments because screen grounding needs a focused prompt and normalized coordinates. */
+  describeScreenshot?: (primary: Provider, path: string, opts: ServeScreenshotContext) => Promise<string>;
+  locateScreenshot?: (
+    primary: Provider,
+    path: string,
+    target: string,
+    opts: ServeScreenshotContext,
+  ) => Promise<{ x: number; y: number } | null>;
   /** Redacted provider/local-model control plane for Desktop settings. Credentials are accepted only by
    * save/test and must never be returned by these callbacks. */
   providerSettings?: (cwd?: string) => ProviderSettingsState;
+  /** Native screen-control policy plus the reviewed structured-browser backend state. All writes remain in
+   * the engine so Desktop cannot bypass environment ownership or Hara's global config lock. */
+  computerSettings?: (cwd?: string) => ComputerSettingsState;
+  saveComputerSettings?: (input: ComputerSettingsInput, cwd?: string) => ComputerSettingsState;
+  installCoreBrowser?: () => CoreBrowserInstallResult;
   saveVisionSettings?: (input: VisionSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
   testVisionSettings?: (input: VisionSettingsTestInput, cwd?: string) => Promise<ProviderSettingsTestResult>;
   saveProviderSettings?: (input: ProviderSettingsInput, cwd?: string) => Promise<ProviderSettingsState>;
@@ -773,6 +797,16 @@ export interface VisionSettingsState {
   /** Image-capable choices only; generation/audio/embedding and text-only models are excluded. */
   availableModels: string[];
   authorizedModels?: string[];
+}
+
+export interface CoreBrowserInstallResult {
+  plugin: {
+    name: "browser";
+    version: string;
+    description: string;
+    enabled: boolean;
+  };
+  restartRequired: boolean;
 }
 
 export interface VisionSettingsInput {
@@ -3036,6 +3070,36 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               model: s.provider.model,
             };
           },
+          ...(deps.describeScreenshot ? {
+            describeImage: async (path: string, hint?: string, signal?: AbortSignal) => {
+              const binding = sessionSpaceBinding(s.meta);
+              const text = await deps.describeScreenshot!(s.provider, path, {
+                cwd: s.meta.cwd,
+                model: s.meta.model,
+                profileId: binding.profileId,
+                spaceId: binding.spaceId,
+                hint,
+                signal: signal ?? turnAbort.signal,
+              });
+              sessionSpaceBinding(s.meta);
+              return text;
+            },
+          } : {}),
+          ...(deps.locateScreenshot ? {
+            locate: async (path: string, target: string, signal?: AbortSignal) => {
+              const binding = sessionSpaceBinding(s.meta);
+              const location = await deps.locateScreenshot!(s.provider, path, target, {
+                cwd: s.meta.cwd,
+                model: s.meta.model,
+                profileId: binding.profileId,
+                spaceId: binding.spaceId,
+                hint: target,
+                signal: signal ?? turnAbort.signal,
+              });
+              sessionSpaceBinding(s.meta);
+              return location;
+            },
+          } : {}),
         },
         approval: s.approval,
         approvalChannel: true,
@@ -4196,6 +4260,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
           }
           if (deps.unpinProjectProfile) methods.push("settings.profiles.unpin");
+          if (deps.computerSettings && deps.saveComputerSettings) {
+            methods.push("settings.computer.get", "settings.computer.save");
+          }
+          if (deps.installCoreBrowser) methods.push("settings.computer.browser.install");
           if (deps.spaces && deps.useSpace) methods.push("spaces.list", "spaces.use");
           if (deps.organizationLearningSubmit) methods.push("learning.submit");
           if (deps.organizationLearningSync) methods.push("learning.sync");
@@ -4235,6 +4303,8 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.runtime-remove.v1",
           ];
           if (deps.spaces && deps.useSpace) features.push("spaces.tenant-boundary.v1");
+          if (deps.computerSettings && deps.saveComputerSettings) features.push("computer-use.core.v1");
+          if (deps.installCoreBrowser) features.push("browser.structured-core.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
           if (deps.organizationLearningSubmit && deps.organizationLearningSync) {
             features.push("learning.organization-review.v1");
@@ -6086,6 +6156,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             setPluginEnabled(p.name, p.enabled);
             return reply(rpcResult(id!, { name: p.name, enabled: p.enabled })); // takes effect on the next session/turn (loaders re-read)
           }
+          case "settings.computer.get": {
+            if (!deps.computerSettings) return reply(rpcError(id, ERR.METHOD, "Computer Use settings are not supported by this server"));
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            return reply(rpcResult(id!, redactSensitiveValue(deps.computerSettings(targetCwd)).value));
+          }
+          case "settings.computer.save": {
+            if (!deps.saveComputerSettings) return reply(rpcError(id, ERR.METHOD, "Computer Use settings are not supported by this server"));
+            if (
+              typeof p.mode !== "string"
+              || !Array.isArray(p.apps)
+              || p.apps.some((app: unknown) => typeof app !== "string")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "mode + string-array apps required"));
+            }
+            const targetCwd = typeof p.cwd === "string" && p.cwd ? p.cwd : opts.cwd;
+            const result = deps.saveComputerSettings({
+              mode: p.mode as ComputerSettingsInput["mode"],
+              apps: p.apps,
+            }, targetCwd);
+            return reply(rpcResult(id!, redactSensitiveValue(result).value));
+          }
+          case "settings.computer.browser.install": {
+            if (!deps.installCoreBrowser) return reply(rpcError(id, ERR.METHOD, "the structured browser is not available in this Hara package"));
+            return reply(rpcResult(id!, redactSensitiveValue(deps.installCoreBrowser()).value));
+          }
           case "session.rename": {
             if (typeof p.sessionId !== "string" || typeof p.title !== "string") return reply(rpcError(id, ERR.PARAMS, "sessionId + title required"));
             const live = hub.get(p.sessionId);
@@ -7031,6 +7126,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (p.clearDeliver !== undefined) {
               return reply(rpcError(id, ERR.PARAMS, "clearDeliver only applies when updating a task"));
             }
+            const mode: CronJob["mode"] = p.mode === "org" || p.mode === "command" ? p.mode : "print";
             const sched = parseSchedule(p.schedule, Date.now());
             if ("error" in sched) return reply(rpcError(id, ERR.PARAMS, `bad schedule: ${sched.error}`));
             const requestedTimezone = typeof p.tz === "string" && p.tz.trim()
@@ -7049,9 +7145,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               if ("error" in parsed) return reply(rpcError(id, ERR.PARAMS, parsed.error));
               const configurationError = deliveryConfigurationError(deliver);
               if (configurationError) return reply(rpcError(id, ERR.PARAMS, configurationError));
-              const conflict = deliveryInstructionConflict(p.task, deliver);
-              if (conflict) return reply(rpcError(id, ERR.PARAMS, conflict));
             }
+            const conflict = deliveryInstructionConflict(p.task, deliver, mode);
+            if (conflict) return reply(rpcError(id, ERR.PARAMS, conflict));
             if (p.deliverMode !== undefined && !isAutomationDeliveryMode(p.deliverMode)) {
               return reply(rpcError(id, ERR.PARAMS, "deliverMode must be always, on-output, or on-error"));
             }
@@ -7067,7 +7163,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               name: p.name.trim().slice(0, 60),
               schedule: sched,
               task: p.task,
-              mode: p.mode === "org" || p.mode === "command" ? p.mode : "print",
+              mode,
               cwd: typeof p.cwd === "string" ? p.cwd.trim() : opts.cwd,
               ...(timezone ? { tz: timezone } : {}),
               ...(deliver ? { deliver } : {}),
@@ -7179,7 +7275,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               const configurationError = deliveryConfigurationError(effectiveDeliver);
               if (configurationError) return reply(rpcError(id, ERR.PARAMS, configurationError));
             }
-            const conflict = deliveryInstructionConflict(p.task, effectiveDeliver);
+            const conflict = deliveryInstructionConflict(p.task, effectiveDeliver, p.mode);
             if (conflict) return reply(rpcError(id, ERR.PARAMS, conflict));
             const alertAfter = p.alertAfter === undefined ? undefined : Number(p.alertAfter);
             if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {

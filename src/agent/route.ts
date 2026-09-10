@@ -3,6 +3,7 @@
 // routeBaseURL/routeApiKey) and trivial turns route there; everything with any code/action signal stays on
 // the primary model. Conservative by design (a coding tool should err toward the strong model).
 import type { Provider, NeutralMsg, TurnArgs } from "../providers/types.js";
+import { lastGenuineUserText } from "./core-capabilities.js";
 
 // Words that signal real coding/action work → keep the primary (strong) model. Broad on purpose: routing
 // should fire only on clearly trivial, non-actionable turns (questions, lookups, chit-chat).
@@ -19,11 +20,7 @@ const COMPLEX_CJK =
 /** The text of the most recent genuine user message (tool results are role:"tool", so this is stable
  *  across a turn's tool rounds). */
 export function lastUserText(history: NeutralMsg[]): string {
-  for (let i = history.length - 1; i >= 0; i--) {
-    const m = history[i];
-    if (m.role === "user") return typeof m.content === "string" ? m.content : "";
-  }
-  return "";
+  return lastGenuineUserText(history);
 }
 
 /** True if a turn is trivial enough to hand to the cheap/general model: short, single-line, no code,

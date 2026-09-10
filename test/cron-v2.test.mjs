@@ -1198,7 +1198,16 @@ test("delivery validation rejects missing credentials and duplicate prompt routi
     deliveryInstructionConflict("整理日报并发送到飞书群 oc_old", "feishu:oc_current"),
     /structured deliver is the sole destination/,
   );
+  assert.match(
+    deliveryInstructionConflict("整理日报并发送到飞书群", undefined),
+    /no structured deliver is configured.*结果发送到/,
+  );
   assert.equal(deliveryInstructionConflict("整理每日 AI 科技早报", "feishu:oc_current"), null);
+  assert.equal(
+    deliveryInstructionConflict("node send-to-feishu.mjs", undefined, "command"),
+    null,
+    "an explicit deterministic command remains user-owned when no result delivery is configured",
+  );
 });
 
 test("deterministic missing credentials block once and resume only after configuration appears", async () => {
@@ -1359,6 +1368,17 @@ test("cronjob tool: add/list/remove work; cron-run sessions are refused (recursi
     deliver: "feishu:oc_test",
   }, { cwd: process.cwd() });
   assert.match(missingConfiguration, /Feishu delivery is not configured/);
+  const missingStructuredRoute = await tool.run({
+    action: "add",
+    schedule: "every 5m",
+    task: "整理日报并发送到飞书群",
+  }, { cwd: process.cwd() });
+  assert.match(missingStructuredRoute, /no structured deliver is configured.*结果发送到/);
+  assert.equal(
+    loadJobs().some((job) => job.task === "整理日报并发送到飞书群"),
+    false,
+    "a prompt-owned external route is rejected before persistence",
+  );
   const savedAppId = process.env.HARA_FEISHU_APP_ID;
   const savedAppSecret = process.env.HARA_FEISHU_APP_SECRET;
   process.env.HARA_FEISHU_APP_ID = "configured";

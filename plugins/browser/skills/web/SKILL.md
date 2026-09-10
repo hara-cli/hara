@@ -19,7 +19,8 @@ counterpart to the fragile desktop `computer` tool: prefer it for anything on th
 4. `browser_snapshot` again to verify before the next step.
 
 ## Notes
-- First run downloads a browser once: `npx playwright install chromium`.
+- The reviewed package is pinned by Hara. Its first connection may download the isolated Chromium runtime;
+  Hara reports startup progress and does not treat the download as proof that a page action succeeded.
 - The Playwright MCP uses its **own** browser (no existing logins). For tasks needing the running Chrome
   profile, use Hara's `chrome` plugin instead. Its `chrome-devtools-mcp --autoConnect` route requires Chrome
   144+, remote debugging enabled at `chrome://inspect/#remote-debugging`, and explicit approval in Chrome.

@@ -92,6 +92,9 @@ configured always stays listed, and `/model <id>` still accepts any id the key i
 - **Semantic search / vectors** — see below: `embedProvider` (`off` \| `ollama` \| `qwen` \| `openai`) + `embedModel` / `embedBaseURL` / `embedApiKey`.
 - **B-end fleet**: `hara enroll <gateway> --code <code>` → device token in `~/.hara/org.json` (0600); sets `provider=hara-gateway`.
 - **Behavior**: `approval` · `sandbox` · `theme` · `evolve` · `assetCapture` · `computerUse`/`computerApps` · `hooks` · `notify` · `vimMode` · `mcpServers` · `HARA_MAX_CONCURRENCY` (parallel sub-agent/read cap, default 8).
+  Desktop exposes `computerUse` and `computerApps` as the first-party **Security → Computer Use** capability.
+  Its optional structured-browser backend is a pinned bundled plugin installed only by an explicit user action;
+  the native screen adapter stays off until the user selects a tier, and every computer action remains approval-gated.
   An `mcpServers.<name>.description` may provide a short non-secret capability hint so the lazy launcher can
   choose the relevant reviewed server without starting every configured external process.
 - **Remembered project approvals**: choosing **always for this project** writes an opaque, owner-only grant

@@ -220,6 +220,105 @@ test("deferred schemas require tool_search activation and remain run-local", asy
   assert.equal(toolSpecs({ activatedDeferred: new Set() }).some((spec) => spec.name === deferredName), false);
 });
 
+test("browser and desktop interaction requests expose core Computer Use on the first round", async () => {
+  registerTool({
+    name: "computer",
+    description: "Operate the local screen for this fixture.",
+    input_schema: { type: "object", properties: {} },
+    kind: "computer",
+    visibility: "deferred",
+    async run() { return "unused"; },
+  });
+
+  for (const prompt of [
+    "打开浏览器，点击登录按钮并截图确认",
+    "Use browser automation to fill this form",
+  ]) {
+    const outcome = await runAgent([{ role: "user", content: prompt }], {
+      provider: {
+        id: "fixture",
+        model: "fixture",
+        async turn({ tools }) {
+          assert.equal(tools.some((tool) => tool.name === "computer"), true);
+          return { text: "ready", toolUses: [], stop: "end" };
+        },
+      },
+      ctx: { cwd: TEST_HOME },
+      approval: "suggest",
+      confirm: async () => true,
+      quiet: true,
+    });
+    assert.equal(outcome.status, "completed");
+  }
+});
+
+test("opening a browser promotes core Computer Use on the next provider round", async () => {
+  registerTool({
+    name: "open_browser",
+    description: "Open a URL in the system browser for this fixture.",
+    input_schema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+    kind: "read",
+    async run() { return "opened"; },
+  });
+  registerTool({
+    name: "computer",
+    description: "Operate the local screen for this fixture.",
+    input_schema: { type: "object", properties: {} },
+    kind: "computer",
+    visibility: "deferred",
+    async run() { return "unused"; },
+  });
+
+  let turn = 0;
+  const outcome = await runAgent([{ role: "user", content: "打开百度" }], {
+    provider: {
+      id: "fixture",
+      model: "fixture",
+      async turn({ tools }) {
+        if (turn++ === 0) {
+          assert.equal(tools.some((tool) => tool.name === "computer"), false);
+          return {
+            text: "",
+            toolUses: [{ id: "open", name: "open_browser", input: { url: "https://www.baidu.com" } }],
+            stop: "tool_use",
+          };
+        }
+        assert.equal(tools.some((tool) => tool.name === "computer"), true);
+        return { text: "ready", toolUses: [], stop: "end" };
+      },
+    },
+    ctx: { cwd: TEST_HOME },
+    approval: "suggest",
+    confirm: async () => true,
+    quiet: true,
+  });
+  assert.equal(outcome.status, "completed");
+});
+
+test("core Computer Use activation stays conservative and obeys run filters", async () => {
+  const assertComputerVisibility = async (prompt, expected, toolFilter) => {
+    const outcome = await runAgent([{ role: "user", content: prompt }], {
+      provider: {
+        id: "fixture",
+        model: "fixture",
+        async turn({ tools }) {
+          assert.equal(tools.some((tool) => tool.name === "computer"), expected);
+          return { text: "done", toolUses: [], stop: "end" };
+        },
+      },
+      ctx: { cwd: TEST_HOME },
+      approval: "suggest",
+      confirm: async () => true,
+      quiet: true,
+      ...(toolFilter ? { toolFilter } : {}),
+    });
+    assert.equal(outcome.status, "completed");
+  };
+
+  await assertComputerVisibility("Refactor the browser compatibility CSS", false);
+  await assertComputerVisibility("打开网页并点击按钮", false, () => false);
+});
+
 test("runtime helpers survive role filters while activated targets still obey them", async () => {
   const allowed = "fixture_filtered_browser";
   const denied = "fixture_filtered_calendar";

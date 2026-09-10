@@ -416,11 +416,15 @@ external MCP/agent confirmations remain stricter and cannot be bypassed by a rem
 **Protected files and shell sandboxing**: built-in file, search, and context paths hard-reject `.env`/credential/private-key/private-Hara-state files before the ordinary approval/dispatch path can authorize them. Safe templates (`.env.example`, `.env.sample`, `.env.template`) remain readable. `HARA_ALLOW_SENSITIVE_FILES=1` is an explicit one-process exposure switch: it removes these built-in denies and that process's shell protected-read mask. Shell subprocesses receive a scrubbed environment; explicitly retain a named inherited variable with `HARA_SUBPROCESS_ENV_ALLOW=NAME[,NAME]` (output is still redacted). With the protected-file policy enabled, shell preflight rejects literal protected paths and environment-dump commands on every OS. On macOS, Seatbelt also masks existing protected files/directories from the shell and `--sandbox workspace-write|read-only` provides **file-write confinement**. Linux/Windows have no equivalent kernel read mask: static shell preflight is a useful guardrail, not a security sandbox, and arbitrary code can bypass it.
 **Screen control** (opt-in): the `computer` tool drives desktop software (screenshot → click/type), native per OS
 (mac `screencapture`+`cliclick` · Windows PowerShell · Linux `scrot`+`xdotool`). Off by default — enable a tier with
-`hara config set computerUse read|click|full` and allowlist apps with `hara config set computerApps "App, …"`. Guarded
+Desktop **Settings → Security → Computer Use**, or use `hara config set computerUse read|click|full` and allowlist
+apps with `hara config set computerApps "App, …"`. Concrete browser/desktop requests receive this core tool on the
+first useful model round; after `open_browser`, it also becomes available automatically on the next round. Guarded
 by the tier, the frontmost-app allowlist, a dangerous-key blocklist, and per-action approval. Screenshots are
 read into **actionable** output—interactive elements + positions (pass `focus` to target what you're after)—by
 the configured vision-first model, or otherwise by the multimodal conversation model. A text-only route with
-neither option cannot perform visual screen control.
+neither option cannot perform visual screen control. The same Desktop card can explicitly install Hara's pinned,
+isolated structured-browser backend for accessibility-tree navigation, forms, uploads, and post-action verification;
+it does not reuse another browser's login state.
 **Sessions and task execution**: conversations are saved automatically — `-c` / `--resume <id>` or
 `hara resume <id>` to continue, `hara sessions` to list, `hara export [id] [--out file]` to render one as a
 Markdown transcript. The current task is persisted separately with stable task/turn identity and recovers as

@@ -1,8 +1,8 @@
 // computer — native screen control (operate desktop software, not just the browser). Shell-out per OS, no
 // heavy deps: mac = screencapture + cliclick · windows = PowerShell + .NET/user32 · linux = scrot + xdotool.
 // Safety: opt-in tier (config computerUse off|read|click|full) + per-app allowlist (config computerApps:
-// frontmost-window check before any pointer/keyboard action) + dangerous-key blocklist + a once-per-session
-// grant (tool kind "computer" always confirms once, even in full-auto). Screenshots are read only by the
+// frontmost-window check before any pointer/keyboard action) + dangerous-key blocklist + per-action approval
+// (tool kind "computer" always confirms, even in full-auto). Screenshots are read only by the
 // selected conversation model when it has native image input; text-only models must be switched first.
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
@@ -413,25 +413,25 @@ registerTool({
   visibility: "deferred",
   async run(input, ctx) {
     if (ctx.signal?.aborted) throw new ComputerInterruptedError();
-    const cfg = loadConfig();
+    const cfg = loadConfig({ cwd: ctx.cwd });
     const tier = cfg.computerUse as Tier;
-    if (tier === "off") return "Screen control is off. Enable it: `hara config set computerUse read|click|full` (and `hara config set computerApps \"App Name, …\"` for the click/type allowlist).";
+    if (tier === "off") return "Screen control is off. Enable it in Hara Desktop → Settings → Security → Computer Use, or run `hara config set computerUse read|click|full` (and set an app allowlist for click/type).";
     const action = String(input.action ?? "");
-    if (!actionAllowed(tier, action)) return `'${action}' needs a higher tier (current computerUse=${tier}). Raise it with \`hara config set computerUse …\`.`;
+    if (!actionAllowed(tier, action)) return `'${action}' needs a higher tier (current computerUse=${tier}). Raise it in Hara Desktop → Settings → Security → Computer Use, or with \`hara config set computerUse …\`.`;
 
     // Bring the target app to the foreground first — without this, clicks land on the terminal hara runs in.
     if (action === "activate") {
       const app = String(input.app ?? input.target ?? "");
       if (!app) return "activate needs an `app` name (e.g. 'WeChat').";
       if (!cfg.computerApps.some((a) => a.toLowerCase() === app.toLowerCase()))
-        return `Refused: "${app}" isn't in your allowlist (${cfg.computerApps.join(", ") || "empty"}). Add it: \`hara config set computerApps "${app}"\`.`;
+        return `Refused: "${app}" isn't in your allowlist (${cfg.computerApps.join(", ") || "empty"}). Add it in Hara Desktop → Settings → Security → Computer Use, or run \`hara config set computerApps "${app}"\`.`;
       const r = await activateApp(app, ctx.signal);
       return r.ok ? ok(`✓ ${r.msg} — now screenshot/find/click to act on it`) : fail(r.msg);
     }
 
     if (action !== "screenshot" && action !== "find") {
       // per-app allowlist: only act when an allowlisted app is frontmost (the key guard against wrong-window clicks)
-      if (!cfg.computerApps.length) return "No apps allowlisted — set `hara config set computerApps \"App Name, …\"` before clicking/typing.";
+      if (!cfg.computerApps.length) return "No apps allowlisted — add exact app names in Hara Desktop → Settings → Security → Computer Use, or set `hara config set computerApps \"App Name, …\"`, before clicking/typing.";
       const app = await frontmostApp(ctx.signal);
       const allowed = cfg.computerApps.some((a) => a.toLowerCase() === app.toLowerCase());
       if (!allowed) return `Refused: frontmost app "${app || "unknown"}" isn't in your allowlist (${cfg.computerApps.join(", ")}). Switch to an allowed app or update computerApps.`;

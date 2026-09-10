@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.172.0 — 2026-09-10 — governed Computer Use and structured browser control
+
+- Promote Computer Use to a first-party core capability for concrete browser and desktop interaction. The
+  native screen tool is discoverable on the first useful model round (and immediately after `open_browser`),
+  while its opt-in tier, exact app allowlist, dangerous-key guard, and per-action approval remain authoritative.
+- Give Desktop-managed sessions the same vision-first screenshot understanding and normalized visual grounding
+  as CLI sessions, bound to the exact Personal or company Space and its authorized model route. A text-only route
+  fails with an actionable recovery path instead of pretending that an unread screenshot was understood.
+- Ship an explicitly installed, pinned structured-browser capability for accessibility-tree navigation, forms,
+  uploads, and post-action verification. Serve registers installed MCP backends lazily, and Desktop exposes the
+  Computer Use policy, environment locks, backend status, and controlled browser installation under Security.
+- Reject scheduled Agent prompts that ask to send to Feishu, WeChat, Telegram, or a webhook while the structured
+  delivery target is still local. CLI, Agent tools, and Desktop automation now fail before persistence, while an
+  explicit deterministic command remains a separate user-owned execution lane.
+
 ## 0.171.0 — 2026-09-10 — exact-account fallback and model-aware recovery
 
 - Let Personal users authorize and order up to four saved model connections for automatic fallback from

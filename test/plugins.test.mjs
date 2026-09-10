@@ -121,6 +121,32 @@ test("a signed package can install its bundled Chrome capability without a devel
   }
 });
 
+test("a signed package can install its pinned structured-browser capability", () => {
+  const name = "browser";
+  try {
+    const plugin = installPlugin("bundled:browser");
+    assert.equal(plugin.name, name);
+    assert.deepEqual(plugin.manifest.mcpServers.browser.args, ["-y", "@playwright/mcp@0.0.80"]);
+    assert.deepEqual(
+      plugin.manifest,
+      JSON.parse(readFileSync(join(process.cwd(), "plugins", "browser", ".hara-plugin", "plugin.json"), "utf8")),
+      "the binary-embedded browser manifest stays in sync with the reviewed package asset",
+    );
+    assert.equal(
+      readFileSync(join(plugin.root, "skills", "web", "SKILL.md"), "utf8"),
+      readFileSync(join(process.cwd(), "plugins", "browser", "skills", "web", "SKILL.md"), "utf8"),
+      "the binary-embedded browser skill stays in sync with the reviewed package asset",
+    );
+    assert.ok(pluginSkillDirs().some((dir) => dir.includes(`${name}/skills`)));
+    assert.ok(pluginMcpServers().browser, "bundled structured-browser MCP is available after explicit installation");
+    assert.equal(uninstallPlugin(name), true);
+  } finally {
+    rmSync(installedRoot(name), { recursive: true, force: true });
+    rmSync(receiptPath(name), { force: true });
+    cleanPluginFlag(name);
+  }
+});
+
 test("plugin install → skills/roles/mcp auto-contribute; disable hides them; uninstall removes", () => {
   const pname = "hara-test-plugin-" + Math.random().toString(36).slice(2, 8);
   const src = makeDemoPlugin(pname);

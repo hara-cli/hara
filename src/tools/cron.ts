@@ -110,15 +110,16 @@ registerTool({
       const tz = input.tz ? String(input.tz) : undefined;
       if (tz && !validTz(tz)) return `Error: invalid timezone "${tz}" (IANA name, e.g. Asia/Shanghai).`;
       if (tz && sched.kind !== "cron") return "Error: `tz` only applies to cron expressions.";
+      const mode = input.mode === "org" || input.mode === "command" ? input.mode : "print";
       const deliver = input.deliver ? String(input.deliver) : undefined;
       if (deliver) {
         const d = parseDeliver(deliver);
         if ("error" in d) return `Error: ${d.error}`;
         const configurationError = deliveryConfigurationError(deliver);
         if (configurationError) return `Error: ${configurationError}`;
-        const conflict = deliveryInstructionConflict(task, deliver);
-        if (conflict) return `Error: ${conflict}`;
       }
+      const conflict = deliveryInstructionConflict(task, deliver, mode);
+      if (conflict) return `Error: ${conflict}`;
       const deliverMode = input.deliverMode === undefined ? undefined : String(input.deliverMode);
       if (deliverMode && !deliver) return "Error: `deliverMode` requires `deliver`.";
       if (deliverMode && !["always", "on-output", "on-error"].includes(deliverMode)) {
@@ -128,7 +129,6 @@ registerTool({
       if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
         return "Error: `alertAfter` must be an integer from 1 to 1000.";
       }
-      const mode = input.mode === "org" || input.mode === "command" ? input.mode : "print";
       if (mode === "command") {
         const denied = sensitiveShellCommandReason(task, ctx.cwd);
         if (denied) return `Error: scheduled shell command crosses Hara's protected secret boundary (${denied}).`;

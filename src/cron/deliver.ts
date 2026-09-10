@@ -63,16 +63,25 @@ export function deliveryConfigurationError(
   return null;
 }
 
-/** A scheduled prompt describes the work; `deliver` is the sole routing source. Rejecting duplicate
- * routing instructions prevents an agent from sending twice or choosing a prompt-embedded stale chat. */
-export function deliveryInstructionConflict(task: string, deliver?: string): string | null {
-  if (!deliver) return null;
+/** A scheduled agent prompt describes the work; `deliver` is the sole routing source. Rejecting both a
+ * missing structured route and duplicate routing instructions prevents the agent from inventing its own
+ * transport, asking for credentials, sending twice, or choosing a prompt-embedded stale chat. A deterministic
+ * command with no `deliver` remains an explicit user-owned script lane rather than an agent prompt. */
+export function deliveryInstructionConflict(
+  task: string,
+  deliver?: string,
+  mode: "print" | "org" | "command" = "print",
+): string | null {
   const explicitTarget = /\b(?:feishu|lark|telegram|weixin|wechat|webhook):\S+/iu.test(task);
   const englishRoute = /\b(?:send|deliver|post|push)\b[^\r\n]{0,100}\b(?:feishu|lark|telegram|weixin|wechat|webhook|chat[ _-]?id)\b/iu.test(task);
   const chineseRoute = /(?:发送|投递|推送|发到|发至)[^\r\n]{0,100}(?:飞书|群聊|群组|会话|微信|电报|Webhook|chat[ _-]?id)/iu.test(task);
-  return explicitTarget || englishRoute || chineseRoute
-    ? "task must describe the work only; remove its delivery instruction because structured deliver is the sole destination"
-    : null;
+  if (!explicitTarget && !englishRoute && !chineseRoute) return null;
+  if (!deliver) {
+    return mode === "command"
+      ? null
+      : "task requests external delivery but no structured deliver is configured — 检测到任务要求投递到外部平台，但「结果发送到」仍为「仅保存在 Hara」；请删除任务描述中的投递指令，或配置结构化投递目标";
+  }
+  return "task must describe the work only; remove its delivery instruction because structured deliver is the sole destination";
 }
 
 /** Convert a sanitized transport error into a durable terminal/retry state. Deterministic failures do

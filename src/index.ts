@@ -346,6 +346,7 @@ import { installPlugin, uninstallPlugin, listInstalled, enabledPlugins, setPlugi
 import { routeByKeywords, buildDispatchPrompt, parseRoleId } from "./org/router.js";
 import { decompose, topoOrder, topoWaves, savePlan, loadPlan, atomPrompt, verify, type Atom, type Plan } from "./org/planner.js";
 import { closeMcp, registerLazyMcpServers } from "./mcp/client.js";
+import { registerServeMcpCapabilities } from "./serve/mcp-capabilities.js";
 import { sandboxSupported, runShell, type SandboxMode } from "./sandbox.js";
 import { undoLast } from "./undo.js";
 import { searchAssets, scaffoldAssets, assetsDir, assetSearchRoots } from "./recall.js";
@@ -380,6 +381,10 @@ import "./tools/external_agent.js"; // register external_agent (delegate to clau
 import "./tools/ask_user.js"; // register ask_user (pause mid-turn to ask the user a structured question)
 import "./tools/cron.js"; // register cronjob (model-facing scheduler — "remind me every morning" just works)
 import { computerBackends } from "./tools/computer.js"; // register the computer tool + expose the backend probe
+import {
+  computerSettingsSnapshot,
+  saveComputerSettings as saveComputerSettingsPolicy,
+} from "./computer-settings.js";
 import "./tools/open-directory.js"; // register safe Finder/File Explorer directory opening
 import "./tools/open-browser.js"; // register safe real-browser navigation for website/UI testing
 import { HARA_RUNTIME_VERSION } from "./version.js";
@@ -4408,6 +4413,14 @@ program
       ));
     }
     const cfg = loadConfig({ cwd });
+    // `serve` runs the same in-process agent core as the terminal, so installed MCP capabilities must be
+    // advertised here too. Registration is lazy: no external process starts until an authenticated,
+    // interactive turn explicitly approves `mcp_connect`.
+    registerServeMcpCapabilities(
+      pluginMcpServers(),
+      cfg.mcpServers,
+      (message) => process.stderr.write(`${message}\n`),
+    );
     const initialProfile = profileForConfig(cfg).profile;
     if (initialProfile.kind === "gateway") {
       try {
@@ -4429,6 +4442,22 @@ program
     const { startServe } = await import("./serve/server.js");
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const gatewayLogins = new GatewayLoginManager();
+    const structuredBrowserStatus = () => {
+      const installed = listInstalled().find((plugin) => plugin.name === "browser");
+      const enabled = installed
+        ? enabledPlugins().some((plugin) => plugin.name === "browser")
+        : false;
+      return {
+        installed: !!installed,
+        enabled,
+        ...(installed?.version ? { version: installed.version } : {}),
+      };
+    };
+    const computerSettingsFor = (targetCwd = cwd) => computerSettingsSnapshot(
+      targetCwd,
+      computerBackends(),
+      structuredBrowserStatus(),
+    );
     const controlPlaneRefreshAt = new Map<string, number>();
     const refreshSessionControlPlane = async (
       profile: Profile,
@@ -4618,7 +4647,68 @@ program
                 ),
           );
         },
+        describeScreenshot: async (primary, path, opts) => {
+          const live = loadConfig({ cwd: opts.cwd });
+          try {
+            const profile = assertProfileAudience(live, opts.profileId, opts.spaceId);
+            const route = await buildImageProviderForRoute(live, primary, profile, opts.spaceId);
+            const description = await describeImages(
+              route.provider,
+              [{ path, mediaType: "image/png" }],
+              { system: SCREENSHOT_SYSTEM, hint: opts.hint, signal: opts.signal },
+            );
+            assertProfileAudience(live, opts.profileId, opts.spaceId);
+            return description;
+          } catch (error) {
+            if (opts.signal?.aborted) throw error;
+            // Computer Use reports a precise text-only/vision-route recovery path when no description is
+            // available. Recheck the tenant boundary before converting an ordinary model error to empty.
+            assertProfileAudience(live, opts.profileId, opts.spaceId);
+            return "";
+          }
+        },
+        locateScreenshot: async (primary, path, target, opts) => {
+          const live = loadConfig({ cwd: opts.cwd });
+          try {
+            const profile = assertProfileAudience(live, opts.profileId, opts.spaceId);
+            const route = await buildImageProviderForRoute(live, primary, profile, opts.spaceId);
+            const location = await locateImage(
+              route.provider,
+              { path, mediaType: "image/png" },
+              target,
+              { signal: opts.signal },
+            );
+            assertProfileAudience(live, opts.profileId, opts.spaceId);
+            return location;
+          } catch (error) {
+            if (opts.signal?.aborted) throw error;
+            assertProfileAudience(live, opts.profileId, opts.spaceId);
+            return null;
+          }
+        },
         providerSettings: (targetCwd) => providerSettingsSnapshot(targetCwd ?? cwd),
+        computerSettings: (targetCwd) => computerSettingsFor(targetCwd ?? cwd),
+        saveComputerSettings: (input, targetCwd) => {
+          const settingsCwd = targetCwd ?? cwd;
+          saveComputerSettingsPolicy(input, settingsCwd);
+          return computerSettingsFor(settingsCwd);
+        },
+        installCoreBrowser: () => {
+          let browser = listInstalled().find((plugin) => plugin.name === "browser");
+          if (!browser || browser.version !== "0.2.0") browser = installPlugin("bundled:browser");
+          setPluginEnabled("browser", true);
+          return {
+            plugin: {
+              name: "browser" as const,
+              version: browser.version,
+              description: browser.manifest.description ?? "",
+              enabled: true,
+            },
+            // The current process captured its reviewed MCP catalog at startup. A controlled engine restart
+            // is required before the newly installed external server can be offered to model turns.
+            restartRequired: true,
+          };
+        },
         testVisionSettings: (input, targetCwd) => testVisionSettingsCandidate(input, targetCwd ?? cwd),
         saveVisionSettings: async (input, targetCwd) => saveVisionSettings(input, targetCwd ?? cwd),
         unpinProjectProfile: (targetCwd) => {
@@ -5236,14 +5326,15 @@ cronCmd
     if ("error" in sched) return void out(c.red(sched.error + "\n"));
     if (opts.tz && !validTz(opts.tz)) return void out(c.red(`invalid timezone "${opts.tz}" (IANA name, e.g. Asia/Shanghai)\n`));
     if (opts.tz && sched.kind !== "cron") return void out(c.red("--tz only applies to cron expressions\n"));
+    const mode = opts.command ? ("command" as const) : opts.org ? ("org" as const) : ("print" as const);
     if (opts.deliver) {
       const d = parseDeliver(opts.deliver);
       if ("error" in d) return void out(c.red(d.error + "\n"));
       const configurationError = deliveryConfigurationError(opts.deliver);
       if (configurationError) return void out(c.red(configurationError + "\n"));
-      const conflict = deliveryInstructionConflict(task, opts.deliver);
-      if (conflict) return void out(c.red(conflict + "\n"));
     }
+    const conflict = deliveryInstructionConflict(task, opts.deliver, mode);
+    if (conflict) return void out(c.red(conflict + "\n"));
     if (opts.deliverMode && !opts.deliver) return void out(c.red("--deliver-mode requires --deliver\n"));
     if (opts.deliverMode && !["always", "on-output", "on-error"].includes(opts.deliverMode)) {
       return void out(c.red("--deliver-mode must be always, on-output, or on-error\n"));
@@ -5252,7 +5343,6 @@ cronCmd
     if (alertAfter !== undefined && (!Number.isInteger(alertAfter) || alertAfter < 1 || alertAfter > 1_000)) {
       return void out(c.red("--alert-after must be an integer from 1 to 1000\n"));
     }
-    const mode = opts.command ? ("command" as const) : opts.org ? ("org" as const) : ("print" as const);
     let job: CronJob;
     try {
       job = addJob({
