@@ -21,10 +21,14 @@ function deliveryText(text: string, targetPlatform: string): string {
 registerTool({
   name: "channel_message",
   description:
-    "Hara-native cross-channel messaging through gateways that are already connected on this device. " +
-    "Use this tool—not a vendor CLI, browser automation, or guessed HTTP credentials—when the user asks to send " +
-    "a message to Feishu or WeChat. action=list shows safe bridge aliases; action=send accepts bridge:<name> or an " +
-    "explicit feishu:<chatId>/weixin:<peerId>. Never invent an id. A queued result is not proof of delivery.",
+    "Send plain text to a Feishu or WeChat destination already connected to Hara on this device. Use action=send " +
+    "only when both the recipient and message body are known. If either is missing, do not call the tool: ask only " +
+    "the direct question(s) for the missing value(s), with no preface, explanation, example, or promise to send. " +
+    "When both are missing, default to only the localized equivalent of 'Who should I send it to? What should I " +
+    "send?'; when one is missing, ask only that one. Follow any user-requested response length or exact format. Use " +
+    "action=list only when the user asks which destinations are available or their supplied recipient remains " +
+    "ambiguous. Keep tool names, parameter names, internal ids, and bridge mechanics out of ordinary user-facing " +
+    "clarifications. Never invent a destination. A queued result is not proof of delivery.",
   input_schema: {
     type: "object",
     properties: {

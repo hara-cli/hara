@@ -69,6 +69,11 @@ test("Hara prompt keeps core/session identities stable when the accepted task br
     assert.match(after.text, /Working directory: \/workspace\/project/);
     assert.match(after.text, /Reply in the same language as the user's latest message/);
     assert.match(after.text, /Keep that language consistent in every user-visible/);
+    assert.match(after.text, /explicit response shape as a binding contract/);
+    assert.match(after.text, /ask only for the missing fields in one short sentence/);
+    assert.match(after.text, /For message delivery, a missing recipient and\/or message body/);
+    assert.match(after.text, /no preface, explanation, example, or promise to send/);
+    assert.match(after.text, /Who should I send it to\? What should I send\?/);
     assert.match(after.text, /never give a long-lived server or tunnel a short/);
     assert.match(after.text, /verify the failing function's actual inputs and observable state/);
     assert.match(after.text, /Trace a missing or unexpected value upstream through its callers/);

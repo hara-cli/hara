@@ -173,6 +173,12 @@ test("the eager channel_message tool uses a connected Feishu gateway instead of 
     const tool = getTool("channel_message");
     assert.ok(tool);
     assert.equal(tool.visibility, "eager");
+    assert.match(tool.description, /only when both the recipient and message body are known/);
+    assert.match(tool.description, /direct question\(s\) for the missing value\(s\)/);
+    assert.match(tool.description, /no preface, explanation, example, or promise to send/);
+    assert.match(tool.description, /Who should I send it to\? What should I send\?/);
+    assert.match(tool.description, /action=list only when the user asks which destinations are available/);
+    assert.match(tool.description, /internal ids, and bridge mechanics out of ordinary user-facing clarifications/);
     assert.equal(tool.classify({ action: "list" }, { cwd: process.cwd() }).effect, "read");
     assert.equal(tool.classify({ action: "send" }, { cwd: process.cwd() }).effect, "exec");
     const listed = await tool.run({ action: "list" }, { cwd: process.cwd(), stateHome: home });
