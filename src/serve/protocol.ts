@@ -162,6 +162,11 @@
 //                                                     each route's own endpoint, credential, model,
 //                                                     capabilities and circuit; company Spaces never use it.
 //   settings.gateways.list {}                      → {gateways:[redacted configuration/runtime health]}
+//   settings.gateways.credentials.save {platform:"feishu",appId,appSecret,domain?}
+//                                                   → {gateway:redacted status}; the write-only credential is
+//                                                     saved in Engine private state and never returned
+//   settings.gateways.credentials.remove {platform:"feishu"} → {gateway:redacted status}; removes only the
+//                                                     stored record, never an environment override
 //   settings.gateways.login.start {platform:"weixin"} → {login:{id,phase,qrPayload?,qrRevision,…}}
 //   settings.gateways.login.status {platform:"weixin",id?} → {login:{id,phase,qrPayload?,…}}
 //   settings.gateways.login.cancel {platform:"weixin",id} → {login:{id,phase:"cancelled",…}}
@@ -179,9 +184,21 @@
 //   desk.snapshot    {profileId,state?}               → {profileId,fetchedAt,me,tasks,agents,events,
 //                                                        circles,truncated}
 //                                                        Task summaries contain a short excerpt, not body.
-//   desk.task.get    {profileId,taskId}               → {profileId,task:{...,body},events}
+//   desk.task.get    {profileId,taskId}               → {profileId,task:{...,body},events,comments,
+//                                                        attachments,sources,links,executionEvents,diffs}
 //                                                        Remote Desk reads are explicit and profile-pinned;
 //                                                        changing the active organization cannot reroute them.
+//   desk.task.create {profileId,kind,title,body?,risk?,priority?,severity?,slaDueAt?}
+//   desk.task.claim  {profileId,taskId}                → {profileId,task}
+//   desk.task.ack    {profileId,taskId}                → {profileId,task}; Desk enforces owner role
+//   desk.task.transition {profileId,taskId,state,note?,releaseVersion?,verificationSteps?,claimFence?}
+//   desk.task.complete {profileId,taskId,detail?,releaseVersion?,verificationSteps?,claimFence?}
+//   desk.task.cancel {profileId,taskId,detail,claimFence?}
+//   desk.task.comment {profileId,taskId,body}           → {profileId,comment}
+//   feature organization.desk.tasks.v1 is advertised only when the complete write set above exists;
+//   partial/older Engines remain read-only instead of exposing actions that can fail by construction.
+//                                                        Every mutation is organization-pinned; credentials
+//                                                        remain inside Engine and never cross the loopback RPC.
 //   automation.validate {schedule,tz?,id?}         → {schedule,description,nextRuns:[…],nextRunDeferred?}
 //   automation.add    {name,schedule,task,mode?,cwd?,tz?,deliver?,deliverMode?,alertAfter?}
 //                                                               → {id,name,schedule}

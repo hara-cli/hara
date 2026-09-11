@@ -2,12 +2,13 @@
 // WITHOUT needing the gateway process: adapters are constructed one-shot from the same env vars the
 // gateway uses, send once, and are dropped. Spec format: "<target>:<id>" —
 //   telegram:<chatId>   (HARA_TELEGRAM_TOKEN)
-//   feishu:<chatId>     (HARA_FEISHU_APP_ID + HARA_FEISHU_APP_SECRET)
+//   feishu:<chatId>     (Hara's private Feishu setting, or a complete environment override)
 //   webhook:<url>       (plain POST {name,status,text} JSON — for anything else)
 //   weixin:<peerId>     (sends over stored ~/.hara/weixin creds — explicit peer required; guessing the
 //                        "owner" from a multi-DM context-token cache can deliver private results to the wrong person)
 // Adapters are imported LAZILY so the (heavy) SDKs never load unless a job actually delivers.
 import { outboundTransferTimeoutMs, withOutboundDeadline } from "../gateway/telegram.js";
+import { inspectFeishuGatewayCredentials } from "../gateway/credentials.js";
 
 export interface DeliverTarget {
   platform: "telegram" | "feishu" | "webhook" | "weixin";
@@ -43,11 +44,22 @@ export function parseDeliver(spec: string): DeliverTarget | { error: string } {
 export function deliveryConfigurationError(
   spec: string,
   env: NodeJS.ProcessEnv = process.env,
+  home?: string,
 ): string | null {
   const target = parseDeliver(spec);
   if ("error" in target) return target.error;
-  if (target.platform === "feishu" && (!env.HARA_FEISHU_APP_ID || !env.HARA_FEISHU_APP_SECRET)) {
-    return "Feishu delivery is not configured — set HARA_FEISHU_APP_ID and HARA_FEISHU_APP_SECRET before saving this job";
+  if (target.platform === "feishu") {
+    const inspected = inspectFeishuGatewayCredentials({
+      env,
+      ...(home ? { home } : {}),
+      // An explicitly supplied test/validation environment must stay hermetic and never borrow a user's store.
+      allowStored: env === process.env,
+    });
+    if (inspected.state !== "ready") {
+      return inspected.state === "unreadable"
+        ? "Feishu delivery credentials are unreadable — repair or replace them in Hara Settings"
+        : "Feishu delivery is not configured — configure it in Hara Settings or set both HARA_FEISHU_APP_ID and HARA_FEISHU_APP_SECRET in the trusted launch environment before saving this job";
+    }
   }
   if (target.platform === "telegram" && !env.HARA_TELEGRAM_TOKEN) {
     return "Telegram delivery is not configured — set HARA_TELEGRAM_TOKEN before saving this job";
@@ -90,7 +102,7 @@ export function classifyDeliveryFailure(
   error: string,
   attempts: number,
 ): CronNotificationFailureDisposition {
-  if (/not configured|not set|creds\.json missing|not logged in/iu.test(error)) {
+  if (/not configured|not set|credentials are unreadable|creds\.json missing|not logged in/iu.test(error)) {
     return { state: "blocked", code: "configuration_required" };
   }
   if (/bad deliver spec|missing a target|unsupported deliver platform|ambiguous|absolute HTTP\(S\) URL/iu.test(error)) {
@@ -141,10 +153,11 @@ export async function deliverResult(
   text: string,
   signal?: AbortSignal,
   idempotencyKey?: string,
+  options: { home?: string } = {},
 ): Promise<string | null> {
   const t = parseDeliver(spec);
   if ("error" in t) return t.error;
-  const configurationError = deliveryConfigurationError(spec);
+  const configurationError = deliveryConfigurationError(spec, process.env, options.home);
   if (configurationError) return configurationError;
   if (t.platform !== "webhook") text = plainChat(text); // chat surfaces are plain text; webhooks get raw payload
   try {
@@ -181,10 +194,13 @@ export async function deliverResult(
           return null;
         }
         // feishu
-        const appId = process.env.HARA_FEISHU_APP_ID!;
-        const appSecret = process.env.HARA_FEISHU_APP_SECRET!;
+        const inspected = inspectFeishuGatewayCredentials(options.home ? { home: options.home } : {});
+        if (inspected.state !== "ready") {
+          return "Feishu delivery is not configured — configure it in Hara Settings or the trusted launch environment";
+        }
+        const { appId, appSecret, domain } = inspected.credentials;
         const { feishuAdapter } = await import("../gateway/feishu.js");
-        await feishuAdapter(appId, appSecret).send(t.to, text, deliverySignal, idempotencyKey);
+        await feishuAdapter(appId, appSecret, domain).send(t.to, text, deliverySignal, idempotencyKey);
         return null;
       },
     );

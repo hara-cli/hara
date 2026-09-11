@@ -31,7 +31,7 @@ type CommandReceiptBody = MobileCommandReceipt["receipt"];
 
 type CompanionRequest = Readonly<{
   body: unknown;
-  method: "sessions.list" | "sessions.read" | "terminal.snapshot" | "terminal.control" | "command.execute";
+  method: "sessions.list" | "sessions.read" | "terminal.snapshot" | "terminal.control" | "command.execute" | "command.status";
   protocolVersion: 1;
   requestId: string;
   type: "companion.request";
@@ -63,7 +63,7 @@ export function parseCompanionRequest(value: unknown): CompanionRequest | null {
     input.type !== "companion.request"
     || input.protocolVersion !== 1
     || !identifier(input.requestId)
-    || !["sessions.list", "sessions.read", "terminal.snapshot", "terminal.control", "command.execute"].includes(String(input.method))
+    || !["sessions.list", "sessions.read", "terminal.snapshot", "terminal.control", "command.execute", "command.status"].includes(String(input.method))
   ) return null;
   return input as unknown as CompanionRequest;
 }
@@ -565,6 +565,19 @@ export class MobileCompanionRouter {
     return result;
   }
 
+  private commandStatus(raw: unknown): CommandReceiptBody | null {
+    const body = record(raw);
+    if (!body || !identifier(body.commandId)) return null;
+    const prior = this.receipts.get(body.commandId);
+    if (!prior) return null;
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify(body), "utf8")
+      .digest("hex");
+    return prior.fingerprint === fingerprint
+      ? prior.receipt
+      : this.receipt(body.commandId, "failed", "COMMAND_ID_COLLISION");
+  }
+
   async route(request: CompanionRequest): Promise<CompanionResponse> {
     try {
       switch (request.method) {
@@ -588,6 +601,12 @@ export class MobileCompanionRouter {
           return ok(request.requestId, await this.terminalControl(request.body));
         case "command.execute":
           return ok(request.requestId, await this.executeCommand(request.body));
+        case "command.status": {
+          const receipt = this.commandStatus(request.body);
+          return receipt
+            ? ok(request.requestId, receipt)
+            : failed(request.requestId, "COMMAND_OUTCOME_UNKNOWN");
+        }
       }
     } catch {
       return failed(request.requestId, "LOCAL_SERVICE_UNAVAILABLE");

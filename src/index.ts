@@ -229,14 +229,28 @@ import { MIN_NODE_VERSION, unsupportedNodeMessage } from "./runtime.js";
 import { redactKnownSecrets, redactSensitiveText } from "./security/secrets.js";
 import { normalizePackageRegistry } from "./package-registry.js";
 import {
+  ackDeskTask,
+  ackStandaloneDeskTask,
+  cancelDeskTask,
+  cancelStandaloneDeskTask,
+  claimDeskTask,
+  claimStandaloneDeskTask,
+  commentDeskTask,
+  completeDeskTask,
+  completeStandaloneDeskTask,
+  createDeskTask,
   DeskClientError,
   deskOrganizationIdentityMatches,
   deskConnectionsSnapshot as localDeskConnectionsSnapshot,
   fetchDeskSnapshot,
   fetchDeskTask,
   removeProfileCreds,
+  transitionDeskTask,
+  type DeskCompleteTaskInput,
+  type DeskCreateTaskInput,
   type DeskOrganizationIdentity,
   type DeskTaskState,
+  type DeskTransitionTaskInput,
 } from "./desk.js";
 
 /** Render the background-job list for /jobs (user-facing view of what the agent has running in the
@@ -1744,6 +1758,7 @@ function deskOrganizationIdentity(profile: Profile): DeskOrganizationIdentity {
   return {
     profileId: profile.id,
     gatewayUrl: profile.gatewayUrl,
+    ...(profile.tenantId ? { tenantId: profile.tenantId } : {}),
     ...(profile.deviceId ? { deviceId: profile.deviceId } : {}),
     ...(profile.enrolledAt ? { enrolledAt: profile.enrolledAt } : {}),
   };
@@ -1786,6 +1801,53 @@ async function fetchDeskTaskForProfile(profileId: string, taskId: string) {
   }
   return result;
 }
+
+async function withPinnedDeskOrganization<T>(
+  profileId: string,
+  operation: (identity: DeskOrganizationIdentity) => Promise<T>,
+): Promise<T> {
+  const identity = assertDeskOrganizationProfile(profileId);
+  const result = await operation(identity);
+  const current = assertDeskOrganizationProfile(profileId);
+  if (!deskOrganizationIdentityMatches(identity, current)) {
+    throw new DeskClientError(
+      "CONFLICT",
+      "organization connection changed during the Desk update",
+    );
+  }
+  return result;
+}
+
+const createDeskTaskForProfile = (profileId: string, input: DeskCreateTaskInput) =>
+  withPinnedDeskOrganization(profileId, (identity) => createDeskTask(identity, input));
+
+const claimDeskTaskForProfile = (profileId: string, taskId: string) =>
+  withPinnedDeskOrganization(profileId, (identity) => claimDeskTask(identity, taskId));
+
+const ackDeskTaskForProfile = (profileId: string, taskId: string) =>
+  withPinnedDeskOrganization(profileId, (identity) => ackDeskTask(identity, taskId));
+
+const transitionDeskTaskForProfile = (
+  profileId: string,
+  taskId: string,
+  input: DeskTransitionTaskInput,
+) => withPinnedDeskOrganization(profileId, (identity) => transitionDeskTask(identity, taskId, input));
+
+const completeDeskTaskForProfile = (
+  profileId: string,
+  taskId: string,
+  input: DeskCompleteTaskInput,
+) => withPinnedDeskOrganization(profileId, (identity) => completeDeskTask(identity, taskId, input));
+
+const cancelDeskTaskForProfile = (
+  profileId: string,
+  taskId: string,
+  detail: string,
+  claimFence?: number,
+) => withPinnedDeskOrganization(profileId, (identity) => cancelDeskTask(identity, taskId, detail, claimFence));
+
+const commentDeskTaskForProfile = (profileId: string, taskId: string, body: string) =>
+  withPinnedDeskOrganization(profileId, (identity) => commentDeskTask(identity, taskId, body));
 
 async function testProviderSettingsCandidate(input: {
   provider: string;
@@ -4724,6 +4786,31 @@ program
           const gateway = await import("./gateway/serve.js");
           return gateway.listGatewayStatuses(["weixin", "feishu"]);
         },
+        saveGatewayCredentials: async (input) => {
+          const credentials = await import("./gateway/credentials.js");
+          const environment = credentials.inspectFeishuGatewayCredentials({ allowStored: false });
+          if (environment.source === "environment") {
+            throw new Error("Feishu credentials are controlled by the Engine launch environment; remove that override before editing Hara Settings");
+          }
+          try {
+            credentials.saveFeishuGatewayCredentials(input);
+          } catch {
+            throw new Error("Feishu credentials could not be saved securely; repair Hara's private state permissions and retry");
+          }
+          const gateway = await import("./gateway/serve.js");
+          return gateway.gatewayStatus("feishu");
+        },
+        removeGatewayCredentials: async (platform) => {
+          if (platform !== "feishu") throw new Error("only Feishu credential removal is supported");
+          const credentials = await import("./gateway/credentials.js");
+          try {
+            credentials.removeStoredFeishuGatewayCredentials();
+          } catch {
+            throw new Error("Stored Feishu credentials could not be removed securely; repair Hara's private state permissions and retry");
+          }
+          const gateway = await import("./gateway/serve.js");
+          return gateway.gatewayStatus("feishu");
+        },
         startGatewayLogin: (platform) => gatewayLogins.start(platform),
         gatewayLoginStatus: (platform, id) => gatewayLogins.status(platform, id),
         cancelGatewayLogin: (platform, id) => gatewayLogins.cancel(platform, id),
@@ -4798,6 +4885,13 @@ program
         ),
         deskSnapshot: fetchDeskSnapshotForProfile,
         deskTask: fetchDeskTaskForProfile,
+        deskTaskCreate: createDeskTaskForProfile,
+        deskTaskClaim: claimDeskTaskForProfile,
+        deskTaskAck: ackDeskTaskForProfile,
+        deskTaskTransition: transitionDeskTaskForProfile,
+        deskTaskComplete: completeDeskTaskForProfile,
+        deskTaskCancel: cancelDeskTaskForProfile,
+        deskTaskComment: commentDeskTaskForProfile,
         testProviderSettings: (input) => testProviderSettingsCandidate(input),
         createProviderConnection: (input, targetCwd) => createNamedProviderConnection(
           input,
@@ -5709,7 +5803,7 @@ program
 
 // `hara desk` — connect to a hara-desk coordination server (identity registry + task board).
 // The desk is the closed-source enterprise piece; this is the open-source client side.
-const deskCmd = program.command("desk").description("coordinate with a hara-desk server (register · post · board · claim · complete)");
+const deskCmd = program.command("desk").description("coordinate with a hara-desk server (organization Agents · tasks · replay)");
 
 const resolveDeskProfile = (requested?: string): {
   profileId: string;
@@ -5743,31 +5837,67 @@ const loadDeskCliCreds = async (requested?: string) => {
 
 const missingDeskRegistration = (profileId?: string): string =>
   profileId
-    ? `Desk is not configured for '${profileId}' — run \`hara desk register --profile ${profileId} --url … --key …\`\n`
-    : "Desk is not configured — run `hara desk register --url … --key …` first\n";
+    ? `Desk is not connected for '${profileId}' — re-enroll this organization connection or ask its administrator to enable Desk\n`
+    : "Standalone Desk is not configured — run `hara desk register --url … --key-file <private-0600-file>` first\n";
+
+deskCmd
+  .command("provision-agent")
+  .description("connect Claude Code or Codex to the active organization's Desk without exposing its enrollment key")
+  .requiredOption("--client <client>", "claude-code | codex")
+  .option("--profile <id>", "organization connection id (default: active organization)")
+  .option("--instance <id>", "stable account/runtime id; use a different value for another account", "default")
+  .option("--name <name>", "Agent name shown in the organization")
+  .action(async (o: { client: string; profile?: string; instance: string; name?: string }) => {
+    const aliases: Record<string, "anthropic.claude-code" | "openai.codex"> = {
+      "claude-code": "anthropic.claude-code",
+      claude: "anthropic.claude-code",
+      "anthropic.claude-code": "anthropic.claude-code",
+      codex: "openai.codex",
+      "openai.codex": "openai.codex",
+    };
+    const clientKind = aliases[o.client.trim().toLowerCase()];
+    if (!clientKind) {
+      return void out(c.red("provision failed: --client must be claude-code or codex\n"));
+    }
+    const profileId = o.profile?.trim() || resolveActive(process.cwd()).id;
+    try {
+      const { provisionOrganizationDeskAgent } = await import("./org-fleet/enroll.js");
+      const result = await provisionOrganizationDeskAgent(profileId, {
+        clientKind,
+        instanceId: o.instance,
+        name: o.name,
+      });
+      out(c.green("✓ organization Agent connected ") + `${result.agentId} (${result.clientKind})\n`);
+      out(`MCP identity (non-secret): DESK_URL=${result.deskUrl} DESK_CLIENT_KIND=${result.clientKind} DESK_INSTALLATION_ID=${result.installationId} DESK_PROFILE=${result.instanceId}\n`);
+      out("The scoped bearer was saved privately (0600) and was not printed. Add these four non-secret variables to this client's hara-desk MCP configuration.\n");
+    } catch (e: any) {
+      out(c.red(`provision failed: ${e?.message ?? "unknown error"}\n`));
+    }
+  });
 
 deskCmd
   .command("register")
-  .description("register with the active organization's Desk (or a standalone Desk when no organization is active)")
+  .description("register a standalone Desk; organization Desk credentials are provisioned by Hara Control")
   .requiredOption("--url <url>", "desk base URL (e.g. http://127.0.0.1:4200)")
-  .requiredOption("--key <enrollKey>", "the desk's enroll key")
-  .option("--profile <id>", "organization connection id (default: active organization)")
+  .requiredOption("--key-file <file>", "owner-only (0600) file containing the standalone Desk enrollment key")
   .option("--name <name>", "agent name shown in the registry", "hara-cli")
   .option("--owner <owner>", "the human this agent belongs to", "me")
-  .action(async (o: { url: string; key: string; profile?: string; name: string; owner: string }) => {
-    const { registerAgent } = await import("./desk.js");
+  .action(async (o: { url: string; keyFile: string; name: string; owner: string }) => {
+    const { readStandaloneDeskEnrollmentKeyFile, registerAgent } = await import("./desk.js");
     try {
-      const resolved = resolveDeskProfile(o.profile);
+      const activeProfile = resolveActive(process.cwd());
+      if (getProfile(activeProfile.id)?.kind === "gateway") {
+        throw new Error("organization Desk registration is managed by Hara Control; re-enroll the organization connection instead");
+      }
+      const enrollKey = readStandaloneDeskEnrollmentKeyFile(o.keyFile);
       const creds = await registerAgent(
         o.url,
-        o.key,
+        enrollKey,
         o.name,
         o.owner,
-        "hara-cli",
-        resolved?.identity,
+        "nanhara.hara-cli",
       );
-      const scope = resolved ? ` [${resolved.profileId}]` : " [standalone]";
-      out(c.green("✓ registered ") + `${creds.agentId} (owner ${creds.owner}) → ${creds.url}${scope}\n`);
+      out(c.green("✓ registered ") + `${creds.agentId} (owner ${creds.owner}) → ${creds.url} [standalone]\n`);
     } catch (e: any) {
       out(c.red(`register failed: ${e.message}\n`));
     }
@@ -5823,18 +5953,25 @@ deskCmd
       out(c.red(`board failed: ${e.message}\n`));
     }
   });
-for (const [verb, path, ok] of [
-  ["claim", "claim", "claimed"],
-  ["complete", "complete", "completed"],
-  ["ack", "ack", "acked"],
-  ["cancel", "cancel", "cancelled"],
+for (const [verb, ok] of [
+  ["claim", "claimed"],
+  ["complete", "completed"],
+  ["ack", "acked"],
+  ["cancel", "cancelled"],
 ] as const) {
   deskCmd
     .command(`${verb} <taskId>`)
     .description(`${verb} a task`)
     .option("--profile <id>", "organization connection id (default: active organization)")
-    .option("--detail <text>", "note (complete)", "")
-    .action(async (taskId: string, o: { profile?: string; detail: string }) => {
+    .option("--detail <text>", "completion note or cancellation reason", "")
+    .option("--release-version <version>", "verified release version (complete only)", "")
+    .option("--verification-steps <steps>", "focused verification steps (complete only)", "")
+    .action(async (taskId: string, o: {
+      profile?: string;
+      detail: string;
+      releaseVersion: string;
+      verificationSteps: string;
+    }) => {
       const { deskCall } = await import("./desk.js");
       let profileId: string | undefined;
       let creds;
@@ -5845,7 +5982,51 @@ for (const [verb, path, ok] of [
       }
       if (!creds) return void out(c.red(missingDeskRegistration(profileId)));
       try {
-        const r = await deskCall(creds.url, "POST", `/tasks/${encodeURIComponent(taskId)}/${path}`, { token: creds.token, body: verb === "complete" ? { detail: o.detail } : {} }) as any;
+        const claimedFence = async (): Promise<number | undefined> => {
+          const result = profileId
+            ? await withPinnedDeskOrganization(profileId, (identity) => fetchDeskTask(identity, taskId))
+            : await deskCall(creds.url, "GET", `/tasks/${encodeURIComponent(taskId)}`, { token: creds.token }) as any;
+          const task = profileId ? result.task : result?.task;
+          const fence = Number(task?.claimFence);
+          return task?.claimedBy === creds.agentId
+            && typeof task?.claimedSessionId === "string"
+            && task.claimedSessionId
+            && Number.isSafeInteger(fence)
+            && fence > 0
+            ? fence
+            : undefined;
+        };
+
+        let r;
+        if (profileId) {
+          if (verb === "claim") {
+            r = await claimDeskTaskForProfile(profileId, taskId);
+          } else if (verb === "ack") {
+            r = await ackDeskTaskForProfile(profileId, taskId);
+          } else if (verb === "complete") {
+            r = await completeDeskTaskForProfile(profileId, taskId, {
+              detail: o.detail,
+              releaseVersion: o.releaseVersion,
+              verificationSteps: o.verificationSteps,
+              claimFence: await claimedFence(),
+            });
+          } else {
+            r = await cancelDeskTaskForProfile(profileId, taskId, o.detail, await claimedFence());
+          }
+        } else if (verb === "claim") {
+          r = await claimStandaloneDeskTask(creds, taskId);
+        } else if (verb === "ack") {
+          r = await ackStandaloneDeskTask(creds, taskId);
+        } else if (verb === "complete") {
+          r = await completeStandaloneDeskTask(creds, taskId, {
+            detail: o.detail,
+            releaseVersion: o.releaseVersion,
+            verificationSteps: o.verificationSteps,
+            claimFence: await claimedFence(),
+          });
+        } else {
+          r = await cancelStandaloneDeskTask(creds, taskId, o.detail, await claimedFence());
+        }
         out(c.green(`✓ ${ok} `) + `${r.task?.id ?? taskId}${r.task ? ` (${r.task.state})` : ""}\n`);
       } catch (e: any) {
         out(c.red(`${verb} failed: ${e.message}\n`));

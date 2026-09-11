@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { deliverResult, parseDeliver, plainChat } from "../cron/deliver.js";
 import { listChannelBridges, resolveChannelBridgeTarget } from "../gateway/channel-bridges.js";
+import { inspectFeishuGatewayCredentials } from "../gateway/credentials.js";
 import { sendThroughConnectedGateway } from "../gateway/outbound-broker.js";
 import { liveGatewayRuntimeScopes } from "../gateway/runtime-state.js";
 import { registerTool } from "./registry.js";
@@ -94,7 +95,10 @@ registerTool({
       .update(text)
       .digest("hex");
 
-    if (parsed.platform === "feishu" && (!process.env.HARA_FEISHU_APP_ID || !process.env.HARA_FEISHU_APP_SECRET)) {
+    const feishuCredentials = parsed.platform === "feishu"
+      ? inspectFeishuGatewayCredentials(home ? { home } : {})
+      : undefined;
+    if (parsed.platform === "feishu" && feishuCredentials?.state !== "ready") {
       const result = await sendThroughConnectedGateway(
         "feishu",
         parsed.to,
@@ -110,7 +114,7 @@ registerTool({
       return `Error: ${result.error}. The message was not confirmed as delivered.`;
     }
 
-    const error = await deliverResult(target, text, ctx.signal, operationId);
+    const error = await deliverResult(target, text, ctx.signal, operationId, home ? { home } : {});
     return error
       ? `Error: ${error}. The message was not confirmed as delivered.`
       : `Sent to ${destinationLabel} through Hara's connected ${parsed.platform === "feishu" ? "Feishu" : "WeChat"} capability.`;

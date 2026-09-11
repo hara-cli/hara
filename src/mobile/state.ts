@@ -55,6 +55,8 @@ export type MobileCompanionState = Readonly<{
    * executing terminal input or another side effect twice. Prompts and model/session output never live here. */
   commandReceipts?: readonly MobileCommandReceipt[];
   pairedMobileDevices: readonly PairedMobileDevice[];
+  refreshToken?: string;
+  refreshTokenExpiresAt?: number;
   /** Cloud Relay delivery progress for this exact Desktop device. It is intentionally unrelated to
    * Hara Serve's local event cursor and contains no message/session payload. */
   relayCursor?: Readonly<{
@@ -68,6 +70,8 @@ const bounded = (value: unknown, maximum: number): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= maximum;
 const identifier = (value: unknown): value is string => bounded(value, 160) && value.trim() === value && !/\s/u.test(value);
 const credential = (value: unknown): value is string => bounded(value, 12_000) && /^[A-Za-z0-9._~-]+$/u.test(value);
+const accountRefreshToken = (value: unknown): value is string =>
+  typeof value === "string" && value.length >= 50 && value.length <= 200 && /^hara_rt_[A-Za-z0-9_-]+$/u.test(value);
 const timestamp = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 const relayCursor = (value: unknown): boolean => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -149,6 +153,9 @@ export function parseMobileState(value: unknown): MobileCompanionState | null {
         || !root.commandReceipts.every(commandReceipt)
         || new Set(root.commandReceipts.map((entry) => (entry as MobileCommandReceipt).commandId)).size !== root.commandReceipts.length))
     || (root.relayCursor !== undefined && !relayCursor(root.relayCursor))
+    || ((root.refreshToken === undefined) !== (root.refreshTokenExpiresAt === undefined))
+    || (root.refreshToken !== undefined && !accountRefreshToken(root.refreshToken))
+    || (root.refreshTokenExpiresAt !== undefined && !timestamp(root.refreshTokenExpiresAt))
   ) return null;
   try {
     assertDeviceKey({

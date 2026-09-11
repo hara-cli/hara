@@ -55,7 +55,7 @@ async function confirm(label: string, assumeYes: boolean): Promise<boolean> {
 
 async function login(options: MobileCommandOptions): Promise<void> {
   const account = new MobileAccountClient(ACCOUNT_ORIGIN);
-  const phone = options.phone?.trim() || await prompt("Nayi 手机号");
+  const phone = options.phone?.trim() || await prompt("Hara 登录手机号");
   await account.sendSms(phone);
   write("验证码已发送。\n");
   const code = options.code?.trim() || await prompt("短信验证码", true);
@@ -86,6 +86,9 @@ async function login(options: MobileCommandOptions): Promise<void> {
       previous?.account.id === signedIn.account.id && previous.desktop.id === desktop.deviceId
         ? previous.pairedMobileDevices
         : [],
+    refreshToken: signedIn.refreshToken,
+    refreshTokenExpiresAt:
+      observedAt + signedIn.refreshExpiresInSeconds * 1_000,
     ...(previous?.account.id === signedIn.account.id
       && previous.desktop.id === desktop.deviceId
       && previous.commandReceipts
@@ -103,10 +106,11 @@ async function login(options: MobileCommandOptions): Promise<void> {
 }
 
 async function pair(options: MobileCommandOptions): Promise<void> {
-  const state = loadMobileState();
-  if (!state || state.accessTokenExpiresAt <= Date.now() + 5_000) {
+  const stored = loadMobileState();
+  if (!stored) {
     throw new Error("请先运行 `hara mobile login`，再开始配对");
   }
+  const state = await refreshedState(stored);
   const account = new MobileAccountClient(ACCOUNT_ORIGIN);
   const created = await account.createChallenge(state.accessToken, state.desktop.id);
   write("\n在 Hara Mobile 的配对页输入下面的一次性配对码：\n\n");
@@ -159,22 +163,43 @@ async function pair(options: MobileCommandOptions): Promise<void> {
 }
 
 async function refreshedState(state: MobileCompanionState): Promise<MobileCompanionState> {
-  if (state.desktop.credentialExpiresAt > Date.now() + 60_000) return state;
-  if (state.accessTokenExpiresAt <= Date.now() + 60_000) {
-    throw new Error("Desktop 云凭证已过期，请重新运行 `hara mobile login`");
-  }
   const account = new MobileAccountClient(ACCOUNT_ORIGIN);
-  const desktop = await account.registerDesktop({
-    accessToken: state.accessToken,
-    accountId: state.account.id,
-    accountRegion: state.account.region,
-    key: state.desktop.key,
-    platform: state.desktop.platform,
-  });
+  let current = state;
+  if (current.accessTokenExpiresAt <= Date.now() + 60_000) {
+    if (
+      !current.refreshToken
+      || !current.refreshTokenExpiresAt
+      || current.refreshTokenExpiresAt <= Date.now() + 60_000
+    ) {
+      throw new Error("Hara 账号会话已过期，请重新运行 `hara mobile login`");
+    }
+    const refreshed = await account.refresh(current.refreshToken);
+    if (
+      refreshed.account.id !== current.account.id
+      || refreshed.account.region !== current.account.region
+    ) {
+      throw new Error("Hara 账号会话身份发生变化，请重新登录");
+    }
+    const observedAt = Date.now();
+    current = {
+      ...current,
+      accessToken: refreshed.accessToken,
+      accessTokenExpiresAt: observedAt + refreshed.expiresInSeconds * 1_000,
+      account: refreshed.account,
+      refreshToken: refreshed.refreshToken,
+      refreshTokenExpiresAt: observedAt + refreshed.refreshExpiresInSeconds * 1_000,
+    };
+    saveMobileState(current);
+  }
+  if (current.desktop.credentialExpiresAt > Date.now() + 60_000) return current;
+  const desktop = await account.renewDesktop(
+    current.accessToken,
+    current.desktop.id,
+  );
   const next: MobileCompanionState = {
-    ...state,
+    ...current,
     desktop: {
-      ...state.desktop,
+      ...current.desktop,
       credential: desktop.credential,
       credentialExpiresAt: Date.now() + desktop.expiresInSeconds * 1_000,
       id: desktop.deviceId,
@@ -188,44 +213,74 @@ async function connect(): Promise<void> {
   const stored = loadMobileState();
   if (!stored) throw new Error("请先运行 `hara mobile login`");
   if (stored.pairedMobileDevices.length === 0) throw new Error("请先运行 `hara mobile pair`");
-  const state = await refreshedState(stored);
   const local = await LocalServeClient.connect();
-  let currentState = state;
-  const router = new MobileCompanionRouter(
-    local,
-    state.desktop.id,
-    state.desktop.credentialExpiresAt,
-    {
-      commandReceipts: state.commandReceipts,
-      persistCommandReceipts: (commandReceipts) => {
-        currentState = { ...currentState, commandReceipts };
-        saveMobileState(currentState);
-      },
-    },
-  );
-  const bridge = new MobileRelayBridge(
-    RELAY_URL,
-    state,
-    router,
-    Date.now,
-    (relayCursor) => {
-      currentState = { ...currentState, relayCursor };
-      saveMobileState(currentState);
-    },
-  );
+  let currentState = stored;
+  let activeBridge: MobileRelayBridge | null = null;
+  let stopping = false;
+  let stopped = false;
   const stop = async (): Promise<void> => {
+    if (stopped) return;
+    stopped = true;
+    stopping = true;
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
-    await bridge.close().catch(() => undefined);
+    await activeBridge?.close().catch(() => undefined);
     await local.close().catch(() => undefined);
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   try {
-    await bridge.start();
-    write("手机桥接已上线；已配对手机可读取明确发布的 Personal 会话，并按权限申请控制。\n");
-    write("保持此进程和 `hara serve` 运行；按 Ctrl+C 停止发布。\n");
-    await bridge.waitUntilClosed();
+    let announced = false;
+    while (!stopping) {
+      currentState = await refreshedState(currentState);
+      const router = new MobileCompanionRouter(
+        local,
+        currentState.desktop.id,
+        currentState.desktop.credentialExpiresAt,
+        {
+          commandReceipts: currentState.commandReceipts,
+          persistCommandReceipts: (commandReceipts) => {
+            currentState = { ...currentState, commandReceipts };
+            saveMobileState(currentState);
+          },
+        },
+      );
+      const bridge = new MobileRelayBridge(
+        RELAY_URL,
+        currentState,
+        router,
+        Date.now,
+        (relayCursor) => {
+          currentState = { ...currentState, relayCursor };
+          saveMobileState(currentState);
+        },
+      );
+      activeBridge = bridge;
+      await bridge.start();
+      if (!announced) {
+        announced = true;
+        write("手机桥接已上线；已配对手机可读取明确发布的 Personal 会话，并按权限申请控制。\n");
+        write("账号和设备凭证会安全轮换；保持 `hara serve` 运行，按 Ctrl+C 停止发布。\n");
+      }
+      let renewalTimer: ReturnType<typeof setTimeout> | null = null;
+      const renewAt = Math.max(
+        1_000,
+        currentState.desktop.credentialExpiresAt - Date.now() - 60_000,
+      );
+      const outcome = await Promise.race([
+        bridge.waitUntilClosed().then(() => "closed" as const),
+        new Promise<"renew">((resolve) => {
+          renewalTimer = setTimeout(() => resolve("renew"), renewAt);
+        }),
+      ]);
+      if (renewalTimer) clearTimeout(renewalTimer);
+      if (stopping) break;
+      if (outcome === "closed") {
+        throw new Error("Hara Relay 意外断开，请检查网络后重新运行 `hara mobile connect`");
+      }
+      await bridge.close();
+      activeBridge = null;
+    }
   } finally {
     await stop();
   }
@@ -262,6 +317,14 @@ export async function runMobileCommand(
       status();
       return;
     case "logout":
+      {
+        const state = loadMobileState();
+        if (state?.refreshToken) {
+          await new MobileAccountClient(ACCOUNT_ORIGIN)
+            .logout(state.refreshToken)
+            .catch(() => undefined);
+        }
+      }
       clearMobileState();
       write("Hara Mobile Desktop 本地登录和配对状态已清除。\n");
       return;

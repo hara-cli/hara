@@ -62,6 +62,7 @@ import {
 import { createExternalSessionRegistry } from "../external-sessions/registry.js";
 import type { ExternalSessionInfo, ExternalSessionSourceInfo } from "../external-sessions/types.js";
 import { HARA_RUNTIME_VERSION } from "../version.js";
+import { inspectFeishuGatewayCredentials } from "./credentials.js";
 
 /** Parse a leading slash-command from a chat message (pure). null if it isn't one. */
 export function parseCommand(text: string): { cmd: string; arg: string } | null {
@@ -667,6 +668,7 @@ export interface GatewayStatus {
   platform: GatewayPlatform;
   label: string;
   configuration: GatewayConfigurationState;
+  credentialSource?: "environment" | "stored" | "process-only";
   configured: boolean;
   running: boolean;
   runningInstances: number;
@@ -684,7 +686,13 @@ export interface GatewayStatus {
 interface GatewayConfigurationProbe {
   state: GatewayConfigurationState;
   runtimeScope?: string;
+  credentialSource?: "environment" | "stored";
   missingHint: string;
+}
+
+export interface GatewayStatusOptions {
+  home?: string;
+  env?: NodeJS.ProcessEnv;
 }
 
 const GATEWAY_LABELS: Record<GatewayPlatform, string> = {
@@ -715,11 +723,14 @@ function environmentConfiguration(
 ): GatewayConfigurationProbe {
   const present = values.filter((value) => Boolean(value?.trim())).length;
   return present === values.length
-    ? { state: "ready", runtimeScope: runtimeScope(), missingHint }
+    ? { state: "ready", runtimeScope: runtimeScope(), credentialSource: "environment", missingHint }
     : { state: present === 0 ? "missing" : "incomplete", missingHint };
 }
 
-async function inspectGatewayConfiguration(platform: GatewayPlatform): Promise<GatewayConfigurationProbe> {
+async function inspectGatewayConfiguration(
+  platform: GatewayPlatform,
+  options: GatewayStatusOptions = {},
+): Promise<GatewayConfigurationProbe> {
   if (platform === "weixin") {
     const { inspectWeixinCredentials } = await import("./weixin.js");
     const inspected = inspectWeixinCredentials();
@@ -727,6 +738,7 @@ async function inspectGatewayConfiguration(platform: GatewayPlatform): Promise<G
       return {
         state: "ready",
         runtimeScope: gatewayRuntimeScope("weixin", inspected.credentials.user_id),
+        credentialSource: "stored",
         missingHint: "run `hara gateway --platform weixin --login`",
       };
     }
@@ -746,9 +758,25 @@ async function inspectGatewayConfiguration(platform: GatewayPlatform): Promise<G
     return environmentConfiguration([token], () => gatewayRuntimeScope("discord", token), "set HARA_DISCORD_TOKEN");
   }
   if (platform === "feishu") {
-    const appId = process.env.HARA_FEISHU_APP_ID;
-    const secret = process.env.HARA_FEISHU_APP_SECRET;
-    return environmentConfiguration([appId, secret], () => gatewayRuntimeScope("feishu", appId), "set HARA_FEISHU_APP_ID and HARA_FEISHU_APP_SECRET");
+    const inspected = inspectFeishuGatewayCredentials({
+      ...(options.home ? { home: options.home } : {}),
+      ...(options.env ? { env: options.env, allowStored: true } : {}),
+    });
+    if (inspected.state === "ready") {
+      return {
+        state: "ready",
+        runtimeScope: gatewayRuntimeScope("feishu", inspected.credentials.appId),
+        credentialSource: inspected.source,
+        missingHint: "configure Feishu credentials in Hara Settings or the trusted gateway environment",
+      };
+    }
+    return {
+      state: inspected.state,
+      credentialSource: inspected.source,
+      missingHint: inspected.state === "unreadable"
+        ? "repair or replace the private Feishu credential in Hara Settings"
+        : "configure Feishu credentials in Hara Settings or the trusted gateway environment",
+    };
   }
   if (platform === "slack") {
     const appToken = process.env.HARA_SLACK_APP_TOKEN;
@@ -801,12 +829,16 @@ function gatewayRecommendation(
 }
 
 /** Read-only, redacted gateway diagnosis shared by the CLI and Desktop serve protocol. */
-export async function gatewayStatus(platformValue: string): Promise<GatewayStatus> {
+export async function gatewayStatus(
+  platformValue: string,
+  options: GatewayStatusOptions = {},
+): Promise<GatewayStatus> {
   const platform = gatewayPlatform(platformValue);
-  const configuration = await inspectGatewayConfiguration(platform);
+  const configuration = await inspectGatewayConfiguration(platform, options);
   const runtime = await inspectGatewayRuntime(
     platform,
     configuration.runtimeScope ? [configuration.runtimeScope] : [],
+    options.home ? { home: options.home } : {},
   );
   // A long-running gateway can own environment-only credentials that are intentionally unavailable to the
   // Desktop/CLI status process. Report that boundary explicitly instead of contradicting a live connection
@@ -816,10 +848,14 @@ export async function gatewayStatus(platformValue: string): Promise<GatewayStatu
     && configuration.state !== "ready"
       ? "process-only"
       : configuration.state;
+  const credentialSource = exposedConfiguration === "process-only"
+    ? "process-only"
+    : configuration.credentialSource;
   return {
     platform,
     label: GATEWAY_LABELS[platform],
     configuration: exposedConfiguration,
+    ...(credentialSource ? { credentialSource } : {}),
     configured: exposedConfiguration === "ready" || exposedConfiguration === "process-only" || runtime.running,
     running: runtime.running,
     runningInstances: runtime.runningInstances,
@@ -837,8 +873,9 @@ export async function gatewayStatus(platformValue: string): Promise<GatewayStatu
 
 export async function listGatewayStatuses(
   platforms: readonly string[] = GATEWAY_PLATFORMS,
+  options: GatewayStatusOptions = {},
 ): Promise<GatewayStatus[]> {
-  return Promise.all(platforms.map((platform) => gatewayStatus(platform)));
+  return Promise.all(platforms.map((platform) => gatewayStatus(platform, options)));
 }
 
 async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; ownerId?: string; runtimeScope: string } | null> {
@@ -866,14 +903,14 @@ async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; o
     return { adapter: discordAdapter(token), runtimeScope: gatewayRuntimeScope("discord", token) };
   }
   if (platform === "feishu" || platform === "lark") {
-    const appId = process.env.HARA_FEISHU_APP_ID;
-    const appSecret = process.env.HARA_FEISHU_APP_SECRET;
-    if (!appId || !appSecret) {
-      console.error("hara gateway: set HARA_FEISHU_APP_ID + HARA_FEISHU_APP_SECRET (Feishu app console) and HARA_GATEWAY_ALLOWED=<your open_id>. (HARA_FEISHU_DOMAIN=lark for larksuite.com.)");
+    const inspected = inspectFeishuGatewayCredentials();
+    if (inspected.state !== "ready") {
+      console.error("hara gateway: configure Feishu App credentials in Hara Settings or the trusted launch environment, then set HARA_GATEWAY_ALLOWED=<your open_id>.");
       return null;
     }
+    const { appId, appSecret, domain } = inspected.credentials;
     const { feishuAdapter } = await import("./feishu.js");
-    return { adapter: feishuAdapter(appId, appSecret), runtimeScope: gatewayRuntimeScope("feishu", appId) };
+    return { adapter: feishuAdapter(appId, appSecret, domain), runtimeScope: gatewayRuntimeScope("feishu", appId) };
   }
   if (platform === "slack") {
     const appToken = process.env.HARA_SLACK_APP_TOKEN;

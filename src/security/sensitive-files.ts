@@ -42,6 +42,7 @@ const HARA_PRIVATE_FILES = new Set([
   "desk.json",
   "desk-connections.json",
   "desk-collector.json",
+  "gateway-credentials.json",
   "org.json",
   "org.json.legacy",
   "flows.json",

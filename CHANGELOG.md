@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.173.0 — 2026-09-11 — organization Desk workbench and durable Agent coordination
+
+- Let one company enrollment install a separately scoped Desk identity beside its managed model route. Hara
+  verifies the exact tenant, provisioning identity, installation and credential generation before committing
+  either credential, so retries rotate one Agent and a late response cannot overwrite newer authority.
+- Add a full organization ticket and task workbench for CLI and Desktop: board/detail reads, creation, claim and
+  reclaim, lease renewal, state transitions, comments, attachments, release verification, cancellation and
+  high-risk owner approval. Every mutation stays bound to the selected company Space and current Desk revision.
+- Provision Claude Code and Codex as distinct organization Agents, with multiple named instances per provider and
+  independent short-lived Sessions. Credentials are stored in identity-bound owner-only files and never returned
+  through the renderer, MCP registration surface, logs or ordinary Desk responses.
+- Harden remote coordination across Serve, Mobile and chat gateways with profile-scoped credentials, durable
+  delivery state and explicit channel identity. Cross-channel delivery now uses the configured destination
+  capability instead of assuming that a Feishu-connected Hara process exposes a local Feishu CLI.
+
 ## 0.172.0 — 2026-09-10 — governed Computer Use and structured browser control
 
 - Promote Computer Use to a first-party core capability for concrete browser and desktop interaction. The

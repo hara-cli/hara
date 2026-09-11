@@ -1226,9 +1226,21 @@ test("serve Desk RPCs advertise only with complete support and pin every remote 
     excerpt: "Deploy",
     risk: "low",
     state: "open",
+    priority: "normal",
+    severity: "minor",
+    slaDueAt: null,
+    parentId: null,
     createdBy: "agent-a",
     claimedBy: null,
     ackedBy: null,
+    reporterRef: "",
+    occurrenceCount: 1,
+    sourceCount: 0,
+    releaseVersion: "",
+    verificationSteps: "",
+    claimedSessionId: null,
+    claimExpiresAt: null,
+    claimFence: 0,
     createdAt: now,
     updatedAt: now,
   };
@@ -1260,7 +1272,45 @@ test("serve Desk RPCs advertise only with complete support and pin every remote 
     },
     deskTask: async (profileId, taskId) => {
       calls.push({ method: "task", profileId, taskId });
-      return { profileId, task: { ...task, id: taskId, body: "Deploy" }, events: [] };
+      return {
+        profileId,
+        task: { ...task, id: taskId, body: "Deploy" },
+        events: [],
+        comments: [],
+        attachments: [],
+        sources: [],
+        links: [],
+        executionEvents: [],
+        diffs: [],
+      };
+    },
+    deskTaskCreate: async (profileId, input) => {
+      calls.push({ method: "create", profileId, input });
+      return { profileId, task: { ...task, id: "t_cafe", title: input.title, body: input.body ?? "" } };
+    },
+    deskTaskClaim: async (profileId, taskId) => {
+      calls.push({ method: "claim", profileId, taskId });
+      return { profileId, task: { ...task, id: taskId, body: "Deploy", state: "claimed", claimedBy: "agent-a" } };
+    },
+    deskTaskAck: async (profileId, taskId) => {
+      calls.push({ method: "ack", profileId, taskId });
+      return { profileId, task: { ...task, id: taskId, body: "Deploy", ackedBy: "owner-a" } };
+    },
+    deskTaskTransition: async (profileId, taskId, input) => {
+      calls.push({ method: "transition", profileId, taskId, input });
+      return { profileId, task: { ...task, id: taskId, body: "Deploy", state: input.state } };
+    },
+    deskTaskComplete: async (profileId, taskId, input) => {
+      calls.push({ method: "complete", profileId, taskId, input });
+      return { profileId, task: { ...task, id: taskId, body: "Deploy", state: "done" } };
+    },
+    deskTaskCancel: async (profileId, taskId, detail, claimFence) => {
+      calls.push({ method: "cancel", profileId, taskId, detail, claimFence });
+      return { profileId, task: { ...task, id: taskId, body: "Deploy", state: "cancelled" } };
+    },
+    deskTaskComment: async (profileId, taskId, body) => {
+      calls.push({ method: "comment", profileId, taskId, body });
+      return { profileId, comment: { id: "cm_cafe", taskId, actor: "agent-a", sessionId: null, body, at: now } };
     },
   };
   const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, deps);
@@ -1270,7 +1320,18 @@ test("serve Desk RPCs advertise only with complete support and pin every remote 
     for (const method of ["desk.connections.list", "desk.snapshot", "desk.task.get"]) {
       assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
     }
+    for (const method of [
+      "desk.task.create",
+      "desk.task.claim",
+      "desk.task.ack",
+      "desk.task.transition",
+      "desk.task.complete",
+      "desk.task.cancel",
+      "desk.task.comment",
+    ]) assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
     assert.ok(init.result.capabilities.features.includes("collaboration.remote.v1"));
+    assert.ok(init.result.capabilities.features.includes("collaboration.remote.manage.v1"));
+    assert.ok(init.result.capabilities.features.includes("organization.desk.tasks.v1"));
     assert.equal(calls.length, 0, "initialize performs no Desk remote read");
 
     const connections = await client.call("desk.connections.list", {});
@@ -1286,8 +1347,18 @@ test("serve Desk RPCs advertise only with complete support and pin every remote 
     assert.equal(details.result.task.id, "t_abcd");
     assert.deepEqual(calls[1], { method: "task", profileId: "org-a", taskId: "t_abcd" });
 
+    const created = await client.call("desk.task.create", { profileId: "org-a", kind: "feedback", title: "Desktop report", body: "Observed once" });
+    assert.equal(created.result.task.id, "t_cafe");
+    assert.deepEqual(calls[2], { method: "create", profileId: "org-a", input: { kind: "feedback", title: "Desktop report", body: "Observed once" } });
+    assert.equal((await client.call("desk.task.claim", { profileId: "org-a", taskId: "t_abcd" })).result.task.state, "claimed");
+    assert.equal((await client.call("desk.task.transition", { profileId: "org-a", taskId: "t_abcd", state: "waiting_user", note: "Need details" })).result.task.state, "waiting_user");
+    assert.equal((await client.call("desk.task.comment", { profileId: "org-a", taskId: "t_abcd", body: "More context" })).result.comment.body, "More context");
+    assert.equal((await client.call("desk.task.cancel", { profileId: "org-a", taskId: "t_abcd", detail: "Duplicate" })).result.task.state, "cancelled");
+
     assert.equal((await client.call("desk.snapshot", { profileId: "../org-b" })).error.code, -32602);
     assert.equal((await client.call("desk.task.get", { profileId: "org-a", taskId: "../whoami" })).error.code, -32602);
+    assert.equal((await client.call("desk.task.create", { profileId: "org-a", kind: "unknown", title: "Invalid" })).error.code, -32602);
+    assert.equal((await client.call("desk.task.cancel", { profileId: "org-a", taskId: "t_abcd", detail: "" })).error.code, -32602);
     assert.doesNotMatch(JSON.stringify({ snapshot, details, connections }), /token|secret/i);
   } finally {
     client.close();
@@ -2994,6 +3065,9 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
   let testedVisionInput;
   let createdConnectionInput;
   let savedFallbackConnectionIds;
+  let savedGatewayCredentialInput;
+  let removedGatewayCredentialPlatform;
+  let removeGatewayCredentialCalls = 0;
   let enrolledOrganizationInput;
   let unpinnedCwd;
   let closeGatewayLoginsCalled = false;
@@ -3103,6 +3177,42 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       recommendation: "start it",
       token: "gateway-secret-must-not-leak",
     }],
+    saveGatewayCredentials: async (input) => {
+      savedGatewayCredentialInput = input;
+      if (input.appId === "cli_error_connection") {
+        throw new Error(`unsafe lower-layer echo: ${input.appSecret}`);
+      }
+      return {
+        platform: "feishu",
+        label: "Feishu",
+        configuration: "ready",
+        credentialSource: "stored",
+        configured: true,
+        running: false,
+        runningInstances: 0,
+        runtimeState: "stopped",
+        recommendation: "start it",
+        accidentalIdentity: input.appId,
+        accidentalValue: input.appSecret,
+      };
+    },
+    removeGatewayCredentials: async (platform) => {
+      removeGatewayCredentialCalls += 1;
+      if (removeGatewayCredentialCalls > 1) {
+        throw new Error("unsafe lower-layer echo: stale-feishu-secret-must-not-leak");
+      }
+      removedGatewayCredentialPlatform = platform;
+      return {
+        platform: "feishu",
+        label: "Feishu",
+        configuration: "missing",
+        configured: false,
+        running: false,
+        runningInstances: 0,
+        runtimeState: "stopped",
+        recommendation: "configure it",
+      };
+    },
     startGatewayLogin: async () => ({
       ...loginSnapshot,
       bot_token: "login-token-must-not-leak",
@@ -3155,6 +3265,8 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     ]) assert.ok(init.result.capabilities.methods.includes(method), `${method} advertised`);
     assert.ok(init.result.capabilities.methods.includes("settings.gateways.list"));
     for (const method of [
+      "settings.gateways.credentials.save",
+      "settings.gateways.credentials.remove",
       "settings.gateways.login.start",
       "settings.gateways.login.status",
       "settings.gateways.login.cancel",
@@ -3235,6 +3347,43 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     const gateways = await c.call("settings.gateways.list", {});
     assert.equal(gateways.result.gateways[0].platform, "weixin");
     assert.equal(JSON.stringify(gateways.result).includes("gateway-secret-must-not-leak"), false);
+
+    const gatewaySecret = "feishu-app-secret-must-not-return";
+    const savedGateway = await c.call("settings.gateways.credentials.save", {
+      platform: "feishu",
+      appId: "cli_private_connection",
+      appSecret: gatewaySecret,
+      domain: "lark",
+    });
+    assert.equal(savedGatewayCredentialInput.appSecret, gatewaySecret, "the authenticated callback receives the one-shot credential");
+    assert.equal(savedGateway.result.gateway.credentialSource, "stored");
+    assert.equal(JSON.stringify(savedGateway.result).includes(gatewaySecret), false, "gateway credential save never echoes a submitted secret");
+    assert.equal(JSON.stringify(savedGateway.result).includes("cli_private_connection"), false, "gateway credential save never echoes a submitted identity");
+    const rejectedGatewaySecret = "opaque-rejected-secret-value";
+    const rejectedGateway = await c.call("settings.gateways.credentials.save", {
+      platform: "feishu",
+      appId: "cli_error_connection",
+      appSecret: rejectedGatewaySecret,
+      domain: "feishu",
+    });
+    assert.equal(rejectedGateway.error.code, -32603);
+    assert.equal(rejectedGateway.error.message, "gateway credentials could not be saved securely");
+    assert.equal(JSON.stringify(rejectedGateway).includes(rejectedGatewaySecret), false, "gateway credential failures remain write-only");
+    const invalidGatewaySave = await c.call("settings.gateways.credentials.save", {
+      platform: "feishu",
+      appId: "cli_private_connection",
+      appSecret: gatewaySecret,
+      domain: "invalid",
+    });
+    assert.equal(invalidGatewaySave.error.code, -32602);
+    const removedGateway = await c.call("settings.gateways.credentials.remove", { platform: "feishu" });
+    assert.equal(removedGatewayCredentialPlatform, "feishu");
+    assert.equal(removedGateway.result.gateway.configuration, "missing");
+    const rejectedGatewayRemoval = await c.call("settings.gateways.credentials.remove", { platform: "feishu" });
+    assert.equal(rejectedGatewayRemoval.error.code, -32603);
+    assert.equal(rejectedGatewayRemoval.error.message, "gateway credentials could not be removed securely");
+    assert.equal(JSON.stringify(rejectedGatewayRemoval).includes("stale-feishu-secret-must-not-leak"), false,
+      "gateway credential removal failures cannot reflect old secret material");
 
     const startedLogin = await c.call("settings.gateways.login.start", { platform: "weixin" });
     assert.equal(startedLogin.result.login.qrPayload, loginSnapshot.qrPayload);

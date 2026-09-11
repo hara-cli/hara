@@ -1,6 +1,7 @@
 // Feishu/Lark adapter for `hara gateway` — uses the official @larksuiteoapi/node-sdk: a WSClient long-connection
 // for inbound events (no public webhook endpoint needed — fits hara's local daemon) and the REST Client for
-// outbound. Creds from HARA_FEISHU_APP_ID / HARA_FEISHU_APP_SECRET (+ HARA_FEISHU_DOMAIN=lark for larksuite.com).
+// outbound. Credentials are resolved by the Engine from private Settings state or a complete trusted launch
+// environment before constructing this adapter; the raw values never enter Agent or renderer state.
 // Same ChatAdapter shape as the others, so all cross-platform gateway logic (send_file, system context,
 // stuck-guard, image attach/describe) works unchanged. v1 = p2p (DM) only; group support is a fast-follow.
 // Namespace import + default fallback: node resolves this SDK as CJS (default = module object), but
@@ -245,9 +246,14 @@ function waitForFeishuWork(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export function feishuAdapter(appId: string, appSecret: string): ChatAdapter {
-  const domain = process.env.HARA_FEISHU_DOMAIN === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
-  const restBase = process.env.HARA_FEISHU_DOMAIN === "lark" ? "https://open.larksuite.com" : "https://open.feishu.cn";
+export function feishuAdapter(
+  appId: string,
+  appSecret: string,
+  configuredDomain?: "feishu" | "lark",
+): ChatAdapter {
+  const domainName = configuredDomain ?? (process.env.HARA_FEISHU_DOMAIN === "lark" ? "lark" : "feishu");
+  const domain = domainName === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
+  const restBase = domainName === "lark" ? "https://open.larksuite.com" : "https://open.feishu.cn";
   // appId is the connection identity used by the gateway instance lease too. The lane hashes it before use,
   // so one-shot cron adapters and the daemon share ordering without retaining either credential.
   const outbound = new PerChatOutboundLane("feishu", appId);

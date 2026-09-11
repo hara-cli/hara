@@ -1,5 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,10 +13,12 @@ import {
   fetchDeskTask,
   loadCreds,
   loadProfileCreds,
+  mcpCredentialPathPart,
   normalizeDeskBaseUrl,
   removeMismatchedProfileCreds,
   removeProfileCreds,
   saveCreds,
+  saveMcpClientCreds,
   saveProfileCreds,
 } from "../dist/desk.js";
 import { resetPrivateHaraStateForTests } from "../dist/security/private-state.js";
@@ -28,12 +31,14 @@ const connectionsPath = join(haraDir, "desk-connections.json");
 const identityA = {
   profileId: "org-a",
   gatewayUrl: "https://control-a.example.test",
+  tenantId: "tenant-a",
   deviceId: "device-a",
   enrolledAt: "2026-07-30T10:00:00.000Z",
 };
 const identityB = {
   profileId: "org-b",
   gatewayUrl: "https://control-b.example.test",
+  tenantId: "tenant-b",
   deviceId: "device-b",
   enrolledAt: "2026-07-30T11:00:00.000Z",
 };
@@ -57,6 +62,61 @@ test("Desk URL policy requires HTTPS except for loopback and rejects URL-carried
   assert.throws(() => normalizeDeskBaseUrl("https://user:pass@desk.example.test"), /credentials/i);
   assert.throws(() => normalizeDeskBaseUrl("https://desk.example.test/api"), /without an API path/i);
   assert.throws(() => normalizeDeskBaseUrl("https://desk.example.test?token=secret"), /query/i);
+});
+
+test("MCP credential path identities cannot collide on a case-insensitive filesystem", () => {
+  assert.notEqual(
+    mcpCredentialPathPart("Work", "default"),
+    mcpCredentialPathPart("work", "default"),
+  );
+  assert.match(mcpCredentialPathPart("work", "default"), /^work-[a-f0-9]{16}$/);
+  assert.throws(() => saveMcpClientCreds({
+    url: "https://desk.example.test",
+    agentId: "agent-work",
+    owner: "member@example.test",
+    token: `hdk_${"a".repeat(48)}`,
+  }, {
+    client: "openai.codex",
+    installationId: "device-one",
+    profile: "Work",
+  }), /identity is invalid/);
+});
+
+test("a late lower-generation MCP response cannot overwrite the newest credential", () => {
+  const url = "https://generation.desk.example.test";
+  const identity = {
+    client: "openai.codex",
+    installationId: "device-generation",
+    profile: "work",
+  };
+  saveMcpClientCreds({
+    url,
+    agentId: "agent-generation",
+    owner: "member@example.test",
+    token: `hdk_${"2".repeat(48)}`,
+    credentialGeneration: 2,
+  }, identity);
+  saveMcpClientCreds({
+    url,
+    agentId: "agent-generation",
+    owner: "member@example.test",
+    token: `hdk_${"1".repeat(48)}`,
+    credentialGeneration: 1,
+  }, identity);
+  const originId = createHash("sha256").update(url).digest("hex").slice(0, 16);
+  const credentialPath = join(
+    deskHome,
+    ".hara",
+    "desk",
+    "credentials",
+    originId,
+    mcpCredentialPathPart(identity.installationId, "unbound-installation"),
+    mcpCredentialPathPart(identity.client, "unbound-client"),
+    `${mcpCredentialPathPart(identity.profile, "default")}.json`,
+  );
+  const stored = JSON.parse(readFileSync(credentialPath, "utf8"));
+  assert.equal(stored.credentialGeneration, 2);
+  assert.equal(stored.token, `hdk_${"2".repeat(48)}`);
 });
 
 test("legacy Desk credentials remain unbound while native connections use an independent store", () => {
@@ -447,7 +507,7 @@ test("Desk snapshot rejects unknown authorization and task-state enums instead o
     const path = new URL(String(input)).pathname;
     const agent = { ...baseAgent };
     const task = { ...baseTask };
-    if (scenario === "state") task.state = "blocked";
+    if (scenario === "state") task.state = "archived";
     if (scenario === "risk") task.risk = "critical";
     if (scenario === "kind") task.kind = "job";
     if (scenario === "role") agent.role = "observer";

@@ -1753,7 +1753,7 @@ test("gateway startup imports legacy history before opening the transport", () =
       encoding: "utf8",
     });
     assert.equal(child.status, 1, "the transport exits only because test credentials are intentionally absent");
-    assert.match(child.stderr, /HARA_FEISHU_APP_ID/u);
+    assert.match(child.stderr, /configure Feishu App credentials in Hara Settings/u);
     assert.ok(
       loadSession(id)?.storageGeneration,
       "legacy gateway history is migrated before transport configuration can end startup",

@@ -148,6 +148,56 @@ test("Account pairing accepts a verified mobile key and rejects a changed thumbp
   );
 });
 
+test("Desktop login uses Hara-owned verification routes without a Nayi dependency", async () => {
+  const requests = [];
+  const response = (body) => ({
+    headers: { get: () => null },
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify(body),
+  });
+  const client = new MobileAccountClient(
+    "http://127.0.0.1:7200",
+    async (url, options) => {
+      requests.push({ body: JSON.parse(options.body), url });
+      return requests.length === 1
+        ? response({ accepted: true, cooldownSeconds: 60, protocolVersion: 1 })
+        : response({
+          accessToken: "a".repeat(64),
+          account: { displayName: "Hara", id: "account-a", region: "cn" },
+          expiresInSeconds: 600,
+          protocolVersion: 1,
+          refreshExpiresInSeconds: 2_592_000,
+          refreshToken: `hara_rt_${"r".repeat(64)}`,
+          tokenType: "Bearer",
+        });
+    },
+    1_000,
+    { allowInsecureLoopback: true },
+  );
+
+  assert.equal(await client.sendSms("18800000000"), 60);
+  await client.login("18800000000", "123456", "macos");
+  assert.deepEqual(requests, [
+    {
+      body: {
+        channel: "phone",
+        identifier: "18800000000",
+        locale: "zh-Hans",
+      },
+      url: "http://127.0.0.1:7200/v1/auth/code/send",
+    },
+    {
+      body: {
+        channel: "phone",
+        code: "123456",
+        identifier: "18800000000",
+      },
+      url: "http://127.0.0.1:7200/v1/auth/code/login",
+    },
+  ]);
+});
+
 test("Relay bridge rejects a paired mobile identity whose public key changed", async () => {
   const desktop = generateDeviceKey();
   const mobile = generateDeviceKey();
@@ -415,6 +465,17 @@ test("Router publishes bounded sessions and enforces terminal leases and command
   assert.equal(first.body.status, "succeeded");
   assert.deepEqual(replay.body, first.body);
   assert.equal(calls.filter((entry) => entry.method === "external.sessions.terminal.raw-input").length, 1);
+  const reconciled = await router.route(
+    request("request-input-status", "command.status", inputCommand),
+  );
+  assert.deepEqual(reconciled.body, first.body);
+  const unknown = await router.route(request(
+    "request-input-unknown",
+    "command.status",
+    { ...inputCommand, commandId: "terminal-command-unknown" },
+  ));
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.errorCode, "COMMAND_OUTCOME_UNKNOWN");
 
   for (const listener of listeners) listener("external.event.terminal.handoff_requested", {
     handoffId: "handoff-a",
@@ -534,7 +595,20 @@ test("Router persists content-free command receipts and suppresses terminal inpu
   await restarted.close();
 });
 
-test("Companion request parser rejects extra fields and unknown methods", () => {
+test("Companion request parser accepts status reconciliation and rejects extra fields and unknown methods", () => {
+  assert.deepEqual(parseCompanionRequest({
+    body: { commandId: "command-a" },
+    method: "command.status",
+    protocolVersion: 1,
+    requestId: "request-status-a",
+    type: "companion.request",
+  }), {
+    body: { commandId: "command-a" },
+    method: "command.status",
+    protocolVersion: 1,
+    requestId: "request-status-a",
+    type: "companion.request",
+  });
   assert.equal(request("request-a", "sessions.list")?.method, "sessions.list");
   assert.equal(parseCompanionRequest({
     body: {},

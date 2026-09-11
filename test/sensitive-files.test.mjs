@@ -155,6 +155,7 @@ test("sensitive path policy covers Hara control-plane state, NTFS aliases, and n
       "desk.json",
       "desk-connections.json",
       "desk-collector.json",
+      "gateway-credentials.json",
       "org.json",
       "org.json.legacy",
       "flows.json",

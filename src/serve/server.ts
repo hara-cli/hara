@@ -60,6 +60,7 @@ import type {
   ProviderModelCapabilities,
 } from "../providers/connection-health.js";
 import type { GatewayStatus } from "../gateway/serve.js";
+import type { FeishuGatewayCredentialsInput } from "../gateway/credentials.js";
 import type { GatewayLoginSnapshot } from "../gateway/login.js";
 import type { UiSink } from "../tools/registry.js";
 import { APPROVAL_MODES, type ApprovalMode } from "../config.js";
@@ -226,10 +227,15 @@ import {
 import { effectiveRoleModel } from "../session/session-model.js";
 import {
   DeskClientError,
+  type DeskCompleteTaskInput,
   type DeskConnectionsSnapshot,
+  type DeskCreateTaskInput,
   type DeskSnapshot,
+  type DeskTaskComment,
   type DeskTaskDetails,
+  type DeskTaskMutationResult,
   type DeskTaskState,
+  type DeskTransitionTaskInput,
 } from "../desk.js";
 import {
   ArtifactStoreError,
@@ -350,6 +356,10 @@ export interface ServeDeps {
   unpinProjectProfile?: (cwd?: string) => ProjectProfileUnpinResult;
   /** Read-only, redacted connector health for Desktop settings. */
   gatewayStatuses?: () => Promise<GatewayStatus[]>;
+  /** Masked Feishu enrollment. Credentials cross authenticated loopback only as one write request and are
+   * never returned; all later use stays inside Engine-owned gateway/cron delivery. */
+  saveGatewayCredentials?: (input: FeishuGatewayCredentialsInput) => Promise<GatewayStatus>;
+  removeGatewayCredentials?: (platform: "feishu") => Promise<GatewayStatus>;
   /** In-process interactive connector login. Only a short-lived QR payload and lifecycle phase cross the
    * authenticated loopback protocol; confirmed credentials stay inside the gateway private-state writer. */
   startGatewayLogin?: (platform: string) => Promise<GatewayLoginSnapshot>;
@@ -386,6 +396,30 @@ export interface ServeDeps {
   deskConnections?: () => DeskConnectionsSnapshot;
   deskSnapshot?: (profileId: string, state?: DeskTaskState) => Promise<DeskSnapshot>;
   deskTask?: (profileId: string, taskId: string) => Promise<DeskTaskDetails>;
+  deskTaskCreate?: (profileId: string, input: DeskCreateTaskInput) => Promise<DeskTaskMutationResult>;
+  deskTaskClaim?: (profileId: string, taskId: string) => Promise<DeskTaskMutationResult>;
+  deskTaskAck?: (profileId: string, taskId: string) => Promise<DeskTaskMutationResult>;
+  deskTaskTransition?: (
+    profileId: string,
+    taskId: string,
+    input: DeskTransitionTaskInput,
+  ) => Promise<DeskTaskMutationResult>;
+  deskTaskComplete?: (
+    profileId: string,
+    taskId: string,
+    input: DeskCompleteTaskInput,
+  ) => Promise<DeskTaskMutationResult>;
+  deskTaskCancel?: (
+    profileId: string,
+    taskId: string,
+    detail: string,
+    claimFence?: number,
+  ) => Promise<DeskTaskMutationResult>;
+  deskTaskComment?: (
+    profileId: string,
+    taskId: string,
+    body: string,
+  ) => Promise<{ profileId: string; comment: DeskTaskComment }>;
   /** thinking-dial levels valid for this endpoint's reasoning style (from the provider registry) */
   effortLevels?: string[];
   /** Live defaults advertised to persistent clients after config/profile edits. `model` lets a session
@@ -991,7 +1025,21 @@ const DISCOVERY_LOCK_WAIT_MS = 2_000;
 const SERVE_PROFILE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SERVE_SPACE_ID_PATTERN = /^(?:personal|org:[A-Za-z0-9][A-Za-z0-9._-]{0,127}|org-enrollment:[a-f0-9]{32}|org-profile:[A-Za-z0-9][A-Za-z0-9._-]{0,63})$/;
 const SERVE_DESK_TASK_ID_PATTERN = /^t_[a-f0-9]+$/;
-const SERVE_DESK_STATES = new Set<DeskTaskState>(["open", "claimed", "done", "cancelled"]);
+const SERVE_DESK_STATES = new Set<DeskTaskState>([
+  "open",
+  "claimed",
+  "blocked",
+  "waiting_user",
+  "waiting_release",
+  "waiting_verification",
+  "review",
+  "done",
+  "cancelled",
+]);
+const SERVE_DESK_KINDS = new Set(["feedback", "dispatch"] as const);
+const SERVE_DESK_RISKS = new Set(["low", "high"] as const);
+const SERVE_DESK_PRIORITIES = new Set(["urgent", "high", "normal", "low"] as const);
+const SERVE_DESK_SEVERITIES = new Set(["critical", "major", "minor", "cosmetic"] as const);
 
 const artifactRpcError = (
   id: number | string | null,
@@ -4240,6 +4288,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.test", "settings.vision.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.providers.failover.save", "settings.gateways.list",
+            "settings.gateways.credentials.save", "settings.gateways.credentials.remove",
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
             "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
             "settings.organizations.remove", "settings.organizations.check",
@@ -4258,6 +4307,25 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             && !!deps.deskTask;
           if (collaborationRemote) {
             methods.push("desk.connections.list", "desk.snapshot", "desk.task.get");
+          }
+          const collaborationRemoteManage =
+            !!deps.deskTaskCreate
+            && !!deps.deskTaskClaim
+            && !!deps.deskTaskAck
+            && !!deps.deskTaskTransition
+            && !!deps.deskTaskComplete
+            && !!deps.deskTaskCancel
+            && !!deps.deskTaskComment;
+          if (collaborationRemoteManage) {
+            methods.push(
+              "desk.task.create",
+              "desk.task.claim",
+              "desk.task.ack",
+              "desk.task.transition",
+              "desk.task.complete",
+              "desk.task.cancel",
+              "desk.task.comment",
+            );
           }
           if (deps.unpinProjectProfile) methods.push("settings.profiles.unpin");
           if (deps.computerSettings && deps.saveComputerSettings) {
@@ -4306,6 +4374,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (deps.computerSettings && deps.saveComputerSettings) features.push("computer-use.core.v1");
           if (deps.installCoreBrowser) features.push("browser.structured-core.v1");
           if (collaborationRemote) features.push("collaboration.remote.v1");
+          if (collaborationRemoteManage) {
+            features.push("collaboration.remote.manage.v1", "organization.desk.tasks.v1");
+          }
           if (deps.organizationLearningSubmit && deps.organizationLearningSync) {
             features.push("learning.organization-review.v1");
           }
@@ -6630,6 +6701,52 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const gateways = await deps.gatewayStatuses();
             return reply(rpcResult(id!, { gateways: redactSensitiveValue(gateways).value }));
           }
+          case "settings.gateways.credentials.save": {
+            if (!deps.saveGatewayCredentials) return reply(rpcError(id, ERR.METHOD, "gateway credential settings not supported by this server"));
+            if (
+              typeof p.platform !== "string"
+              || p.platform.trim().toLowerCase() !== "feishu"
+              || typeof p.appId !== "string"
+              || typeof p.appSecret !== "string"
+              || p.appId.length === 0
+              || p.appId.length > 256
+              || p.appSecret.length === 0
+              || p.appSecret.length > 1_024
+              || (p.domain !== undefined && p.domain !== "feishu" && p.domain !== "lark")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "platform must be 'feishu'; appId and appSecret are required; domain must be 'feishu' or 'lark'"));
+            }
+            let gateway: GatewayStatus;
+            try {
+              gateway = await deps.saveGatewayCredentials({
+                appId: p.appId,
+                appSecret: p.appSecret,
+                ...(p.domain ? { domain: p.domain } : {}),
+              });
+            } catch {
+              // Credential enrollment is deliberately write-only. Even a lower-layer exception that happens
+              // to quote its input must not turn the RPC error surface into a credential echo.
+              return reply(rpcError(id, ERR.INTERNAL, "gateway credentials could not be saved securely"));
+            }
+            return reply(rpcResult(id!, {
+              gateway: redactSensitiveValue(gateway, [p.appId, p.appSecret]).value,
+            }));
+          }
+          case "settings.gateways.credentials.remove": {
+            if (!deps.removeGatewayCredentials) return reply(rpcError(id, ERR.METHOD, "gateway credential removal not supported by this server"));
+            if (typeof p.platform !== "string" || p.platform.trim().toLowerCase() !== "feishu") {
+              return reply(rpcError(id, ERR.PARAMS, "platform must be 'feishu'"));
+            }
+            let gateway: GatewayStatus;
+            try {
+              gateway = await deps.removeGatewayCredentials("feishu");
+            } catch {
+              // Removal is part of the same sealed control-plane surface as enrollment. Do not let a
+              // filesystem or adapter exception reflect old credential material through the RPC error.
+              return reply(rpcError(id, ERR.INTERNAL, "gateway credentials could not be removed securely"));
+            }
+            return reply(rpcResult(id!, { gateway: redactSensitiveValue(gateway).value }));
+          }
           case "settings.gateways.login.start": {
             if (!deps.startGatewayLogin) return reply(rpcError(id, ERR.METHOD, "gateway login not supported by this server"));
             if (typeof p.platform !== "string" || p.platform.trim().toLowerCase() !== "weixin") {
@@ -6730,7 +6847,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
                 && (typeof p.state !== "string" || !SERVE_DESK_STATES.has(p.state as DeskTaskState))
               )
             ) {
-              return reply(rpcError(id, ERR.PARAMS, "valid profileId required; optional state must be open, claimed, done, or cancelled"));
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId required; optional state must be a supported Desk task state"));
             }
             const profileId = p.profileId;
             const state = p.state as DeskTaskState | undefined;
@@ -6756,6 +6873,151 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             try {
               const result = await deps.deskTask(profileId, taskId);
               return reply(rpcResult(id!, redactSensitiveValue(result).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
+          }
+          case "desk.task.create": {
+            if (!deps.deskTaskCreate) return reply(rpcError(id, ERR.METHOD, "organization Desk task creation is not supported by this server"));
+            if (
+              typeof p.profileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || typeof p.kind !== "string"
+              || !SERVE_DESK_KINDS.has(p.kind as "feedback" | "dispatch")
+              || typeof p.title !== "string"
+              || !p.title.trim()
+              || p.title.length > 200
+              || (p.body !== undefined && (typeof p.body !== "string" || p.body.length > 20_000))
+              || (p.risk !== undefined && (typeof p.risk !== "string" || !SERVE_DESK_RISKS.has(p.risk as "low" | "high")))
+              || (p.priority !== undefined && (typeof p.priority !== "string" || !SERVE_DESK_PRIORITIES.has(p.priority as "urgent" | "high" | "normal" | "low")))
+              || (p.severity !== undefined && (typeof p.severity !== "string" || !SERVE_DESK_SEVERITIES.has(p.severity as "critical" | "major" | "minor" | "cosmetic")))
+              || (p.slaDueAt !== undefined && (!Number.isSafeInteger(p.slaDueAt) || p.slaDueAt <= Date.now()))
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId, kind, and title required; optional task fields are invalid"));
+            }
+            const input: DeskCreateTaskInput = {
+              kind: p.kind as DeskCreateTaskInput["kind"],
+              title: p.title,
+              ...(p.body !== undefined ? { body: p.body } : {}),
+              ...(p.risk !== undefined ? { risk: p.risk as DeskCreateTaskInput["risk"] } : {}),
+              ...(p.priority !== undefined ? { priority: p.priority as DeskCreateTaskInput["priority"] } : {}),
+              ...(p.severity !== undefined ? { severity: p.severity as DeskCreateTaskInput["severity"] } : {}),
+              ...(p.slaDueAt !== undefined ? { slaDueAt: p.slaDueAt } : {}),
+            };
+            try {
+              return reply(rpcResult(id!, redactSensitiveValue(await deps.deskTaskCreate(p.profileId, input)).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
+          }
+          case "desk.task.claim":
+          case "desk.task.ack": {
+            const callback = req.method === "desk.task.claim" ? deps.deskTaskClaim : deps.deskTaskAck;
+            if (!callback) return reply(rpcError(id, ERR.METHOD, "organization Desk task action is not supported by this server"));
+            if (
+              typeof p.profileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || typeof p.taskId !== "string"
+              || !SERVE_DESK_TASK_ID_PATTERN.test(p.taskId)
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId and taskId required"));
+            }
+            try {
+              return reply(rpcResult(id!, redactSensitiveValue(await callback(p.profileId, p.taskId)).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
+          }
+          case "desk.task.transition": {
+            if (!deps.deskTaskTransition) return reply(rpcError(id, ERR.METHOD, "organization Desk task transitions are not supported by this server"));
+            if (
+              typeof p.profileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || typeof p.taskId !== "string"
+              || !SERVE_DESK_TASK_ID_PATTERN.test(p.taskId)
+              || typeof p.state !== "string"
+              || !SERVE_DESK_STATES.has(p.state as DeskTaskState)
+              || (p.note !== undefined && (typeof p.note !== "string" || p.note.length > 2_000))
+              || (p.releaseVersion !== undefined && (typeof p.releaseVersion !== "string" || p.releaseVersion.length > 64))
+              || (p.verificationSteps !== undefined && (typeof p.verificationSteps !== "string" || p.verificationSteps.length > 4_000))
+              || (p.claimFence !== undefined && (!Number.isSafeInteger(p.claimFence) || p.claimFence < 1))
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId, taskId, and Desk task transition required"));
+            }
+            const input: DeskTransitionTaskInput = {
+              state: p.state as DeskTaskState,
+              ...(p.note !== undefined ? { note: p.note } : {}),
+              ...(p.releaseVersion !== undefined ? { releaseVersion: p.releaseVersion } : {}),
+              ...(p.verificationSteps !== undefined ? { verificationSteps: p.verificationSteps } : {}),
+              ...(p.claimFence !== undefined ? { claimFence: p.claimFence } : {}),
+            };
+            try {
+              return reply(rpcResult(id!, redactSensitiveValue(await deps.deskTaskTransition(p.profileId, p.taskId, input)).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
+          }
+          case "desk.task.complete": {
+            if (!deps.deskTaskComplete) return reply(rpcError(id, ERR.METHOD, "organization Desk task completion is not supported by this server"));
+            if (
+              typeof p.profileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || typeof p.taskId !== "string"
+              || !SERVE_DESK_TASK_ID_PATTERN.test(p.taskId)
+              || (p.detail !== undefined && (typeof p.detail !== "string" || p.detail.length > 2_000))
+              || (p.releaseVersion !== undefined && (typeof p.releaseVersion !== "string" || p.releaseVersion.length > 64))
+              || (p.verificationSteps !== undefined && (typeof p.verificationSteps !== "string" || p.verificationSteps.length > 4_000))
+              || (p.claimFence !== undefined && (!Number.isSafeInteger(p.claimFence) || p.claimFence < 1))
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId, taskId, and completion fields required"));
+            }
+            const input: DeskCompleteTaskInput = {
+              ...(p.detail !== undefined ? { detail: p.detail } : {}),
+              ...(p.releaseVersion !== undefined ? { releaseVersion: p.releaseVersion } : {}),
+              ...(p.verificationSteps !== undefined ? { verificationSteps: p.verificationSteps } : {}),
+              ...(p.claimFence !== undefined ? { claimFence: p.claimFence } : {}),
+            };
+            try {
+              return reply(rpcResult(id!, redactSensitiveValue(await deps.deskTaskComplete(p.profileId, p.taskId, input)).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
+          }
+          case "desk.task.cancel": {
+            if (!deps.deskTaskCancel) return reply(rpcError(id, ERR.METHOD, "organization Desk task cancellation is not supported by this server"));
+            if (
+              typeof p.profileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || typeof p.taskId !== "string"
+              || !SERVE_DESK_TASK_ID_PATTERN.test(p.taskId)
+              || typeof p.detail !== "string"
+              || !p.detail.trim()
+              || p.detail.length > 2_000
+              || (p.claimFence !== undefined && (!Number.isSafeInteger(p.claimFence) || p.claimFence < 1))
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId, taskId, and cancellation reason required"));
+            }
+            try {
+              return reply(rpcResult(id!, redactSensitiveValue(await deps.deskTaskCancel(p.profileId, p.taskId, p.detail, p.claimFence)).value));
+            } catch (error) {
+              return reply(deskRpcError(id, error));
+            }
+          }
+          case "desk.task.comment": {
+            if (!deps.deskTaskComment) return reply(rpcError(id, ERR.METHOD, "organization Desk task comments are not supported by this server"));
+            if (
+              typeof p.profileId !== "string"
+              || !SERVE_PROFILE_ID_PATTERN.test(p.profileId)
+              || typeof p.taskId !== "string"
+              || !SERVE_DESK_TASK_ID_PATTERN.test(p.taskId)
+              || typeof p.body !== "string"
+              || !p.body.trim()
+              || p.body.length > 8_000
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "valid profileId, taskId, and comment body required"));
+            }
+            try {
+              return reply(rpcResult(id!, redactSensitiveValue(await deps.deskTaskComment(p.profileId, p.taskId, p.body)).value));
             } catch (error) {
               return reply(deskRpcError(id, error));
             }

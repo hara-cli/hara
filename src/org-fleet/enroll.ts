@@ -19,7 +19,9 @@ import { readdirSync } from "node:fs";
 import {
   normalizeDeskBaseUrl,
   removeMismatchedProfileCreds,
+  saveMcpClientCreds,
   saveProfileCreds,
+  type DeskMcpClientKind,
   type DeskCreds,
 } from "../desk.js";
 import {
@@ -109,7 +111,14 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 const THINKING_EFFORTS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const loopbackHostname = (hostname: string): boolean => hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 
-const deviceInfo = (): { name: string; os: string; hara_version: string } => ({ name: hostname(), os: platform(), hara_version: process.env.HARA_BUILD_VERSION ?? "dev" });
+const deviceInfo = (): { name: string; os: string; hara_version: string; client_kind: string } => ({
+  name: hostname(),
+  os: platform(),
+  hara_version: process.env.HARA_BUILD_VERSION ?? "dev",
+  client_kind: process.env.HARA_DESKTOP_SIDECAR === "1"
+    ? "nanhara.hara-desktop"
+    : "nanhara.hara-cli",
+});
 
 /** Enrollment codes are sent to a security-sensitive endpoint. Only HTTPS is accepted outside a
  * loopback development server, and userinfo/path/query/fragment are rejected so a code cannot be
@@ -298,6 +307,7 @@ function parseDeskBinding(value: unknown): DeskCreds | undefined {
   const rawAgentId = record.agent_id ?? record.agentId;
   const rawOwner = record.owner ?? "";
   const rawToken = record.token;
+  const rawCredentialGeneration = record.credential_generation ?? record.credentialGeneration;
   if (
     typeof rawUrl !== "string"
     || typeof rawAgentId !== "string"
@@ -311,6 +321,14 @@ function parseDeskBinding(value: unknown): DeskCreds | undefined {
     || CONTROL_CHARACTERS.test(rawAgentId)
     || CONTROL_CHARACTERS.test(rawOwner)
     || CONTROL_CHARACTERS.test(rawToken)
+    || (
+      rawCredentialGeneration !== undefined
+      && (
+        typeof rawCredentialGeneration !== "number"
+        || !Number.isSafeInteger(rawCredentialGeneration)
+        || rawCredentialGeneration < 1
+      )
+    )
   ) {
     throw new Error("enroll response contains an invalid desk binding");
   }
@@ -325,6 +343,9 @@ function parseDeskBinding(value: unknown): DeskCreds | undefined {
     agentId: rawAgentId,
     owner: rawOwner,
     token: rawToken,
+    ...(rawCredentialGeneration === undefined
+      ? {}
+      : { credentialGeneration: rawCredentialGeneration }),
   };
 }
 
@@ -487,6 +508,126 @@ export async function exchangeEnrollment(gatewayUrl: string, code: string, signa
   return parseEnrollResponse(base, payload, new Date().toISOString());
 }
 
+export interface ProvisionOrganizationDeskAgentInput {
+  clientKind: DeskMcpClientKind;
+  instanceId?: string;
+  name?: string;
+}
+
+export interface ProvisionedOrganizationDeskAgent {
+  profileId: string;
+  clientKind: DeskMcpClientKind;
+  instanceId: string;
+  installationId: string;
+  deskUrl: string;
+  agentId: string;
+  owner: string;
+}
+
+/** Ask Control for a client-scoped Desk bearer and seal it directly into the MCP credential store.
+ * The returned value is deliberately non-secret and is safe for CLI display. */
+export async function provisionOrganizationDeskAgent(
+  profileId: string,
+  input: ProvisionOrganizationDeskAgentInput,
+  signal?: AbortSignal,
+): Promise<ProvisionedOrganizationDeskAgent> {
+  if (!isValidProfileId(profileId)) throw new Error("invalid organization connection id");
+  const profile = getProfile(profileId);
+  if (
+    !profile
+    || profile.kind !== "gateway"
+    || !profile.gatewayUrl
+    || !profile.deviceToken
+    || !profile.deviceId
+  ) throw new Error(`organization connection '${profileId}' must be re-enrolled before provisioning an Agent`);
+  if (deviceTokenExpired(profile.tokenExpiresAt)) {
+    throw new Error(`organization connection '${profileId}' has expired; re-enroll it before provisioning an Agent`);
+  }
+  if (!["anthropic.claude-code", "openai.codex"].includes(input.clientKind)) {
+    throw new Error("Desk Agent client must be anthropic.claude-code or openai.codex");
+  }
+  const instanceId = (input.instanceId?.trim() || "default").toLowerCase();
+  if (instanceId.length > 80 || !/^[a-z0-9][a-z0-9._-]*$/.test(instanceId)) {
+    throw new Error("Desk Agent instance must use 1-80 lowercase letters, numbers, dots, underscores, or dashes");
+  }
+  const name = input.name?.trim();
+  if (name && (name.length > 120 || CONTROL_CHARACTERS.test(name))) {
+    throw new Error("Desk Agent name must be 120 printable characters or fewer");
+  }
+  const gatewayUrl = normalizeGatewayUrl(profile.gatewayUrl);
+  let response: Response;
+  try {
+    response = await userModelFetch(`${gatewayUrl}/v1/desk/agents`, {
+      method: "POST",
+      redirect: "error",
+      cache: "no-store",
+      signal,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        authorization: `Bearer ${profile.deviceToken}`,
+      },
+      body: JSON.stringify({
+        client_kind: input.clientKind,
+        instance_id: instanceId,
+        ...(name ? { name } : {}),
+      }),
+    });
+  } catch {
+    throw new Error("organization Desk Agent provisioning request failed; retry the same client and instance");
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`organization Desk Agent provisioning failed (HTTP ${response.status})`);
+  }
+  const raw = await readBoundedResponseText(
+    response,
+    MAX_HEARTBEAT_RESPONSE_BYTES,
+    "Desk Agent provisioning response is too large",
+  );
+  let payload: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid");
+    payload = parsed as Record<string, unknown>;
+  } catch {
+    throw new Error("Desk Agent provisioning response is not valid JSON");
+  }
+  if (payload.client_kind !== input.clientKind || payload.instance_id !== instanceId) {
+    throw new Error("Control returned a Desk Agent for a different client instance");
+  }
+  const desk = parseDeskBinding(payload.desk);
+  if (!desk) throw new Error("Control did not return a Desk Agent credential");
+
+  // A profile id is mutable. Freeze its authenticated device generation across the network call so
+  // a late response cannot populate credentials under a replacement tenant/device.
+  const current = getProfile(profileId);
+  if (
+    !current
+    || current.kind !== "gateway"
+    || current.gatewayUrl !== profile.gatewayUrl
+    || current.deviceToken !== profile.deviceToken
+    || current.deviceId !== profile.deviceId
+    || current.tenantId !== profile.tenantId
+    || current.enrolledAt !== profile.enrolledAt
+  ) throw new Error("organization connection changed while its Desk Agent was provisioned; retry");
+
+  saveMcpClientCreds(desk, {
+    client: input.clientKind,
+    installationId: profile.deviceId,
+    profile: instanceId,
+  });
+  return Object.freeze({
+    profileId,
+    clientKind: input.clientKind,
+    instanceId,
+    installationId: profile.deviceId,
+    deskUrl: desk.url,
+    agentId: desk.agentId,
+    owner: desk.owner,
+  });
+}
+
 /** Legacy enrollment path: exchange, then persist ~/.hara/org.json for older callers. */
 export async function enrollDevice(gatewayUrl: string, code: string, signal?: AbortSignal): Promise<Enrollment> {
   const e = await exchangeEnrollment(gatewayUrl, code, signal);
@@ -530,6 +671,7 @@ export function upsertGatewayProfileFromEnrollment(
   const identity = {
     profileId: profile.id,
     gatewayUrl: enrollment.gatewayUrl,
+    ...(enrollment.tenantId ? { tenantId: enrollment.tenantId } : {}),
     deviceId: enrollment.deviceId,
     enrolledAt: enrollment.enrolledAt,
   };

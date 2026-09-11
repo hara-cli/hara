@@ -140,8 +140,9 @@ test("gateway status marks environment credentials as process-only and does not 
     reporter.connected();
     await reporter.flush();
 
-    const status = await gatewayStatus("feishu");
+    const status = await gatewayStatus("feishu", { home, env: {} });
     assert.equal(status.configuration, "process-only");
+    assert.equal(status.credentialSource, "process-only");
     assert.equal(status.running, true);
     assert.equal(status.runtimeState, "connected");
     assert.equal(status.lastErrorCode, "network", "last error remains available as resolved history");

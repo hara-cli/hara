@@ -325,12 +325,20 @@ Uses the official `@larksuiteoapi/node-sdk` over a WebSocket long-connection (no
 1. Create an app at the [Feishu open platform](https://open.feishu.cn) → copy **App ID** + **App Secret**.
 2. Add the **bot** capability; subscribe to the `im.message.receive_v1` event; enable **长连接 (long-connection)**
    event delivery. Grant scopes to read/send messages and read message resources (for image download).
-3. `HARA_GATEWAY_ALLOWED` = your `open_id`. For larksuite.com (international), set `HARA_FEISHU_DOMAIN=lark`.
+3. In Hara Desktop, open **Settings → Chat bots → Feishu private connection**. Enter the App ID and App
+   Secret in the masked fields, choose Feishu or Lark, and save. The local Engine stores the complete record
+   in owner-only private state; it returns status only and never exposes the values to a chat or Agent script.
+4. `HARA_GATEWAY_ALLOWED` = your `open_id`, then start the gateway without putting either credential on the
+   command line:
 
 ```bash
-HARA_FEISHU_APP_ID=cli_… HARA_FEISHU_APP_SECRET=… HARA_GATEWAY_ALLOWED=<your-open_id> \
-  hara gateway --platform feishu
+HARA_GATEWAY_ALLOWED=<your-open_id> hara gateway --platform feishu
 ```
+
+Existing supervised/headless deployments may continue to inject `HARA_FEISHU_APP_ID`,
+`HARA_FEISHU_APP_SECRET`, and (for larksuite.com) `HARA_FEISHU_DOMAIN=lark` as one complete trusted launch
+environment. Use the service manager's protected secret facility; never put the values in chat, an `echo`
+command, a project file, or an inline shell command.
 
 Direct messages drive the full coding session. Group events and @mentions are surfaced only to matching flow
 rules and explicitly enabled `/bridge` subscriptions; they never fall through to the full coding agent. The long-connection callback first writes each event

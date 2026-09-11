@@ -19,6 +19,8 @@ export type MobileAccountLogin = Readonly<{
   accessToken: string;
   account: Readonly<{ displayName: string; id: string; region: "cn" | "global" }>;
   expiresInSeconds: number;
+  refreshExpiresInSeconds: number;
+  refreshToken: string;
 }>;
 
 export type RegisteredDesktop = Readonly<{
@@ -51,6 +53,10 @@ const base64url = (value: unknown, max: number): value is string =>
   bounded(value, max) && /^[A-Za-z0-9_-]+$/u.test(value);
 const seconds = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 60 && value <= 3_600;
+const refreshSeconds = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value >= 60 && value <= 7_776_000;
+const refreshToken = (value: unknown): value is string =>
+  typeof value === "string" && value.length >= 50 && value.length <= 200 && /^hara_rt_[A-Za-z0-9_-]+$/u.test(value);
 
 function origin(value: string, allowInsecureLoopback: boolean): string {
   const parsed = new URL(value);
@@ -181,7 +187,13 @@ export class MobileAccountClient {
 
   async sendSms(phone: string): Promise<number> {
     if (!/^1[3-9][0-9]{9}$/u.test(phone)) throw new MobileAccountError("INPUT_INVALID");
-    const response = record(await this.request("/v1/auth/nayi/sms", { body: { phone } }));
+    const response = record(await this.request("/v1/auth/code/send", {
+      body: {
+        channel: "phone",
+        identifier: phone,
+        locale: "zh-Hans",
+      },
+    }));
     if (
       response.protocolVersion !== 1
       || response.accepted !== true
@@ -194,17 +206,24 @@ export class MobileAccountClient {
   }
 
   async login(phone: string, code: string, platform: "macos" | "windows" | "linux"): Promise<MobileAccountLogin> {
-    if (!/^1[3-9][0-9]{9}$/u.test(phone) || !/^[0-9]{4,12}$/u.test(code)) {
+    if (!/^1[3-9][0-9]{9}$/u.test(phone) || !/^[0-9]{6}$/u.test(code)) {
       throw new MobileAccountError("INPUT_INVALID");
     }
-    const response = record(await this.request("/v1/auth/nayi/login", {
-      body: { code, phone, platform },
+    void platform;
+    return this.parseLogin(await this.request("/v1/auth/code/login", {
+      body: { channel: "phone", code, identifier: phone },
     }));
+  }
+
+  private parseLogin(value: unknown): MobileAccountLogin {
+    const response = record(value);
     const account = record(response.account);
     if (
       response.protocolVersion !== 1
       || !token(response.accessToken)
       || !seconds(response.expiresInSeconds)
+      || !refreshToken(response.refreshToken)
+      || !refreshSeconds(response.refreshExpiresInSeconds)
       || !id(account.id)
       || !bounded(account.displayName, 120)
       || (account.region !== "cn" && account.region !== "global")
@@ -217,7 +236,26 @@ export class MobileAccountClient {
         region: account.region as "cn" | "global",
       },
       expiresInSeconds: response.expiresInSeconds,
+      refreshExpiresInSeconds: response.refreshExpiresInSeconds,
+      refreshToken: response.refreshToken,
     });
+  }
+
+  async refresh(value: string): Promise<MobileAccountLogin> {
+    if (!refreshToken(value)) throw new MobileAccountError("INPUT_INVALID");
+    return this.parseLogin(await this.request("/v1/auth/refresh", {
+      body: { refreshToken: value },
+    }));
+  }
+
+  async logout(value: string): Promise<void> {
+    if (!refreshToken(value)) throw new MobileAccountError("INPUT_INVALID");
+    const response = record(await this.request("/v1/auth/logout", {
+      body: { refreshToken: value },
+    }));
+    if (response.protocolVersion !== 1 || response.revoked !== true) {
+      throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    }
   }
 
   async registerDesktop(input: Readonly<{
@@ -257,6 +295,33 @@ export class MobileAccountClient {
     return Object.freeze({
       credential: response.deviceCredential,
       deviceId: device.id,
+      expiresInSeconds: response.expiresInSeconds,
+    });
+  }
+
+  async renewDesktop(
+    accessToken: string,
+    deviceId: string,
+  ): Promise<RegisteredDesktop> {
+    if (!token(accessToken) || !id(deviceId)) {
+      throw new MobileAccountError("INPUT_INVALID");
+    }
+    const response = record(await this.request(
+      `/v1/devices/${encodeURIComponent(deviceId)}/credential`,
+      { accessToken, method: "POST" },
+    ));
+    const device = record(response.device);
+    if (
+      response.protocolVersion !== 1
+      || response.deviceCredentialReady !== true
+      || !token(response.deviceCredential)
+      || !seconds(response.expiresInSeconds)
+      || device.id !== deviceId
+      || device.kind !== "desktop"
+    ) throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    return Object.freeze({
+      credential: response.deviceCredential,
+      deviceId,
       expiresInSeconds: response.expiresInSeconds,
     });
   }

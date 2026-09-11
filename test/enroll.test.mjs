@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, statSync, existsSync, readFileSync, readdirSync } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   enrollDevice,
   loadEnrollment,
@@ -22,6 +23,7 @@ import {
   enrollGatewayProfile,
   upsertGatewayProfileFromEnrollment,
   gatewayProfileFromEnrollment,
+  provisionOrganizationDeskAgent,
 } from "../dist/org-fleet/enroll.js";
 import {
   captureLearning,
@@ -320,12 +322,15 @@ test("profile-native enrollment stores only the scoped token in private profiles
   process.env.HOME = home;
   process.env.HARA_DESK_STATE_HOME = home;
   let heartbeatSeen = false;
+  let provisionRequest;
   const server = createServer((req, res) => {
     if (req.url === "/v1/enroll") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         device_token: "scoped-device-token",
         device_id: "device-one",
+        tenant_id: "tenant-team-a",
+        tenant_name: "Team A",
         model: "deepseek-v4-pro",
         available_models: ["deepseek-v4-pro"],
         thinking_efforts: ["off", "low", "high", "max"],
@@ -352,6 +357,27 @@ test("profile-native enrollment stores only the scoped token in private profiles
           config_version: 2,
         }],
       }));
+    } else if (req.url === "/v1/desk/agents") {
+      let raw = "";
+      req.on("data", (chunk) => { raw += chunk; });
+      req.on("end", () => {
+        provisionRequest = {
+          authorization: req.headers.authorization,
+          body: JSON.parse(raw),
+        };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          desk: {
+            url: "https://desk.example.test",
+            agent_id: "desk-codex-work",
+            owner: "member@example.test",
+            token: `hdk_${"a".repeat(48)}`,
+            credential_generation: 1,
+          },
+          client_kind: "openai.codex",
+          instance_id: "work-account",
+        }));
+      });
     } else if (req.url === "/v1/heartbeat") {
       heartbeatSeen = req.headers.authorization === "Bearer scoped-device-token";
       res.writeHead(200, { "content-type": "application/json" });
@@ -408,12 +434,55 @@ test("profile-native enrollment stores only the scoped token in private profiles
       loadProfileCreds({
         profileId: "team-a",
         gatewayUrl: url,
+        tenantId: storedProfile?.tenantId,
         deviceId: "device-one",
         enrolledAt: storedProfile?.enrolledAt,
       })?.agentId,
       "desk-team-a",
       "one enrollment stores the separately scoped Desk binding for the same organization identity",
     );
+    const codex = await provisionOrganizationDeskAgent("team-a", {
+      clientKind: "openai.codex",
+      instanceId: "work-account",
+      name: "Codex · Work",
+    });
+    assert.deepEqual(codex, {
+      profileId: "team-a",
+      clientKind: "openai.codex",
+      instanceId: "work-account",
+      installationId: "device-one",
+      deskUrl: "https://desk.example.test",
+      agentId: "desk-codex-work",
+      owner: "member@example.test",
+    });
+    assert.deepEqual(provisionRequest, {
+      authorization: "Bearer scoped-device-token",
+      body: {
+        client_kind: "openai.codex",
+        instance_id: "work-account",
+        name: "Codex · Work",
+      },
+    });
+    const deskOriginId = createHash("sha256")
+      .update("https://desk.example.test")
+      .digest("hex")
+      .slice(0, 16);
+    const credentialPart = (value) => `${value.toLowerCase()}-${createHash("sha256")
+      .update(value)
+      .digest("hex")
+      .slice(0, 16)}`;
+    const mcpCredentialPath = join(
+      home, ".hara", "desk", "credentials", deskOriginId,
+      credentialPart("device-one"), credentialPart("openai.codex"),
+      `${credentialPart("work-account")}.json`,
+    );
+    assert.equal(statSync(mcpCredentialPath).mode & 0o777, 0o600);
+    const mcpCredential = JSON.parse(readFileSync(mcpCredentialPath, "utf8"));
+    assert.equal(mcpCredential.token, `hdk_${"a".repeat(48)}`);
+    assert.equal(mcpCredential.client, "openai.codex");
+    assert.equal(mcpCredential.installationId, "device-one");
+    assert.equal(mcpCredential.profile, "work-account");
+    assert.equal(mcpCredential.credentialGeneration, 1);
     const profilesPath = join(home, ".hara", "profiles.json");
     assert.equal(statSync(profilesPath).mode & 0o777, 0o600);
     const stored = readFileSync(profilesPath, "utf8");
