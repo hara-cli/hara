@@ -4504,6 +4504,10 @@ program
     const { startServe } = await import("./serve/server.js");
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
+    const {
+      mobileSessionPublications,
+      setMobileSessionPublication,
+    } = await import("./mobile/state.js");
     const gatewayLogins = new GatewayLoginManager();
     const mobilePairing = new MobilePairingCoordinator();
     const structuredBrowserStatus = () => {
@@ -4821,6 +4825,11 @@ program
         createMobilePairing: () => mobilePairing.create(),
         inspectMobilePairing: (challengeId) => mobilePairing.inspect(challengeId),
         decideMobilePairing: (challengeId, approved) => mobilePairing.decide(challengeId, approved),
+        mobileSessionPublications: () => mobileSessionPublications(),
+        publishMobileSession: (sessionId) =>
+          setMobileSessionPublication(sessionId, true),
+        unpublishMobileSession: (sessionId) =>
+          setMobileSessionPublication(sessionId, false),
         organizationConnections: (targetCwd) => organizationConnectionsSnapshot(targetCwd ?? cwd),
         spaces: (targetCwd) => spaceDirectorySnapshot(targetCwd ?? cwd),
         useSpace: (spaceId, targetCwd) => useSpaceConnection(spaceId, targetCwd ?? cwd),
@@ -5132,8 +5141,10 @@ program
 program
   .command("mobile [action]")
   .description("pair Hara Mobile with this Desktop and bridge explicitly published local sessions")
-  .option("--phone <number>", "Nayi phone number for mobile login")
-  .option("--code <digits>", "short-lived Nayi SMS verification code")
+  .option("--phone <number>", "Hara phone number for Desktop sign-in")
+  .option("--email <address>", "Hara email address for Desktop sign-in")
+  .option("--code <digits>", "short-lived Hara verification code")
+  .option("--session <id>", "local Hara Session ID to publish or unpublish")
   .option("--yes", "approve the currently displayed mobile pairing request")
   .action(async (action, options) => {
     const { runMobileCommand } = await import("./mobile/command.js");

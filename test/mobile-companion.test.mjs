@@ -17,7 +17,9 @@ import {
 import {
   clearMobileState,
   loadMobileState,
+  mobileSessionPublications,
   saveMobileState,
+  setMobileSessionPublication,
 } from "../dist/mobile/state.js";
 import {
   MobileCompanionRouter,
@@ -82,11 +84,23 @@ test("Mobile companion state is private, validated, and removable", () => {
       publicKeySpki: mobileKey.publicKeySpki,
       publicKeyThumbprint: publicKeyThumbprint(mobileKey.publicKeySpki),
     }],
+    publishedSessionIds: ["ext_runtime_test-a"],
     schemaVersion: 1,
   };
   try {
     saveMobileState(state, path);
     assert.equal(loadMobileState(path)?.desktop.id, "desktop-a");
+    assert.deepEqual(mobileSessionPublications(path).sessionIds, [
+      "ext_runtime_test-a",
+    ]);
+    assert.deepEqual(
+      setMobileSessionPublication("ext_codex_test-b", true, path).sessionIds,
+      ["ext_runtime_test-a", "ext_codex_test-b"],
+    );
+    assert.deepEqual(
+      setMobileSessionPublication("ext_runtime_test-a", false, path).sessionIds,
+      ["ext_codex_test-b"],
+    );
     assert.doesNotMatch(readFileSync(path, "utf8"), /Test User.*accessToken/s,
       "serialized state remains JSON but tests never print its credential values");
     if (process.platform !== "win32") {
@@ -196,6 +210,92 @@ test("Desktop login uses Hara-owned verification routes without a Nayi dependenc
       url: "http://127.0.0.1:7200/v1/auth/code/login",
     },
   ]);
+});
+
+test("Desktop email login uses the same independent Hara verification contract", async () => {
+  const requests = [];
+  const response = (body) => ({
+    headers: { get: () => null },
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify(body),
+  });
+  const client = new MobileAccountClient(
+    "http://127.0.0.1:7200",
+    async (url, options) => {
+      requests.push({ body: JSON.parse(options.body), url });
+      return requests.length === 1
+        ? response({ accepted: true, cooldownSeconds: 60, protocolVersion: 1 })
+        : response({
+          accessToken: "a".repeat(64),
+          account: { displayName: "Hara", id: "account-a", region: "cn" },
+          expiresInSeconds: 600,
+          protocolVersion: 1,
+          refreshExpiresInSeconds: 2_592_000,
+          refreshToken: `hara_rt_${"r".repeat(64)}`,
+          tokenType: "Bearer",
+        });
+    },
+    1_000,
+    { allowInsecureLoopback: true },
+  );
+
+  assert.equal(await client.sendCode("email", "user@example.com", "en"), 60);
+  await client.loginWithCode("email", "user@example.com", "123456", "macos");
+  assert.deepEqual(requests, [
+    {
+      body: {
+        channel: "email",
+        identifier: "user@example.com",
+        locale: "en",
+      },
+      url: "http://127.0.0.1:7200/v1/auth/code/send",
+    },
+    {
+      body: {
+        channel: "email",
+        code: "123456",
+        identifier: "user@example.com",
+      },
+      url: "http://127.0.0.1:7200/v1/auth/code/login",
+    },
+  ]);
+});
+
+test("Desktop discovers the server-authoritative Session Relay switch", async () => {
+  const response = (body) => ({
+    headers: { get: () => null },
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify(body),
+  });
+  const client = new MobileAccountClient(
+    "http://127.0.0.1:7200",
+    async () => response({
+      features: { sessionRelay: false },
+      protocolVersion: 1,
+      service: "hara-account",
+    }),
+    1_000,
+    { allowInsecureLoopback: true },
+  );
+
+  assert.deepEqual(await client.capabilities(), { sessionRelay: false });
+
+  const missingSwitch = new MobileAccountClient(
+    "http://127.0.0.1:7200",
+    async () => response({
+      features: {},
+      protocolVersion: 1,
+      service: "hara-account",
+    }),
+    1_000,
+    { allowInsecureLoopback: true },
+  );
+  await assert.rejects(
+    () => missingSwitch.capabilities(),
+    { code: "SERVICE_UNAVAILABLE" },
+  );
 });
 
 test("Relay bridge rejects a paired mobile identity whose public key changed", async () => {
@@ -422,7 +522,10 @@ test("Router publishes bounded sessions and enforces terminal leases and command
     },
   };
   const now = 2_000_000_000;
-  const router = new MobileCompanionRouter(local, "desktop-a", now + 600_000, { clock: () => now });
+  const router = new MobileCompanionRouter(local, "desktop-a", now + 600_000, {
+    clock: () => now,
+    publishedSessionIds: ["ext_runtime_test-a"],
+  });
   const listed = await router.route(request("request-list", "sessions.list"));
   assert.equal(listed.ok, true);
   assert.equal(listed.body[0].status, "needs_input");
@@ -510,6 +613,76 @@ test("Router publishes bounded sessions and enforces terminal leases and command
   await router.close();
 });
 
+test("Router defaults to zero published sessions and revokes a removed allowlist entry", async () => {
+  let publishedSessionIds = [];
+  const localCalls = [];
+  const local = {
+    async call(method, params = {}) {
+      localCalls.push({ method, params });
+      if (method === "external.sessions.list") {
+        return {
+          sources: [{
+            id: "runtime",
+            capabilities: {
+              interrupt: true,
+              read: true,
+              submit: true,
+              terminalInput: true,
+              terminalView: true,
+            },
+          }],
+          sessions: [{
+            id: "ext_runtime_private-a",
+            sourceId: "runtime",
+            title: "Private by default",
+            workspaceName: "hara",
+            state: "waiting",
+            updatedAt: "2026-09-06T12:00:00.000Z",
+          }],
+        };
+      }
+      if (method === "external.sessions.read") {
+        return { controlMode: "live", messages: [], readOnly: false };
+      }
+      return {};
+    },
+    async close() {},
+    onNotification() { return () => {}; },
+  };
+  const now = 2_000_000_000;
+  const router = new MobileCompanionRouter(
+    local,
+    "desktop-a",
+    now + 600_000,
+    {
+      clock: () => now,
+      publishedSessionIds: () => publishedSessionIds,
+    },
+  );
+
+  assert.deepEqual(
+    (await router.route(request("private-list", "sessions.list"))).body,
+    [],
+  );
+  publishedSessionIds = ["ext_runtime_private-a"];
+  const visible = await router.route(request("published-list", "sessions.list"));
+  assert.equal(visible.body.length, 1);
+  assert.equal(visible.body[0].id, visible.body[0].publicationId);
+
+  const publicationId = visible.body[0].publicationId;
+  publishedSessionIds = [];
+  const revoked = await router.route(request("revoked-read", "sessions.read", {
+    publicationId,
+  }));
+  assert.equal(revoked.ok, false);
+  assert.equal(revoked.errorCode, "PUBLICATION_NOT_FOUND");
+  assert.equal(
+    localCalls.some(entry => entry.method === "external.sessions.read"),
+    false,
+  );
+  await router.close();
+});
+
 test("Router persists content-free command receipts and suppresses terminal input after restart", async () => {
   const calls = [];
   const local = {
@@ -553,6 +726,7 @@ test("Router persists content-free command receipts and suppresses terminal inpu
   const firstRouter = new MobileCompanionRouter(local, "desktop-a", now + 600_000, {
     clock: () => now,
     persistCommandReceipts: (receipts) => { persisted = structuredClone(receipts); },
+    publishedSessionIds: ["ext_runtime_restart-a"],
   });
   const firstList = await firstRouter.route(request("request-restart-list-a", "sessions.list"));
   const publication = firstList.body[0];
@@ -583,6 +757,7 @@ test("Router persists content-free command receipts and suppresses terminal inpu
   const restarted = new MobileCompanionRouter(local, "desktop-a", now + 600_000, {
     clock: () => now,
     commandReceipts: persisted,
+    publishedSessionIds: ["ext_runtime_restart-a"],
   });
   await restarted.route(request("request-restart-list-b", "sessions.list"));
   const replay = await restarted.route(request("request-restart-input-b", "command.execute", input));

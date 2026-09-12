@@ -23,6 +23,12 @@ export type MobileAccountLogin = Readonly<{
   refreshToken: string;
 }>;
 
+export type MobileAccountCapabilities = Readonly<{
+  sessionRelay: boolean;
+}>;
+
+export type VerificationChannel = "phone" | "email";
+
 export type RegisteredDesktop = Readonly<{
   credential: string;
   deviceId: string;
@@ -185,13 +191,33 @@ export class MobileAccountClient {
     }
   }
 
-  async sendSms(phone: string): Promise<number> {
-    if (!/^1[3-9][0-9]{9}$/u.test(phone)) throw new MobileAccountError("INPUT_INVALID");
+  async capabilities(): Promise<MobileAccountCapabilities> {
+    const response = record(await this.request("/v1/capabilities"));
+    const features = record(response.features);
+    if (
+      response.protocolVersion !== 1
+      || response.service !== "hara-account"
+      || typeof features.sessionRelay !== "boolean"
+    ) throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    return Object.freeze({ sessionRelay: features.sessionRelay });
+  }
+
+  async sendCode(
+    channel: VerificationChannel,
+    identifier: string,
+    locale: "zh-Hans" | "en" = "zh-Hans",
+  ): Promise<number> {
+    const valid = channel === "phone"
+      ? /^1[3-9][0-9]{9}$/u.test(identifier)
+      : identifier.length >= 3
+        && identifier.length <= 254
+        && /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(identifier);
+    if (!valid) throw new MobileAccountError("INPUT_INVALID");
     const response = record(await this.request("/v1/auth/code/send", {
       body: {
-        channel: "phone",
-        identifier: phone,
-        locale: "zh-Hans",
+        channel,
+        identifier,
+        locale,
       },
     }));
     if (
@@ -205,14 +231,36 @@ export class MobileAccountClient {
     return response.cooldownSeconds;
   }
 
-  async login(phone: string, code: string, platform: "macos" | "windows" | "linux"): Promise<MobileAccountLogin> {
-    if (!/^1[3-9][0-9]{9}$/u.test(phone) || !/^[0-9]{6}$/u.test(code)) {
+  async loginWithCode(
+    channel: VerificationChannel,
+    identifier: string,
+    code: string,
+    platform: "macos" | "windows" | "linux",
+  ): Promise<MobileAccountLogin> {
+    const validIdentifier = channel === "phone"
+      ? /^1[3-9][0-9]{9}$/u.test(identifier)
+      : identifier.length >= 3
+        && identifier.length <= 254
+        && /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(identifier);
+    if (!validIdentifier || !/^[0-9]{6}$/u.test(code)) {
       throw new MobileAccountError("INPUT_INVALID");
     }
     void platform;
     return this.parseLogin(await this.request("/v1/auth/code/login", {
-      body: { channel: "phone", code, identifier: phone },
+      body: { channel, code, identifier },
     }));
+  }
+
+  async sendSms(phone: string): Promise<number> {
+    return this.sendCode("phone", phone);
+  }
+
+  async login(
+    phone: string,
+    code: string,
+    platform: "macos" | "windows" | "linux",
+  ): Promise<MobileAccountLogin> {
+    return this.loginWithCode("phone", phone, code, platform);
   }
 
   private parseLogin(value: unknown): MobileAccountLogin {

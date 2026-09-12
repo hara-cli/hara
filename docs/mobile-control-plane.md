@@ -27,7 +27,8 @@ the CLI against its publication, lease epoch, expiry, command ID, and active tur
 
 ## Protocol v1 already implemented in CLI
 
-- Nayi account SMS login and expiring Desktop-device registration.
+- Independent Hara phone/email verification login and expiring Desktop-device registration. Nayi account
+  data, tokens, and user APIs are outside this trust boundary.
 - A user-visible, one-time pairing challenge. The Desktop approves the exact mobile public-key thumbprint.
 - P-256 signatures plus peer encryption for every relay envelope; the relay handles ciphertext and routing.
 - An explicit, bounded publication directory for Personal coding-agent sessions (`hara`, `codex`, and
@@ -49,10 +50,14 @@ the CLI against its publication, lease epoch, expiry, command ID, and active tur
 The CLI entry points are:
 
 ```text
-hara mobile login
+hara mobile login --phone <number>
+hara mobile login --email <address>
 hara mobile pair
+hara mobile sessions
+hara mobile publish --session <id>
 hara mobile connect
 hara mobile status
+hara mobile unpublish --session <id>
 hara mobile logout
 ```
 

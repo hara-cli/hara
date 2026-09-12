@@ -67,6 +67,7 @@ import type {
   MobilePairingInvitation,
   MobilePairingSnapshot,
 } from "../mobile/pairing.js";
+import type { MobileSessionPublications } from "../mobile/state.js";
 import type { UiSink } from "../tools/registry.js";
 import { APPROVAL_MODES, type ApprovalMode } from "../config.js";
 import type { ComputerSettingsInput, ComputerSettingsState } from "../computer-settings.js";
@@ -377,6 +378,9 @@ export interface ServeDeps {
   createMobilePairing?: () => Promise<MobilePairingInvitation>;
   inspectMobilePairing?: (challengeId: string) => Promise<MobilePairingSnapshot>;
   decideMobilePairing?: (challengeId: string, approved: boolean) => Promise<MobilePairingSnapshot>;
+  mobileSessionPublications?: () => MobileSessionPublications;
+  publishMobileSession?: (sessionId: string) => MobileSessionPublications;
+  unpublishMobileSession?: (sessionId: string) => MobileSessionPublications;
   /** Redacted organization/profile control plane. One-time codes are accepted only by enroll and are
    * never returned. Device tokens remain inside the CLI's private profile store. */
   organizationConnections?: (cwd?: string) => OrganizationConnectionsState;
@@ -4357,6 +4361,17 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               "mobile.pairing.decide",
             );
           }
+          const mobilePublications =
+            !!deps.mobileSessionPublications
+            && !!deps.publishMobileSession
+            && !!deps.unpublishMobileSession;
+          if (mobilePublications) {
+            methods.push(
+              "mobile.publications.list",
+              "mobile.publications.publish",
+              "mobile.publications.unpublish",
+            );
+          }
           if (deps.computerSettings && deps.saveComputerSettings) {
             methods.push("settings.computer.get", "settings.computer.save");
           }
@@ -4411,6 +4426,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             features.push("learning.organization-review.v1");
           }
           if (mobilePairing) features.push("mobile.pairing.qr.v1");
+          if (mobilePublications) {
+            features.push("mobile.session-publications.v1");
+          }
           const runtime = runtimeInfo();
           const setupState = deps.providerSettings
             ? (deps.providerSettings(opts.cwd).current.authenticated ? "ready" : "needs-credentials")
@@ -4486,6 +4504,31 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               id!,
               await deps.decideMobilePairing(p.challengeId, p.approved),
             ));
+          }
+          case "mobile.publications.list": {
+            if (!deps.mobileSessionPublications) {
+              return reply(rpcError(id, ERR.METHOD, "mobile publications are not supported by this server"));
+            }
+            return reply(rpcResult(id!, deps.mobileSessionPublications()));
+          }
+          case "mobile.publications.publish":
+          case "mobile.publications.unpublish": {
+            const update = req.method === "mobile.publications.publish"
+              ? deps.publishMobileSession
+              : deps.unpublishMobileSession;
+            if (!update) {
+              return reply(rpcError(id, ERR.METHOD, "mobile publications are not supported by this server"));
+            }
+            if (
+              typeof p.sessionId !== "string"
+              || p.sessionId.length < 1
+              || p.sessionId.length > 160
+              || p.sessionId.trim() !== p.sessionId
+              || /\s/u.test(p.sessionId)
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "sessionId must be a bounded session ID"));
+            }
+            return reply(rpcResult(id!, update(p.sessionId)));
           }
           case "events.snapshot": {
             if (!Array.isArray(p.sessionIds) || p.sessionIds.length > 100) {

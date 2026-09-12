@@ -129,6 +129,7 @@ export class MobileCompanionRouter {
   private readonly runningSubmits = new Set<string>();
   private readonly approvals = new Map<string, { publicationId: string; question: string }>();
   private readonly removeNotificationListener: () => void;
+  private readonly publishedSessionIds: () => ReadonlySet<string>;
 
   constructor(
     private readonly local: LocalCompanionRpc,
@@ -138,6 +139,7 @@ export class MobileCompanionRouter {
       clock?: () => number;
       commandReceipts?: readonly MobileCommandReceipt[];
       persistCommandReceipts?: (receipts: readonly MobileCommandReceipt[]) => void;
+      publishedSessionIds?: readonly string[] | (() => readonly string[]);
     }> = {},
   ) {
     if (!identifier(desktopDeviceId) || !safeInteger(publicationExpiresAt)) {
@@ -145,6 +147,11 @@ export class MobileCompanionRouter {
     }
     this.clock = options.clock ?? Date.now;
     this.persistCommandReceipts = options.persistCommandReceipts;
+    this.publishedSessionIds = () => new Set(
+      typeof options.publishedSessionIds === "function"
+        ? options.publishedSessionIds()
+        : options.publishedSessionIds ?? [],
+    );
     this.leaseEpoch = this.clock();
     for (const entry of options.commandReceipts ?? []) {
       if (entry.expiresAt > this.clock()) this.receipts.set(entry.commandId, entry);
@@ -216,10 +223,29 @@ export class MobileCompanionRouter {
       .slice(0, 40)}`;
   }
 
+  private async revokePublication(publication: Publication): Promise<void> {
+    const lease = this.leases.get(publication.id);
+    if (lease) {
+      await (this.terminalInputTails.get(lease.streamId) ?? Promise.resolve());
+      await this.local.call("external.sessions.terminal.release", {
+        streamId: lease.streamId,
+      }).catch(() => undefined);
+      this.terminalInputTails.delete(lease.streamId);
+      this.leases.delete(publication.id);
+    }
+    this.publications.delete(publication.id);
+    for (const [approvalId, approval] of this.approvals) {
+      if (approval.publicationId === publication.id) {
+        this.approvals.delete(approvalId);
+      }
+    }
+  }
+
   private async listPublishedSessions(): Promise<unknown[]> {
     const result = record(await this.local.call("external.sessions.list", { limit: MAX_SESSIONS }));
     if (!result || !Array.isArray(result.sessions)) throw new Error("invalid local session directory");
     const sources = sourceCapabilities(result.sources);
+    const allowedSessionIds = this.publishedSessionIds();
     const next = new Map<string, Publication>();
     const published: unknown[] = [];
     for (const raw of result.sessions.slice(0, MAX_SESSIONS)) {
@@ -227,6 +253,7 @@ export class MobileCompanionRouter {
       if (
         !session
         || !identifier(session.id)
+        || !allowedSessionIds.has(session.id)
         || !["codex", "claude", "runtime"].includes(String(session.sourceId))
         || !bounded(session.title, 240)
         || !bounded(session.workspaceName, 160)
@@ -254,7 +281,8 @@ export class MobileCompanionRouter {
       published.push({
         capabilities,
         engine: engine(sourceId),
-        id: session.id,
+        // Provider-owned session IDs never cross the Desktop-to-phone boundary.
+        id: publication.id,
         leaseEpoch: this.leaseEpoch,
         publicationExpiresAt: publication.expiresAt,
         publicationId: publication.id,
@@ -264,6 +292,9 @@ export class MobileCompanionRouter {
         workspaceLabel: session.workspaceName,
       });
     }
+    for (const publication of this.publications.values()) {
+      if (!next.has(publication.id)) await this.revokePublication(publication);
+    }
     this.publications.clear();
     for (const [key, value] of next) this.publications.set(key, value);
     return published;
@@ -272,6 +303,13 @@ export class MobileCompanionRouter {
   private async publication(value: unknown): Promise<Publication | null> {
     if (!identifier(value)) return null;
     let publication = this.publications.get(value);
+    if (
+      publication
+      && !this.publishedSessionIds().has(publication.sessionId)
+    ) {
+      await this.revokePublication(publication);
+      publication = undefined;
+    }
     if (!publication) {
       await this.listPublishedSessions();
       publication = this.publications.get(value);

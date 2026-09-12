@@ -5,6 +5,19 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.175.0 — 2026-09-13 — explicit Mobile Session publication
+
+- Start every Desktop with zero Sessions exposed to a paired phone. Add `hara mobile sessions`, `publish`,
+  `publications`, and `unpublish`, plus matching Desktop controls, so the user grants and revokes phone access
+  per Session. Remote identifiers are opaque and removing a publication immediately releases its terminal lease.
+- Make the Account service's live Session Relay capability an authoritative fail-closed gate before Desktop
+  connects. Relay now revalidates each signed device against Account, including credential version, active device
+  row, region, public key, and the same capability switch, so revocation takes effect without waiting for expiry.
+- Add independent Hara email verification as a Desktop sign-in option alongside phone verification. Both routes
+  use Hara Account directly; Nayi accounts, tokens, user APIs, and data remain outside the trust boundary.
+- Persist bounded encrypted Relay delivery and acknowledgement cursors across restart while keeping model keys,
+  local paths, native provider Session IDs, command text, and terminal plaintext off the cloud service.
+
 ## 0.174.1 — 2026-09-13 — visible and recoverable automation delivery blocks
 
 - Record every due automation that cannot launch because its configured delivery credential, blocked item or

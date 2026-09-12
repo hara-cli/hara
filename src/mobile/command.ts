@@ -1,6 +1,9 @@
 import { createInterface } from "node:readline/promises";
 
-import { MobileAccountClient } from "./account-client.js";
+import {
+  MobileAccountClient,
+  type VerificationChannel,
+} from "./account-client.js";
 import { LocalServeClient } from "./local-serve-client.js";
 import { MobilePairingCoordinator } from "./pairing.js";
 import { MobileRelayBridge } from "./relay-bridge.js";
@@ -9,7 +12,9 @@ import { generateDeviceKey } from "./security.js";
 import {
   clearMobileState,
   loadMobileState,
+  mobileSessionPublications,
   saveMobileState,
+  setMobileSessionPublication,
   type MobileCompanionState,
 } from "./state.js";
 
@@ -18,7 +23,9 @@ const RELAY_URL = "wss://relay.hara.nanhara.tech/v1/connect";
 
 export type MobileCommandOptions = Readonly<{
   code?: string;
+  email?: string;
   phone?: string;
+  session?: string;
   yes?: boolean;
 }>;
 
@@ -56,12 +63,26 @@ async function confirm(label: string, assumeYes: boolean): Promise<boolean> {
 
 async function login(options: MobileCommandOptions): Promise<void> {
   const account = new MobileAccountClient(ACCOUNT_ORIGIN);
-  const phone = options.phone?.trim() || await prompt("Hara 登录手机号");
-  await account.sendSms(phone);
-  write("验证码已发送。\n");
-  const code = options.code?.trim() || await prompt("短信验证码", true);
+  if (options.phone?.trim() && options.email?.trim()) {
+    throw new Error("--phone 与 --email 只能选择一个");
+  }
+  const enteredIdentifier = options.phone?.trim()
+    || options.email?.trim()
+    || await prompt("Hara 登录手机号或邮箱");
+  const channel: VerificationChannel = options.email?.trim()
+    || (!options.phone?.trim() && enteredIdentifier.includes("@"))
+    ? "email"
+    : "phone";
+  await account.sendCode(channel, enteredIdentifier);
+  write(channel === "phone" ? "短信验证码已发送。\n" : "邮箱验证码已发送。\n");
+  const code = options.code?.trim() || await prompt("验证码", true);
   const platform = desktopPlatform();
-  const signedIn = await account.login(phone, code, platform);
+  const signedIn = await account.loginWithCode(
+    channel,
+    enteredIdentifier,
+    code,
+    platform,
+  );
   const previous = loadMobileState();
   const key = previous?.desktop.key ?? generateDeviceKey();
   const desktop = await account.registerDesktop({
@@ -100,6 +121,11 @@ async function login(options: MobileCommandOptions): Promise<void> {
       && previous.relayCursor
       ? { relayCursor: previous.relayCursor }
       : {}),
+    publishedSessionIds:
+      previous?.account.id === signedIn.account.id
+        && previous.desktop.id === desktop.deviceId
+        ? previous.publishedSessionIds ?? []
+        : [],
     schemaVersion: 1,
   };
   saveMobileState(state);
@@ -147,6 +173,11 @@ async function connect(): Promise<void> {
   const stored = loadMobileState();
   if (!stored) throw new Error("请先运行 `hara mobile login`");
   if (stored.pairedMobileDevices.length === 0) throw new Error("请先运行 `hara mobile pair`");
+  const account = new MobileAccountClient(ACCOUNT_ORIGIN);
+  const capabilities = await account.capabilities();
+  if (!capabilities.sessionRelay) {
+    throw new Error("Hara 云会话暂未开放；账号和配对信息已保留，无需重新配对");
+  }
   const pairing = new MobilePairingCoordinator();
   const local = await LocalServeClient.connect();
   let currentState = await pairing.currentState();
@@ -175,9 +206,18 @@ async function connect(): Promise<void> {
         {
           commandReceipts: currentState.commandReceipts,
           persistCommandReceipts: (commandReceipts) => {
-            currentState = { ...currentState, commandReceipts };
+            currentState = {
+              ...currentState,
+              commandReceipts,
+              publishedSessionIds:
+                loadMobileState()?.publishedSessionIds
+                ?? currentState.publishedSessionIds
+                ?? [],
+            };
             saveMobileState(currentState);
           },
+          publishedSessionIds: () =>
+            loadMobileState()?.publishedSessionIds ?? [],
         },
       );
       const bridge = new MobileRelayBridge(
@@ -231,6 +271,94 @@ function status(): void {
   const device = state.desktop.credentialExpiresAt > Date.now() ? "有效" : "已过期";
   write(`Hara Mobile Desktop：${state.account.displayName}\n`);
   write(`账号会话：${access} · 设备凭证：${device} · 已配对手机：${state.pairedMobileDevices.length}\n`);
+  write(`手机可访问会话：${state.publishedSessionIds?.length ?? 0}\n`);
+}
+
+type LocalSessionSummary = Readonly<{
+  id: string;
+  sourceId: string;
+  state: string;
+  title: string;
+  workspaceName: string;
+}>;
+
+const safeLabel = (value: unknown, fallback: string): string => {
+  if (typeof value !== "string") return fallback;
+  const normalized = value.replace(/[\u0000-\u001f\u007f]/gu, " ").replace(/\s+/gu, " ").trim();
+  return normalized.slice(0, 240) || fallback;
+};
+
+async function localSessions(): Promise<readonly LocalSessionSummary[]> {
+  const local = await LocalServeClient.connect();
+  try {
+    const result = await local.call<Record<string, unknown>>(
+      "external.sessions.list",
+      { limit: 100 },
+    );
+    if (!Array.isArray(result?.sessions)) {
+      throw new Error("Hara Serve 没有返回可用会话目录");
+    }
+    return result.sessions.flatMap((value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const session = value as Record<string, unknown>;
+      if (
+        typeof session.id !== "string"
+        || session.id.length < 1
+        || session.id.length > 160
+        || /\s/u.test(session.id)
+      ) return [];
+      return [{
+        id: session.id,
+        sourceId: safeLabel(session.sourceId, "unknown"),
+        state: safeLabel(session.state, "unknown"),
+        title: safeLabel(session.title, "Untitled Session"),
+        workspaceName: safeLabel(session.workspaceName, "workspace"),
+      }];
+    });
+  } finally {
+    await local.close().catch(() => undefined);
+  }
+}
+
+async function listSessions(): Promise<void> {
+  const state = loadMobileState();
+  if (!state) throw new Error("请先运行 `hara mobile login`");
+  const published = new Set(state.publishedSessionIds ?? []);
+  const sessions = await localSessions();
+  if (sessions.length === 0) {
+    write("当前没有可开放到手机的 Session。\n");
+    return;
+  }
+  for (const session of sessions) {
+    write(`${published.has(session.id) ? "[手机可见]" : "[仅电脑]"} ${session.id}  ${session.sourceId} · ${session.workspaceName} · ${session.title}\n`);
+  }
+}
+
+async function updatePublication(
+  options: MobileCommandOptions,
+  published: boolean,
+): Promise<void> {
+  if (!loadMobileState()) throw new Error("请先运行 `hara mobile login`");
+  const sessionId = options.session?.trim() || await prompt("Session ID");
+  if (published) {
+    const sessions = await localSessions();
+    if (!sessions.some((session) => session.id === sessionId)) {
+      throw new Error("找不到这个本地 Session；先运行 `hara mobile sessions` 查看可用列表");
+    }
+  }
+  const result = setMobileSessionPublication(sessionId, published);
+  write(published
+    ? `已允许手机访问这个 Session；当前共 ${result.sessionIds.length} 个。\n`
+    : `已撤销手机访问；当前共 ${result.sessionIds.length} 个。\n`);
+}
+
+function listPublications(): void {
+  const result = mobileSessionPublications();
+  if (result.sessionIds.length === 0) {
+    write("当前没有向手机开放任何 Session。\n");
+    return;
+  }
+  for (const sessionId of result.sessionIds) write(`${sessionId}\n`);
 }
 
 export async function runMobileCommand(
@@ -251,6 +379,18 @@ export async function runMobileCommand(
     case "status":
       status();
       return;
+    case "sessions":
+      await listSessions();
+      return;
+    case "publications":
+      listPublications();
+      return;
+    case "publish":
+      await updatePublication(options, true);
+      return;
+    case "unpublish":
+      await updatePublication(options, false);
+      return;
     case "logout":
       {
         const state = loadMobileState();
@@ -264,6 +404,6 @@ export async function runMobileCommand(
       write("Hara Mobile Desktop 本地登录和配对状态已清除。\n");
       return;
     default:
-      throw new Error("mobile action must be login, pair, connect, status, or logout");
+      throw new Error("mobile action must be login, pair, connect, status, sessions, publications, publish, unpublish, or logout");
   }
 }

@@ -55,6 +55,9 @@ export type MobileCompanionState = Readonly<{
    * executing terminal input or another side effect twice. Prompts and model/session output never live here. */
   commandReceipts?: readonly MobileCommandReceipt[];
   pairedMobileDevices: readonly PairedMobileDevice[];
+  /** Desktop-owned allowlist of provider session IDs that may be projected to paired phones.
+   * Missing means no sessions are published, including for state written by older builds. */
+  publishedSessionIds?: readonly string[];
   refreshToken?: string;
   refreshTokenExpiresAt?: number;
   /** Cloud Relay delivery progress for this exact Desktop device. It is intentionally unrelated to
@@ -147,6 +150,11 @@ export function parseMobileState(value: unknown): MobileCompanionState | null {
     || root.pairedMobileDevices.length > 20
     || !root.pairedMobileDevices.every(pairedMobileDevice)
     || new Set(root.pairedMobileDevices.map((device) => (device as PairedMobileDevice).id)).size !== root.pairedMobileDevices.length
+    || (root.publishedSessionIds !== undefined
+      && (!Array.isArray(root.publishedSessionIds)
+        || root.publishedSessionIds.length > 100
+        || !root.publishedSessionIds.every(identifier)
+        || new Set(root.publishedSessionIds).size !== root.publishedSessionIds.length))
     || (root.commandReceipts !== undefined
       && (!Array.isArray(root.commandReceipts)
         || root.commandReceipts.length > 64
@@ -166,6 +174,52 @@ export function parseMobileState(value: unknown): MobileCompanionState | null {
     return null;
   }
   return value as MobileCompanionState;
+}
+
+export type MobileSessionPublications = Readonly<{
+  protocolVersion: 1;
+  sessionIds: readonly string[];
+}>;
+
+function publicationSessionId(value: unknown): string {
+  if (!identifier(value)) throw new TypeError("mobile publication session ID is invalid");
+  return value;
+}
+
+export function mobileSessionPublications(
+  path = mobileStatePath(),
+): MobileSessionPublications {
+  const state = loadMobileState(path);
+  if (!state) throw new Error("Hara Mobile Desktop is not signed in");
+  return Object.freeze({
+    protocolVersion: 1,
+    sessionIds: Object.freeze([...(state.publishedSessionIds ?? [])]),
+  });
+}
+
+export function setMobileSessionPublication(
+  sessionIdValue: unknown,
+  published: boolean,
+  path = mobileStatePath(),
+): MobileSessionPublications {
+  const sessionId = publicationSessionId(sessionIdValue);
+  const state = loadMobileState(path);
+  if (!state) throw new Error("Hara Mobile Desktop is not signed in");
+  const next = new Set(state.publishedSessionIds ?? []);
+  if (published) {
+    if (!next.has(sessionId) && next.size >= 100) {
+      throw new Error("at most 100 sessions can be published to Hara Mobile");
+    }
+    next.add(sessionId);
+  } else {
+    next.delete(sessionId);
+  }
+  const updated: MobileCompanionState = {
+    ...state,
+    publishedSessionIds: [...next],
+  };
+  saveMobileState(updated, path);
+  return mobileSessionPublications(path);
 }
 
 export function loadMobileState(path = mobileStatePath()): MobileCompanionState | null {

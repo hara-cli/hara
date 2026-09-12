@@ -393,6 +393,7 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
     state: "claimed",
   };
   const calls = [];
+  let publishedSessionIds = [];
   const server = await startServe(
     { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
     {
@@ -417,6 +418,18 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
           state: approved ? "approved" : "rejected",
         };
       },
+      mobileSessionPublications: () => ({
+        protocolVersion: 1,
+        sessionIds: publishedSessionIds,
+      }),
+      publishMobileSession: (sessionId) => ({
+        protocolVersion: 1,
+        sessionIds: publishedSessionIds = [...new Set([...publishedSessionIds, sessionId])],
+      }),
+      unpublishMobileSession: (sessionId) => ({
+        protocolVersion: 1,
+        sessionIds: publishedSessionIds = publishedSessionIds.filter(value => value !== sessionId),
+      }),
     },
   );
   const client = await connect(server.port);
@@ -427,8 +440,12 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
       "mobile.pairing.create",
       "mobile.pairing.status",
       "mobile.pairing.decide",
+      "mobile.publications.list",
+      "mobile.publications.publish",
+      "mobile.publications.unpublish",
     ]) assert.ok(initialized.result.capabilities.methods.includes(method), `${method} advertised`);
     assert.ok(initialized.result.capabilities.features.includes("mobile.pairing.qr.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("mobile.session-publications.v1"));
 
     const status = await client.call("mobile.status", {});
     assert.equal(status.result.account.displayName, "Hara User");
@@ -447,6 +464,26 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
       challengeId: "challenge-a",
     });
     assert.equal(approved.result.state, "approved");
+    assert.deepEqual(
+      (await client.call("mobile.publications.list", {})).result.sessionIds,
+      [],
+    );
+    assert.deepEqual(
+      (await client.call("mobile.publications.publish", {
+        sessionId: "ext_runtime_session-a",
+      })).result.sessionIds,
+      ["ext_runtime_session-a"],
+    );
+    assert.deepEqual(
+      (await client.call("mobile.publications.unpublish", {
+        sessionId: "ext_runtime_session-a",
+      })).result.sessionIds,
+      [],
+    );
+    assert.equal(
+      (await client.call("mobile.publications.publish", { sessionId: "bad id" })).error.code,
+      -32602,
+    );
     assert.deepEqual(calls, [
       ["inspect", "challenge-a"],
       ["decide", "challenge-a", true],
