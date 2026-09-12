@@ -155,6 +155,9 @@ export class MobileRelayBridge {
     const socket = new WebSocket(this.url, {
       followRedirects: false,
       handshakeTimeout: 8_000,
+      headers: {
+        Authorization: `Bearer ${this.state.desktop.credential}`,
+      },
       maxPayload: 400_000,
       perMessageDeflate: false,
     });
