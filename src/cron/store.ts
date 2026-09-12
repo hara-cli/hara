@@ -71,6 +71,10 @@ export interface CronDeliveryOutcome {
 }
 
 export type CronDeliverMode = "always" | "on-output" | "on-error";
+export type CronSkipCode =
+  | "delivery_configuration_required"
+  | "delivery_blocked"
+  | "delivery_dead_letter";
 
 /** Hard persistence bounds: outages must apply backpressure instead of growing jobs.json forever. */
 export const MAX_CRON_PENDING_NOTIFICATIONS = 64;
@@ -109,6 +113,11 @@ export interface CronJob {
   /** One explicit creation-minute occurrence waiting for the next OS tick. Disable/start clears it. */
   pendingDueAt?: number;
   lastRunAt?: number;
+  /** A due occurrence that was intentionally not launched. Unlike lastStatus, this never pretends that a
+   * task ran; cron occurrences remain pending so restoring the prerequisite runs them on the next tick. */
+  lastSkippedAt?: number;
+  lastSkipCode?: CronSkipCode;
+  lastSkipReason?: string;
   /** Persisted lifecycle state. `running` survives a scheduler crash so `cron list` never lies by omission. */
   lastStatus?: "ok" | "error" | "running" | "timed_out";
   /** Wall-clock start of the active run; cleared on every terminal outcome. */
@@ -596,6 +605,12 @@ function validCronJob(value: unknown): value is CronJob {
     )
     && (job.alertAfter === undefined || (Number.isInteger(job.alertAfter) && job.alertAfter >= 1 && job.alertAfter <= 1_000))
     && (job.lastRunAt === undefined || validFinite(job.lastRunAt))
+    && (job.lastSkippedAt === undefined || validFinite(job.lastSkippedAt))
+    && (
+      job.lastSkipCode === undefined
+      || ["delivery_configuration_required", "delivery_blocked", "delivery_dead_letter"].includes(job.lastSkipCode)
+    )
+    && (job.lastSkipReason === undefined || (typeof job.lastSkipReason === "string" && job.lastSkipReason.length <= 1_000))
     && (job.runningSince === undefined || validFinite(job.runningSince))
     && (job.runningPid === undefined || (Number.isInteger(job.runningPid) && job.runningPid > 0))
     && (job.runningToken === undefined || (typeof job.runningToken === "string" && job.runningToken.length > 0 && job.runningToken.length <= 128))
@@ -809,6 +824,14 @@ export function updateJob(
       // must not discard an independent alert that is already waiting for delivery.
       delete job.pendingNotifications;
       delete job.lastAlertAt;
+      delete job.lastSkippedAt;
+      delete job.lastSkipCode;
+      delete job.lastSkipReason;
+    }
+    if (scheduleChanged) {
+      delete job.lastSkippedAt;
+      delete job.lastSkipCode;
+      delete job.lastSkipReason;
     }
     return job;
   });
@@ -939,7 +962,57 @@ export function recordRunStart(
     job.runningToken = token;
     delete job.lastDurationMs;
     delete job.lastError;
+    delete job.lastSkippedAt;
+    delete job.lastSkipCode;
+    delete job.lastSkipReason;
     return token;
+  });
+}
+
+/** Record why a selected due occurrence did not launch without falsely changing the previous run outcome.
+ * Cron occurrences are converted into an explicit pending marker, so repairing the prerequisite makes the
+ * same occurrence run on the next tick instead of losing it when the matching minute ends. */
+export function recordRunSkip(
+  id: string,
+  at: number,
+  code: CronSkipCode,
+  reason: string,
+  expectedDefinitionRevision?: number,
+  selectedOccurrence?: CronSelectedOccurrence,
+): boolean {
+  return mutateJobs((jobs) => {
+    const job = jobs.find((entry) => entry.id === id);
+    if (!job || !job.enabled || job.lastStatus === "running") return false;
+    if (
+      expectedDefinitionRevision !== undefined
+      && (job.definitionRevision ?? 0) !== expectedDefinitionRevision
+    ) return false;
+    const dueAt = selectedOccurrence?.dueAt ?? at;
+    if (selectedOccurrence) {
+      if (
+        !schedulesEqual(job.schedule, selectedOccurrence.schedule)
+        || job.tz !== selectedOccurrence.tz
+        || (
+          (
+            selectedOccurrence.scheduleRevision !== undefined
+            || job.scheduleRevision !== undefined
+          )
+          && (selectedOccurrence.scheduleRevision ?? 0) !== (job.scheduleRevision ?? 0)
+        )
+      ) return false;
+    }
+    if (!isDue(job, dueAt)) return false;
+
+    job.lastSkippedAt = at;
+    job.lastSkipCode = code;
+    job.lastSkipReason = reason.replace(/\0/gu, "").replace(/\s+/gu, " ").trim().slice(0, 1_000)
+      || "scheduled run was skipped";
+    if (job.schedule.kind === "cron") {
+      job.pendingDueAt = job.pendingDueAt === undefined
+        ? dueAt
+        : Math.min(job.pendingDueAt, dueAt);
+    }
+    return true;
   });
 }
 

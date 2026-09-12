@@ -16,6 +16,7 @@ import {
   loadJobs,
   recordRun,
   recordRunStart,
+  recordRunSkip,
   recoverInterruptedRuns,
   enqueueOutcomeNotifications,
   listPendingNotifications,
@@ -28,6 +29,7 @@ import {
   logPath,
   type CronJob,
   type CronDeliveryOutcome,
+  type CronSkipCode,
 } from "./store.js";
 import { isDue } from "./schedule.js";
 import { shellCommand } from "../sandbox.js";
@@ -48,6 +50,67 @@ import { RUNTIME_TIME_ZONE_ENV } from "../runtime-time.js";
 /** Jobs that are enabled AND due at `nowMs` (pure — for the tick and for testing). */
 export function dueJobs(jobs: CronJob[], nowMs: number): CronJob[] {
   return jobs.filter((j) => j.enabled && isDue(j, nowMs));
+}
+
+export interface CronTickDecision {
+  id: string;
+  name: string;
+  action: "run" | "skip" | "not_due" | "disabled";
+  code?: CronSkipCode | "already_running";
+  reason?: string;
+}
+
+interface CronExecutionBlock {
+  code: CronSkipCode;
+  reason: string;
+}
+
+function cronExecutionBlock(job: CronJob, deliver: CronDeliver): CronExecutionBlock | null {
+  if (deliver === deliverResult && job.deliver) {
+    const configurationError = deliveryConfigurationError(job.deliver);
+    if (configurationError) {
+      return { code: "delivery_configuration_required", reason: configurationError };
+    }
+  }
+  const blocked = job.pendingNotifications?.find((notification) => (
+    notification.state === "blocked" || notification.state === "dead_letter"
+  ));
+  if (!blocked) return null;
+  return blocked.state === "dead_letter"
+    ? {
+        code: "delivery_dead_letter",
+        reason: `delivery has an unresolved dead-letter item (${blocked.failureCode ?? "unknown"})`,
+      }
+    : {
+        code: "delivery_blocked",
+        reason: `delivery has an unresolved blocked item (${blocked.failureCode ?? "unknown"})`,
+      };
+}
+
+/** Read-only scheduler explanation for `cron tick --dry-run`. It deliberately does not acquire the tick
+ * lock, recover state, drain delivery, update timestamps, or launch work. */
+export function inspectCronTick(
+  jobs: CronJob[],
+  nowMs: number,
+  deliver: CronDeliver = deliverResult,
+): CronTickDecision[] {
+  return jobs.map((job) => {
+    if (!job.enabled) return { id: job.id, name: job.name, action: "disabled" };
+    if (!isDue(job, nowMs)) return { id: job.id, name: job.name, action: "not_due" };
+    if (job.lastStatus === "running") {
+      return {
+        id: job.id,
+        name: job.name,
+        action: "skip",
+        code: "already_running",
+        reason: "job is already running",
+      };
+    }
+    const blocked = cronExecutionBlock(job, deliver);
+    return blocked
+      ? { id: job.id, name: job.name, action: "skip", ...blocked }
+      : { id: job.id, name: job.name, action: "run" };
+  });
 }
 
 /** How to invoke hara again. Under node, argv[1] is the entry to hand back to node — either `dist/index.js`
@@ -423,6 +486,8 @@ export interface CronTickOptions {
 export interface CronTickResult {
   ran: string[];
   skipped?: string;
+  /** Due jobs not launched because a durable prerequisite is unresolved. */
+  jobSkips?: Array<{ id: string; code: CronSkipCode; reason: string }>;
   /** A tick that acquired the lock but stopped early due to its watchdog/caller. */
   stopped?: string;
 }
@@ -1106,6 +1171,7 @@ export async function runTick(
       };
     }
     const ran: string[] = [];
+    const jobSkips: Array<{ id: string; code: CronSkipCode; reason: string }> = [];
     let stopped: string | undefined;
     for (const job of due) {
       if (tickSignal.aborted) {
@@ -1120,10 +1186,31 @@ export async function runTick(
       // clear only after successful retry or an explicit delivery edit.
       const current = findJob(job.id);
       if (!current) continue;
-      if (deliver === deliverResult && current.deliver && deliveryConfigurationError(current.deliver)) continue;
-      if (current.pendingNotifications?.some((notification) => (
-        notification.state === "blocked" || notification.state === "dead_letter"
-      ))) continue;
+      const executionBlock = cronExecutionBlock(current, deliver);
+      if (executionBlock) {
+        try {
+          const recorded = recordRunSkip(
+            job.id,
+            Date.now(),
+            executionBlock.code,
+            executionBlock.reason,
+            job.definitionRevision ?? 0,
+            {
+              schedule: job.schedule,
+              ...(job.tz ? { tz: job.tz } : {}),
+              dueAt: nowMs,
+              ...(job.scheduleRevision === undefined
+                ? {}
+                : { scheduleRevision: job.scheduleRevision }),
+            },
+          );
+          if (recorded) jobSkips.push({ id: job.id, ...executionBlock });
+        } catch (error) {
+          stopped = `could not persist skipped state for ${job.id}: ${safeRunFailure(error).error}`;
+          break;
+        }
+        continue;
+      }
       const startedAt = Date.now();
       let runningToken: string | null;
       try {
@@ -1181,7 +1268,11 @@ export async function runTick(
         break;
       }
     }
-    return { ran, ...(stopped ? { stopped } : {}) };
+    return {
+      ran,
+      ...(jobSkips.length ? { jobSkips } : {}),
+      ...(stopped ? { stopped } : {}),
+    };
   } finally {
     clearTimeout(tickTimer);
     // Remove only the lock instance we created; never unlink a successor after a stale-lock takeover.

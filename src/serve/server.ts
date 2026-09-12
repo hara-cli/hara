@@ -1597,6 +1597,11 @@ function automationJobForClient(
     alertAfter: job.alertAfter ?? 3,
     ...(job.lastRunAt === undefined ? {} : { lastRunAt: job.lastRunAt }),
     ...(job.lastStatus === undefined ? {} : { lastStatus: job.lastStatus }),
+    ...(job.lastSkippedAt === undefined ? {} : { lastSkippedAt: job.lastSkippedAt }),
+    ...(job.lastSkipCode === undefined ? {} : { lastSkipCode: job.lastSkipCode }),
+    ...(job.lastSkipReason === undefined
+      ? {}
+      : { lastSkipReason: redactSensitiveText(job.lastSkipReason).text }),
     ...(job.lastError === undefined
       ? {}
       : { lastError: redactSensitiveText(job.lastError).text }),
@@ -4368,6 +4373,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "sessions.runtime-journal-replay.v1",
             "sessions.pause-migrate.v1",
             "models.capabilities.v1",
+            "automations.skip-diagnostics.v1",
             "sessions.command-idempotency.v1",
             "sessions.command-idempotency.durable.v2",
             "sessions.control-lease.v1",

@@ -178,7 +178,7 @@ import {
   logPath,
   type CronJob,
 } from "./cron/store.js";
-import { runTick, runJobTracked, runSelfAttached, selfArgv } from "./cron/runner.js";
+import { inspectCronTick, runTick, runJobTracked, runSelfAttached, selfArgv } from "./cron/runner.js";
 import { installScheduler, uninstallScheduler, isInstalled } from "./cron/install.js";
 import { getTools, type Tool, type ToolContext } from "./tools/registry.js";
 import { resetReachability } from "./tools/net-reachability.js";
@@ -5403,7 +5403,10 @@ function renderCronJobs(): string {
             ? c.red(`err${elapsed}`)
             : c.dim("—");
     const delivery = j.deliver ? ` · deliver ${j.deliver} (${j.deliverMode ?? "always"})` : "";
-    return `${c.bold(j.id)} ${describeSchedule(j.schedule)} ${c.dim(`· ${j.mode}${delivery} · next ${nextLabel} · last ${status}`)}${j.enabled ? "" : c.dim(" [disabled]")}\n   ${c.dim(j.name)}`;
+    const skipped = j.lastSkippedAt === undefined
+      ? ""
+      : `\n   ${c.yellow(`last skipped ${new Date(j.lastSkippedAt).toLocaleString()}`)}${j.lastSkipReason ? c.dim(` · ${j.lastSkipReason}`) : ""}`;
+    return `${c.bold(j.id)} ${describeSchedule(j.schedule)} ${c.dim(`· ${j.mode}${delivery} · next ${nextLabel} · last ${status}`)}${j.enabled ? "" : c.dim(" [disabled]")}\n   ${c.dim(j.name)}${skipped}`;
   });
   return head + "\n" + lines.join("\n") + "\n";
 }
@@ -5549,9 +5552,34 @@ cronCmd
 cronCmd
   .command("tick")
   .description("run all due jobs now (your OS scheduler calls this every minute)")
-  .action(async () => {
+  .option("--dry-run", "explain which jobs are due or blocked without changing state or running anything")
+  .action(async (opts: { dryRun?: boolean }) => {
+    if (opts.dryRun) {
+      let decisions: ReturnType<typeof inspectCronTick>;
+      try {
+        decisions = inspectCronTick(loadJobs(), Date.now());
+      } catch (error) {
+        return void out(c.red(`${error instanceof Error ? error.message : String(error)}\n`));
+      }
+      const actionable = decisions.filter((decision) => decision.action === "run" || decision.action === "skip");
+      if (!actionable.length) out(c.dim("(dry run — no jobs due this minute)\n"));
+      for (const decision of actionable) {
+        out(decision.action === "run"
+          ? c.green(`would run ${decision.id}`) + c.dim(` · ${decision.name}\n`)
+          : c.yellow(`would skip ${decision.id}`) + c.dim(` · ${decision.name} · ${decision.reason ?? "blocked"}\n`));
+      }
+      const runnable = actionable.filter((decision) => decision.action === "run").length;
+      const blocked = actionable.length - runnable;
+      const notDue = decisions.filter((decision) => decision.action === "not_due").length;
+      const disabled = decisions.filter((decision) => decision.action === "disabled").length;
+      out(c.dim(`dry-run summary: ${runnable} runnable, ${blocked} blocked, ${notDue} not due, ${disabled} disabled\n`));
+      return;
+    }
     const r = await withCronCliSignal((signal) => runTick(Date.now(), undefined, { signal }));
     if (r.skipped) return void out(c.dim(`(skipped — ${r.skipped})\n`));
+    for (const skipped of r.jobSkips ?? []) {
+      out(c.yellow(`skipped due job ${skipped.id}`) + c.dim(` · ${skipped.reason}\n`));
+    }
     if (r.stopped) return void out(c.yellow(`(stopped — ${r.stopped}; ran ${r.ran.length} job(s): ${r.ran.join(", ") || "none"})\n`));
     out(c.dim(r.ran.length ? `ran ${r.ran.length} job(s): ${r.ran.join(", ")}\n` : "(no jobs due)\n"));
   });

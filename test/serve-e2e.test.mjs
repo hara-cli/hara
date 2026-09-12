@@ -1504,6 +1504,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "sessions.runtime-journal-replay.v1",
         "sessions.pause-migrate.v1",
         "models.capabilities.v1",
+        "automations.skip-diagnostics.v1",
         "sessions.command-idempotency.v1",
         "sessions.command-idempotency.durable.v2",
         "sessions.control-lease.v1",
@@ -1994,6 +1995,22 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     assert.ok(Number.isFinite(quietJob.nextRunAt));
     assert.doesNotMatch(JSON.stringify(autoWithQuiet.result), /SECRET_PATH|PRIVATE_QUERY|example\.invalid/);
 
+    const skippedAt = Date.now();
+    saveJobs(loadJobs().map((job) => job.id === automationId
+      ? {
+          ...job,
+          lastSkippedAt: skippedAt,
+          lastSkipCode: "delivery_configuration_required",
+          lastSkipReason: "Bearer sk-secret-value was unavailable",
+        }
+      : job));
+    const autoWithSkip = await c.call("automation.list", {});
+    const skippedJob = autoWithSkip.result.jobs.find((job) => job.id === automationId);
+    assert.equal(skippedJob.lastSkippedAt, skippedAt);
+    assert.equal(skippedJob.lastSkipCode, "delivery_configuration_required");
+    assert.match(skippedJob.lastSkipReason, /(?:REDACTED|\*{3})/);
+    assert.doesNotMatch(JSON.stringify(autoWithSkip.result), /sk-secret-value/);
+
     const updatedAutomation = await c.call("automation.update", {
       id: automationId,
       name: "quiet monitor edited",
@@ -2008,6 +2025,7 @@ test("serve e2e: auth gate → create → send streams text events and returns t
     const updatedJob = autoWithUpdate.result.jobs.find((job) => job.id === automationId);
     assert.equal(updatedJob.name, "quiet monitor edited");
     assert.equal(updatedJob.scheduleSpec, "every 10m");
+    assert.equal("lastSkippedAt" in updatedJob, false, "editing timing clears obsolete skip telemetry");
     assert.equal(updatedJob.task, "check again");
     assert.deepEqual(updatedJob.delivery, {
       kind: "webhook",

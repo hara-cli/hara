@@ -31,6 +31,7 @@ const {
   runJobTracked,
   deliverOutcome,
   deliverPendingNotifications,
+  inspectCronTick,
   runTick,
   cronJobTimeoutMs,
   cronTickTimeoutMs,
@@ -1273,21 +1274,55 @@ test("a legacy job with missing delivery configuration is blocked before its tas
   delete process.env.HARA_FEISHU_APP_ID;
   delete process.env.HARA_FEISHU_APP_SECRET;
   try {
-    const now = Date.now();
+    const now = Date.UTC(2026, 8, 7, 21, 17, 30);
     const job = addJob({
       name: "legacy missing config",
-      schedule: { kind: "every", everyMs: 60_000, display: "every 1m" },
+      schedule: { kind: "cron", expr: "17 21 * * *" },
       task: "must not execute",
       mode: "print",
       cwd: home,
+      tz: "UTC",
       deliver: "feishu:oc_test",
-      createdAt: now - 120_000,
+      createdAt: now - 60_000,
     });
+    const beforeDryRun = readFileSync(join(cronDir(), "jobs.json"), "utf8");
+    const dryRun = inspectCronTick(loadJobs(), now);
+    assert.deepEqual(dryRun.map(({ id, action, code }) => ({ id, action, code })), [{
+      id: job.id,
+      action: "skip",
+      code: "delivery_configuration_required",
+    }]);
+    assert.equal(readFileSync(join(cronDir(), "jobs.json"), "utf8"), beforeDryRun, "dry-run inspection never writes state");
+
     let runs = 0;
     const result = await runTick(now, async () => { runs += 1; return { ok: true }; });
     assert.deepEqual(result.ran, []);
+    assert.deepEqual(result.jobSkips?.map(({ id, code }) => ({ id, code })), [{
+      id: job.id,
+      code: "delivery_configuration_required",
+    }]);
     assert.equal(runs, 0);
-    assert.equal(findJob(job.id).lastRunAt, undefined);
+    const skipped = findJob(job.id);
+    assert.equal(skipped.lastRunAt, undefined);
+    assert.ok(Number.isFinite(skipped.lastSkippedAt));
+    assert.equal(skipped.lastSkipCode, "delivery_configuration_required");
+    assert.match(skipped.lastSkipReason, /Feishu delivery is not configured/);
+    assert.equal(skipped.pendingDueAt, now, "the selected cron occurrence remains pending after a blocked launch");
+
+    const recoveredAt = now + 5 * 60_000;
+    const recovered = await runTick(
+      recoveredAt,
+      async () => { runs += 1; return { ok: true, stdout: "restored", output: "restored" }; },
+      { deliver: async () => null },
+    );
+    assert.deepEqual(recovered.ran, [job.id], "the pending occurrence runs immediately after configuration recovers");
+    assert.equal(runs, 1);
+    const completed = findJob(job.id);
+    assert.equal(completed.lastStatus, "ok");
+    assert.equal(completed.pendingDueAt, undefined);
+    assert.equal(completed.lastSkippedAt, undefined);
+    assert.equal(completed.lastSkipCode, undefined);
+    assert.equal(completed.lastSkipReason, undefined);
   } finally {
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;

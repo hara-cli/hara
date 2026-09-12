@@ -141,12 +141,16 @@
 //                                                    → {learning}; approve/reject/revoke local personal/project
 //                                                    records only; organization records require Control review.
 //   automation.list   {sessionCursor?,sessionLimit?} → {jobs:[{id,name,mode,enabled,task,scheduleSpec,
-//                                                    delivery:{kind,label,mode?},nextRunAt?,nextRunDeferred?,…}],
+//                                                    delivery:{kind,label,mode?},nextRunAt?,nextRunDeferred?,
+//                                                    lastSkippedAt?,lastSkipCode?,lastSkipReason?,…}],
 //                                                    sessions:[{id,title,source,sourceName,jobId?,updatedAt,
 //                                                               status?,startedAt?,finishedAt?,durationMs?,error?}],
 //                                                    sessionPage:{hasMore,limit,nextCursor?},
 //                                                    scheduler:{installed,supported,platform,detail}}
 //                                                    Raw delivery targets are write-only and never returned.
+//                                                    Feature automations.skip-diagnostics.v1 means a due run
+//                                                    blocked before launch remains pending and exposes a
+//                                                    redacted skip reason without overwriting its last outcome.
 //   models.list       {sessionId?}                → {models:[…],current,currentAvailable?,recommendedModel?,
 //                                                    entries:[{id,providerId,available?,effortLevels,
 //                                                    attachmentCapabilities}],current,profileId?,

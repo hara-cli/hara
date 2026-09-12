@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.174.1 — 2026-09-13 — visible and recoverable automation delivery blocks
+
+- Record every due automation that cannot launch because its configured delivery credential, blocked item or
+  dead-letter prerequisite is unresolved. `hara cron list` and Desktop's redacted Serve response now expose the
+  skip time, stable reason code and safe explanation without pretending the task ran or overwriting its last result.
+- Preserve a blocked cron occurrence as an explicit pending run. Once the delivery prerequisite is repaired, the
+  next scheduler tick executes that occurrence instead of silently losing it when the scheduled minute passes.
+- Add `hara cron tick --dry-run` to explain runnable and blocked jobs without taking the scheduler lock, mutating
+  state, retrying delivery or launching work. Normal scheduler logs now also name every due job held before launch.
+
 ## 0.174.0 — 2026-09-12 — secure Desktop-to-Mobile QR pairing
 
 - Add an authenticated Serve control plane for Mobile readiness, invitation creation, claim inspection and
