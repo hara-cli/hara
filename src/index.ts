@@ -4503,7 +4503,9 @@ program
     const approval = (APPROVAL_MODES as readonly string[]).includes(o.approval) ? (o.approval as ApprovalMode) : "auto-edit";
     const { startServe } = await import("./serve/server.js");
     const { GatewayLoginManager } = await import("./gateway/login.js");
+    const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
     const gatewayLogins = new GatewayLoginManager();
+    const mobilePairing = new MobilePairingCoordinator();
     const structuredBrowserStatus = () => {
       const installed = listInstalled().find((plugin) => plugin.name === "browser");
       const enabled = installed
@@ -4815,6 +4817,10 @@ program
         gatewayLoginStatus: (platform, id) => gatewayLogins.status(platform, id),
         cancelGatewayLogin: (platform, id) => gatewayLogins.cancel(platform, id),
         closeGatewayLogins: () => gatewayLogins.close(),
+        mobileCompanionStatus: () => mobilePairing.status(),
+        createMobilePairing: () => mobilePairing.create(),
+        inspectMobilePairing: (challengeId) => mobilePairing.inspect(challengeId),
+        decideMobilePairing: (challengeId, approved) => mobilePairing.decide(challengeId, approved),
         organizationConnections: (targetCwd) => organizationConnectionsSnapshot(targetCwd ?? cwd),
         spaces: (targetCwd) => spaceDirectorySnapshot(targetCwd ?? cwd),
         useSpace: (spaceId, targetCwd) => useSpaceConnection(spaceId, targetCwd ?? cwd),

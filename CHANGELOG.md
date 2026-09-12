@@ -5,6 +5,21 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.174.0 — 2026-09-12 — secure Desktop-to-Mobile QR pairing
+
+- Add an authenticated Serve control plane for Mobile readiness, invitation creation, claim inspection and
+  explicit allow/reject decisions. Renderer responses expose only the account display state, short-lived
+  invitation, phone label/platform and public-key thumbprint; account tokens, device credentials, full public
+  keys and private keys remain in Core-owned storage.
+- Generate a fixed `hara://pair` v1 payload containing only region, expiry and the two-minute one-time code, so
+  Desktop can render a QR locally while the CLI retains a manual-code fallback. Pairing is feature-negotiated
+  and never implies that Session Relay or terminal control is available.
+- Pin the complete claimed phone identity when Desktop presents it for review, re-read it immediately before
+  approval and reject expiry or any label/platform/key substitution. Successful decisions merge into the latest
+  account state instead of overwriting a concurrent credential refresh.
+- Reuse the same pairing coordinator from `hara mobile pair` and `hara mobile connect`, including account-session
+  and Desktop-credential renewal plus idempotent handling of an already consumed approval.
+
 ## 0.173.0 — 2026-09-11 — organization Desk workbench and durable Agent coordination
 
 - Let one company enrollment install a separately scoped Desk identity beside its managed model route. Hara

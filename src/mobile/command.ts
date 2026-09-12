@@ -2,6 +2,7 @@ import { createInterface } from "node:readline/promises";
 
 import { MobileAccountClient } from "./account-client.js";
 import { LocalServeClient } from "./local-serve-client.js";
+import { MobilePairingCoordinator } from "./pairing.js";
 import { MobileRelayBridge } from "./relay-bridge.js";
 import { MobileCompanionRouter } from "./router.js";
 import { generateDeviceKey } from "./security.js";
@@ -106,115 +107,49 @@ async function login(options: MobileCommandOptions): Promise<void> {
 }
 
 async function pair(options: MobileCommandOptions): Promise<void> {
-  const stored = loadMobileState();
-  if (!stored) {
+  if (!loadMobileState()) {
     throw new Error("请先运行 `hara mobile login`，再开始配对");
   }
-  const state = await refreshedState(stored);
-  const account = new MobileAccountClient(ACCOUNT_ORIGIN);
-  const created = await account.createChallenge(state.accessToken, state.desktop.id);
-  write("\n在 Hara Mobile 的配对页输入下面的一次性配对码：\n\n");
+  const pairing = new MobilePairingCoordinator();
+  const created = await pairing.create();
+  write("\n在 Hara Mobile 扫描 Desktop 显示的二维码，或手动输入一次性配对码：\n\n");
   write(`  ${created.pairingCode}\n\n`);
+  write(`  ${created.qrPayload}\n\n`);
   write("正在等待手机申请配对…\n");
-  let challenge = created.challenge;
+  let challenge = await pairing.inspect(created.challengeId);
   while (challenge.state === "pending" && challenge.expiresAt > Date.now()) {
     await pause(1_000);
-    challenge = await account.inspectChallenge(state.accessToken, challenge.id, state.desktop.id);
+    challenge = await pairing.inspect(created.challengeId);
   }
   if (
     challenge.state !== "claimed"
-    || !challenge.mobileLabel
-    || !challenge.mobilePlatform
-    || !challenge.mobilePublicKeySpki
-    || !challenge.mobilePublicKeyThumbprint
+    || !challenge.mobile
   ) {
     throw new Error("配对请求已失效，请重新运行 `hara mobile pair`");
   }
   const approved = await confirm(
-    `允许 ${challenge.mobileLabel} (${challenge.mobilePlatform}) 访问当前明确发布的会话和终端`,
+    `允许 ${challenge.mobile.label} (${challenge.mobile.platform}) 访问当前明确发布的会话和终端`,
     options.yes === true,
   );
-  const decided = await account.decideChallenge(
-    state.accessToken,
-    challenge.id,
-    state.desktop.id,
-    approved,
-  );
-  if (!approved || decided.state !== "approved" || !decided.pairedDeviceId) {
+  const decided = await pairing.decide(created.challengeId, approved);
+  if (
+    !approved
+    || (decided.state !== "approved" && decided.state !== "consumed")
+    || !decided.pairedDeviceId
+  ) {
     write("已拒绝这次配对。\n");
     return;
   }
-  if (
-    decided.mobilePublicKeySpki !== challenge.mobilePublicKeySpki
-    || decided.mobilePublicKeyThumbprint !== challenge.mobilePublicKeyThumbprint
-  ) {
-    throw new Error("配对期间手机设备身份发生变化，请重新配对");
-  }
-  const pairedMobileDevices = [
-    ...state.pairedMobileDevices.filter((device) => device.id !== decided.pairedDeviceId),
-    {
-      id: decided.pairedDeviceId,
-      publicKeySpki: decided.mobilePublicKeySpki,
-      publicKeyThumbprint: decided.mobilePublicKeyThumbprint,
-    },
-  ].slice(-20);
-  saveMobileState({ ...state, pairedMobileDevices });
   write("配对已批准。手机完成确认后，可运行 `hara mobile connect`。\n");
-}
-
-async function refreshedState(state: MobileCompanionState): Promise<MobileCompanionState> {
-  const account = new MobileAccountClient(ACCOUNT_ORIGIN);
-  let current = state;
-  if (current.accessTokenExpiresAt <= Date.now() + 60_000) {
-    if (
-      !current.refreshToken
-      || !current.refreshTokenExpiresAt
-      || current.refreshTokenExpiresAt <= Date.now() + 60_000
-    ) {
-      throw new Error("Hara 账号会话已过期，请重新运行 `hara mobile login`");
-    }
-    const refreshed = await account.refresh(current.refreshToken);
-    if (
-      refreshed.account.id !== current.account.id
-      || refreshed.account.region !== current.account.region
-    ) {
-      throw new Error("Hara 账号会话身份发生变化，请重新登录");
-    }
-    const observedAt = Date.now();
-    current = {
-      ...current,
-      accessToken: refreshed.accessToken,
-      accessTokenExpiresAt: observedAt + refreshed.expiresInSeconds * 1_000,
-      account: refreshed.account,
-      refreshToken: refreshed.refreshToken,
-      refreshTokenExpiresAt: observedAt + refreshed.refreshExpiresInSeconds * 1_000,
-    };
-    saveMobileState(current);
-  }
-  if (current.desktop.credentialExpiresAt > Date.now() + 60_000) return current;
-  const desktop = await account.renewDesktop(
-    current.accessToken,
-    current.desktop.id,
-  );
-  const next: MobileCompanionState = {
-    ...current,
-    desktop: {
-      ...current.desktop,
-      credential: desktop.credential,
-      credentialExpiresAt: Date.now() + desktop.expiresInSeconds * 1_000,
-      id: desktop.deviceId,
-    },
-  };
-  saveMobileState(next);
-  return next;
 }
 
 async function connect(): Promise<void> {
   const stored = loadMobileState();
   if (!stored) throw new Error("请先运行 `hara mobile login`");
   if (stored.pairedMobileDevices.length === 0) throw new Error("请先运行 `hara mobile pair`");
+  const pairing = new MobilePairingCoordinator();
   const local = await LocalServeClient.connect();
-  let currentState = stored;
+  let currentState = await pairing.currentState();
   let activeBridge: MobileRelayBridge | null = null;
   let stopping = false;
   let stopped = false;
@@ -232,7 +167,7 @@ async function connect(): Promise<void> {
   try {
     let announced = false;
     while (!stopping) {
-      currentState = await refreshedState(currentState);
+      currentState = await pairing.currentState();
       const router = new MobileCompanionRouter(
         local,
         currentState.desktop.id,

@@ -171,6 +171,13 @@
 //   settings.gateways.login.status {platform:"weixin",id?} → {login:{id,phase,qrPayload?,…}}
 //   settings.gateways.login.cancel {platform:"weixin",id} → {login:{id,phase:"cancelled",…}}
 //                                                    QR data stays on authenticated loopback; tokens never return
+//   mobile.status      {}                          → redacted Desktop account/device readiness
+//   mobile.pairing.create {}                       → {protocolVersion:1,challengeId,pairingCode,
+//                                                     qrPayload,expiresAt,accountRegion,state}
+//   mobile.pairing.status {challengeId}            → claimed phone label/platform/key thumbprint + state
+//   mobile.pairing.decide {challengeId,approved}   → final state after explicit Desktop confirmation
+//                                                    QR contains only a short-lived one-time invitation;
+//                                                    account tokens, credentials, and private keys stay in Core.
 //   settings.organizations.list {cwd?}              → {activeId,activeSource,switchLocked,
 //                                                    connections:[{id,label,model,availableModels?,accessState,…}]}
 //   settings.organizations.enroll {id,label?,gatewayUrl,code,activate?,cwd?}

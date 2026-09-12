@@ -62,6 +62,11 @@ import type {
 import type { GatewayStatus } from "../gateway/serve.js";
 import type { FeishuGatewayCredentialsInput } from "../gateway/credentials.js";
 import type { GatewayLoginSnapshot } from "../gateway/login.js";
+import type {
+  MobileCompanionStatus,
+  MobilePairingInvitation,
+  MobilePairingSnapshot,
+} from "../mobile/pairing.js";
 import type { UiSink } from "../tools/registry.js";
 import { APPROVAL_MODES, type ApprovalMode } from "../config.js";
 import type { ComputerSettingsInput, ComputerSettingsState } from "../computer-settings.js";
@@ -366,6 +371,12 @@ export interface ServeDeps {
   gatewayLoginStatus?: (platform: string, id?: string) => GatewayLoginSnapshot | undefined;
   cancelGatewayLogin?: (platform: string, id: string) => GatewayLoginSnapshot | undefined;
   closeGatewayLogins?: () => Promise<void>;
+  /** Hara Account + Mobile pairing. Only redacted account state and a short-lived one-time invitation
+   * cross authenticated loopback. Account tokens, device credentials, and private keys remain in Core. */
+  mobileCompanionStatus?: () => MobileCompanionStatus;
+  createMobilePairing?: () => Promise<MobilePairingInvitation>;
+  inspectMobilePairing?: (challengeId: string) => Promise<MobilePairingSnapshot>;
+  decideMobilePairing?: (challengeId: string, approved: boolean) => Promise<MobilePairingSnapshot>;
   /** Redacted organization/profile control plane. One-time codes are accepted only by enroll and are
    * never returned. Device tokens remain inside the CLI's private profile store. */
   organizationConnections?: (cwd?: string) => OrganizationConnectionsState;
@@ -4328,6 +4339,19 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             );
           }
           if (deps.unpinProjectProfile) methods.push("settings.profiles.unpin");
+          const mobilePairing =
+            !!deps.mobileCompanionStatus
+            && !!deps.createMobilePairing
+            && !!deps.inspectMobilePairing
+            && !!deps.decideMobilePairing;
+          if (mobilePairing) {
+            methods.push(
+              "mobile.status",
+              "mobile.pairing.create",
+              "mobile.pairing.status",
+              "mobile.pairing.decide",
+            );
+          }
           if (deps.computerSettings && deps.saveComputerSettings) {
             methods.push("settings.computer.get", "settings.computer.save");
           }
@@ -4380,6 +4404,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           if (deps.organizationLearningSubmit && deps.organizationLearningSync) {
             features.push("learning.organization-review.v1");
           }
+          if (mobilePairing) features.push("mobile.pairing.qr.v1");
           const runtime = runtimeInfo();
           const setupState = deps.providerSettings
             ? (deps.providerSettings(opts.cwd).current.authenticated ? "ready" : "needs-credentials")
@@ -4423,6 +4448,39 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
         if (!authed.has(ws)) return reply(rpcError(id, ERR.UNAUTHORIZED, "initialize first"));
 
         switch (req.method) {
+          case "mobile.status": {
+            if (!deps.mobileCompanionStatus) {
+              return reply(rpcError(id, ERR.METHOD, "mobile pairing is not supported by this server"));
+            }
+            return reply(rpcResult(id!, deps.mobileCompanionStatus()));
+          }
+          case "mobile.pairing.create": {
+            if (!deps.createMobilePairing) {
+              return reply(rpcError(id, ERR.METHOD, "mobile pairing is not supported by this server"));
+            }
+            return reply(rpcResult(id!, await deps.createMobilePairing()));
+          }
+          case "mobile.pairing.status": {
+            if (!deps.inspectMobilePairing) {
+              return reply(rpcError(id, ERR.METHOD, "mobile pairing is not supported by this server"));
+            }
+            if (typeof p.challengeId !== "string") {
+              return reply(rpcError(id, ERR.PARAMS, "challengeId required"));
+            }
+            return reply(rpcResult(id!, await deps.inspectMobilePairing(p.challengeId)));
+          }
+          case "mobile.pairing.decide": {
+            if (!deps.decideMobilePairing) {
+              return reply(rpcError(id, ERR.METHOD, "mobile pairing is not supported by this server"));
+            }
+            if (typeof p.challengeId !== "string" || typeof p.approved !== "boolean") {
+              return reply(rpcError(id, ERR.PARAMS, "challengeId and approved decision required"));
+            }
+            return reply(rpcResult(
+              id!,
+              await deps.decideMobilePairing(p.challengeId, p.approved),
+            ));
+          }
           case "events.snapshot": {
             if (!Array.isArray(p.sessionIds) || p.sessionIds.length > 100) {
               return reply(rpcError(id, ERR.PARAMS, "sessionIds must be an array of at most 100 session IDs"));

@@ -370,6 +370,94 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
   quietDiscovery: true,
 });
 
+test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane", { timeout: 10000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hara-serve-mobile-pairing-"));
+  const invitation = {
+    accountRegion: "cn",
+    challengeId: "challenge-a",
+    expiresAt: Date.now() + 120_000,
+    pairingCode: "HARA_abcdefghijklmnopqrstuvwxyz",
+    protocolVersion: 1,
+    qrPayload: `hara://pair?v=1&region=cn&code=HARA_abcdefghijklmnopqrstuvwxyz&expires=${Math.floor((Date.now() + 120_000) / 1_000)}`,
+    state: "pending",
+  };
+  const claimed = {
+    challengeId: "challenge-a",
+    expiresAt: invitation.expiresAt,
+    mobile: {
+      label: "Test iPhone",
+      platform: "ios",
+      publicKeyThumbprint: "a".repeat(64),
+    },
+    pairedDeviceId: null,
+    state: "claimed",
+  };
+  const calls = [];
+  const server = await startServe(
+    { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
+    {
+      ...baseDeps(textProvider, memStore()),
+      mobileCompanionStatus: () => ({
+        account: { displayName: "Hara User", region: "cn" },
+        accountSession: "active",
+        desktopCredential: "active",
+        pairedMobileDevices: 0,
+        signedIn: true,
+      }),
+      createMobilePairing: async () => invitation,
+      inspectMobilePairing: async (challengeId) => {
+        calls.push(["inspect", challengeId]);
+        return claimed;
+      },
+      decideMobilePairing: async (challengeId, approved) => {
+        calls.push(["decide", challengeId, approved]);
+        return {
+          ...claimed,
+          pairedDeviceId: approved ? "mobile-a" : null,
+          state: approved ? "approved" : "rejected",
+        };
+      },
+    },
+  );
+  const client = await connect(server.port);
+  try {
+    const initialized = await client.call("initialize", { token: "tok" });
+    for (const method of [
+      "mobile.status",
+      "mobile.pairing.create",
+      "mobile.pairing.status",
+      "mobile.pairing.decide",
+    ]) assert.ok(initialized.result.capabilities.methods.includes(method), `${method} advertised`);
+    assert.ok(initialized.result.capabilities.features.includes("mobile.pairing.qr.v1"));
+
+    const status = await client.call("mobile.status", {});
+    assert.equal(status.result.account.displayName, "Hara User");
+    assert.equal(Object.hasOwn(status.result, "accessToken"), false);
+    assert.deepEqual((await client.call("mobile.pairing.create", {})).result, invitation);
+    assert.deepEqual(
+      (await client.call("mobile.pairing.status", { challengeId: "challenge-a" })).result,
+      claimed,
+    );
+    assert.equal(
+      (await client.call("mobile.pairing.status", { challengeId: 7 })).error.code,
+      -32602,
+    );
+    const approved = await client.call("mobile.pairing.decide", {
+      approved: true,
+      challengeId: "challenge-a",
+    });
+    assert.equal(approved.result.state, "approved");
+    assert.deepEqual(calls, [
+      ["inspect", "challenge-a"],
+      ["decide", "challenge-a", true],
+    ]);
+  } finally {
+    client.close();
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("serve e2e: Desktop negotiates and edits core Computer Use policy", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-computer-settings-"));
   let saved;
