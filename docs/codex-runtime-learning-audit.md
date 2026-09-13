@@ -71,9 +71,11 @@ estimate, assign stable window identity, and install replacement history as a co
 5. writes content-free start/install/failure transitions for CLI and Serve and treats the paired projection
    commit as authoritative evidence when a crash loses the explicit installed item.
 
-The deterministic reducer now handles the commit-to-terminal crash window. Remaining hardening is real
-process-level fault injection before the request, after the response, and between transcript rename and
-secondary journal/index writes, plus one reminder/fallback policy per window.
+The deterministic reducer now handles the commit-to-terminal crash window. A spawned-process regression also
+blocks the journal boundary, kills Hara with `SIGKILL` after the replacement transcript and matching metadata
+generation are durable, then proves restart recovery and exactly-once journal reconciliation without replaying
+the provider. Remaining hardening is process-level fault injection immediately before the provider request and
+after its response, plus one reminder/fallback policy per window.
 
 ### 2.3 Durable Agent tree, mailbox, and cold resume
 
@@ -267,7 +269,8 @@ a reverse check, and permanent session removal/rewind cleans up the Hara-owned w
 1. **Completed foundation — retry core**: central classification/backoff/cancellation with deterministic tests.
 2. **Completed foundation — compaction transaction**: stable window IDs, observed/estimated accounting,
    save-before-install semantics, typed terminal outcomes, and commit-backed crash-window recovery exist;
-   real process-crash fault injection remains.
+   the transcript-to-journal boundary now has a real `SIGKILL` recovery test, while provider-boundary crash
+   injection remains.
 3. **Completed safe execution trace — event journal**: projection commits, torn-tail handling,
    sequence/generation gap detection, typed task/provider/message/tool/diff/Agent/mailbox/steering/control,
    compaction and approval lifecycles, deterministic reduction, and bounded Serve paging are implemented. The

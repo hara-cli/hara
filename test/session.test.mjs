@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, rmSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, statSync, readdirSync, truncateSync, utimesSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync, readFileSync, mkdirSync, mkdtempSync, renameSync, statSync, readdirSync, truncateSync, utimesSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
@@ -2323,6 +2323,155 @@ test("session save: concurrent readers observe only complete old/new JSON and no
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
     else process.env.HOME = previousHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("session save recovers after SIGKILL between transcript commit and journal append", { skip: process.platform === "win32" }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "hara-sess-crash-after-rename-"));
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  const id = "crash-after-transcript-commit";
+  const project = join(home, "project");
+  const sessions = join(home, ".hara", "sessions");
+  const journal = join(sessions, `${id}.journal`);
+  const journalBeforeCrash = `${journal}.before-crash`;
+  const attemptId = "77777777-7777-4777-8777-777777777777";
+  const windowId = "88888888-8888-4888-8888-888888888888";
+  const oldPrivateContent = "source transcript before process loss";
+  const compactedPrivateContent = "replacement checkpoint committed before process loss";
+  let saveChild;
+  try {
+    mkdirSync(project, { recursive: true });
+    const createdAt = "2026-09-13T09:00:00.000Z";
+    const meta = {
+      id,
+      cwd: project,
+      provider: "fixture",
+      model: "fixture-model",
+      title: "process crash compaction",
+      createdAt,
+      updatedAt: createdAt,
+    };
+    saveSession(meta, [
+      { role: "user", content: oldPrivateContent },
+      { role: "assistant", text: "source response before process loss", toolUses: [] },
+    ]);
+    assert.equal(recordSessionCompactionState({
+      sessionId: id,
+      attemptId,
+      windowId,
+      sourceMessages: 2,
+      state: "started",
+      at: "2026-09-13T09:00:01.000Z",
+    }), true);
+
+    // Keep the already-durable history, then replace the live journal path with a FIFO. The child reaches
+    // the FIFO only after the transcript rename and metadata sidecar write, so SIGKILL exercises the real
+    // process-loss boundary without a production-only fault-injection environment variable or code path.
+    renameSync(journal, journalBeforeCrash);
+    const fifo = spawnSync("mkfifo", [journal], { encoding: "utf8" });
+    assert.equal(fifo.status, 0, fifo.stderr);
+
+    const candidateMeta = {
+      ...meta,
+      compaction: {
+        windowId,
+        attemptId,
+        installedAt: "2026-09-13T09:00:02.000Z",
+        sourceMessages: 2,
+        replacementMessages: 1,
+        sourceInputTokens: 321,
+        inputAccounting: "estimated",
+      },
+    };
+    const modulePath = join(process.cwd(), "dist", "session", "store.js");
+    const childSource = `
+      const { pathToFileURL } = await import("node:url");
+      const { saveSession } = await import(pathToFileURL(process.argv[1]).href);
+      const meta = JSON.parse(Buffer.from(process.argv[2], "base64url").toString("utf8"));
+      const content = Buffer.from(process.argv[3], "base64url").toString("utf8");
+      process.stdout.write("saving\\n");
+      saveSession(meta, [{ role: "user", content }]);
+      process.stdout.write("saved\\n");
+    `;
+    saveChild = spawn(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      childSource,
+      modulePath,
+      Buffer.from(JSON.stringify(candidateMeta)).toString("base64url"),
+      Buffer.from(compactedPrivateContent).toString("base64url"),
+    ], {
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    saveChild.stdout.setEncoding("utf8");
+    saveChild.stderr.setEncoding("utf8");
+    saveChild.stdout.on("data", (chunk) => { stdout += chunk; });
+    saveChild.stderr.on("data", (chunk) => { stderr += chunk; });
+    const exited = once(saveChild, "exit");
+    const deadline = Date.now() + 5_000;
+    let committed = false;
+    while (Date.now() < deadline) {
+      try {
+        const transcript = JSON.parse(readFileSync(join(sessions, `${id}.json`), "utf8"));
+        const metadata = JSON.parse(readFileSync(join(sessions, `${id}.metadata`), "utf8"));
+        committed = transcript.meta?.compaction?.attemptId === attemptId
+          && transcript.history?.[0]?.content === compactedPrivateContent
+          && metadata.generation === transcript.storageGeneration;
+      } catch {
+        committed = false;
+      }
+      if (committed) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(committed, true, `child never committed the replacement transcript: ${stderr}`);
+    assert.equal(stdout.includes("saved\n"), false, "the FIFO must hold the child before journal commit");
+    saveChild.kill("SIGKILL");
+    const [exitCode, signal] = await exited;
+    assert.equal(exitCode, null);
+    assert.equal(signal, "SIGKILL");
+
+    rmSync(journal, { force: true });
+    renameSync(journalBeforeCrash, journal);
+    const recovered = loadSession(id);
+    assert.equal(recovered?.meta.compaction?.attemptId, attemptId);
+    assert.equal(recovered?.history[0]?.content, compactedPrivateContent);
+    assert.equal(recovered?.history.some((message) => message.role === "user" && message.content === oldPrivateContent), false);
+    assert.deepEqual(readdirSync(sessions).filter((name) => name.includes(".tmp")), []);
+
+    // A normal post-restart checkpoint links the authoritative generation back into the content-free
+    // journal. The reducer can then close the interrupted attempt exactly once without provider replay.
+    saveSession(recovered.meta, recovered.history, recovered.task);
+    const replay = replaySessionJournal(readSessionJournal(id).events);
+    assert.deepEqual({
+      attemptId: replay.latestCompaction?.attemptId,
+      state: replay.latestCompaction?.state,
+      inferredInstalled: replay.latestCompaction?.inferredInstalled,
+    }, {
+      attemptId,
+      state: "installed",
+      inferredInstalled: true,
+    });
+    assert.equal(replay.compactionIssues.length, 0);
+  } finally {
+    if (saveChild && saveChild.exitCode === null && saveChild.signalCode === null) {
+      saveChild.kill("SIGKILL");
+      await once(saveChild, "exit");
+    }
+    try { rmSync(journal, { force: true }); } catch {}
+    try {
+      if (existsSync(journalBeforeCrash)) renameSync(journalBeforeCrash, journal);
+    } catch {}
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
     rmSync(home, { recursive: true, force: true });
   }
 });
