@@ -7,6 +7,9 @@ All notable changes to `@nanhara/hara`.
 
 ## 0.176.0 — 2026-09-13 — phone-approved Desktop sign-in
 
+- Host the durable Agent tree in attached interactive CLI sessions as well as Serve/Desktop. Stable child
+  identities, bounded mailboxes, isolated-worktree Diffs, lifecycle journals, and cold restore now survive an
+  interactive session restart; shutdown drains or records remaining child work before releasing the session.
 - Let an unsigned Desktop create a five-minute QR invitation that an already signed-in Hara Mobile app can
   preview and approve. The Desktop then joins that same regional Hara account and pins the approving phone's
   verified P-256 device identity without asking the user to sign in twice.
