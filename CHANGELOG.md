@@ -5,6 +5,17 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.176.0 — 2026-09-13 — phone-approved Desktop sign-in
+
+- Let an unsigned Desktop create a five-minute QR invitation that an already signed-in Hara Mobile app can
+  preview and approve. The Desktop then joins that same regional Hara account and pins the approving phone's
+  verified P-256 device identity without asking the user to sign in twice.
+- Keep the Desktop-only poll secret, account tokens, device credentials, full public keys, private keys, local
+  paths, and Session data inside Core. Desktop's renderer receives only the one-time QR payload and redacted
+  authorization state.
+- Start the new phone/Desktop relationship with zero published Sessions. Conversation, approval, and terminal
+  access still require explicit per-Session grants and the existing short terminal-control lease.
+
 ## 0.175.1 — 2026-09-13 — least-privilege Mobile Session grants
 
 - Make every newly published Mobile Session read-only by default. Message submission/interruption, approval
