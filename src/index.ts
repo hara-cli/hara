@@ -4510,6 +4510,7 @@ program
     const approval = (APPROVAL_MODES as readonly string[]).includes(o.approval) ? (o.approval as ApprovalMode) : "auto-edit";
     const { startServe } = await import("./serve/server.js");
     const { GatewayLoginManager } = await import("./gateway/login.js");
+    const { MobileDesktopAuthorizationCoordinator } = await import("./mobile/desktop-authorization.js");
     const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
     const {
       configureMobileSessionPublication,
@@ -4517,6 +4518,7 @@ program
       setMobileSessionPublication,
     } = await import("./mobile/state.js");
     const gatewayLogins = new GatewayLoginManager();
+    const mobileDesktopAuthorization = new MobileDesktopAuthorizationCoordinator();
     const mobilePairing = new MobilePairingCoordinator();
     const structuredBrowserStatus = () => {
       const installed = listInstalled().find((plugin) => plugin.name === "browser");
@@ -4830,6 +4832,8 @@ program
         cancelGatewayLogin: (platform, id) => gatewayLogins.cancel(platform, id),
         closeGatewayLogins: () => gatewayLogins.close(),
         mobileCompanionStatus: () => mobilePairing.status(),
+        createMobileDesktopAuthorization: () => mobileDesktopAuthorization.create(),
+        mobileDesktopAuthorizationStatus: () => mobileDesktopAuthorization.status(),
         createMobilePairing: () => mobilePairing.create(),
         inspectMobilePairing: (challengeId) => mobilePairing.inspect(challengeId),
         decideMobilePairing: (challengeId, approved) => mobilePairing.decide(challengeId, approved),
@@ -5149,7 +5153,7 @@ program
 
 program
   .command("mobile [action]")
-  .description("pair Hara Mobile with this Desktop and bridge explicitly published local sessions")
+  .description("authorize or pair Hara Mobile with this Desktop and bridge explicitly published local sessions")
   .option("--phone <number>", "Hara phone number for Desktop sign-in")
   .option("--email <address>", "Hara email address for Desktop sign-in")
   .option("--code <digits>", "short-lived Hara verification code")

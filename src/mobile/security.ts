@@ -88,6 +88,13 @@ export function publicKeyThumbprint(publicKeySpki: string): string {
   return createHash("sha256").update(publicKeySpki, "utf8").digest("hex");
 }
 
+export function sha256Text(value: string): string {
+  if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > 65_536) {
+    throw new TypeError("hash input must be bounded text");
+  }
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
 export function signPayload(privateKeyPem: string, payload: string): string {
   if (!payload || Buffer.byteLength(payload, "utf8") > 65_536) {
     throw new TypeError("payload must be bounded");
@@ -114,6 +121,54 @@ export function registrationProofPayload(input: Readonly<{
     "hara-device-registration-v1",
     input.accountRegion,
     identifier(input.accountId, "accountId"),
+    publicKeyThumbprint(input.publicKeySpki),
+  ].join("\n");
+}
+
+export function desktopAuthorizationCreateProofPayload(input: Readonly<{
+  accountRegion: "cn" | "global";
+  desktopLabel: string;
+  desktopPlatform: "macos" | "windows" | "linux";
+  pollSecret: string;
+  publicKeySpki: string;
+}>): string {
+  const label = input.desktopLabel.trim();
+  if (
+    label.length < 1
+    || label.length > 120
+    || /[\u0000-\u001f\u007f]/u.test(label)
+  ) throw new TypeError("desktop label must contain 1 to 120 display characters");
+  if (!new Set(["macos", "windows", "linux"]).has(input.desktopPlatform)) {
+    throw new TypeError("desktop platform is invalid");
+  }
+  if (!/^HARA_DAP_[A-Za-z0-9_-]{32,151}$/u.test(input.pollSecret)) {
+    throw new TypeError("Desktop authorization poll secret is invalid");
+  }
+  return [
+    "hara-desktop-authorization-create-v1",
+    input.accountRegion,
+    input.desktopPlatform,
+    sha256Text(label),
+    sha256Text(input.pollSecret),
+    publicKeyThumbprint(input.publicKeySpki),
+  ].join("\n");
+}
+
+export function desktopAuthorizationSecretProofPayload(input: Readonly<{
+  accountRegion: "cn" | "global";
+  action: "exchange" | "status";
+  challengeId: string;
+  pollSecret: string;
+  publicKeySpki: string;
+}>): string {
+  if (!/^HARA_DAP_[A-Za-z0-9_-]{32,151}$/u.test(input.pollSecret)) {
+    throw new TypeError("Desktop authorization poll secret is invalid");
+  }
+  return [
+    `hara-desktop-authorization-${input.action}-v1`,
+    input.accountRegion,
+    identifier(input.challengeId, "challengeId"),
+    sha256Text(input.pollSecret),
     publicKeyThumbprint(input.publicKeySpki),
   ].join("\n");
 }

@@ -67,6 +67,10 @@ import type {
   MobilePairingInvitation,
   MobilePairingSnapshot,
 } from "../mobile/pairing.js";
+import type {
+  DesktopAuthorizationInvitation,
+  DesktopAuthorizationSnapshot,
+} from "../mobile/desktop-authorization.js";
 import {
   normalizeMobilePublicationCapabilities,
   type MobilePublicationCapabilities,
@@ -379,6 +383,8 @@ export interface ServeDeps {
   /** Hara Account + Mobile pairing. Only redacted account state and a short-lived one-time invitation
    * cross authenticated loopback. Account tokens, device credentials, and private keys remain in Core. */
   mobileCompanionStatus?: () => MobileCompanionStatus;
+  createMobileDesktopAuthorization?: () => Promise<DesktopAuthorizationInvitation>;
+  mobileDesktopAuthorizationStatus?: () => Promise<DesktopAuthorizationSnapshot>;
   createMobilePairing?: () => Promise<MobilePairingInvitation>;
   inspectMobilePairing?: (challengeId: string) => Promise<MobilePairingSnapshot>;
   decideMobilePairing?: (challengeId: string, approved: boolean) => Promise<MobilePairingSnapshot>;
@@ -4371,6 +4377,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               "mobile.pairing.decide",
             );
           }
+          const mobileDesktopAuthorization =
+            !!deps.createMobileDesktopAuthorization
+            && !!deps.mobileDesktopAuthorizationStatus;
+          if (mobileDesktopAuthorization) {
+            methods.push(
+              "mobile.authorization.create",
+              "mobile.authorization.status",
+            );
+          }
           const mobilePublications =
             !!deps.mobileSessionPublications
             && !!deps.publishMobileSession
@@ -4436,6 +4451,9 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             features.push("learning.organization-review.v1");
           }
           if (mobilePairing) features.push("mobile.pairing.qr.v1");
+          if (mobileDesktopAuthorization) {
+            features.push("mobile.desktop-authorization.qr.v1");
+          }
           if (mobilePublications) {
             features.push(
               "mobile.session-publications.v1",
@@ -4490,6 +4508,24 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
               return reply(rpcError(id, ERR.METHOD, "mobile pairing is not supported by this server"));
             }
             return reply(rpcResult(id!, deps.mobileCompanionStatus()));
+          }
+          case "mobile.authorization.create": {
+            if (!deps.createMobileDesktopAuthorization) {
+              return reply(rpcError(id, ERR.METHOD, "mobile Desktop authorization is not supported by this server"));
+            }
+            return reply(rpcResult(
+              id!,
+              await deps.createMobileDesktopAuthorization(),
+            ));
+          }
+          case "mobile.authorization.status": {
+            if (!deps.mobileDesktopAuthorizationStatus) {
+              return reply(rpcError(id, ERR.METHOD, "mobile Desktop authorization is not supported by this server"));
+            }
+            return reply(rpcResult(
+              id!,
+              await deps.mobileDesktopAuthorizationStatus(),
+            ));
           }
           case "mobile.pairing.create": {
             if (!deps.createMobilePairing) {

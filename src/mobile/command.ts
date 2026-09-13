@@ -5,6 +5,7 @@ import {
   type VerificationChannel,
 } from "./account-client.js";
 import { LocalServeClient } from "./local-serve-client.js";
+import { MobileDesktopAuthorizationCoordinator } from "./desktop-authorization.js";
 import { MobilePairingCoordinator } from "./pairing.js";
 import { MobileRelayBridge } from "./relay-bridge.js";
 import { MobileCompanionRouter } from "./router.js";
@@ -174,6 +175,28 @@ async function pair(options: MobileCommandOptions): Promise<void> {
     return;
   }
   write("配对已批准。手机完成确认后，可运行 `hara mobile connect`。\n");
+}
+
+async function authorizeDesktop(): Promise<void> {
+  if (loadMobileState()) {
+    write("Hara Desktop 已登录；无需再次由手机授权。\n");
+    return;
+  }
+  const authorization = new MobileDesktopAuthorizationCoordinator();
+  const created = await authorization.create();
+  write("\n请使用已登录同一 Hara 账号的手机扫描：\n\n");
+  write(`  ${created.authorizationCode}\n\n`);
+  write(`  ${created.qrPayload}\n\n`);
+  write("手机会先显示这台 Desktop 的名称和密钥尾号；确认后 Desktop 将自动登录并完成配对。\n");
+  let current = await authorization.status();
+  while (current.state === "pending" && (current.expiresAt ?? 0) > Date.now()) {
+    await pause(1_000);
+    current = await authorization.status();
+  }
+  if (!current.signedIn) {
+    throw new Error("手机授权已失效，请重新运行 `hara mobile authorize`");
+  }
+  write(`Desktop 已加入 ${current.account?.displayName ?? "Hara"}，并与批准它的手机完成配对。\n`);
 }
 
 async function connect(): Promise<void> {
@@ -412,6 +435,9 @@ export async function runMobileCommand(
     case "pair":
       await pair(options);
       return;
+    case "authorize":
+      await authorizeDesktop();
+      return;
     case "connect":
       await connect();
       return;
@@ -443,6 +469,6 @@ export async function runMobileCommand(
       write("Hara Mobile Desktop 本地登录和配对状态已清除。\n");
       return;
     default:
-      throw new Error("mobile action must be login, pair, connect, status, sessions, publications, publish, unpublish, or logout");
+      throw new Error("mobile action must be login, authorize, pair, connect, status, sessions, publications, publish, unpublish, or logout");
   }
 }

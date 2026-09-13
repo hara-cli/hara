@@ -304,7 +304,7 @@ test("Desktop discovers the server-authoritative Session Relay switch", async ()
   const client = new MobileAccountClient(
     "http://127.0.0.1:7200",
     async () => response({
-      features: { sessionRelay: false },
+      features: { desktopAuthorization: true, sessionRelay: false },
       protocolVersion: 1,
       service: "hara-account",
     }),
@@ -312,7 +312,10 @@ test("Desktop discovers the server-authoritative Session Relay switch", async ()
     { allowInsecureLoopback: true },
   );
 
-  assert.deepEqual(await client.capabilities(), { sessionRelay: false });
+  assert.deepEqual(await client.capabilities(), {
+    desktopAuthorization: true,
+    sessionRelay: false,
+  });
 
   const missingSwitch = new MobileAccountClient(
     "http://127.0.0.1:7200",

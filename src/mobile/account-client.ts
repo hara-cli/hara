@@ -1,7 +1,10 @@
 import type { DeviceKeyMaterial } from "./security.js";
 import {
+  desktopAuthorizationCreateProofPayload,
+  desktopAuthorizationSecretProofPayload,
   publicKeyThumbprint,
   registrationProofPayload,
+  sha256Text,
   signPayload,
 } from "./security.js";
 
@@ -9,7 +12,7 @@ const MAX_RESPONSE_CHARACTERS = 64 * 1_024;
 const DEFAULT_TIMEOUT_MS = 8_000;
 
 export class MobileAccountError extends Error {
-  constructor(readonly code: "AUTH_REQUIRED" | "INPUT_INVALID" | "PAIRING_FAILED" | "SERVICE_UNAVAILABLE") {
+  constructor(readonly code: "AUTH_REQUIRED" | "AUTHORIZATION_FAILED" | "INPUT_INVALID" | "PAIRING_FAILED" | "SERVICE_UNAVAILABLE") {
     super(code);
     this.name = "MobileAccountError";
   }
@@ -24,6 +27,7 @@ export type MobileAccountLogin = Readonly<{
 }>;
 
 export type MobileAccountCapabilities = Readonly<{
+  desktopAuthorization: boolean;
   sessionRelay: boolean;
 }>;
 
@@ -45,6 +49,36 @@ export type PairingChallenge = Readonly<{
   pairedDeviceId: string | null;
   sourceDeviceId: string;
   state: "pending" | "claimed" | "approved" | "rejected" | "consumed" | "expired" | "cancelled";
+}>;
+
+export type DesktopAuthorizationState =
+  | "pending"
+  | "approved"
+  | "consumed"
+  | "expired"
+  | "cancelled";
+
+export type DesktopAuthorizationChallenge = Readonly<{
+  desktop: Readonly<{
+    label: string;
+    platform: "macos" | "windows" | "linux";
+    publicKeyThumbprint: string;
+  }>;
+  expiresAt: number;
+  id: string;
+  state: DesktopAuthorizationState;
+}>;
+
+export type DesktopAuthorizationExchange = MobileAccountLogin & Readonly<{
+  authorization: DesktopAuthorizationChallenge;
+  desktopCredential: string;
+  desktopCredentialExpiresInSeconds: number;
+  desktopDeviceId: string;
+  pairedMobileDevice: Readonly<{
+    id: string;
+    publicKeySpki: string;
+    publicKeyThumbprint: string;
+  }>;
 }>;
 
 const record = (value: unknown): Record<string, unknown> => {
@@ -126,6 +160,32 @@ function parseChallenge(value: unknown): PairingChallenge {
   });
 }
 
+function parseDesktopAuthorization(value: unknown): DesktopAuthorizationChallenge {
+  const authorization = record(value);
+  const desktop = record(authorization.desktop);
+  const expiresAt = Date.parse(String(authorization.expiresAt ?? ""));
+  const states = new Set(["pending", "approved", "consumed", "expired", "cancelled"]);
+  if (
+    !id(authorization.id)
+    || !Number.isFinite(expiresAt)
+    || !states.has(String(authorization.state))
+    || !bounded(desktop.label, 120)
+    || !["macos", "windows", "linux"].includes(String(desktop.platform))
+    || typeof desktop.publicKeyThumbprint !== "string"
+    || !/^[a-f0-9]{64}$/u.test(desktop.publicKeyThumbprint)
+  ) throw new MobileAccountError("SERVICE_UNAVAILABLE");
+  return Object.freeze({
+    desktop: Object.freeze({
+      label: desktop.label,
+      platform: desktop.platform as "macos" | "windows" | "linux",
+      publicKeyThumbprint: desktop.publicKeyThumbprint,
+    }),
+    expiresAt,
+    id: authorization.id,
+    state: authorization.state as DesktopAuthorizationState,
+  });
+}
+
 export class MobileAccountClient {
   private readonly baseUrl: string;
 
@@ -175,6 +235,9 @@ export class MobileAccountClient {
       if (!response.ok) {
         const errorBody = record(body);
         const errorCode = typeof errorBody?.code === "string" ? errorBody.code : "";
+        if (errorCode.startsWith("DESKTOP_AUTHORIZATION_")) {
+          throw new MobileAccountError("AUTHORIZATION_FAILED");
+        }
         if (response.status === 400) throw new MobileAccountError("INPUT_INVALID");
         if (response.status === 401 || response.status === 403 || errorCode.startsWith("ACCOUNT_AUTH_")) {
           throw new MobileAccountError("AUTH_REQUIRED");
@@ -199,7 +262,10 @@ export class MobileAccountClient {
       || response.service !== "hara-account"
       || typeof features.sessionRelay !== "boolean"
     ) throw new MobileAccountError("SERVICE_UNAVAILABLE");
-    return Object.freeze({ sessionRelay: features.sessionRelay });
+    return Object.freeze({
+      desktopAuthorization: features.desktopAuthorization === true,
+      sessionRelay: features.sessionRelay,
+    });
   }
 
   async sendCode(
@@ -371,6 +437,165 @@ export class MobileAccountClient {
       credential: response.deviceCredential,
       deviceId,
       expiresInSeconds: response.expiresInSeconds,
+    });
+  }
+
+  async createDesktopAuthorization(input: Readonly<{
+    accountRegion: "cn" | "global";
+    desktopLabel: string;
+    key: DeviceKeyMaterial;
+    platform: "macos" | "windows" | "linux";
+    pollSecret: string;
+  }>): Promise<Readonly<{
+    authorization: DesktopAuthorizationChallenge;
+    authorizationCode: string;
+  }>> {
+    const proofSignature = signPayload(
+      input.key.privateKeyPem,
+      desktopAuthorizationCreateProofPayload({
+        accountRegion: input.accountRegion,
+        desktopLabel: input.desktopLabel,
+        desktopPlatform: input.platform,
+        pollSecret: input.pollSecret,
+        publicKeySpki: input.key.publicKeySpki,
+      }),
+    );
+    const response = record(await this.request("/v1/device-authorizations", {
+      body: {
+        desktopLabel: input.desktopLabel.trim(),
+        desktopPlatform: input.platform,
+        desktopPublicKeySpki: input.key.publicKeySpki,
+        pollSecretHash: sha256Text(input.pollSecret),
+        proofSignature,
+      },
+    }));
+    const authorization = parseDesktopAuthorization(response.authorization);
+    if (
+      response.protocolVersion !== 1
+      || !bounded(response.authorizationCode, 128)
+      || !/^HARA_AUTH_[A-Za-z0-9_-]+$/u.test(response.authorizationCode)
+      || authorization.state !== "pending"
+      || authorization.desktop.label !== input.desktopLabel.trim()
+      || authorization.desktop.platform !== input.platform
+      || authorization.desktop.publicKeyThumbprint
+        !== publicKeyThumbprint(input.key.publicKeySpki)
+    ) throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    return Object.freeze({
+      authorization,
+      authorizationCode: response.authorizationCode,
+    });
+  }
+
+  async inspectDesktopAuthorization(input: Readonly<{
+    accountRegion: "cn" | "global";
+    challengeId: string;
+    key: DeviceKeyMaterial;
+    pollSecret: string;
+  }>): Promise<DesktopAuthorizationChallenge> {
+    const proofSignature = signPayload(
+      input.key.privateKeyPem,
+      desktopAuthorizationSecretProofPayload({
+        accountRegion: input.accountRegion,
+        action: "status",
+        challengeId: input.challengeId,
+        pollSecret: input.pollSecret,
+        publicKeySpki: input.key.publicKeySpki,
+      }),
+    );
+    const response = record(await this.request(
+      "/v1/device-authorizations/status",
+      {
+        body: {
+          challengeId: input.challengeId,
+          pollSecret: input.pollSecret,
+          proofSignature,
+        },
+      },
+    ));
+    if (response.protocolVersion !== 1) {
+      throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    }
+    const authorization = parseDesktopAuthorization(response.authorization);
+    if (
+      authorization.id !== input.challengeId
+      || authorization.desktop.publicKeyThumbprint
+        !== publicKeyThumbprint(input.key.publicKeySpki)
+    ) throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    return authorization;
+  }
+
+  async exchangeDesktopAuthorization(input: Readonly<{
+    accountRegion: "cn" | "global";
+    challengeId: string;
+    key: DeviceKeyMaterial;
+    platform: "macos" | "windows" | "linux";
+    pollSecret: string;
+  }>): Promise<DesktopAuthorizationExchange> {
+    const proofSignature = signPayload(
+      input.key.privateKeyPem,
+      desktopAuthorizationSecretProofPayload({
+        accountRegion: input.accountRegion,
+        action: "exchange",
+        challengeId: input.challengeId,
+        pollSecret: input.pollSecret,
+        publicKeySpki: input.key.publicKeySpki,
+      }),
+    );
+    const response = record(await this.request(
+      "/v1/device-authorizations/exchange",
+      {
+        body: {
+          challengeId: input.challengeId,
+          pollSecret: input.pollSecret,
+          proofSignature,
+        },
+      },
+    ));
+    const login = this.parseLogin(response);
+    const authorization = parseDesktopAuthorization(response.authorization);
+    const desktopDevice = record(response.desktopDevice);
+    const pairedMobileDevice = record(response.pairedMobileDevice);
+    if (
+      authorization.id !== input.challengeId
+      || login.account.region !== input.accountRegion
+      || authorization.state !== "consumed"
+      || authorization.desktop.platform !== input.platform
+      || authorization.desktop.publicKeyThumbprint
+        !== publicKeyThumbprint(input.key.publicKeySpki)
+      || response.deviceCredentialReady !== true
+      || !token(response.deviceCredential)
+      || !seconds(response.deviceCredentialExpiresInSeconds)
+      || !id(desktopDevice.id)
+      || desktopDevice.kind !== "desktop"
+      || desktopDevice.platform !== input.platform
+      || !id(pairedMobileDevice.id)
+      || pairedMobileDevice.kind !== "mobile"
+      || (pairedMobileDevice.platform !== "ios"
+        && pairedMobileDevice.platform !== "android")
+      || !base64url(pairedMobileDevice.publicKeySpki, 2_048)
+      || typeof pairedMobileDevice.publicKeyThumbprint !== "string"
+      || !/^[a-f0-9]{64}$/u.test(pairedMobileDevice.publicKeyThumbprint)
+    ) throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    try {
+      if (
+        publicKeyThumbprint(pairedMobileDevice.publicKeySpki)
+          !== pairedMobileDevice.publicKeyThumbprint
+      ) throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    } catch {
+      throw new MobileAccountError("SERVICE_UNAVAILABLE");
+    }
+    return Object.freeze({
+      ...login,
+      authorization,
+      desktopCredential: response.deviceCredential,
+      desktopCredentialExpiresInSeconds:
+        response.deviceCredentialExpiresInSeconds,
+      desktopDeviceId: desktopDevice.id,
+      pairedMobileDevice: Object.freeze({
+        id: pairedMobileDevice.id,
+        publicKeySpki: pairedMobileDevice.publicKeySpki,
+        publicKeyThumbprint: pairedMobileDevice.publicKeyThumbprint,
+      }),
     });
   }
 

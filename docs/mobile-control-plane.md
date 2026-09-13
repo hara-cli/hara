@@ -1,6 +1,6 @@
 # Hara Mobile control-plane contract
 
-> Status: protocol v1 foundation, 2026-09-07. Hara CLI/Serve is the execution authority; Desktop and Mobile
+> Status: protocol v1 foundation, 2026-09-13. Hara CLI/Serve is the execution authority; Desktop and Mobile
 > are clients of the same provider-neutral runtime.
 
 ## Product boundary
@@ -29,6 +29,10 @@ the CLI against its publication, lease epoch, expiry, command ID, and active tur
 
 - Independent Hara phone/email verification login and expiring Desktop-device registration. Nayi account
   data, tokens, and user APIs are outside this trust boundary.
+- An unsigned Desktop can create a five-minute `hara://authorize-desktop` invitation. A signed-in phone
+  previews and approves that exact Desktop key; Core exchanges the result into its own account session and
+  device credential, pins the approving phone key, and starts with zero published Sessions. The QR never
+  contains the Desktop-only poll secret, a token, or a private key.
 - A user-visible, one-time pairing challenge. The Desktop approves the exact mobile public-key thumbprint.
 - P-256 signatures plus peer encryption for every relay envelope; the relay handles ciphertext and routing.
 - An explicit, bounded publication directory for Personal coding-agent sessions (`hara`, `codex`, and
@@ -52,6 +56,7 @@ The CLI entry points are:
 ```text
 hara mobile login --phone <number>
 hara mobile login --email <address>
+hara mobile authorize # scan with an already signed-in Hara Mobile app
 hara mobile pair
 hara mobile sessions
 hara mobile publish --session <id> # read-only by default
@@ -74,7 +79,9 @@ The React Native client may reuse visual/component patterns from NayiApp, but it
 protocol rather than copy NayiApp account or networking assumptions.
 
 1. Generate the mobile P-256 key inside Keychain/Keystore and never export the private key.
-2. Claim a pairing challenge, show the Desktop identity and expiry, and finish only after Desktop approval.
+2. For first use, scan only the strict `hara://authorize-desktop` payload, fetch the authenticated preview,
+   show the Desktop label/platform/key suffix, and require a deliberate phone approval. For an already
+   signed-in Desktop, retain the separate Desktop-approved pairing flow.
 3. Reject relay devices whose signed public-key identity differs from the paired thumbprint.
 4. List only published sessions and render their explicit capabilities. Do not guess that a disabled button is
    authorized merely because another device could use it.

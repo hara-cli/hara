@@ -372,6 +372,21 @@ const baseDeps = (provider, store, approval = "full-auto") => ({
 
 test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane", { timeout: 10000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "hara-serve-mobile-pairing-"));
+  const desktopAuthorization = {
+    accountRegion: "cn",
+    authorizationCode: "HARA_AUTH_abcdefghijklmnopqrstuvwxyz",
+    challengeId: "desktop-authorization-a",
+    desktop: {
+      label: "Hara Desktop · Test Mac",
+      platform: "macos",
+      publicKeyThumbprint: "b".repeat(64),
+    },
+    expiresAt: Date.now() + 300_000,
+    protocolVersion: 1,
+    qrPayload: `hara://authorize-desktop?v=1&region=cn&code=HARA_AUTH_abcdefghijklmnopqrstuvwxyz&expires=${Math.floor((Date.now() + 300_000) / 1_000)}`,
+    signedIn: false,
+    state: "pending",
+  };
   const invitation = {
     accountRegion: "cn",
     challengeId: "challenge-a",
@@ -409,6 +424,16 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
         desktopCredential: "active",
         pairedMobileDevices: 0,
         signedIn: true,
+      }),
+      createMobileDesktopAuthorization: async () => desktopAuthorization,
+      mobileDesktopAuthorizationStatus: async () => ({
+        account: null,
+        challengeId: desktopAuthorization.challengeId,
+        desktop: desktopAuthorization.desktop,
+        expiresAt: desktopAuthorization.expiresAt,
+        protocolVersion: 1,
+        signedIn: false,
+        state: "pending",
       }),
       createMobilePairing: async () => invitation,
       inspectMobilePairing: async (challengeId) => {
@@ -449,6 +474,8 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
     const initialized = await client.call("initialize", { token: "tok" });
     for (const method of [
       "mobile.status",
+      "mobile.authorization.create",
+      "mobile.authorization.status",
       "mobile.pairing.create",
       "mobile.pairing.status",
       "mobile.pairing.decide",
@@ -457,12 +484,23 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
       "mobile.publications.unpublish",
     ]) assert.ok(initialized.result.capabilities.methods.includes(method), `${method} advertised`);
     assert.ok(initialized.result.capabilities.features.includes("mobile.pairing.qr.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("mobile.desktop-authorization.qr.v1"));
     assert.ok(initialized.result.capabilities.features.includes("mobile.session-publications.v1"));
     assert.ok(initialized.result.capabilities.features.includes("mobile.session-publications.granular-capabilities.v2"));
 
     const status = await client.call("mobile.status", {});
     assert.equal(status.result.account.displayName, "Hara User");
     assert.equal(Object.hasOwn(status.result, "accessToken"), false);
+    const authorizationCreated = (
+      await client.call("mobile.authorization.create", {})
+    ).result;
+    assert.deepEqual(authorizationCreated, desktopAuthorization);
+    assert.equal(Object.hasOwn(authorizationCreated, "pollSecret"), false);
+    assert.equal(Object.hasOwn(authorizationCreated, "privateKeyPem"), false);
+    assert.equal(
+      (await client.call("mobile.authorization.status", {})).result.state,
+      "pending",
+    );
     assert.deepEqual((await client.call("mobile.pairing.create", {})).result, invitation);
     assert.deepEqual(
       (await client.call("mobile.pairing.status", { challengeId: "challenge-a" })).result,
