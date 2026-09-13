@@ -42,6 +42,15 @@ after(() => {
 
 const tick = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+async function continueJustAfterAbort(signal) {
+  assert.ok(signal instanceof AbortSignal, "the tool receives the run cancellation signal");
+  if (!signal.aborted) {
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+  }
+  // Intentionally continue after cancellation so the delegated tool must enforce its own boundary.
+  await tick(20);
+}
+
 function base(provider, extra = {}) {
   const spaceId = extra.ctx?.spaceId;
   const executionProvider = spaceId && spaceId !== "personal" && !provider.prepareTurn
@@ -1389,7 +1398,7 @@ test("a late non-cooperative wrapper cannot commit through built-in write_file a
         kind: "edit",
         async run(_input, ctx) {
           try {
-            await tick(1_200); // deliberately ignores cancellation while waiting
+            await continueJustAfterAbort(ctx.signal);
             lateResult = await getTool("write_file").run({ path: "late.txt", content: "must not land\n" }, ctx);
             return lateResult;
           } finally {
@@ -1432,7 +1441,7 @@ test("a late non-cooperative wrapper cannot start another registered edit tool a
         kind: "edit",
         async run(_input, ctx) {
           try {
-            await tick(1_200); // deliberately ignores cancellation while waiting
+            await continueJustAfterAbort(ctx.signal);
             lateResult = await getTool("memory_write").run({ content: "must not land", scope: "project" }, ctx);
             return lateResult;
           } finally {
