@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.177.0 — 2026-09-13 — automatic Mobile Relay
+
+- Let `hara serve` own the encrypted Mobile Relay bridge after Hara sign-in and explicit phone pairing. It
+  reconnects with bounded backoff, renews expiring Desktop credentials, and follows account/device changes without
+  requiring a separate `hara mobile connect` process.
+- Expose only a redacted Relay lifecycle through `mobile.status` so Desktop can distinguish waiting, connecting,
+  online, retrying, and unavailable states. Cloud capability checks fail closed and transport details stay private.
+- Keep Session access independent from device pairing: a paired phone still sees zero Sessions until the user
+  explicitly publishes each Session and grants its read, message, approval, interrupt, or terminal capabilities.
+
 ## 0.176.1 — 2026-09-13 — replay-safe approvals and terminal helpers
 
 - Bind session and provider-owned approval replies to durable, payload-bound command identities so reconnects,

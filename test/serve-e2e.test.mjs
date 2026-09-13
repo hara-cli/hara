@@ -408,6 +408,7 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
     state: "claimed",
   };
   const calls = [];
+  let relayCloses = 0;
   let publications = [];
   const publicationResult = () => ({
     protocolVersion: 1,
@@ -423,8 +424,19 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
         accountSession: "active",
         desktopCredential: "active",
         pairedMobileDevices: 0,
+        relay: {
+          connectionState: "online",
+          managedByServe: true,
+          reason: null,
+          retryAt: null,
+          updatedAt: 2_000_000_000_000,
+        },
         signedIn: true,
       }),
+      mobileRelayManaged: true,
+      closeMobileRelay: async () => {
+        relayCloses += 1;
+      },
       createMobileDesktopAuthorization: async () => desktopAuthorization,
       mobileDesktopAuthorizationStatus: async () => ({
         account: null,
@@ -484,13 +496,17 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
       "mobile.publications.unpublish",
     ]) assert.ok(initialized.result.capabilities.methods.includes(method), `${method} advertised`);
     assert.ok(initialized.result.capabilities.features.includes("mobile.pairing.qr.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("mobile.relay-supervisor.v1"));
     assert.ok(initialized.result.capabilities.features.includes("mobile.desktop-authorization.qr.v1"));
     assert.ok(initialized.result.capabilities.features.includes("mobile.session-publications.v1"));
     assert.ok(initialized.result.capabilities.features.includes("mobile.session-publications.granular-capabilities.v2"));
 
     const status = await client.call("mobile.status", {});
     assert.equal(status.result.account.displayName, "Hara User");
+    assert.equal(status.result.relay.connectionState, "online");
+    assert.equal(status.result.relay.managedByServe, true);
     assert.equal(Object.hasOwn(status.result, "accessToken"), false);
+    assert.equal(Object.hasOwn(status.result.relay, "credential"), false);
     const authorizationCreated = (
       await client.call("mobile.authorization.create", {})
     ).result;
@@ -560,6 +576,7 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
   } finally {
     client.close();
     await server.close();
+    assert.equal(relayCloses, 1);
     rmSync(dir, { recursive: true, force: true });
   }
 });

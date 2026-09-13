@@ -4512,6 +4512,7 @@ program
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const { MobileDesktopAuthorizationCoordinator } = await import("./mobile/desktop-authorization.js");
     const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
+    const { MobileRelaySupervisor } = await import("./mobile/relay-supervisor.js");
     const {
       configureMobileSessionPublication,
       mobileSessionPublications,
@@ -4520,6 +4521,9 @@ program
     const gatewayLogins = new GatewayLoginManager();
     const mobileDesktopAuthorization = new MobileDesktopAuthorizationCoordinator();
     const mobilePairing = new MobilePairingCoordinator();
+    const mobileRelay = new MobileRelaySupervisor({
+      log: (message) => process.stderr.write(`${message}\n`),
+    });
     const structuredBrowserStatus = () => {
       const installed = listInstalled().find((plugin) => plugin.name === "browser");
       const enabled = installed
@@ -4831,7 +4835,12 @@ program
         gatewayLoginStatus: (platform, id) => gatewayLogins.status(platform, id),
         cancelGatewayLogin: (platform, id) => gatewayLogins.cancel(platform, id),
         closeGatewayLogins: () => gatewayLogins.close(),
-        mobileCompanionStatus: () => mobilePairing.status(),
+        mobileCompanionStatus: () => ({
+          ...mobilePairing.status(),
+          relay: mobileRelay.status(),
+        }),
+        mobileRelayManaged: true,
+        closeMobileRelay: () => mobileRelay.close(),
         createMobileDesktopAuthorization: () => mobileDesktopAuthorization.create(),
         mobileDesktopAuthorizationStatus: () => mobileDesktopAuthorization.status(),
         createMobilePairing: () => mobilePairing.create(),
@@ -5141,9 +5150,11 @@ program
         approval,
       },
     );
+    mobileRelay.start();
     const setupStatus = provider0 ? `${cfg.provider}:${cfg.model}` : `setup required · ${cfg.provider}:${cfg.model}`;
     out(c.bold("hara serve") + c.dim(`  ·  ws://${o.host}:${handle.port}  ·  ${setupStatus}  ·  approval ${approval}  ·  token → ~/.hara/serve.json\n`));
     const bye = async (): Promise<void> => {
+      await mobileRelay.close();
       await handle.close();
       process.exit(0);
     };

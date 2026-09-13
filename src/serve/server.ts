@@ -383,6 +383,10 @@ export interface ServeDeps {
   /** Hara Account + Mobile pairing. Only redacted account state and a short-lived one-time invitation
    * cross authenticated loopback. Account tokens, device credentials, and private keys remain in Core. */
   mobileCompanionStatus?: () => MobileCompanionStatus;
+  /** Serve owns the single long-lived Relay bridge when this is set. The close hook lets every shutdown
+   * path release the private loopback connection, Relay socket, terminal streams, and routing listeners. */
+  mobileRelayManaged?: boolean;
+  closeMobileRelay?: () => Promise<void>;
   createMobileDesktopAuthorization?: () => Promise<DesktopAuthorizationInvitation>;
   mobileDesktopAuthorizationStatus?: () => Promise<DesktopAuthorizationSnapshot>;
   createMobilePairing?: () => Promise<MobilePairingInvitation>;
@@ -4460,6 +4464,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             features.push("learning.organization-review.v1");
           }
           if (mobilePairing) features.push("mobile.pairing.qr.v1");
+          if (deps.mobileRelayManaged) features.push("mobile.relay-supervisor.v1");
           if (mobileDesktopAuthorization) {
             features.push("mobile.desktop-authorization.qr.v1");
           }
@@ -8396,6 +8401,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       for (const team of agentTeams.values()) team.close();
       for (const session of hub.active()) session.abort?.abort();
       await externalSessions.close?.().catch(() => {});
+      await deps.closeMobileRelay?.().catch(() => {});
       await deps.closeGatewayLogins?.().catch(() => {});
 
       for (const client of wss.clients) {

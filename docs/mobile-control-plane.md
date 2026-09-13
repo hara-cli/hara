@@ -15,10 +15,10 @@ Hara Mobile
   <-> signed + end-to-end encrypted envelopes
 Hara Relay (ciphertext transport only)
   <-> signed + end-to-end encrypted envelopes
-`hara mobile connect` on the user's computer
-  <-> authenticated loopback JSON-RPC
-`hara serve`
-  <-> Hara engine / Codex app-server / Claude Code / local PTY
+`hara serve` / Hara Desktop-owned Relay supervisor
+  <-> authenticated private loopback JSON-RPC
+Hara engine
+  <-> Codex app-server / Claude Code / local PTY
 ```
 
 Desktop and Mobile may both observe the same session. Exactly one current lease holder may send terminal input
@@ -49,6 +49,10 @@ the CLI against its publication, lease epoch, expiry, command ID, and active tur
 - Private, bounded publication and command-outcome checkpoints survive bridge restart. Relay delivery has an
   independent per-device stream/cursor: reconnect re-acknowledges the local checkpoint and requests only the
   missing suffix, while gaps, changed streams, and conflicting replays fail closed.
+- `hara serve` owns one Relay supervisor. Once the Desktop is signed in and at least one phone is explicitly
+  paired, it checks the server-side capability, renews expiring credentials, reconnects with bounded backoff, and
+  reports a redacted lifecycle to Desktop. `hara mobile connect` remains a compatibility fallback for older Serve
+  processes and exits without opening a duplicate bridge when the supervisor is present.
 - Approval, interrupt, submit/steer, terminal input, resize, and release are capability-gated separately.
 
 The CLI entry points are:
@@ -61,7 +65,7 @@ hara mobile pair
 hara mobile sessions
 hara mobile publish --session <id> # read-only by default
 hara mobile publish --session <id> --send --approve --terminal-view --terminal-control
-hara mobile connect
+hara mobile connect # compatibility check/fallback; current hara serve connects automatically
 hara mobile status
 hara mobile unpublish --session <id>
 hara mobile logout
@@ -99,8 +103,9 @@ protocol rather than copy NayiApp account or networking assumptions.
 
 ## Delivery work still required
 
-- Deploy and verify the account/device/pairing endpoints at `api.hara.nanhara.tech` and the WSS relay at
-  `relay.hara.nanhara.tech`; add rate limits, abuse controls, encrypted backups, key rotation, and restore drills.
+- Continue production hardening for the deployed account/device/pairing endpoints at `api.hara.nanhara.tech` and
+  WSS relay at `relay.hara.nanhara.tech`: rate limits, abuse controls, encrypted backups, key rotation, and restore
+  drills remain ongoing operational gates.
 - Implement the React Native pairing, session list, conversation, approval, and terminal screens against the
   protocol above.
 - Extend publication to ordinary Hara sessions only after their task/workforce/approval snapshot and controller

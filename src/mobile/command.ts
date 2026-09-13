@@ -2,6 +2,7 @@ import { createInterface } from "node:readline/promises";
 
 import {
   MobileAccountClient,
+  type MobileAccountCapabilities,
   type VerificationChannel,
 } from "./account-client.js";
 import { LocalServeClient } from "./local-serve-client.js";
@@ -174,7 +175,7 @@ async function pair(options: MobileCommandOptions): Promise<void> {
     write("已拒绝这次配对。\n");
     return;
   }
-  write("配对已批准。手机完成确认后，可运行 `hara mobile connect`。\n");
+  write("配对已批准。保持 `hara serve` 或 Hara Desktop 运行，手机桥接会自动上线。\n");
 }
 
 async function authorizeDesktop(): Promise<void> {
@@ -199,17 +200,53 @@ async function authorizeDesktop(): Promise<void> {
   write(`Desktop 已加入 ${current.account?.displayName ?? "Hara"}，并与批准它的手机完成配对。\n`);
 }
 
+function managedRelayDescription(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const relay = value as Record<string, unknown>;
+  if (relay.managedByServe !== true) return null;
+  const phase = typeof relay.connectionState === "string"
+    ? relay.connectionState
+    : "waiting";
+  const descriptions: Record<string, string> = {
+    connecting: "正在连接云端 Relay",
+    online: "已经在线",
+    retrying: "网络暂不可用，正在自动重连",
+    stopped: "正在停止",
+    unavailable: "云端 Relay 暂未开放",
+    waiting: "正在等待账号或手机配对就绪",
+  };
+  return descriptions[phase] ?? descriptions.waiting;
+}
+
 async function connect(): Promise<void> {
   const stored = loadMobileState();
   if (!stored) throw new Error("请先运行 `hara mobile login`");
   if (stored.pairedMobileDevices.length === 0) throw new Error("请先运行 `hara mobile pair`");
+  const local = await LocalServeClient.connect();
+  try {
+    const serveStatus = await local.call<Record<string, unknown>>("mobile.status", {}, 5_000);
+    const description = managedRelayDescription(serveStatus?.relay);
+    if (description) {
+      write(`手机桥接已由 hara serve 自动管理：${description}。无需另开连接进程。\n`);
+      await local.close().catch(() => undefined);
+      return;
+    }
+  } catch {
+    // Older Serve versions do not expose a managed Relay state; retain the explicit bridge fallback.
+  }
   const account = new MobileAccountClient(ACCOUNT_ORIGIN);
-  const capabilities = await account.capabilities();
+  let capabilities: MobileAccountCapabilities;
+  try {
+    capabilities = await account.capabilities();
+  } catch (error) {
+    await local.close().catch(() => undefined);
+    throw error;
+  }
   if (!capabilities.sessionRelay) {
+    await local.close().catch(() => undefined);
     throw new Error("Hara 云会话暂未开放；账号和配对信息已保留，无需重新配对");
   }
   const pairing = new MobilePairingCoordinator();
-  const local = await LocalServeClient.connect();
   let currentState = await pairing.currentState();
   let activeBridge: MobileRelayBridge | null = null;
   let stopping = false;
@@ -283,7 +320,7 @@ async function connect(): Promise<void> {
       if (renewalTimer) clearTimeout(renewalTimer);
       if (stopping) break;
       if (outcome === "closed") {
-        throw new Error("Hara Relay 意外断开，请检查网络后重新运行 `hara mobile connect`");
+        throw new Error("Hara Relay 意外断开；新版 `hara serve` 会自动重连，请确认 Desktop 引擎仍在运行");
       }
       await bridge.close();
       activeBridge = null;
@@ -293,7 +330,7 @@ async function connect(): Promise<void> {
   }
 }
 
-function status(): void {
+async function status(): Promise<void> {
   const state = loadMobileState();
   if (!state) {
     write("Hara Mobile Desktop：未登录。\n");
@@ -304,6 +341,19 @@ function status(): void {
   write(`Hara Mobile Desktop：${state.account.displayName}\n`);
   write(`账号会话：${access} · 设备凭证：${device} · 已配对手机：${state.pairedMobileDevices.length}\n`);
   write(`手机可访问会话：${mobilePublicationEntries(state).length}\n`);
+  let local: LocalServeClient | null = null;
+  try {
+    local = await LocalServeClient.connect();
+    const serveStatus = await local.call<Record<string, unknown>>("mobile.status", {}, 5_000);
+    const description = managedRelayDescription(serveStatus?.relay);
+    write(description
+      ? `自动 Relay：${description}。\n`
+      : "自动 Relay：当前 Desktop 引擎版本不支持状态查询。\n");
+  } catch {
+    write("自动 Relay：Desktop 引擎未运行。\n");
+  } finally {
+    await local?.close().catch(() => undefined);
+  }
 }
 
 type LocalSessionSummary = Readonly<{
@@ -442,7 +492,7 @@ export async function runMobileCommand(
       await connect();
       return;
     case "status":
-      status();
+      await status();
       return;
     case "sessions":
       await listSessions();
