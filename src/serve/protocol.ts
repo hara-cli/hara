@@ -53,6 +53,11 @@
 //   external.event.command_failed    {sessionId,commandId,commandMethod,code,message}
 //                      is emitted only after the terminal receipt is durable. A client may forget its local
 //                      uncertain-retry marker only after this event or the matching terminal RPC response.
+//   external.sessions.terminal.input {sessionId,text,commandId?} → {}
+//   external.sessions.terminal.key   {sessionId,key,commandId?}  → {}
+//                      Legacy prompt/key helpers use the same durable provider-session command ledger when
+//                      commandId is present. Exact retries do not inject terminal input twice; conflicting
+//                      reuse is rejected. Streaming terminal input continues to use inputSeq below.
 //   external.sessions.remove {sessionId}            → {} (Hara Live only; closes the original terminal)
 //   external.sessions.terminal.attach {sessionId,mode,cols,rows,takeover?}
 //                                                   → {streamId,mode,cols,rows,nextInputSeq?}
@@ -130,7 +135,11 @@
 //                      Once a lease is active, session submit/send/steer/interrupt, approval replies, model or
 //                      approval changes, compaction, rewind, and deletion require the exact
 //                      controlLease:{leaseId,epoch}. With no active lease, older local clients remain compatible.
-//   approval.reply    {approvalId,allow,always?,controlLease?} → {} (`always` persists only the engine-declared project scope)
+//   approval.reply    {approvalId,allow,always?,scope?,sessionId?,commandId?,controlLease?} → {}
+//                      `always` persists only when allow=true and the engine declared a project scope.
+//                      New clients send scope + sessionId + a stable UUID commandId; Hara saves a started/result
+//                      receipt before/after applying the decision so reconnect retries cannot flip or repeat it.
+//                      Omitting all three retains the legacy late-reply no-op behavior.
 //   plugins.list      {}                          → {plugins:[{name,version,description,enabled,skills,agents,mcpServers}]}
 //   plugins.set       {name,enabled}              → {name,enabled}   (applies to future sessions/turns)
 //   skills.list       {cwd?}                      → {skills:[{id,description,source}]}

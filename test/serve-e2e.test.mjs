@@ -1631,9 +1631,11 @@ test("serve e2e: auth gate → create → send streams text events and returns t
         "external.sessions.launch-options.v1",
         "external.sessions.command-idempotency.serve-lifetime.v1",
         "external.sessions.command-idempotency.durable.v2",
+        "approval.command-idempotency.v1",
         "external.sessions.terminal-mirror.v1",
         "external.sessions.terminal-stream.v2",
         "external.sessions.terminal-input-sequence.v1",
+        "external.sessions.terminal-command-idempotency.v1",
         "external.sessions.terminal-handoff.v1",
         "external.sessions.runtime-remove.v1",
         "spaces.tenant-boundary.v1",
@@ -5452,10 +5454,13 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
   const srv = await startServe({ host: "127.0.0.1", port: 0, token: "tok", cwd: dir }, baseDeps(toolProvider(), store, "suggest"));
   const c = await connect(srv.port);
   try {
-    await c.call("initialize", { token: "tok" });
+    const initialized = await c.call("initialize", { token: "tok" });
+    assert.ok(initialized.result.capabilities.features.includes("approval.command-idempotency.v1"));
     const { result } = await c.call("session.create", {});
+    const approvalCommandId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa4";
     // answer the approval as soon as it arrives (concurrently with the running send)
     const approver = c.waitEvent("approval.request").then(async (ev) => {
+      let response;
       try {
         assert.equal(ev.params.allowAlways, true, "ordinary project edits advertise the narrow remembered scope");
         const snapshot = await c.call("events.snapshot", { sessionIds: [result.sessionId] });
@@ -5469,11 +5474,35 @@ test("serve e2e: approval round-trip — suggest mode write_file waits for appro
       } finally {
         // A failed assertion must not strand the provider on an unanswered approval and turn one
         // useful failure into a misleading file-level timeout.
-        await c.call("approval.reply", { approvalId: ev.params.approvalId, allow: true });
+        response = await c.call("approval.reply", {
+          approvalId: ev.params.approvalId,
+          allow: true,
+          scope: "session",
+          sessionId: result.sessionId,
+          commandId: approvalCommandId,
+        });
       }
+      return { event: ev, response };
     });
     const sent = await c.call("session.send", { sessionId: result.sessionId, text: "write it" });
-    await approver;
+    const approved = await approver;
+    assert.deepEqual(approved.response.result, {});
+    const duplicateApproval = await c.call("approval.reply", {
+      commandId: approvalCommandId,
+      sessionId: result.sessionId,
+      scope: "session",
+      allow: true,
+      approvalId: approved.event.params.approvalId,
+    });
+    assert.deepEqual(duplicateApproval.result, {});
+    const conflictingApproval = await c.call("approval.reply", {
+      commandId: approvalCommandId,
+      sessionId: result.sessionId,
+      scope: "session",
+      allow: false,
+      approvalId: approved.event.params.approvalId,
+    });
+    assert.equal(conflictingApproval.error.code, -32005);
     assert.equal(sent.result.reply, "done");
     assert.equal(c.events.filter((e) => e.method === "approval.request").length, 1, "exactly one approval asked");
     const waiting = c.events.find((e) => e.method === "event.task_state" && e.params.state === "waiting");

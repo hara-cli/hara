@@ -101,7 +101,8 @@ export type SessionCommandMethod =
   | "session.submit"
   | "session.send"
   | "session.steer"
-  | "session.interrupt";
+  | "session.interrupt"
+  | "approval.reply";
 
 export type SessionCommandOutcome =
   | { kind: "result"; json: string }
@@ -2844,6 +2845,7 @@ function isSessionCommandReceipt(value: unknown): value is SessionCommandReceipt
       && receipt.method !== "session.send"
       && receipt.method !== "session.steer"
       && receipt.method !== "session.interrupt"
+      && receipt.method !== "approval.reply"
     )
     || typeof receipt.requestHash !== "string"
     || !/^[0-9a-f]{64}$/u.test(receipt.requestHash)

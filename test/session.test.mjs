@@ -195,7 +195,7 @@ test("session persistence retains a write-ahead command receipt without prompt c
       commandReceipts: [{
         v: 1,
         commandId: "11111111-1111-4111-8111-111111111111",
-        method: "session.submit",
+        method: "approval.reply",
         requestHash: "a".repeat(64),
         startedAt: at,
       }],
@@ -204,7 +204,7 @@ test("session persistence retains a write-ahead command receipt without prompt c
     assert.deepEqual(loaded?.meta.commandReceipts, [{
       v: 1,
       commandId: "11111111-1111-4111-8111-111111111111",
-      method: "session.submit",
+      method: "approval.reply",
       requestHash: "a".repeat(64),
       startedAt: at,
     }]);

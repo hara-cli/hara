@@ -384,6 +384,43 @@ test("Relay bridge rejects a paired mobile identity whose public key changed", a
   );
 });
 
+test("Relay bridge still releases local routing resources after a safe protocol stop", async () => {
+  const desktop = generateDeviceKey();
+  const now = 2_000_000_000;
+  let routerCloses = 0;
+  const bridge = new MobileRelayBridge(
+    "wss://relay.example.test/v1/connect",
+    {
+      accessToken: "a".repeat(64),
+      accessTokenExpiresAt: now + 600_000,
+      account: { displayName: "Test User", id: "account-a", region: "cn" },
+      desktop: {
+        credential: "b".repeat(64),
+        credentialExpiresAt: now + 600_000,
+        id: "desktop-a",
+        key: desktop,
+        platform: "macos",
+      },
+      pairedMobileDevices: [],
+      schemaVersion: 1,
+    },
+    {
+      close: async () => {
+        routerCloses += 1;
+      },
+      route: async () => ({}),
+    },
+    () => now,
+  );
+  const stopped = bridge.waitUntilClosed().catch(() => undefined);
+
+  bridge.stopWithError(new Error("safe protocol stop"));
+  await bridge.close();
+  await stopped;
+
+  assert.equal(routerCloses, 1);
+});
+
 test("Relay bridge replays its independent cloud cursor and ACKs only after its response is durable", async () => {
   const desktop = generateDeviceKey();
   const mobile = generateDeviceKey();
@@ -587,6 +624,43 @@ test("Router publishes bounded sessions and enforces terminal leases and command
     calls.find((entry) => entry.method === "external.sessions.terminal.attach")?.params.takeover,
     true,
     "a phone control grant is an explicit takeover rather than a silent second writer",
+  );
+
+  for (const listener of listeners) listener("external.approval.request", {
+    approvalId: "approval-mobile-a",
+    question: "Allow the release command?",
+    sessionId: "ext_runtime_test-a",
+  });
+  const approvalCommand = {
+    commandId: "approval-command-mobile-a",
+    expiresAt: now + 30_000,
+    kind: "approval",
+    leaseEpoch: router.leaseEpoch,
+    payload: {
+      approvalId: "approval-mobile-a",
+      decision: "approve",
+      leaseId: grant.leaseId,
+    },
+    publicationId: publication.publicationId,
+    schemaVersion: 1,
+  };
+  const approved = await router.route(request("request-approval-a", "command.execute", approvalCommand));
+  const approvalReplay = await router.route(request("request-approval-b", "command.execute", approvalCommand));
+  assert.equal(approved.body.status, "succeeded");
+  assert.deepEqual(approvalReplay.body, approved.body);
+  const approvalCalls = calls.filter((entry) => entry.method === "approval.reply");
+  assert.equal(approvalCalls.length, 1, "a retried phone approval is forwarded only once");
+  assert.deepEqual(approvalCalls[0].params, {
+    allow: true,
+    approvalId: "approval-mobile-a",
+    commandId: approvalCalls[0].params.commandId,
+    scope: "external",
+    sessionId: "ext_runtime_test-a",
+  });
+  assert.match(
+    approvalCalls[0].params.commandId,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    "legacy opaque Mobile command IDs become deterministic core UUIDs",
   );
 
   const inputCommand = {

@@ -61,6 +61,21 @@ export type CompanionResponse = Readonly<{
 const bounded = (value: unknown, maximum: number): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= maximum;
 const identifier = (value: unknown): value is string => bounded(value, 160) && value.trim() === value && !/\s/u.test(value);
+const commandUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+/** Mobile protocol identifiers are bounded opaque strings for compatibility. Core requires UUID command
+ * identities, so legacy Mobile IDs receive one deterministic, non-reversible UUID rather than a fresh retry ID. */
+function coreCommandId(value: string): string {
+  if (commandUuid.test(value)) return value;
+  const bytes = createHash("sha256")
+    .update("hara-mobile-core-command-v1\0")
+    .update(value, "utf8")
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 const record = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 const safeInteger = (value: unknown): value is number =>
@@ -522,7 +537,7 @@ export class MobileCompanionRouter {
         const activeTurnId = this.activeTurns.get(publication.sessionId);
         if (activeTurnId) {
           await this.local.call("external.sessions.steer", {
-            commandId,
+            commandId: coreCommandId(commandId),
             expectedTurnId: activeTurnId,
             sessionId: publication.sessionId,
             text: payload.text,
@@ -533,7 +548,7 @@ export class MobileCompanionRouter {
         } else {
           this.runningSubmits.add(publication.sessionId);
           void this.local.call("external.sessions.submit", {
-            commandId,
+            commandId: coreCommandId(commandId),
             sessionId: publication.sessionId,
             text: payload.text,
           }, 30 * 60_000).finally(() => {
@@ -548,7 +563,7 @@ export class MobileCompanionRouter {
         result = this.receipt(commandId, "failed", "CAPABILITY_DENIED");
       } else {
         await this.local.call("external.sessions.interrupt", {
-          commandId,
+          commandId: coreCommandId(commandId),
           ...(this.activeTurns.has(publication.sessionId)
             ? { expectedTurnId: this.activeTurns.get(publication.sessionId) }
             : {}),
@@ -569,6 +584,9 @@ export class MobileCompanionRouter {
         await this.local.call("approval.reply", {
           allow: payload.decision === "approve",
           approvalId,
+          commandId: coreCommandId(commandId),
+          scope: "external",
+          sessionId: publication.sessionId,
         });
         this.approvals.delete(approvalId);
         result = this.receipt(commandId, "succeeded");

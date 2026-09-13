@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.176.1 — 2026-09-13 — replay-safe approvals and terminal helpers
+
+- Bind session and provider-owned approval replies to durable, payload-bound command identities so reconnects,
+  renderer restarts, and phone retries cannot apply one decision twice or reuse an ID for a different decision.
+- Treat `always=true` as meaningful only beside an explicit approval. A stale or malformed client can no longer
+  turn a rejection into a remembered project-wide allow decision.
+- Give the legacy provider-terminal text/key helpers the same write-ahead receipt boundary as submit, steer, and
+  interrupt. Exact retries are no-ops; conflicting reuse fails closed. Mobile maps older opaque command IDs to
+  stable core UUIDs without exposing command content.
+- Always release local routing and terminal resources after a Relay protocol stop, including fail-closed error
+  paths, so reconnect does not retain a stale observer or control lease.
+
 ## 0.176.0 — 2026-09-13 — phone-approved Desktop sign-in
 
 - Host the durable Agent tree in attached interactive CLI sessions as well as Serve/Desktop. Stable child

@@ -196,6 +196,59 @@ test("an external retry cannot report provider success after its durable receipt
   }
 });
 
+test("approval always requires an explicit allow and replays one durable external decision", async () => {
+  const root = mkdtempSync(join(tmpdir(), "hara-serve-approval-command-"));
+  const sessionId = "ext_codex_approvalcommand00000000";
+  let observedVerdict;
+  const externalSessions = {
+    async submit(requestedSessionId, _text, sink) {
+      assert.equal(requestedSessionId, sessionId);
+      observedVerdict = await sink.confirm(
+        { question: "Allow one command?", allowAlways: true },
+        new AbortController().signal,
+      );
+      return {
+        sessionId,
+        turnId: "provider-private-turn",
+        status: "completed",
+        reply: "decision observed",
+      };
+    },
+    async close() {},
+  };
+  const server = await startServe(
+    { host: "127.0.0.1", port: 0, token: "personal-token", cwd: root },
+    deps("personal", externalSessions),
+  );
+  const client = await connect(server.port);
+  try {
+    await client.call("initialize", { token: "personal-token" });
+    const submitting = client.call("external.sessions.submit", { sessionId, text: "ask once" });
+    const approval = await client.waitFor("external.approval.request");
+    const commandId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5";
+    const params = {
+      approvalId: approval.params.approvalId,
+      allow: false,
+      always: true,
+      scope: "external",
+      sessionId,
+      commandId,
+    };
+    const denied = await client.call("approval.reply", params);
+    assert.deepEqual(denied.result, {});
+    const completed = await submitting;
+    assert.equal(completed.result.reply, "decision observed");
+    assert.equal(observedVerdict, false, "always=true cannot turn an explicit denial into a remembered approval");
+    assert.deepEqual((await client.call("approval.reply", params)).result, {});
+    const conflicting = await client.call("approval.reply", { ...params, allow: true });
+    assert.equal(conflicting.error.code, -32005);
+  } finally {
+    client.ws.close();
+    await server.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Serve advertises a Personal-only external session interaction surface", async () => {
   const root = mkdtempSync(join(tmpdir(), "hara-serve-external-"));
   const sessionId = "ext_codex_0123456789abcdef01234567";
@@ -205,6 +258,8 @@ test("Serve advertises a Personal-only external session interaction surface", as
   let interrupted = 0;
   let terminalInput = "";
   let terminalKey = "";
+  let terminalInputCount = 0;
+  let terminalKeyCount = 0;
   let terminalRawInput = "";
   let terminalResize = [];
   let terminalScroll = [];
@@ -327,10 +382,12 @@ test("Serve advertises a Personal-only external session interaction surface", as
     },
     async terminalInput(requestedSessionId, text) {
       assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
+      terminalInputCount += 1;
       terminalInput = text;
     },
     async terminalKey(requestedSessionId, key) {
       assert.equal(requestedSessionId, "ext_runtime_0123456789abcdef01234567");
+      terminalKeyCount += 1;
       terminalKey = key;
     },
     async openTerminalStream(requestedSessionId, input, sink) {
@@ -383,9 +440,11 @@ test("Serve advertises a Personal-only external session interaction surface", as
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.launch-options.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.command-idempotency.serve-lifetime.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.command-idempotency.durable.v2"));
+    assert.ok(initialized.result.capabilities.features.includes("approval.command-idempotency.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-mirror.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-stream.v2"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-input-sequence.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-command-idempotency.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.terminal-handoff.v1"));
     assert.ok(initialized.result.capabilities.features.includes("external.sessions.runtime-remove.v1"));
     assert.ok(initialized.result.capabilities.methods.includes("external.sessions.terminal.handoff-ready"));
@@ -411,10 +470,38 @@ test("Serve advertises a Personal-only external session interaction surface", as
     const terminalSessionId = created.result.session.id;
     const terminal = await client.call("external.sessions.terminal.snapshot", { sessionId: terminalSessionId });
     assert.equal(terminal.result.text, "native screen");
-    await client.call("external.sessions.terminal.input", { sessionId: terminalSessionId, text: "/status" });
-    await client.call("external.sessions.terminal.key", { sessionId: terminalSessionId, key: "esc" });
+    const terminalInputCommandId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+    await client.call("external.sessions.terminal.input", {
+      sessionId: terminalSessionId,
+      text: "/status",
+      commandId: terminalInputCommandId,
+    });
+    await client.call("external.sessions.terminal.input", {
+      commandId: terminalInputCommandId,
+      text: "/status",
+      sessionId: terminalSessionId,
+    });
+    const conflictingTerminalInput = await client.call("external.sessions.terminal.input", {
+      sessionId: terminalSessionId,
+      text: "/different",
+      commandId: terminalInputCommandId,
+    });
+    assert.equal(conflictingTerminalInput.error.code, -32005);
+    const terminalKeyCommandId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
+    await client.call("external.sessions.terminal.key", {
+      sessionId: terminalSessionId,
+      key: "esc",
+      commandId: terminalKeyCommandId,
+    });
+    await client.call("external.sessions.terminal.key", {
+      commandId: terminalKeyCommandId,
+      key: "esc",
+      sessionId: terminalSessionId,
+    });
     assert.equal(terminalInput, "/status");
     assert.equal(terminalKey, "esc");
+    assert.equal(terminalInputCount, 1, "a terminal prompt retry does not inject text twice");
+    assert.equal(terminalKeyCount, 1, "a terminal key retry does not inject the key twice");
     const attached = await client.call("external.sessions.terminal.attach", {
       sessionId: terminalSessionId,
       mode: "control",
@@ -545,8 +632,33 @@ test("Serve advertises a Personal-only external session interaction surface", as
       question: "Allow test command?",
       allowAlways: true,
     }]);
-    const approvalReply = await client.call("approval.reply", { approvalId: approval.params.approvalId, allow: true });
+    const approvalCommandId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3";
+    const approvalParams = {
+      approvalId: approval.params.approvalId,
+      allow: true,
+      scope: "external",
+      sessionId,
+      commandId: approvalCommandId,
+    };
+    const approvalReply = await client.call("approval.reply", approvalParams);
     assert.deepEqual(approvalReply.result, {});
+    const duplicateApprovalReply = await retryClient.call("approval.reply", {
+      commandId: approvalCommandId,
+      sessionId,
+      scope: "external",
+      allow: true,
+      approvalId: approval.params.approvalId,
+    });
+    assert.deepEqual(duplicateApprovalReply.result, {});
+    const conflictingApprovalReply = await retryClient.call("approval.reply", {
+      ...approvalParams,
+      allow: false,
+    });
+    assert.equal(conflictingApprovalReply.error.code, -32005);
+    assert.equal(client.events.filter((event) => (
+      event.method === "external.event.command_committed"
+      && event.params.commandId === approvalCommandId
+    )).length, 1, "only one durable approval command is committed");
     await client.waitFor("external.event.text");
     const staleSteer = await client.call("external.sessions.steer", {
       sessionId,

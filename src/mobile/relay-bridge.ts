@@ -120,6 +120,7 @@ export class MobileRelayBridge {
   private authenticated = false;
   private ready = false;
   private stopped = false;
+  private closing: Promise<void> | null = null;
   private processing: Promise<void> = Promise.resolve();
   private closeResolve: (() => void) | null = null;
   private closeReject: ((error: Error) => void) | null = null;
@@ -511,30 +512,36 @@ export class MobileRelayBridge {
   }
 
   async close(): Promise<void> {
-    if (this.stopped) return;
-    this.stopped = true;
-    for (const pending of this.forwardReceipts.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("Hara mobile bridge stopped"));
-    }
-    this.forwardReceipts.clear();
-    await this.router.close();
-    const socket = this.socket;
-    if (!socket || socket.readyState === WebSocket.CLOSED) {
-      this.closeResolve?.();
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        socket.terminate();
-        resolve();
-      }, 1_000);
-      socket.once("close", () => {
-        clearTimeout(timer);
-        resolve();
+    if (this.closing) return await this.closing;
+    this.closing = (async () => {
+      const alreadyStopped = this.stopped;
+      this.stopped = true;
+      for (const pending of this.forwardReceipts.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("Hara mobile bridge stopped"));
+      }
+      this.forwardReceipts.clear();
+      await this.router.close();
+      const socket = this.socket;
+      if (!socket || socket.readyState === WebSocket.CLOSED) {
+        if (!alreadyStopped) this.closeResolve?.();
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          socket.terminate();
+          resolve();
+        }, 1_000);
+        socket.once("close", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+          socket.close(alreadyStopped ? 4400 : 1000, alreadyStopped ? "protocol failure" : "mobile bridge stopped");
+        }
       });
-      socket.close(1000, "mobile bridge stopped");
-    });
-    this.closeResolve?.();
+      if (!alreadyStopped) this.closeResolve?.();
+    })();
+    await this.closing;
   }
 }

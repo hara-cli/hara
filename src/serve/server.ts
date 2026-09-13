@@ -3765,6 +3765,13 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
   }
   const inFlightExternalCommands = new Map<string, ExternalCommandEntry>();
   const MAX_EXTERNAL_COMMAND_RECEIPTS = DEFAULT_REMOTE_COMMAND_RECEIPTS;
+  type ExternalCommandMethod =
+    | "external.sessions.submit"
+    | "external.sessions.steer"
+    | "external.sessions.interrupt"
+    | "external.sessions.terminal.input"
+    | "external.sessions.terminal.key"
+    | "approval.reply";
 
   const externalCommandFromOutcome = (outcome: RemoteCommandOutcome): unknown => {
     if (outcome.kind === "error") {
@@ -3814,7 +3821,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
    * started receipt crosses fsync before the provider action. Exact terminal outcomes are bounded and
    * restart-replayable; a crash-window receipt blocks new mutation until an authoritative read/resume. */
   const runIdempotentExternalCommand = async <T>(
-    method: "external.sessions.submit" | "external.sessions.steer" | "external.sessions.interrupt",
+    method: ExternalCommandMethod,
     params: Record<string, unknown>,
     externalSessionId: string,
     operation: () => Promise<T>,
@@ -4434,9 +4441,11 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "external.sessions.launch-options.v1",
             "external.sessions.command-idempotency.serve-lifetime.v1",
             "external.sessions.command-idempotency.durable.v2",
+            "approval.command-idempotency.v1",
             "external.sessions.terminal-mirror.v1",
             "external.sessions.terminal-stream.v2",
             "external.sessions.terminal-input-sequence.v1",
+            "external.sessions.terminal-command-idempotency.v1",
             EXTERNAL_TERMINAL_HANDOFF_FEATURE,
             "external.sessions.runtime-remove.v1",
           ];
@@ -5147,8 +5156,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             if (typeof p.sessionId !== "string" || typeof p.text !== "string") {
               return reply(rpcError(id, ERR.PARAMS, "sessionId + text required"));
             }
-            await externalSessions.terminalInput(p.sessionId, p.text);
-            return reply(rpcResult(id!, {}));
+            const result = await runIdempotentExternalCommand(
+              "external.sessions.terminal.input",
+              p,
+              p.sessionId,
+              async () => {
+                await externalSessions.terminalInput(p.sessionId, p.text);
+                return {};
+              },
+            );
+            return reply(rpcResult(id!, result));
           }
           case "external.sessions.terminal.key": {
             if (externalSessionSpaceId() !== "personal") {
@@ -5159,8 +5176,16 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             ].includes(String(p.key))) {
               return reply(rpcError(id, ERR.PARAMS, "sessionId + allowed terminal key required"));
             }
-            await externalSessions.terminalKey(p.sessionId, p.key);
-            return reply(rpcResult(id!, {}));
+            const result = await runIdempotentExternalCommand(
+              "external.sessions.terminal.key",
+              p,
+              p.sessionId,
+              async () => {
+                await externalSessions.terminalKey(p.sessionId, p.key);
+                return {};
+              },
+            );
+            return reply(rpcResult(id!, result));
           }
           case "external.sessions.terminal.attach": {
             if (externalSessionSpaceId() !== "personal") {
@@ -6372,14 +6397,69 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             return reply(rpcResult(id!, interrupted));
           }
           case "approval.reply": {
-            if (typeof p.approvalId !== "string") return reply(rpcError(id, ERR.PARAMS, "approvalId required"));
-            const approval = pendingApprovals.get(p.approvalId);
-            if (approval) {
-              if (approval.scope === "session") authorizeSessionMutation(ws, approval.sessionId, p);
-              const value = p.always === true && approval.allowAlways ? "always" : p.allow === true;
-              approval.finish(value, value === "always" ? "allowed_always" : value ? "allowed" : "denied");
+            if (
+              typeof p.approvalId !== "string"
+              || typeof p.allow !== "boolean"
+              || (p.always !== undefined && typeof p.always !== "boolean")
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "approvalId + boolean allow required"));
             }
-            return reply(rpcResult(id!, {})); // idempotent — a late/duplicate reply is a no-op
+            const finishApproval = (expected?: { scope: "session" | "external"; sessionId: string }): {} => {
+              if (expected?.scope === "session") authorizeSessionMutation(ws, expected.sessionId, p);
+              const approval = pendingApprovals.get(p.approvalId);
+              if (!approval) return {};
+              if (
+                expected
+                && (approval.scope !== expected.scope || approval.sessionId !== expected.sessionId)
+              ) {
+                throw new SessionCommandRpcError(ERR.CONFLICT, "approval no longer belongs to the requested session");
+              }
+              if (!expected && approval.scope === "session") authorizeSessionMutation(ws, approval.sessionId, p);
+              const allowed = p.allow === true;
+              const value = allowed && p.always === true && approval.allowAlways ? "always" : allowed;
+              approval.finish(value, value === "always" ? "allowed_always" : value ? "allowed" : "denied");
+              return {};
+            };
+            if (p.commandId === undefined) {
+              return reply(rpcResult(id!, finishApproval())); // legacy: a late/duplicate reply is a no-op
+            }
+            if (!validSessionCommandId(p.commandId)) {
+              return reply(rpcError(id, ERR.PARAMS, "commandId must be a UUID"));
+            }
+            if (
+              (p.scope !== "session" && p.scope !== "external")
+              || typeof p.sessionId !== "string"
+              || !p.sessionId
+              || p.sessionId.length > 256
+            ) {
+              return reply(rpcError(id, ERR.PARAMS, "scope + sessionId are required with commandId"));
+            }
+            const expected = { scope: p.scope, sessionId: p.sessionId } as const;
+            const pending = pendingApprovals.get(p.approvalId);
+            if (pending && (pending.scope !== expected.scope || pending.sessionId !== expected.sessionId)) {
+              return reply(rpcError(id, ERR.CONFLICT, "approval does not belong to the requested session"));
+            }
+            if (expected.scope === "session") {
+              const session = hub.get(expected.sessionId);
+              if (!session) return reply(rpcError(id, ERR.NO_SESSION, "no such live session"));
+              const result = await runIdempotentSessionCommand(
+                "approval.reply",
+                p,
+                session,
+                async () => finishApproval(expected),
+              );
+              return reply(rpcResult(id!, result));
+            }
+            if (externalSessionSpaceId() !== "personal") {
+              return reply(rpcError(id, ERR.UNAUTHORIZED, "local external sessions are available only in Personal Space"));
+            }
+            const result = await runIdempotentExternalCommand(
+              "approval.reply",
+              p,
+              expected.sessionId,
+              async () => finishApproval(expected),
+            );
+            return reply(rpcResult(id!, result));
           }
           case "plugins.list": {
             const on = new Set(enabledPlugins().map((pl) => pl.name));
