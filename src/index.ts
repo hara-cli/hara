@@ -195,11 +195,16 @@ import {
   type SubagentLifecycleObserver,
   type SubagentResult,
 } from "./subagent/runtime.js";
-import type {
-  AgentMailboxDelivery,
-  AgentTeamController,
-  AgentTeamExecutionMetrics,
+import {
+  AgentTeamStore,
+  DurableAgentTeam,
+  type AgentMailboxLifecycleEvent,
+  type AgentMailboxDelivery,
+  type AgentTeamAgentView,
+  type AgentTeamController,
+  type AgentTeamExecutionMetrics,
 } from "./subagent/team.js";
+import { AgentWorktreeManager } from "./subagent/worktree.js";
 import {
   overrideProviderTarget,
   profileByIdForConfig,
@@ -289,6 +294,8 @@ import {
   saveSession,
   recordSessionCompactionState,
   recordSessionRuntimeItem,
+  readSessionJournal,
+  replaySessionJournal,
   loadSession,
   acquireSessionLock,
   reclaimOrphanedSessionLocks,
@@ -7562,6 +7569,208 @@ program.action(async (opts) => {
         },
       }
     : {};
+  // Interactive CLI sessions are persistent hosts too: keep the same durable Agent tree contract used by
+  // Serve/Desktop instead of exposing only the older one-shot `agent` helper. The tree lives outside the
+  // transcript, remains bound to this exact session/profile/Space, and is interrupted truthfully before this
+  // foreground host exits or hands the workspace to another Hara process.
+  const interactiveAgentTaskIds = new Map<string, string>();
+  if (task) interactiveAgentTaskIds.set(task.turnId, task.id);
+  const interactiveWorkspaceStates = new Map<string, RunRuntimeItemEvent["state"]>();
+  try {
+    for (const item of replaySessionJournal(readSessionJournal(meta.id).events).runtimeItems) {
+      if (item.kind === "diff" && item.name === "agent_worktree_diff") {
+        interactiveWorkspaceStates.set(item.itemId, item.state);
+      }
+    }
+  } catch {
+    // The session snapshot remains authoritative. A damaged optional journal is diagnosed by the normal
+    // replay surface and must not make an otherwise readable conversation unusable.
+  }
+  const workspaceRuntimeState = (agent: AgentTeamAgentView): RunRuntimeItemEvent["state"] | undefined => {
+    const workspace = agent.workspace;
+    if (!workspace) return undefined;
+    switch (workspace.state) {
+      case "pending": return "queued";
+      case "ready": return workspace.capturedAt && workspace.patchBytes === 0 ? "completed" : "started";
+      case "changes": return "paused";
+      case "applying": return "resumed";
+      case "applied": return "completed";
+      case "rejected": return "cancelled";
+      case "error": return "failed";
+    }
+  };
+  const workspaceTransitionPath = (
+    from: RunRuntimeItemEvent["state"] | undefined,
+    to: RunRuntimeItemEvent["state"],
+  ): RunRuntimeItemEvent["state"][] => {
+    if (from === to) return [];
+    const terminal = new Set<RunRuntimeItemEvent["state"]>(["completed", "failed", "cancelled", "denied"]);
+    if (from && terminal.has(from)) return [];
+    const start = from === undefined
+      ? ["queued", "started"] as RunRuntimeItemEvent["state"][]
+      : [from];
+    const edges = new Map<RunRuntimeItemEvent["state"], RunRuntimeItemEvent["state"][]>([
+      ["queued", ["started", "completed", "failed", "cancelled"]],
+      ["started", ["paused", "completed", "failed", "cancelled"]],
+      ["paused", ["resumed", "failed", "cancelled"]],
+      ["resumed", ["paused", "completed", "failed", "cancelled"]],
+    ]);
+    const queue = start.map((state) => ({ state, path: [state] }));
+    const seen = new Set<RunRuntimeItemEvent["state"]>();
+    while (queue.length) {
+      const current = queue.shift()!;
+      if (seen.has(current.state)) continue;
+      seen.add(current.state);
+      if (current.state === to) return from === undefined ? current.path : current.path.slice(1);
+      for (const next of edges.get(current.state) ?? []) {
+        queue.push({ state: next, path: [...current.path, next] });
+      }
+    }
+    return [];
+  };
+  const interactiveAgentTeam = new DurableAgentTeam({
+    sessionId: meta.id,
+    store: new AgentTeamStore(homedir()),
+    currentRootTurnId: () => task?.turnId,
+    limits: () => {
+      const perAgentRounds = Math.max(1, Math.min(24, cfg.maxAgentRounds));
+      const modelWindow = provider.connection?.capabilities.contextWindowTokens
+        ?? bar.contextWindow(provider.model);
+      return {
+        maxGenerations: 128,
+        maxProviderRounds: Math.max(perAgentRounds, Math.min(384, perAgentRounds * 8)),
+        maxToolCalls: Math.max(96, Math.min(3_072, perAgentRounds * 64)),
+        maxTokens: Math.max(200_000, Math.min(4_000_000, modelWindow * 2)),
+        maxActiveMs: Math.max(cfg.runTimeoutMs, Math.min(2 * 60 * 60_000, cfg.runTimeoutMs * 4)),
+        maxRoundsPerAgent: perAgentRounds,
+        maxToolsPerAgent: Math.max(16, Math.min(256, perAgentRounds * 8)),
+        maxTokensPerAgent: Math.max(32_000, Math.min(500_000, Math.floor(modelWindow / 2))),
+      };
+    },
+    worktreeManager: () => new AgentWorktreeManager(cwd, homedir(), meta.id),
+    executor: async (request) => {
+      const agent = interactiveAgentTeam.list().find((candidate) => candidate.id === request.id);
+      const rootTurnId = agent?.rootTurnId ?? task?.turnId;
+      const taskId = rootTurnId ? interactiveAgentTaskIds.get(rootTurnId) : undefined;
+      assertInteractiveAudience();
+      const observers = {
+        onSubagentLifecycle: (event: Parameters<NonNullable<SubagentLifecycleObserver>>[0]) => {
+          if (!taskId || !rootTurnId) return;
+          recordSessionRuntimeItem({
+            sessionId: meta.id,
+            taskId,
+            turnId: rootTurnId,
+            itemId: `agent:${event.id}:${request.generation}`,
+            kind: "agent",
+            state: event.state === "working" ? "started" : event.state,
+            role: "agent",
+            provider: event.providerId,
+            generation: request.generation,
+            at: event.endedAt ?? event.startedAt ?? event.queuedAt,
+          });
+        },
+      };
+      const result = await runSubagentResult(
+        cfg,
+        provider,
+        cwd,
+        sandbox,
+        projectContext,
+        stats,
+        request.task,
+        request.role,
+        request.signal,
+        observers,
+        authoritativeProfileId,
+        meta.spaceId,
+        {
+          id: request.id,
+          agentTeam: request.controller,
+          pendingInput: request.pendingInput,
+          executionBudget: request.budget,
+          reportProgress: request.reportProgress,
+          ...(request.workspace ? { workspace: request.workspace } : {}),
+        },
+      );
+      assertInteractiveAudience();
+      return {
+        status: result.status,
+        text: result.text,
+        ...(result.model ? { model: result.model } : {}),
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.usage ? { usage: result.usage } : {}),
+        ...(result.metrics ? { metrics: result.metrics } : {}),
+      };
+    },
+    onChange: (agent) => {
+      const desired = workspaceRuntimeState(agent);
+      const turnId = agent.rootTurnId;
+      const taskId = turnId ? interactiveAgentTaskIds.get(turnId) : undefined;
+      if (!desired || !turnId || !taskId) return;
+      const itemId = `agent-worktree:${agent.id}:${agent.generation}`;
+      const previous = interactiveWorkspaceStates.get(itemId);
+      for (const state of workspaceTransitionPath(previous, desired)) {
+        recordSessionRuntimeItem({
+          sessionId: meta.id,
+          taskId,
+          turnId,
+          itemId,
+          kind: "diff",
+          state,
+          parentItemId: `agent:${agent.id}:${agent.generation}`,
+          name: "agent_worktree_diff",
+          effect: "edit",
+          generation: agent.generation,
+        });
+        interactiveWorkspaceStates.set(itemId, state);
+      }
+    },
+    onMailbox: (event: AgentMailboxLifecycleEvent) => {
+      const turnId = event.rootTurnId;
+      const taskId = turnId ? interactiveAgentTaskIds.get(turnId) : undefined;
+      if (!turnId || !taskId) return;
+      recordSessionRuntimeItem({
+        sessionId: meta.id,
+        taskId,
+        turnId,
+        itemId: `mailbox:${event.id}`,
+        kind: "mailbox",
+        state: event.state,
+        role: "agent",
+        name: event.kind,
+        generation: event.generation,
+        at: event.at,
+      });
+    },
+  });
+  const interactiveAgentControllerForRun = (): AgentTeamController | undefined => {
+    if (!task) return undefined;
+    interactiveAgentTaskIds.set(task.turnId, task.id);
+    return interactiveAgentTeam.controller("/root", { rootTurnId: task.turnId });
+  };
+  const interactiveAgentContextForRun = (): { agentTeam?: AgentTeamController } => {
+    const controller = interactiveAgentControllerForRun();
+    return controller ? { agentTeam: controller } : {};
+  };
+  let interactiveAgentShutdown: Promise<boolean> | undefined;
+  const shutdownInteractiveAgentTeam = (): Promise<boolean> => {
+    if (interactiveAgentShutdown) return interactiveAgentShutdown;
+    interactiveAgentShutdown = (async () => {
+      const quiet = await interactiveAgentTeam.interruptAllAndWait(10_000);
+      interactiveAgentTeam.close();
+      return quiet;
+    })();
+    return interactiveAgentShutdown;
+  };
+  let interactiveAgentShutdownWarningShown = false;
+  const stopInteractiveAgentTeam = async (): Promise<void> => {
+    const quiet = await shutdownInteractiveAgentTeam();
+    if (!quiet && !interactiveAgentShutdownWarningShown) {
+      interactiveAgentShutdownWarningShown = true;
+      out(c.yellow("Hara saved the active Agent tree as interrupted after its shutdown deadline. Resume a child explicitly in the next session.\n"));
+    }
+  };
+  process.on("exit", () => interactiveAgentTeam.close());
   let requestedWorkspaceSwitch: string | null = null;
   let requestedSessionSwitch: { id: string; cwd: string; kind: "resume" | "workspace-transfer"; historyCount?: number } | null = null;
   const queueWorkspaceSwitch = (target: string): string => {
@@ -7584,6 +7793,7 @@ program.action(async (opts) => {
     const target = sessionSwitch?.cwd ?? requestedWorkspaceSwitch!;
     requestedWorkspaceSwitch = null;
     requestedSessionSwitch = null;
+    await stopInteractiveAgentTeam();
     // The foreground child starts a new session. Do not keep the old session artificially locked for the
     // entire lifetime of the new workspace merely because this small parent process is waiting on it.
     releaseSessionLock(sessionId);
@@ -8712,7 +8922,7 @@ program.action(async (opts) => {
               const __skApproval: ApprovalMode = h.approval === "plan" ? "suggest" : h.approval;
               let skillOutcome: RunOutcome | undefined;
               try {
-                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot }, approval: __skApproval, approvalChannel: true, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+                skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ...interactiveAgentContextForRun(), ui: { text: h.sink.assistantDelta, reasoning: h.sink.reasoningDelta, tool: h.sink.tool, diff: h.sink.diff, notice: h.sink.notice }, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot }, approval: __skApproval, approvalChannel: true, confirm: h.confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), pendingInput, stats, signal: h.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
               } catch (e: any) {
                 h.sink.notice(`[error] ${e?.message ?? e}`);
               }
@@ -8798,7 +9008,7 @@ program.action(async (opts) => {
           };
           let planOutcome = await runAgent(history, {
             provider,
-            ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
+            ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ...interactiveAgentContextForRun(), ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
             approval: "suggest",
             approvalChannel: true,
             confirm: h.confirm,
@@ -8858,7 +9068,7 @@ program.action(async (opts) => {
             const xout = stats.output;
             planOutcome = await runAgent(history, {
               provider,
-              ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
+              ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ...interactiveAgentContextForRun(), ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
               approval: choice as ApprovalMode,
               approvalChannel: true,
               memory: buildMemory(),
@@ -8908,7 +9118,7 @@ program.action(async (opts) => {
         const beforeOut = stats.output;
         const turnOutcome = await runAgent(history, {
           provider,
-          ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
+          ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ...interactiveAgentContextForRun(), ui, ask: h.ask, describeImage: describeScreenshot, inspectImage, locate: locateScreenshot },
           approval: appr,
           approvalChannel: true,
           memory: buildMemory(),
@@ -8951,6 +9161,7 @@ program.action(async (opts) => {
     // hint would mislead and `hara resume <id>` would fail with "no session matching".
     if (loadSession(meta.id))
       out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
+    await stopInteractiveAgentTeam();
     await closeMcp();
     await relaunchRequestedTarget();
     process.exit(process.exitCode ?? 0); // TUI done — exit cleanly (ink can leave stdin referenced)
@@ -9019,7 +9230,7 @@ program.action(async (opts) => {
           currentTurn = skillTurn;
           let skillOutcome: RunOutcome | undefined;
           try {
-            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+            skillOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ...interactiveAgentContextForRun(), ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext: skillExecutionContext, ...(sk.allowedTools !== undefined ? { skillPolicies: [{ id: sk.id, allowedTools: sk.allowedTools }] } : {}), taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), stats, signal: skillTurn.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
           } catch (e: any) {
             out(c.red(`\n[error] ${e.message}\n`));
           }
@@ -9086,7 +9297,7 @@ program.action(async (opts) => {
     const t0 = Date.now();
     let turnOutcome: RunOutcome | undefined;
     try {
-      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
+      turnOutcome = await runAgent(history, { provider, ctx: { cwd, sandbox, profileId: authoritativeProfileId, spaceId: meta.spaceId, sessionId: meta.id, spawn, ...interactiveAgentContextForRun(), ask: askUser, inspectImage: (image, hint, signal) => inspectImageWithCurrentRoute(provider, __activeP, image, hint, signal, meta.spaceId) }, approval, approvalChannel: true, confirm, autoApprove, projectApprovals, projectContext, memory: buildMemory(), continuationSession, executionContext, skillPolicies: turnSkillPolicies, taskIntake: taskIntakeForRun(), ...runtimeJournalForRun(), stats, signal: turnController.signal, fallback: fbOpt, guardian: guardianOpt, ...agentRunLimits(cfg) });
     } catch (e: any) {
       out(c.red(`\n[error] ${e.message}\n`));
     }
@@ -9127,6 +9338,7 @@ program.action(async (opts) => {
   if (loadSession(meta.id))
     out("\n" + c.dim("Session ") + c.bold(shortId(meta.id)) + c.dim(" saved · resume:  ") + c.cyan(`hara resume ${shortId(meta.id)}`) + "\n");
   rl.close();
+  await stopInteractiveAgentTeam();
   await closeMcp();
   await relaunchRequestedTarget();
 });

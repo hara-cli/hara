@@ -35,7 +35,7 @@ providers behind that boundary, not competing user-facing control products.
 | Tool approvals and sandbox boundary | Implemented and replay-auditable after 0.169.0 | Engine policy remains authoritative rather than trusting prose in the transcript. Registered requests and terminal outcomes now have content-free task/turn-bound journal items; approval text and tool payloads remain only on the live protected surface. |
 | Background jobs and bounded output | Implemented | Long-running processes and large tool output do not have to block or flood the main model context. |
 | Deferred tool discovery | Implemented | Optional web, desktop, scheduler, external-agent, and MCP schemas stay out of the base prompt until provider-neutral `tool_search` activates an allowed capability. |
-| Durable Agent teams and isolated writing | Hardened after 0.169.0 | Persistent Serve sessions own stable nested Agent IDs/paths, parent/root turn provenance, a redacted payload-bound idempotent mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. Children are read-only by default; an explicit `isolated-write` child receives a private Git worktree and one owned, bounded Diff that requires fresh human approval to apply. Whole-tree and per-Agent generations, rounds, tools, active time, and actual transport tokens are durably bounded from the active saved connection's model capability; subscription allowance remains provider-authoritative. The original `agent` tool remains the faster one-shot path. |
+| Durable Agent teams and isolated writing | Hardened after 0.175.1 | Persistent Serve/Desktop sessions and attached interactive CLI sessions own stable nested Agent IDs/paths, parent/root turn provenance, a redacted payload-bound idempotent mailbox, background spawn, list/wait/message/follow-up/interrupt/resume, terminal outcomes, shared concurrency/accounting, cold-interruption recovery, and replayable safe state events. Interactive CLI shutdown and workspace/session handoff drain or explicitly interrupt the tree before releasing its writer. Children are read-only by default; an explicit `isolated-write` child receives a private Git worktree and one owned, bounded Diff that requires fresh human approval to apply. Whole-tree and per-Agent generations, rounds, tools, active time, and actual transport tokens are durably bounded from the active saved connection's model capability; subscription allowance remains provider-authoritative. One-shot `hara -p` deliberately keeps the lower-overhead `agent` primitive because no long-lived host remains after that process exits. |
 | Provider-independent runtime | Stronger Hara requirement | Hara keeps Anthropic/OpenAI-compatible/subscription/enterprise connections behind one engine contract. |
 | External Codex app-server adapter | Implemented | Hara can preserve the provider's native execution path without leaking its native session ID into UI clients. |
 | Hara Mobile companion bridge | Restart-safe foundation implemented after 0.169.0 | CLI owns account login, Desktop device registration, explicit phone pairing, signed end-to-end encrypted relay envelopes, bounded publication of Personal coding-agent sessions, expiring control leases, idempotent remote commands, sequenced terminal input, persisted publications/outcomes, and a Relay-owned delivery cursor. The mobile app and production Account/Relay deployment remain separate delivery work; the phone never receives provider credentials or native session IDs. |
@@ -79,7 +79,8 @@ after its response, plus one reminder/fallback policy per window.
 
 ### 2.3 Durable Agent tree, mailbox, and cold resume
 
-The provider-neutral foundation is now implemented for persistent Serve/Desktop sessions. A session owns a
+The provider-neutral foundation is now implemented for persistent Serve/Desktop and attached interactive CLI
+sessions. A session owns a
 durable tree with stable child UUIDs and paths, parent/root turn provenance, role and lifecycle generation. The
 private `0600` store uses locked atomic writes and retains redacted instructions, mailbox deliveries, lifecycle
 state, aggregate usage, and terminal outcomes across process restarts.
@@ -102,8 +103,14 @@ allowance, coefficients, reset windows, and overage remain separate provider/Con
 
 Writable children now use the managed worktree/owned-Diff/manual-merge contract in section 2.10. The child still
 inherits the current session's saved connection, account, model-capability policy, and organization authorization;
-workspace mode never selects or broadens a provider. Remaining Agent work is to expose the same durable host to
-direct non-Serve CLI sessions and add richer Desktop/mobile presentation.
+workspace mode never selects or broadens a provider. Attached `hara` sessions now host the same tree, expose the
+collaboration schemas only while that host is real, retain exact profile/Space and root-turn fences, journal
+Agent/mailbox/Diff lifecycles, cold-restore completed or interrupted children, and drain them before CLI exit or
+workspace/session relaunch. A real-process regression spawns a child, waits for its result, exits, resumes the
+conversation in another process, and observes the same stable child. Headless one-shot `hara -p` remains
+intentionally non-durable: making a process that immediately exits advertise background work would be false unless
+a separate long-lived Host is selected. Remaining Agent work is richer Desktop/mobile presentation rather than
+another hidden execution authority.
 
 The direct headless task path now also preserves an unanswered structured question and its bounded options as a
 durable pause, normalizes a numbered remote reply to the retained option, and records it in the verified decision
