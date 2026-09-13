@@ -4,7 +4,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PromptAssembler } from "../dist/agent/prompt.js";
-import { composeSystem, replyLanguageInstruction } from "../dist/agent/loop.js";
+import {
+  composeSystem,
+  replyLanguageInstruction,
+  retainedQuestionCopy,
+  runtimeCopyLanguage,
+} from "../dist/agent/loop.js";
 import { runtimeTimePrompt } from "../dist/runtime-time.js";
 
 test("PromptAssembler renders deterministic text and refuses a stable suffix after turn context", () => {
@@ -129,6 +134,22 @@ test("reply language follows the latest message by default and accepts an explic
     /same language as the user's latest message/,
     "invalid environment values fail back to automatic language matching",
   );
+});
+
+test("engine-owned retained-question copy follows Chinese conversations without mixing English", () => {
+  const chinese = [{ role: "user", content: "帮我生成一个表格" }];
+  const english = [{ role: "user", content: "Build a spreadsheet" }];
+
+  assert.equal(runtimeCopyLanguage(chinese, {}), "zh-Hans");
+  assert.equal(runtimeCopyLanguage(english, {}), "en");
+  assert.equal(runtimeCopyLanguage(english, { HARA_REPLY_LANGUAGE: "zh-CN" }), "zh-Hans");
+  assert.equal(runtimeCopyLanguage(chinese, { HARA_REPLY_LANGUAGE: "en" }), "en");
+
+  const copy = retainedQuestionCopy(chinese, {});
+  assert.equal(copy.defaultHeader, "需要你确认");
+  assert.match(copy.footer, /请直接在当前对话中回复/);
+  assert.match(copy.footer, /受保护输入框/);
+  assert.doesNotMatch(copy.footer, /Reply in this same conversation/);
 });
 
 test("gateway prompt identifies the actual execution host and treats location corrections as evidence requests", () => {

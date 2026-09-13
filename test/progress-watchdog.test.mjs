@@ -189,3 +189,18 @@ test("an unattended 200k-token run pauses early when durable state does not adva
   assert.equal(decision.state.trigger, "unattended_token_budget");
   assert.equal(decision.state.tokens.total, 200_000);
 });
+
+test("an attached 200k-token run also pauses instead of only printing warnings", () => {
+  const watchdog = new AgentProgressWatchdog({ unattended: false });
+  let decision;
+  for (let currentRound = 1; currentRound <= 3; currentRound += 1) {
+    decision = watchdog.recordRound(round({
+      observations: [{ name: `interactive_${currentRound}`, input: {}, content: `state-${currentRound}` }],
+      usage: { input: currentRound * 50_000, output: currentRound * 20_000 },
+    }));
+  }
+  assert.equal(decision.stop, true);
+  assert.equal(decision.state.trigger, "unattended_token_budget");
+  assert.equal(decision.state.tokens.total, 210_000);
+  assert.equal(decision.state.checkpointStaleRounds, 3);
+});

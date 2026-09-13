@@ -423,7 +423,43 @@ test("unchanged successful tool evidence stops before the general round limit", 
   assert.match(outcome.error, /same successful rewrite_helper call.*no durable progress/i);
   assert.match(outcome.error, /4 tool call\(s\)/);
   assert.doesNotMatch(outcome.error, /increase.*maxAgentRounds/i);
-  assert.ok(notices.some((message) => /no-progress warning/.test(message)));
+  assert.ok(notices.some((message) => /Task progress has stalled/.test(message)));
+});
+
+test("Chinese runs localize visible no-progress warnings and stop messages", async () => {
+  let turns = 0;
+  const notices = [];
+  const provider = {
+    id: "chinese-no-progress-loop",
+    model: "chinese-no-progress-loop",
+    async turn() {
+      turns += 1;
+      return {
+        text: "",
+        toolUses: [{ id: `same-zh-${turns}`, name: "chinese_probe", input: { target: "same" } }],
+        stop: "tool_use",
+      };
+    },
+  };
+  const outcome = await runAgent([{ role: "user", content: "继续生成这个表格" }], base(provider, {
+    ctx: { cwd: process.cwd(), ui: { text() {}, reasoning() {}, tool() {}, diff() {}, notice: (message) => notices.push(message) } },
+    maxRounds: 20,
+    timeoutMs: "10s",
+    extraTools: [{
+      name: "chinese_probe",
+      description: "returns stable evidence",
+      input_schema: { type: "object", properties: { target: { type: "string" } }, required: ["target"] },
+      kind: "read",
+      async run() { return "相同结果，没有新增证据。"; },
+    }],
+  }));
+
+  assert.equal(outcome.status, "halted");
+  assert.equal(outcome.stopReason, "no_progress");
+  assert.match(outcome.error, /任务已暂停/);
+  assert.match(outcome.error, /没有形成可验证进展/);
+  assert.ok(notices.some((message) => /任务进展停滞/.test(message)));
+  assert.equal(notices.some((message) => /no-progress warning/.test(message)), false);
 });
 
 test("changing successful observations are progress and do not trip the no-progress guard", async () => {
@@ -586,7 +622,7 @@ test("changing command fragments without durable state pause within eight unatte
   assert.equal(outcome.status, "halted");
   assert.equal(outcome.stopReason, "no_progress");
   assert.equal(task.checkpoint.completion, undefined);
-  assert.ok(notices.some((message) => /no-progress warning/i.test(message)));
+  assert.ok(notices.some((message) => /Task progress has stalled/i.test(message)));
 });
 
 test("a malformed tool call gets one bounded retry on the same model", async () => {

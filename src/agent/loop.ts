@@ -41,6 +41,7 @@ import {
 } from "./repeat-guard.js";
 import {
   AgentProgressWatchdog,
+  UNATTENDED_NO_PROGRESS_TOKEN_LIMIT,
   UNATTENDED_PROGRESS_STOP_ROUNDS,
   type ProgressObservation,
   type ProgressState,
@@ -161,6 +162,53 @@ export function replyLanguageInstruction(env: NodeJS.ProcessEnv = process.env): 
     return `Reply in ${requested} unless the user explicitly asks for another language;`;
   }
   return "Reply in the same language as the user's latest message unless they explicitly ask for another language;";
+}
+
+type RuntimeCopyLanguage = "en" | "zh-Hans";
+
+const RETAINED_QUESTION_COPY = Object.freeze({
+  en: Object.freeze({
+    defaultQuestion: "A user decision is required to continue.",
+    defaultHeader: "Need your answer",
+    footer: "Reply in this same conversation and Hara will continue the retained task. Never send credentials here; use Hara's masked Settings/login surface.",
+    blockedStep: "answer the pending user question",
+    nextStep: "continue automatically after the next reply in this persisted conversation",
+    waitingEvidence: "The current persisted run has no live interactive answer channel, so no answer was inferred.",
+    dependencyEvidence: "The model invoked ask_user without an explicit deterministic default.",
+  }),
+  "zh-Hans": Object.freeze({
+    defaultQuestion: "需要你的确认后才能继续。",
+    defaultHeader: "需要你确认",
+    footer: "请直接在当前对话中回复，Hara 会继续执行已保留的任务。请勿在这里发送凭据；请使用 Hara 设置或登录界面的受保护输入框。",
+    blockedStep: "回答待确认问题",
+    nextStep: "收到当前对话的下一条回复后自动继续",
+    waitingEvidence: "当前保留的任务没有实时交互回答通道，因此没有推断用户答案。",
+    dependencyEvidence: "模型调用 ask_user 时没有提供明确且确定的默认值。",
+  }),
+});
+
+export function runtimeCopyLanguage(
+  history: NeutralMsg[],
+  env: NodeJS.ProcessEnv = process.env,
+): RuntimeCopyLanguage {
+  const requested = String(env.HARA_REPLY_LANGUAGE ?? "").trim().toLowerCase();
+  if (/^[a-z]{2,8}(?:-[a-z0-9]{1,8}){0,3}$/u.test(requested)) {
+    return requested === "zh" || requested.startsWith("zh-") ? "zh-Hans" : "en";
+  }
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const message = history[index];
+    if (message.role !== "user") continue;
+    const visibleText = message.displayContent ?? message.content;
+    return /\p{Script=Han}/u.test(visibleText) ? "zh-Hans" : "en";
+  }
+  return "en";
+}
+
+export function retainedQuestionCopy(
+  history: NeutralMsg[],
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  return RETAINED_QUESTION_COPY[runtimeCopyLanguage(history, env)];
 }
 
 const HARA_SYSTEM = () =>
@@ -635,6 +683,7 @@ function recoverableMalformedToolCall(error: string | undefined): boolean {
 }
 
 interface RunLifecycle {
+  language: RuntimeCopyLanguage;
   signal: AbortSignal;
   timeoutController: AbortController;
   timeoutTimer: ReturnType<typeof setTimeout> | null;
@@ -849,7 +898,7 @@ async function waitForHuman<T>(opts: RunOpts, life: RunLifecycle, action: () => 
   }
 }
 
-function createRunLifecycle(opts: RunOpts): RunLifecycle {
+function createRunLifecycle(opts: RunOpts, language: RuntimeCopyLanguage): RunLifecycle {
   const timeoutMs = agentRunTimeoutMs(opts.timeoutMs);
   const maxRounds = agentMaxRounds(opts.maxRounds);
   const timeoutController = new AbortController();
@@ -865,6 +914,7 @@ function createRunLifecycle(opts: RunOpts): RunLifecycle {
     else signal.addEventListener("abort", stopped, { once: true });
   });
   const life: RunLifecycle = {
+    language,
     signal,
     timeoutController,
     timeoutTimer: null,
@@ -918,27 +968,49 @@ function hardStop(
 ): RunOutcome {
   const elapsedMs = runActiveElapsedMs(life);
   const progress = detail?.progress;
+  const chinese = life.language === "zh-Hans";
   const progressFacts = progress
-    ? [
-        `round ${progress.rounds}/${progress.maxRounds}`,
-        `${progress.toolCalls} tool call(s)`,
-        `${progress.tokens.total} token(s) in this run`,
-        progress.todo.total > 0
-          ? `todo ${progress.todo.done}/${progress.todo.total} done (${progress.todo.unchangedRounds} unchanged round(s))`
-          : "no active todo progress",
-      ].join("; ")
+    ? (chinese
+        ? [
+            `第 ${progress.rounds}/${progress.maxRounds} 轮`,
+            `${progress.toolCalls} 次工具调用`,
+            `本轮累计 ${progress.tokens.total} token`,
+            progress.todo.total > 0
+              ? `待办完成 ${progress.todo.done}/${progress.todo.total}（连续 ${progress.todo.unchangedRounds} 轮未推进）`
+              : "没有待办进展",
+          ]
+        : [
+            `round ${progress.rounds}/${progress.maxRounds}`,
+            `${progress.toolCalls} tool call(s)`,
+            `${progress.tokens.total} token(s) in this run`,
+            progress.todo.total > 0
+              ? `todo ${progress.todo.done}/${progress.todo.total} done (${progress.todo.unchangedRounds} unchanged round(s))`
+              : "no active todo progress",
+          ]).join("; ")
     : "";
-  const message = kind === "deadline"
-    ? `⏸ agent run paused: active-execution deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). Waiting for your answers did not consume this budget. No further model or tool calls will start in this turn. Session-backed work keeps its task and checklist checkpoint; type \`/continue\` to resume in a fresh bounded turn. Only for intentionally long single turns, use \`hara config set runTimeoutMs 45m\` (maximum 2h).`
-    : kind === "task_round_budget"
-      ? `⏸ task paused after ${life.taskRoundsUsed + life.rounds} cumulative provider round(s), reaching its ${life.taskRoundLimit}-round task budget. This is a recoverable evidence checkpoint, not completion. Review the task state and type \`/continue\` to explicitly open the next bounded tranche.`
-    : kind === "max_rounds"
-      ? `⏸ agent paused at the ${life.maxRounds}-round safety boundary after ${formatAgentDuration(elapsedMs)}. Hara stopped before spending more tokens because the current strategy did not converge. Completed file changes and the latest task checkpoint remain in this conversation. Review the current artifact, then use \`/continue\` for one bounded, materially different strategy; raising the round limit is not the first recovery step.`
-      : kind === "strategy_stall"
-        ? `⏸ agent paused early after ${detail?.count ?? 20} consecutive working round(s) without a durable task checkpoint. Hara preserved completed changes and stopped before the general round limit. Review the current artifact and acceptance checks, then use \`/continue\` with one bounded, materially different strategy.`
-      : kind === "no_progress" || detail?.mode === "no_progress"
-        ? `⏸ agent paused because ${detail?.label ?? "the current tool strategy"} made no durable progress. Hara stopped further model and tool calls before more tokens were spent (${progressFacts || `${detail?.count ?? 0} unchanged round(s)`}). Completed changes remain saved. Review the visible stop reason, then use \`/continue\` only with a materially different strategy or after resolving the named boundary.`
-      : `⛔ agent run stopped: the same failing ${detail?.label ?? "tool call"} repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
+  const message = chinese
+    ? kind === "deadline"
+      ? `⏸ 任务已暂停：本轮主动执行在 ${life.rounds} 轮后达到 ${formatAgentDuration(life.timeoutMs)} 时限。等待你的回答不会计入该时限，本轮也不会再启动模型或工具调用。任务和检查点仍保留在当前对话中；输入 \`/continue\` 即可开始新的受限回合。只有确实需要单轮长时间运行时，才使用 \`hara config set runTimeoutMs 45m\`（上限 2h）。`
+      : kind === "task_round_budget"
+        ? `⏸ 任务已暂停：累计执行 ${life.taskRoundsUsed + life.rounds} 个模型回合，达到 ${life.taskRoundLimit} 轮任务预算。这是可恢复的证据检查点，并不表示任务完成。检查任务状态后，在当前对话输入 \`/continue\` 明确开始下一段受限执行。`
+        : kind === "max_rounds"
+          ? `⏸ 任务已在 ${life.maxRounds} 轮安全边界暂停，主动执行用时 ${formatAgentDuration(elapsedMs)}。当前策略没有收敛，Hara 已停止继续消耗 token。已完成的文件修改和最新任务检查点仍保留；检查当前产物后，可输入 \`/continue\` 使用一种有实质差异的受限策略继续。`
+          : kind === "strategy_stall"
+            ? `⏸ 任务已提前暂停：连续 ${detail?.count ?? 20} 个工作回合没有形成持久任务检查点。Hara 已保留完成的修改，并在达到总轮次上限前停止。检查当前产物和验收条件后，可输入 \`/continue\` 使用一种有实质差异的受限策略继续。`
+            : kind === "no_progress" || detail?.mode === "no_progress"
+              ? `⏸ 任务已暂停：${detail?.label ?? "当前工具策略"}，没有形成可验证进展。Hara 已停止继续调用模型和工具（${progressFacts || `连续 ${detail?.count ?? 0} 轮未变化`}）。已完成的修改仍保留；请先检查暂停原因，再在调整策略或解决明确阻塞后输入 \`/continue\`。`
+              : `⛔ 任务已停止：失败的 ${detail?.label ?? "工具调用"} 连续重复 ${detail?.count ?? REPEATED_FAILURE_LIMIT} 次。请更换方法或解决已报告的原因后重试。`
+    : kind === "deadline"
+      ? `⏸ agent run paused: active-execution deadline ${formatAgentDuration(life.timeoutMs)} reached after ${life.rounds} round(s). Waiting for your answers did not consume this budget. No further model or tool calls will start in this turn. Session-backed work keeps its task and checklist checkpoint; type \`/continue\` to resume in a fresh bounded turn. Only for intentionally long single turns, use \`hara config set runTimeoutMs 45m\` (maximum 2h).`
+      : kind === "task_round_budget"
+        ? `⏸ task paused after ${life.taskRoundsUsed + life.rounds} cumulative provider round(s), reaching its ${life.taskRoundLimit}-round task budget. This is a recoverable evidence checkpoint, not completion. Review the task state and type \`/continue\` to explicitly open the next bounded tranche.`
+        : kind === "max_rounds"
+          ? `⏸ agent paused at the ${life.maxRounds}-round safety boundary after ${formatAgentDuration(elapsedMs)}. Hara stopped before spending more tokens because the current strategy did not converge. Completed file changes and the latest task checkpoint remain in this conversation. Review the current artifact, then use \`/continue\` for one bounded, materially different strategy; raising the round limit is not the first recovery step.`
+          : kind === "strategy_stall"
+            ? `⏸ agent paused early after ${detail?.count ?? 20} consecutive working round(s) without a durable task checkpoint. Hara preserved completed changes and stopped before the general round limit. Review the current artifact and acceptance checks, then use \`/continue\` with one bounded, materially different strategy.`
+            : kind === "no_progress" || detail?.mode === "no_progress"
+              ? `⏸ agent paused because ${detail?.label ?? "the current tool strategy"} made no durable progress. Hara stopped further model and tool calls before more tokens were spent (${progressFacts || `${detail?.count ?? 0} unchanged round(s)`}). Completed changes remain saved. Review the visible stop reason, then use \`/continue\` only with a materially different strategy or after resolving the named boundary.`
+              : `⛔ agent run stopped: the same failing ${detail?.label ?? "tool call"} repeated ${detail?.count ?? REPEATED_FAILURE_LIMIT} times. Change the approach or fix the reported cause before retrying.`;
   const event: RunLimitEvent = {
     kind,
     message,
@@ -963,7 +1035,7 @@ function hardStop(
 
 /** Provider-agnostic agentic loop. Mutates `history` in place. */
 export async function runAgent(history: NeutralMsg[], opts: RunOpts): Promise<RunOutcome> {
-  const life = createRunLifecycle(opts);
+  const life = createRunLifecycle(opts, runtimeCopyLanguage(history));
   try {
     const outcome = await runAgentInner(history, opts, life);
     const uncommittedRounds = life.rounds - life.taskRoundsCommitted;
@@ -2104,6 +2176,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     };
     const headlessQuestionWithoutDefault = !ctx.ask && r.toolUses.some(isPendingHeadlessQuestion);
     if (headlessQuestionWithoutDefault) {
+      const questionCopy = RETAINED_QUESTION_COPY[life.language];
       if (!opts.taskIntake || !intakeTask || !ctx.sessionId) {
         history.push({
           role: "tool",
@@ -2122,8 +2195,8 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       const pendingAsk = r.toolUses.find(isPendingHeadlessQuestion)!;
       const pendingInput = pendingAsk.input as { question?: unknown; options?: unknown; header?: unknown; context?: unknown } | null;
       const safeQuestion = redactSensitiveText(
-        typeof pendingInput?.question === "string" ? pendingInput.question : "A user decision is required to continue.",
-      ).text.trim().slice(0, 800) || "A user decision is required to continue.";
+        typeof pendingInput?.question === "string" ? pendingInput.question : questionCopy.defaultQuestion,
+      ).text.trim().slice(0, 800) || questionCopy.defaultQuestion;
       const safeHeader = redactSensitiveText(typeof pendingInput?.header === "string" ? pendingInput.header : "").text.trim().slice(0, 120);
       const safeContext = redactSensitiveText(typeof pendingInput?.context === "string" ? pendingInput.context : "").text.trim().slice(0, 500);
       const safeOptions = Array.isArray(pendingInput?.options)
@@ -2150,16 +2223,16 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         finishToolRuntimeItem(index, r.toolUses[index].id === pendingAsk.id ? "completed" : "denied");
       }
       const waiting = applyTaskCheckpoint(intakeTask, {
-        blocked_step: "answer the pending user question",
+        blocked_step: questionCopy.blockedStep,
         block_reason: safeQuestion,
-        next_step: "continue automatically after the next reply in this persisted conversation",
+        next_step: questionCopy.nextStep,
         completion: {
           state: "awaiting_user",
-          evidence: ["The current persisted run has no live interactive answer channel, so no answer was inferred."],
+          evidence: [questionCopy.waitingEvidence],
           dependency: {
             kind: "material_choice",
             detail: safeQuestion,
-            evidence: ["The model invoked ask_user without an explicit deterministic default."],
+            evidence: [questionCopy.dependencyEvidence],
             ...(safeOptions.length ? { options: safeOptions } : {}),
           },
         },
@@ -2173,11 +2246,11 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         return interactionFailure("pending user-question checkpoint", error);
       }
       const renderedQuestion = [
-        safeHeader ? `[${safeHeader}]` : "Need your answer / 需要你确认",
+        safeHeader ? `[${safeHeader}]` : questionCopy.defaultHeader,
         safeContext,
         safeQuestion,
         ...(safeOptions.length ? safeOptions.map((option, index) => `${index + 1}. ${option}`) : []),
-        "Reply in this same conversation and Hara will continue the retained task. Never send credentials here; use Hara's masked Settings/login surface.",
+        questionCopy.footer,
       ].filter(Boolean).join("\n");
       emitVisibleText(`${renderedQuestion}\n`);
       return { status: "completed" };
@@ -3021,14 +3094,23 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       });
     }
     if (progressDecision.stop) {
-      const labels: Record<NonNullable<ProgressState["trigger"]>, string> = {
-        repeated_tool_call: `the same successful ${progressEvent.repeatedTool ?? "tool"} call kept returning substantially unchanged evidence`,
-        similar_tool_evidence: "recent successful tool rounds kept returning more than 80% similar evidence",
-        unattended_without_checkpoint: `an unattended run reached ${progressEvent.checkpointStaleRounds} working rounds without a new verified checkpoint or completed todo`,
-        unattended_token_budget: `an unattended run spent ${progressEvent.tokens.total} tokens without a new verified checkpoint or completed todo`,
-      };
+      const labels: Record<NonNullable<ProgressState["trigger"]>, string> = life.language === "zh-Hans"
+        ? {
+            repeated_tool_call: `同一个 ${progressEvent.repeatedTool ?? "工具"} 调用持续返回基本不变的结果`,
+            similar_tool_evidence: "最近成功的工具回合持续返回相似度超过 80% 的结果",
+            unattended_without_checkpoint: `连续 ${progressEvent.checkpointStaleRounds} 个工作回合没有新增可验证检查点或完成待办`,
+            unattended_token_budget: `本轮已使用 ${progressEvent.tokens.total} token，仍没有新增可验证检查点或完成待办`,
+          }
+        : {
+            repeated_tool_call: `the same successful ${progressEvent.repeatedTool ?? "tool"} call kept returning substantially unchanged evidence`,
+            similar_tool_evidence: "recent successful tool rounds kept returning more than 80% similar evidence",
+            unattended_without_checkpoint: `an unattended run reached ${progressEvent.checkpointStaleRounds} working rounds without a new verified checkpoint or completed todo`,
+            unattended_token_budget: `this run spent ${progressEvent.tokens.total} tokens without a new verified checkpoint or completed todo`,
+          };
       return hardStop(opts, life, "no_progress", {
-        label: progressEvent.trigger ? labels[progressEvent.trigger] : "the current strategy",
+        label: progressEvent.trigger
+          ? labels[progressEvent.trigger]
+          : life.language === "zh-Hans" ? "当前策略" : "the current strategy",
         count: progressEvent.noProgressRounds,
         mode: "no_progress",
         progress: progressEvent,
@@ -3048,14 +3130,15 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
             "Recent evidence or durable task state is not advancing. Stop changing offsets, temporary names, " +
             "command fragments, or checkpoint wording. Inspect the original acceptance checks now; either " +
             "record genuinely new verified evidence/finish a todo, state a typed human-only blocker, or stop. " +
-            `In an unattended run Hara pauses at ${UNATTENDED_PROGRESS_STOP_ROUNDS} stale working rounds.`,
+            `Every run pauses after ${UNATTENDED_NO_PROGRESS_TOKEN_LIMIT} tokens without durable progress; ` +
+            `an unattended run also pauses at ${UNATTENDED_PROGRESS_STOP_ROUNDS} stale working rounds.`,
           ]),
         });
         showRunNotice(
           opts,
-          `✻ no-progress warning: round ${progressEvent.rounds}, ${progressEvent.toolCalls} tool call(s), ` +
-          `${progressEvent.tokens.total} token(s), todo ${progressEvent.todo.done}/${progressEvent.todo.total}; ` +
-          "the Agent must produce a real checkpoint or change strategy.",
+          life.language === "zh-Hans"
+            ? `✻ 任务进展停滞：连续 ${progressEvent.checkpointStaleRounds} 轮没有新的可验证检查点，Hara 正在要求 Agent 更换策略。`
+            : `✻ Task progress has stalled for ${progressEvent.checkpointStaleRounds} round(s); Hara is requiring the Agent to record a verified checkpoint or change strategy.`,
         );
       }
     }

@@ -8,6 +8,9 @@ export const REPEATED_SUCCESSFUL_CALL_STOP = 4;
 export const SIMILAR_EVIDENCE_STOP_ROUNDS = 6;
 export const UNATTENDED_PROGRESS_NUDGE_ROUNDS = 5;
 export const UNATTENDED_PROGRESS_STOP_ROUNDS = 8;
+/** Legacy exported name retained for persisted protocol compatibility. The token boundary now protects
+ * attached and unattended runs alike: either can otherwise burn hundreds of thousands of tokens while
+ * changing tool inputs without advancing a verified checkpoint. */
 export const UNATTENDED_NO_PROGRESS_TOKEN_LIMIT = 200_000;
 
 const MAX_OBSERVATIONS = 128;
@@ -329,10 +332,8 @@ export class AgentProgressWatchdog {
     } else if (this.similarEvidenceRounds >= SIMILAR_EVIDENCE_STOP_ROUNDS) {
       trigger = "similar_tool_evidence";
     } else if (
-      this.unattended
-      && totalTokens >= UNATTENDED_NO_PROGRESS_TOKEN_LIMIT
-      && this.unattendedRounds >= 4
-      && this.checkpointStaleRounds >= 4
+      totalTokens >= UNATTENDED_NO_PROGRESS_TOKEN_LIMIT
+      && this.checkpointStaleRounds >= 3
     ) {
       trigger = "unattended_token_budget";
     } else if (
@@ -348,9 +349,8 @@ export class AgentProgressWatchdog {
       || (this.unattended
         && this.unattendedRounds >= UNATTENDED_PROGRESS_NUDGE_ROUNDS
         && this.checkpointStaleRounds >= UNATTENDED_PROGRESS_NUDGE_ROUNDS)
-      || (this.unattended
-        && totalTokens >= Math.floor(UNATTENDED_NO_PROGRESS_TOKEN_LIMIT * 0.8)
-        && this.checkpointStaleRounds >= 3);
+      || (totalTokens >= Math.floor(UNATTENDED_NO_PROGRESS_TOKEN_LIMIT * 0.8)
+        && this.checkpointStaleRounds >= 2);
     const state: ProgressState = {
       state: trigger ? "stopped" : warn ? "warning" : "working",
       ...(trigger ? { trigger } : {}),

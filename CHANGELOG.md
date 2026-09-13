@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.177.1 — 2026-09-14 — localized retained tasks and bounded stalled runs
+
+- Keep engine-owned questions, resume instructions, progress warnings, and safety-stop receipts in the language of
+  the user's latest message. Chinese conversations no longer end with a fixed English continuation footer, while
+  an explicit valid `HARA_REPLY_LANGUAGE` remains authoritative when a host supplies one.
+- Pause attached as well as unattended work after 200,000 tokens without a new verified checkpoint or completed
+  todo. Repeated and substantially unchanged tool evidence retains its earlier, tighter round-based circuit breakers.
+- Replace raw round/tool/token warning dumps with concise user-facing guidance while preserving the complete
+  structured progress event for Desktop status panels and diagnostics.
+
 ## 0.177.0 — 2026-09-13 — automatic Mobile Relay
 
 - Let `hara serve` own the encrypted Mobile Relay bridge after Hara sign-in and explicit phone pairing. It
