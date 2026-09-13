@@ -36,6 +36,29 @@ export type MobileCommandReceipt = Readonly<{
   recordedAt: number;
 }>;
 
+export type MobilePublicationCapabilities = Readonly<{
+  approve: boolean;
+  interrupt: boolean;
+  read: boolean;
+  submit: boolean;
+  terminalControl: boolean;
+  terminalObserve: boolean;
+}>;
+
+export type MobileSessionPublication = Readonly<{
+  capabilities: MobilePublicationCapabilities;
+  sessionId: string;
+}>;
+
+const READ_ONLY_PUBLICATION: MobilePublicationCapabilities = Object.freeze({
+  approve: false,
+  interrupt: false,
+  read: true,
+  submit: false,
+  terminalControl: false,
+  terminalObserve: false,
+});
+
 export type MobileCompanionState = Readonly<{
   accessToken: string;
   accessTokenExpiresAt: number;
@@ -56,8 +79,10 @@ export type MobileCompanionState = Readonly<{
   commandReceipts?: readonly MobileCommandReceipt[];
   pairedMobileDevices: readonly PairedMobileDevice[];
   /** Desktop-owned allowlist of provider session IDs that may be projected to paired phones.
-   * Missing means no sessions are published, including for state written by older builds. */
+   * Kept only to migrate the first publication preview. Legacy entries become read-only. */
   publishedSessionIds?: readonly string[];
+  /** Desktop-owned, per-session Mobile grants. Missing means no sessions are published. */
+  publishedSessions?: readonly MobileSessionPublication[];
   refreshToken?: string;
   refreshTokenExpiresAt?: number;
   /** Cloud Relay delivery progress for this exact Desktop device. It is intentionally unrelated to
@@ -120,6 +145,54 @@ function pairedMobileDevice(value: unknown): value is PairedMobileDevice {
   }
 }
 
+export function normalizeMobilePublicationCapabilities(
+  value: unknown,
+): MobilePublicationCapabilities {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("mobile publication capabilities are invalid");
+  }
+  const capabilities = value as Record<string, unknown>;
+  const keys = [
+    "approve",
+    "interrupt",
+    "read",
+    "submit",
+    "terminalControl",
+    "terminalObserve",
+  ];
+  if (
+    Object.keys(capabilities).length !== keys.length
+    || !keys.every((key) => typeof capabilities[key] === "boolean")
+    || capabilities.read !== true
+    || (capabilities.terminalControl === true && capabilities.terminalObserve !== true)
+  ) {
+    throw new TypeError("mobile publication capabilities are invalid");
+  }
+  return Object.freeze({
+    approve: capabilities.approve as boolean,
+    interrupt: capabilities.interrupt as boolean,
+    read: true,
+    submit: capabilities.submit as boolean,
+    terminalControl: capabilities.terminalControl as boolean,
+    terminalObserve: capabilities.terminalObserve as boolean,
+  });
+}
+
+function mobileSessionPublication(value: unknown): value is MobileSessionPublication {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const publication = value as Record<string, unknown>;
+  if (
+    Object.keys(publication).length !== 2
+    || !identifier(publication.sessionId)
+  ) return false;
+  try {
+    normalizeMobilePublicationCapabilities(publication.capabilities);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function mobileStatePath(home = effectiveHomeDir()): string {
   return join(home, ".hara", "mobile-companion.json");
 }
@@ -155,6 +228,12 @@ export function parseMobileState(value: unknown): MobileCompanionState | null {
         || root.publishedSessionIds.length > 100
         || !root.publishedSessionIds.every(identifier)
         || new Set(root.publishedSessionIds).size !== root.publishedSessionIds.length))
+    || (root.publishedSessions !== undefined
+      && (!Array.isArray(root.publishedSessions)
+        || root.publishedSessions.length > 100
+        || !root.publishedSessions.every(mobileSessionPublication)
+        || new Set(root.publishedSessions.map((entry) => (entry as MobileSessionPublication).sessionId)).size !== root.publishedSessions.length))
+    || (root.publishedSessionIds !== undefined && root.publishedSessions !== undefined)
     || (root.commandReceipts !== undefined
       && (!Array.isArray(root.commandReceipts)
         || root.commandReceipts.length > 64
@@ -177,6 +256,7 @@ export function parseMobileState(value: unknown): MobileCompanionState | null {
 }
 
 export type MobileSessionPublications = Readonly<{
+  publications: readonly MobileSessionPublication[];
   protocolVersion: 1;
   sessionIds: readonly string[];
 }>;
@@ -186,14 +266,31 @@ function publicationSessionId(value: unknown): string {
   return value;
 }
 
+export function mobilePublicationEntries(
+  state: MobileCompanionState,
+): readonly MobileSessionPublication[] {
+  if (state.publishedSessions) {
+    return Object.freeze(state.publishedSessions.map((publication) => Object.freeze({
+      capabilities: normalizeMobilePublicationCapabilities(publication.capabilities),
+      sessionId: publication.sessionId,
+    })));
+  }
+  return Object.freeze((state.publishedSessionIds ?? []).map((sessionId) => Object.freeze({
+    capabilities: READ_ONLY_PUBLICATION,
+    sessionId,
+  })));
+}
+
 export function mobileSessionPublications(
   path = mobileStatePath(),
 ): MobileSessionPublications {
   const state = loadMobileState(path);
   if (!state) throw new Error("Hara Mobile Desktop is not signed in");
+  const publications = mobilePublicationEntries(state);
   return Object.freeze({
+    publications,
     protocolVersion: 1,
-    sessionIds: Object.freeze([...(state.publishedSessionIds ?? [])]),
+    sessionIds: Object.freeze(publications.map((publication) => publication.sessionId)),
   });
 }
 
@@ -205,20 +302,48 @@ export function setMobileSessionPublication(
   const sessionId = publicationSessionId(sessionIdValue);
   const state = loadMobileState(path);
   if (!state) throw new Error("Hara Mobile Desktop is not signed in");
-  const next = new Set(state.publishedSessionIds ?? []);
+  const next = new Map(mobilePublicationEntries(state).map((entry) => [entry.sessionId, entry]));
   if (published) {
     if (!next.has(sessionId) && next.size >= 100) {
       throw new Error("at most 100 sessions can be published to Hara Mobile");
     }
-    next.add(sessionId);
+    if (!next.has(sessionId)) {
+      next.set(sessionId, Object.freeze({
+        capabilities: READ_ONLY_PUBLICATION,
+        sessionId,
+      }));
+    }
   } else {
     next.delete(sessionId);
   }
   const updated: MobileCompanionState = {
     ...state,
-    publishedSessionIds: [...next],
+    publishedSessionIds: undefined,
+    publishedSessions: [...next.values()],
   };
   saveMobileState(updated, path);
+  return mobileSessionPublications(path);
+}
+
+export function configureMobileSessionPublication(
+  sessionIdValue: unknown,
+  capabilitiesValue: unknown,
+  path = mobileStatePath(),
+): MobileSessionPublications {
+  const sessionId = publicationSessionId(sessionIdValue);
+  const capabilities = normalizeMobilePublicationCapabilities(capabilitiesValue);
+  const state = loadMobileState(path);
+  if (!state) throw new Error("Hara Mobile Desktop is not signed in");
+  const next = new Map(mobilePublicationEntries(state).map((entry) => [entry.sessionId, entry]));
+  if (!next.has(sessionId) && next.size >= 100) {
+    throw new Error("at most 100 sessions can be published to Hara Mobile");
+  }
+  next.set(sessionId, Object.freeze({ capabilities, sessionId }));
+  saveMobileState({
+    ...state,
+    publishedSessionIds: undefined,
+    publishedSessions: [...next.values()],
+  }, path);
   return mobileSessionPublications(path);
 }
 

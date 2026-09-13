@@ -393,7 +393,12 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
     state: "claimed",
   };
   const calls = [];
-  let publishedSessionIds = [];
+  let publications = [];
+  const publicationResult = () => ({
+    protocolVersion: 1,
+    publications,
+    sessionIds: publications.map((publication) => publication.sessionId),
+  });
   const server = await startServe(
     { host: "127.0.0.1", port: 0, token: "tok", cwd: dir },
     {
@@ -418,18 +423,25 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
           state: approved ? "approved" : "rejected",
         };
       },
-      mobileSessionPublications: () => ({
-        protocolVersion: 1,
-        sessionIds: publishedSessionIds,
-      }),
-      publishMobileSession: (sessionId) => ({
-        protocolVersion: 1,
-        sessionIds: publishedSessionIds = [...new Set([...publishedSessionIds, sessionId])],
-      }),
-      unpublishMobileSession: (sessionId) => ({
-        protocolVersion: 1,
-        sessionIds: publishedSessionIds = publishedSessionIds.filter(value => value !== sessionId),
-      }),
+      mobileSessionPublications: publicationResult,
+      publishMobileSession: (sessionId, capabilities = {
+        approve: false,
+        interrupt: false,
+        read: true,
+        submit: false,
+        terminalControl: false,
+        terminalObserve: false,
+      }) => {
+        publications = [
+          ...publications.filter((publication) => publication.sessionId !== sessionId),
+          { capabilities, sessionId },
+        ];
+        return publicationResult();
+      },
+      unpublishMobileSession: (sessionId) => {
+        publications = publications.filter((publication) => publication.sessionId !== sessionId);
+        return publicationResult();
+      },
     },
   );
   const client = await connect(server.port);
@@ -446,6 +458,7 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
     ]) assert.ok(initialized.result.capabilities.methods.includes(method), `${method} advertised`);
     assert.ok(initialized.result.capabilities.features.includes("mobile.pairing.qr.v1"));
     assert.ok(initialized.result.capabilities.features.includes("mobile.session-publications.v1"));
+    assert.ok(initialized.result.capabilities.features.includes("mobile.session-publications.granular-capabilities.v2"));
 
     const status = await client.call("mobile.status", {});
     assert.equal(status.result.account.displayName, "Hara User");
@@ -468,12 +481,23 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
       (await client.call("mobile.publications.list", {})).result.sessionIds,
       [],
     );
-    assert.deepEqual(
-      (await client.call("mobile.publications.publish", {
-        sessionId: "ext_runtime_session-a",
-      })).result.sessionIds,
-      ["ext_runtime_session-a"],
-    );
+    const publicationCapabilities = {
+      approve: false,
+      interrupt: true,
+      read: true,
+      submit: true,
+      terminalControl: false,
+      terminalObserve: true,
+    };
+    const published = (await client.call("mobile.publications.publish", {
+      capabilities: publicationCapabilities,
+      sessionId: "ext_runtime_session-a",
+    })).result;
+    assert.deepEqual(published.sessionIds, ["ext_runtime_session-a"]);
+    assert.deepEqual(published.publications, [{
+      capabilities: publicationCapabilities,
+      sessionId: "ext_runtime_session-a",
+    }]);
     assert.deepEqual(
       (await client.call("mobile.publications.unpublish", {
         sessionId: "ext_runtime_session-a",
@@ -482,6 +506,13 @@ test("serve e2e: Desktop negotiates the redacted Mobile QR pairing control plane
     );
     assert.equal(
       (await client.call("mobile.publications.publish", { sessionId: "bad id" })).error.code,
+      -32602,
+    );
+    assert.equal(
+      (await client.call("mobile.publications.publish", {
+        capabilities: { ...publicationCapabilities, read: false },
+        sessionId: "ext_runtime_session-a",
+      })).error.code,
       -32602,
     );
     assert.deepEqual(calls, [

@@ -67,7 +67,11 @@ import type {
   MobilePairingInvitation,
   MobilePairingSnapshot,
 } from "../mobile/pairing.js";
-import type { MobileSessionPublications } from "../mobile/state.js";
+import {
+  normalizeMobilePublicationCapabilities,
+  type MobilePublicationCapabilities,
+  type MobileSessionPublications,
+} from "../mobile/state.js";
 import type { UiSink } from "../tools/registry.js";
 import { APPROVAL_MODES, type ApprovalMode } from "../config.js";
 import type { ComputerSettingsInput, ComputerSettingsState } from "../computer-settings.js";
@@ -379,8 +383,14 @@ export interface ServeDeps {
   inspectMobilePairing?: (challengeId: string) => Promise<MobilePairingSnapshot>;
   decideMobilePairing?: (challengeId: string, approved: boolean) => Promise<MobilePairingSnapshot>;
   mobileSessionPublications?: () => MobileSessionPublications;
-  publishMobileSession?: (sessionId: string) => MobileSessionPublications;
-  unpublishMobileSession?: (sessionId: string) => MobileSessionPublications;
+  publishMobileSession?: (
+    sessionId: string,
+    capabilities?: MobilePublicationCapabilities,
+  ) => MobileSessionPublications;
+  unpublishMobileSession?: (
+    sessionId: string,
+    capabilities?: MobilePublicationCapabilities,
+  ) => MobileSessionPublications;
   /** Redacted organization/profile control plane. One-time codes are accepted only by enroll and are
    * never returned. Device tokens remain inside the CLI's private profile store. */
   organizationConnections?: (cwd?: string) => OrganizationConnectionsState;
@@ -4427,7 +4437,10 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
           }
           if (mobilePairing) features.push("mobile.pairing.qr.v1");
           if (mobilePublications) {
-            features.push("mobile.session-publications.v1");
+            features.push(
+              "mobile.session-publications.v1",
+              "mobile.session-publications.granular-capabilities.v2",
+            );
           }
           const runtime = runtimeInfo();
           const setupState = deps.providerSettings
@@ -4528,7 +4541,15 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             ) {
               return reply(rpcError(id, ERR.PARAMS, "sessionId must be a bounded session ID"));
             }
-            return reply(rpcResult(id!, update(p.sessionId)));
+            let capabilities: MobilePublicationCapabilities | undefined;
+            if (req.method === "mobile.publications.publish" && p.capabilities !== undefined) {
+              try {
+                capabilities = normalizeMobilePublicationCapabilities(p.capabilities);
+              } catch {
+                return reply(rpcError(id, ERR.PARAMS, "capabilities must be a bounded Mobile publication grant"));
+              }
+            }
+            return reply(rpcResult(id!, update(p.sessionId, capabilities)));
           }
           case "events.snapshot": {
             if (!Array.isArray(p.sessionIds) || p.sessionIds.length > 100) {

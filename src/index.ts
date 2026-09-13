@@ -4505,6 +4505,7 @@ program
     const { GatewayLoginManager } = await import("./gateway/login.js");
     const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
     const {
+      configureMobileSessionPublication,
       mobileSessionPublications,
       setMobileSessionPublication,
     } = await import("./mobile/state.js");
@@ -4826,8 +4827,9 @@ program
         inspectMobilePairing: (challengeId) => mobilePairing.inspect(challengeId),
         decideMobilePairing: (challengeId, approved) => mobilePairing.decide(challengeId, approved),
         mobileSessionPublications: () => mobileSessionPublications(),
-        publishMobileSession: (sessionId) =>
-          setMobileSessionPublication(sessionId, true),
+        publishMobileSession: (sessionId, capabilities) => capabilities
+          ? configureMobileSessionPublication(sessionId, capabilities)
+          : setMobileSessionPublication(sessionId, true),
         unpublishMobileSession: (sessionId) =>
           setMobileSessionPublication(sessionId, false),
         organizationConnections: (targetCwd) => organizationConnectionsSnapshot(targetCwd ?? cwd),
@@ -5145,6 +5147,10 @@ program
   .option("--email <address>", "Hara email address for Desktop sign-in")
   .option("--code <digits>", "short-lived Hara verification code")
   .option("--session <id>", "local Hara Session ID to publish or unpublish")
+  .option("--send", "allow messages and interruption for the published Session")
+  .option("--approve", "allow answering provider approval prompts for the published Session")
+  .option("--terminal-view", "allow terminal snapshots for the published Session")
+  .option("--terminal-control", "allow short-lived terminal input control (also enables terminal view)")
   .option("--yes", "approve the currently displayed mobile pairing request")
   .action(async (action, options) => {
     const { runMobileCommand } = await import("./mobile/command.js");

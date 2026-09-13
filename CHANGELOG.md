@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.175.1 — 2026-09-13 — least-privilege Mobile Session grants
+
+- Make every newly published Mobile Session read-only by default. Message submission/interruption, approval
+  replies, terminal observation, and terminal control now require separate user grants and remain intersected
+  with the live Codex, Claude Code, or Hara source capabilities at execution time.
+- Migrate the first publication preview's plain Session allowlist to read-only instead of retaining implicit
+  control. Revoking a Session still releases its active terminal lease immediately.
+- Preserve publication changes made while the Relay bridge is online when command receipts or delivery cursors
+  are persisted, preventing a late checkpoint from restoring stale phone access.
+
 ## 0.175.0 — 2026-09-13 — explicit Mobile Session publication
 
 - Start every Desktop with zero Sessions exposed to a paired phone. Add `hara mobile sessions`, `publish`,

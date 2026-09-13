@@ -182,10 +182,14 @@
 //   mobile.pairing.decide {challengeId,approved}   → final state after explicit Desktop confirmation
 //                                                    QR contains only a short-lived one-time invitation;
 //                                                    account tokens, credentials, and private keys stay in Core.
-//   mobile.publications.list {}                    → {protocolVersion:1,sessionIds:[…]}
-//   mobile.publications.publish/unpublish {sessionId}
-//                                                   → updated allowlist; an absent allowlist publishes zero
-//                                                     sessions, and provider IDs stay on Desktop/Core.
+//   mobile.publications.list {}                    → {protocolVersion:1,sessionIds:[…],
+//                                                     publications:[{sessionId,capabilities}]}
+//   mobile.publications.publish {sessionId,capabilities?}
+//   mobile.publications.unpublish {sessionId}
+//                                                   → updated grants; an absent publication list exposes zero
+//                                                     sessions. New publications default to read-only; each requested
+//                                                     grant is intersected with the live source capabilities, and
+//                                                     provider IDs stay on Desktop/Core.
 //   settings.organizations.list {cwd?}              → {activeId,activeSource,switchLocked,
 //                                                    connections:[{id,label,model,availableModels?,accessState,…}]}
 //   settings.organizations.enroll {id,label?,gatewayUrl,code,activate?,cwd?}

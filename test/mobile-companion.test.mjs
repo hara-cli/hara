@@ -16,6 +16,7 @@ import {
 } from "../dist/mobile/security.js";
 import {
   clearMobileState,
+  configureMobileSessionPublication,
   loadMobileState,
   mobileSessionPublications,
   saveMobileState,
@@ -34,6 +35,20 @@ const request = (requestId, method, body = {}) => parseCompanionRequest({
   protocolVersion: 1,
   requestId,
   type: "companion.request",
+});
+
+const fullMobileCapabilities = Object.freeze({
+  approve: true,
+  interrupt: true,
+  read: true,
+  submit: true,
+  terminalControl: true,
+  terminalObserve: true,
+});
+
+const mobilePublication = (sessionId, capabilities = fullMobileCapabilities) => ({
+  capabilities,
+  sessionId,
 });
 
 test("Desktop and mobile P-256 keys sign and encrypt the same relay protocol", () => {
@@ -94,9 +109,26 @@ test("Mobile companion state is private, validated, and removable", () => {
       "ext_runtime_test-a",
     ]);
     assert.deepEqual(
+      mobileSessionPublications(path).publications[0].capabilities,
+      { ...fullMobileCapabilities, approve: false, interrupt: false, submit: false, terminalControl: false, terminalObserve: false },
+      "legacy allowlist entries migrate to read-only instead of retaining implicit control",
+    );
+    assert.deepEqual(
       setMobileSessionPublication("ext_codex_test-b", true, path).sessionIds,
       ["ext_runtime_test-a", "ext_codex_test-b"],
     );
+    assert.equal(
+      configureMobileSessionPublication("ext_codex_test-b", {
+        ...fullMobileCapabilities,
+        terminalControl: false,
+        terminalObserve: false,
+      }, path).publications[1].capabilities.submit,
+      true,
+    );
+    assert.throws(() => configureMobileSessionPublication("ext_codex_test-b", {
+      ...fullMobileCapabilities,
+      terminalObserve: false,
+    }, path), /capabilities are invalid/u);
     assert.deepEqual(
       setMobileSessionPublication("ext_runtime_test-a", false, path).sessionIds,
       ["ext_codex_test-b"],
@@ -524,7 +556,7 @@ test("Router publishes bounded sessions and enforces terminal leases and command
   const now = 2_000_000_000;
   const router = new MobileCompanionRouter(local, "desktop-a", now + 600_000, {
     clock: () => now,
-    publishedSessionIds: ["ext_runtime_test-a"],
+    publishedSessions: [mobilePublication("ext_runtime_test-a")],
   });
   const listed = await router.route(request("request-list", "sessions.list"));
   assert.equal(listed.ok, true);
@@ -614,7 +646,7 @@ test("Router publishes bounded sessions and enforces terminal leases and command
 });
 
 test("Router defaults to zero published sessions and revokes a removed allowlist entry", async () => {
-  let publishedSessionIds = [];
+  let publishedSessions = [];
   const localCalls = [];
   const local = {
     async call(method, params = {}) {
@@ -656,7 +688,7 @@ test("Router defaults to zero published sessions and revokes a removed allowlist
     now + 600_000,
     {
       clock: () => now,
-      publishedSessionIds: () => publishedSessionIds,
+      publishedSessions: () => publishedSessions,
     },
   );
 
@@ -664,13 +696,28 @@ test("Router defaults to zero published sessions and revokes a removed allowlist
     (await router.route(request("private-list", "sessions.list"))).body,
     [],
   );
-  publishedSessionIds = ["ext_runtime_private-a"];
+  publishedSessions = [mobilePublication("ext_runtime_private-a", {
+    ...fullMobileCapabilities,
+    approve: false,
+    interrupt: false,
+    submit: false,
+    terminalControl: false,
+    terminalObserve: false,
+  })];
   const visible = await router.route(request("published-list", "sessions.list"));
   assert.equal(visible.body.length, 1);
   assert.equal(visible.body[0].id, visible.body[0].publicationId);
+  assert.deepEqual(visible.body[0].capabilities, {
+    approve: false,
+    interrupt: false,
+    read: true,
+    submit: false,
+    terminalControl: false,
+    terminalObserve: false,
+  });
 
   const publicationId = visible.body[0].publicationId;
-  publishedSessionIds = [];
+  publishedSessions = [];
   const revoked = await router.route(request("revoked-read", "sessions.read", {
     publicationId,
   }));
@@ -726,7 +773,7 @@ test("Router persists content-free command receipts and suppresses terminal inpu
   const firstRouter = new MobileCompanionRouter(local, "desktop-a", now + 600_000, {
     clock: () => now,
     persistCommandReceipts: (receipts) => { persisted = structuredClone(receipts); },
-    publishedSessionIds: ["ext_runtime_restart-a"],
+    publishedSessions: [mobilePublication("ext_runtime_restart-a")],
   });
   const firstList = await firstRouter.route(request("request-restart-list-a", "sessions.list"));
   const publication = firstList.body[0];
@@ -757,7 +804,7 @@ test("Router persists content-free command receipts and suppresses terminal inpu
   const restarted = new MobileCompanionRouter(local, "desktop-a", now + 600_000, {
     clock: () => now,
     commandReceipts: persisted,
-    publishedSessionIds: ["ext_runtime_restart-a"],
+    publishedSessions: [mobilePublication("ext_runtime_restart-a")],
   });
   await restarted.route(request("request-restart-list-b", "sessions.list"));
   const replay = await restarted.route(request("request-restart-input-b", "command.execute", input));

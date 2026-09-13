@@ -1,14 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import type { LocalCompanionRpc } from "./local-serve-client.js";
-import type { MobileCommandReceipt } from "./state.js";
+import type {
+  MobileCommandReceipt,
+  MobilePublicationCapabilities,
+  MobileSessionPublication,
+} from "./state.js";
 
 const MAX_SESSIONS = 100;
 const MAX_MESSAGE_TEXT = 32_768;
 const MAX_COMMAND_RECEIPTS = 64;
 
-type CapabilityName = "read" | "submit" | "approve" | "interrupt" | "terminalObserve" | "terminalControl";
-type PublishedCapabilities = Record<CapabilityName, boolean>;
+type PublishedCapabilities = MobilePublicationCapabilities;
+
+const READ_ONLY_CAPABILITIES: PublishedCapabilities = Object.freeze({
+  approve: false,
+  interrupt: false,
+  read: true,
+  submit: false,
+  terminalControl: false,
+  terminalObserve: false,
+});
 
 type Publication = {
   capabilities: PublishedCapabilities;
@@ -129,7 +141,7 @@ export class MobileCompanionRouter {
   private readonly runningSubmits = new Set<string>();
   private readonly approvals = new Map<string, { publicationId: string; question: string }>();
   private readonly removeNotificationListener: () => void;
-  private readonly publishedSessionIds: () => ReadonlySet<string>;
+  private readonly publishedSessions: () => ReadonlyMap<string, MobilePublicationCapabilities>;
 
   constructor(
     private readonly local: LocalCompanionRpc,
@@ -139,6 +151,8 @@ export class MobileCompanionRouter {
       clock?: () => number;
       commandReceipts?: readonly MobileCommandReceipt[];
       persistCommandReceipts?: (receipts: readonly MobileCommandReceipt[]) => void;
+      publishedSessions?: readonly MobileSessionPublication[] | (() => readonly MobileSessionPublication[]);
+      /** Compatibility input for the first publication preview. Old allowlist entries are read-only. */
       publishedSessionIds?: readonly string[] | (() => readonly string[]);
     }> = {},
   ) {
@@ -147,11 +161,21 @@ export class MobileCompanionRouter {
     }
     this.clock = options.clock ?? Date.now;
     this.persistCommandReceipts = options.persistCommandReceipts;
-    this.publishedSessionIds = () => new Set(
-      typeof options.publishedSessionIds === "function"
+    this.publishedSessions = () => {
+      const configured = typeof options.publishedSessions === "function"
+        ? options.publishedSessions()
+        : options.publishedSessions;
+      if (configured) {
+        return new Map(configured.map((publication) => [
+          publication.sessionId,
+          publication.capabilities,
+        ]));
+      }
+      const legacy = typeof options.publishedSessionIds === "function"
         ? options.publishedSessionIds()
-        : options.publishedSessionIds ?? [],
-    );
+        : options.publishedSessionIds ?? [];
+      return new Map(legacy.map((sessionId) => [sessionId, READ_ONLY_CAPABILITIES]));
+    };
     this.leaseEpoch = this.clock();
     for (const entry of options.commandReceipts ?? []) {
       if (entry.expiresAt > this.clock()) this.receipts.set(entry.commandId, entry);
@@ -245,7 +269,7 @@ export class MobileCompanionRouter {
     const result = record(await this.local.call("external.sessions.list", { limit: MAX_SESSIONS }));
     if (!result || !Array.isArray(result.sessions)) throw new Error("invalid local session directory");
     const sources = sourceCapabilities(result.sources);
-    const allowedSessionIds = this.publishedSessionIds();
+    const allowedSessions = this.publishedSessions();
     const next = new Map<string, Publication>();
     const published: unknown[] = [];
     for (const raw of result.sessions.slice(0, MAX_SESSIONS)) {
@@ -253,7 +277,7 @@ export class MobileCompanionRouter {
       if (
         !session
         || !identifier(session.id)
-        || !allowedSessionIds.has(session.id)
+        || !allowedSessions.has(session.id)
         || !["codex", "claude", "runtime"].includes(String(session.sourceId))
         || !bounded(session.title, 240)
         || !bounded(session.workspaceName, 160)
@@ -261,14 +285,19 @@ export class MobileCompanionRouter {
       ) continue;
       const sourceId = session.sourceId as Publication["sourceId"];
       const source = sources.get(sourceId) ?? {};
+      const requested = allowedSessions.get(session.id) ?? READ_ONLY_CAPABILITIES;
       const terminalObserve = sourceId === "runtime" && source.terminalView === true;
       const capabilities: PublishedCapabilities = {
-        approve: source.submit === true,
-        interrupt: source.interrupt === true,
-        read: source.read === true,
-        submit: source.submit === true,
-        terminalControl: terminalObserve && source.terminalInput === true,
-        terminalObserve,
+        approve: requested.approve && source.submit === true,
+        interrupt: requested.interrupt && source.interrupt === true,
+        read: requested.read && source.read === true,
+        submit: requested.submit && source.submit === true,
+        terminalControl:
+          requested.terminalControl
+          && requested.terminalObserve
+          && terminalObserve
+          && source.terminalInput === true,
+        terminalObserve: requested.terminalObserve && terminalObserve,
       };
       const publication: Publication = {
         capabilities,
@@ -305,7 +334,7 @@ export class MobileCompanionRouter {
     let publication = this.publications.get(value);
     if (
       publication
-      && !this.publishedSessionIds().has(publication.sessionId)
+      && !this.publishedSessions().has(publication.sessionId)
     ) {
       await this.revokePublication(publication);
       publication = undefined;

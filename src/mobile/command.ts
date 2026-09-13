@@ -11,10 +11,13 @@ import { MobileCompanionRouter } from "./router.js";
 import { generateDeviceKey } from "./security.js";
 import {
   clearMobileState,
+  configureMobileSessionPublication,
   loadMobileState,
+  mobilePublicationEntries,
   mobileSessionPublications,
   saveMobileState,
   setMobileSessionPublication,
+  type MobilePublicationCapabilities,
   type MobileCompanionState,
 } from "./state.js";
 
@@ -22,10 +25,14 @@ const ACCOUNT_ORIGIN = "https://api.hara.nanhara.tech";
 const RELAY_URL = "wss://relay.hara.nanhara.tech/v1/connect";
 
 export type MobileCommandOptions = Readonly<{
+  approve?: boolean;
   code?: string;
   email?: string;
   phone?: string;
+  send?: boolean;
   session?: string;
+  terminalControl?: boolean;
+  terminalView?: boolean;
   yes?: boolean;
 }>;
 
@@ -121,10 +128,10 @@ async function login(options: MobileCommandOptions): Promise<void> {
       && previous.relayCursor
       ? { relayCursor: previous.relayCursor }
       : {}),
-    publishedSessionIds:
+    publishedSessions:
       previous?.account.id === signedIn.account.id
         && previous.desktop.id === desktop.deviceId
-        ? previous.publishedSessionIds ?? []
+        ? mobilePublicationEntries(previous)
         : [],
     schemaVersion: 1,
   };
@@ -206,18 +213,17 @@ async function connect(): Promise<void> {
         {
           commandReceipts: currentState.commandReceipts,
           persistCommandReceipts: (commandReceipts) => {
+            const latestState = loadMobileState();
             currentState = {
-              ...currentState,
+              ...(latestState ?? currentState),
               commandReceipts,
-              publishedSessionIds:
-                loadMobileState()?.publishedSessionIds
-                ?? currentState.publishedSessionIds
-                ?? [],
             };
             saveMobileState(currentState);
           },
-          publishedSessionIds: () =>
-            loadMobileState()?.publishedSessionIds ?? [],
+          publishedSessions: () => {
+            const latestState = loadMobileState();
+            return latestState ? mobilePublicationEntries(latestState) : [];
+          },
         },
       );
       const bridge = new MobileRelayBridge(
@@ -226,7 +232,10 @@ async function connect(): Promise<void> {
         router,
         Date.now,
         (relayCursor) => {
-          currentState = { ...currentState, relayCursor };
+          currentState = {
+            ...(loadMobileState() ?? currentState),
+            relayCursor,
+          };
           saveMobileState(currentState);
         },
       );
@@ -271,7 +280,7 @@ function status(): void {
   const device = state.desktop.credentialExpiresAt > Date.now() ? "有效" : "已过期";
   write(`Hara Mobile Desktop：${state.account.displayName}\n`);
   write(`账号会话：${access} · 设备凭证：${device} · 已配对手机：${state.pairedMobileDevices.length}\n`);
-  write(`手机可访问会话：${state.publishedSessionIds?.length ?? 0}\n`);
+  write(`手机可访问会话：${mobilePublicationEntries(state).length}\n`);
 }
 
 type LocalSessionSummary = Readonly<{
@@ -323,15 +332,34 @@ async function localSessions(): Promise<readonly LocalSessionSummary[]> {
 async function listSessions(): Promise<void> {
   const state = loadMobileState();
   if (!state) throw new Error("请先运行 `hara mobile login`");
-  const published = new Set(state.publishedSessionIds ?? []);
+  const published = new Map(mobilePublicationEntries(state).map((entry) => [entry.sessionId, entry.capabilities]));
   const sessions = await localSessions();
   if (sessions.length === 0) {
     write("当前没有可开放到手机的 Session。\n");
     return;
   }
   for (const session of sessions) {
-    write(`${published.has(session.id) ? "[手机可见]" : "[仅电脑]"} ${session.id}  ${session.sourceId} · ${session.workspaceName} · ${session.title}\n`);
+    const capabilities = published.get(session.id);
+    const access = capabilities
+      ? Object.entries(capabilities).filter(([, enabled]) => enabled).map(([name]) => name).join(",")
+      : "";
+    write(`${capabilities ? `[手机可见:${access}]` : "[仅电脑]"} ${session.id}  ${session.sourceId} · ${session.workspaceName} · ${session.title}\n`);
   }
+}
+
+function requestedPublicationCapabilities(
+  options: MobileCommandOptions,
+): MobilePublicationCapabilities {
+  const terminalControl = options.terminalControl === true;
+  const submit = options.send === true;
+  return {
+    approve: options.approve === true,
+    interrupt: submit,
+    read: true,
+    submit,
+    terminalControl,
+    terminalObserve: terminalControl || options.terminalView === true,
+  };
 }
 
 async function updatePublication(
@@ -346,7 +374,12 @@ async function updatePublication(
       throw new Error("找不到这个本地 Session；先运行 `hara mobile sessions` 查看可用列表");
     }
   }
-  const result = setMobileSessionPublication(sessionId, published);
+  const result = published
+    ? configureMobileSessionPublication(
+        sessionId,
+        requestedPublicationCapabilities(options),
+      )
+    : setMobileSessionPublication(sessionId, false);
   write(published
     ? `已允许手机访问这个 Session；当前共 ${result.sessionIds.length} 个。\n`
     : `已撤销手机访问；当前共 ${result.sessionIds.length} 个。\n`);
@@ -358,7 +391,13 @@ function listPublications(): void {
     write("当前没有向手机开放任何 Session。\n");
     return;
   }
-  for (const sessionId of result.sessionIds) write(`${sessionId}\n`);
+  for (const publication of result.publications) {
+    const access = Object.entries(publication.capabilities)
+      .filter(([, enabled]) => enabled)
+      .map(([name]) => name)
+      .join(",");
+    write(`${publication.sessionId}  ${access}\n`);
+  }
 }
 
 export async function runMobileCommand(

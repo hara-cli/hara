@@ -54,12 +54,19 @@ hara mobile login --phone <number>
 hara mobile login --email <address>
 hara mobile pair
 hara mobile sessions
-hara mobile publish --session <id>
+hara mobile publish --session <id> # read-only by default
+hara mobile publish --session <id> --send --approve --terminal-view --terminal-control
 hara mobile connect
 hara mobile status
 hara mobile unpublish --session <id>
 hara mobile logout
 ```
+
+Publishing a Session never grants every provider capability implicitly. A new publication is read-only;
+`--send` grants submit plus interruption, `--approve` grants approval replies, and terminal observation and
+control are separate. Terminal control implies terminal observation, and every requested grant is intersected
+again with the live source capabilities before it reaches Mobile. Desktop exposes the same switches per Session.
+An allowlist written by the first publication preview migrates to read-only.
 
 ## Native mobile client requirements
 
