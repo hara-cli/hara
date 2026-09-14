@@ -20,11 +20,18 @@ hara gateway status --platform feishu --json
 ```
 
 Status verifies the private credential state, credential-scoped process lease/PID, real transport lifecycle,
-and the most recent connection, successful poll, inbound message, and bounded error code. It never returns
-tokens, app ids, login URLs, chat/message content, raw errors, or the hash used to isolate two bot accounts.
+redacted direct-message access (`ready`, `blocked`, or `unknown`), and the most recent connection, successful
+poll, inbound message, and bounded error code. `connected` means only that the platform transport is online;
+it is not an end-to-end reply check. The access state never includes authorized user ids or their count, and
+status never returns tokens, app ids, login URLs, chat/message content, raw errors, or the hash used to isolate two bot accounts.
 An environment-only credential held by a live gateway is shown as `process-only` instead of being
 misreported as missing. Desktop reads the same local status every two minutes; that refresh does not call a
 model or consume tokens.
+
+Hara Desktop 0.1.167+ with Engine 0.178.0+ can own the WeChat and Feishu connector lifecycle. Open
+**Settings → Chat bots**, then use **Start** or **Stop**; no terminal command is required. Desktop remembers
+only connectors the local user explicitly started and restores them after the next app launch. A connector
+started by another process remains visible, but Desktop will neither adopt nor stop it.
 
 ## Platforms at a glance
 
@@ -43,8 +50,10 @@ model or consume tokens.
 
 ## Common setup (every platform)
 
-- **`HARA_GATEWAY_ALLOWED`** — comma-separated list of user ids allowed to drive the bot. **Empty = nobody**
-  (safe default — the gateway is never wide-open). Each platform's section says which id to use.
+- **`HARA_GATEWAY_ALLOWED`** — comma-separated list of user ids allowed to drive a CLI- or service-managed bot.
+  **Empty = nobody** (safe default — the gateway is never wide-open). A Desktop-managed Feishu connector can
+  instead enroll one private sender with the local matching-code flow described below. Each other platform's
+  section says which id to use.
 - **`HARA_GATEWAY_OWNER`** — the one allowed user id that may approve consequential flow actions. It is
   optional when the platform proves an owner (WeChat QR login) or the allowlist has exactly one member;
   otherwise flow approvals stay disabled until you set it.
@@ -296,7 +305,8 @@ hara gateway --platform weixin --login     # scan the QR with WeChat; stores cre
 hara gateway --platform weixin             # run the daemon (the scanner is auto-allowed as owner)
 ```
 
-Hara Desktop 0.1.36+ can own the same login from **Settings → Chat bots → WeChat → Log in**. It
+Hara Desktop 0.1.167+ can own the same login and connector from **Settings → Chat bots → WeChat**. Use
+**Log in** to scan, then **Start**; the connector is restored automatically on later Desktop launches. It
 renders the QR locally, shows waiting/scanned/error state, and cancels the poll when the panel or
 app closes; the confirmed credential stays in Hara's private state and never enters the renderer.
 Do not ask an agent task to run the interactive login command: Hara's headless `bash` tool rejects
@@ -328,8 +338,13 @@ Uses the official `@larksuiteoapi/node-sdk` over a WebSocket long-connection (no
 3. In Hara Desktop, open **Settings → Chat bots → Feishu private connection**. Enter the App ID and App
    Secret in the masked fields, choose Feishu or Lark, and save. The local Engine stores the complete record
    in owner-only private state; it returns status only and never exposes the values to a chat or Agent script.
-4. `HARA_GATEWAY_ALLOWED` = your `open_id`, then start the gateway without putting either credential on the
-   command line:
+4. Click **Start**, then send the bot a private message. The bot and Desktop show the same six-character
+   matching code. Verify the code in both places and click **Authorize sender** in Desktop; the request expires
+   after ten minutes, the raw `open_id` stays only in owner-only Engine storage, and the sender resends the
+   private message after approval.
+
+For a supervised CLI deployment, provide the authorized `open_id` through the protected service environment
+and start the gateway without putting either credential on the command line:
 
 ```bash
 HARA_GATEWAY_ALLOWED=<your-open_id> hara gateway --platform feishu
@@ -469,13 +484,15 @@ boundary. Text replies remain supported.
 
 ## Running it as a daemon
 
-`hara gateway` runs in the foreground. To keep it alive across sessions, run it under your process manager of
-choice (launchd/systemd/pm2) or simply:
+This section applies to standalone CLI deployments. Hara Desktop users start and stop WeChat or Feishu in
+**Settings → Chat bots**, and Desktop restores their explicit choice automatically. A standalone `hara gateway`
+runs in the foreground; to keep it alive across sessions, run it under your process manager of choice
+(launchd/systemd/pm2) or simply:
 
 ```bash
 nohup hara gateway --platform <name> > ~/.hara/<name>-gw.log 2>&1 &
 ```
 
 Stop with `Ctrl-C` (or kill the process); cursors/creds persist under `~/.hara/<platform>/`.
-Run `hara gateway status --platform <name>` after starting or stopping it to verify the live PID, connection,
-last activity, and suggested recovery action.
+Run `hara gateway status --platform <name>` after starting or stopping it to verify the live PID, transport,
+direct-message access, last activity, and suggested recovery action.

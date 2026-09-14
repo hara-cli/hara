@@ -50,6 +50,7 @@ import {
   GatewayRuntimeReporter,
   GatewayRunOutcomeStore,
   inspectGatewayRuntime,
+  type GatewayDirectMessageAccess,
   type GatewayRunOutcomeRecovery,
   type GatewayRunOutcomeState,
 } from "./runtime-state.js";
@@ -63,6 +64,13 @@ import { createExternalSessionRegistry } from "../external-sessions/registry.js"
 import type { ExternalSessionInfo, ExternalSessionSourceInfo } from "../external-sessions/types.js";
 import { HARA_RUNTIME_VERSION } from "../version.js";
 import { inspectFeishuGatewayCredentials } from "./credentials.js";
+import {
+  approveGatewaySenderAuthorization as approveStoredGatewaySenderAuthorization,
+  inspectGatewaySenderAuthorization,
+  loadAuthorizedGatewaySenders,
+  requestGatewaySenderAuthorization,
+  type GatewayPendingAuthorization,
+} from "./sender-authorization.js";
 
 /** Parse a leading slash-command from a chat message (pure). null if it isn't one. */
 export function parseCommand(text: string): { cmd: string; arg: string } | null {
@@ -680,6 +688,11 @@ export interface GatewayStatus {
   lastMessageAt?: number;
   lastErrorAt?: number;
   lastErrorCode?: string;
+  directMessageAccess: GatewayDirectMessageAccess | "unknown";
+  /** True only when the current `hara serve` process owns this connector. Omitted outside Serve. */
+  managedByServe?: boolean;
+  /** Opaque, short-lived local approval request. Raw platform identities never cross the protocol. */
+  pendingAuthorization?: GatewayPendingAuthorization;
   recommendation: string;
 }
 
@@ -693,6 +706,14 @@ interface GatewayConfigurationProbe {
 export interface GatewayStatusOptions {
   home?: string;
   env?: NodeJS.ProcessEnv;
+}
+
+export interface RunGatewayOptions {
+  cwd?: string;
+  platform?: string;
+  /** Serve-owned connectors use this signal instead of installing another process signal handler. */
+  signal?: AbortSignal;
+  manageProcessSignals?: boolean;
 }
 
 const GATEWAY_LABELS: Record<GatewayPlatform, string> = {
@@ -823,6 +844,9 @@ function gatewayRecommendation(
   if (runtime.state === "degraded" || runtime.state === "failed" || runtime.state === "unreadable") {
     return "inspect the redacted gateway log and restart the gateway if the error persists";
   }
+  if (runtime.running && runtime.directMessageAccess === "blocked") {
+    return "authorize at least one direct-message sender with HARA_GATEWAY_ALLOWED, then restart the gateway";
+  }
   if (runtime.running) return "none";
   if (configuration.state !== "ready") return configuration.missingHint;
   return `run \`hara gateway --platform ${platform}\``;
@@ -835,6 +859,9 @@ export async function gatewayStatus(
 ): Promise<GatewayStatus> {
   const platform = gatewayPlatform(platformValue);
   const configuration = await inspectGatewayConfiguration(platform, options);
+  const senderAuthorization = platform === "feishu" && configuration.runtimeScope
+    ? inspectGatewaySenderAuthorization(configuration.runtimeScope, options.home ?? homedir())
+    : undefined;
   const runtime = await inspectGatewayRuntime(
     platform,
     configuration.runtimeScope ? [configuration.runtimeScope] : [],
@@ -867,7 +894,15 @@ export async function gatewayStatus(
     ...(runtime.lastMessageAt ? { lastMessageAt: runtime.lastMessageAt } : {}),
     ...(runtime.lastErrorAt ? { lastErrorAt: runtime.lastErrorAt } : {}),
     ...(runtime.lastErrorCode ? { lastErrorCode: runtime.lastErrorCode } : {}),
-    recommendation: gatewayRecommendation(platform, configuration, runtime),
+    directMessageAccess: runtime.running
+      ? senderAuthorization?.authorized
+        ? "ready"
+        : runtime.directMessageAccess ?? "unknown"
+      : "unknown",
+    ...(senderAuthorization?.pending ? { pendingAuthorization: senderAuthorization.pending } : {}),
+    recommendation: senderAuthorization?.pending
+      ? "approve the matching Feishu private-message pairing code in Hara Settings"
+      : gatewayRecommendation(platform, configuration, runtime),
   };
 }
 
@@ -876,6 +911,26 @@ export async function listGatewayStatuses(
   options: GatewayStatusOptions = {},
 ): Promise<GatewayStatus[]> {
   return Promise.all(platforms.map((platform) => gatewayStatus(platform, options)));
+}
+
+/** Approve a Feishu DM request without exposing its raw open_id to Desktop. */
+export async function approveGatewaySenderAuthorization(
+  platformValue: string,
+  requestId: string,
+  options: GatewayStatusOptions = {},
+): Promise<GatewayStatus> {
+  const platform = gatewayPlatform(platformValue);
+  if (platform !== "feishu") throw new Error("sender authorization is supported only for Feishu");
+  const configuration = await inspectGatewayConfiguration(platform, options);
+  if (configuration.state !== "ready" || !configuration.runtimeScope) {
+    throw new Error("configure Feishu credentials before authorizing a sender");
+  }
+  approveStoredGatewaySenderAuthorization(
+    configuration.runtimeScope,
+    requestId,
+    options.home ?? homedir(),
+  );
+  return gatewayStatus(platform, options);
 }
 
 async function buildAdapter(platform: string): Promise<{ adapter: ChatAdapter; ownerId?: string; runtimeScope: string } | null> {
@@ -1108,14 +1163,14 @@ export function defaultWorkspace(): string {
   return dir;
 }
 
-export async function runGateway(opts: { cwd?: string; platform?: string }): Promise<void> {
+export async function runGateway(opts: RunGatewayOptions): Promise<void> {
   const requestedPlatform = opts.platform || "telegram";
   const cwd = opts.cwd ?? defaultWorkspace(); // dir-free default: hara's own ~/.hara/workspace, like Hermes' ~/.hermes
   // A user may upgrade and launch only the long-lived gateway. Import legacy transcripts before accepting
   // `/sessions`, `/resume`, or recall commands so their old chat history is immediately addressable.
   await ensureSessionMetadataIndex();
   const built = await buildAdapter(requestedPlatform);
-  if (!built) process.exit(1);
+  if (!built) throw new Error(`gateway '${canonicalGatewayPlatform(requestedPlatform)}' is not configured`);
   const { adapter, ownerId, runtimeScope } = built;
   // Adapter names are the source of truth (e.g. requested `lark` builds the `feishu` adapter). Keep the
   // requested spelling only for startup/config hints; all persisted/routable identities are canonical.
@@ -1152,10 +1207,27 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     throw error;
   }
   const explicitOwner = process.env.HARA_GATEWAY_OWNER?.trim();
-  const allowlist = resolveAllowlist(process.env.HARA_GATEWAY_ALLOWED, ownerId, explicitOwner);
-  const approvalUserId = resolveApprovalOwner(explicitOwner, ownerId, allowlist);
-  const approvalOwner = approvalUserId ? `${platform}:${approvalUserId}` : undefined;
-  if (allowlist.size === 0) {
+  const configuredAllowlist = resolveAllowlist(process.env.HARA_GATEWAY_ALLOWED, ownerId, explicitOwner);
+  let authorizationReadWarningShown = false;
+  const currentAllowlist = (): Set<string> => {
+    const allowed = new Set(configuredAllowlist);
+    if (platform === "feishu") {
+      try {
+        for (const senderId of loadAuthorizedGatewaySenders(runtimeScope)) allowed.add(senderId);
+      } catch {
+        if (!authorizationReadWarningShown) {
+          authorizationReadWarningShown = true;
+          console.error("hara gateway: saved sender authorization is unreadable; Desktop enrollment is disabled until private state is repaired");
+        }
+      }
+    }
+    return allowed;
+  };
+  const startupAllowlist = currentAllowlist();
+  runtimeReporter?.directMessageAccess(startupAllowlist.size > 0);
+  const startupApprovalUserId = resolveApprovalOwner(explicitOwner, ownerId, startupAllowlist);
+  const startupApprovalOwner = startupApprovalUserId ? `${platform}:${startupApprovalUserId}` : undefined;
+  if (startupAllowlist.size === 0) {
     const hint = platform === "weixin"
       ? "your WeChat id"
       : platform === "telegram"
@@ -1165,10 +1237,10 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   } else if (ownerId) {
     console.error(`hara gateway: bot owner auto-allowed (${ownerId}).`);
   }
-  if (!approvalOwner) {
+  if (!startupApprovalOwner) {
     console.error("hara gateway: flow approvals disabled — set HARA_GATEWAY_OWNER to one allowed sender id (required when multiple users are allowed).");
   } else {
-    console.error(`hara gateway: flow approvals restricted to ${approvalOwner}.`);
+    console.error(`hara gateway: flow approvals restricted to ${startupApprovalOwner}.`);
   }
   const ac = new AbortController();
   // Every daemon-originated outbound operation inherits shutdown cancellation. Telegram/Feishu also enforce
@@ -1189,15 +1261,21 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
   const inboundHandlers = new GatewayInboundTracker();
   const stop = (): void => ac.abort(new GatewayQueueClosedError());
   const closeQueue = (): void => sessionRuns.close(new GatewayQueueClosedError());
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  const manageProcessSignals = opts.manageProcessSignals !== false;
+  const stopFromOwner = (): void => stop();
+  if (manageProcessSignals) {
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  }
+  if (opts.signal?.aborted) stopFromOwner();
+  else opts.signal?.addEventListener("abort", stopFromOwner, { once: true });
   ac.signal.addEventListener("abort", closeQueue, { once: true });
   const outboundWorker = serveGatewayOutboundRequests(adapter, runtimeScope, ac.signal).catch((error) => {
     if (!ac.signal.aborted) {
       console.error(`hara gateway: connected-channel delivery worker stopped — ${error instanceof Error ? error.message : String(error)}`);
     }
   });
-  console.error(`hara gateway: ${adapter.name} up · cwd=${cwd} · ${allowlist.size} allowed user(s) · Ctrl-C to stop`);
+  console.error(`hara gateway: ${adapter.name} up · cwd=${cwd} · ${startupAllowlist.size} allowed user(s) · ${manageProcessSignals ? "Ctrl-C" : "Hara Settings"} to stop`);
 
   let transportFailed = false;
   try {
@@ -1209,6 +1287,10 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     try {
     if (ac.signal.aborted) return;
     runtimeReporter?.message();
+    const allowlist = currentAllowlist();
+    runtimeReporter?.directMessageAccess(allowlist.size > 0);
+    const approvalUserId = resolveApprovalOwner(explicitOwner, ownerId, allowlist);
+    const approvalOwner = approvalUserId ? `${platform}:${approvalUserId}` : undefined;
     let existingRunOutcome: GatewayRunOutcomeState | null = null;
     let outcomeLoadError: unknown;
     try {
@@ -1333,8 +1415,28 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     if (!isPrivateApprovalMessage(m)) return;
 
     if (!isAllowed(m.userId, allowlist)) {
-      console.error(`hara gateway: ✗ message from ${m.userId} — not in allowlist. Add it to HARA_GATEWAY_ALLOWED to authorize.`);
-      await sendMessage(m.chatId, "⛔ not authorized.");
+      if (platform === "feishu") {
+        try {
+          const pending = requestGatewaySenderAuthorization(runtimeScope, m.userId);
+          if (pending) {
+            console.error("hara gateway: a Feishu private sender is waiting for local Desktop authorization");
+            await sendMessage(
+              m.chatId,
+              `🔐 当前用户尚未授权。请在 Hara Desktop → 设置 → 聊天机器人中核对配对码 ${pending.code}，然后点击“授权”。\n\nThis sender is not authorized yet. Match code ${pending.code} in Hara Desktop and approve it locally.`,
+            );
+            return;
+          }
+        } catch {
+          console.error("hara gateway: could not create a private sender authorization request");
+        }
+      }
+      console.error("hara gateway: a private message was rejected because its sender is not authorized");
+      await sendMessage(
+        m.chatId,
+        platform === "feishu"
+          ? "⛔ 当前用户尚未授权。请在 Hara Desktop 的聊天机器人设置中完成授权。\n\nThis sender is not authorized yet."
+          : "⛔ not authorized.",
+      );
       return;
     }
     // One credential/chat/user admission covers context lookup, explicit terminal relays, stateful commands,
@@ -1801,11 +1903,13 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
         console.error(`hara gateway: inbound media cleanup failed — ${error instanceof Error ? error.message : String(error)}`);
       });
     }
-    })()), ac.signal, (m) => shouldDownloadInboundMedia(m, allowlist), runtimeReporter);
+    })()), ac.signal, (m) => shouldDownloadInboundMedia(m, currentAllowlist()), runtimeReporter);
   } catch (error) {
-    transportFailed = true;
-    runtimeReporter?.error("transport-exited");
-    throw error;
+    if (!ac.signal.aborted) {
+      transportFailed = true;
+      runtimeReporter?.error("transport-exited");
+      throw error;
+    }
   } finally {
     stop();
     closeQueue();
@@ -1814,8 +1918,11 @@ export async function runGateway(opts: { cwd?: string; platform?: string }): Pro
     await outboundWorker;
     await externalSessions.close().catch(() => {});
     ac.signal.removeEventListener("abort", closeQueue);
-    process.off("SIGINT", stop);
-    process.off("SIGTERM", stop);
+    opts.signal?.removeEventListener("abort", stopFromOwner);
+    if (manageProcessSignals) {
+      process.off("SIGINT", stop);
+      process.off("SIGTERM", stop);
+    }
     if (handlersDrained) {
       releaseInstance();
       runtimeReporter?.stopped(transportFailed);

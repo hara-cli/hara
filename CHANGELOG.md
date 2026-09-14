@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.178.0 — 2026-09-14 — Desktop-owned connectors and local Feishu pairing
+
+- Let `hara serve` start and stop WeChat and Feishu connectors directly for Desktop, remember only the
+  connectors the local user explicitly started, and restore them on the next Desktop launch. Connectors owned
+  by another process remain visible but cannot be stopped or adopted through Desktop.
+- Let an unknown Feishu private sender request a short-lived matching code and be approved locally in Hara
+  Settings. The raw `open_id` stays in credential-scoped owner-only Engine state and never crosses the Desktop
+  protocol; pending requests are bounded and expire after ten minutes.
+- Distinguish an online chat transport from usable direct-message access in redacted gateway status. Operators
+  now see `ready`, `blocked`, or `unknown` plus an actionable allowlist hint, without exposing authorized user
+  ids or counts.
+
 ## 0.177.1 — 2026-09-14 — localized retained tasks and bounded stalled runs
 
 - Keep engine-owned questions, resume instructions, progress warnings, and safety-stop receipts in the language of

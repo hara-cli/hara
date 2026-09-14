@@ -54,6 +54,7 @@ test("gatewayStatus exposes only redacted configuration and actionable stopped s
     assert.equal(status.configured, true);
     assert.equal(status.running, false);
     assert.equal(status.runtimeState, "unknown");
+    assert.equal(status.directMessageAccess, "unknown");
     assert.match(status.recommendation, /hara gateway --platform feishu/);
     const serialized = JSON.stringify(status);
     assert.equal(serialized.includes("cli_test_public_identity"), false);

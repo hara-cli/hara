@@ -3299,9 +3299,13 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
   let savedGatewayCredentialInput;
   let removedGatewayCredentialPlatform;
   let removeGatewayCredentialCalls = 0;
+  let startedGatewayPlatform;
+  let stoppedGatewayPlatform;
+  let approvedGatewayRequest;
   let enrolledOrganizationInput;
   let unpinnedCwd;
   let closeGatewayLoginsCalled = false;
+  let closeGatewaysCalled = false;
   const loginSnapshot = {
     id: "weixin-login-1",
     platform: "weixin",
@@ -3408,6 +3412,54 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
       recommendation: "start it",
       token: "gateway-secret-must-not-leak",
     }],
+    startGateway: async (platform) => {
+      startedGatewayPlatform = platform;
+      return {
+        platform,
+        label: platform === "weixin" ? "WeChat" : "Feishu",
+        configuration: "ready",
+        configured: true,
+        running: true,
+        runningInstances: 1,
+        runtimeState: "connected",
+        directMessageAccess: "blocked",
+        managedByServe: true,
+        recommendation: "authorize a sender",
+      };
+    },
+    stopGateway: async (platform) => {
+      stoppedGatewayPlatform = platform;
+      return {
+        platform,
+        label: platform === "weixin" ? "WeChat" : "Feishu",
+        configuration: "ready",
+        configured: true,
+        running: false,
+        runningInstances: 0,
+        runtimeState: "stopped",
+        directMessageAccess: "unknown",
+        managedByServe: false,
+        recommendation: "start it",
+      };
+    },
+    approveGatewayAuthorization: async (platform, requestId) => {
+      approvedGatewayRequest = { platform, requestId };
+      return {
+        platform,
+        label: "Feishu",
+        configuration: "ready",
+        configured: true,
+        running: true,
+        runningInstances: 1,
+        runtimeState: "connected",
+        directMessageAccess: "ready",
+        managedByServe: true,
+        recommendation: "none",
+      };
+    },
+    closeGateways: async () => {
+      closeGatewaysCalled = true;
+    },
     saveGatewayCredentials: async (input) => {
       savedGatewayCredentialInput = input;
       if (input.appId === "cli_error_connection") {
@@ -3498,6 +3550,9 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     for (const method of [
       "settings.gateways.credentials.save",
       "settings.gateways.credentials.remove",
+      "settings.gateways.start",
+      "settings.gateways.stop",
+      "settings.gateways.authorization.approve",
       "settings.gateways.login.start",
       "settings.gateways.login.status",
       "settings.gateways.login.cancel",
@@ -3578,6 +3633,25 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
     const gateways = await c.call("settings.gateways.list", {});
     assert.equal(gateways.result.gateways[0].platform, "weixin");
     assert.equal(JSON.stringify(gateways.result).includes("gateway-secret-must-not-leak"), false);
+
+    const startedGateway = await c.call("settings.gateways.start", { platform: "feishu" });
+    assert.equal(startedGatewayPlatform, "feishu");
+    assert.equal(startedGateway.result.gateway.managedByServe, true);
+    assert.equal((await c.call("settings.gateways.start", { platform: "telegram" })).error.code, -32602);
+    const authorizationId = "11111111-1111-4111-8111-111111111111";
+    const approvedGateway = await c.call("settings.gateways.authorization.approve", {
+      platform: "feishu",
+      requestId: authorizationId,
+    });
+    assert.deepEqual(approvedGatewayRequest, { platform: "feishu", requestId: authorizationId });
+    assert.equal(approvedGateway.result.gateway.directMessageAccess, "ready");
+    assert.equal((await c.call("settings.gateways.authorization.approve", {
+      platform: "feishu",
+      requestId: "not-an-id",
+    })).error.code, -32602);
+    const stoppedGateway = await c.call("settings.gateways.stop", { platform: "feishu" });
+    assert.equal(stoppedGatewayPlatform, "feishu");
+    assert.equal(stoppedGateway.result.gateway.running, false);
 
     const gatewaySecret = "feishu-app-secret-must-not-return";
     const savedGateway = await c.call("settings.gateways.credentials.save", {
@@ -3672,6 +3746,7 @@ test("serve e2e: provider settings are capability-advertised, redacted, tested, 
   } finally {
     c.close();
     await srv.close();
+    assert.equal(closeGatewaysCalled, true, "serve shutdown closes every owned connector");
     assert.equal(closeGatewayLoginsCalled, true, "serve shutdown closes every owned interactive login");
     rmSync(dir, { recursive: true, force: true });
   }

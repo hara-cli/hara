@@ -69,6 +69,7 @@ test("gateway runtime status reports a live PID and redacted poll/error history,
   try {
     const release = acquireGatewayInstance(scope, { home, displayPlatform: "weixin", now: () => now });
     const reporter = await GatewayRuntimeReporter.open(scope, "weixin", { home, now: () => now });
+    reporter.directMessageAccess(false);
     now = 2_000;
     reporter.connected();
     now = 3_000;
@@ -85,6 +86,7 @@ test("gateway runtime status reports a live PID and redacted poll/error history,
     assert.equal(live.lastPollAt, 3_000);
     assert.equal(live.lastErrorAt, 4_000);
     assert.equal(live.lastErrorCode, "session-expired");
+    assert.equal(live.directMessageAccess, "blocked");
     const persisted = readFileSync(join(home, ".hara", "gateway", `status-${scope}.json`), "utf8");
     assert.equal(persisted.includes(connectionIdentity), false);
     assert.equal(persisted.includes("token"), false);
@@ -121,6 +123,30 @@ test("gateway runtime inspection fails closed on a linked status file without re
   }
 });
 
+test("gateway runtime inspection rejects invalid direct-message access state", async () => {
+  const home = temporaryHome();
+  const dir = join(home, ".hara", "gateway");
+  const scope = "feishu-forged";
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, `status-${scope}.json`), JSON.stringify({
+      version: 1,
+      platform: "feishu",
+      pid: process.pid,
+      startedAt: 1,
+      updatedAt: 1,
+      state: "connected",
+      directMessageAccess: "everyone",
+    }), { mode: 0o600 });
+    const status = await inspectGatewayRuntime("feishu", [scope], { home });
+    assert.equal(status.running, false);
+    assert.equal(status.state, "unreadable");
+    assert.equal(status.directMessageAccess, undefined);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("gateway status marks environment credentials as process-only and does not repeat a recovered error", async () => {
   const home = temporaryHome();
   const savedHome = process.env.HOME;
@@ -138,14 +164,22 @@ test("gateway status marks environment credentials as process-only and does not 
     reporter.error("network");
     now = 3_000;
     reporter.connected();
+    reporter.directMessageAccess(false);
     await reporter.flush();
 
+    const blockedStatus = await gatewayStatus("feishu", { home, env: {} });
+    assert.equal(blockedStatus.configuration, "process-only");
+    assert.equal(blockedStatus.credentialSource, "process-only");
+    assert.equal(blockedStatus.running, true);
+    assert.equal(blockedStatus.runtimeState, "connected");
+    assert.equal(blockedStatus.directMessageAccess, "blocked");
+    assert.equal(blockedStatus.lastErrorCode, "network", "last error remains available as resolved history");
+    assert.match(blockedStatus.recommendation, /HARA_GATEWAY_ALLOWED/);
+
+    reporter.directMessageAccess(true);
+    await reporter.flush();
     const status = await gatewayStatus("feishu", { home, env: {} });
-    assert.equal(status.configuration, "process-only");
-    assert.equal(status.credentialSource, "process-only");
-    assert.equal(status.running, true);
-    assert.equal(status.runtimeState, "connected");
-    assert.equal(status.lastErrorCode, "network", "last error remains available as resolved history");
+    assert.equal(status.directMessageAccess, "ready");
     assert.equal(status.recommendation, "none");
 
     release();
@@ -755,6 +789,7 @@ test("gateway status CLI accepts the documented subcommand order and returns one
     const status = JSON.parse(result.stdout);
     assert.equal(status.platform, "weixin");
     assert.equal(status.configuration, "missing");
+    assert.equal(status.directMessageAccess, "unknown");
     assert.equal("gateways" in status, false, "--platform returns one object, not an accidental all-platform list");
     assert.equal(JSON.stringify(status).includes("token"), false);
   } finally {

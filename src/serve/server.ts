@@ -370,6 +370,12 @@ export interface ServeDeps {
   unpinProjectProfile?: (cwd?: string) => ProjectProfileUnpinResult;
   /** Read-only, redacted connector health for Desktop settings. */
   gatewayStatuses?: () => Promise<GatewayStatus[]>;
+  /** Start/stop only connectors owned by this Serve process. External gateway processes remain read-only. */
+  startGateway?: (platform: string) => Promise<GatewayStatus>;
+  stopGateway?: (platform: string) => Promise<GatewayStatus>;
+  closeGateways?: () => Promise<void>;
+  /** Approve one opaque Feishu DM pairing request; platform identities stay inside Engine private state. */
+  approveGatewayAuthorization?: (platform: string, requestId: string) => Promise<GatewayStatus>;
   /** Masked Feishu enrollment. Credentials cross authenticated loopback only as one write request and are
    * never returned; all later use stays inside Engine-owned gateway/cron delivery. */
   saveGatewayCredentials?: (input: FeishuGatewayCredentialsInput) => Promise<GatewayStatus>;
@@ -4335,6 +4341,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             "settings.providers.list", "settings.providers.test", "settings.providers.save", "settings.vision.test", "settings.vision.save",
             "settings.providers.connections.create", "settings.providers.connections.test", "settings.providers.connections.use",
             "settings.providers.connections.remove", "settings.providers.failover.save", "settings.gateways.list",
+            "settings.gateways.start", "settings.gateways.stop", "settings.gateways.authorization.approve",
             "settings.gateways.credentials.save", "settings.gateways.credentials.remove",
             "settings.gateways.login.start", "settings.gateways.login.status", "settings.gateways.login.cancel",
             "settings.organizations.list", "settings.organizations.enroll", "settings.organizations.use",
@@ -6950,6 +6957,40 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
             const gateways = await deps.gatewayStatuses();
             return reply(rpcResult(id!, { gateways: redactSensitiveValue(gateways).value }));
           }
+          case "settings.gateways.start":
+          case "settings.gateways.stop": {
+            const callback = req.method === "settings.gateways.start" ? deps.startGateway : deps.stopGateway;
+            if (!callback) return reply(rpcError(id, ERR.METHOD, "gateway lifecycle control not supported by this server"));
+            if (
+              typeof p.platform !== "string"
+              || !["weixin", "feishu"].includes(p.platform.trim().toLowerCase())
+            ) return reply(rpcError(id, ERR.PARAMS, "platform must be 'weixin' or 'feishu'"));
+            try {
+              const gateway = await callback(p.platform.trim().toLowerCase());
+              return reply(rpcResult(id!, { gateway: redactSensitiveValue(gateway).value }));
+            } catch {
+              return reply(rpcError(id, ERR.INTERNAL, req.method === "settings.gateways.start"
+                ? "gateway could not be started"
+                : "gateway could not be stopped"));
+            }
+          }
+          case "settings.gateways.authorization.approve": {
+            if (!deps.approveGatewayAuthorization) {
+              return reply(rpcError(id, ERR.METHOD, "gateway sender authorization not supported by this server"));
+            }
+            if (
+              typeof p.platform !== "string"
+              || p.platform.trim().toLowerCase() !== "feishu"
+              || typeof p.requestId !== "string"
+              || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(p.requestId)
+            ) return reply(rpcError(id, ERR.PARAMS, "platform must be 'feishu' and requestId must be an opaque authorization id"));
+            try {
+              const gateway = await deps.approveGatewayAuthorization("feishu", p.requestId);
+              return reply(rpcResult(id!, { gateway: redactSensitiveValue(gateway).value }));
+            } catch {
+              return reply(rpcError(id, ERR.INTERNAL, "gateway sender could not be authorized"));
+            }
+          }
           case "settings.gateways.credentials.save": {
             if (!deps.saveGatewayCredentials) return reply(rpcError(id, ERR.METHOD, "gateway credential settings not supported by this server"));
             if (
@@ -8402,6 +8443,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       for (const session of hub.active()) session.abort?.abort();
       await externalSessions.close?.().catch(() => {});
       await deps.closeMobileRelay?.().catch(() => {});
+      await deps.closeGateways?.().catch(() => {});
       await deps.closeGatewayLogins?.().catch(() => {});
 
       for (const client of wss.clients) {

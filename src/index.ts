@@ -4423,6 +4423,7 @@ gatewayCommand
         `  process: ${status.running ? `running${status.pid ? ` (pid ${status.pid})` : ""}` : "stopped"}` +
         `${status.runningInstances > 1 ? ` · ${status.runningInstances} credential-scoped instances` : ""}\n` +
         `  transport: ${status.runtimeState}\n` +
+        `  direct-message access: ${status.directMessageAccess}\n` +
         `  started: ${timestamp(status.startedAt)}\n` +
         `  last connected/poll/message: ${timestamp(status.lastConnectedAt)} / ${timestamp(status.lastPollAt)} / ${timestamp(status.lastMessageAt)}\n` +
         `  last error: ${status.lastErrorCode ?? "none"}${status.lastErrorAt ? ` at ${timestamp(status.lastErrorAt)}` : ""}\n` +
@@ -4510,6 +4511,7 @@ program
     const approval = (APPROVAL_MODES as readonly string[]).includes(o.approval) ? (o.approval as ApprovalMode) : "auto-edit";
     const { startServe } = await import("./serve/server.js");
     const { GatewayLoginManager } = await import("./gateway/login.js");
+    const { GatewaySupervisor } = await import("./gateway/supervisor.js");
     const { MobileDesktopAuthorizationCoordinator } = await import("./mobile/desktop-authorization.js");
     const { MobilePairingCoordinator } = await import("./mobile/pairing.js");
     const { MobileRelaySupervisor } = await import("./mobile/relay-supervisor.js");
@@ -4519,6 +4521,9 @@ program
       setMobileSessionPublication,
     } = await import("./mobile/state.js");
     const gatewayLogins = new GatewayLoginManager();
+    const gatewaySupervisor = new GatewaySupervisor({
+      log: (message) => process.stderr.write(`${message}\n`),
+    });
     const mobileDesktopAuthorization = new MobileDesktopAuthorizationCoordinator();
     const mobilePairing = new MobilePairingCoordinator();
     const mobileRelay = new MobileRelaySupervisor({
@@ -4802,9 +4807,14 @@ program
             organizations: organizationConnectionsSnapshot(settingsCwd),
           };
         },
-        gatewayStatuses: async () => {
+        gatewayStatuses: () => gatewaySupervisor.list(["weixin", "feishu"]),
+        startGateway: (platform) => gatewaySupervisor.start(platform),
+        stopGateway: (platform) => gatewaySupervisor.stop(platform),
+        closeGateways: () => gatewaySupervisor.close(),
+        approveGatewayAuthorization: async (platform, requestId) => {
           const gateway = await import("./gateway/serve.js");
-          return gateway.listGatewayStatuses(["weixin", "feishu"]);
+          const approved = await gateway.approveGatewaySenderAuthorization(platform, requestId);
+          return { ...approved, managedByServe: (await gatewaySupervisor.status(platform)).managedByServe };
         },
         saveGatewayCredentials: async (input) => {
           const credentials = await import("./gateway/credentials.js");
@@ -4812,24 +4822,30 @@ program
           if (environment.source === "environment") {
             throw new Error("Feishu credentials are controlled by the Engine launch environment; remove that override before editing Hara Settings");
           }
+          const currentGateway = await gatewaySupervisor.status("feishu");
+          if (currentGateway.running && !currentGateway.managedByServe) {
+            throw new Error("Feishu is running outside Hara Desktop; stop that process before replacing its credential");
+          }
+          const restart = currentGateway.managedByServe === true;
+          if (restart) await gatewaySupervisor.stop("feishu");
           try {
             credentials.saveFeishuGatewayCredentials(input);
           } catch {
             throw new Error("Feishu credentials could not be saved securely; repair Hara's private state permissions and retry");
           }
-          const gateway = await import("./gateway/serve.js");
-          return gateway.gatewayStatus("feishu");
+          if (restart) return gatewaySupervisor.start("feishu");
+          return gatewaySupervisor.status("feishu");
         },
         removeGatewayCredentials: async (platform) => {
           if (platform !== "feishu") throw new Error("only Feishu credential removal is supported");
           const credentials = await import("./gateway/credentials.js");
+          await gatewaySupervisor.stop("feishu");
           try {
             credentials.removeStoredFeishuGatewayCredentials();
           } catch {
             throw new Error("Stored Feishu credentials could not be removed securely; repair Hara's private state permissions and retry");
           }
-          const gateway = await import("./gateway/serve.js");
-          return gateway.gatewayStatus("feishu");
+          return gatewaySupervisor.status("feishu");
         },
         startGatewayLogin: (platform) => gatewayLogins.start(platform),
         gatewayLoginStatus: (platform, id) => gatewayLogins.status(platform, id),
@@ -5150,6 +5166,7 @@ program
         approval,
       },
     );
+    void gatewaySupervisor.resume();
     mobileRelay.start();
     const setupStatus = provider0 ? `${cfg.provider}:${cfg.model}` : `setup required · ${cfg.provider}:${cfg.model}`;
     out(c.bold("hara serve") + c.dim(`  ·  ws://${o.host}:${handle.port}  ·  ${setupStatus}  ·  approval ${approval}  ·  token → ~/.hara/serve.json\n`));

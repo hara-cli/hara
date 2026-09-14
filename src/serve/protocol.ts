@@ -174,7 +174,13 @@
 //                                                     most four saved connections. Every turn re-resolves
 //                                                     each route's own endpoint, credential, model,
 //                                                     capabilities and circuit; company Spaces never use it.
-//   settings.gateways.list {}                      → {gateways:[redacted configuration/runtime health]}
+//   settings.gateways.list {}                      → {gateways:[redacted configuration/runtime health plus
+//                                                     ready/blocked/unknown direct-message access; no sender ids]}
+//   settings.gateways.start {platform:"weixin"|"feishu"} → {gateway:redacted status}; starts a connector
+//                                                     owned by this Serve process, never signals an external one
+//   settings.gateways.stop {platform:"weixin"|"feishu"} → {gateway:redacted status}; stops only Serve-owned work
+//   settings.gateways.authorization.approve {platform:"feishu",requestId} → {gateway:redacted status}; approves
+//                                                     an opaque short-lived DM request without returning open_id
 //   settings.gateways.credentials.save {platform:"feishu",appId,appSecret,domain?}
 //                                                   → {gateway:redacted status}; the write-only credential is
 //                                                     saved in Engine private state and never returned

@@ -137,6 +137,7 @@ export type GatewayRuntimeErrorCode =
   | "transport-terminal";
 
 type StoredGatewayRuntimeState = "starting" | "connected" | "degraded" | "stopped" | "failed";
+export type GatewayDirectMessageAccess = "ready" | "blocked";
 
 interface StoredGatewayRuntimeStatus {
   version: 1;
@@ -150,6 +151,8 @@ interface StoredGatewayRuntimeStatus {
   lastMessageAt?: number;
   lastErrorAt?: number;
   lastErrorCode?: GatewayRuntimeErrorCode;
+  /** Whether at least one sender may enter the full direct-message driver. No ids or counts are persisted. */
+  directMessageAccess?: GatewayDirectMessageAccess;
 }
 
 export interface GatewayRuntimeObserver {
@@ -170,6 +173,7 @@ export interface GatewayRuntimeInspection {
   lastMessageAt?: number;
   lastErrorAt?: number;
   lastErrorCode?: GatewayRuntimeErrorCode;
+  directMessageAccess?: GatewayDirectMessageAccess;
 }
 
 interface InFlightMessage {
@@ -541,6 +545,7 @@ function parseGatewayRuntimeStatus(
   const record = value as Partial<StoredGatewayRuntimeStatus>;
   const state = record.state;
   const error = record.lastErrorCode;
+  const directMessageAccess = record.directMessageAccess;
   if (
     record.version !== 1
     || typeof record.platform !== "string"
@@ -551,6 +556,7 @@ function parseGatewayRuntimeStatus(
     || !optionalRuntimeTimestamp(record.updatedAt)
     || !(["starting", "connected", "degraded", "stopped", "failed"] as const).includes(state as StoredGatewayRuntimeState)
     || (error !== undefined && !GATEWAY_RUNTIME_ERROR_CODES.has(error))
+    || (directMessageAccess !== undefined && directMessageAccess !== "ready" && directMessageAccess !== "blocked")
   ) {
     throw new Error(`invalid gateway runtime status: ${path}`);
   }
@@ -572,8 +578,9 @@ function gatewayRuntimeStatusPath(directory: string, runtimeScope: string): stri
 }
 
 /**
- * Credential-scoped, redacted health writer for one live gateway. It stores only lifecycle timestamps and
- * bounded error codes: never tokens, app ids, URLs, chat ids, message text, or raw transport errors.
+ * Credential-scoped, redacted health writer for one live gateway. It stores only lifecycle timestamps,
+ * bounded error codes, and whether any direct-message sender is authorized: never tokens, ids, URLs, message
+ * text, raw transport errors, or the number of authorized users.
  */
 export class GatewayRuntimeReporter implements GatewayRuntimeObserver {
   private tail: Promise<void> = Promise.resolve();
@@ -674,6 +681,11 @@ export class GatewayRuntimeReporter implements GatewayRuntimeObserver {
     this.record.state = code === "transport-terminal" || code === "transport-exited" ? "failed" : "degraded";
     this.record.lastErrorAt = this.now();
     this.record.lastErrorCode = code;
+    this.scheduleWrite();
+  }
+
+  directMessageAccess(ready: boolean): void {
+    this.record.directMessageAccess = ready ? "ready" : "blocked";
     this.scheduleWrite();
   }
 
@@ -784,6 +796,7 @@ export async function inspectGatewayRuntime(
         ...(matchingRecord.lastMessageAt ? { lastMessageAt: matchingRecord.lastMessageAt } : {}),
         ...(matchingRecord.lastErrorAt ? { lastErrorAt: matchingRecord.lastErrorAt } : {}),
         ...(matchingRecord.lastErrorCode ? { lastErrorCode: matchingRecord.lastErrorCode } : {}),
+        ...(matchingRecord.directMessageAccess ? { directMessageAccess: matchingRecord.directMessageAccess } : {}),
       }
     : {};
 
