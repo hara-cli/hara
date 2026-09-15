@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import "../dist/tools/builtin.js";
+import { getTool } from "../dist/tools/registry.js";
 import {
   reportChangedDeclaredOutputs,
   snapshotDeclaredOutputs,
@@ -41,5 +43,22 @@ test("shell deliverable proof counts changed bytes once and rejects paths outsid
     assert.notEqual(receipts[0], receipts[1]);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("write_file progress proof requires new bytes, including on the first repeated write", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "hara-write-progress-"));
+  const receipts = [];
+  const ctx = { cwd, verifiedChange: (digest) => receipts.push(digest) };
+  try {
+    assert.match(await getTool("write_file").run({ path: "report.txt", content: "draft" }, ctx), /Wrote/);
+    assert.equal(receipts.length, 1);
+    assert.match(await getTool("write_file").run({ path: "report.txt", content: "draft" }, ctx), /Unchanged/);
+    assert.equal(receipts.length, 1, "rewriting identical bytes cannot mint a new progress receipt");
+    assert.match(await getTool("write_file").run({ path: "report.txt", content: "final" }, ctx), /Wrote/);
+    assert.equal(receipts.length, 2);
+    assert.notEqual(receipts[0], receipts[1]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
   }
 });
