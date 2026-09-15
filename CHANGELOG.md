@@ -5,6 +5,18 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.178.1 — 2026-09-16 — verified file progress and clearer long-task recovery
+
+- Count committed `write_file`, `edit_file`, and `apply_patch` content changes as Engine-owned task progress,
+  independently of the Agent's todo and checkpoint wording. Repeated unchanged bytes still reach the stalled-run
+  circuit breaker; only new verified content can extend a bounded execution tranche.
+- Let foreground shell and Python calls declare expected `output_paths`. The Engine compares bounded workspace
+  files before and after successful execution and records only opaque change receipts, so generated Excel or
+  document files can prove progress without copying their content into the conversation.
+- Stream raw shell output as a separate notice category for clients to fold, while keeping actionable notices
+  visible. Chinese no-progress reminders now ask the Agent to check real artifacts and record verified task state;
+  the paused task's next step uses Chinese for Chinese objectives.
+
 ## 0.178.0 — 2026-09-14 — Desktop-owned connectors and local Feishu pairing
 
 - Let `hara serve` start and stop WeChat and Feishu connectors directly for Desktop, remember only the
