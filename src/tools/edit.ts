@@ -1,5 +1,5 @@
 import { isAbsolute, resolve } from "node:path";
-import { registerTool } from "./registry.js";
+import { registerTool, reportVerifiedFileChange } from "./registry.js";
 import { nearestPathsAsync } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
@@ -80,6 +80,7 @@ registerTool({
     }
     emitDiff(input.path, text, res.text, ctx.ui);
     recordEdit([{ path: input.path, absPath: boundary.target, before: text, beforeMode: snapshot.mode, committed, after: res.text }]);
+    if (text !== res.text) reportVerifiedFileChange(ctx, boundary.target, res.text);
     invalidateFileCandidates(ctx.cwd);
     const note = res.fuzzy ? " (quote-normalized)" : "";
     const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}`;

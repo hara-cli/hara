@@ -399,6 +399,9 @@ test("lifecycle, strategy, and engine loop boundaries are resumable pauses with 
   assert.equal(loop.status, "paused");
   assert.equal(loop.checkpoint.blockReason, "loop");
   assert.match(loop.checkpoint.nextStep, /materially different strategy/i);
+  const chineseTask = createTaskExecution("生成季度报表并验证文件", interaction.turnId);
+  const chinesePause = finishTaskExecution(chineseTask, { status: "halted", stopReason: "no_progress", error: "无进展" });
+  assert.match(chinesePause.checkpoint.nextStep, /调整为有实质差异的策略/);
 
   const progress = stoppedProgress();
   const noProgress = finishTaskExecution(task, {

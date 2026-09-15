@@ -277,7 +277,7 @@
 //   session.set-approval {sessionId,approval}      → {sessionId,approval} (next turn; refused mid-turn)
 // Server → client notifications (all carry sessionId):
 //   event.text {delta} · event.tool {name,preview} · event.diff {text}
-//   event.notice {text} · event.surface {kind,title,resource} · event.turn_end {reply,usage,error?,status?,stopReason?}
+//   event.notice {text,category?:"output"} · event.surface {kind,title,resource} · event.turn_end {reply,usage,error?,status?,stopReason?}
 //   approval.request {approvalId,question,allowAlways}
 //   event.task_state {version,streamId,sequence,taskId,turnId,objective,state,taskStatus,phase,checkpoint,…}
 //                     authoritative execution plane; clients feature-detect it via capabilities.events.

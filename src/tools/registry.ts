@@ -4,6 +4,8 @@ import { prepareToolResult } from "./result-limit.js";
 import { homeWorkspaceActionError, isUnsafeProjectWorkspace } from "../context/workspace-scope.js";
 import type { SkillToolPolicyActivation } from "../skills/tool-policy.js";
 import type { AgentTeamController } from "../subagent/team.js";
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 
 /** Where agent-side output goes. In the TUI it drives ink state; in plain mode it's absent and
  *  the loop/tools fall back to writing the terminal directly. */
@@ -16,6 +18,8 @@ export interface UiSink {
   tool(name: string, preview: string): void;
   diff(text: string): void;
   notice(text: string): void;
+  /** Raw tool stdout/stderr. Persistent clients may fold this without hiding actionable notices. */
+  output?(text: string): void;
   /** Typed visual surface offer for persistent clients. Optional so terminal sinks and older embedders
    * keep working without learning Desktop navigation semantics. Artifact ids are opaque and URL
    * resources are independently validated by both the offering tool and the Desktop host. */
@@ -49,6 +53,9 @@ export interface ToolContext {
   /** Engine-owned identity of this concrete model tool call. Side-effecting tools may bind an idempotency
    * receipt to it so a replay of the same call is suppressed without suppressing a later intentional call. */
   toolCallId?: string;
+  /** Engine-only receipt for a verified content change. Tools call this after a committed write;
+   * models cannot set it, and only an opaque digest reaches the progress watchdog. */
+  verifiedChange?: (digest: string) => void;
   /** One-run cancellation boundary. Built-in tools must stop owned subprocesses/work promptly when fired. */
   signal?: AbortSignal;
   /** Isolate the in-memory todo_write checklist for concurrent agent runs (serve sessions/sub-agents). */
@@ -89,6 +96,15 @@ export interface ToolContext {
   ) => Promise<{ text: string; model: string }>;
   /** locate a UI element in a screenshot via a grounding vision model → center as 0..1 fractions (for RPA clicks) */
   locate?: (path: string, target: string, signal?: AbortSignal) => Promise<{ x: number; y: number } | null>;
+}
+
+export function reportVerifiedFileChange(ctx: ToolContext, path: string, after: string | null): void {
+  if (!ctx.verifiedChange) return;
+  const digest = createHash("sha256")
+    .update(resolve(ctx.cwd, path)).update("\0")
+    .update(after === null ? "<deleted>" : after)
+    .digest("hex");
+  ctx.verifiedChange(digest);
 }
 
 export type ToolEffect = "read" | "state" | "probe" | "edit" | "exec" | "computer" | "interactive";

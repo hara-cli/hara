@@ -2849,6 +2849,7 @@ export async function startServe(opts: ServeOpts, deps: ServeDeps): Promise<Serv
       },
       diff: (t) => broadcast("event.diff", { sessionId, text: t }),
       notice: (t) => broadcast("event.notice", { sessionId, text: t }),
+      output: (t) => broadcast("event.notice", { sessionId, text: t, category: "output" }),
       surface: (event) => broadcast("event.surface", { sessionId, ...event }),
     };
     const confirm = (

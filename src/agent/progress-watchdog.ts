@@ -45,6 +45,8 @@ export interface ProgressState {
   noProgressRounds: number;
   checkpointStaleRounds: number;
   checkpointAdvanced: boolean;
+  /** New committed file content observed by the engine, independent of model-authored checkpoints. */
+  verifiedChangeAdvanced: boolean;
   similarity?: number;
   repeatedTool?: string;
   repeatedCount?: number;
@@ -84,6 +86,7 @@ interface CallStreak {
 
 export interface ProgressRound {
   observations: readonly ProgressObservation[];
+  verifiedChanges?: readonly string[];
   toolCalls: number;
   substantive: boolean;
   userIntervened: boolean;
@@ -214,6 +217,7 @@ export class AgentProgressWatchdog {
   private readonly callStreaks = new Map<string, CallStreak>();
   private readonly knownCheckpointEvidence: Set<string>;
   private readonly knownCompletedTodos: Set<string>;
+  private readonly knownVerifiedChanges = new Set<string>();
   private toolCalls = 0;
   private unattendedRounds = 0;
   private similarEvidenceRounds = 0;
@@ -252,6 +256,12 @@ export class AgentProgressWatchdog {
       .some((item) => !this.knownCompletedTodos.has(item));
     for (const item of currentCompletedTodos) this.knownCompletedTodos.add(item);
 
+    const verifiedChangeAdvanced = (round.verifiedChanges ?? [])
+      .some((digest) => /^[a-f0-9]{64}$/u.test(digest) && !this.knownVerifiedChanges.has(digest));
+    for (const digest of round.verifiedChanges ?? []) {
+      if (/^[a-f0-9]{64}$/u.test(digest)) this.knownVerifiedChanges.add(digest);
+    }
+
     const done = round.todos.filter((todo) => todo.status === "done").length;
     const total = round.todos.length;
     if (round.substantive && total > 0) {
@@ -260,11 +270,11 @@ export class AgentProgressWatchdog {
       this.todoUnchangedRounds = 0;
     }
     if (round.substantive) {
-      this.checkpointStaleRounds = checkpointAdvanced || todoAdvanced
+      this.checkpointStaleRounds = checkpointAdvanced || todoAdvanced || verifiedChangeAdvanced
         ? 0
         : this.checkpointStaleRounds + 1;
     }
-    const durableProgress = checkpointAdvanced || todoAdvanced;
+    const durableProgress = checkpointAdvanced || todoAdvanced || verifiedChangeAdvanced;
 
     let roundSimilarity = 0;
     let everyObservationIsStale = round.observations.length > 0;
@@ -360,6 +370,7 @@ export class AgentProgressWatchdog {
       noProgressRounds: Math.max(this.similarEvidenceRounds, this.checkpointStaleRounds),
       checkpointStaleRounds: this.checkpointStaleRounds,
       checkpointAdvanced,
+      verifiedChangeAdvanced,
       ...(roundSimilarity > 0 ? { similarity: Math.round(roundSimilarity * 100) / 100 } : {}),
       ...(repeatedTool ? { repeatedTool } : {}),
       ...(highestRepeatedCount > 0 ? { repeatedCount: highestRepeatedCount } : {}),

@@ -246,6 +246,11 @@ syntax/validation/execution failure: then read the exact current file and report
 because an earlier draft or guessed old_string is no longer authoritative. For generated executable source,
 use straight ASCII quote characters as language delimiters and run a syntax-only validation before the first
 side-effecting execution; typographic quotes belong only inside an already quoted string or comment.
+For a Python or foreground bash command that creates or updates a known deliverable, set output_paths to
+the expected workspace-relative file names. Hara checks their content before and after the call and records
+an engine-owned progress receipt; a repeated unchanged file is not progress. After the deliverable is
+validated, still update todo_write and task_checkpoint with the actual verification result so the user sees
+an accurate plan and can resume from it.
 When edit_file, write_file, or apply_patch is available, never assemble source code through a chain of
 awk/sed/echo or inline Python/shell fragments. Output truncation is not a reason to keep changing inline
 commands: switch to the bounded file-edit tool, inspect only the exact target region, and verify once.
@@ -2757,6 +2762,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     // Execute: read-only tools run concurrently; edit/exec run alone, in order.
     if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return finalizeStoppedToolRound();
     const successfulRoundObservations: ProgressObservation[] = [];
+    const verifiedRoundChanges: string[] = [];
     const runOne = async (idx: number, p: Plan): Promise<void> => {
       if (expireRunBudgetIfNeeded(life) || runSignal.aborted) return;
       if (unansweredUserQuestion || credentialQuestionBlocked) {
@@ -2860,6 +2866,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         const executionToolCtx: ToolContext = {
           ...toolCtx,
           toolCallId: p.tu.id,
+          verifiedChange: (digest) => verifiedRoundChanges.push(digest),
           ...(p.tool === askUserTool && askWithRunCancellation
             ? {
                 ask: (question: string, options?: string[], signal?: AbortSignal) =>
@@ -3061,6 +3068,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     ].includes(toolUse.name));
     const progressDecision = progressWatchdog.recordRound({
       observations: successfulRoundObservations,
+      verifiedChanges: verifiedRoundChanges,
       toolCalls: r.toolUses.length,
       substantive: progressTrackedRound,
       userIntervened: userIntervenedThisRound,
@@ -3078,10 +3086,13 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
     lastProgressState = progressEvent;
     try { opts.onProgress?.(progressEvent); } catch { /* observers cannot weaken the watchdog */ }
 
-    // A checkpoint advances automatic continuation only when the engine observed new fact/artifact/
-    // capability/completion evidence (or a newly completed todo). Rewording the same checkpoint no longer
-    // launders an unchanged tool loop into a healthy tranche.
-    if (opts.taskIntake && successfulTaskCheckpoint && progressEvent.checkpointStaleRounds === 0) {
+    // Advance a bounded tranche on new engine-observed evidence, whether it came from the plan/checkpoint
+    // or committed file bytes. Cosmetic checkpoint rewrites and repeated unchanged files cannot extend it.
+    if (opts.taskIntake && progressEvent.checkpointStaleRounds === 0 && (
+      (successfulTaskCheckpoint && progressEvent.checkpointAdvanced)
+      || progressEvent.todo.advanced
+      || progressEvent.verifiedChangeAdvanced
+    )) {
       lastDurableCheckpointRound = life.rounds;
     }
 
@@ -3098,14 +3109,14 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         ? {
             repeated_tool_call: `同一个 ${progressEvent.repeatedTool ?? "工具"} 调用持续返回基本不变的结果`,
             similar_tool_evidence: "最近成功的工具回合持续返回相似度超过 80% 的结果",
-            unattended_without_checkpoint: `连续 ${progressEvent.checkpointStaleRounds} 个工作回合没有新增可验证检查点或完成待办`,
-            unattended_token_budget: `本轮已使用 ${progressEvent.tokens.total} token，仍没有新增可验证检查点或完成待办`,
+            unattended_without_checkpoint: `连续 ${progressEvent.checkpointStaleRounds} 个工作回合没有新增检查点、完成待办或已验证的文件变化`,
+            unattended_token_budget: `本轮已使用 ${progressEvent.tokens.total} token，仍没有新增检查点、完成待办或已验证的文件变化`,
           }
         : {
             repeated_tool_call: `the same successful ${progressEvent.repeatedTool ?? "tool"} call kept returning substantially unchanged evidence`,
             similar_tool_evidence: "recent successful tool rounds kept returning more than 80% similar evidence",
-            unattended_without_checkpoint: `an unattended run reached ${progressEvent.checkpointStaleRounds} working rounds without a new verified checkpoint or completed todo`,
-            unattended_token_budget: `this run spent ${progressEvent.tokens.total} tokens without a new verified checkpoint or completed todo`,
+            unattended_without_checkpoint: `an unattended run reached ${progressEvent.checkpointStaleRounds} working rounds without a new checkpoint, completed todo, or verified file change`,
+            unattended_token_budget: `this run spent ${progressEvent.tokens.total} tokens without a new checkpoint, completed todo, or verified file change`,
           };
       return hardStop(opts, life, "no_progress", {
         label: progressEvent.trigger
@@ -3124,21 +3135,28 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       if (!opts.quiet) {
         history.push({
           role: "user",
-          content: wrapReminders([
-            `No-progress checkpoint: round ${progressEvent.rounds}, ${progressEvent.toolCalls} tool call(s), ` +
-            `${progressEvent.tokens.total} run token(s), todo ${progressEvent.todo.done}/${progressEvent.todo.total}. ` +
-            "Recent evidence or durable task state is not advancing. Stop changing offsets, temporary names, " +
-            "command fragments, or checkpoint wording. Inspect the original acceptance checks now; either " +
-            "record genuinely new verified evidence/finish a todo, state a typed human-only blocker, or stop. " +
-            `Every run pauses after ${UNATTENDED_NO_PROGRESS_TOKEN_LIMIT} tokens without durable progress; ` +
-            `an unattended run also pauses at ${UNATTENDED_PROGRESS_STOP_ROUNDS} stale working rounds.`,
-          ]),
+          content: wrapReminders([life.language === "zh-Hans"
+            ? `任务进展检查：第 ${progressEvent.rounds} 轮，${progressEvent.toolCalls} 次工具调用，` +
+              `本轮累计 ${progressEvent.tokens.total} token，待办 ${progressEvent.todo.done}/${progressEvent.todo.total}。` +
+              "近期证据和持久状态未推进。立即核对原验收条件及已生成的文件；如果产物存在，" +
+              "对下一次 shell/Python 调用声明 output_paths，验证内容，并更新 todo_write 与 task_checkpoint。" +
+              "不要只改偏移、临时名称、命令碎片或检查点措辞。确有新增证据就记录；确有只能由用户解决的阻碍就注明；否则停止当前策略。" +
+              `没有可验证进展的运行会在 ${UNATTENDED_NO_PROGRESS_TOKEN_LIMIT} token 后暂停，` +
+              `无人值守运行还会在连续 ${UNATTENDED_PROGRESS_STOP_ROUNDS} 个停滞工作回合后暂停。`
+            : `No-progress checkpoint: round ${progressEvent.rounds}, ${progressEvent.toolCalls} tool call(s), ` +
+              `${progressEvent.tokens.total} run token(s), todo ${progressEvent.todo.done}/${progressEvent.todo.total}. ` +
+              "Recent evidence or durable task state is not advancing. Inspect the original acceptance checks " +
+              "and any generated files. Declare output_paths on the next shell/Python call, verify changed content, " +
+              "and update todo_write and task_checkpoint. Stop changing offsets, temporary names, command " +
+              "fragments, or checkpoint wording. Record genuinely new evidence, state a typed human-only blocker, or stop. " +
+              `Every run pauses after ${UNATTENDED_NO_PROGRESS_TOKEN_LIMIT} tokens without verified progress; ` +
+              `unattended runs also pause at ${UNATTENDED_PROGRESS_STOP_ROUNDS} stale working rounds.`]),
         });
         showRunNotice(
           opts,
           life.language === "zh-Hans"
-            ? `✻ 任务进展停滞：连续 ${progressEvent.checkpointStaleRounds} 轮没有新的可验证检查点，Hara 正在要求 Agent 更换策略。`
-            : `✻ Task progress has stalled for ${progressEvent.checkpointStaleRounds} round(s); Hara is requiring the Agent to record a verified checkpoint or change strategy.`,
+            ? `✻ 任务进展停滞：连续 ${progressEvent.checkpointStaleRounds} 轮没有新的可验证进展，Hara 正在要求 Agent 核对产物并调整策略。`
+            : `✻ Task progress has stalled for ${progressEvent.checkpointStaleRounds} round(s); Hara is requiring the Agent to verify artifacts and change strategy.`,
         );
       }
     }

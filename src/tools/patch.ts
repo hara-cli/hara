@@ -4,7 +4,7 @@ import { linkSync, lstatSync, readlinkSync, renameSync, symlinkSync } from "node
 import { lstat, readlink, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { registerTool } from "./registry.js";
+import { registerTool, reportVerifiedFileChange } from "./registry.js";
 import { applyEdits, type OneEdit } from "./apply-core.js";
 import { emitDiff } from "../diff.js";
 import { recordEdit } from "../undo.js";
@@ -411,6 +411,11 @@ registerTool({
       committed: pl.committed,
       after: pl.after ?? undefined,
     })));
+    for (const plan of plans) {
+      if (plan.type === "delete" || plan.before !== plan.after) {
+        reportVerifiedFileChange(ctx, plan.abs, plan.after);
+      }
+    }
     invalidateFileCandidates(ctx.cwd);
     return `apply_patch: ${plans.length} file(s) — ${summary.join("; ")}.` + (cleanupFailures.length ? ` Warning: ${cleanupFailures.join("; ")}` : "");
   },

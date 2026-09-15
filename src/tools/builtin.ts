@@ -2,7 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { resolve, isAbsolute } from "node:path";
 import { stdout as procOut } from "node:process";
-import { registerTool } from "./registry.js";
+import { registerTool, reportVerifiedFileChange } from "./registry.js";
+import { reportChangedDeclaredOutputs, snapshotDeclaredOutputs } from "./declared-outputs.js";
 import { runShell } from "../sandbox.js";
 import { nearestPathsAsync } from "../fs-walk.js";
 import { emitDiff } from "../diff.js";
@@ -333,6 +334,7 @@ registerTool({
     }
     emitDiff(input.path, prev ?? "", input.content, ctx.ui);
     recordEdit([{ path: input.path, absPath: boundary.target, before: prev, beforeMode: prevSnapshot?.mode, committed, after: input.content }]);
+    reportVerifiedFileChange(ctx, boundary.target, input.content);
     invalidateFileCandidates(ctx.cwd);
     const shellPath = isAbsolute(String(input.path)) ? p : String(input.path);
     return `Wrote ${String(input.content).length} chars to ${p}. Shell commands use cwd ${ctx.cwd}; reference this file as ${shellPath}.`
@@ -352,6 +354,7 @@ registerTool({
     properties: {
       code: { type: "string", description: "Python 3 source executed from stdin, never written to a .py file" },
       timeout_ms: { type: "number", description: "default 300000 (5 min), bounded to 1s..1h" },
+      output_paths: { type: "array", items: { type: "string" }, maxItems: 12, description: "Expected files this call creates or changes, relative to cwd; Hara verifies content before/after without reading it into the conversation" },
     },
     required: ["code"],
   },
@@ -372,6 +375,7 @@ registerTool({
       );
     }
     const command = pythonStdinCommand();
+    const declaredOutputs = await snapshotDeclaredOutputs(input.output_paths, ctx);
     try {
       const result = await runShell(command, ctx.cwd, ctx.sandbox ?? "off", {
         timeout: shellTimeoutMs(command, input.timeout_ms),
@@ -379,6 +383,7 @@ registerTool({
         signal: ctx.signal,
         input: input.code,
       });
+      await reportChangedDeclaredOutputs(declaredOutputs, ctx);
       const rendered = redactToolSubprocessOutput(capHeadTail([result.stdout, result.stderr].filter(Boolean).join("\n"))).trim();
       return rendered ? `Python completed without creating a helper script.\n${rendered}` : "Python completed without creating a helper script.";
     } catch (error: any) {
@@ -405,6 +410,7 @@ registerTool({
       timeout_ms: { type: "number", description: "default 300000 (5 min), or 900000 (15 min) for package installs; bounded to 1s..1h" },
       background: { type: "boolean", description: "run as a background job (dev server, watcher, long task); package installs stay foreground unless explicitly requested" },
       registry: { type: "string", description: "for package installs only: npmjs, npmmirror, or an HTTP(S) registry URL; injected as environment, never shell text" },
+      output_paths: { type: "array", items: { type: "string" }, maxItems: 12, description: "Expected files this foreground command creates or changes, relative to cwd; Hara verifies content before/after without exposing it" },
     },
     required: ["command"],
   },
@@ -505,7 +511,11 @@ registerTool({
       }
     }
     const liveEmit = ctx.ui
-      ? createBoundedToolNoticeEmitter((line: string) => ctx.ui!.notice(line.replace(/\r?\n$/, "")))
+      ? createBoundedToolNoticeEmitter((line: string) => {
+          const value = line.replace(/\r?\n$/, "");
+          if (ctx.ui!.output) ctx.ui!.output(value);
+          else ctx.ui!.notice(value);
+        })
       : procOut.isTTY
         ? (line: string) => procOut.write(line)
         : null;
@@ -518,6 +528,7 @@ registerTool({
       : undefined;
     const flushLive = (): void => { liveStdout?.flush(); liveStderr?.flush(); };
     const timeout = shellTimeoutMs(input.command, input.timeout_ms);
+    const declaredOutputs = await snapshotDeclaredOutputs(input.output_paths, ctx);
     try {
       const { stdout, stderr } = await runShell(input.command, ctx.cwd, ctx.sandbox ?? "off", {
         timeout,
@@ -526,6 +537,7 @@ registerTool({
         signal: ctx.signal,
         ...(registry ? { env: packageRegistryEnv(registry) } : {}),
       });
+      await reportChangedDeclaredOutputs(declaredOutputs, ctx);
       flushLive();
       const combined = (stdout || "") + (stderr ? `\n[stderr]\n${stderr}` : "");
       // The endpoint can be a private hostname/path. Confirmation is useful, but echoing it back into the

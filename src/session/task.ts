@@ -1209,7 +1209,9 @@ export function finishTaskExecution(
       outcome.error ?? "Hara paused repeated tool work that was not producing durable progress",
       MAX_TASK_CHECKPOINT_STEP_CHARS,
     );
-    checkpoint.nextStep = "Resume only after selecting a materially different strategy or resolving the named boundary";
+    checkpoint.nextStep = /[\u3400-\u9fff]/u.test(task.objective)
+      ? "调整为有实质差异的策略，或解决已指出的阻碍后，再继续"
+      : "Resume only after selecting a materially different strategy or resolving the named boundary";
   } else if (current) {
     checkpoint.currentStep = boundedText(current.activeForm || current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);
     checkpoint.nextStep ??= boundedText(current.text, MAX_TASK_CHECKPOINT_STEP_CHARS);

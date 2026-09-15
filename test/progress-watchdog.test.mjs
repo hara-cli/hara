@@ -157,6 +157,33 @@ test("new checkpoint evidence breaks similar receipts and lets healthy long work
   }
 });
 
+test("engine-verified file changes prevent a false no-progress pause without laundering repeats", () => {
+  const watchdog = new AgentProgressWatchdog({ unattended: true });
+  const observation = [{ name: "edit_file", input: { path: "report.md" }, content: "Edited report.md: 1 replacement." }];
+  for (let currentRound = 1; currentRound <= 12; currentRound += 1) {
+    const digest = currentRound % 3 === 0 ? currentRound.toString(16).padStart(64, "0") : undefined;
+    const decision = watchdog.recordRound(round({
+      observations: observation,
+      verifiedChanges: digest ? [digest] : [],
+    }));
+    assert.equal(decision.stop, false, `new committed content in round ${currentRound} should keep work active`);
+    if (digest) {
+      assert.equal(decision.state.verifiedChangeAdvanced, true);
+      assert.equal(decision.state.checkpointStaleRounds, 0);
+    }
+  }
+  const duplicate = "c".repeat(64);
+  const first = watchdog.recordRound(round({ observations: observation, verifiedChanges: [duplicate] }));
+  assert.equal(first.state.verifiedChangeAdvanced, true);
+  let stopped;
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    stopped = watchdog.recordRound(round({ observations: observation, verifiedChanges: [duplicate] }));
+    if (stopped.stop) break;
+  }
+  assert.equal(stopped.stop, true, "the same file content cannot endlessly reset the watchdog");
+  assert.equal(stopped.state.verifiedChangeAdvanced, false);
+});
+
 test("a live user steer starts a fresh unattended window", () => {
   const watchdog = new AgentProgressWatchdog({ unattended: true });
   for (let currentRound = 1; currentRound <= 7; currentRound += 1) {
