@@ -5,6 +5,14 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.178.3 — 2026-09-17 — restore Windows standalone chat replies
+
+- Re-enter the Windows Bun standalone through `hara.exe` itself instead of forwarding Bun's synthetic
+  `B:/~BUN/root/cli.js` entry as a user argument. WeChat and Feishu gateway replies no longer fail with
+  `too many arguments` while the transport still appears online.
+- Exercise the real compiled self-invocation path in the native Windows, macOS, and Linux release smoke tests,
+  and reject any regression that leaks Bun virtual-entry paths into a child Hara process.
+
 ## 0.178.2 — 2026-09-16 — finish successful external actions before pausing
 
 - Give a change task one bounded finalization round when an Engine-owned external side effect has already
