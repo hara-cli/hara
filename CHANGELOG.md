@@ -5,6 +5,16 @@ All notable changes to `@nanhara/hara`.
 > Versioning (pre-1.0, SemVer-style): the **minor** (middle) number bumps for a **new feature**; the
 > **patch** (last) number bumps for **optimizations/fixes of existing features**.
 
+## 0.178.2 — 2026-09-16 — finish successful external actions before pausing
+
+- Give a change task one bounded finalization round when an Engine-owned external side effect has already
+  succeeded but the Agent has not yet recorded its completion receipt. This lets a successful upload or message
+  finish cleanly instead of being reported as a stalled task immediately after delivery.
+- During that finalization round, explicitly forbid repeating uploads, messages, releases, or other external
+  side effects. The Agent may only record completion evidence or preserve the remaining blocker in a checkpoint;
+  the existing no-progress circuit breaker still pauses the task if it cannot close out.
+- Keep the finalization reminder and recovery guidance localized to the conversation language.
+
 ## 0.178.1 — 2026-09-16 — verified file progress and clearer long-task recovery
 
 - Count committed `write_file`, `edit_file`, and `apply_patch` content changes as Engine-owned task progress,
