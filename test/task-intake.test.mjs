@@ -306,6 +306,92 @@ test("successful owned work is paused without exposing success prose to a remote
   );
 });
 
+test("a successful external action gets one bounded completion round before the no-progress token stop", async () => {
+  const turn = newTurnInteraction();
+  let task = createTaskExecution("把文件上传到飞书并通知群", turn.turnId);
+  let sends = 0;
+  let reads = 0;
+  const notices = [];
+  const progress = [];
+  const stats = { input: 0, output: 0 };
+  const send = {
+    name: "fixture_external_send",
+    description: "test-only confirmed external action",
+    input_schema: { type: "object", properties: {} },
+    kind: "exec",
+    async run() {
+      sends += 1;
+      return "four files uploaded and the group notification was delivered";
+    },
+  };
+  const inspect = {
+    name: "fixture_external_inspect",
+    description: "test-only read",
+    input_schema: { type: "object", properties: { pass: { type: "number" } }, required: ["pass"] },
+    kind: "read",
+    async run(input) {
+      reads += 1;
+      return `verified delivery status ${input.pass}`;
+    },
+  };
+  const p = provider([
+    { text: "", toolUses: [{ id: "b1", name: "task_intake", input: BRIEF }], stop: "tool_use", usage: { input: 50_000, output: 1 } },
+    { text: "", toolUses: [{ id: "s1", name: send.name, input: {} }], stop: "tool_use", usage: { input: 70_000, output: 1 } },
+    { text: "", toolUses: [{ id: "r1", name: inspect.name, input: { pass: 1 } }], stop: "tool_use", usage: { input: 70_000, output: 1 } },
+    { text: "", toolUses: [{ id: "r2", name: inspect.name, input: { pass: 2 } }], stop: "tool_use", usage: { input: 70_000, output: 1 } },
+    {
+      text: "",
+      toolUses: [{
+        id: "c1",
+        name: "task_checkpoint",
+        input: { completion: { state: "verified", evidence: ["four files uploaded and the group notification was delivered"] } },
+      }],
+      stop: "tool_use",
+      usage: { input: 1, output: 1 },
+    },
+    { text: "文件已上传并通知一次。", toolUses: [], stop: "end", usage: { input: 1, output: 1 } },
+  ]);
+  const history = [{ role: "user", content: "把文件上传到飞书并通知群" }];
+  const outcome = await runAgent(history, {
+    provider: p,
+    ctx: {
+      cwd: process.cwd(),
+      ui: {
+        text: () => {},
+        reasoning: () => {},
+        tool: () => {},
+        diff: () => {},
+        notice: (value) => notices.push(value),
+      },
+    },
+    approval: "full-auto",
+    confirm: async () => true,
+    stats,
+    extraTools: [send, inspect],
+    onProgress(event) {
+      progress.push(event);
+    },
+    taskIntake: {
+      task,
+      current: () => task,
+      onUpdate(next) {
+        task = next;
+      },
+      onCheckpoint(next) {
+        task = next;
+      },
+    },
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(sends, 1, "the successful external side effect is never repeated during finalization");
+  assert.equal(reads, 2);
+  assert.equal(task.checkpoint.completion.state, "verified");
+  assert.match(notices.join("\n"), /正在要求 Agent 先记录完成证据/);
+  assert.equal(progress.some((event) => event.state === "stopped"), false, "the grace round remains visibly active");
+  assert.match(JSON.stringify(history), /任务收尾边界/);
+});
+
 test("task_intake and an edit in the same model response cannot bypass the round boundary", async () => {
   const turn = newTurnInteraction();
   let task = createTaskExecution("change one file", turn.turnId);

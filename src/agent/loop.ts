@@ -1373,6 +1373,7 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
   let emptyRetried = false; // one-shot: a genuinely empty model turn gets a single nudge before we give up
   let actionOwnershipRetries = 0; // accepted change tasks may not terminate as advice without a typed blocker
   let completionReceiptRetries = 0; // performed work gets one bounded chance to record final verification
+  let noProgressFinalizationRetries = 0; // a successful side effect gets one close-out round before watchdog halt
   let credentialDisclosureRetries = 0; // gateway prose gets one hidden correction before a safe hard stop
   let successfulOwnedActionObserved = false; // reads alone never satisfy execution ownership
   let recallExhausted = false; // after three empty attempts, hide only recall and allow a natural final answer
@@ -3076,8 +3077,22 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
       todos: currentTodos(ctx.todoScope),
       usage: opts.stats,
     });
+    syncIntakeTask();
+    const grantNoProgressFinalization = progressDecision.stop
+      && !repeatHalt
+      && noProgressFinalizationRetries < 1
+      && intakeTask?.brief?.intent === "change"
+      && successfulOwnedActionObserved
+      && !freshTaskCompletion(intakeTask);
+    if (grantNoProgressFinalization) noProgressFinalizationRetries += 1;
+    const progressState = grantNoProgressFinalization
+      ? (() => {
+          const { trigger: _trigger, ...pending } = progressDecision.state;
+          return { ...pending, state: "warning" as const };
+        })()
+      : progressDecision.state;
     const progressEvent: RunProgressEvent = {
-      ...progressDecision.state,
+      ...progressState,
       rounds: life.rounds,
       maxRounds: life.maxRounds,
       cumulativeTaskRounds: life.taskRoundsUsed + life.rounds,
@@ -3103,6 +3118,21 @@ async function runAgentInner(history: NeutralMsg[], opts: RunOpts, life: RunLife
         count: repeatedFailure.count,
         progress: progressEvent,
       });
+    }
+    if (grantNoProgressFinalization) {
+      history.push({
+        role: "user",
+        content: wrapReminders([life.language === "zh-Hans"
+          ? "任务收尾边界：Hara 已观察到本任务至少有一次成功的修改或外部操作，但在 Agent 记录完成证据前触发了无进展止损。不要重复上传、发送、发布或执行其他外部操作。根据已有工具回执核对原验收条件：如果已经全部满足，下一轮只调用 task_checkpoint，记录 completion.state=verified 和简短可观察证据；如果尚未满足，记录当前事实、剩余步骤或真实的人类依赖，然后安全停止。"
+          : "Task finalization boundary: Hara observed at least one successful change or external action, but the no-progress limit was reached before the Agent recorded completion evidence. Do not repeat uploads, messages, releases, or other external side effects. Check the accepted criteria against the existing tool receipts. If every check already passes, use only task_checkpoint in the next round with completion.state=verified and concise observable evidence. Otherwise checkpoint the current facts, remaining step, or real human dependency, then stop safely."]),
+      });
+      showRunNotice(
+        opts,
+        life.language === "zh-Hans"
+          ? "✻ 已观察到成功操作；Hara 正在要求 Agent 先记录完成证据，再决定是否暂停。"
+          : "✻ successful work was observed; Hara is giving the Agent one bounded round to record completion evidence before pausing.",
+      );
+      continue;
     }
     if (progressDecision.stop) {
       const labels: Record<NonNullable<ProgressState["trigger"]>, string> = life.language === "zh-Hans"
