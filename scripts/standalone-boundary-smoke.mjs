@@ -3,7 +3,7 @@
 // historically loaded cwd/.env and cwd/bunfig.toml by default; both happen before Hara can apply its own
 // file, command, or approval boundaries. This smoke is intentionally runtime-based rather than a source grep.
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -38,6 +38,10 @@ try {
   const env = { ...process.env, HOME: home, USERPROFILE: home, NO_COLOR: "1", HARA_UPDATE_CHECK: "0" };
   delete env.HARA_MODEL;
   delete env.BUN_CONFIG;
+  delete env.HARA_PROFILE;
+  delete env.HARA_PROVIDER;
+  delete env.HARA_API_KEY;
+  delete env.ANTHROPIC_API_KEY;
 
   const run = (args) => spawnSync(binary, args, {
     cwd: root,
@@ -68,7 +72,31 @@ try {
     throw new Error("cwd bunfig.toml preload executed during Hara startup");
   }
 
-  console.log("✓ standalone ignores cwd .env and bunfig.toml preload");
+  // Exercise the exact self-reentry used by chat gateways and prompt-mode cron jobs. Bun exposes a synthetic
+  // argv[1] for compiled programs (`/$bunfs/...` on POSIX and `B:/~BUN/...` on Windows); forwarding it makes
+  // Commander reject the child before it reaches authentication with `too many arguments`.
+  const added = run(["cron", "add", "in 1h", "standalone self invocation smoke", "--name", "self-reentry-probe"]);
+  const jobId = /scheduled\s+([0-9a-f]{8})\b/iu.exec(added.stdout)?.[1];
+  if (added.error || added.status !== 0 || !jobId) {
+    const details = added.error?.message
+      ?? [added.stderr.trim(), added.stdout.trim()].filter(Boolean).join("\n");
+    throw new Error(`self-reentry setup failed (status ${added.status}): ${details}`);
+  }
+  const reentered = run(["cron", "run", jobId]);
+  if (reentered.error || reentered.status !== 0) {
+    const details = reentered.error?.message
+      ?? [reentered.stderr.trim(), reentered.stdout.trim()].filter(Boolean).join("\n");
+    throw new Error(`self-reentry probe failed (status ${reentered.status}): ${details}`);
+  }
+  const runLog = readFileSync(join(home, ".hara", "cron", "logs", `${jobId}.log`), "utf8");
+  if (/too many arguments|(?:\$bunfs|~BUN)[\\/]/iu.test(runLog)) {
+    throw new Error(`compiled self-reentry forwarded Bun's virtual entry: ${runLog.trim().slice(-1_000)}`);
+  }
+  if (!/Not authenticated for profile 'personal'/u.test(runLog)) {
+    throw new Error(`compiled self-reentry did not reach the expected auth boundary: ${runLog.trim().slice(-1_000)}`);
+  }
+
+  console.log("✓ standalone ignores ambient project loaders and safely re-enters itself");
 } catch (error) {
   console.error(`standalone boundary smoke: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;

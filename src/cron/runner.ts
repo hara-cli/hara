@@ -116,11 +116,14 @@ export function inspectCronTick(
 /** How to invoke hara again. Under node, argv[1] is the entry to hand back to node — either `dist/index.js`
  *  OR the installed `hara` bin symlink (node runs both); as a compiled single-binary, execPath itself IS hara
  *  (argv[1] is a user arg), so re-invoke the binary directly. Used by the cron tick + the chat gateway.
- *  Node and ordinary Bun scripts retain argv[1] (the bin symlink need not end in `.js`); only Bun's
- *  `/$bunfs/…` compile-time virtual entry is omitted because execPath is already the standalone Hara. */
+ *  Node and ordinary Bun scripts retain argv[1] (the bin symlink need not end in `.js`); Bun's POSIX
+ *  `/$bunfs/…` and Windows `B:/~BUN/…` compile-time virtual entries are omitted because execPath is already
+ *  the standalone Hara. */
 export function selfArgvFor(exec: string, entry: string | undefined, versions: NodeJS.ProcessVersions): string[] {
   const underNode = /(^|[\\/])node(\.exe)?$/i.test(exec);
-  const bunScript = typeof versions.bun === "string" && !!entry && !entry.replace(/\\/g, "/").startsWith("/$bunfs/");
+  const normalizedEntry = entry?.replace(/\\/g, "/") ?? "";
+  const bunVirtualEntry = normalizedEntry.startsWith("/$bunfs/") || /^B:\/~BUN\//iu.test(normalizedEntry);
+  const bunScript = typeof versions.bun === "string" && !!entry && !bunVirtualEntry;
   return entry && (underNode || bunScript) ? [exec, entry] : [exec];
 }
 

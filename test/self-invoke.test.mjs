@@ -30,6 +30,16 @@ test("selfArgvFor keeps script entries for Node and plain Bun, but not Bun compi
     ["C:\\hara.exe"],
     "the Bun virtual-entry discriminator is separator-neutral",
   );
+  assert.deepEqual(
+    selfArgvFor("C:\\Program Files\\Hara\\hara.exe", "B:/~BUN/root/cli.js", { bun: "1.3.9" }),
+    ["C:\\Program Files\\Hara\\hara.exe"],
+    "a Windows Bun standalone omits its synthetic B:/~BUN entry",
+  );
+  assert.deepEqual(
+    selfArgvFor("C:\\Program Files\\Hara\\hara.exe", "B:\\~bun\\root\\cli.js", { bun: "1.3.9" }),
+    ["C:\\Program Files\\Hara\\hara.exe"],
+    "the Windows Bun virtual-entry discriminator is case- and separator-neutral",
+  );
 });
 
 test("selfInvocation under a plain Bun script retains the script entry", { skip: bunProbe.status !== 0 }, () => {

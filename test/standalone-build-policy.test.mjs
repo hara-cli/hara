@@ -6,6 +6,7 @@ const build = readFileSync(new URL("../scripts/build-binary.ts", import.meta.url
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const release = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+const boundarySmoke = readFileSync(new URL("../scripts/standalone-boundary-smoke.mjs", import.meta.url), "utf8");
 const serveSmoke = readFileSync(new URL("../scripts/standalone-serve-smoke.mjs", import.meta.url), "utf8");
 
 test("standalone compile disables every ambient project config loader", () => {
@@ -23,6 +24,8 @@ test("standalone releases use baseline x64 targets and runtime boundary smoke", 
   }
   assert.match(ci, /standalone-boundary-smoke\.mjs/);
   assert.match(release, /standalone-boundary-smoke\.mjs/);
+  assert.match(boundarySmoke, /\["cron", "run", jobId\]/, "native standalone smoke must exercise self-reentry");
+  assert.match(boundarySmoke, /too many arguments/, "native standalone smoke must reject virtual-entry regressions");
   assert.match(serveSmoke, /"session\.list"/, "native serve smoke must exercise session index initialization");
   for (const capability of [
     "desk.connections.list",
